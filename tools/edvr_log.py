@@ -290,6 +290,9 @@ value and Elite read its eye transform at that value afterwards, NEVER APPLIED w
 The desktop window (visual.desktop_window) is the other rule whose lines carry no build tag: the graphics log's "desktop window:" lines. It says OK when a 10 s line (or the line
 that ends an activation) shows a Present drawn, NEVER APPLIED when a "desktop window: setting" line named a mode other than game and no line shows one, and nothing at all when
 the setting is game or absent.
+The frame generation shadow (fix.frame_generation_shadow, TEMPORARY, Phase 1 of the frame-generation design) is another: the graphics log's "frame generation (shadow):" lines, an
+armed line once and a report line every second. It says OK when a report line is in the window, NEVER APPLIED when the armed line is there and no report line is, and nothing
+at all in a log with neither (the key off).
 The SRV turret view (experimental.srv_turret_camera_back, experimental.srv_turret_hud_forward, experimental.srv_turret_radar_forward, experimental.srv_turret_panels_back, experimental.srv_turret_radar_back, experimental.srv_turret_hud_gap, experimental.srv_turret_hud_depth, experimental.srv_turret_hud_scissor) is the third: the graphics log's "srv turret ..." lines. The settings lines and the vehicle latch's lines
 ("srv turret: the vehicle is the Scorpion|not the Scorpion (event X)", written by the journal watcher) are kept whatever --since says; the last vehicle line is said in the detail, and
 vehicle lines alone are not the rule's lines (nothing is said for them). The pass acts in the Scorpion only: when the turret view bit is on in an SRV the journal does not call the Scorpion
@@ -10602,6 +10605,15 @@ H_DESKTOP_STOP = r"desktop window: stopped \((?P<reason>.*)\); drawn=(?P<drawn>\
 H_DESKTOP_ACTIVE = r"desktop window: active #(?P<n>\d+)"   # F173: the window took the eye images (an activation): evidence that 3D was on
 H_DESKTOP_DECLINED = r"desktop window: not drawing -- (?P<why>.*)$"   # F173: the draw declined, and why
 H_DESKTOP_OTHER = r"desktop window: (?!setting |10 s: |stopped \()"
+# Frame generation, Phase 1 (fix.frame_generation_shadow, TEMPORARY; src\common\framegen_shadow_report.h): two lines of the graphics log with no build tag, read the way the desktop
+# window's are. The armed line is said once per change to on (so health_scan keeps it whatever --since says); the report line every second.
+H_FRAMEGEN = "frame generation shadow"
+H_FRAMEGEN_LABEL = "frame generation (shadow):"
+H_FRAMEGEN_ARMED = r"frame generation \(shadow\): armed, quarter (?P<qw>\d+)x(?P<qh>\d+) per eye, classes far cockpit world"
+_HFG_CLASS = r" {n}=(?P<{n}_share>[\d.]+)%,(?P<{n}_mean>\d+),(?P<{n}_p50>\d+),(?P<{n}_p95>\d+),(?P<{n}_o02>[\d.]+)%,(?P<{n}_o05>[\d.]+)%\|id:(?P<{n}_idmean>\d+),(?P<{n}_idp95>\d+)"
+H_FRAMEGEN_REPORT = (r"frame generation \(shadow\): frames=(?P<frames>\d+) skipped=(?P<s0>\d+)/(?P<s1>\d+)/(?P<s2>\d+)/(?P<s3>\d+)/(?P<s4>\d+)"
+                     + "".join(_HFG_CLASS.format(n=n) for n in ("far", "cockpit", "world")) +
+                     r" holes=(?P<holes>[\d.]+)% gpu_ms=(?P<gpu_med>[\d.]+)/(?P<gpu_max>[\d.]+) rig_deg=(?P<deg_med>[\d.]+)/(?P<deg_max>[\d.]+) rig_mm=(?P<mm_med>[\d.]+)/(?P<mm_max>[\d.]+)$")
 # The SRV turret view (issue 140; src\d3d11\srv_turret.cpp, the vehicle latch's line in journal_watch.cpp, and the geometry shader's creation line in shader_swap.cpp, shaderSwapCreateGs,
 # called with who "srv turret hud"): lines of the graphics log with no build tag, read the way the desktop window's are. The settings and vehicle lines are state, so health_scan keeps
 # every one whatever --since says; the rest are events and are cut by the window. Every kind of line the DLL writes has a pattern of its own, so a labelled line that none matches is
@@ -10670,7 +10682,7 @@ H_F125_LABEL = "native on foot log (F125)"
 H_F125_RE = re.compile(r"native on foot log \(F125\): detail (?P<detail>on|off), summary window (?P<wl>\d+) s")
 # Rules whose absence says nothing about a feature, so a log without their lines does not list them as not present: every log written before F125 has no F125
 # line, and its report stays as it was.
-HEALTH_QUIET_WHEN_ABSENT = frozenset((H_F125, H_WORLD, H_DESKTOP, H_SRV_TURRET))   # world scale writes nothing while the value stays 100; the desktop window nothing while the setting is game; the SRV turret view nothing in a log with no VR profile
+HEALTH_QUIET_WHEN_ABSENT = frozenset((H_F125, H_WORLD, H_DESKTOP, H_SRV_TURRET, H_FRAMEGEN))   # the frame generation shadow is off by default and says nothing then; world scale writes nothing while the value stays 100; the desktop window nothing while the setting is game; the SRV turret view nothing in a log with no VR profile
 
 # ---- F125: summary windows (the on-foot log diet) ----
 # By default an on-foot summary line covers a window of 10 s, 1 s with log.on_foot_detail = on, and 1 to 10 s when a window is flushed early (a held-item change,
@@ -16811,6 +16823,29 @@ def _hj_desktop_window(rows, ctx):
     return ("OK", text)
 
 
+def _hj_framegen_shadow(rows, ctx):
+    """Frame generation, Phase 1 (fix.frame_generation_shadow, TEMPORARY): ran is the armed line (the first treated eye with the key on), applied is a report line (the
+    scorer's one-second line). OK when at least one report line is in the window; NEVER APPLIED when the armed line is there and no report line is (the scorer armed and
+    never reported: no trained-engine eye after it, or the report path is dead); None (nothing said) when neither is there, which is the key off."""
+    armed = rows.get("armed", [])
+    reports = rows.get("report", [])
+    if not armed and not reports:
+        return None
+    if not reports:
+        return ("NEVER APPLIED", "the key was on (armed, quarter %sx%s per eye) but no 'frame generation (shadow): frames=' report line follows in the window: the scorer "
+                                 "never reported (no trained-engine VR eye ran after it armed, or the report path is dead)" % (armed[-1]["qw"], armed[-1]["qh"]))
+    frames = sum(int(r["frames"]) for r in reports)
+    skipped = sum(int(r["s%d" % i]) for r in reports for i in range(5))
+    text = "%d report line(s), %d frame(s) scored, %d skipped" % (len(reports), frames, skipped)
+    if armed:
+        text += "; armed at quarter %sx%s per eye" % (armed[-1]["qw"], armed[-1]["qh"])
+    else:
+        text += "; the armed line is before the window"
+    if not frames:
+        text += "; no frame was scored (every frame skipped)"
+    return ("OK", text)
+
+
 SRV_TURRET_REFUSE_NAMES = ("no-eye", "game-gs", "topology", "not-ready", "no-geometry")   # the order of the 10 s line's refused[...] counts (srv_turret_math.h refuseName)
 SRV_TURRET_HUD_MIN_SECS = 12.0   # the turret view this long with no 10 s line and no first draw: the HUD half never ran (a 10 s line is due within 10 s of the view going on, and the first draw within a frame)
 SRV_TURRET_BOUND_MIN = 0.9       # the share of the 10 s lines' HUD draws that must go through the shader
@@ -17988,6 +18023,11 @@ HEALTH_RULES = (
         ("declined", H_DESKTOP_DECLINED),
         ("_", H_DESKTOP_OTHER),
     ), _hj_desktop_window),
+    # Frame generation, Phase 1 (TEMPORARY): the armed line and the one-second report, graphics-log lines with no build tag, read the desktop window's way.
+    _hrule(H_FRAMEGEN, (), (H_FRAMEGEN_LABEL,), (
+        ("armed", H_FRAMEGEN_ARMED),
+        ("report", H_FRAMEGEN_REPORT),
+    ), _hj_framegen_shadow),
     # The SRV turret view (issue 140): lines of the graphics log that carry no build tag (health_scan reads them, as it reads the desktop window's, before it drops the untagged lines).
     _hrule(H_SRV_TURRET, (), H_SRV_TURRET_LABELS, (
         ("setting", H_SRV_TURRET_SETTING),
@@ -18059,7 +18099,8 @@ def health_scan(text, since=None, until=None):
         ("head containment (F119)", re.compile(r"head containment \(F119\): report context: reference (?P<reference>\d+) \((?P<known>known|not read)\), epoch (?P<epoch>\d+), (?P<context>steady|mixed rest)$")),
     )
     desktop = next(r for r in HEALTH_RULES if r.name == H_DESKTOP)
-    turret = next(r for r in HEALTH_RULES if r.name == H_SRV_TURRET)
+    framegen = next(r for r in HEALTH_RULES if r.name == H_FRAMEGEN)
+    turret =next(r for r in HEALTH_RULES if r.name == H_SRV_TURRET)
     for raw in text.splitlines():
         if "srv turret" in raw and any(label in raw for label in H_SRV_TURRET_LABELS):
             # The SRV turret view's lines carry no build tag either. The settings and vehicle lines are state, so every one is kept; the rest are events and are cut by the window.
@@ -18074,6 +18115,22 @@ def health_scan(text, since=None, until=None):
                     break
             else:
                 u = unparsed[H_SRV_TURRET]
+                u[0] += 1
+                u[1] = u[1] or raw.strip()[:160]
+            continue
+        if H_FRAMEGEN_LABEL in raw:
+            # The frame generation shadow's lines carry no build tag. The armed line is state, so it is kept whatever --since says; the report lines are events and are cut by the window.
+            sm = HEALTH_STAMP_RE.match(raw)
+            tod = int(sm.group(1)) * 3600 + int(sm.group(2)) * 60 + int(sm.group(3)) + int(sm.group(4)) / 1000.0 if sm else None
+            body = raw[sm.end():] if sm else raw
+            for kind, rx in framegen.kinds:
+                g = rx.search(body)
+                if g:
+                    if kind == "armed" or _health_in_window(tod, since, until):
+                        rows[H_FRAMEGEN].setdefault(kind, []).append(dict(g.groupdict(), _t=tod))
+                    break
+            else:
+                u = unparsed[H_FRAMEGEN]
                 u[0] += 1
                 u[1] = u[1] or raw.strip()[:160]
             continue
@@ -24939,6 +24996,36 @@ def self_test_health():
               has=["the setting was left_eye but no 10 s line and no stopped line shows a Present drawn"], lacks=["UNPARSED"])
         check("desktop window: a declined draw and no Present drawn is NEVER APPLIED", dw_ok + [dw_setting("left_eye"), RD(dwcpp, "desktop window: not drawing -- %s", "no eye image yet")], 3, [("NEVER APPLIED", DW)])
         check("desktop window: a 10 s line inside --since is counted", dw_ok + [(1, dw_setting("left_eye")), (70, dw_sec())], 0, [("OK", DW)], extra=["--since", "10:01:00"])
+
+        # ---- the frame generation shadow: the armed and report lines, rendered from the C format strings in src\common\framegen_shadow_report.h ----
+        fgsrc = read_text(os.path.join(repo_root(), "src", "common", "framegen_shadow_report.h"))
+
+        def RF(needle, *vals):
+            key = "fg:" + needle
+            if key not in fmts:
+                fmts[key] = health_c_format(fgsrc, needle)
+            if fmts[key] is None:
+                raise AssertionError("frame generation shadow: no log format holds %r: the --health rule that reads it is out of date" % needle)
+            return health_render(fmts[key], vals)
+
+        def fg_armed(qw=612, qh=699):
+            return RF("armed, quarter %ux%u", qw, qh)
+
+        def fg_report(frames=60, skipped=(1, 2, 3, 4, 5)):
+            cls = "".join(RF(" %s=%.1f%%,%u", n, 10.0, 12, 8, 40, 5.5, 1.5, 9, 30) for n in ("far", "cockpit", "world"))
+            return (RF("frames=%u skipped=%u/", frames, *skipped) + cls + RF(" holes=%.1f%% gpu_ms=%.2f", 3.5, 0.85, 1.2, 0.012, 0.034, 0.4, 1.25))
+
+        FG, fg_ok = H_FRAMEGEN, [f90_part()]
+        check("frame generation shadow: no line at all, nothing said (the key off)", fg_ok, 0, [("OK", F90S)], lacks=["frame generation", "NEVER APPLIED"])
+        check("frame generation shadow: armed and reporting is OK", fg_ok + [fg_armed(), fg_report(), fg_report(frames=58)], 0, [("OK", FG)],
+              has=["2 report line(s), 118 frame(s) scored, 30 skipped; armed at quarter 612x699 per eye"], lacks=["UNPARSED"])
+        check("frame generation shadow: armed and no report line is NEVER APPLIED", fg_ok + [fg_armed()], 3, [("NEVER APPLIED", FG)],
+              has=["the key was on (armed, quarter 612x699 per eye) but no 'frame generation (shadow): frames=' report line follows", "exit 3"])
+        check("frame generation shadow: the armed line before --since still counts as armed", fg_ok + [(1, fg_armed()), (70, fg_report())], 0, [("OK", FG)],
+              has=["1 report line(s), 60 frame(s) scored"], extra=["--since", "10:01:00"])
+        check("frame generation shadow: a report line without the armed line is OK, and says so", fg_ok + [fg_report()], 0, [("OK", FG)], has=["the armed line is before the window"])
+        check("frame generation shadow: a drifted report line is UNPARSED, not a report", fg_ok + [fg_armed(), fg_report().replace("holes=", "gaps=")], 3, [("NEVER APPLIED", FG)],
+              has=["line(s) the rule's patterns do not match"])
 
         # ---- the SRV turret view: the graphics log's untagged lines, rendered from the C format strings in src\d3d11\srv_turret.cpp and (the geometry shader's creation line) shader_swap.cpp ----
         stsrc = read_text(os.path.join(repo_root(), "src", "d3d11", "srv_turret.cpp"))

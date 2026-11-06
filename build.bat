@@ -720,6 +720,7 @@ python tools\compile_cache.py --prune --keep thunks.obj --keep weapon_ui_getter_
     "src\d3d11\depth_probe.cpp" ^
     "src\d3d11\luma_probe.cpp" ^
     "src\d3d11\sky_ring.cpp" ^
+    "src\d3d11\framegen_shadow.cpp" ^
     "src\d3d11\terrain_cull_cover_hook.cpp" ^
     "src\d3d11\dlaa.cpp" ^
     "src\d3d11\fsr3_engine.cpp" ^
@@ -2085,6 +2086,21 @@ if not exist "%OBJ%\skyflickertest" mkdir "%OBJ%\skyflickertest"
 if errorlevel 1 ( echo [edvr] ERROR: sky_flicker_test build failed & exit /b 1 )
 "%OBJ%\skyflickertest\sky_flicker_test.exe" --dry-run || exit /b 1
 "%OBJ%\skyflickertest\sky_flicker_test.exe" --self-test || exit /b 1
+exit /b 0
+
+:rig_framegen_shadow_report_test
+echo [edvr] === framegen_shadow_report_test.exe ===
+REM The frame-generation shadow scorer's pure half (src\common\framegen_shadow_report.h; fix.frame_generation_shadow, TEMPORARY): the histogram binning, the
+REM percentile and share-over arithmetic, the merge, and the armed and report lines' exact text. Needs no GPU.
+if not exist "%OBJ%\framegenshadowreport" mkdir "%OBJ%\framegenshadowreport"
+%CC% /nologo /O2 /MT /std:c++17 /EHsc /W4 /DWIN32_LEAN_AND_MEAN /DNOMINMAX ^
+    /D_CRT_SECURE_NO_WARNINGS /I"src\common" ^
+    /Fo"%OBJ%\framegenshadowreport"\ /Fe"%OBJ%\framegenshadowreport\framegen_shadow_report_test.exe" ^
+    "tools\framegen_shadow_report_test\framegen_shadow_report_test.cpp" ^
+    /link /INCREMENTAL:NO
+if errorlevel 1 ( echo [edvr] ERROR: framegen_shadow_report_test build failed & exit /b 1 )
+"%OBJ%\framegenshadowreport\framegen_shadow_report_test.exe" --dry-run || exit /b 1
+"%OBJ%\framegenshadowreport\framegen_shadow_report_test.exe" --self-test || exit /b 1
 exit /b 0
 
 :rig_ui_depth
