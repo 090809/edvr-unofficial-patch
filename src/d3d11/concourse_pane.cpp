@@ -78,6 +78,7 @@ std::atomic<uint64_t> g_withheld{0};
 constexpr size_t kWithheldFamilies = cc::kWithheldPsCount + cc::kWithheldVsCount;
 std::atomic<uint64_t> g_withheldFam[kWithheldFamilies] = {};
 std::atomic<uint64_t> g_farLimited{0};   // glows limited by the mark (farLimitedPs), read and cleared with the families
+std::atomic<bool> g_surveyRequested{false};   // an F3 press, for the cull's names survey
 uint64_t g_withheldLogMs = 0;
 std::atomic<uint32_t> g_frameNow{0};
 std::atomic<uint32_t> g_hashEpoch{1};
@@ -1695,6 +1696,7 @@ void updateArmed() noexcept {
 }  // namespace
 
 uint64_t concoursePaneTakeTreated() noexcept { return g_treated.exchange(0, std::memory_order_relaxed); }
+bool concoursePaneTakeSurveyRequest() noexcept { return g_surveyRequested.exchange(false, std::memory_order_relaxed); }
 namespace {
 // Every 30 s, while any family was withheld: one line naming the families that were (a family that never matched is absent).
 void logWithheld(uint64_t nowMs) noexcept {
@@ -1781,6 +1783,7 @@ void concoursePaneTick(ID3D11Device* device, uint32_t frame, uint64_t nowMs) noe
         setMode(next, g_social ? "hotkey.concourse_pane_mode" : "hotkey.concourse_pane_mode; it applies on foot in social space");
     }
     if (g_keyCapture && g_keyCapture->pressed()) {
+        g_surveyRequested.store(true, std::memory_order_relaxed);
         if (!g_social) Log::get().note("concourse pane capture: refused: not on foot in social space (Status.json Flags2 bits 0 and 14, gameplay seen)");
         else if (!device) Log::get().note("concourse pane capture: refused: no device");
         else if (g_capState != CapState::kIdle) Log::get().note("concourse pane capture: refused: a capture is still open");

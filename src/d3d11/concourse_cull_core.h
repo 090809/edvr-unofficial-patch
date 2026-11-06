@@ -71,12 +71,14 @@ enum class Judge : uint8_t { kKeepName, kKeepUnreadableName, kKeepUnreadableSphe
 
 inline bool judgeKeeps(Judge j) noexcept { return j != Judge::kCull; }
 
-// One record. Keep an unreadable name; an allowed name is kept, unless its sphere is readable and wholly past kAllowedFarM (distance - radius) and it is not
-// the anchor or the hub (`farExempt`, computed from the name by the caller); keep an unreadable sphere (not finite, or no radius); keep a small, close record; cull.
+// One record. A record whose name is unreadable, or an allowed name, is kept unless its sphere is readable and wholly past kAllowedFarM (distance - radius); the
+// anchor and the hub (`farExempt`, computed from the name by the caller) are kept however far. Then: keep an unreadable sphere (not finite, or no radius); keep a
+// small, close record; cull.
 inline Judge concourseJudge(bool nameReadable, bool allowed, bool sphereReadable, float distance, float radius, bool farExempt) noexcept {
-    if (!nameReadable) return Judge::kKeepUnreadableName;
     const bool sphereOk = sphereReadable && std::isfinite(distance) && std::isfinite(radius) && radius > 0.0f;
-    if (allowed) return (!farExempt && sphereOk && distance - radius > kAllowedFarM) ? Judge::kCull : Judge::kKeepName;
+    const bool pastRoom = sphereOk && distance - radius > kAllowedFarM;
+    if (!nameReadable) return pastRoom ? Judge::kCull : Judge::kKeepUnreadableName;
+    if (allowed) return (!farExempt && pastRoom) ? Judge::kCull : Judge::kKeepName;
     if (!sphereOk) return Judge::kKeepUnreadableSphere;
     if (radius <= kSmallRadiusM && distance <= kCloseDistanceM) return Judge::kKeepSmallClose;
     return Judge::kCull;
@@ -145,6 +147,7 @@ constexpr WithheldFamily kWithheldPs[] = {
     {0xE54F2A902E5631F6ull, "particles C"},           // VS BBAD1CA8
     {0x6EAA86EFE135B2D4ull, "shield strike part 2"},  // VS 820E5C13, the same 3984 indices as the shield strike
     {0xDD371C57C9093BB8ull, "ship ribbon"},           // VS 5EAFFCD0: a triangle strip of about 100 indices, two draws a frame, the orange double trail
+    {0x89B662E266E5D73Eull, "ship engine glow"},      // VS 2D8263CC: n=36, additive, one vertex buffer each, seen with a ship's hull in view
 };
 constexpr WithheldFamily kWithheldVs[] = {
     {0x72BDD292154158ADull, "body surface"},

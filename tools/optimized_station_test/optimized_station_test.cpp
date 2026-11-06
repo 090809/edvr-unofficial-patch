@@ -3284,6 +3284,9 @@ int main(int argc, char** argv) {
               "concourse judge: the far rule needs a readable sphere");
         check(cc::kAllowedFarM == 200.0f, "concourse judge: the far limit is 200 m");
         check(cc::concourseJudge(false, false, true, 5.0f, 300.0f, false) == cc::Judge::kKeepUnreadableName, "concourse judge: an unreadable name is kept");
+        check(cc::concourseJudge(false, false, true, 500.0f, 30.0f, false) == cc::Judge::kCull, "concourse judge: an unreadable name wholly past the far limit is culled");
+        check(cc::concourseJudge(false, false, true, 205.0f, 30.0f, false) == cc::Judge::kKeepUnreadableName, "concourse judge: an unreadable name reaching inside the far limit is kept");
+        check(cc::concourseJudge(false, false, false, 500.0f, 30.0f, false) == cc::Judge::kKeepUnreadableName, "concourse judge: an unreadable name with no readable sphere is kept");
         check(cc::concourseJudge(true, false, false, 0.0f, 0.0f, false) == cc::Judge::kKeepUnreadableSphere, "concourse judge: an unreadable sphere is kept");
         check(cc::concourseJudge(true, false, true, 300.0f, 10.0f, false) == cc::Judge::kCull, "concourse judge: Spoke03 at 300 m with radius 10 m is culled");
         check(cc::concourseJudge(true, false, true, 40.0f, 25.0f, false) == cc::Judge::kKeepSmallClose && cc::concourseJudge(true, false, true, 40.01f, 25.0f, false) == cc::Judge::kCull &&
@@ -3669,7 +3672,7 @@ int main(int argc, char** argv) {
         // The withheld outside draws: named by shader, found by a bloom and a scan.
         {
             static_assert(cc::kWithheldPs[0].hash == cc::kPlumePs && cc::kWithheldPs[1].hash == cc::kTwinPs, "the plume pair leads the list");
-            check(cc::kWithheldPsCount == 20 && cc::kWithheldVsCount == 10, "concourse withheld: 20 pixel shaders and 10 vertex shaders");
+            check(cc::kWithheldPsCount == 21 && cc::kWithheldVsCount == 10, "concourse withheld: 21 pixel shaders and 10 vertex shaders");
             check(!cc::withheldHasDuplicate(cc::kWithheldPs, cc::kWithheldPsCount) && !cc::withheldHasDuplicate(cc::kWithheldVs, cc::kWithheldVsCount),
                   "concourse withheld: no list holds a hash twice");
             const cc::WithheldFamily dup[] = {{1, "a"}, {2, "b"}, {1, "c"}};

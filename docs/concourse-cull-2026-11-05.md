@@ -2,7 +2,7 @@
 
 ## Status
 
-- **State:** Flight 6 flown 2026-11-06 flat on Steam, log `edvr_gfx_20261106_063641`, build d42c6471. The green haze and the light cones are gone. Two trails stayed: an orange double one, and a thin blue-white streak seen with the mirror on. The seventh build a41de79b (the ship ribbon withheld, a longer NumLock census; full build green, optimized_station_test 1001 checks) is installed on Steam and not flown. Not merged. Extends `fix.optimized_stations`; off unless the temporary keys turn it on.
+- **State:** Flight 7 flown 2026-11-06 flat on Steam, log `edvr_gfx_20261106_065604`, build a41de79b. p50 6.94 ms looking out from the bay and about 13 ms at the lift bank. Two reports: a ship's hull and engine glows still draw, and the room looks washed out at the entrance. The eighth build (nameless records past the far limit culled, engine glow withheld, F3 names what is kept) is not flown. Not merged. Extends `fix.optimized_stations`; off unless the temporary keys turn it on.
 - **Goals (Sean, 2026-11-05):** (1) on foot in the large-station concourse, cull everything outside the bay windows; (2) skylights and the window above the lift bank become a permanent mirrored surface, so missing structure is never seen; (3) approaching the bay windows clears the mirror and stops the cull, so the station interior is visible from there.
 - **Direction:** identify records by the store's name, keep an allow-list, and make the panes opaque. The fitted hall, the shader-pair lists and the shell read-back from the earlier attempt are not carried over (see Ruled out).
 - **Answered by Flight 1:** H1 yes, with named survivors. H2 yes. H3 yes for the bay window: VS `98397963AAEC45D3` / PS `66B08F89E4926C01`, n=36. H5 yes by eye: the room stayed lit. See "Flight 1 results".
@@ -11,14 +11,15 @@
 - **Answered by Flight 4:** H14 yes: Sean, "the turn away from the bay windows works well". H12 half: "I don't see anything missing or incorrect on the interior", no planet in his screenshot or his report, and the lists matched 15 of 24 families, but the haze and lasers stayed. See "Flight 4 results".
 - **Answered by Flight 5:** H15 yes: `beams and bolts` is no longer on Sean's list, no lasers. H16 half: the wash went with `scatter`, so that is what it was; the ellipses and wedges stayed, so they were not the particles. H13 still open: `flares` matched and no flares in the screenshot; the room was not reported.
 - **Answered by Flight 6:** H18 yes: Sean, "the green haze and light fills are gone", with `far glows limited` at about 8000 a second. The room was not reported wrong.
-- **Open hypotheses (Flight 7 answers them):**
-  - **H20** The orange double trail is the ribbon `5EAFFCD0/DD371C57`: a triangle strip of 95-107 indices, two draws a frame, in every census. `ship ribbon` must appear in the 30 s line.
-  - **H21** The blue-white streak on a mirrored pane is that ribbon too, in another ship's engine colour. This is the weak one: the ribbon draws before the panes, and the mirror paints over those pixels and writes depth, so a direct draw should not show. Its NumLock ran out of lines before the main view. If the streak survives, a census now reaches it.
+- **Open hypotheses (Flight 8 answers them):**
+  - **H22** The hull (`66DE2CAD/864F1F94`, n=32310) is kept as a record with no readable name, the only keep with no distance limit until this build. Not proven: no survey ran with the ship in view. If it still draws, an F3 press lists the kept names and the largest nameless records, each with its distance.
+  - **H23** The washed-out look at the entrance is one of: (a) Elite's own, seen without the cull too; (b) the cull, which F2 alone would change; (c) auto-exposure reacting to the dark sky, which F4 between `off` and `mirror` would change. The census at that spot has no extra fullscreen family and the same sun draw, so it names nothing. Flight 2's screenshot from z -11 has the same pale look, with the mirror on and every effect still drawn, which argues against the withheld families.
+  - **H20** and **H21** The ribbon: Sean's Flight 7 report mentions neither trail, so probably gone. Ask.
   - **H17** None of the withheld families is in the room. Compare with F2 at a fixed view.
   - **H6** `Standard_SocialArea` marks the large-station concourse at other stations too. Still unflown.
 - **Temporary keys (all removed when the arc closes):** `diag.concourse_cull` (on, off), `diag.concourse_keep` (extra name prefixes), `diag.concourse_pane_mode`, `diag.concourse_panes`, `diag.concourse_clear_share`, `diag.concourse_mirror_beyond`, `hotkey.concourse_cull`, `hotkey.concourse_pane_capture`, `hotkey.concourse_pane_mode`.
 - **Ruled out:** see the section of that name. **Issues:** none yet.
-- **Next flight:** the Flight 7 list, on build a41de79b, installed on Steam 2026-11-06. Keys in both Steam inis: `hotkey.concourse_cull` F2 (the cull and the mirrors), `hotkey.concourse_pane_capture` F3 (logs a ranking by screen coverage, changes nothing), `hotkey.concourse_pane_mode` F4.
+- **Next flight:** the Flight 8 list. Keys in both Steam inis: `hotkey.concourse_cull` F2 (the cull and the mirrors), `hotkey.concourse_pane_capture` F3 (logs a ranking by screen coverage and the kept names, changes nothing), `hotkey.concourse_pane_mode` F4.
 
 ## What the earlier attempt learned
 
@@ -54,7 +55,7 @@ Grok session `render-thread-optimization`, branch `interior-portal-clear`, uncom
 ### The cull
 
 - **Gate.** Flags2 bit 0 (on foot) and bit 14 (social space), gameplay set, `fix.optimized_stations` on, and a record named `Standard_SocialArea` seen recently. The last condition keeps outposts and carriers out until they are added by name. The hangar seal is released on foot already, so the two never overlap.
-- **Rule, per record.** Keep if the name is unreadable. Keep if the name is on the allow-list. Keep if the sphere is unreadable. Keep if it is small and near (radius at most 25 m, centre within 40 m), which protects a weapon or prop whose name is generic (`Barrel`, `Slider`, `Hinge`). Otherwise cull.
+- **Rule, per record.** Past a far limit (the sphere starts more than 200 m from the camera), cull whatever the name says, or if the name is unreadable; the anchor and the hub are exempt. Otherwise: keep if the name is unreadable, keep if it is on the allow-list, keep if the sphere is unreadable, keep if it is small and near (radius at most 25 m, centre within 40 m), which protects a weapon or prop whose name is generic (`Barrel`, `Slider`, `Hinge`). Otherwise cull.
 - **Where.** The same three levels as the seal: rig veto (no record of the rig kept), producer-B veto, and the store's clear for path A.
 - **Cost.** The class is one bit in the existing node cache, so the name is read once per node per cache period.
 
@@ -291,6 +292,25 @@ On the seventh build, flat, at the same station.
 4. If it is cheap, a second station type.
 
 Then: `python tools\edvr_log.py --target steam --expect-build a41de79b --grep "concourse"`.
+
+## Flight 7 results
+
+Log `edvr_gfx_20261106_065604`, build a41de79b, flat, Steam. NumLocks at 07:01:40 (z 30.8, the ship) and 07:02:59 (z -15.3, the entrance); both censuses reached the panes, so the longer cap works. F4 at `off` for both. Sean has moved his frame cap to 144.
+
+- **Frame time.** `flat cpu` present p50 6.94 ms looking out from the bay, the 144 fps cap, and 13-14 ms at the lift bank.
+- **The ship.** A dark hull with blue engine glows, in the first census only: `66DE2CAD/864F1F94` n=32310 one draw (the hull plating family), and `2D8263CC/89B662E2` n=36 six draws, additive, each with its own vertex buffer. Its other parts did not draw, so the name cull took them. Only records kept with no distance limit could carry a hull past 200 m, and that left the nameless ones. The 5 s line has about 15000-23000 nameless keeps. No survey ran then: it runs at an engage, and this ship came later.
+- **The entrance.** Sean: "the lights are really bright, if I move a bit inside, it goes to normal". The far ceiling is paler than the near beams, so it may be haze rather than exposure, but `scatter` was withheld and no other fullscreen draw appears. See H23.
+
+## Flight 8
+
+On the eighth build, flat, at the same station.
+
+1. At the entrance where it looks washed out, stay still. Press F2 off and on. Then F4 between `off` and `mirror`. Which of them changes the look, if any?
+2. At the bay with a ship in the docking area, F4 at `off`: is it gone? If not, F3 with it in view.
+3. F4 at `mirror`: are the two trails gone?
+4. If it is cheap, a second station type.
+
+Then: `python tools\edvr_log.py --target steam --expect-build <this build> --grep "concourse"`.
 
 ## Performance candidates
 

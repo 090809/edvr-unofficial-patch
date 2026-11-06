@@ -124,6 +124,8 @@ void concoursePaneTick(ID3D11Device* device, uint32_t frame, uint64_t nowMs) noe
 // Treated draws (mirror draws issued) and withheld draws since the last call (the cull's 5 s summary reports them, so "matched nothing" is visible).
 uint64_t concoursePaneTakeTreated() noexcept;
 uint64_t concoursePaneTakeWithheld() noexcept;
+// An F3 press since the last call: the cull runs its names survey too, so the log names what is left in view.
+bool concoursePaneTakeSurveyRequest() noexcept;
 // The mirror's own counters: mark passes run and refused (no depth view, no stencil, a geometry stage bound, states missing) and side tests read since the last
 // call; the side table as it stands now. All zero when the mirror never ran.
 struct ConcoursePaneMirrorStats {

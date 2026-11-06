@@ -2640,6 +2640,7 @@ struct Survey {
     std::mutex m;
     std::unordered_map<std::string, SurveyAgg> names;
     std::vector<SurveyClose> close;
+    std::vector<SurveyClose> unnamed;   // records with no readable name and a readable sphere; `name` says whether the judge kept them
 };
 Survey& survey() {
     static Survey* s = new Survey;   // never destroyed: a callback may still be inside it at unload
@@ -2647,6 +2648,20 @@ Survey& survey() {
 }
 constexpr float kSurveyCloseM = 60.0f;
 constexpr size_t kSurveyCloseCap = 8192;
+
+void concourseSurveyUnnamed(cc::Judge j, float dist, float radius) noexcept {
+    try {
+        Survey& sv = survey();
+        std::lock_guard<std::mutex> lock(sv.m);
+        if (sv.unnamed.size() >= kSurveyCloseCap) return;
+        SurveyClose c;
+        std::snprintf(c.name, sizeof(c.name), "%s", cc::judgeKeeps(j) ? "kept" : "culled");
+        c.dist = dist;
+        c.radius = radius;
+        sv.unnamed.push_back(c);
+    } catch (...) {
+    }
+}
 
 void concourseSurveyNote(const char* name, cc::Judge j, float dist, float radius) noexcept {
     try {
@@ -2724,6 +2739,8 @@ void afterStoreConcourse(uintptr_t bucket, uintptr_t record) noexcept {
     if (g_concSurveyArmed.load(std::memory_order_relaxed) && nameReadable) {
         char nm[64] = {};
         if (cachedNameOfNode(node, nm, sizeof(nm), &ni.validator)) concourseSurveyNote(nm, j, d, sphere ? wr.radius : 0.0f);
+    } else if (g_concSurveyArmed.load(std::memory_order_relaxed) && sphere) {
+        concourseSurveyUnnamed(j, d, wr.radius);
     }
     if (keep) {
         ++tc.kept;
@@ -3021,10 +3038,12 @@ void concourseSurveyReport() {
         float nearest = -1.0f;
     };
     std::vector<Row> kept, culled, smallClose, unreadSphere;
-    std::vector<SurveyClose> close;
+    std::vector<SurveyClose> close, unnamed;
     try {
         Survey& sv = survey();
         std::lock_guard<std::mutex> lock(sv.m);
+        unnamed = sv.unnamed;
+        sv.unnamed.clear();
         for (const auto& kv : sv.names) {
             const SurveyAgg& a = kv.second;
             if (a.kept) kept.push_back({kv.first, a.kept, a.radiusMax, a.nearest});
@@ -3058,6 +3077,11 @@ void concourseSurveyReport() {
     for (size_t i = 0; i < smallClose.size() && i < 40; ++i) Log::get().note("concourse names: small-close %s x%u", smallClose[i].name.c_str(), smallClose[i].n);
     for (size_t i = 0; i < unreadSphere.size() && i < 40; ++i)
         Log::get().note("concourse names: unreadable-sphere %s x%u", unreadSphere[i].name.c_str(), unreadSphere[i].n);
+    // The records with no readable name: the largest, since a hull would be among them.
+    std::sort(unnamed.begin(), unnamed.end(), [](const SurveyClose& a, const SurveyClose& b) { return a.radius > b.radius; });
+    Log::get().note("concourse names: %u records with no readable name and a readable sphere", static_cast<unsigned>(unnamed.size()));
+    for (size_t i = 0; i < unnamed.size() && i < 24; ++i)
+        Log::get().note("concourse names: unnamed %s r=%.1f dist=%.1f", unnamed[i].name, static_cast<double>(unnamed[i].radius), static_cast<double>(unnamed[i].dist));
 }
 
 // H6: the camera in the anchor record's frame, once a second, while on foot in social space with the key armed (the cull on or off).
@@ -3279,6 +3303,7 @@ void concourseTick(uint64_t now, uint32_t frame) {
     g_concWasArmed = armed;
     // The one-shot names: due at an engage (or 2 s after a toggle-on that did not re-engage), gathered over 2 frames.
     const uint32_t stamp = g_frameStamp.load(std::memory_order_relaxed);
+    if (concoursePaneTakeSurveyRequest() && active && !g_concSurveyOn) g_concSurveyDueMs = now;   // an F3 press: name what is left in view
     if (!active) {
         if (g_concSurveyOn) {
             g_concSurveyArmed.store(false, std::memory_order_release);
@@ -3290,6 +3315,7 @@ void concourseTick(uint64_t now, uint32_t frame) {
             std::lock_guard<std::mutex> lock(sv.m);
             sv.names.clear();
             sv.close.clear();
+            sv.unnamed.clear();
         } catch (...) {
         }
         g_concSurveyDueMs = 0;
