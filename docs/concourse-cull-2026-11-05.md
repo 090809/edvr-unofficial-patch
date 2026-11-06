@@ -2,7 +2,7 @@
 
 ## Status
 
-- **State:** Flight 8 flown 2026-11-06 flat on Steam, build b14a788d. The washed-out entrance stays with F2 off, so it is Elite's own. The ninth build 2b487014 (the mirror lit from behind, the outside's families also withheld in a sealed hangar; full build green, optimized_station_test 1007 checks) is installed on Steam and not flown. Not merged. Extends `fix.optimized_stations`; the concourse cull is off unless the temporary keys turn it on, but the sealed-hangar withhold is on with `fix.optimized_stations`.
+- **State:** Flight 9 flown 2026-11-06 flat on Steam, log `edvr_gfx_20261106_092241`, build 4eead728. The build now on Steam is 990a2b44 (the mirror with a steady light behind it; full build green, optimized_station_test 1007 checks), not flown. Not merged. Extends `fix.optimized_stations`; the concourse cull is off unless the temporary keys turn it on, but the sealed-hangar withhold is on with `fix.optimized_stations`.
 - **Goals (Sean, 2026-11-05):** (1) on foot in the large-station concourse, cull everything outside the bay windows; (2) skylights and the window above the lift bank become a permanent mirrored surface, so missing structure is never seen; (3) approaching the bay windows clears the mirror and stops the cull, so the station interior is visible from there. **Added 2026-11-06:** (4) light behind the mirror, for the impression of a brightly lit station beyond it; (5) with `fix.optimized_stations` on, the same outside draws go while the hangar is sealed.
 - **Direction:** identify records by the store's name, keep an allow-list, and make the panes opaque. The fitted hall, the shader-pair lists and the shell read-back from the earlier attempt are not carried over (see Ruled out).
 - **Answered by Flight 1:** H1 yes, with named survivors. H2 yes. H3 yes for the bay window: VS `98397963AAEC45D3` / PS `66B08F89E4926C01`, n=36. H5 yes by eye: the room stayed lit. See "Flight 1 results".
@@ -21,7 +21,7 @@
   - **H6** `Standard_SocialArea` marks the large-station concourse at other stations too. Still unflown.
 - **Temporary keys (all removed when the arc closes):** `diag.concourse_cull` (on, off), `diag.concourse_keep` (extra name prefixes), `diag.concourse_pane_mode`, `diag.concourse_panes`, `diag.concourse_clear_share`, `diag.concourse_mirror_beyond`, `hotkey.concourse_cull`, `hotkey.concourse_pane_capture`, `hotkey.concourse_pane_mode`.
 - **Ruled out:** see the section of that name. **Issues:** none yet.
-- **Next flight:** the Flight 9 list, on build 4eead728 (2b487014 plus the census's `rs=` column), installed on Steam 2026-11-06. Keys in both Steam inis: `hotkey.concourse_cull` F2 (the cull and the mirrors), `hotkey.concourse_pane_capture` F3 (logs a ranking by screen coverage and the kept names, changes nothing), `hotkey.concourse_pane_mode` F4.
+- **Next flight:** the Flight 10 list, on build 990a2b44, installed on Steam 2026-11-06. Keys in both Steam inis: `hotkey.concourse_cull` F2 (the cull and the mirrors), `hotkey.concourse_pane_capture` F3 (logs a ranking by screen coverage and the kept names, changes nothing), `hotkey.concourse_pane_mode` F4.
 
 ## What the earlier attempt learned
 
@@ -338,6 +338,18 @@ Then: `python tools\edvr_log.py --target steam --expect-build 4eead728 --grep "c
 ## Flight 9 notes
 
 Log `edvr_gfx_20261106_092241`, build 4eead728. Sean sees rotating shadows on the lit mirrors, with a shadow's edge sharp across a pane. The glow pass is the game's glass shader at F0 1 and roughness 1, and that shader reads the sun's moment shadow map at `t7` (`ps_66B08F89`, four-moment gather, `cb1[297]`, `cb1[261]`), so the pane now shows the sun and its shadows, moving as the station turns. The look depends on the sun's direction, so it also changes over a rotation. He likes the look of the mode he is on, which the log says is `mirror-brightest`, and chose a steady light over keeping the sun without its shadows. The steady modes step around a guess at the HDR scale, so the first flight is to find the level.
+
+## Flight 10
+
+On build 990a2b44, flat, at the same station.
+
+1. In the room, F4 through `mirror-steady-100`, `-200`, `-400`, `mirror-brightest`, `mirror`, `tint`, `off`, `-25`, `-50`. Which steady level looks right, from across the room and at a skylight? Does anything still move across a pane?
+2. The sealed hangar: on the pad, is anything missing? Then launch.
+3. A ship in the docking area, F4 at `off`: is it gone? If not, F3 with it in view.
+4. Are the two trails gone?
+5. If it is cheap, a second station type.
+
+Then: `python tools\edvr_log.py --target steam --expect-build 990a2b44 --grep "concourse"`.
 
 ## Performance candidates
 
