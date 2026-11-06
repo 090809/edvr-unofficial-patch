@@ -3753,11 +3753,22 @@ int main(int argc, char** argv) {
                   "concourse walk zone: the names");
         }
 
+        // The lift survey's name test and moved test (TEMPORARY, log only).
+        {
+            check(cc::liftPartName("TurboLiftDoorLeft") && cc::liftPartName("TurboLiftDoorLeft2") && cc::liftPartName("TurboLiftDoorRight") && cc::liftPartName("TurboLiftDoorRight2") &&
+                      cc::liftPartName("TurboLiftDoor") && cc::liftPartName("TurboLift_Blocker") && cc::liftPartName("SA_TurboLiftBones") && cc::liftPartName("saturboliftx"),
+                  "lift survey: the seven door and cabin names match, in any case");
+            check(!cc::liftPartName("Lift") && !cc::liftPartName("LandingPadSmallA") && !cc::liftPartName("") && !cc::liftPartName(nullptr) && !cc::liftPartName("Turbo"),
+                  "lift survey: Lift, a pad, an empty name, null and a partial prefix do not match");
+            const float a[3] = {1, 2, 3}, b[3] = {1, 2.01f, 3}, c[3] = {1, 2.05f, 3}, nan3[3] = {NAN, 0, 0};
+            check(!cc::liftMoved(b, a, 0.02f) && cc::liftMoved(c, a, 0.02f) && !cc::liftMoved(nan3, a, 0.02f) && cc::liftMoved(a, nan3, 0.02f), "lift survey: moved is over 0.02 m, a non-finite current is not a move, a non-finite last is");
+        }
+
         // The glow levels by window type (diag.concourse_glow = sky,angled,other,bay).
         {
             float v[4] = {-1, -1, -1, -1};
-            check(cc::parseGlowLevels("4,1.6,1,0.5", v) && v[0] == 4.0f && v[1] == 1.6f && v[2] == 1.0f && v[3] == 0.5f, "concourse glow: the default text parses to sky 4, angled 1.6, other 1, bay 0.5");
-            check(cc::kGlowSkyDefault == 4.0f && cc::kGlowAngledDefault == 1.6f && cc::kGlowOtherDefault == 1.0f && cc::kGlowBayDefault == 0.5f, "concourse glow: the defaults are 4, 1.6, 1, 0.5");
+            check(cc::parseGlowLevels("4,0.5,1,0.5", v) && v[0] == 4.0f && v[1] == 0.5f && v[2] == 1.0f && v[3] == 0.5f, "concourse glow: the default text parses to sky 4, angled 0.5, other 1, bay 0.5");
+            check(cc::kGlowSkyDefault == 4.0f && cc::kGlowAngledDefault == 0.5f && cc::kGlowOtherDefault == 1.0f && cc::kGlowBayDefault == 0.5f, "concourse glow: the defaults are 4, 0.5, 1, 0.5");
             check(cc::parseGlowLevels(" 0 , 16 ,  2.5 , 1 ", v) && v[0] == 0.0f && v[1] == 16.0f && v[2] == 2.5f && v[3] == 1.0f, "concourse glow: spaces are allowed, 0 and 16 are the limits");
             float keep[4] = {7, 8, 9, 10};
             check(!cc::parseGlowLevels("", keep) && !cc::parseGlowLevels(nullptr, keep) && !cc::parseGlowLevels("1,2,3", keep) && !cc::parseGlowLevels("4,0.25,1", keep) &&

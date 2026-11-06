@@ -459,11 +459,35 @@ inline WalkZone walkZone(bool seated, bool anchorFresh, bool hasCell, bool camIn
     return camIn ? WalkZone::kBay : WalkZone::kPastBox;
 }
 
+// ---- The lift survey (TEMPORARY, log only; goes when the arc closes) --------------------------------------------------------------------------------------
+// A record whose name contains "TurboLift", any case (the door and cabin records, and SA_TurboLiftBones).
+inline bool liftPartName(const char* name) noexcept {
+    if (!name) return false;
+    constexpr char kKey[] = "turbolift";
+    constexpr size_t kLen = sizeof(kKey) - 1;
+    for (const char* s = name; *s; ++s) {
+        size_t i = 0;
+        while (i < kLen && s[i] != '\0' && (s[i] | 0x20) == kKey[i]) ++i;
+        if (i == kLen) return true;
+        if (s[i] == '\0') return false;
+    }
+    return false;
+}
+// A position that moved more than `limitM` from the last logged one (a non-finite current value does not count as moved; a non-finite last one does).
+inline bool liftMoved(const float now[3], const float last[3], float limitM) noexcept {
+    for (int k = 0; k < 3; ++k)
+        if (!std::isfinite(now[k])) return false;
+    for (int k = 0; k < 3; ++k)
+        if (!std::isfinite(last[k])) return true;
+    const float dx = now[0] - last[0], dy = now[1] - last[1], dz = now[2] - last[2];
+    return dx * dx + dy * dy + dz * dz > limitM * limitM;
+}
+
 // ---- The glow levels by window type (diag.concourse_glow = "sky,angled,other,bay") ---------------------------------------------------------------------
 // The steady light of a pane: the brightest on overhead skylights, a level between on angled skylights, a middle level on any other window, and its own level on the
 // bay window. Absolute levels, each from 0 to 16. Overhead, angled and other are told by how much the pane faces the anchor's up axis (the pixel shader).
 constexpr float kGlowMax = 16.0f;
-constexpr float kGlowSkyDefault = 4.0f, kGlowAngledDefault = 1.6f, kGlowOtherDefault = 1.0f, kGlowBayDefault = 0.5f;
+constexpr float kGlowSkyDefault = 4.0f, kGlowAngledDefault = 0.5f, kGlowOtherDefault = 1.0f, kGlowBayDefault = 0.5f;
 // "a,b,c,d": four numbers, each 0 to 16, separated by commas, spaces allowed around each. False for anything else (the caller keeps the last value).
 inline bool parseGlowLevels(const char* text, float out[4]) noexcept {
     if (!text) return false;

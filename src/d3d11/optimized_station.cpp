@@ -2525,9 +2525,91 @@ void gatherRigNote(GatherWriter& w, uintptr_t bucket, uintptr_t record, const fl
 // the tick needs into its thread's slot, and judges from the view alone. Order: the centre (unreadable: kept), the gathered parts (pads, explicit parts,
 // the near list, the own candidate, the ship's tally, the latch and the hangar names), then (judge only) the named keep, the bay keep, the own ship, and
 // otherwise culled. judge: the sealed judgement; false: gathering only.
+// ---- TEMPORARY (the lift survey, docs\concourse-cull-2026-11-05.md; log only, removed when the arc closes) --------------------------------------------------
+// Do the lift's door records move when the doors do? The store callbacks note every record whose name contains "TurboLift" (the doors, the blocker, the bones)
+// with every position the record can give: c (worldOfRecord, source s), m (the pose's own translation, pose+0x20), k (the store-style centre) and w (the raw
+// rec+0x240). The tick (liftSurveyTick) logs the ones near the camera. Nothing here reaches a veto or a keep decision.
+constexpr size_t kLiftSlots = 128;
+struct LiftPart {
+    uintptr_t addr = 0;
+    char name[32] = {};
+    float c[3] = {}, m[3] = {}, k[3] = {}, w[3] = {};   // a position that could not be read is NaN
+    float r = 0.0f;
+    uint8_t src = 4;
+    uint32_t stamp = 0;                                 // g_frameStamp when last seen
+    float lastC[3] = {NAN, NAN, NAN}, lastM[3] = {NAN, NAN, NAN}, lastK[3] = {NAN, NAN, NAN}, lastW[3] = {NAN, NAN, NAN};   // the values last logged
+};
+struct LiftAgg {
+    std::mutex mtx;
+    LiftPart parts[kLiftSlots];
+    size_t used = 0;
+    uint64_t overflow = 0;
+};
+LiftAgg& liftAgg() {
+    static LiftAgg* a = new LiftAgg;   // never destroyed: a callback may still be inside it at unload
+    return *a;
+}
+std::atomic<bool> g_liftSurveyOn{false};   // the tick's: the survey is armed (the callbacks read it relaxed)
+
+void liftSurveyNote(uintptr_t record, uintptr_t node, const NodeInfo& ni) noexcept {
+    try {
+        char nm[64] = {};
+        if (!cachedNameOfNode(node, nm, sizeof(nm), &ni.validator) || !cc::liftPartName(nm)) return;
+        const WorldRead wr = worldOfRecord(record);
+        if (wr.source == 4 || !std::isfinite(wr.world[0]) || !std::isfinite(wr.world[1]) || !std::isfinite(wr.world[2]) || !std::isfinite(wr.radius)) return;
+        float m[3] = {NAN, NAN, NAN}, k[3] = {NAN, NAN, NAN}, w[3] = {NAN, NAN, NAN};
+        uintptr_t pose = 0;
+        float t[4] = {};
+        if (readVal(&pose, record + kRecPose) && pose && readMem(t, pose + kPoseT, sizeof(t)) && sealed::finite3(t)) {
+            m[0] = t[0];
+            m[1] = t[1];
+            m[2] = t[2];
+        }
+        float kr = 0.0f;
+        if (!storeSphereOf(record, k, &kr)) k[0] = k[1] = k[2] = NAN;
+        float raw[3] = {};
+        if (readMem(raw, record + kRecCentre, sizeof(raw)) && sealed::finite3(raw)) {
+            w[0] = raw[0];
+            w[1] = raw[1];
+            w[2] = raw[2];
+        }
+        const uint32_t stamp = g_frameStamp.load(std::memory_order_relaxed);
+        LiftAgg& a = liftAgg();
+        std::lock_guard<std::mutex> lock(a.mtx);
+        LiftPart* p = nullptr;
+        for (size_t i = 0; i < a.used; ++i) {
+            if (a.parts[i].addr == record) {
+                p = &a.parts[i];
+                break;
+            }
+        }
+        if (!p) {
+            if (a.used >= kLiftSlots) {
+                ++a.overflow;
+                return;
+            }
+            p = &a.parts[a.used++];
+            *p = LiftPart();
+            p->addr = record;
+        }
+        std::snprintf(p->name, sizeof(p->name), "%s", nm);
+        for (int i = 0; i < 3; ++i) {
+            p->c[i] = wr.world[i];
+            p->m[i] = m[i];
+            p->k[i] = k[i];
+            p->w[i] = w[i];
+        }
+        p->r = wr.radius;
+        p->src = wr.source;
+        p->stamp = stamp;
+    } catch (...) {
+    }
+}
+
 // The anchor's sighting (and the hub's, while the tick wants it): whatever path the store callback takes, this is how the cull finds its room. Shared by the
 // concourse path and the seal's gather path (a docked, on-foot pass with the cull not active), so the pad's gathers and the anchor's sighting both go on.
 void concourseSight(uintptr_t record, uintptr_t node, const NodeInfo& ni) noexcept {
+    if (g_liftSurveyOn.load(std::memory_order_relaxed) && (ni.flags & sealed::kNodeConcourseAllow) != 0) liftSurveyNote(record, node, ni);   // log only
     if ((ni.flags & sealed::kNodeConcourseAnchor) != 0) {
         g_concAnchorAddr.store(record, std::memory_order_relaxed);
         g_concAnchorMs.store(GetTickCount64(), std::memory_order_relaxed);
@@ -3426,15 +3508,144 @@ void walkSurveyReport() noexcept {
     Log::get().note("%s", text);
 }
 
+// ---- TEMPORARY (the lift survey's report; log only, removed when the arc closes) ------------------------------------------------------------------------------
+// At most every 33 ms: the lift parts seen in the last 60 frames and within 12 m (surface) of the camera, as one line when a position moved over 0.02 m since
+// it was last logged, the set changed, or a second has passed. Parts unseen for 600 frames are dropped from the table.
+constexpr uint32_t kLiftLinesCap = 3000, kLiftSeenFrames = 60, kLiftDropFrames = 600;
+constexpr float kLiftReachM = 12.0f, kLiftMovedM = 0.02f;
+constexpr uint64_t kLiftPollMs = 33, kLiftRepeatMs = 1000;
+bool g_liftOn = false;
+uint64_t g_liftPollMsLast = 0, g_liftLineMs = 0;
+uint32_t g_liftLines = 0;
+bool g_liftCapNoted = false, g_liftOverflowNoted = false;
+std::vector<uintptr_t> g_liftLastSet;
+
+void liftSurveyLine(const char* text) noexcept {
+    if (g_liftLines < kLiftLinesCap) {
+        Log::get().note("%s", text);
+    } else if (!g_liftCapNoted) {
+        g_liftCapNoted = true;
+        Log::get().note("lift survey: %u lines written; no more lines this session", kLiftLinesCap);
+    }
+    ++g_liftLines;
+}
+
+int liftPosText(char* out, size_t cap, const char* tag, const float p[3]) noexcept {
+    if (!std::isfinite(p[0]) || !std::isfinite(p[1]) || !std::isfinite(p[2])) return 0;
+    const int n = std::snprintf(out, cap, " %s %.2f %.2f %.2f", tag, static_cast<double>(p[0]), static_cast<double>(p[1]), static_cast<double>(p[2]));
+    return n > 0 && static_cast<size_t>(n) < cap ? n : 0;
+}
+
+void liftSurveyTick(uint64_t now) noexcept {
+    try {
+        if (!g_liftOn) {
+            g_liftOn = true;
+            g_liftPollMsLast = 0;
+            g_liftLineMs = 0;
+            g_liftLastSet.clear();
+            g_liftSurveyOn.store(true, std::memory_order_relaxed);
+            if (g_liftLines < kLiftLinesCap) Log::get().note("lift survey: on");
+        }
+        if (!g_frameCamValid || g_liftLines > kLiftLinesCap || now - g_liftPollMsLast < kLiftPollMs) return;
+        g_liftPollMsLast = now;
+        const uint32_t stampNow = g_frameStamp.load(std::memory_order_relaxed);
+        std::vector<LiftPart> seen;
+        uint64_t overflow = 0;
+        {
+            LiftAgg& a = liftAgg();
+            std::lock_guard<std::mutex> lock(a.mtx);
+            overflow = a.overflow;
+            for (size_t i = 0; i < a.used;) {
+                const uint32_t age = stampNow - a.parts[i].stamp;
+                if (age > kLiftDropFrames && age < 0x80000000u) {
+                    a.parts[i] = a.parts[--a.used];
+                    continue;
+                }
+                const LiftPart& e = a.parts[i];
+                if (age <= kLiftSeenFrames) {
+                    const float surface = std::max(0.0f, sealed::distance(e.c, g_frameCam) - e.r);
+                    if (surface <= kLiftReachM) seen.push_back(e);
+                }
+                ++i;
+            }
+        }
+        if (overflow != 0 && !g_liftOverflowNoted) {
+            g_liftOverflowNoted = true;
+            Log::get().note("lift survey: the table of %u parts overflowed, %llu records not kept", static_cast<unsigned>(kLiftSlots), static_cast<unsigned long long>(overflow));
+        }
+        if (seen.empty()) {
+            if (!g_liftLastSet.empty()) g_liftLastSet.clear();
+            return;
+        }
+        std::sort(seen.begin(), seen.end(), [](const LiftPart& x, const LiftPart& y) {
+            const int c = std::strcmp(x.name, y.name);
+            return c != 0 ? c < 0 : x.addr < y.addr;
+        });
+        std::vector<uintptr_t> set;
+        for (const LiftPart& e : seen) set.push_back(e.addr);
+        bool emit = set != g_liftLastSet || g_liftLineMs == 0 || now - g_liftLineMs >= kLiftRepeatMs;
+        for (const LiftPart& e : seen) {
+            if (cc::liftMoved(e.c, e.lastC, kLiftMovedM) || cc::liftMoved(e.m, e.lastM, kLiftMovedM) || cc::liftMoved(e.k, e.lastK, kLiftMovedM) ||
+                cc::liftMoved(e.w, e.lastW, kLiftMovedM))
+                emit = true;
+        }
+        if (!emit) return;
+        g_liftLastSet = set;
+        g_liftLineMs = now;
+        constexpr const char* kCont = "lift survey (cont.):";
+        char text[1000] = {};
+        int used = std::snprintf(text, sizeof(text), "lift survey: cam %.2f %.2f %.2f, %u parts:", static_cast<double>(g_frameCam[0]), static_cast<double>(g_frameCam[1]),
+                                 static_cast<double>(g_frameCam[2]), static_cast<unsigned>(seen.size()));
+        bool first = true;
+        for (const LiftPart& e : seen) {
+            char one[400] = {};
+            int n = std::snprintf(one, sizeof(one), "%s %s a=%04X s=%u", first ? "" : ";", e.name, static_cast<unsigned>(e.addr & 0xFFFFu), static_cast<unsigned>(e.src));
+            n += liftPosText(one + n, sizeof(one) - static_cast<size_t>(n), "c", e.c);
+            n += std::snprintf(one + n, sizeof(one) - static_cast<size_t>(n), " r %.2f", static_cast<double>(e.r));
+            n += liftPosText(one + n, sizeof(one) - static_cast<size_t>(n), "m", e.m);
+            n += liftPosText(one + n, sizeof(one) - static_cast<size_t>(n), "k", e.k);
+            n += liftPosText(one + n, sizeof(one) - static_cast<size_t>(n), "w", e.w);
+            if (static_cast<size_t>(used) + static_cast<size_t>(n) + 1 >= sizeof(text)) {
+                liftSurveyLine(text);
+                used = std::snprintf(text, sizeof(text), "%s", kCont);
+                if (!first) std::memmove(one, one + 1, std::strlen(one));   // drop the ';': the continuation's colon leads
+            }
+            std::snprintf(text + used, sizeof(text) - static_cast<size_t>(used), "%s", one);
+            used += static_cast<int>(std::strlen(text + used));
+            first = false;
+        }
+        liftSurveyLine(text);
+        // The logged values: the next line compares to these.
+        LiftAgg& a = liftAgg();
+        std::lock_guard<std::mutex> lock(a.mtx);
+        for (const LiftPart& e : seen) {
+            for (size_t i = 0; i < a.used; ++i) {
+                if (a.parts[i].addr != e.addr) continue;
+                for (int k = 0; k < 3; ++k) {
+                    a.parts[i].lastC[k] = e.c[k];
+                    a.parts[i].lastM[k] = e.m[k];
+                    a.parts[i].lastK[k] = e.k[k];
+                    a.parts[i].lastW[k] = e.w[k];
+                }
+                break;
+            }
+        }
+    } catch (...) {
+    }
+}
+
 void walkSurveyTick(uint64_t now, bool camIn) {
     const bool gate = concourseArmed() && g_dockedNow.load(std::memory_order_acquire);
     if (!gate) {
+        g_liftOn = false;
+        g_liftSurveyOn.store(false, std::memory_order_relaxed);
         g_walkOn = false;
         g_walkPassArmed = false;
         g_walkZoneSeen = false;
         g_walkHeldValid = false;
         return;
     }
+    liftSurveyTick(now);   // TEMPORARY, log only (the lift survey)
     // The held pick cell: a copy of the last pick with a cell, good for kWalkHoldMs, and the camera tested against it (the caller's camIn is the raw pick's).
     if (g_pickCell.has) {
         g_walkHeld = g_pickCell;
