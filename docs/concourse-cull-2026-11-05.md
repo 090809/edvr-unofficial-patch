@@ -12,8 +12,9 @@
 - **Answered by Flight 5:** H15 yes: `beams and bolts` is no longer on Sean's list, no lasers. H16 half: the wash went with `scatter`, so that is what it was; the ellipses and wedges stayed, so they were not the particles. H13 still open: `flares` matched and no flares in the screenshot; the room was not reported.
 - **Answered by Flight 6:** H18 yes: Sean, "the green haze and light fills are gone", with `far glows limited` at about 8000 a second. The room was not reported wrong.
 - **Answered by Flight 8:** H23 (a): Sean, "the bright washed out look stays on when F2 is off". Elite's own, and not this arc's.
-- **Open hypotheses (Flight 9 answers them):**
-  - **H24** A second, additive pass of the game's glass shader with a white, fully rough material reads as soft light behind the glass, at the scene's own scale. F4 steps 1, 2 and 4 times. Costs a third pass over the mirrored pixels; `mirror` on F4 is the comparison.
+- **Answered by Flight 9:** H24 half: Sean likes `mirror-brightest`, the best so far, but the pass brings the sun's moving shadows with it. He chose a steady light instead.
+- **Open hypotheses (the next flight answers them):**
+  - **H26** A flat colour added over the mirror, with no light or shadow in it, reads as a bright station behind the glass and stays still as the station turns. It costs almost nothing, a white pixel shader in place of a third full pass. The scene's HDR scale is unmeasured, so F4 steps 0.25 to 4 around a guess of 1. `mirror-brightest` is on F4 to compare.
   - **H25** The families marked `sealedToo` (lasers, plumes, trails, smoke, the planet, its atmosphere, the sun's glare) draw nothing a sealed hangar needs. No census has been taken in a sealed hangar, so this is by reasoning. Flares, the scatter, the particle batches and engine glows stay for that reason. `concourse withheld 30s:` says what matched there.
   - **H22** The hull is a nameless record. Not reported in Flight 8. If it still draws, an F3 press names what is kept.
   - **H20** and **H21** The ribbon: ask whether either trail is left.
@@ -75,7 +76,8 @@ The reflection is the game's own probe cube array at `t5`, and the lights and sh
 | Mode | Around the draw | Result |
 |---|---|---|
 | normal | nothing | the game's glass |
-| `mirror-lit` (default), `mirror-bright`, `mirror-brightest` | `mirror`, then a third draw over it: a white, fully rough `t10`, `BlendFactor`, `One`, at 1, 2 or 4 | a mirror lit from behind, by the room's own probes and lights |
+| `mirror-steady-100` (default), `-25`, `-50`, `-200`, `-400` | `mirror`, then a third draw over it: a white pixel shader, `BlendFactor`, `One`, a pale colour at 0.25 to 4 | a mirror with steady light behind it; no shadows, and it does not move |
+| `mirror-lit`, `mirror-bright`, `mirror-brightest` | `mirror`, then a third draw over it: a white, fully rough `t10`, `BlendFactor`, `One`, at 1, 2 or 4 | a mirror lit from behind, by the room's own probes and lights |
 | `mirror` | a second draw with the three textures; `One`, `Zero`, RGB only; depth write on; marked pixels only | a lit metal mirror, nothing behind |
 | `mirror-soft` | as `mirror`, plus `cb2` row 2 = 0, 1, 1.8, 0 | roughness 0.54, to compare |
 | `tint` | as `mirror`, with a white pixel shader; `BlendFactor`, `Zero`; colour per index count | shows which pixels the mirror takes, by index count |
@@ -111,7 +113,7 @@ The scope is on all four draw thunks. Beams, flares, stars, dust and the scatter
 
 **The trigger (goal 3).** Pane coverage, not a room coordinate: an occlusion query around the game's n=36 draws gives its share of the view. This needs no table per station and covers every bay window at once. At 20% of the view (12% in VR), on two readings running, the cull lifts, and 150 ms later the pane fades to the game's glass over 600 ms. From the fourth build it follows the view (Sean, after Flight 3: turning round at the glass left the cull off until he walked away). Under 40% of the entry share (8%, or 4.8% in VR) for 250 ms, it closes: straight back to the mirror and the cull if the bay is out of view (1% or less, or no reading), where a fade would only delay the saving, or by a fade if some of the bay is still in view. Coming back over the entry share during the fade turns it round. Coordinates were the first plan, but Flight 1's walk could not place the pane, and a table would have needed flights at each station type.
 
-**Light behind the mirror.** The glass shader has no diffuse term. Its base colour only feeds F0, and the rest is the probes and lights through a specular lobe. So at roughness 1, F0 1, it returns a very soft sample of the room's light. Drawn additively over the mirror, it reads as light from behind and sits at the scene's own scale, which a constant in HDR units would not: nothing here has measured that scale. It follows the pane through its fade.
+**Light behind the mirror.** The steady modes add a flat colour and need nothing below. The lit modes came first, and Flight 9 showed their cost: the sun's shadows, moving. The glass shader has no diffuse term. Its base colour only feeds F0, and the rest is the probes and lights through a specular lobe. So at roughness 1, F0 1, it returns a very soft sample of the room's light. Drawn additively over the mirror, it reads as light from behind and sits at the scene's own scale, which a constant in HDR units would not: nothing here has measured that scale. It follows the pane through its fade.
 
 **The fade.** `BlendFactor`, `InvBlendFactor` with the mirror's textures, over the game's own glass, on exterior panes. At 0 the second draw stops.
 
@@ -335,7 +337,7 @@ Then: `python tools\edvr_log.py --target steam --expect-build 4eead728 --grep "c
 
 ## Flight 9 notes
 
-Log `edvr_gfx_20261106_092241`, build 4eead728. Sean sees rotating shadows on the lit mirrors, with a shadow's edge sharp across a pane. The glow pass is the game's glass shader at F0 1 and roughness 1, and that shader reads the sun's moment shadow map at `t7` (`ps_66B08F89`, four-moment gather, `cb1[297]`, `cb1[261]`), so the pane now shows the sun and its shadows, moving as the station turns. The look depends on the sun's direction, so it also changes over a rotation. He likes the look of the mode he is on.
+Log `edvr_gfx_20261106_092241`, build 4eead728. Sean sees rotating shadows on the lit mirrors, with a shadow's edge sharp across a pane. The glow pass is the game's glass shader at F0 1 and roughness 1, and that shader reads the sun's moment shadow map at `t7` (`ps_66B08F89`, four-moment gather, `cb1[297]`, `cb1[261]`), so the pane now shows the sun and its shadows, moving as the station turns. The look depends on the sun's direction, so it also changes over a rotation. He likes the look of the mode he is on, which the log says is `mirror-brightest`, and chose a steady light over keeping the sun without its shadows. The steady modes step around a guess at the HDR scale, so the first flight is to find the level.
 
 ## Performance candidates
 

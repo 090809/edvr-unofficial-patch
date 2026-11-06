@@ -82,6 +82,7 @@ private:
     bool planTint_ = false;
     bool planSoft_ = false;     // mirror-soft: EDVR's constant buffer 2
     float planGlow_ = 0.0f;     // the lit modes: the glow pass's blend factor (0: no glow pass)
+    bool planSteady_ = false;   // the steady modes: the glow pass is a flat colour, with no light or shadow in it
     bool mirrorBound_ = false;  // the mirror pass has been bound
     FLOAT planFactor_[4] = {1.0f, 1.0f, 1.0f, 1.0f};
     uint32_t keyN_ = 0, keyStart_ = 0;

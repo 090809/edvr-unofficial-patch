@@ -30,10 +30,18 @@ namespace {
 
 namespace cc = edvr::concourse;
 
-enum Mode : uint32_t { kModeMirror = 0, kModeMirrorSoft = 1, kModeTint = 2, kModeOff = 3, kModeLit = 4, kModeBright = 5, kModeBrightest = 6 };
+enum Mode : uint32_t { kModeMirror = 0, kModeMirrorSoft = 1, kModeTint = 2, kModeOff = 3, kModeLit = 4, kModeBright = 5, kModeBrightest = 6,
+                       kModeSteady25 = 7, kModeSteady50 = 8, kModeSteady100 = 9, kModeSteady200 = 10, kModeSteady400 = 11 };
 
-// The lit modes' glow pass, as a factor on the white, rough material: how much of the room's own light the pane gives back on top of its mirror.
+// The lit modes' glow pass, as a factor on the white, rough material: how much of the room's own light the pane gives back on top of its mirror. That pass is the
+// glass shader, so it carries the sun and its shadow map, and they move as the station turns.
 float glowOf(uint32_t m) noexcept { return m == kModeLit ? 1.0f : m == kModeBright ? 2.0f : m == kModeBrightest ? 4.0f : 0.0f; }
+// The steady modes' glow pass: a flat HDR colour added over the mirror, with no light or shadow in it, so it does not change as the station turns. The scene's HDR scale
+// has not been measured, so the five steps bracket a guess of 1.0 by four times each way.
+float steadyOf(uint32_t m) noexcept {
+    return m == kModeSteady25 ? 0.25f : m == kModeSteady50 ? 0.5f : m == kModeSteady100 ? 1.0f : m == kModeSteady200 ? 2.0f : m == kModeSteady400 ? 4.0f : 0.0f;
+}
+constexpr float kSteadyColour[3] = {0.95f, 0.97f, 0.92f};   // a pale white, a little to the green of the station's light
 
 const char* modeText(uint32_t m) noexcept {
     switch (m) {
@@ -43,6 +51,11 @@ const char* modeText(uint32_t m) noexcept {
         case kModeLit: return "mirror-lit";
         case kModeBright: return "mirror-bright";
         case kModeBrightest: return "mirror-brightest";
+        case kModeSteady25: return "mirror-steady-25";
+        case kModeSteady50: return "mirror-steady-50";
+        case kModeSteady100: return "mirror-steady-100";
+        case kModeSteady200: return "mirror-steady-200";
+        case kModeSteady400: return "mirror-steady-400";
         default: return "mirror";
     }
 }
@@ -55,6 +68,11 @@ bool parseMode(const std::string& t, uint32_t* out) noexcept {
     else if (t == "mirror-lit") *out = kModeLit;
     else if (t == "mirror-bright") *out = kModeBright;
     else if (t == "mirror-brightest") *out = kModeBrightest;
+    else if (t == "mirror-steady-25") *out = kModeSteady25;
+    else if (t == "mirror-steady-50") *out = kModeSteady50;
+    else if (t == "mirror-steady-100") *out = kModeSteady100;
+    else if (t == "mirror-steady-200") *out = kModeSteady200;
+    else if (t == "mirror-steady-400") *out = kModeSteady400;
     else return false;
     return true;
 }
@@ -71,7 +89,7 @@ constexpr uint32_t kFlagTestDrawn = 1u << 7;    // the side test's first query (
 constexpr uint32_t kFlagTestMirror = 1u << 8;   // the side test's second query (the mirror draw) is open
 
 // ---- The list, the mode and the feed (the draw threads read them; the tick and the feed write them) --------------------------------------------
-std::atomic<uint32_t> g_mode{kModeLit};
+std::atomic<uint32_t> g_mode{kModeSteady100};
 cc::PaneTriple g_list[cc::kPaneListCap] = {{cc::kPaneFamilyVs, cc::kPaneFamilyPs, 0}};   // entry 0 is the built-in glass family; diag.concourse_panes adds
 std::atomic<uint32_t> g_listN{1};
 std::atomic<bool> g_feedMeasure{false}, g_feedTreat{false}, g_feedWithhold{false}, g_feedSealed{false};
@@ -1400,7 +1418,8 @@ void ConcoursePaneScope::begin(ID3D11DeviceContext* ctx, UINT indexCount, UINT s
     planOpaque_ = opaque;
     planTint_ = tint;
     planSoft_ = mode == kModeMirrorSoft;
-    planGlow_ = tint ? 0.0f : glowOf(mode) * opacity;
+    planSteady_ = steadyOf(mode) > 0.0f;
+    planGlow_ = tint ? 0.0f : (planSteady_ ? steadyOf(mode) : glowOf(mode)) * opacity;
     if (tint) {
         const float* c = cc::kPaneColours[tintSlotOf(indexCount) % cc::kPaneColourCount];
         for (int k = 0; k < 3; ++k) planFactor_[k] = c[k] * cc::kPaneTintIntensity;
@@ -1436,9 +1455,20 @@ bool ConcoursePaneScope::nextMirrorPassSlow() noexcept {
     }
     if (!(planGlow_ > 0.0f) || (flags_ & kFlagSrv) == 0 || (flags_ & kFlagBlend) == 0) return false;
     ID3D11BlendState* bs = g_bsGlow.load(std::memory_order_acquire);
+    if (!bs) return false;
+    if (planSteady_) {
+        ID3D11PixelShader* white = g_psWhite.load(std::memory_order_acquire);
+        if (!white) return false;
+        ctx_->PSGetShader(&prevPs_, nullptr, nullptr);
+        calls_->setPs(ctx_, white, nullptr, 0);
+        flags_ |= kFlagPs;
+        const FLOAT steady[4] = {kSteadyColour[0] * planGlow_, kSteadyColour[1] * planGlow_, kSteadyColour[2] * planGlow_, planGlow_};
+        calls_->setBlend(ctx_, bs, steady, 0xFFFFFFFFu);
+        return true;
+    }
     ID3D11ShaderResourceView* mine[3] = {g_mirrorSrv[0].load(std::memory_order_acquire), g_mirrorSrv[1].load(std::memory_order_acquire),
                                          g_glowT10.load(std::memory_order_acquire)};
-    if (!bs || !mine[0] || !mine[1] || !mine[2]) return false;
+    if (!mine[0] || !mine[1] || !mine[2]) return false;
     calls_->setSrv(ctx_, kPaneSrvFirst, kPaneSrvCount, mine);
     const FLOAT factor[4] = {planGlow_, planGlow_, planGlow_, planGlow_};
     calls_->setBlend(ctx_, bs, factor, 0xFFFFFFFFu);
@@ -1687,13 +1717,13 @@ void pollConfig(uint64_t nowMs) {
     bindKey(g_keyCapture, g_keyCaptureText, Config::get().getString("hotkey.concourse_pane_capture", ""), "hotkey.concourse_pane_capture", "capture key");
     bindKey(g_keyMode, g_keyModeText, Config::get().getString("hotkey.concourse_pane_mode", ""), "hotkey.concourse_pane_mode", "mode key");
     g_keysBound = true;
-    const std::string modeT = Config::get().getString("diag.concourse_pane_mode", "mirror-lit");
+    const std::string modeT = Config::get().getString("diag.concourse_pane_mode", "mirror-steady-100");
     if (!g_modeTextSeen || modeT != g_modeAppliedText) {
         g_modeTextSeen = true;
         g_modeAppliedText = modeT;
-        uint32_t m = kModeLit;
+        uint32_t m = kModeSteady100;
         if (parseMode(modeT, &m)) setMode(m, "diag.concourse_pane_mode");
-        else Log::get().note("concourse pane: diag.concourse_pane_mode = \"%s\" is not mirror-lit, mirror-bright, mirror-brightest, mirror, mirror-soft, tint or off; the mode is unchanged", modeT.c_str());
+        else Log::get().note("concourse pane: diag.concourse_pane_mode = \"%s\" is not mirror-steady-25, -50, -100, -200 or -400, mirror-lit, mirror-bright, mirror-brightest, mirror, mirror-soft, tint or off; the mode is unchanged", modeT.c_str());
     }
     const std::string beyondT = Config::get().getString("diag.concourse_mirror_beyond", "");
     if (!g_beyondTextSeen || beyondT != g_beyondAppliedText) {
@@ -1839,8 +1869,9 @@ void concoursePaneTick(ID3D11Device* device, uint32_t frame, uint64_t nowMs) noe
     g_social = cc::concourseSocialOnFoot(journalStatusFlags2(), known, raw.gameplay);
     if (g_keyMode && g_keyMode->pressed()) {
         const uint32_t cur = g_mode.load(std::memory_order_relaxed);
-        const uint32_t next = cur == kModeLit ? kModeBright : cur == kModeBright ? kModeBrightest : cur == kModeBrightest ? kModeMirror : cur == kModeMirror ? kModeMirrorSoft
-                              : cur == kModeMirrorSoft ? kModeTint : cur == kModeTint ? kModeOff : kModeLit;
+        // mirror-lit, mirror-bright and mirror-soft are set by the key only: the press steps the five steady levels, then the look to compare them with.
+        const uint32_t next = cur == kModeSteady100 ? kModeSteady200 : cur == kModeSteady200 ? kModeSteady400 : cur == kModeSteady400 ? kModeBrightest : cur == kModeBrightest ? kModeMirror
+                              : cur == kModeMirror ? kModeTint : cur == kModeTint ? kModeOff : cur == kModeOff ? kModeSteady25 : cur == kModeSteady25 ? kModeSteady50 : kModeSteady100;
         setMode(next, g_social ? "hotkey.concourse_pane_mode" : "hotkey.concourse_pane_mode; it applies on foot in social space");
     }
     if (g_keyCapture && g_keyCapture->pressed()) {
