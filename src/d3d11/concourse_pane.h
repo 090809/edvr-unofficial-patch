@@ -16,8 +16,8 @@
 //
 // The draw thunks of vscreen.cpp (hookedDraw and hookedDrawInstanced for what is withheld; hookedDrawIndexed and hookedDrawIndexedInstanced for that and the
 // mirror; the flat branch and the VR path of each) build one ConcoursePaneScope around the
-// real draw call, skip the real call when withheld() says so, and issue the second draw when beginMirror() says so. With nothing armed the scope is one
-// relaxed atomic load, and beginMirror() is a check of one member that is false for every draw that is not the family's.
+// real draw call, skip the real call when withheld() says so, and issue the second draw when nextMirrorPass() says so. With nothing armed the scope is one
+// relaxed atomic load, and nextMirrorPass() is a check of one member that is false for every draw that is not the family's.
 #include <d3d11_1.h>
 
 #include <atomic>
@@ -61,10 +61,12 @@ public:
     bool withheld() const noexcept { return withheld_; }
     // Called right after the game's own draw was issued: true when the site is to issue the same draw again (the mirror), with the replacement state bound. The
     // state is put back when the scope ends. False for every draw that is not a family draw.
-    bool beginMirror() noexcept { return family_ && beginMirrorSlow(); }
+    // Asked after the game's own draw and after each pass: true means issue the same draw again. First the mirror, then, in the lit modes, its glow.
+    bool nextMirrorPass() noexcept { return family_ && nextMirrorPassSlow(); }
 
 private:
     void begin(ID3D11DeviceContext* ctx, UINT indexCount, UINT startIndex, INT baseVertex, const ConcoursePaneCalls& calls) noexcept;
+    bool nextMirrorPassSlow() noexcept;
     bool beginMirrorSlow() noexcept;
     void end() noexcept;
 
@@ -79,6 +81,8 @@ private:
     bool planOpaque_ = true;    // false: the fade (blend factor opacity)
     bool planTint_ = false;
     bool planSoft_ = false;     // mirror-soft: EDVR's constant buffer 2
+    float planGlow_ = 0.0f;     // the lit modes: the glow pass's blend factor (0: no glow pass)
+    bool mirrorBound_ = false;  // the mirror pass has been bound
     FLOAT planFactor_[4] = {1.0f, 1.0f, 1.0f, 1.0f};
     uint32_t keyN_ = 0, keyStart_ = 0;
     int32_t keyBase_ = 0;
@@ -102,6 +106,7 @@ struct ConcoursePaneFeed {
     bool measure = false;       // the gate holds: family draws are measured
     bool treat = false;         // the cull is wanted: family draws are treated by the mode
     bool withhold = false;      // the cull is on and the phase is the plain mirror phase: the outside draws are not issued, the mirror is marked
+    bool sealed = false;        // the hangar is sealed: the families that can only be outside are not issued (concourse_cull_core.h, sealedToo)
     float bayOpacity = 1.0f;    // the bay window's opacity, 0 to 1
 };
 void concoursePaneSetFeed(const ConcoursePaneFeed& feed) noexcept;

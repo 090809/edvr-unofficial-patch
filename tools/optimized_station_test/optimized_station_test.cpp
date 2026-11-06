@@ -3701,6 +3701,16 @@ int main(int argc, char** argv) {
             check(cc::withheldPsIndex(0) == -1 && cc::withheldVsIndex(0) == -1, "concourse withheld: no shader (hash 0) is not found");
             check(cc::withheldPsIndex(cc::kPaneFamilyPs) == -1 && cc::withheldVsIndex(cc::kPaneFamilyVs) == -1, "concourse withheld: the glass family is not withheld");
             check(cc::farLimitedPs(0x2519C9050946D545ull) && cc::farLimitedPs(0x92FF8499ED345759ull), "concourse far-limited: the cones and the glow quads");
+            const auto sealedPs = [](uint64_t h) { const int i = cc::withheldPsIndex(h); return i >= 0 && cc::kWithheldPs[i].sealedToo; };
+            const auto sealedVs = [](uint64_t h) { const int i = cc::withheldVsIndex(h); return i >= 0 && cc::kWithheldVs[i].sealedToo; };
+            check(sealedPs(0xA75C1DB6562B8CA7ull) && sealedPs(0x3B0B38CD96F53BC1ull) && sealedPs(0x43E5E6EB67AC751Bull) && sealedPs(0xDD371C57C9093BB8ull) && sealedVs(0x26FC402B1274EE7Bull),
+                  "concourse sealed: lasers, plumes, the planet and the ship ribbon also go in a sealed hangar");
+            check(!sealedPs(0xD56F859BE4781431ull) && !sealedPs(0x41152F82C6E8BE1Full) && !sealedPs(0x2BAE3742FEB916D9ull) && !sealedPs(0x3789CA2062E196FBull) && !sealedPs(0xE54F2A902E5631F6ull) &&
+                      !sealedPs(0x89B662E266E5D73Eull),
+                  "concourse sealed: flares, the scatter, the particles and the engine glow stay in a sealed hangar");
+            uint8_t glowT10[cc::kPaneTexSize * cc::kPaneTexSize * 4] = {};
+            cc::fillPaneGlowT10(glowT10);
+            check(glowT10[0] == 255 && glowT10[3] == 255 && glowT10[sizeof(glowT10) - 1] == 255, "concourse glow: a white, fully rough material");
             check(!cc::farLimitedPs(0) && !cc::farLimitedPs(cc::kPaneFamilyPs) && !cc::farLimitedPs(0x06332CA168B6DA63ull), "concourse far-limited: nothing else (no shader, the glass, the stars)");
             check(cc::withheldPsIndex(0x2519C9050946D545ull) == -1 && cc::withheldPsIndex(0x92FF8499ED345759ull) == -1, "concourse far-limited: not also withheld, or the room's would go");
             const uint64_t keep[] = {0x88DCF1164C640EC3ull, 0x494506A6ull, 0x1C506222ull, 0x359BF8FFull, 0xF8FA801Full, 0x68DDDEF0ull, 0xF7A6E916ull, 0xE904D334ull};

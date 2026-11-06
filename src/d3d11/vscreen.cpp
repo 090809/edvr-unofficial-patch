@@ -5649,7 +5649,7 @@ void STDMETHODCALLTYPE hookedDrawIndexed(ID3D11DeviceContext* self, UINT count,
             ConcoursePaneScope pane(self, count, startIndex, baseVertex, kConcoursePaneCalls);
             if (sun.issues() && !pane.withheld()) {
                 g_state->realDrawIndexed(self, count, startIndex, baseVertex);
-                if (pane.beginMirror()) g_state->realDrawIndexed(self, count, startIndex, baseVertex);   // the mirror: the same draw again (concourse_pane.h)
+                while (pane.nextMirrorPass()) g_state->realDrawIndexed(self, count, startIndex, baseVertex);   // the mirror: the same draw again (concourse_pane.h)
             }
         }
         sun.restore();
@@ -5688,7 +5688,7 @@ void STDMETHODCALLTYPE hookedDrawIndexed(ID3D11DeviceContext* self, UINT count,
                 ConcoursePaneScope pane(self, count, startIndex, baseVertex, kConcoursePaneCalls);   // TEMPORARY (concourse_pane.h)
                 if (!pane.withheld()) {
                     g_state->realDrawIndexed(self, count, startIndex, baseVertex);
-                    if (pane.beginMirror()) g_state->realDrawIndexed(self, count, startIndex, baseVertex);
+                    while (pane.nextMirrorPass()) g_state->realDrawIndexed(self, count, startIndex, baseVertex);
                 }
             }
             if (clock.on) clock.realCall(r0);
@@ -5700,7 +5700,7 @@ void STDMETHODCALLTYPE hookedDrawIndexed(ID3D11DeviceContext* self, UINT count,
             ConcoursePaneScope pane(self, count, startIndex, baseVertex, kConcoursePaneCalls);   // TEMPORARY (concourse_pane.h)
             if (!pane.withheld()) {
                 g_state->realDrawIndexed(self, count, startIndex, baseVertex);
-                if (pane.beginMirror()) g_state->realDrawIndexed(self, count, startIndex, baseVertex);
+                while (pane.nextMirrorPass()) g_state->realDrawIndexed(self, count, startIndex, baseVertex);
             }
         }
         srvTurretHudCountIssue(self);   // issue 140: the game's own issue; a family's first scope says its state (one relaxed load otherwise)
@@ -5848,7 +5848,7 @@ void STDMETHODCALLTYPE hookedDrawIndexedInstanced(ID3D11DeviceContext* self,
             if (sun.issues() && !pane.withheld()) {
                 g_state->realDrawIndexedInstanced(self, perInstance, instances, startIndex,
                                                   baseVertex, startInstance);
-                if (pane.beginMirror())
+                while (pane.nextMirrorPass())
                     g_state->realDrawIndexedInstanced(self, perInstance, instances, startIndex,
                                                       baseVertex, startInstance);
             }
@@ -5913,7 +5913,7 @@ void STDMETHODCALLTYPE hookedDrawIndexedInstanced(ID3D11DeviceContext* self,
             if (!pane.withheld()) {
                 g_state->realDrawIndexedInstanced(self, perInstance, instances, startIndex,
                                                   baseVertex, startInstance);
-                if (pane.beginMirror())
+                while (pane.nextMirrorPass())
                     g_state->realDrawIndexedInstanced(self, perInstance, instances, startIndex,
                                                       baseVertex, startInstance);
             }

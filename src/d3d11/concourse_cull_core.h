@@ -122,44 +122,47 @@ constexpr uint64_t kTwinPs = 0x34A1475B2C790DFAull;
 // Named by pixel shader hash or vertex shader hash (a draw with either is not issued). A terrain patch has no pixel shader, so it is named by its vertex
 // shader. Not here, on purpose: the player's first-person laser (0x88DCF1164C640EC3 / 494506A6), the room's glows (1C506222, 359BF8FF), the sky (F8FA801F),
 // the stars (68DDDEF0, F7A6E916), the dust (E904D334). Beams, flares and the scatter are non-indexed draws, so the plain draw thunks carry the scope too.
+// sealedToo: also withheld while the hangar is sealed (fix.optimized_stations): it can only be outside. Not so for what a hangar may draw itself: flares, the scatter,
+// the particle batches and an engine glow (its own ship's on the pad); no census has been taken in a sealed hangar yet to say otherwise.
 struct WithheldFamily {
     uint64_t hash;
     const char* name;
+    bool sealedToo = false;
 };
 constexpr WithheldFamily kWithheldPs[] = {
-    {0x3B0B38CD96F53BC1ull, "plume"},
-    {0x34A1475B2C790DFAull, "plume twin"},
-    {0x42AC0CACC9CDF72Bull, "trail ribbon"},
-    {0xEEAAC839A9F09448ull, "trail volume"},
-    {0x6FD4C38BA927C8C7ull, "trail haze"},
-    {0xA75C1DB6562B8CA7ull, "beams and bolts"},
-    {0xC5DF9CC943476289ull, "multicannon rounds"},
-    {0xC49F999F7D3C801Dull, "shield strike"},
-    {0xBD801F2FB02522EBull, "smoke"},
-    {0x6EF82262EB12A037ull, "atmosphere"},
-    {0x5BCB6B95BE7C0700ull, "atmosphere quad A"},
-    {0x97DBC87FCAA429C4ull, "atmosphere quad B"},
+    {0x3B0B38CD96F53BC1ull, "plume", true},
+    {0x34A1475B2C790DFAull, "plume twin", true},
+    {0x42AC0CACC9CDF72Bull, "trail ribbon", true},
+    {0xEEAAC839A9F09448ull, "trail volume", true},
+    {0x6FD4C38BA927C8C7ull, "trail haze", true},
+    {0xA75C1DB6562B8CA7ull, "beams and bolts", true},
+    {0xC5DF9CC943476289ull, "multicannon rounds", true},
+    {0xC49F999F7D3C801Dull, "shield strike", true},
+    {0xBD801F2FB02522EBull, "smoke", true},
+    {0x6EF82262EB12A037ull, "atmosphere", true},
+    {0x5BCB6B95BE7C0700ull, "atmosphere quad A", true},
+    {0x97DBC87FCAA429C4ull, "atmosphere quad B", true},
     {0xD56F859BE4781431ull, "flares"},
-    {0x43E5E6EB67AC751Bull, "planet surface"},
+    {0x43E5E6EB67AC751Bull, "planet surface", true},
     {0x41152F82C6E8BE1Full, "scatter"},               // VS AFFEF018: fullscreen, additive, no depth test, reads only the depth
     {0x2BAE3742FEB916D9ull, "particles A"},           // VS AFBCD3AD, 9F4BBCFC (docs\billboard-root-cause-2026-10-16.md)
     {0x3789CA2062E196FBull, "particles B"},           // VS 9AEC596A
     {0xE54F2A902E5631F6ull, "particles C"},           // VS BBAD1CA8
-    {0x6EAA86EFE135B2D4ull, "shield strike part 2"},  // VS 820E5C13, the same 3984 indices as the shield strike
-    {0xDD371C57C9093BB8ull, "ship ribbon"},           // VS 5EAFFCD0: a triangle strip of about 100 indices, two draws a frame, the orange double trail
+    {0x6EAA86EFE135B2D4ull, "shield strike part 2", true},  // VS 820E5C13, the same 3984 indices as the shield strike
+    {0xDD371C57C9093BB8ull, "ship ribbon", true},           // VS 5EAFFCD0: a triangle strip of about 100 indices, two draws a frame, the orange double trail
     {0x89B662E266E5D73Eull, "ship engine glow"},      // VS 2D8263CC: n=36, additive, one vertex buffer each, seen with a ship's hull in view
 };
 constexpr WithheldFamily kWithheldVs[] = {
-    {0x72BDD292154158ADull, "body surface"},
-    {0x26FC402B1274EE7Bull, "planetary pipeline"},
-    {0x9FFA5D5E79F04873ull, "planetary 2"},
-    {0x3530A6FD15EDE145ull, "planetary 3"},
-    {0x71DD9863DCFC0986ull, "planet surface vs"},
-    {0xACE405F428C17EF6ull, "terrain patch"},
-    {0x19F70CE80DA3242Bull, "body sphere"},
-    {0xC7FA0C0F5DD49180ull, "beside the bodies"},
-    {0x8BD7C37ABCEE7E45ull, "sun"},
-    {0x1F3AD1584D7FA3C8ull, "sun arcs"},
+    {0x72BDD292154158ADull, "body surface", true},
+    {0x26FC402B1274EE7Bull, "planetary pipeline", true},
+    {0x9FFA5D5E79F04873ull, "planetary 2", true},
+    {0x3530A6FD15EDE145ull, "planetary 3", true},
+    {0x71DD9863DCFC0986ull, "planet surface vs", true},
+    {0xACE405F428C17EF6ull, "terrain patch", true},
+    {0x19F70CE80DA3242Bull, "body sphere", true},
+    {0xC7FA0C0F5DD49180ull, "beside the bodies", true},
+    {0x8BD7C37ABCEE7E45ull, "sun", true},
+    {0x1F3AD1584D7FA3C8ull, "sun arcs", true},
 };
 constexpr size_t kWithheldPsCount = sizeof(kWithheldPs) / sizeof(kWithheldPs[0]);
 constexpr size_t kWithheldVsCount = sizeof(kWithheldVs) / sizeof(kWithheldVs[0]);
@@ -322,6 +325,11 @@ inline void fillPaneT9(uint8_t* out) noexcept {
     }
 }
 // One colour, roughness 0.30. out: kPaneTexSize * kPaneTexSize * 4 bytes.
+// The lit modes' second pass: a white, fully rough material. The glass shader has no diffuse term, only a specular one over the probes and lights, so at roughness 1 this
+// reads as the room's own light, soft and at the scene's own scale, without a new shader or a constant in HDR units. out: kPaneTexSize * kPaneTexSize * 4 bytes.
+inline void fillPaneGlowT10(uint8_t* out) noexcept {
+    for (uint32_t i = 0; i < kPaneTexSize * kPaneTexSize * 4; ++i) out[i] = 255;
+}
 inline void fillPaneT10(uint8_t* out) noexcept {
     for (uint32_t i = 0; i < kPaneTexSize * kPaneTexSize; ++i) {
         for (int c = 0; c < 3; ++c) out[4 * i + c] = kPaneT10Rgb[c];

@@ -2,8 +2,8 @@
 
 ## Status
 
-- **State:** Flight 7 flown 2026-11-06 flat on Steam, log `edvr_gfx_20261106_065604`, build a41de79b. p50 6.94 ms looking out from the bay and about 13 ms at the lift bank. Two reports: a ship's hull and engine glows still draw, and the room looks washed out at the entrance. The eighth build b14a788d (nameless records past the far limit culled, engine glow withheld, F3 names what is kept; full build green, optimized_station_test 1004 checks) is installed on Steam and not flown. Not merged. Extends `fix.optimized_stations`; off unless the temporary keys turn it on.
-- **Goals (Sean, 2026-11-05):** (1) on foot in the large-station concourse, cull everything outside the bay windows; (2) skylights and the window above the lift bank become a permanent mirrored surface, so missing structure is never seen; (3) approaching the bay windows clears the mirror and stops the cull, so the station interior is visible from there.
+- **State:** Flight 8 flown 2026-11-06 flat on Steam, build b14a788d. The washed-out entrance stays with F2 off, so it is Elite's own. The ninth build (the mirror lit from behind, the outside's families also withheld in a sealed hangar) is not flown. Not merged. Extends `fix.optimized_stations`; the concourse cull is off unless the temporary keys turn it on, but the sealed-hangar withhold is on with `fix.optimized_stations`.
+- **Goals (Sean, 2026-11-05):** (1) on foot in the large-station concourse, cull everything outside the bay windows; (2) skylights and the window above the lift bank become a permanent mirrored surface, so missing structure is never seen; (3) approaching the bay windows clears the mirror and stops the cull, so the station interior is visible from there. **Added 2026-11-06:** (4) light behind the mirror, for the impression of a brightly lit station beyond it; (5) with `fix.optimized_stations` on, the same outside draws go while the hangar is sealed.
 - **Direction:** identify records by the store's name, keep an allow-list, and make the panes opaque. The fitted hall, the shader-pair lists and the shell read-back from the earlier attempt are not carried over (see Ruled out).
 - **Answered by Flight 1:** H1 yes, with named survivors. H2 yes. H3 yes for the bay window: VS `98397963AAEC45D3` / PS `66B08F89E4926C01`, n=36. H5 yes by eye: the room stayed lit. See "Flight 1 results".
 - **Answered by Flight 2:** H4b yes, by eye. H7 yes: lifts at 20.2-22.3% of the view, all near the bay. H6b no: the family covers every pane in the room at about 20 index counts, so no count names the exterior. See "Flight 2 results".
@@ -11,15 +11,16 @@
 - **Answered by Flight 4:** H14 yes: Sean, "the turn away from the bay windows works well". H12 half: "I don't see anything missing or incorrect on the interior", no planet in his screenshot or his report, and the lists matched 15 of 24 families, but the haze and lasers stayed. See "Flight 4 results".
 - **Answered by Flight 5:** H15 yes: `beams and bolts` is no longer on Sean's list, no lasers. H16 half: the wash went with `scatter`, so that is what it was; the ellipses and wedges stayed, so they were not the particles. H13 still open: `flares` matched and no flares in the screenshot; the room was not reported.
 - **Answered by Flight 6:** H18 yes: Sean, "the green haze and light fills are gone", with `far glows limited` at about 8000 a second. The room was not reported wrong.
-- **Open hypotheses (Flight 8 answers them):**
-  - **H22** The hull (`66DE2CAD/864F1F94`, n=32310) is kept as a record with no readable name, the only keep with no distance limit until this build. Not proven: no survey ran with the ship in view. If it still draws, an F3 press lists the kept names and the largest nameless records, each with its distance.
-  - **H23** The washed-out look at the entrance is one of: (a) Elite's own, seen without the cull too; (b) the cull, which F2 alone would change; (c) auto-exposure reacting to the dark sky, which F4 between `off` and `mirror` would change. The census at that spot has no extra fullscreen family and the same sun draw, so it names nothing. Flight 2's screenshot from z -11 has the same pale look, with the mirror on and every effect still drawn, which argues against the withheld families.
-  - **H20** and **H21** The ribbon: Sean's Flight 7 report mentions neither trail, so probably gone. Ask.
-  - **H17** None of the withheld families is in the room. Compare with F2 at a fixed view.
+- **Answered by Flight 8:** H23 (a): Sean, "the bright washed out look stays on when F2 is off". Elite's own, and not this arc's.
+- **Open hypotheses (Flight 9 answers them):**
+  - **H24** A second, additive pass of the game's glass shader with a white, fully rough material reads as soft light behind the glass, at the scene's own scale. F4 steps 1, 2 and 4 times. Costs a third pass over the mirrored pixels; `mirror` on F4 is the comparison.
+  - **H25** The families marked `sealedToo` (lasers, plumes, trails, smoke, the planet, its atmosphere, the sun's glare) draw nothing a sealed hangar needs. No census has been taken in a sealed hangar, so this is by reasoning. Flares, the scatter, the particle batches and engine glows stay for that reason. `concourse withheld 30s:` says what matched there.
+  - **H22** The hull is a nameless record. Not reported in Flight 8. If it still draws, an F3 press names what is kept.
+  - **H20** and **H21** The ribbon: ask whether either trail is left.
   - **H6** `Standard_SocialArea` marks the large-station concourse at other stations too. Still unflown.
 - **Temporary keys (all removed when the arc closes):** `diag.concourse_cull` (on, off), `diag.concourse_keep` (extra name prefixes), `diag.concourse_pane_mode`, `diag.concourse_panes`, `diag.concourse_clear_share`, `diag.concourse_mirror_beyond`, `hotkey.concourse_cull`, `hotkey.concourse_pane_capture`, `hotkey.concourse_pane_mode`.
 - **Ruled out:** see the section of that name. **Issues:** none yet.
-- **Next flight:** the Flight 8 list, on build b14a788d, installed on Steam 2026-11-06. Keys in both Steam inis: `hotkey.concourse_cull` F2 (the cull and the mirrors), `hotkey.concourse_pane_capture` F3 (logs a ranking by screen coverage and the kept names, changes nothing), `hotkey.concourse_pane_mode` F4.
+- **Next flight:** the Flight 9 list. Keys in both Steam inis: `hotkey.concourse_cull` F2 (the cull and the mirrors), `hotkey.concourse_pane_capture` F3 (logs a ranking by screen coverage and the kept names, changes nothing), `hotkey.concourse_pane_mode` F4.
 
 ## What the earlier attempt learned
 
@@ -74,6 +75,7 @@ The reflection is the game's own probe cube array at `t5`, and the lights and sh
 | Mode | Around the draw | Result |
 |---|---|---|
 | normal | nothing | the game's glass |
+| `mirror-lit` (default), `mirror-bright`, `mirror-brightest` | `mirror`, then a third draw over it: a white, fully rough `t10`, `BlendFactor`, `One`, at 1, 2 or 4 | a mirror lit from behind, by the room's own probes and lights |
 | `mirror` | a second draw with the three textures; `One`, `Zero`, RGB only; depth write on; marked pixels only | a lit metal mirror, nothing behind |
 | `mirror-soft` | as `mirror`, plus `cb2` row 2 = 0, 1, 1.8, 0 | roughness 0.54, to compare |
 | `tint` | as `mirror`, with a white pixel shader; `BlendFactor`, `Zero`; colour per index count | shows which pixels the mirror takes, by index count |
@@ -103,11 +105,13 @@ Not withheld: `88DCF116/494506A6` (the first-person laser), the sky `F8FA801F`, 
 
 The scope is on all four draw thunks. Beams, flares, stars, dust and the scatter are non-indexed, and until the fifth build only the indexed thunks looked at the lists.
 
-Depth-tested late draws (`BBAD1CA8`, `820E5C13`) fail against the pane's depth write.
+**The sealed hangar (from the ninth build).** While the hangar is sealed, the families marked `sealedToo` are withheld too, with no diag key and whatever F4 says: everything above except flares, the scatter, the particle batches and the engine glow, which a hangar may draw itself (its own ship's glow on the pad, sparks, a lamp's glint). The light cones are not limited there.
 
 **A known loss:** the logo on the glass (same VS, PS `98337732`, n=162) draws before the pane, so the mirror covers it. It returns when the bay clears.
 
 **The trigger (goal 3).** Pane coverage, not a room coordinate: an occlusion query around the game's n=36 draws gives its share of the view. This needs no table per station and covers every bay window at once. At 20% of the view (12% in VR), on two readings running, the cull lifts, and 150 ms later the pane fades to the game's glass over 600 ms. From the fourth build it follows the view (Sean, after Flight 3: turning round at the glass left the cull off until he walked away). Under 40% of the entry share (8%, or 4.8% in VR) for 250 ms, it closes: straight back to the mirror and the cull if the bay is out of view (1% or less, or no reading), where a fade would only delay the saving, or by a fade if some of the bay is still in view. Coming back over the entry share during the fade turns it round. Coordinates were the first plan, but Flight 1's walk could not place the pane, and a table would have needed flights at each station type.
+
+**Light behind the mirror.** The glass shader has no diffuse term. Its base colour only feeds F0, and the rest is the probes and lights through a specular lobe. So at roughness 1, F0 1, it returns a very soft sample of the room's light. Drawn additively over the mirror, it reads as light from behind and sits at the scene's own scale, which a constant in HDR units would not: nothing here has measured that scale. It follows the pane through its fade.
 
 **The fade.** `BlendFactor`, `InvBlendFactor` with the mirror's textures, over the game's own glass, on exterior panes. At 0 the second draw stops.
 
@@ -312,6 +316,22 @@ On the eighth build, flat, at the same station.
 
 Then: `python tools\edvr_log.py --target steam --expect-build b14a788d --grep "concourse"`.
 
+## Flight 8 results
+
+Flat, Steam, build b14a788d. Sean toggled F2 at the entrance: "the bright washed out look stays on when F2 is off". He asked for light behind the mirror, and for the same culling in a sealed hangar. His screenshot has the panes a flat blue-grey with a horizontal band, which is the probes' dark sky in the reflection now that the outside is gone.
+
+## Flight 9
+
+On the ninth build, flat, at the same station.
+
+1. In the room with the mirrors on, F4 through `mirror-lit`, `mirror-bright`, `mirror-brightest` and `mirror`, from across the room and at a skylight. Which looks like a bright station beyond the glass? Is a lamp's highlight blotchy on a pane? The frame rate of each, if under the cap.
+2. Board and stay on the pad, with the hangar sealed: does anything in the hangar go, such as a light, steam or a glint? Then launch: does anything pop back at the doors?
+3. With a ship in the docking area, F4 at `off`: is it gone? If not, F3 with it in view.
+4. Are the two trails gone?
+5. If it is cheap, a second station type.
+
+Then: `python tools\edvr_log.py --target steam --expect-build <this build> --grep "concourse"`.
+
 ## Performance candidates
 
 Ranked by expected gain against risk. The first two and the plume are in the build.
@@ -346,3 +366,4 @@ Ranked by expected gain against risk. The first two and the plume are in the bui
 - `ruled out: EB787F98/3B0B38CD as the pale wedges, because Flight 4 withheld it at 12 draws a frame and the wedges stayed in the screenshot.`
 - `ruled out: B12F7A61/42AC0CAC as all of the green haze, because Flight 4 withheld it and the haze stayed.`
 - `ruled out: the particle batches (2BAE3742, 3789CA20, E54F2A90) as the green ellipses and pale wedges, because Flight 5 withheld them all and the shapes stayed.`
+- `ruled out: the cull as the cause of the washed-out look at the concourse's entrance, because it stays with F2 off (Flight 8).`

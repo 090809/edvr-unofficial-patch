@@ -3255,6 +3255,7 @@ void concourseTick(uint64_t now, uint32_t frame) {
     feed.treat = wantCull;
     feed.withhold = active;
     feed.bayOpacity = clr.bayOpacity;
+    feed.sealed = g_sealedFlag.load(std::memory_order_acquire);   // the hangar is sealed: what can only be outside is not issued, with no diag key
     concoursePaneSetFeed(feed);
     g_concWanted.store(gateWanted, std::memory_order_release);
     g_concHubWanted.store(gateWanted && g_concHubAddr.load(std::memory_order_relaxed) == 0, std::memory_order_relaxed);

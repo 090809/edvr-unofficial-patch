@@ -30,13 +30,19 @@ namespace {
 
 namespace cc = edvr::concourse;
 
-enum Mode : uint32_t { kModeMirror = 0, kModeMirrorSoft = 1, kModeTint = 2, kModeOff = 3 };
+enum Mode : uint32_t { kModeMirror = 0, kModeMirrorSoft = 1, kModeTint = 2, kModeOff = 3, kModeLit = 4, kModeBright = 5, kModeBrightest = 6 };
+
+// The lit modes' glow pass, as a factor on the white, rough material: how much of the room's own light the pane gives back on top of its mirror.
+float glowOf(uint32_t m) noexcept { return m == kModeLit ? 1.0f : m == kModeBright ? 2.0f : m == kModeBrightest ? 4.0f : 0.0f; }
 
 const char* modeText(uint32_t m) noexcept {
     switch (m) {
         case kModeMirrorSoft: return "mirror-soft";
         case kModeTint: return "tint";
         case kModeOff: return "off";
+        case kModeLit: return "mirror-lit";
+        case kModeBright: return "mirror-bright";
+        case kModeBrightest: return "mirror-brightest";
         default: return "mirror";
     }
 }
@@ -46,6 +52,9 @@ bool parseMode(const std::string& t, uint32_t* out) noexcept {
     else if (t == "mirror-soft") *out = kModeMirrorSoft;
     else if (t == "tint") *out = kModeTint;
     else if (t == "off") *out = kModeOff;
+    else if (t == "mirror-lit") *out = kModeLit;
+    else if (t == "mirror-bright") *out = kModeBright;
+    else if (t == "mirror-brightest") *out = kModeBrightest;
     else return false;
     return true;
 }
@@ -62,10 +71,11 @@ constexpr uint32_t kFlagTestDrawn = 1u << 7;    // the side test's first query (
 constexpr uint32_t kFlagTestMirror = 1u << 8;   // the side test's second query (the mirror draw) is open
 
 // ---- The list, the mode and the feed (the draw threads read them; the tick and the feed write them) --------------------------------------------
-std::atomic<uint32_t> g_mode{kModeMirror};
+std::atomic<uint32_t> g_mode{kModeLit};
 cc::PaneTriple g_list[cc::kPaneListCap] = {{cc::kPaneFamilyVs, cc::kPaneFamilyPs, 0}};   // entry 0 is the built-in glass family; diag.concourse_panes adds
 std::atomic<uint32_t> g_listN{1};
-std::atomic<bool> g_feedMeasure{false}, g_feedTreat{false}, g_feedWithhold{false};
+std::atomic<bool> g_feedMeasure{false}, g_feedTreat{false}, g_feedWithhold{false}, g_feedSealed{false};
+std::atomic<bool> g_withholdSealedNow{false};   // the hangar is sealed: only the families marked sealedToo are not issued
 std::atomic<float> g_bayOpacity{1.0f};
 std::atomic<bool> g_treatNow{false};      // treat fed, a mode other than off, and the replacement states made
 std::atomic<bool> g_withholdNow{false};   // withhold fed (the cull is on): outside draws are not issued, whatever the mode; the mirror itself needs a mode other than off
@@ -86,9 +96,11 @@ std::atomic<uint32_t> g_hashEpoch{1};
 // The replacement states, made by the tick for the game's device.
 std::atomic<ID3D11BlendState*> g_bsFactor{nullptr};   // src = BLEND_FACTOR, dest = ZERO (tint)
 std::atomic<ID3D11BlendState*> g_bsMirror{nullptr};   // src = ONE, dest = ZERO (a fully opaque pane)
+std::atomic<ID3D11BlendState*> g_bsGlow{nullptr};     // src = BLEND_FACTOR, dest = ONE (a lit mode's glow, over the mirror)
 std::atomic<ID3D11BlendState*> g_bsFade{nullptr};     // src = BLEND_FACTOR, dest = INV_BLEND_FACTOR (a pane below full opacity)
 std::atomic<ID3D11PixelShader*> g_psWhite{nullptr};   // tint: the blend factor multiplies this, so it is the pane's colour
 std::atomic<ID3D11ShaderResourceView*> g_mirrorSrv[3] = {};   // t8, t9, t10
+std::atomic<ID3D11ShaderResourceView*> g_glowT10{nullptr};    // t10 of the glow pass; its t8 and t9 are the mirror's
 std::atomic<ID3D11Buffer*> g_cbMirror{nullptr};       // mirror-soft: the pixel shader's constant buffer 2
 std::atomic<bool> g_statesReady{false};
 bool g_psWhiteTried = false;   // the tick's: one compile per device
@@ -300,6 +312,8 @@ void releaseStates() noexcept {
     g_bsFactor.store(nullptr, std::memory_order_release);
     g_bsMirror.store(nullptr, std::memory_order_release);
     g_bsFade.store(nullptr, std::memory_order_release);
+    g_bsGlow.store(nullptr, std::memory_order_release);
+    g_glowT10.store(nullptr, std::memory_order_release);
     g_psWhite.store(nullptr, std::memory_order_release);
     for (auto& s : g_mirrorSrv) s.store(nullptr, std::memory_order_release);
     g_cbMirror.store(nullptr, std::memory_order_release);
@@ -367,6 +381,7 @@ bool makeBlendStates(ID3D11Device* device) noexcept {
     ID3D11BlendState* factor = nullptr;
     ID3D11BlendState* mirror = nullptr;
     ID3D11BlendState* fade = nullptr;
+    ID3D11BlendState* glow = nullptr;
     rt.SrcBlend = D3D11_BLEND_BLEND_FACTOR;
     rt.DestBlend = D3D11_BLEND_ZERO;
     const HRESULT h1 = device->CreateBlendState(&d, &factor);
@@ -375,17 +390,21 @@ bool makeBlendStates(ID3D11Device* device) noexcept {
     rt.SrcBlend = D3D11_BLEND_BLEND_FACTOR;
     rt.DestBlend = D3D11_BLEND_INV_BLEND_FACTOR;
     const HRESULT h3 = device->CreateBlendState(&d, &fade);
-    if (FAILED(h1) || FAILED(h2) || FAILED(h3) || !factor || !mirror || !fade) {
+    rt.DestBlend = D3D11_BLEND_ONE;
+    const HRESULT h4 = device->CreateBlendState(&d, &glow);
+    if (FAILED(h1) || FAILED(h2) || FAILED(h3) || FAILED(h4) || !factor || !mirror || !fade || !glow) {
         Log::get().note("concourse pane: the replacement blend states could not be made (hr %08X, %08X, %08X); no pane is treated", static_cast<unsigned>(h1),
                         static_cast<unsigned>(h2), static_cast<unsigned>(h3));
         if (factor) factor->Release();
         if (mirror) mirror->Release();
         if (fade) fade->Release();
+        if (glow) glow->Release();
         return false;
     }
     g_bsMirror.store(mirror, std::memory_order_release);
     g_bsFactor.store(factor, std::memory_order_release);
     g_bsFade.store(fade, std::memory_order_release);
+    g_bsGlow.store(glow, std::memory_order_release);
     return true;
 }
 
@@ -393,18 +412,20 @@ bool makeMirrorTextures(ID3D11Device* device) noexcept {
     static uint8_t t8[cc::kPaneTexSize * cc::kPaneTexSize * 2];
     static uint8_t t9[cc::kPaneTexSize * cc::kPaneTexSize * 2];
     static uint8_t t10[cc::kPaneTexSize * cc::kPaneTexSize * 4];
+    static uint8_t glow[cc::kPaneTexSize * cc::kPaneTexSize * 4];
     cc::fillPaneT8(t8);
     cc::fillPaneT9(t9);
     cc::fillPaneT10(t10);
+    cc::fillPaneGlowT10(glow);
     struct Spec {
         DXGI_FORMAT format;
         const uint8_t* data;
         UINT bytes;
     };
-    const Spec specs[3] = {{DXGI_FORMAT_R8G8_UNORM, t8, 2}, {DXGI_FORMAT_R8G8_UNORM, t9, 2}, {DXGI_FORMAT_R8G8B8A8_UNORM, t10, 4}};
-    ID3D11ShaderResourceView* made[3] = {};
+    const Spec specs[4] = {{DXGI_FORMAT_R8G8_UNORM, t8, 2}, {DXGI_FORMAT_R8G8_UNORM, t9, 2}, {DXGI_FORMAT_R8G8B8A8_UNORM, t10, 4}, {DXGI_FORMAT_R8G8B8A8_UNORM, glow, 4}};
+    ID3D11ShaderResourceView* made[4] = {};
     bool ok = true;
-    for (int i = 0; i < 3 && ok; ++i) {
+    for (int i = 0; i < 4 && ok; ++i) {
         D3D11_TEXTURE2D_DESC td{};
         td.Width = cc::kPaneTexSize;
         td.Height = cc::kPaneTexSize;
@@ -439,6 +460,7 @@ bool makeMirrorTextures(ID3D11Device* device) noexcept {
         Log::get().note("concourse pane: the mirror textures could not be made; no pane is treated");
         return false;
     }
+    g_glowT10.store(made[3], std::memory_order_release);
     for (int i = 0; i < 3; ++i) g_mirrorSrv[i].store(made[i], std::memory_order_release);
     return true;
 }
@@ -1283,21 +1305,28 @@ void ConcoursePaneScope::begin(ID3D11DeviceContext* ctx, UINT indexCount, UINT s
     // call: 0 is no pixel shader (a depth-only draw), and the draw has none to name. Any other context asks the context for its pixel shader.
     const bool followed = ctx == g_immediate.load(std::memory_order_relaxed);
     const uint64_t ps = followed ? bindingShaderHash(BindSlot::Ps) : pixelShaderHash(ctx);
-    if (g_withholdNow.load(std::memory_order_relaxed)) {
+    const bool cullOn = g_withholdNow.load(std::memory_order_relaxed);
+    const bool sealedOn = g_withholdSealedNow.load(std::memory_order_relaxed);
+    if (cullOn || sealedOn) {
         // The outside (smoke, trails, ship lasers, the planet) is not issued while the cull is on. By pixel shader on any context; by vertex shader too on the
         // immediate one, because a terrain patch has no pixel shader. Checked before `if (!ps) return`.
         int fam = cc::withheldPsIndex(ps);
+        bool sealedToo = fam >= 0 && cc::kWithheldPs[fam].sealedToo;
         if (fam < 0 && followed) {
             const int v = cc::withheldVsIndex(bindingShaderHash(BindSlot::Vs));
-            if (v >= 0) fam = static_cast<int>(cc::kWithheldPsCount) + v;
+            if (v >= 0) {
+                fam = static_cast<int>(cc::kWithheldPsCount) + v;
+                sealedToo = cc::kWithheldVs[v].sealedToo;
+            }
         }
-        if (fam >= 0) {
+        if (fam >= 0 && (cullOn || sealedToo)) {
             withheld_ = true;
             g_withheld.fetch_add(1, std::memory_order_relaxed);
             g_withheldFam[fam].fetch_add(1, std::memory_order_relaxed);
             return;
         }
         // The glows that may also be the room's: their far pixels are dropped by the mark (concourse_cull_core.h, farLimitedPs). Immediate context only, as the mark is.
+        if (!cullOn) return;   // sealed: nothing below is for a sealed hangar
         if (followed && cc::farLimitedPs(ps)) {
             if (ensureMarked(ctx, calls)) {
                 UINT ref = 0;
@@ -1371,6 +1400,7 @@ void ConcoursePaneScope::begin(ID3D11DeviceContext* ctx, UINT indexCount, UINT s
     planOpaque_ = opaque;
     planTint_ = tint;
     planSoft_ = mode == kModeMirrorSoft;
+    planGlow_ = tint ? 0.0f : glowOf(mode) * opacity;
     if (tint) {
         const float* c = cc::kPaneColours[tintSlotOf(indexCount) % cc::kPaneColourCount];
         for (int k = 0; k < 3; ++k) planFactor_[k] = c[k] * cc::kPaneTintIntensity;
@@ -1388,6 +1418,33 @@ void ConcoursePaneScope::begin(ID3D11DeviceContext* ctx, UINT indexCount, UINT s
 
 // Called right after the game's own draw. Closes the share query (so the bay's coverage is the game's draw alone) and the test's first query, then, if the plan
 // says so and the mark pass could run, binds the mirror's state and returns true. Every false return leaves the context as the game had it.
+bool ConcoursePaneScope::nextMirrorPassSlow() noexcept {
+    if (!mirrorBound_) {
+        if (!beginMirrorSlow()) {
+            family_ = false;
+            return false;
+        }
+        mirrorBound_ = true;
+        return true;
+    }
+    // The mirror has drawn. Its count for the side test ends here, whether or not a glow follows; the glow is the last pass.
+    family_ = false;
+    if (testSlot_ >= 0 && (flags_ & kFlagTestMirror) != 0) {
+        testCloseMirror(ctx_, testSlot_);
+        flags_ &= ~kFlagTestMirror;
+        testSlot_ = -1;
+    }
+    if (!(planGlow_ > 0.0f) || (flags_ & kFlagSrv) == 0 || (flags_ & kFlagBlend) == 0) return false;
+    ID3D11BlendState* bs = g_bsGlow.load(std::memory_order_acquire);
+    ID3D11ShaderResourceView* mine[3] = {g_mirrorSrv[0].load(std::memory_order_acquire), g_mirrorSrv[1].load(std::memory_order_acquire),
+                                         g_glowT10.load(std::memory_order_acquire)};
+    if (!bs || !mine[0] || !mine[1] || !mine[2]) return false;
+    calls_->setSrv(ctx_, kPaneSrvFirst, kPaneSrvCount, mine);
+    const FLOAT factor[4] = {planGlow_, planGlow_, planGlow_, planGlow_};
+    calls_->setBlend(ctx_, bs, factor, 0xFFFFFFFFu);
+    return true;
+}
+
 bool ConcoursePaneScope::beginMirrorSlow() noexcept {
     if ((flags_ & kFlagQuery) != 0) {
         if (query_ >= 0) closeShareQuery(ctx_, query_);
@@ -1630,13 +1687,13 @@ void pollConfig(uint64_t nowMs) {
     bindKey(g_keyCapture, g_keyCaptureText, Config::get().getString("hotkey.concourse_pane_capture", ""), "hotkey.concourse_pane_capture", "capture key");
     bindKey(g_keyMode, g_keyModeText, Config::get().getString("hotkey.concourse_pane_mode", ""), "hotkey.concourse_pane_mode", "mode key");
     g_keysBound = true;
-    const std::string modeT = Config::get().getString("diag.concourse_pane_mode", "mirror");
+    const std::string modeT = Config::get().getString("diag.concourse_pane_mode", "mirror-lit");
     if (!g_modeTextSeen || modeT != g_modeAppliedText) {
         g_modeTextSeen = true;
         g_modeAppliedText = modeT;
-        uint32_t m = kModeMirror;
+        uint32_t m = kModeLit;
         if (parseMode(modeT, &m)) setMode(m, "diag.concourse_pane_mode");
-        else Log::get().note("concourse pane: diag.concourse_pane_mode = \"%s\" is not mirror, mirror-soft, tint or off; the mode is unchanged", modeT.c_str());
+        else Log::get().note("concourse pane: diag.concourse_pane_mode = \"%s\" is not mirror-lit, mirror-bright, mirror-brightest, mirror, mirror-soft, tint or off; the mode is unchanged", modeT.c_str());
     }
     const std::string beyondT = Config::get().getString("diag.concourse_mirror_beyond", "");
     if (!g_beyondTextSeen || beyondT != g_beyondAppliedText) {
@@ -1689,8 +1746,10 @@ void updateArmed() noexcept {
     const bool withhold = g_feedWithhold.load(std::memory_order_relaxed);   // whatever the mode: F4 at off shows what the cull leaves
     const bool shares = g_feedMeasure.load(std::memory_order_relaxed) && g_shareOn.load(std::memory_order_relaxed);
     g_treatNow.store(treat, std::memory_order_release);
+    const bool sealed = g_feedSealed.load(std::memory_order_relaxed);
     g_withholdNow.store(withhold, std::memory_order_release);
-    detail::g_concoursePaneArmed.store(treat || withhold || shares || g_capturing.load(std::memory_order_relaxed), std::memory_order_release);
+    g_withholdSealedNow.store(sealed, std::memory_order_release);
+    detail::g_concoursePaneArmed.store(treat || withhold || sealed || shares || g_capturing.load(std::memory_order_relaxed), std::memory_order_release);
 }
 
 }  // namespace
@@ -1748,6 +1807,7 @@ void concoursePaneSetFeed(const ConcoursePaneFeed& feed) noexcept {
     }
     if (!g_feedWithhold.exchange(feed.withhold, std::memory_order_relaxed) && feed.withhold)
         g_plainFrom.store(g_frameNow.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    g_feedSealed.store(feed.sealed, std::memory_order_relaxed);
     g_bayOpacity.store(feed.bayOpacity, std::memory_order_relaxed);
     updateArmed();
 }
@@ -1779,7 +1839,8 @@ void concoursePaneTick(ID3D11Device* device, uint32_t frame, uint64_t nowMs) noe
     g_social = cc::concourseSocialOnFoot(journalStatusFlags2(), known, raw.gameplay);
     if (g_keyMode && g_keyMode->pressed()) {
         const uint32_t cur = g_mode.load(std::memory_order_relaxed);
-        const uint32_t next = cur == kModeMirror ? kModeMirrorSoft : cur == kModeMirrorSoft ? kModeTint : cur == kModeTint ? kModeOff : kModeMirror;
+        const uint32_t next = cur == kModeLit ? kModeBright : cur == kModeBright ? kModeBrightest : cur == kModeBrightest ? kModeMirror : cur == kModeMirror ? kModeMirrorSoft
+                              : cur == kModeMirrorSoft ? kModeTint : cur == kModeTint ? kModeOff : kModeLit;
         setMode(next, g_social ? "hotkey.concourse_pane_mode" : "hotkey.concourse_pane_mode; it applies on foot in social space");
     }
     if (g_keyCapture && g_keyCapture->pressed()) {
