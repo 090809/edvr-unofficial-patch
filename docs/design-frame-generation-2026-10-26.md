@@ -2,12 +2,9 @@
 
 ## Status
 
-- **State (2026-11-07): Phase 1 first slice BUILT, NOT FLOWN** (branch
-  `framegen-phase1` of the fork `090809/edvr-unofficial-patch`; 2026-11-07
-  entry). Scores far, cockpit and world, and H6; mover, reactive, H4, H8, H9
-  and the surface classifier are not built. Design from OFXR-Bridge
-  `d7fcca72` and EDVR `6b8ef374`; dated entries add AFW and the flat profile
-  (10-27) and VectorXR (10-30). No issue is filed yet.
+- **State (2026-11-07): Phase 1 first slice BUILT, NOT FLOWN** (fork branch
+  `framegen-phase1`; far, cockpit, world and H6 only; 2026-11-07 entry).
+  Design from OFXR-Bridge `d7fcca72` and EDVR `6b8ef374`. No issue yet.
 - **Recommendation:** take OFXR-Bridge's frame loop, not its synthesizer. Elite
   renders at half the headset rate and EDVR's runtime presents every display
   period. The frame in between is **extrapolated** from Elite's newest frame,
