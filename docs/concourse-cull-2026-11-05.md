@@ -2,7 +2,7 @@
 
 ## Status
 
-- **State:** Flight 2 flown 2026-11-06 flat on Steam, log `edvr_gfx_20261106_040008`, build e7b4b49b. The texture swap reads as a mirror, the clear on approach fired correctly every time, and frame time went from about 16 ms to the 90 fps cap. It also mirrored every piece of glass in the room, and the big plate cluster stayed. The third build (mirror by depth, smooth, far names culled) is not flown. Not merged. Extends `fix.optimized_stations`; off unless the temporary keys turn it on.
+- **State:** Flight 2 flown 2026-11-06 flat on Steam, log `edvr_gfx_20261106_040008`, build e7b4b49b. The texture swap reads as a mirror, the clear on approach fired correctly every time, and frame time went from about 16 ms to the 90 fps cap. It also mirrored every piece of glass in the room, and the big plate cluster stayed. The third build b19b368d (mirror by depth, smooth, far names culled; full build green, optimized_station_test 970 checks) is installed on Steam and not flown. Not merged. Extends `fix.optimized_stations`; off unless the temporary keys turn it on.
 - **Goals (Sean, 2026-11-05):** (1) on foot in the large-station concourse, cull everything outside the bay windows; (2) skylights and the window above the lift bank become a permanent mirrored surface, so missing structure is never seen; (3) approaching the bay windows clears the mirror and stops the cull, so the station interior is visible from there.
 - **Direction:** identify records by the store's name, keep an allow-list, and make the panes opaque. The fitted hall, the shader-pair lists and the shell read-back from the earlier attempt are not carried over (see Ruled out).
 - **Answered by Flight 1:** H1 yes, with named survivors. H2 yes. H3 yes for the bay window: VS `98397963AAEC45D3` / PS `66B08F89E4926C01`, n=36. H5 yes by eye: the room stayed lit. See "Flight 1 results".
@@ -15,7 +15,7 @@
   - **H6** `Standard_SocialArea` marks the large-station concourse at other stations too. Still unflown.
 - **Temporary keys (all removed when the arc closes):** `diag.concourse_cull` (on, off), `diag.concourse_keep` (extra name prefixes), `diag.concourse_pane_mode`, `diag.concourse_panes`, `diag.concourse_clear_share`, `diag.concourse_mirror_beyond`, `hotkey.concourse_cull`, `hotkey.concourse_pane_capture`, `hotkey.concourse_pane_mode`.
 - **Ruled out:** see the section of that name. **Issues:** none yet.
-- **Next flight:** the Flight 3 list. Keys in both Steam inis: `hotkey.concourse_cull` F2 (the cull and the mirrors), `hotkey.concourse_pane_capture` F3 (logs a ranking, changes nothing), `hotkey.concourse_pane_mode` F4.
+- **Next flight:** the Flight 3 list, on build b19b368d, installed on Steam 2026-11-06. Keys in both Steam inis: `hotkey.concourse_cull` F2 (the cull and the mirrors), `hotkey.concourse_pane_capture` F3 (logs a ranking, changes nothing), `hotkey.concourse_pane_mode` F4.
 
 ## What the earlier attempt learned
 
@@ -187,7 +187,7 @@ On the third build, flat, at the same station. Start with F2 off.
 6. NumLock with the mirror on, looking at the bay from across the room, then NumLock at a shop window.
 7. If it is cheap, repeat 2 and 5 at a second station type.
 
-Then: `python tools\edvr_log.py --target steam --expect-build <this build> --grep "concourse"`.
+Then: `python tools\edvr_log.py --target steam --expect-build b19b368d --grep "concourse"`.
 
 ## Performance candidates
 
