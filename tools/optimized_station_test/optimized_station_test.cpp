@@ -3872,21 +3872,28 @@ int main(int argc, char** argv) {
             check(!to.on(), "lift gate: stop is off");
         }
 
-        // The view test's table (TEMPORARY): mode to masks, effects, sun.
+        // The view test (TEMPORARY): mode to keep radius, and the judgement that uses it.
         {
-            struct Row { uint32_t mode; uint8_t masks; bool active, effects, sun; };
-            const Row table[] = {{0, 0, false, false, false}, {1, cc::kViewMask3DC, true, true, false}, {2, cc::kViewMask3DA, true, true, false},
-                                 {3, static_cast<uint8_t>(cc::kViewMask3DC | cc::kViewMask3DA), true, true, false}, {4, static_cast<uint8_t>(cc::kViewMask3DC | cc::kViewMask3DA), true, false, false},
-                                 {5, static_cast<uint8_t>(cc::kViewMask3DC | cc::kViewMask3DA), true, false, true}, {6, 0, false, false, false}, {99, 0, false, false, false}};
+            const float want[] = {0.0f, 150.0f, 80.0f, 40.0f, 20.0f, 10.0f, 0.0f, 0.0f};
+            const uint32_t modes[] = {0, 1, 2, 3, 4, 5, 6, 99};
             bool all = true;
-            for (const Row& r : table) {
-                const cc::ViewTest t = cc::viewTestOf(r.mode);
-                all = all && t.masks == r.masks && t.active == r.active && t.effectsDrawn == r.effects && t.sunSkipped == r.sun;
-            }
-            check(all && cc::kViewTestModes == 6 && cc::kViewMask3DC != cc::kViewMask3DA, "view test: modes 0 to 5 give the masks, the effects and the sun of the table, and an unknown mode is mode 0");
-            check(std::strlen(cc::viewTestText(0)) > 0 && std::strcmp(cc::viewTestText(0), cc::viewTestText(1)) != 0 && std::strstr(cc::viewTestText(5), "sun pair skipped") != nullptr &&
-                      std::strstr(cc::viewTestText(2), "+0x3DA") != nullptr && std::strstr(cc::viewTestText(1), "+0x3DC") != nullptr,
-                  "view test: each mode's text names its masks, and mode 5 the sun");
+            for (size_t i = 0; i < 8; ++i) all = all && cc::viewTestOf(modes[i]).keepRadiusM == want[i];
+            check(all && cc::kViewTestModes == 6, "view test: modes 0 to 5 keep from 0 (off), 150, 80, 40, 20 and 10 m, and an unknown mode is off");
+            using J = cc::Judge;
+            check(cc::concourseJudge(true, true, true, 600.0f, 300.0f, false, false, 150.0f) == J::kKeepBig && cc::concourseJudge(true, false, true, 900.0f, 150.0f, false, false, 150.0f) == J::kKeepBig,
+                  "view test judge: a record of the keep radius or more is kept, past 200 m, allowed name or not");
+            check(cc::concourseJudge(true, false, true, 900.0f, 149.0f, false, false, 150.0f) == J::kCull && cc::concourseJudge(true, true, true, 900.0f, 100.0f, false, false, 150.0f) == J::kCull &&
+                      cc::concourseJudge(true, false, true, 10.0f, 2.0f, false, false, 150.0f) == J::kKeepSmallClose && cc::concourseJudge(true, true, true, 100.0f, 3.0f, false, false, 150.0f) == J::kKeepName,
+                  "view test judge: a smaller record is judged as before");
+            check(cc::concourseJudge(true, true, true, 600.0f, 300.0f, false, true, 150.0f) == J::kCull && cc::concourseJudge(true, true, true, 3.0f, 3.0f, false, true, 150.0f) == J::kKeepSmallClose,
+                  "view test judge: the lift rule comes first and ignores the keep radius");
+            check(cc::concourseJudge(true, true, true, 600.0f, 300.0f, false, false, 0.0f) == J::kCull && cc::concourseJudge(true, false, true, 900.0f, 1000.0f, false, false) == J::kCull &&
+                      cc::concourseJudge(true, true, true, 150.0f, 3.0f, false, false, 0.0f) == J::kKeepName,
+                  "view test judge: a keep radius of 0 changes nothing");
+            check(cc::concourseJudge(true, false, false, 0.0f, 500.0f, false, false, 150.0f) == J::kKeepUnreadableSphere && cc::concourseJudge(true, false, true, 900.0f, 0.0f, false, false, 150.0f) == J::kKeepUnreadableSphere &&
+                      cc::concourseJudge(false, false, true, 900.0f, 500.0f, false, false, 150.0f) == J::kKeepBig && cc::concourseJudge(false, false, true, 900.0f, 100.0f, false, false, 150.0f) == J::kCull,
+                  "view test judge: an unreadable sphere behaves as before; an unreadable name is kept by size and culled below it");
+            check(cc::judgeKeeps(J::kKeepBig), "view test judge: kept by size is a keep");
         }
 
         // The lift survey's name test and moved test (TEMPORARY, log only).

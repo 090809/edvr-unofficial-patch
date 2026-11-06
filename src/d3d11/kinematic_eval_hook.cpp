@@ -89,7 +89,6 @@ alignas(8) std::atomic<GateProbeBuilderFn> gateProbeBuilder{nullptr};
 std::atomic<DirectVetoFn> directVeto{nullptr};
 std::atomic<bool> directVetoWanted{false};
 std::atomic<RigVetoFn> rigVeto{nullptr};
-std::atomic<RigMaskFn> rigMasks{nullptr};   // TEMPORARY (the concourse view test): which masks to zero on a vetoed rig; null or 0: the emulation as ever
 std::atomic<bool> rigVetoWanted{false};
 std::atomic<uint64_t> rigEmulateFaults{0};
 alignas(8) std::atomic<GateProbePartFn> gateProbePart{nullptr};
@@ -445,36 +444,6 @@ bool rigOffScreenEmulate(uintptr_t rig) noexcept {
     return done;
 }
 
-// TEMPORARY (the concourse view test): the forward with the rig's view-class masks (u16 at +0x3DC for bit 0, +0x3DA for bit 1) zeroed and restored on every path out,
-// the fault of the forward included (__finally). Only POD locals, so SEH and the early return are legal here. A mask that cannot be read is left alone.
-__declspec(noinline) uintptr_t forwardMasksZeroed(RigEvalFn forward,uintptr_t rig,uintptr_t poseCtx,uint8_t which) noexcept {
-    static const uintptr_t kOff[2]={0x3DCu,0x3DAu};
-    uint16_t saved[2]={0,0};
-    bool zeroed[2]={false,false};
-    for(int i=0;i<2;++i) {
-        if((which&(1u<<i))==0) continue;
-        __try {
-            saved[i]=*reinterpret_cast<volatile uint16_t*>(rig+kOff[i]);
-            *reinterpret_cast<volatile uint16_t*>(rig+kOff[i])=0;
-            zeroed[i]=true;
-        } __except(EXCEPTION_EXECUTE_HANDLER) {
-        }
-    }
-    uintptr_t out=0;
-    __try {
-        out=forward(rig,poseCtx);
-    } __finally {
-        for(int i=0;i<2;++i) {
-            if(!zeroed[i]) continue;
-            __try {
-                *reinterpret_cast<volatile uint16_t*>(rig+kOff[i])=saved[i];
-            } __except(EXCEPTION_EXECUTE_HANDLER) {
-            }
-        }
-    }
-    return out;
-}
-
 __declspec(noinline) uintptr_t __fastcall rigEvalObserved(uintptr_t rig,uintptr_t poseCtx) noexcept {
     emcpu::count(emcpu::kEval);
     KinematicEvalProbe* probe=observer.load(std::memory_order_acquire);
@@ -485,21 +454,7 @@ __declspec(noinline) uintptr_t __fastcall rigEvalObserved(uintptr_t rig,uintptr_
     // The early veto: a veto performs Elite's off-screen branch in place of the body and returns without the forward. The decision is the
     // station's (optimized_station.cpp), and it answers only while the station is sealed.
     if(const auto veto=rigVeto.load(std::memory_order_acquire)) {
-        if(veto(rig,poseCtx)) {
-            const auto pick=rigMasks.load(std::memory_order_acquire);
-            const uint8_t which=pick?pick(rig,poseCtx):0;
-            if(which==0) {
-                if(rigOffScreenEmulate(rig)) return 0;
-            } else {
-                // TEMPORARY (the concourse view test): not the off-screen branch: the forward, with the chosen masks zeroed around it.
-                const auto fwd=reinterpret_cast<RigEvalFn>(g_rigEvalEntry.forward.load(std::memory_order_acquire));
-                const uintptr_t prev=t_rigCurrent;
-                t_rigCurrent=rig;
-                const uintptr_t o=forwardMasksZeroed(fwd,rig,poseCtx,which);
-                t_rigCurrent=prev;
-                return o;
-            }
-        }
+        if(veto(rig,poseCtx) && rigOffScreenEmulate(rig)) return 0;
     }
     // The rig whose forward is running on this thread: the store's synchronous association reads it (restored after the forward).
     const auto forward=reinterpret_cast<RigEvalFn>(g_rigEvalEntry.forward.load(std::memory_order_acquire));
@@ -1279,10 +1234,6 @@ void recomputeGateLocked() noexcept;
 
 void kinematicEvalSetRigVeto(RigVetoFn fn) noexcept {
     rigVeto.store(fn,std::memory_order_release);
-}
-
-void kinematicEvalSetRigMasks(RigMaskFn fn) noexcept {
-    rigMasks.store(fn,std::memory_order_release);
 }
 
 uint64_t kinematicEvalRigEmulateFaults() noexcept {

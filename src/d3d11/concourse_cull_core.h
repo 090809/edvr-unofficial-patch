@@ -72,7 +72,7 @@ constexpr float kCloseDistanceM = 40.0f;
 // the anchor and the hub are exempt, because the gate reads them from the store.
 constexpr float kAllowedFarM = 200.0f;
 
-enum class Judge : uint8_t { kKeepName, kKeepUnreadableName, kKeepUnreadableSphere, kKeepSmallClose, kCull };
+enum class Judge : uint8_t { kKeepName, kKeepUnreadableName, kKeepUnreadableSphere, kKeepSmallClose, kKeepBig, kCull };
 
 inline bool judgeKeeps(Judge j) noexcept { return j != Judge::kCull; }
 
@@ -84,7 +84,9 @@ constexpr float kLiftKeepM = 8.0f;
 // One record. A record whose name is unreadable, or an allowed name, is kept unless its sphere is readable and wholly past kAllowedFarM (distance - radius); the
 // anchor and the hub (`farExempt`, computed from the name by the caller) are kept however far. Then: keep an unreadable sphere (not finite, or no radius); keep a
 // small, close record; cull. `lift` (the player is in a shut lift cabin) replaces all of that by the rule above kLiftKeepM; `farExempt` does not apply to it.
-inline Judge concourseJudge(bool nameReadable, bool allowed, bool sphereReadable, float distance, float radius, bool farExempt, bool lift = false) noexcept {
+// `keepRadiusM` (the view test; 0 is off): a record with a readable sphere and a radius of at least this is kept, before the name and far rules; the lift comes first.
+inline Judge concourseJudge(bool nameReadable, bool allowed, bool sphereReadable, float distance, float radius, bool farExempt, bool lift = false,
+                            float keepRadiusM = 0.0f) noexcept {
     const bool sphereOk = sphereReadable && std::isfinite(distance) && std::isfinite(radius) && radius > 0.0f;
     if (lift) {
         if (!sphereOk) return Judge::kKeepUnreadableSphere;
@@ -92,6 +94,7 @@ inline Judge concourseJudge(bool nameReadable, bool allowed, bool sphereReadable
         if (radius <= kSmallRadiusM && surface <= kLiftKeepM) return Judge::kKeepSmallClose;
         return Judge::kCull;
     }
+    if (keepRadiusM > 0.0f && sphereOk && radius >= keepRadiusM) return Judge::kKeepBig;   // the view test: kept by size, whatever the name or the far rule
     const bool pastRoom = sphereOk && distance - radius > kAllowedFarM;
     if (!nameReadable) return pastRoom ? Judge::kCull : Judge::kKeepUnreadableName;
     if (allowed) return (!farExempt && pastRoom) ? Judge::kCull : Judge::kKeepName;
@@ -504,7 +507,7 @@ constexpr float kLiftInsideM = 1.3f;       // the camera to the cabin's centre: 
 constexpr float kLiftGap1ShutM = 1.55f;    // TurboLiftDoorLeft to TurboLiftDoorRight: over this the doors are open
 constexpr float kLiftGap2ShutM = 1.42f;    // TurboLiftDoorLeft2 to TurboLiftDoorRight2
 constexpr uint32_t kLiftShutReadings = 6;  // both pairs shut, after being seen open, this many ticks running
-constexpr uint64_t kLiftMaxOnMs = 30000;   // a ride is about 6 s shut; a gate stuck on stands down
+constexpr uint64_t kLiftMaxOnMs = 5000;    // the gate arms about 6 s before the camera cut; it lets go after 5 s, so the room's rigs run again about a second before the doors open (a gate stuck on stands down the same way)
 struct LiftReading {
     bool cabin = false;        // a record named TurboLift is in view
     float cabinDistM = 0.0f;   // the camera to its centre
@@ -517,7 +520,7 @@ inline const char* liftEndName(LiftEnd e) noexcept {
         case LiftEnd::kDoorsMoved: return "the doors moved";
         case LiftEnd::kCut: return "the camera cut";
         case LiftEnd::kLeftCabin: return "left the cabin";
-        case LiftEnd::kTimedOut: return "timed out";
+        case LiftEnd::kTimedOut: return "released before arrival";
         case LiftEnd::kGateOff: return "the cull's conditions ended";
         default: return "none";
     }
@@ -578,39 +581,17 @@ private:
 };
 
 // ---- The view test (TEMPORARY, hotkey.concourse_view_test; removed when the arc closes, docs\concourse-cull-2026-11-05.md) ------------------------------------------
-// Which of the rig's three view-class masks (u16 at rig+0x3DA, +0x3DC; build 334925) are zeroed around the forward of a rig the veto would refuse, whether the outside
-// effects are drawn, and whether the sun pair is skipped. Mode 0 is today's cull and veto. Modes 1 to 5 forward the vetoed rigs with the masks zeroed instead, keep the
-// records and leave the panes untreated; the lift rule still judges inside a shut cabin.
+// Each press steps a mode: the radius, in metres, from which an outside record is kept whatever its name (0: today's cull and the flat fill). Modes 1 to 5 also leave the
+// panes as plain glass and keep the outside effects withheld; the lift rule still judges inside a shut cabin.
 constexpr uint32_t kViewTestModes = 6;
-constexpr uint8_t kViewMask3DC = 1, kViewMask3DA = 2;   // the bits of ViewTest::masks
 struct ViewTest {
-    uint8_t masks = 0;           // kViewMask3DC | kViewMask3DA
-    bool active = false;         // modes 1 to 5: forward masked, keep the records, leave the panes
-    bool effectsDrawn = false;   // the withheld families and the far-glow limit are off
-    bool sunSkipped = false;     // the sun pair is not drawn
+    float keepRadiusM = 0.0f;
 };
 inline ViewTest viewTestOf(uint32_t mode) noexcept {
+    static const float kRadius[kViewTestModes] = {0.0f, 150.0f, 80.0f, 40.0f, 20.0f, 10.0f};
     ViewTest t;
-    switch (mode) {
-        case 1: t.masks = kViewMask3DC; t.effectsDrawn = true; break;
-        case 2: t.masks = kViewMask3DA; t.effectsDrawn = true; break;
-        case 3: t.masks = kViewMask3DC | kViewMask3DA; t.effectsDrawn = true; break;
-        case 4: t.masks = kViewMask3DC | kViewMask3DA; break;
-        case 5: t.masks = kViewMask3DC | kViewMask3DA; t.sunSkipped = true; break;
-        default: return t;
-    }
-    t.active = true;
+    if (mode < kViewTestModes) t.keepRadiusM = kRadius[mode];
     return t;
-}
-inline const char* viewTestText(uint32_t mode) noexcept {
-    switch (mode) {
-        case 1: return "rig+0x3DC zeroed on outside rigs, outside effects drawn, sun as now";
-        case 2: return "rig+0x3DA zeroed on outside rigs, outside effects drawn, sun as now";
-        case 3: return "rig+0x3DC and +0x3DA zeroed on outside rigs, outside effects drawn, sun as now";
-        case 4: return "rig+0x3DC and +0x3DA zeroed on outside rigs, outside effects withheld, sun as now";
-        case 5: return "rig+0x3DC and +0x3DA zeroed on outside rigs, outside effects withheld, sun pair skipped";
-        default: return "no masks zeroed: today's cull and veto, outside effects withheld, sun as now";
-    }
 }
 
 // ---- The glow levels by window type (diag.concourse_glow = "sky,angled,other,bay") ---------------------------------------------------------------------
