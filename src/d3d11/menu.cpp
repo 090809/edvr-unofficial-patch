@@ -60,6 +60,7 @@
 #include "terrain_checkerboard.h"   // Elite's terrain checkerboard rendering in VR: the worker's tick and the word it publishes
 #include "ui_layer_math.h"  // uiQualityParse: the HUD Anti-Aliasing row dims while fix.ui_quality is off (or the anti-aliasing is), UI quality read as the layer reads it
 #include "vscreen.h"        // vScreenRenderBelowEye: Elite's Supersampling below 1, from the sizes
+#include "concourse_pane.h"     // concoursePaneTakeToast: the concourse window mode's toast (TEMPORARY, docs\concourse-cull-2026-11-05.md)
 #include "vr_ssaa_hold.h"       // vrSsaaHoldNoticeDue: the Supersampling hold's toast (a requested value held at 1.0)
 #include "vr_ssaa_hold_math.h"  // ssaahold::formatHoldToast
 #include "mode_watch.h"         // modeWatchNoticeDue: the 3D mode watch's toast, once per commit
@@ -4856,11 +4857,14 @@ void menuShowNotice(const char* text) {
         Log::get().note("menu: notice \"%s\" not queued: menu.toasts is off.", text);
         return;
     }
-    // The newest AA notice replaces an older one still waiting or on screen: a quick second press must not queue behind the first.
+    // The newest AA notice (or "Windows: " notice, the concourse pane mode) replaces an older one of its kind still waiting or on screen: a quick second press
+    // must not queue behind the first.
+    const char* const kind = std::strncmp(text, "Windows: ", 9) == 0 ? "Windows: " : "AA ";
+    const size_t kindLen = std::strlen(kind);
     for (size_t i = s.toastQueue.size(); i-- > 0;) {
-        if (s.toastQueue[i].compare(0, 3, "AA ") == 0) s.toastQueue.erase(s.toastQueue.begin() + static_cast<std::ptrdiff_t>(i));
+        if (s.toastQueue[i].compare(0, kindLen, kind) == 0) s.toastQueue.erase(s.toastQueue.begin() + static_cast<std::ptrdiff_t>(i));
     }
-    if (s.toastUp && s.toastText.compare(0, 3, "AA ") == 0) s.toastUntilMs = 0;
+    if (s.toastUp && s.toastText.compare(0, kindLen, kind) == 0) s.toastUntilMs = 0;
     s.toastQueue.push_back(text);
     Log::get().note("menu: notice \"%s\" queued as a toast.", text);
 }
@@ -4963,6 +4967,12 @@ void menuTick(ID3D11Device* dev) {
     State& s = g_s;
     menuDrainPluginRows();
     if (!s.configured) return;
+    {
+        // TEMPORARY (concourse window mode, docs\concourse-cull-2026-11-05.md): a hotkey change of the mode, and the capture's result, are said as a notice (flat: the panel's
+        // raster in the upper left, as the AA comparison's; VR: a toast). menuShowNotice keeps only the newest "Windows: " notice.
+        char windowsToast[64];
+        if (concoursePaneTakeToast(windowsToast, sizeof(windowsToast))) menuShowNotice(windowsToast);
+    }
     if (runtimeFlatProfile()) {
         guardedBudget(g_budget, [&] {
             const uint64_t now = nowMs();

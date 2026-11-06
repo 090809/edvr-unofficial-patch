@@ -93,7 +93,7 @@ struct TlsCounters {
     uint64_t rigHitVetoed = 0, rigHitKept = 0, rigHitMoved = 0, rigMiss = 0, rigStale = 0, rigAsked = 0;
     uint32_t sampleStore = 0, sampleProducer = 0, sampleRig = 0;   // the 1-in-32 sampling counters (the thread's own)
     uint64_t concRigSeen = 0, concRigVetoed = 0, concProdVetoed = 0, concProdKept = 0, concStoreCleared = 0;   // built 2026-11-05: the concourse cull's counts
-    uint64_t concKept[5] = {};
+    uint64_t concKept[4] = {};
 };
 thread_local TlsCounters tlsTc;
 void tcFlush(TlsCounters& t) noexcept;
@@ -272,8 +272,6 @@ ConcourseExtra g_concExtra;
 std::atomic<bool> g_concWanted{false};        // armed, on foot in social space and not sealed: the store gate is open (it sights the anchor, and judges while active)
 std::atomic<bool> g_concActive{false};        // the cull runs: wanted, the key or its override on, and the anchor seen within kConcAnchorFreshMs
 std::atomic<bool> g_liftGateOn{false};        // the tick's: the lift gate is on, the player is in a shut lift cabin (published in the snapshot as `lift`; part of g_concActive)
-// TEMPORARY (the concourse view test, hotkey.concourse_view_test; docs\concourse-cull-2026-11-05.md; removed when the arc closes): the keep radius in force (0: none), published to the callbacks in the snapshot.
-std::atomic<float> g_keepRadiusM{0.0f};
 std::atomic<bool> g_concSurveyArmed{false};   // the one-shot names are being gathered: the rig and producer vetoes forward so the store judges and names every record
 bool g_roomCutPending = false;   // the camera stepped over kRoomCutM this tick (resolveTickView); the concourse tick takes it, under the state lock
 float g_roomCutM = 0.0f;
@@ -297,7 +295,7 @@ uint32_t concourseNodeFlagsOf(const char* name) noexcept {
 struct ConcourseWin {   // the 5 s summary's window (the callbacks' counters flush here, tcFlush)
     std::atomic<uint64_t> rigSeen{0}, rigVetoed{0}, prodVetoed{0}, prodKept{0}, storeCleared{0};
     std::atomic<uint64_t> tot[6] = {};    // the same counts, never reset: rig seen, rig vetoed, producer vetoed, producer kept, small-close kept, store cleared (the lift's summary takes differences)
-    std::atomic<uint64_t> kept[5] = {};   // name, small-close, unreadable-name, unreadable-sphere, big (the producer's keeps)
+    std::atomic<uint64_t> kept[4] = {};   // name, small-close, unreadable-name, unreadable-sphere (the producer's keeps)
 };
 ConcourseWin g_concWin;
 
@@ -508,7 +506,6 @@ struct PadSnapshot {
     bool engagePending = false;   // built v14.31: an engage is pending: every pass gathers the near list, the own candidate and the tally
     bool concourse = false;       // built 2026-11-05: the concourse cull is active (the producer veto judges by name)
     bool lift = false;            // built 2026-11-06: the player is in a shut lift cabin: the judgement keeps only what is near (cc::concourseJudge)
-    float keepRadiusM = 0.0f;     // TEMPORARY (the view test): records of at least this radius are kept by size (cc::concourseJudge); 0 is off
     bool walkOn = false;          // TEMPORARY (the walk survey): this publication's passes report what the seal would cull against walkCell; nothing else reads either
     sealed::OwnCell walkCell;
 };
@@ -1457,7 +1454,7 @@ void tcFlush(TlsCounters& t) noexcept {
     g_concWin.tot[3].fetch_add(t.concProdKept, std::memory_order_relaxed);
     g_concWin.tot[4].fetch_add(t.concKept[1], std::memory_order_relaxed);
     g_concWin.tot[5].fetch_add(t.concStoreCleared, std::memory_order_relaxed);
-    for (int k = 0; k < 5; ++k) g_concWin.kept[k].fetch_add(t.concKept[k], std::memory_order_relaxed);
+    for (int k = 0; k < 4; ++k) g_concWin.kept[k].fetch_add(t.concKept[k], std::memory_order_relaxed);
     const uint32_t keepStamp = t.stamp;
     const uint32_t s0 = t.sampleStore, s1 = t.sampleProducer, s2 = t.sampleRig;
     t = TlsCounters{};
@@ -1935,7 +1932,6 @@ void concourseCountKept(TlsCounters& tc, cc::Judge j) noexcept {
         case cc::Judge::kKeepSmallClose: ++tc.concKept[1]; break;
         case cc::Judge::kKeepUnreadableName: ++tc.concKept[2]; break;
         case cc::Judge::kKeepUnreadableSphere: ++tc.concKept[3]; break;
-        case cc::Judge::kKeepBig: ++tc.concKept[4]; break;
         default: break;
     }
 }
@@ -1953,7 +1949,7 @@ bool concourseProducerVeto(uintptr_t rec) noexcept {
     if (sphere) prodPutGen(rec, centre, radius, s.prodGen);
     const bool nameReadable = ni.cls != sealed::NameClass::kUnnamed && ni.cls != sealed::NameClass::kNone;
     const float d = sphere ? sealed::distance(centre, s.cam) : 0.0f;
-    const cc::Judge j = cc::concourseJudge(nameReadable, (ni.flags & sealed::kNodeConcourseAllow) != 0, sphere, d, radius, (ni.flags & sealed::kNodeConcourseFarExempt) != 0, s.lift, s.keepRadiusM);
+    const cc::Judge j = cc::concourseJudge(nameReadable, (ni.flags & sealed::kNodeConcourseAllow) != 0, sphere, d, radius, (ni.flags & sealed::kNodeConcourseFarExempt) != 0, s.lift);
     if (cc::judgeKeeps(j)) {
         ++tc.concProdKept;
         concourseCountKept(tc, j);
@@ -2479,7 +2475,6 @@ void publishSnapshot() noexcept {
     s.engagePending = g_engagePending;
     s.concourse = g_concActive.load(std::memory_order_acquire);
     s.lift = g_liftGateOn.load(std::memory_order_acquire);
-    s.keepRadiusM = g_keepRadiusM.load(std::memory_order_relaxed);
     s.walkOn = g_walkPassArmed;
     if (s.walkOn) s.walkCell = g_walkCellCopy;
     g_engagePublished = g_engagePending;
@@ -2876,7 +2871,6 @@ void concourseSurveyNote(const char* name, cc::Judge j, float dist, float radius
         if (radius > 0.0f && std::isfinite(dist) && (a.nearest < 0.0f || dist < a.nearest)) a.nearest = dist;
         switch (j) {
             case cc::Judge::kKeepName: ++a.kept; break;
-            case cc::Judge::kKeepBig: ++a.kept; break;   // kept by size (the view test); the survey lists it with the kept
             case cc::Judge::kKeepSmallClose: ++a.smallClose; break;
             case cc::Judge::kKeepUnreadableSphere: ++a.unreadSphere; break;
             case cc::Judge::kCull:
@@ -2932,7 +2926,7 @@ void afterStoreConcourse(uintptr_t bucket, uintptr_t record) noexcept {
     const bool nameReadable = ni.cls != sealed::NameClass::kUnnamed && ni.cls != sealed::NameClass::kNone;
     const float d = sphere ? sealed::distance(wr.world, s.cam) : 0.0f;
     const cc::Judge j = cc::concourseJudge(nameReadable, (ni.flags & sealed::kNodeConcourseAllow) != 0, sphere, d, sphere ? wr.radius : 0.0f,
-                                      (ni.flags & sealed::kNodeConcourseFarExempt) != 0, s.lift, s.keepRadiusM);
+                                      (ni.flags & sealed::kNodeConcourseFarExempt) != 0, s.lift);
     const bool keep = cc::judgeKeeps(j);
     const float zero[3] = {0.0f, 0.0f, 0.0f};
     gatherRigNote(w, bucket, record, sphere ? wr.world : zero, sphere ? wr.radius : 0.0f, stamp,
@@ -3130,7 +3124,11 @@ Hotkey* g_concHotkey = nullptr;
 Hotkey* g_viewHotkey = nullptr;
 std::string g_viewHotkeyText;
 bool g_viewHotkeyBound = false;
-uint32_t g_viewTestMode = 0;
+// PROTOTYPE (the backdrop capture, hotkey.concourse_view_test = F6; docs\concourse-cull-2026-11-05.md "The window plan"): Lifting (the cull is off for cc::kBackdropLiftMs, the
+// outside effects still withheld), then Armed (the pane module is told to capture in the next frame, and its status is read each tick until it says what happened).
+enum class BackdropPhase : uint8_t { kIdle, kLifting, kArmed };
+BackdropPhase g_backdropPhase = BackdropPhase::kIdle;
+uint64_t g_backdropStartMs = 0, g_backdropArmMs = 0;
 std::string g_concHotkeyText;
 bool g_concHotkeyBound = false;
 bool g_concWasActive = false;
@@ -3230,34 +3228,88 @@ void concoursePoll(uint64_t now) {
         g_viewHotkeyBound = true;
         g_viewHotkeyText = viewKey;
         g_viewHotkey->setBinding(viewKey.c_str());
-        if (g_viewHotkey->bound()) Log::get().note("concourse view test: hotkey.concourse_view_test = \"%s\" bound (TEMPORARY: a press steps the mode 0 to 5; each step logs the views)", viewKey.c_str());
-        else if (!viewKey.empty()) Log::get().note("concourse view test: hotkey.concourse_view_test = \"%s\" bound nothing, so the test cannot be used this session", viewKey.c_str());
+        if (g_viewHotkey->bound()) Log::get().note("concourse view test: hotkey.concourse_view_test = \"%s\" bound (TEMPORARY, a prototype: a press lifts the cull for %llu ms and captures the view through the windows, see concourse_pane.h)", viewKey.c_str(), static_cast<unsigned long long>(cc::kBackdropLiftMs));
+        else if (!viewKey.empty()) Log::get().note("concourse view test: hotkey.concourse_view_test = \"%s\" bound nothing, so the capture cannot be used this session", viewKey.c_str());
         else if (!first) Log::get().note("concourse view test: hotkey.concourse_view_test cleared");
     }
 }
 
-// A press of hotkey.concourse_view_test: the next mode. The rig verdicts are made afresh (the keep radius changes which rigs hold a kept record), and while the cull is
-// active the names survey runs, listing the culled names (concourseSurveyReport).
 bool g_concSurveyListPending = false;   // the next survey is the press's or F3's: it lists the culled names
-void concourseViewTestPress(bool active, uint64_t now) {
-    g_viewTestMode = (g_viewTestMode + 1) % cc::kViewTestModes;
-    const float r = cc::viewTestOf(g_viewTestMode).keepRadiusM;
-    if (r > 0.0f) Log::get().note("concourse view test: mode %u: outside records of radius %.0f m or more are kept, plain glass", g_viewTestMode, static_cast<double>(r));
-    else Log::get().note("concourse view test: mode %u: today's cull and the flat fill", g_viewTestMode);
-    bumpRigEpoch();
-    if (active) {
-        g_concSurveyDueMs = now;
-        g_concSurveyListPending = true;
+
+// A press of hotkey.concourse_view_test: the backdrop capture. Only while the cull's own part is on.
+void concourseBackdropPress(bool cullPartOn, uint64_t now) {
+    if (g_backdropPhase != BackdropPhase::kIdle) {
+        Log::get().note("concourse backdrop: press ignored: a capture is already running");
+        return;
     }
+    if (!cullPartOn) {
+        Log::get().note("concourse backdrop: press refused: the cull's own part is not on (no cull, the bay is clearing, or not in the concourse)");
+        return;
+    }
+    concoursePaneSetBackdropMode("hotkey.concourse_view_test");
+    g_backdropPhase = BackdropPhase::kLifting;
+    g_backdropStartMs = now;
+    Log::get().note("concourse backdrop: capture requested: the cull lifts for %llu ms, the outside effects stay withheld", static_cast<unsigned long long>(cc::kBackdropLiftMs));
 }
 
+// One tick of the capture. True while the cull is to stay lifted. The result is logged once, whichever way it ends, and what it says tells the ways apart: never armed
+// ("no result"), armed with no pane drawn ("no pane draw reached the scene copy"), scene copied with no pane captured, refused (the pane module's own line says why), done.
+bool concourseBackdropStep(uint64_t now, bool wantCull) {
+    if (g_backdropPhase == BackdropPhase::kIdle) return false;
+    const unsigned long long lifted = static_cast<unsigned long long>(now - g_backdropStartMs);
+    const auto finish = [&]() {
+        concoursePaneBackdropEnd();
+        g_backdropPhase = BackdropPhase::kIdle;
+        return false;
+    };
+    if (!wantCull) {
+        Log::get().note("concourse backdrop: capture abandoned after %llu ms: the cull is no longer wanted (left the concourse, the hangar sealed, or the key is off)", lifted);
+        return finish();
+    }
+    if (g_backdropPhase == BackdropPhase::kLifting) {
+        if (now - g_backdropStartMs >= cc::kBackdropLiftMs) {
+            concoursePaneArmCapture();
+            g_backdropPhase = BackdropPhase::kArmed;
+            g_backdropArmMs = now;
+        }
+        return true;
+    }
+    const ConcourseBackdropStatus st = concoursePaneBackdropStatus();
+    switch (st.phase) {
+        case ConcourseBackdropPhase::kDone:
+            Log::get().note("concourse backdrop: capture: lifted %llu ms, scene %ux%u format %s, %u pane draws captured", lifted, st.sceneW, st.sceneH, st.sceneFormat, st.paneDraws);
+            return finish();
+        case ConcourseBackdropPhase::kRefused:
+            Log::get().note("concourse backdrop: capture failed after %llu ms lifted: refused (%s)", lifted, st.refusal[0] ? st.refusal : "no reason recorded");
+            return finish();
+        case ConcourseBackdropPhase::kEmpty:
+            if (!st.sceneCopied)
+                Log::get().note("concourse backdrop: capture empty after %llu ms lifted: no pane draw reached the scene copy in %u frames (no pane was drawn, or the copy was refused: see the scene copy line)",
+                                lifted, st.framesWaited);
+            else
+                Log::get().note("concourse backdrop: capture empty after %llu ms lifted: scene %ux%u format %s was copied, but 0 pane draws were captured in %u frames (no exterior pane drawn, or every capture pass was refused: see the capture pass line)",
+                                lifted, st.sceneW, st.sceneH, st.sceneFormat, st.framesWaited);
+            return finish();
+        default:
+            break;
+    }
+    if (now - g_backdropArmMs > 1000) {
+        Log::get().note("concourse backdrop: capture never finished: no result 1000 ms after the arm (the pane module's phase is %s); lifted %llu ms",
+                        st.phase == ConcourseBackdropPhase::kArmed ? "armed" : "idle, so it never armed", lifted);
+        return finish();
+    }
+    return true;
+}
 // The setting is off (fix.optimized_stations): nothing runs. One line says so when the concourse key is on.
 void concourseSettingOffTick(uint64_t now) {
     concoursePoll(now);
     const bool wasActive = g_concWasActive;
     g_concWanted.store(false, std::memory_order_release);
     g_liftGateOn.store(false, std::memory_order_release);
-    g_keepRadiusM.store(0.0f, std::memory_order_relaxed);
+    if (g_backdropPhase != BackdropPhase::kIdle) {
+        concoursePaneBackdropEnd();
+        g_backdropPhase = BackdropPhase::kIdle;
+    }
     g_liftGate.reset();
     g_liftWasOn = false;
     g_concWasCull = false;
@@ -3923,16 +3975,18 @@ void concourseTick(uint64_t now, uint32_t frame) {
     if (liftEnded) bumpRigEpoch();
     g_liftWasOn = liftOn;
     g_liftGateOn.store(liftOn, std::memory_order_release);
-    const bool cullPart = wantCull && clr.cullOn;
+    // PROTOTYPE (the backdrop capture): a press while the cull's own part is on lifts it for a moment, as the bay's lifting step does, with the clearing machine untouched.
+    // The panes keep their treatment (an exterior pane is opaque over its whole area, as in the lifted phase) and the outside effects stay withheld (feed.effects).
+    const bool cullPartRaw = wantCull && clr.cullOn;
+    if (g_viewHotkey && g_viewHotkey->pressed()) concourseBackdropPress(cullPartRaw && !liftOn, now);
+    const bool backdropLift = concourseBackdropStep(now, wantCull);
+    const bool cullPart = cullPartRaw && !backdropLift;
     const bool active = cullPart || liftOn;
-    // TEMPORARY (the concourse view test): a press steps the mode; it applies only while the cull's own part is on (the lift's rule still wins in a shut cabin).
-    if (g_viewHotkey && g_viewHotkey->pressed()) concourseViewTestPress(active, now);
-    const cc::ViewTest vt = cc::viewTestOf(cullPart ? g_viewTestMode : 0);
-    g_keepRadiusM.store(vt.keepRadiusM, std::memory_order_relaxed);
     ConcoursePaneFeed feed;
     feed.measure = gateWanted;
-    feed.treat = wantCull && !(vt.keepRadiusM > 0.0f);   // the view test: the panes are plain glass, as with F4 at off
+    feed.treat = wantCull;
     feed.withhold = active;
+    feed.effects = active || backdropLift;
     feed.bayOpacity = clr.bayOpacity;
     feed.sealed = g_sealedFlag.load(std::memory_order_acquire);   // the hangar is sealed: what can only be outside is not issued, with no diag key
     feed.enterShare = g_concEnterShare;
@@ -3973,6 +4027,7 @@ void concourseTick(uint64_t now, uint32_t frame) {
             char liftWhy[96] = {};
             if (liftEnded && !g_concWasCull) std::snprintf(liftWhy, sizeof(liftWhy), "the lift: %s", cc::liftEndName(g_liftGate.lastEnd()));
             const char* why = liftWhy[0] != '\0' ? liftWhy
+                              : backdropLift ? "the backdrop capture lifts it for a moment (hotkey.concourse_view_test)"
                               : !effective ? "the key or its override is off"
                               : sealedNow ? "the hangar seal engaged"
                               : cutNow    ? "the camera cut to another room"
@@ -4050,13 +4105,13 @@ void concourseTick(uint64_t now, uint32_t frame) {
                                ringMean(g_costRig) * static_cast<double>(calls[2] - g_concSumCalls[2])) / frames;
             for (int k = 0; k < 3; ++k) g_concSumCalls[k] = calls[k];
             g_concSumFrames = 0;
-            Log::get().note("concourse cull 5s: rigs seen %u vetoed %u, producer vetoed %u kept %u (name %u, small-close %u, unreadable-name %u, unreadable-sphere %u, big %u), "
+            Log::get().note("concourse cull 5s: rigs seen %u vetoed %u, producer vetoed %u kept %u (name %u, small-close %u, unreadable-name %u, unreadable-sphere %u), "
                             "store cleared %u, callback cost %.3f ms/frame, panes treated %u draws (mode %s, %u slots), outside draws withheld %u, phase %s, "
                             "mark passes %u (refused %u), panes known %u exterior %u (dropped %u), tests %u",
                             static_cast<unsigned>(g_concWin.rigSeen.exchange(0)), static_cast<unsigned>(g_concWin.rigVetoed.exchange(0)),
                             static_cast<unsigned>(g_concWin.prodVetoed.exchange(0)), static_cast<unsigned>(g_concWin.prodKept.exchange(0)),
                             static_cast<unsigned>(g_concWin.kept[0].exchange(0)), static_cast<unsigned>(g_concWin.kept[1].exchange(0)),
-                            static_cast<unsigned>(g_concWin.kept[2].exchange(0)), static_cast<unsigned>(g_concWin.kept[3].exchange(0)), static_cast<unsigned>(g_concWin.kept[4].exchange(0)),
+                            static_cast<unsigned>(g_concWin.kept[2].exchange(0)), static_cast<unsigned>(g_concWin.kept[3].exchange(0)),
                             static_cast<unsigned>(g_concWin.storeCleared.exchange(0)), ms, static_cast<unsigned>(treated), concoursePaneModeName(),
                             static_cast<unsigned>(concoursePaneSlotCount()), static_cast<unsigned>(withheld), cc::clearPhaseName(clr.phase),
                             static_cast<unsigned>(mir.markPasses), static_cast<unsigned>(mir.markRefused), static_cast<unsigned>(mir.known),

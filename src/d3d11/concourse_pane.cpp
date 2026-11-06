@@ -9,6 +9,7 @@
 #include <cstring>
 #include <mutex>
 #include <string>
+#include <vector>
 
 #include "../common/config.h"
 #include "../common/hotkey.h"
@@ -30,7 +31,7 @@ namespace {
 
 namespace cc = edvr::concourse;
 
-enum Mode : uint32_t { kModeMirror = 0, kModeMirrorSoft = 1, kModeTint = 2, kModeOff = 3, kModeLit = 4, kModeBright = 5, kModeBrightest = 6, kModeSteady = 7 };
+enum Mode : uint32_t { kModeMirror = 0, kModeMirrorSoft = 1, kModeTint = 2, kModeOff = 3, kModeLit = 4, kModeBright = 5, kModeBrightest = 6, kModeSteady = 7, kModeBackdrop = 8 };
 
 // The lit modes' glow pass, as a factor on the white, rough material: how much of the room's own light the pane gives back on top of its mirror. That pass is the
 // glass shader, so it carries the sun and its shadow map, and they move as the station turns.
@@ -48,6 +49,7 @@ const char* modeText(uint32_t m) noexcept {
         case kModeBright: return "mirror-bright";
         case kModeBrightest: return "mirror-brightest";
         case kModeSteady: return "mirror-steady";
+        case kModeBackdrop: return "mirror-backdrop";
         default: return "mirror";
     }
 }
@@ -61,6 +63,7 @@ bool parseMode(const std::string& t, uint32_t* out) noexcept {
     else if (t == "mirror-bright") *out = kModeBright;
     else if (t == "mirror-brightest") *out = kModeBrightest;
     else if (t == "mirror-steady") *out = kModeSteady;
+    else if (t == "mirror-backdrop") *out = kModeBackdrop;
     else return false;
     return true;
 }
@@ -75,16 +78,19 @@ constexpr uint32_t kFlagQuery = 1u << 5;
 constexpr uint32_t kFlagCapQuery = 1u << 6;
 constexpr uint32_t kFlagTestDrawn = 1u << 7;    // the side test's first query (the game's glass draw) is open
 constexpr uint32_t kFlagTestMirror = 1u << 8;   // the side test's second query (the mirror draw) is open
+constexpr uint32_t kFlagCapPass = 1u << 10;     // mirror-backdrop: the capture pass's state is bound (endCapturePass puts it back)
+constexpr uint32_t kFlagSampler = 1u << 9;      // mirror-backdrop: the sampler slot holds EDVR's sampler (the game's is in prevSampler_)
 
 // ---- The list, the mode and the feed (the draw threads read them; the tick and the feed write them) --------------------------------------------
 std::atomic<uint32_t> g_mode{kModeSteady};
 cc::PaneTriple g_list[cc::kPaneListCap] = {{cc::kPaneFamilyVs, cc::kPaneFamilyPs, 0}};   // entry 0 is the built-in glass family; diag.concourse_panes adds
 std::atomic<uint32_t> g_listN{1};
-std::atomic<bool> g_feedMeasure{false}, g_feedTreat{false}, g_feedWithhold{false}, g_feedSealed{false};
+std::atomic<bool> g_feedMeasure{false}, g_feedTreat{false}, g_feedWithhold{false}, g_feedSealed{false}, g_feedEffects{false};
 std::atomic<bool> g_withholdSealedNow{false};   // the hangar is sealed: only the families marked sealedToo are not issued
 std::atomic<float> g_bayOpacity{1.0f};
 std::atomic<bool> g_treatNow{false};      // treat fed, a mode other than off, and the replacement states made
-std::atomic<bool> g_withholdNow{false};   // withhold fed (the cull is on): outside draws are not issued, whatever the mode; the mirror itself needs a mode other than off
+std::atomic<bool> g_withholdNow{false};   // withhold fed (the cull is on, the plain mirror phase): the mirror is marked; the mirror itself needs a mode other than off
+std::atomic<bool> g_effectsNow{false};    // the outside draws (smoke, trails, lasers, the planet) are not issued, whatever the mode: the plain phase, or the backdrop capture's lift (feed.effects)
 std::atomic<bool> g_shareOn{false};       // measure fed and the query pool made
 std::atomic<ID3D11DeviceContext*> g_immediate{nullptr};   // not held: the device's immediate context, the one the binding shadow follows
 std::atomic<bool> g_capturing{false};     // a capture frame is open
@@ -148,6 +154,49 @@ std::atomic<uint64_t> g_markPasses{0}, g_markRefused{0}, g_testsRead{0};
 // depth of the structure the cull has just taken away, and the mark would open holes in the pane for that frame.
 constexpr uint32_t kMarkSettleFrames = 8;
 std::atomic<uint32_t> g_plainFrom{0};
+
+// ---- The backdrop (PROTOTYPE on the concourse arc, docs\concourse-cull-2026-11-05.md "The window plan") ----------------------------------------------------
+// A cube of view directions captured once, on a key press, from a frame with the cull off: `back` is written by the capture pass (a UAV), `front` is what the display
+// pass samples (the tick copies back to front after the capture frame, so no resource is bound both ways). Everything is made on the first capture, per device.
+constexpr UINT kBdUavSlot = 7;       // u7 of the capture shader; must be at least the bound render target count
+constexpr UINT kBdSceneSlot = 8;     // t8 of the capture shader (the scene copy) and of the display shader (the cube)
+constexpr UINT kBdSamplerSlot = 7;   // s7 of the display shader
+std::atomic<bool> g_bdArmed{false};                 // a capture frame is open: pane draws copy the scene and issue capture passes
+std::atomic<uint32_t> g_bdSceneFrame{0xFFFFFFFFu};  // the frame whose first pane draw tried the scene copy
+std::atomic<uint32_t> g_bdSceneOkFrame{0xFFFFFFFFu};   // the frame whose scene copy was taken
+std::atomic<uint32_t> g_bdPaneDraws{0};             // capture passes issued since the arm
+std::atomic<bool> g_bdSceneCopied{false};           // a scene copy was taken since the arm
+std::atomic<void*> g_bdSceneSource{nullptr};        // the render target resource the copy came from (identity only; a capture pass needs the same one bound)
+std::atomic<ID3D11Texture2D*> g_bdScene{nullptr};
+std::atomic<ID3D11ShaderResourceView*> g_bdSceneSrv{nullptr};
+std::atomic<ID3D11Texture2D*> g_bdBack{nullptr}, g_bdFront{nullptr};
+std::atomic<ID3D11UnorderedAccessView*> g_bdBackUav{nullptr};
+std::atomic<ID3D11ShaderResourceView*> g_bdFrontSrv{nullptr};
+std::atomic<ID3D11PixelShader*> g_psBdShow{nullptr}, g_psBdCapture{nullptr};
+std::atomic<ID3D11SamplerState*> g_bdSampler{nullptr};
+std::atomic<bool> g_bdCubeValid{false};             // front holds a capture
+std::atomic<bool> g_bdFallbackSaid{false};
+std::atomic<bool> g_bdSceneRefusedSaid{false};
+std::atomic<bool> g_bdPassRefusedSaid{false};
+std::mutex g_bdMutex;                               // the scene texture's (re)making and the status text below
+uint32_t g_bdSceneW = 0, g_bdSceneH = 0;
+DXGI_FORMAT g_bdSceneFmt = DXGI_FORMAT_UNKNOWN;
+char g_bdSceneFmtText[28] = {};
+char g_bdRefusal[200] = {};
+std::atomic<uint8_t> g_bdPhase{0};                  // ConcourseBackdropPhase
+std::atomic<bool> g_bdArmRequested{false};
+uint32_t g_bdArmFrame = 0;                          // the tick's
+uint32_t g_bdFramesWaited = 0;
+// The toast, one slot: the newest text wins (hotkey changes of the mode, the capture's result). The tick's thread writes it and menuTick takes it.
+std::mutex g_toastMutex;
+char g_toastText[64] = {};
+bool g_toastDue = false;
+void queueToast(const char* text) noexcept {
+    std::lock_guard<std::mutex> lock(g_toastMutex);
+    std::snprintf(g_toastText, sizeof(g_toastText), "%s", text);
+    g_toastDue = true;
+}
+void releaseBackdrop() noexcept;
 
 constexpr UINT kPaneSrvFirst = 8;
 constexpr UINT kPaneSrvCount = 3;
@@ -262,8 +311,9 @@ struct DsEntry {
     ID3D11DepthStencilState* plain = nullptr;
     ID3D11DepthStencilState* marked = nullptr;
     ID3D11DepthStencilState* farOut = nullptr;
+    ID3D11DepthStencilState* probe = nullptr;
 };
-enum class DsVariant { kPlain, kMarked, kFarOut };
+enum class DsVariant { kPlain, kMarked, kFarOut, kProbe };
 std::mutex g_dsMutex;
 DsEntry g_ds[16];
 size_t g_dsN = 0;
@@ -334,6 +384,7 @@ void shaderHashes(ID3D11DeviceContext* ctx, uint64_t* vs, uint64_t* ps) noexcept
 
 void releaseStates() noexcept {
     // The draw threads may hold the pointers for one more draw, and the old device owns the objects: not released (a device change is rare).
+    releaseBackdrop();   // the exception: the cube is about 230 MB
     g_statesReady.store(false, std::memory_order_release);
     g_bsFactor.store(nullptr, std::memory_order_release);
     g_bsMirror.store(nullptr, std::memory_order_release);
@@ -401,24 +452,30 @@ void makeWhitePs(ID3D11Device* device) noexcept {
 // The steady pane's pixel shader: it replaces the glass shader for the whole pane (one flat opaque draw, so the glass shader's reflection of a horizon cannot show).
 // Its inputs are the first two outputs of the glass vertex shader (matched by name and order). The level is told by how much the pane faces the anchor's up axis:
 // overhead (sky), angled, other. A zero `up` gives `other`. A failed compile is logged once and the steady mode falls back to the plain mirror.
+// The steady colour of a pane from its lighting normal and b2 (up, the levels, the colour): shared by the steady shader and the backdrop's fallback, so the two are the same text.
+static const char kSkyCommon[] =
+    "cbuffer GlowCb : register(b2) { float4 up; float4 lv; float4 colour; };\n"
+    "float3 fallbackColour(float3 n) {\n"
+    "    float ul = length(up.xyz);\n"
+    "    float3 nn = n * rsqrt(max(dot(n, n), 1e-12));\n"
+    "    float d = ul > 0.5 ? abs(dot(nn, up.xyz / ul)) : 0.0;\n"
+    "    float lvl = lerp(lv.z, lv.y, smoothstep(0.35, 0.6, d));\n"
+    "    lvl = lerp(lvl, lv.x, smoothstep(0.92, 0.98, d));\n"
+    "    return colour.rgb * lvl;\n"
+    "}\n";
+
 void makeSkyPs(ID3D11Device* device) noexcept {
     if (g_psSkyTried) return;
     g_psSkyTried = true;
     ID3D11DeviceContext* imm = nullptr;
     device->GetImmediateContext(&imm);
     if (!imm) return;
-    static const char kSky[] =
-        "cbuffer GlowCb : register(b2) { float4 up; float4 lv; float4 colour; };\n"
+    static const std::string kSky = std::string(kSkyCommon) +
         "struct PsIn { nointerpolation uint face : __USER_VERTEX_FACEINVARIANT0; float3 n : __USER_VERTEX_M_LIGHTINGNORMAL0; };\n"
         "float4 main(PsIn i) : SV_Target {\n"
-        "    float ul = length(up.xyz);\n"
-        "    float3 nn = i.n * rsqrt(max(dot(i.n, i.n), 1e-12));\n"
-        "    float d = ul > 0.5 ? abs(dot(nn, up.xyz / ul)) : 0.0;\n"
-        "    float lvl = lerp(lv.z, lv.y, smoothstep(0.35, 0.6, d));\n"
-        "    lvl = lerp(lvl, lv.x, smoothstep(0.92, 0.98, d));\n"
-        "    return float4(colour.rgb * lvl, 1.0);\n"
+        "    return float4(fallbackColour(i.n), 1.0);\n"
         "}\n";
-    ID3D11PixelShader* ps = shaderSwapCompilePs(imm, kSky, sizeof(kSky) - 1, "main", "concourse_pane_sky", nullptr, "concourse pane");
+    ID3D11PixelShader* ps = shaderSwapCompilePs(imm, kSky.c_str(), kSky.size(), "main", "concourse_pane_sky", nullptr, "concourse pane");
     imm->Release();
     g_psSky.store(ps, std::memory_order_release);
     if (!ps) Log::get().note("concourse pane: the steady pixel shader did not compile; mirror-steady draws the plain mirror");
@@ -854,7 +911,7 @@ void pollShares(ID3D11Device* device, uint32_t prevFrame, uint32_t frame, bool m
 
 // ---- The derived depth state -------------------------------------------------------------------------------------------------------------------
 // nullptr when the variant cannot be made (a full cache, or the device refused): the caller does not draw the mirror then.
-// kPlain and kMarked are the mirror's: depth write on, without and with the mark's test. kFarOut is the far-limited glows': the game's depth state as it is, and only
+// kProbe is the backdrop capture pass's: the game's depth test, no depth write, no stencil. kPlain and kMarked are the mirror's: depth write on, without and with the mark's test. kFarOut is the far-limited glows': the game's depth state as it is, and only
 // the pixels the mark did not set.
 ID3D11DepthStencilState* derivedDepth(ID3D11DeviceContext* ctx, ID3D11DepthStencilState* orig, DsVariant variant) noexcept {
     std::lock_guard<std::mutex> lock(g_dsMutex);
@@ -871,12 +928,14 @@ ID3D11DepthStencilState* derivedDepth(ID3D11DeviceContext* ctx, ID3D11DepthStenc
         g_ds[g_dsN].orig = orig;
         ++g_dsN;
     }
-    ID3D11DepthStencilState*& slot = variant == DsVariant::kFarOut ? g_ds[at].farOut : variant == DsVariant::kMarked ? g_ds[at].marked : g_ds[at].plain;
+    ID3D11DepthStencilState*& slot = variant == DsVariant::kFarOut ? g_ds[at].farOut : variant == DsVariant::kMarked ? g_ds[at].marked
+                                   : variant == DsVariant::kProbe ? g_ds[at].probe : g_ds[at].plain;
     if (slot) return slot;
     D3D11_DEPTH_STENCIL_DESC d{};
     orig->GetDesc(&d);
-    if (variant != DsVariant::kFarOut) d.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ALL;
-    if (variant != DsVariant::kPlain) {
+    if (variant == DsVariant::kProbe) d.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ZERO;   // the backdrop's capture pass: the game's depth test, nothing written
+    else if (variant != DsVariant::kFarOut) d.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ALL;
+    if (variant != DsVariant::kPlain && variant != DsVariant::kProbe) {
         d.StencilEnable = TRUE;
         d.StencilReadMask = static_cast<UINT8>(kMarkRef);
         d.StencilWriteMask = 0;
@@ -1263,6 +1322,289 @@ void pollTests(ID3D11Device* device, uint32_t frame) noexcept {
 }
 
 // ---- The mark pass -----------------------------------------------------------------------------------------------------------------------------
+// ---- The backdrop's resources and the scene copy (PROTOTYPE, docs\concourse-cull-2026-11-05.md) ------------------------------------------------------------
+template <class T>
+void releaseAtomic(std::atomic<T*>& a) noexcept {
+    T* p = a.exchange(nullptr, std::memory_order_acq_rel);   // the draw threads may hold the pointer for one more draw
+    if (p) p->Release();
+}
+
+void releaseBackdrop() noexcept {
+    g_bdArmed.store(false, std::memory_order_release);
+    g_bdCubeValid.store(false, std::memory_order_release);
+    g_bdSceneSource.store(nullptr, std::memory_order_release);
+    g_bdSceneFrame.store(0xFFFFFFFFu, std::memory_order_relaxed);
+    g_bdSceneOkFrame.store(0xFFFFFFFFu, std::memory_order_relaxed);
+    releaseAtomic(g_bdSceneSrv);
+    releaseAtomic(g_bdScene);
+    releaseAtomic(g_bdBackUav);
+    releaseAtomic(g_bdFrontSrv);
+    releaseAtomic(g_bdBack);
+    releaseAtomic(g_bdFront);
+    releaseAtomic(g_psBdShow);
+    releaseAtomic(g_psBdCapture);
+    releaseAtomic(g_bdSampler);
+    std::lock_guard<std::mutex> lock(g_bdMutex);
+    g_bdSceneW = g_bdSceneH = 0;
+    g_bdSceneFmt = DXGI_FORMAT_UNKNOWN;
+    g_bdSceneFmtText[0] = '\0';
+}
+
+const char* bdFormatName(DXGI_FORMAT f, char* fb, size_t cap) noexcept {
+    switch (f) {
+        case DXGI_FORMAT_R16G16B16A16_FLOAT: return "R16G16B16A16_FLOAT";
+        case DXGI_FORMAT_R32G32B32A32_FLOAT: return "R32G32B32A32_FLOAT";
+        case DXGI_FORMAT_R11G11B10_FLOAT: return "R11G11B10_FLOAT";
+        case DXGI_FORMAT_R10G10B10A2_UNORM: return "R10G10B10A2_UNORM";
+        case DXGI_FORMAT_R8G8B8A8_UNORM: return "R8G8B8A8_UNORM";
+        case DXGI_FORMAT_B8G8R8A8_UNORM: return "B8G8R8A8_UNORM";
+        case DXGI_FORMAT_R16G16B16A16_TYPELESS: return "R16G16B16A16_TYPELESS";
+        default: break;
+    }
+    const char* n = formatName(f);
+    if (n) return n;
+    std::snprintf(fb, cap, "format %u", static_cast<unsigned>(f));
+    return fb;
+}
+
+bool formatIsTypeless(DXGI_FORMAT f) noexcept {
+    switch (f) {
+        case DXGI_FORMAT_R32G32B32A32_TYPELESS: case DXGI_FORMAT_R32G32B32_TYPELESS: case DXGI_FORMAT_R16G16B16A16_TYPELESS: case DXGI_FORMAT_R32G32_TYPELESS:
+        case DXGI_FORMAT_R32G8X24_TYPELESS: case DXGI_FORMAT_R10G10B10A2_TYPELESS: case DXGI_FORMAT_R8G8B8A8_TYPELESS: case DXGI_FORMAT_R16G16_TYPELESS:
+        case DXGI_FORMAT_R32_TYPELESS: case DXGI_FORMAT_R24G8_TYPELESS: case DXGI_FORMAT_R8G8_TYPELESS: case DXGI_FORMAT_R16_TYPELESS: case DXGI_FORMAT_R8_TYPELESS:
+        case DXGI_FORMAT_B8G8R8A8_TYPELESS: case DXGI_FORMAT_B8G8R8X8_TYPELESS:
+            return true;
+        default: return false;
+    }
+}
+
+bool bdRefuse(const char* why) noexcept {
+    {
+        std::lock_guard<std::mutex> lock(g_bdMutex);
+        std::snprintf(g_bdRefusal, sizeof(g_bdRefusal), "%s", why);
+    }
+    Log::get().note("concourse backdrop: capture refused: %s", why);
+    return false;
+}
+
+// The capture shader (an exterior pane''s pixel: the scene behind it goes to the texel of its view direction) and the display shader (the cube sampled by that direction,
+// the steady colour where nothing was captured). Both declare the glass vertex shader''s outputs in order (v0 face, v1 lighting normal, v2 lighting position = the world
+// position relative to the camera, INFERRED); the capture shader also declares what lies before SV_POSITION in the game''s own pixel shader (v3 tangent, v4 texcoord).
+bool makeBackdropShaders(ID3D11Device* device) noexcept {
+    ID3D11DeviceContext* imm = nullptr;
+    device->GetImmediateContext(&imm);
+    if (!imm) return false;
+    const std::string show = std::string(kSkyCommon) +
+        "struct PsIn { nointerpolation uint face : __USER_VERTEX_FACEINVARIANT0; float3 n : __USER_VERTEX_M_LIGHTINGNORMAL0; float3 wp : __USER_VERTEX_M_LIGHTINGPOSITION0; };\n"
+        "TextureCube<float4> backdrop : register(t8);\n"
+        "SamplerState backdropSmp : register(s7);\n"
+        "float4 main(PsIn i) : SV_Target {\n"
+        "    float3 fb = fallbackColour(i.n);\n"
+        "    float3 d = i.wp * rsqrt(max(dot(i.wp, i.wp), 1e-12));\n"
+        "    float4 c = backdrop.SampleLevel(backdropSmp, d, 0);\n"
+        "    return float4(lerp(fb, c.rgb, saturate(c.a)), 1.0);\n"
+        "}\n";
+    const std::string capture = std::string(cc::cubeTexelHlsl()) +
+        "struct PsIn { nointerpolation uint face : __USER_VERTEX_FACEINVARIANT0; float3 n : __USER_VERTEX_M_LIGHTINGNORMAL0; float3 wp : __USER_VERTEX_M_LIGHTINGPOSITION0;\n"
+        "              float3 tg : __USER_VERTEX_M_LIGHTINGTANGENT0; float2 uv : __USER_VERTEX_M_TEXCOORD0; float4 p : SV_POSITION; };\n"
+        "Texture2D<float4> scene : register(t8);\n"
+        "RWTexture2DArray<float4> cube : register(u7);\n"
+        "[earlydepthstencil]\n"
+        "void main(PsIn i) {\n"
+        "    float3 keep = (i.face == 0xDEADBEEFu) ? float3(i.tg.x, i.n.y + i.uv.x, i.n.z) : float3(0, 0, 0);\n"   // never true: keeps v3 and v4 in the signature
+        "    float3 d = i.wp + keep;\n"
+        "    if (dot(d, d) < 1e-12) return;\n"
+        "    float3 c = clamp(scene.Load(int3(i.p.xy, 0)).rgb, 0.0, 60000.0);\n"
+        "    cube[cubeTexel(d, " + std::to_string(cc::kBackdropCubeSize) + "u)] = float4(c, 1.0);\n"
+        "}\n";
+    ID3D11PixelShader* psShow = shaderSwapCompilePs(imm, show.c_str(), show.size(), "main", "concourse_backdrop_show", nullptr, "concourse backdrop");
+    ID3D11PixelShader* psCap = shaderSwapCompilePs(imm, capture.c_str(), capture.size(), "main", "concourse_backdrop_capture", nullptr, "concourse backdrop");
+    imm->Release();
+    if (!psShow || !psCap) {
+        if (psShow) psShow->Release();
+        if (psCap) psCap->Release();
+        return bdRefuse(!psShow ? "the display pixel shader did not compile" : "the capture pixel shader did not compile");
+    }
+    g_psBdShow.store(psShow, std::memory_order_release);
+    g_psBdCapture.store(psCap, std::memory_order_release);
+    return true;
+}
+
+// The cube pair, the views, the sampler and both shaders; made once per device (releaseBackdrop undoes it). A refusal is one log line and leaves nothing half-made.
+bool makeBackdropResources(ID3D11Device* device) noexcept {
+    if (g_bdBack.load() && g_bdFront.load() && g_bdBackUav.load() && g_bdFrontSrv.load() && g_psBdCapture.load() && g_psBdShow.load() && g_bdSampler.load()) return true;
+    releaseBackdrop();
+    const DXGI_FORMAT fmt = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    UINT sup = 0;
+    const UINT need = D3D11_FORMAT_SUPPORT_TEXTURE2D | D3D11_FORMAT_SUPPORT_TEXTURECUBE | D3D11_FORMAT_SUPPORT_SHADER_SAMPLE | D3D11_FORMAT_SUPPORT_TYPED_UNORDERED_ACCESS_VIEW;
+    if (FAILED(device->CheckFormatSupport(fmt, &sup)) || (sup & need) != need) return bdRefuse("R16G16B16A16_FLOAT cannot be a sampled cube and a typed UAV on this device");
+    D3D11_FEATURE_DATA_FORMAT_SUPPORT2 f2{};
+    f2.InFormat = fmt;
+    if (FAILED(device->CheckFeatureSupport(D3D11_FEATURE_FORMAT_SUPPORT2, &f2, sizeof(f2))) || (f2.OutFormatSupport2 & D3D11_FORMAT_SUPPORT2_UAV_TYPED_STORE) == 0)
+        return bdRefuse("R16G16B16A16_FLOAT has no typed UAV store on this device");
+    const UINT size = cc::kBackdropCubeSize;
+    const UINT rowBytes = size * 8u;
+    std::vector<uint8_t> zero(static_cast<size_t>(rowBytes) * size, 0);   // alpha 0 everywhere: nothing captured
+    D3D11_SUBRESOURCE_DATA init[6];
+    for (auto& s : init) {
+        s.pSysMem = zero.data();
+        s.SysMemPitch = rowBytes;
+        s.SysMemSlicePitch = rowBytes * size;
+    }
+    D3D11_TEXTURE2D_DESC td{};
+    td.Width = td.Height = size;
+    td.MipLevels = 1;
+    td.ArraySize = 6;
+    td.Format = fmt;
+    td.SampleDesc.Count = 1;
+    td.Usage = D3D11_USAGE_DEFAULT;
+    td.MiscFlags = D3D11_RESOURCE_MISC_TEXTURECUBE;
+    ID3D11Texture2D* back = nullptr;
+    ID3D11Texture2D* front = nullptr;
+    td.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
+    const HRESULT h1 = device->CreateTexture2D(&td, init, &back);
+    td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    const HRESULT h2 = device->CreateTexture2D(&td, init, &front);
+    ID3D11UnorderedAccessView* uav = nullptr;
+    ID3D11ShaderResourceView* srv = nullptr;
+    HRESULT h3 = E_FAIL, h4 = E_FAIL;
+    if (back && front) {
+        D3D11_UNORDERED_ACCESS_VIEW_DESC ud{};
+        ud.Format = fmt;
+        ud.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2DARRAY;
+        ud.Texture2DArray.MipSlice = 0;
+        ud.Texture2DArray.FirstArraySlice = 0;
+        ud.Texture2DArray.ArraySize = 6;
+        h3 = device->CreateUnorderedAccessView(back, &ud, &uav);
+        D3D11_SHADER_RESOURCE_VIEW_DESC sd{};
+        sd.Format = fmt;
+        sd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURECUBE;
+        sd.TextureCube.MostDetailedMip = 0;
+        sd.TextureCube.MipLevels = 1;
+        h4 = device->CreateShaderResourceView(front, &sd, &srv);
+    }
+    D3D11_SAMPLER_DESC smd{};
+    smd.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+    smd.AddressU = smd.AddressV = smd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+    smd.ComparisonFunc = D3D11_COMPARISON_NEVER;
+    smd.MaxLOD = D3D11_FLOAT32_MAX;
+    ID3D11SamplerState* smp = nullptr;
+    const HRESULT h5 = device->CreateSamplerState(&smd, &smp);
+    if (FAILED(h1) || FAILED(h2) || FAILED(h3) || FAILED(h4) || FAILED(h5) || !back || !front || !uav || !srv || !smp) {
+        char why[160];
+        std::snprintf(why, sizeof(why), "the cube could not be made (hr %08X %08X %08X %08X %08X)", static_cast<unsigned>(h1), static_cast<unsigned>(h2), static_cast<unsigned>(h3),
+                      static_cast<unsigned>(h4), static_cast<unsigned>(h5));
+        if (back) back->Release();
+        if (front) front->Release();
+        if (uav) uav->Release();
+        if (srv) srv->Release();
+        if (smp) smp->Release();
+        return bdRefuse(why);
+    }
+    g_bdBack.store(back, std::memory_order_release);
+    g_bdFront.store(front, std::memory_order_release);
+    g_bdBackUav.store(uav, std::memory_order_release);
+    g_bdFrontSrv.store(srv, std::memory_order_release);
+    g_bdSampler.store(smp, std::memory_order_release);
+    if (!makeBackdropShaders(device)) {
+        releaseBackdrop();
+        return false;
+    }
+    Log::get().note("concourse backdrop: cube made: %u square x 6, R16G16B16A16_FLOAT, 2 textures of %u MB", static_cast<unsigned>(size), static_cast<unsigned>((static_cast<uint64_t>(rowBytes) * size * 6u) >> 20));
+    return true;
+}
+
+// The first pane draw of an armed frame, before the game''s glass draws (begin() runs before the real draw): the bound render target is copied to a texture of the same
+// size and format (a typeless format resolves through the view''s own), which the capture shader reads. Remade when the render target''s size or format changes.
+// On any refusal nothing is copied and the capture passes of the frame are not issued (they need g_bdSceneOkFrame to be this frame).
+void backdropSceneCopy(ID3D11DeviceContext* ctx) noexcept {
+    const uint32_t frame = g_frameNow.load(std::memory_order_relaxed);
+    if (g_bdSceneFrame.exchange(frame, std::memory_order_acq_rel) == frame) return;   // once a frame
+    const auto refuse = [&](const char* why) noexcept {
+        if (!g_bdSceneRefusedSaid.exchange(true, std::memory_order_relaxed)) Log::get().note("concourse backdrop: scene copy refused: %s", why);
+    };
+    ID3D11RenderTargetView* rtv = nullptr;
+    ctx->OMGetRenderTargets(1, &rtv, nullptr);
+    if (!rtv) return refuse("no render target is bound at the first pane draw");
+    D3D11_RENDER_TARGET_VIEW_DESC rd{};
+    rtv->GetDesc(&rd);
+    ID3D11Resource* res = nullptr;
+    rtv->GetResource(&res);
+    rtv->Release();
+    ID3D11Texture2D* src = nullptr;
+    if (res) res->QueryInterface(IID_PPV_ARGS(&src));
+    if (!src) {
+        if (res) res->Release();
+        return refuse("the render target is not a 2D texture");
+    }
+    D3D11_TEXTURE2D_DESC sd{};
+    src->GetDesc(&sd);
+    const DXGI_FORMAT fmt = rd.Format != DXGI_FORMAT_UNKNOWN ? rd.Format : sd.Format;
+    if (formatIsTypeless(fmt) || sd.SampleDesc.Count > 1 || sd.ArraySize != 1 || rd.ViewDimension != D3D11_RTV_DIMENSION_TEXTURE2D || rd.Texture2D.MipSlice != 0) {
+        char why[160];
+        std::snprintf(why, sizeof(why), "the render target is not a single, single-sample, whole 2D texture of a typed format (format %u, %ux%u, %u samples, array %u)", static_cast<unsigned>(fmt),
+                      sd.Width, sd.Height, sd.SampleDesc.Count, sd.ArraySize);
+        src->Release();
+        res->Release();
+        return refuse(why);
+    }
+    ID3D11Device* dev = nullptr;
+    ctx->GetDevice(&dev);
+    bool ok = false;
+    if (dev) {
+        std::lock_guard<std::mutex> lock(g_bdMutex);
+        ID3D11Texture2D* scene = g_bdScene.load(std::memory_order_acquire);
+        if (!scene || g_bdSceneW != sd.Width || g_bdSceneH != sd.Height || g_bdSceneFmt != fmt) {
+            ID3D11Texture2D* made = nullptr;
+            ID3D11ShaderResourceView* madeSrv = nullptr;
+            D3D11_TEXTURE2D_DESC td{};
+            td.Width = sd.Width;
+            td.Height = sd.Height;
+            td.MipLevels = 1;
+            td.ArraySize = 1;
+            td.Format = fmt;
+            td.SampleDesc.Count = 1;
+            td.Usage = D3D11_USAGE_DEFAULT;
+            td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+            if (SUCCEEDED(dev->CreateTexture2D(&td, nullptr, &made)) && made) {
+                D3D11_SHADER_RESOURCE_VIEW_DESC vd{};
+                vd.Format = fmt;
+                vd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+                vd.Texture2D.MipLevels = 1;
+                if (FAILED(dev->CreateShaderResourceView(made, &vd, &madeSrv)) || !madeSrv) {
+                    made->Release();
+                    made = nullptr;
+                }
+            }
+            if (made) {
+                ID3D11Texture2D* oldTex = g_bdScene.exchange(made, std::memory_order_acq_rel);
+                ID3D11ShaderResourceView* oldSrv = g_bdSceneSrv.exchange(madeSrv, std::memory_order_acq_rel);
+                if (oldSrv) oldSrv->Release();
+                if (oldTex) oldTex->Release();
+                scene = made;
+                g_bdSceneW = sd.Width;
+                g_bdSceneH = sd.Height;
+                g_bdSceneFmt = fmt;
+                char fb[24] = {};
+                std::snprintf(g_bdSceneFmtText, sizeof(g_bdSceneFmtText), "%s", bdFormatName(fmt, fb, sizeof(fb)));
+            } else {
+                scene = nullptr;
+            }
+        }
+        if (scene) {
+            FlatComputeInternalScope internal;
+            ctx->CopySubresourceRegion(scene, 0, 0, 0, 0, src, 0, nullptr);
+            g_bdSceneSource.store(res, std::memory_order_release);   // identity only
+            g_bdSceneOkFrame.store(frame, std::memory_order_release);
+            g_bdSceneCopied.store(true, std::memory_order_release);
+            ok = true;
+        }
+        dev->Release();
+    }
+    src->Release();
+    res->Release();
+    if (!ok) refuse("the scene texture could not be made");
+}
 bool formatHasStencil(DXGI_FORMAT f) noexcept {
     return f == DXGI_FORMAT_D24_UNORM_S8_UINT || f == DXGI_FORMAT_D32_FLOAT_S8X24_UINT || f == DXGI_FORMAT_R24G8_TYPELESS || f == DXGI_FORMAT_R32G8X24_TYPELESS;
 }
@@ -1419,7 +1761,7 @@ void ConcoursePaneScope::begin(ID3D11DeviceContext* ctx, UINT indexCount, UINT s
     // call: 0 is no pixel shader (a depth-only draw), and the draw has none to name. Any other context asks the context for its pixel shader.
     const bool followed = ctx == g_immediate.load(std::memory_order_relaxed);
     const uint64_t ps = followed ? bindingShaderHash(BindSlot::Ps) : pixelShaderHash(ctx);
-    const bool cullOn = g_withholdNow.load(std::memory_order_relaxed);
+    const bool cullOn = g_effectsNow.load(std::memory_order_relaxed);   // the outside is not issued: the plain phase, or the backdrop capture's lift
     const bool sealedOn = g_withholdSealedNow.load(std::memory_order_relaxed);
     if (cullOn || sealedOn) {
         // The outside (smoke, trails, ship lasers, the planet) is not issued while the cull is on. By pixel shader on any context; by vertex shader too on the
@@ -1441,7 +1783,7 @@ void ConcoursePaneScope::begin(ID3D11DeviceContext* ctx, UINT indexCount, UINT s
         }
         // The glows that may also be the room's: their far pixels are dropped by the mark (concourse_cull_core.h, farLimitedPs). Immediate context only, as the mark is.
         if (!cullOn) return;   // sealed: nothing below is for a sealed hangar
-        if (followed && cc::farLimitedPs(ps)) {
+        if (followed && g_withholdNow.load(std::memory_order_relaxed) && cc::farLimitedPs(ps)) {   // the plain phase only: the capture's lift draws the room's far glows
             if (ensureMarked(ctx, calls)) {
                 UINT ref = 0;
                 ctx->OMGetDepthStencilState(&prevDs_, &ref);
@@ -1478,6 +1820,12 @@ void ConcoursePaneScope::begin(ID3D11DeviceContext* ctx, UINT indexCount, UINT s
     keyN_ = indexCount;
     keyStart_ = startIndex;
     keyBase_ = baseVertex;
+    // PROTOTYPE (backdrop): in an armed frame the first pane draw copies the render target now, before the game's glass or any pass of ours has drawn into it, and
+    // an exterior pane is planned a capture pass (its context's own: a deferred context records it).
+    if (g_bdArmed.load(std::memory_order_acquire)) {
+        backdropSceneCopy(ctx);
+        if (sideOf(cc::PaneKey{indexCount, startIndex, baseVertex}) == cc::PaneSide::kExterior) planCapture_ = true;
+    }
     const bool immediate = ctx->GetType() == D3D11_DEVICE_CONTEXT_IMMEDIATE;
     if (immediate) {
         materialOnce(ctx, indexCount);
@@ -1514,7 +1862,8 @@ void ConcoursePaneScope::begin(ID3D11DeviceContext* ctx, UINT indexCount, UINT s
     planOpaque_ = opaque;
     planTint_ = tint;
     planSoft_ = mode == kModeMirrorSoft;
-    planSteady_ = mode == kModeSteady;
+    planSteady_ = mode == kModeSteady || mode == kModeBackdrop;
+    planBackdrop_ = mode == kModeBackdrop;
     if (tint) {
         planGlow_ = 0.0f;
     } else if (planSteady_) {
@@ -1540,6 +1889,12 @@ void ConcoursePaneScope::begin(ID3D11DeviceContext* ctx, UINT indexCount, UINT s
 // Called right after the game's own draw. Closes the share query (so the bay's coverage is the game's draw alone) and the test's first query, then, if the plan
 // says so and the mark pass could run, binds the mirror's state and returns true. Every false return leaves the context as the game had it.
 bool ConcoursePaneScope::nextMirrorPassSlow() noexcept {
+    if (capBound_) endCapturePass();   // the capture pass has drawn: its state goes back before anything else is bound
+    if (planCapture_ && !capDone_) {
+        capDone_ = true;
+        closeGameQueries();   // the capture draw must not count in the game's draw's occlusion queries
+        if (beginCapturePass()) return true;
+    }
     if (!mirrorBound_) {
         if (!beginMirrorSlow()) {
             family_ = false;
@@ -1586,7 +1941,7 @@ void ConcoursePaneScope::bindPsCb(ID3D11Buffer* own) noexcept {
     flags_ |= kFlagCb;
 }
 
-bool ConcoursePaneScope::beginMirrorSlow() noexcept {
+void ConcoursePaneScope::closeGameQueries() noexcept {
     if ((flags_ & kFlagQuery) != 0) {
         if (query_ >= 0) closeShareQuery(ctx_, query_);
         flags_ &= ~kFlagQuery;
@@ -1595,6 +1950,98 @@ bool ConcoursePaneScope::beginMirrorSlow() noexcept {
         testCloseDrawn(ctx_, testSlot_);
         flags_ &= ~kFlagTestDrawn;
     }
+}
+
+// PROTOTYPE (backdrop). The capture pass: the game's glass geometry again, no colour written, the capture pixel shader, the scene copy at t8, the game's depth test with no
+// write, and the cube's back texture at u7. Refused (nothing bound, one line once) when the scene was not copied this frame, the bound render target is not the one copied, the
+// render target count does not leave slot 7 free, or there is no depth view. The saved state comes back in endCapturePass (called by the next nextMirrorPass, or end()).
+bool ConcoursePaneScope::beginCapturePass() noexcept {
+    const auto refuse = [&](const char* why) noexcept {
+        if (!g_bdPassRefusedSaid.exchange(true, std::memory_order_relaxed)) Log::get().note("concourse backdrop: a capture pass was refused: %s", why);
+        return false;
+    };
+    ID3D11PixelShader* ps = g_psBdCapture.load(std::memory_order_acquire);
+    ID3D11ShaderResourceView* sceneSrv = g_bdSceneSrv.load(std::memory_order_acquire);
+    ID3D11UnorderedAccessView* uav = g_bdBackUav.load(std::memory_order_acquire);
+    ID3D11BlendState* noColour = g_bsMark.load(std::memory_order_acquire);
+    if (!ps || !sceneSrv || !uav || !noColour || !calls_ || !calls_->setBlend || !calls_->setPs || !calls_->setSrv || !calls_->setDepth) return refuse("a shader, view or state is missing");
+    if (g_bdSceneOkFrame.load(std::memory_order_acquire) != g_frameNow.load(std::memory_order_relaxed)) return refuse("the scene was not copied in this frame");
+    ID3D11RenderTargetView* rtvs[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT] = {};
+    ID3D11DepthStencilView* dsv = nullptr;
+    ctx_->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, rtvs, &dsv);
+    int bound = 0;   // the render target count the runtime sees: the highest bound slot, plus one
+    for (int i = 0; i < D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT; ++i)
+        if (rtvs[i]) bound = i + 1;
+    bool sameTarget = false;
+    if (rtvs[0]) {
+        ID3D11Resource* r = nullptr;
+        rtvs[0]->GetResource(&r);
+        sameTarget = r != nullptr && r == g_bdSceneSource.load(std::memory_order_acquire);
+        if (r) r->Release();
+    }
+    for (auto*& v : rtvs)
+        if (v) {
+            v->Release();
+            v = nullptr;
+        }
+    const bool haveDsv = dsv != nullptr;
+    if (dsv) dsv->Release();
+    if (!sameTarget) return refuse("the render target is not the one the scene was copied from");
+    if (bound > static_cast<int>(kBdUavSlot)) return refuse("a render target is bound at slot 7 or above, so u7 is not free");
+    if (!haveDsv) return refuse("no depth view is bound");
+    UINT ref = 0;
+    ctx_->OMGetDepthStencilState(&capPrevDs_, &ref);
+    ID3D11DepthStencilState* derived = capPrevDs_ ? derivedDepth(ctx_, capPrevDs_, DsVariant::kProbe) : nullptr;
+    if (!derived) {
+        if (capPrevDs_) capPrevDs_->Release();
+        capPrevDs_ = nullptr;
+        return refuse("the depth state could not be derived");
+    }
+    capPrevRef_ = ref;
+    ctx_->OMGetBlendState(&capPrevBs_, capPrevFactor_, &capPrevMask_);
+    ctx_->PSGetShader(&capPrevPs_, nullptr, nullptr);
+    ctx_->PSGetShaderResources(kBdSceneSlot, 1, &capPrevSrv_);
+    const FLOAT zeros[4] = {};
+    calls_->setBlend(ctx_, noColour, zeros, 0xFFFFFFFFu);
+    calls_->setPs(ctx_, ps, nullptr, 0);
+    calls_->setSrv(ctx_, kBdSceneSlot, 1, &sceneSrv);
+    calls_->setDepth(ctx_, derived, ref);
+    {
+        // OMSetRenderTargetsAndUnorderedAccessViews is not hooked by EDVR (nothing in src hooks it): this goes to the context directly.
+        FlatComputeInternalScope internal;
+        ctx_->OMSetRenderTargetsAndUnorderedAccessViews(D3D11_KEEP_RENDER_TARGETS_AND_DEPTH_STENCIL, nullptr, nullptr, kBdUavSlot, 1, &uav, nullptr);
+    }
+    capBound_ = true;
+    flags_ |= kFlagCapPass;
+    g_bdPaneDraws.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
+void ConcoursePaneScope::endCapturePass() noexcept {
+    if (!capBound_) return;
+    capBound_ = false;
+    flags_ &= ~kFlagCapPass;
+    {
+        FlatComputeInternalScope internal;
+        ID3D11UnorderedAccessView* none = nullptr;
+        ctx_->OMSetRenderTargetsAndUnorderedAccessViews(D3D11_KEEP_RENDER_TARGETS_AND_DEPTH_STENCIL, nullptr, nullptr, kBdUavSlot, 1, &none, nullptr);
+    }
+    calls_->setDepth(ctx_, capPrevDs_, capPrevRef_);
+    if (capPrevDs_) capPrevDs_->Release();
+    capPrevDs_ = nullptr;
+    calls_->setSrv(ctx_, kBdSceneSlot, 1, &capPrevSrv_);
+    if (capPrevSrv_) capPrevSrv_->Release();
+    capPrevSrv_ = nullptr;
+    calls_->setPs(ctx_, capPrevPs_, nullptr, 0);
+    if (capPrevPs_) capPrevPs_->Release();
+    capPrevPs_ = nullptr;
+    calls_->setBlend(ctx_, capPrevBs_, capPrevFactor_, capPrevMask_);
+    if (capPrevBs_) capPrevBs_->Release();
+    capPrevBs_ = nullptr;
+}
+
+bool ConcoursePaneScope::beginMirrorSlow() noexcept {
+    closeGameQueries();
     const auto no = [&]() noexcept {
         if (testSlot_ >= 0) {
             testAbandon(testSlot_);
@@ -1611,9 +2058,24 @@ bool ConcoursePaneScope::beginMirrorSlow() noexcept {
     // instead (the textures), said once: a pane is never left transparent with the outside culled.
     ID3D11PixelShader* skyPs = nullptr;
     ID3D11Buffer* steadyCb = nullptr;
+    ID3D11ShaderResourceView* cubeSrv = nullptr;   // mirror-backdrop: the cube, sampled by the display shader, with its sampler
+    ID3D11SamplerState* cubeSmp = nullptr;
     if (planSteady_ && !planTint_) {
         skyPs = g_psSky.load(std::memory_order_acquire);
         steadyCb = (keyN_ == cc::kBayIndexCount ? g_cbGlowBay : g_cbGlow).load(std::memory_order_acquire);
+        if (planBackdrop_) {
+            ID3D11PixelShader* show = g_psBdShow.load(std::memory_order_acquire);
+            ID3D11ShaderResourceView* srv = g_bdFrontSrv.load(std::memory_order_acquire);
+            ID3D11SamplerState* smp = g_bdSampler.load(std::memory_order_acquire);
+            if (show && srv && smp) {
+                skyPs = show;
+                cubeSrv = srv;
+                cubeSmp = smp;
+            } else if (!g_bdFallbackSaid.exchange(true, std::memory_order_relaxed)) {
+                Log::get().note("concourse backdrop: mirror-backdrop has no %s yet (the cube is made by the first capture, F6); the panes are drawn as mirror-steady",
+                                !show ? "display shader" : !srv ? "cube" : "sampler");
+            }
+        }
         if (!skyPs || !steadyCb) {
             skyPs = nullptr;
             steadyCb = nullptr;
@@ -1657,7 +2119,15 @@ bool ConcoursePaneScope::beginMirrorSlow() noexcept {
     } else if (steadyNow) {
         ctx_->PSGetShader(&prevPs_, nullptr, nullptr);
         calls_->setPs(ctx_, skyPs, nullptr, 0);
-        flags_ |= kFlagPs;   // put back by end(), with the buffer below (kFlagCb); no textures are swapped
+        flags_ |= kFlagPs;   // put back by end(), with the buffer below (kFlagCb); no textures are swapped (the backdrop: t8 and s7 below)
+        if (cubeSrv) {
+            ctx_->PSGetShaderResources(kPaneSrvFirst, kPaneSrvCount, prevSrv_);
+            calls_->setSrv(ctx_, kBdSceneSlot, 1, &cubeSrv);
+            flags_ |= kFlagSrv;
+            ctx_->PSGetSamplers(kBdSamplerSlot, 1, &prevSampler_);
+            ctx_->PSSetSamplers(kBdSamplerSlot, 1, &cubeSmp);
+            flags_ |= kFlagSampler;
+        }
     } else {
         ctx_->PSGetShaderResources(kPaneSrvFirst, kPaneSrvCount, prevSrv_);
         calls_->setSrv(ctx_, kPaneSrvFirst, kPaneSrvCount, mine);
@@ -1678,6 +2148,12 @@ bool ConcoursePaneScope::beginMirrorSlow() noexcept {
 }
 
 void ConcoursePaneScope::end() noexcept {
+    if ((flags_ & kFlagCapPass) != 0) endCapturePass();   // a capture pass the site never asked past (the loop always does; this is the way out of any other exit)
+    if ((flags_ & kFlagSampler) != 0) {
+        ctx_->PSSetSamplers(kBdSamplerSlot, 1, &prevSampler_);
+        if (prevSampler_) prevSampler_->Release();
+        prevSampler_ = nullptr;
+    }
     if (testSlot_ >= 0) {
         if ((flags_ & kFlagTestMirror) != 0) {
             testCloseMirror(ctx_, testSlot_);
@@ -1747,9 +2223,22 @@ struct Group {
     uint64_t samples = 0;
 };
 
-void setMode(uint32_t m, const char* why) noexcept {
+// The toast names the mode in plain words (F4 and F6 only; the ini's own setting at start-up says nothing).
+void modeToast(uint32_t m) noexcept {
+    switch (m) {
+        case kModeBackdrop: queueToast(g_bdCubeValid.load(std::memory_order_relaxed) ? "Windows: captured view" : "Windows: captured view, none yet"); break;
+        case kModeSteady: queueToast("Windows: flat light"); break;
+        case kModeLit: case kModeBright: case kModeBrightest: queueToast("Windows: bright mirror"); break;
+        case kModeMirror: case kModeMirrorSoft: queueToast("Windows: mirror"); break;
+        case kModeTint: queueToast("Windows: tint"); break;
+        default: queueToast("Windows: plain glass"); break;
+    }
+}
+
+void setMode(uint32_t m, const char* why, bool toast = false) noexcept {
     const uint32_t before = g_mode.exchange(m, std::memory_order_relaxed);
     if (before != m) Log::get().note("concourse pane: mode %s (%s)", modeText(m), why);
+    if (toast && before != m) modeToast(m);
 }
 
 // The ranking only: the capture never changes the list or the mode.
@@ -1843,7 +2332,7 @@ void pollConfig(uint64_t nowMs) {
         g_modeAppliedText = modeT;
         uint32_t m = kModeSteady;
         if (parseMode(modeT, &m)) setMode(m, "diag.concourse_pane_mode");
-        else Log::get().note("concourse pane: diag.concourse_pane_mode = \"%s\" is not mirror-steady, mirror-brightest, mirror-lit, mirror-bright, mirror-soft, mirror, tint or off; the mode is unchanged", modeT.c_str());
+        else Log::get().note("concourse pane: diag.concourse_pane_mode = \"%s\" is not mirror-backdrop, mirror-steady, mirror-brightest, mirror-lit, mirror-bright, mirror-soft, mirror, tint or off; the mode is unchanged", modeT.c_str());
     }
     const std::string glowT = Config::get().getString("diag.concourse_glow", "");
     if (!g_glowTextSeen || glowT != g_glowAppliedText) {
@@ -1916,12 +2405,14 @@ void updateArmed() noexcept {
     const uint32_t mode = g_mode.load(std::memory_order_relaxed);
     const bool treat = g_feedTreat.load(std::memory_order_relaxed) && mode != kModeOff && g_statesReady.load(std::memory_order_acquire);
     const bool withhold = g_feedWithhold.load(std::memory_order_relaxed);   // whatever the mode: F4 at off shows what the cull leaves
+    const bool effects = withhold || g_feedEffects.load(std::memory_order_relaxed);   // the outside is not issued: the plain phase, or the backdrop capture's lift
     const bool shares = g_feedMeasure.load(std::memory_order_relaxed) && g_shareOn.load(std::memory_order_relaxed);
     g_treatNow.store(treat, std::memory_order_release);
     const bool sealed = g_feedSealed.load(std::memory_order_relaxed);
     g_withholdNow.store(withhold, std::memory_order_release);
+    g_effectsNow.store(effects, std::memory_order_release);
     g_withholdSealedNow.store(sealed, std::memory_order_release);
-    detail::g_concoursePaneArmed.store(treat || withhold || sealed || shares || g_capturing.load(std::memory_order_relaxed), std::memory_order_release);
+    detail::g_concoursePaneArmed.store(treat || effects || sealed || shares || g_capturing.load(std::memory_order_relaxed) || g_bdArmed.load(std::memory_order_relaxed), std::memory_order_release);
 }
 
 }  // namespace
@@ -1962,7 +2453,7 @@ void updateGlowCb(ID3D11Device* device) noexcept {
             g_glowCbSentValid = true;
         }
     }
-    if (g_mode.load(std::memory_order_relaxed) == kModeSteady && g_treatNow.load(std::memory_order_relaxed) &&
+    if ((g_mode.load(std::memory_order_relaxed) == kModeSteady || g_mode.load(std::memory_order_relaxed) == kModeBackdrop) && g_treatNow.load(std::memory_order_relaxed) &&
         (!g_glowLogged || g_glowLoggedLv[0] != sky || g_glowLoggedLv[1] != angled || g_glowLoggedLv[2] != other || g_glowLoggedLv[3] != bay)) {
         g_glowLogged = true;
         g_glowLoggedLv[0] = sky;
@@ -2028,6 +2519,7 @@ void concoursePaneSetFeed(const ConcoursePaneFeed& feed) noexcept {
         g_plainFrom.store(g_frameNow.load(std::memory_order_relaxed), std::memory_order_relaxed);
         g_clearN.store(cc::kBayIndexCount, std::memory_order_relaxed);   // back in the plain mirror phase: the next approach starts from the bay window
     }
+    g_feedEffects.store(feed.effects, std::memory_order_relaxed);
     g_feedSealed.store(feed.sealed, std::memory_order_relaxed);
     g_bayOpacity.store(feed.bayOpacity, std::memory_order_relaxed);
     g_enterShareFed.store(feed.enterShare, std::memory_order_relaxed);
@@ -2042,6 +2534,63 @@ ConcoursePaneShares concoursePaneShares() noexcept {
     if (r.valid && GetTickCount64() - g_latestMs > 250) r = ConcoursePaneShares{};   // no family draw on screen makes no reading: the bay is out of view, soon
     return r;
 }
+
+namespace {
+// The state machine, once a tick (the cull's tick runs first in the same Present: it arms, and reads the result a tick later). Idle -> (arm requested) -> Armed, whose
+// pane draws, in the frames after this tick, copy the scene and capture; at the tick after a frame in which at least one pane was captured, the back texture is copied to
+// the front one and the phase is Done. With no pane captured for kBackdropWaitFrames frames it is Empty. A resource refusal is Refused (its line is logged by the maker).
+void backdropTick(ID3D11Device* device, uint32_t frame) noexcept {
+    const auto phase = static_cast<ConcourseBackdropPhase>(g_bdPhase.load(std::memory_order_relaxed));
+    if (phase == ConcourseBackdropPhase::kIdle && g_bdArmRequested.exchange(false, std::memory_order_acq_rel)) {
+        if (!device) {
+            bdRefuse("no device");
+            g_bdPhase.store(static_cast<uint8_t>(ConcourseBackdropPhase::kRefused), std::memory_order_relaxed);
+            queueToast("Windows: capture refused");
+        } else if (!makeBackdropResources(device) || !g_statesReady.load(std::memory_order_acquire)) {
+            if (g_statesReady.load(std::memory_order_acquire) == false && g_bdBack.load() != nullptr) bdRefuse("the pane states are not made (the cull is not treating panes)");
+            g_bdPhase.store(static_cast<uint8_t>(ConcourseBackdropPhase::kRefused), std::memory_order_relaxed);
+            queueToast("Windows: capture refused");
+        } else {
+            g_bdPaneDraws.store(0, std::memory_order_relaxed);
+            g_bdSceneCopied.store(false, std::memory_order_relaxed);
+            g_bdSceneFrame.store(0xFFFFFFFFu, std::memory_order_relaxed);
+            g_bdSceneOkFrame.store(0xFFFFFFFFu, std::memory_order_relaxed);
+            g_bdSceneRefusedSaid.store(false, std::memory_order_relaxed);
+            g_bdPassRefusedSaid.store(false, std::memory_order_relaxed);
+            g_bdFramesWaited = 0;
+            g_bdArmFrame = frame;
+            g_bdPhase.store(static_cast<uint8_t>(ConcourseBackdropPhase::kArmed), std::memory_order_relaxed);
+            g_bdArmed.store(true, std::memory_order_release);   // the draws after this tick are the capture frame
+        }
+        return;
+    }
+    if (phase != ConcourseBackdropPhase::kArmed || frame == g_bdArmFrame) return;
+    g_bdFramesWaited = frame - g_bdArmFrame;
+    if (g_bdPaneDraws.load(std::memory_order_relaxed) > 0) {
+        g_bdArmed.store(false, std::memory_order_release);
+        ID3D11Texture2D* back = g_bdBack.load(std::memory_order_acquire);
+        ID3D11Texture2D* front = g_bdFront.load(std::memory_order_acquire);
+        ID3D11DeviceContext* imm = nullptr;
+        if (device) device->GetImmediateContext(&imm);
+        if (back && front && imm) {
+            FlatComputeInternalScope internal;
+            imm->CopyResource(front, back);
+            g_bdCubeValid.store(true, std::memory_order_release);
+            g_bdPhase.store(static_cast<uint8_t>(ConcourseBackdropPhase::kDone), std::memory_order_relaxed);
+            queueToast("Windows: view captured");
+        } else {
+            bdRefuse("the cube could not be copied (no immediate context or texture)");
+            g_bdPhase.store(static_cast<uint8_t>(ConcourseBackdropPhase::kRefused), std::memory_order_relaxed);
+            queueToast("Windows: capture refused");
+        }
+        if (imm) imm->Release();
+    } else if (g_bdFramesWaited >= cc::kBackdropWaitFrames) {
+        g_bdArmed.store(false, std::memory_order_release);
+        g_bdPhase.store(static_cast<uint8_t>(ConcourseBackdropPhase::kEmpty), std::memory_order_relaxed);
+        queueToast("Windows: nothing captured");
+    }
+}
+}  // namespace
 
 void concoursePaneTick(ID3D11Device* device, uint32_t frame, uint64_t nowMs) noexcept {
     g_lastTickMs = nowMs;
@@ -2064,9 +2613,10 @@ void concoursePaneTick(ID3D11Device* device, uint32_t frame, uint64_t nowMs) noe
     g_social = cc::concourseSocialOnFoot(journalStatusFlags2(), known, raw.gameplay);
     if (g_keyMode && g_keyMode->pressed()) {
         const uint32_t cur = g_mode.load(std::memory_order_relaxed);
-        // mirror-lit, mirror-bright and mirror-soft are set by the key only: the press steps mirror-steady, mirror-brightest, mirror, tint, off.
-        const uint32_t next = cur == kModeSteady ? kModeBrightest : cur == kModeBrightest ? kModeMirror : cur == kModeMirror ? kModeTint : cur == kModeTint ? kModeOff : kModeSteady;
-        setMode(next, g_social ? "hotkey.concourse_pane_mode" : "hotkey.concourse_pane_mode; it applies on foot in social space");
+        // mirror-lit, mirror-bright and mirror-soft are set by the ini only: the press steps mirror-backdrop, mirror-steady, mirror-brightest, mirror, tint, off.
+        const uint32_t next = cur == kModeBackdrop ? kModeSteady : cur == kModeSteady ? kModeBrightest : cur == kModeBrightest ? kModeMirror : cur == kModeMirror ? kModeTint
+                              : cur == kModeTint ? kModeOff : kModeBackdrop;
+        setMode(next, g_social ? "hotkey.concourse_pane_mode" : "hotkey.concourse_pane_mode; it applies on foot in social space", true);
     }
     if (g_keyCapture && g_keyCapture->pressed()) {
         g_surveyRequested.store(true, std::memory_order_relaxed);
@@ -2120,7 +2670,46 @@ void concoursePaneTick(ID3D11Device* device, uint32_t frame, uint64_t nowMs) noe
         pollShares(device, prevFrame, frame, measuring, nowMs);
         readMaterials(device, frame);
     }
+    backdropTick(device, frame);
     updateArmed();
+}
+
+// ---- The backdrop capture's tick and its API (PROTOTYPE) -------------------------------------------------------------------------------------------------
+void concoursePaneSetBackdropMode(const char* why) noexcept { setMode(kModeBackdrop, why, true); }
+
+void concoursePaneArmCapture() noexcept {
+    g_bdPhase.store(static_cast<uint8_t>(ConcourseBackdropPhase::kIdle), std::memory_order_relaxed);
+    g_bdArmRequested.store(true, std::memory_order_release);
+}
+
+ConcourseBackdropStatus concoursePaneBackdropStatus() noexcept {
+    ConcourseBackdropStatus s;
+    s.phase = static_cast<ConcourseBackdropPhase>(g_bdPhase.load(std::memory_order_relaxed));
+    s.sceneCopied = g_bdSceneCopied.load(std::memory_order_relaxed);
+    s.paneDraws = g_bdPaneDraws.load(std::memory_order_relaxed);
+    s.framesWaited = g_bdFramesWaited;
+    std::lock_guard<std::mutex> lock(g_bdMutex);
+    s.sceneW = g_bdSceneW;
+    s.sceneH = g_bdSceneH;
+    std::snprintf(s.sceneFormat, sizeof(s.sceneFormat), "%s", g_bdSceneFmtText);
+    std::snprintf(s.refusal, sizeof(s.refusal), "%s", g_bdRefusal);
+    return s;
+}
+
+void concoursePaneBackdropEnd() noexcept {
+    g_bdArmRequested.store(false, std::memory_order_relaxed);
+    g_bdArmed.store(false, std::memory_order_release);
+    g_bdPhase.store(static_cast<uint8_t>(ConcourseBackdropPhase::kIdle), std::memory_order_relaxed);
+    updateArmed();
+}
+
+bool concoursePaneTakeToast(char* out, size_t size) noexcept {
+    if (!out || size == 0) return false;
+    std::lock_guard<std::mutex> lock(g_toastMutex);
+    if (!g_toastDue) return false;
+    g_toastDue = false;
+    std::snprintf(out, size, "%s", g_toastText);
+    return true;
 }
 
 }  // namespace edvr

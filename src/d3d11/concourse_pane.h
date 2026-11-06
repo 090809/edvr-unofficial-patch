@@ -8,6 +8,7 @@
 //   mirror-soft  mirror, and the pixel shader's constant buffer 2 replaced by EDVR's own (roughness scaled to 0.54)
 //   tint         the second draw is a white pixel shader and a blend-factor colour per index count, opaque, so each window type can be told apart by eye
 //   off          the game's own glass, unchanged
+//   mirror-backdrop  mirror-steady's one opaque pass, with a pixel shader that samples a cube of view directions captured on a key press (PROTOTYPE, the end of this header)
 // While the cull is on (the plain phase), the second draw is limited to the pixels whose scene behind the pane is farther than diag.concourse_mirror_beyond
 // metres: a mark pass (one fullscreen triangle at that depth, writing stencil bit 0x40 where the scene is farther) runs once a frame before the first mirror
 // draw, and the mirror draw tests that bit. Glass with a wall behind it (a terminal screen) is left as the game drew it. Each pane's side, learned by two
@@ -21,6 +22,7 @@
 #include <d3d11_1.h>
 
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 
 namespace edvr {
@@ -69,6 +71,9 @@ private:
     bool nextMirrorPassSlow() noexcept;
     void bindPsCb(ID3D11Buffer* own) noexcept;   // constant buffer 2 of the pixel stage, the previous one kept for end()
     bool beginMirrorSlow() noexcept;
+    void closeGameQueries() noexcept;   // the share query and the side test's first query end with the game's own draw, before any pass of ours
+    bool beginCapturePass() noexcept;   // PROTOTYPE (backdrop): binds the capture pass; false leaves the context as it was
+    void endCapturePass() noexcept;     // puts the capture pass's state back (the UAV, the pixel shader, t8, the blend and depth states)
     void end() noexcept;
 
     ID3D11DeviceContext* ctx_ = nullptr;
@@ -85,6 +90,18 @@ private:
     float planGlow_ = 0.0f;     // the lit modes: the glow pass's blend factor (0: no glow pass)
     bool planSteady_ = false;   // the steady modes: the glow pass is a flat colour, with no light or shadow in it
     bool mirrorBound_ = false;  // the mirror pass has been bound
+    bool planBackdrop_ = false; // mirror-backdrop: the steady pass with the cube-sampling pixel shader
+    bool planCapture_ = false;  // an armed backdrop capture: this exterior pane gets a capture pass before its display pass
+    bool capDone_ = false;      // the capture pass has been asked for
+    bool capBound_ = false;     // the capture pass's state is bound (endCapturePass puts it back)
+    ID3D11BlendState* capPrevBs_ = nullptr;
+    FLOAT capPrevFactor_[4] = {};
+    UINT capPrevMask_ = 0;
+    ID3D11PixelShader* capPrevPs_ = nullptr;
+    ID3D11ShaderResourceView* capPrevSrv_ = nullptr;
+    ID3D11DepthStencilState* capPrevDs_ = nullptr;
+    UINT capPrevRef_ = 0;
+    ID3D11SamplerState* prevSampler_ = nullptr;   // the display pass's sampler slot, the game's kept for end()
     FLOAT planFactor_[4] = {1.0f, 1.0f, 1.0f, 1.0f};
     uint32_t keyN_ = 0, keyStart_ = 0;
     int32_t keyBase_ = 0;
@@ -108,6 +125,7 @@ struct ConcoursePaneFeed {
     bool measure = false;       // the gate holds: family draws are measured
     bool treat = false;         // the cull is wanted: family draws are treated by the mode
     bool withhold = false;      // the cull is on and the phase is the plain mirror phase: the outside draws are not issued, the mirror is marked
+    bool effects = false;       // the outside effects are not issued although the phase is not the plain one (the backdrop capture's lift); withhold implies it
     bool sealed = false;        // the hangar is sealed: the families that can only be outside are not issued (concourse_cull_core.h, sealedToo)
     float bayOpacity = 1.0f;    // the clearing pane's opacity, 0 to 1
     float enterShare = 0.0f;    // the share of the view at which the clearing starts (diag.concourse_clear_share); 0 never: a pane read as exterior that fills this much becomes the clearing pane
@@ -143,12 +161,33 @@ struct ConcoursePaneMirrorStats {
     uint32_t known = 0, exterior = 0, dropped = 0;
 };
 ConcoursePaneMirrorStats concoursePaneTakeMirrorStats() noexcept;
-// The mode ("mirror", "mirror-soft", "tint", "off") and the number of panes in the list, for the summary.
+// The mode ("mirror-backdrop", "mirror-steady", "mirror", "mirror-soft", "tint", "off") and the number of panes in the list, for the summary.
 const char* concoursePaneModeName() noexcept;
 // The index count treated as the clearing pane now (36 until an exterior pane fills the view).
 uint32_t concoursePaneClearingN() noexcept;
 uint32_t concoursePaneSlotCount() noexcept;
 // Panes are being treated: the feed says treat, the mode is not off and the replacement states are made.
 bool concoursePaneTreating() noexcept;
+
+// ---- The backdrop capture (PROTOTYPE on the concourse arc, docs\concourse-cull-2026-11-05.md "The window plan") ----------------------------------------------
+// The cull's tick lifts the cull for kBackdropLiftMs, then calls concoursePaneArmCapture(). In the next frame (up to kBackdropWaitFrames) the first pane draw copies the
+// bound render target, and each exterior pane gets a capture pass that writes the scene behind it into the cube's back texture; the tick after copies it to the front
+// texture the display pass samples. The status says what happened, so the cull's tick can log it once and end the lift.
+enum class ConcourseBackdropPhase : uint8_t { kIdle, kArmed, kDone, kRefused, kEmpty };
+struct ConcourseBackdropStatus {
+    ConcourseBackdropPhase phase = ConcourseBackdropPhase::kIdle;
+    bool sceneCopied = false;        // a frame's first pane draw copied the render target
+    uint32_t sceneW = 0, sceneH = 0;
+    char sceneFormat[28] = {};
+    uint32_t paneDraws = 0;          // capture passes issued
+    uint32_t framesWaited = 0;
+    char refusal[200] = {};          // kRefused: why
+};
+void concoursePaneSetBackdropMode(const char* why) noexcept;   // F6: the mode becomes mirror-backdrop (a toast says so)
+void concoursePaneArmCapture() noexcept;                       // the capture is armed from the next tick; the status follows
+ConcourseBackdropStatus concoursePaneBackdropStatus() noexcept;
+void concoursePaneBackdropEnd() noexcept;                      // the cull's tick has read the result (or gives up): back to idle, and an open capture is closed
+// A toast text, once per hotkey change of the mode and per capture result ("Windows: ..."); false when none is waiting. The tick hands it to menuShowNotice.
+bool concoursePaneTakeToast(char* out, size_t size) noexcept;
 
 }  // namespace edvr

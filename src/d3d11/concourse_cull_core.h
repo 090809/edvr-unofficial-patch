@@ -72,7 +72,7 @@ constexpr float kCloseDistanceM = 40.0f;
 // the anchor and the hub are exempt, because the gate reads them from the store.
 constexpr float kAllowedFarM = 200.0f;
 
-enum class Judge : uint8_t { kKeepName, kKeepUnreadableName, kKeepUnreadableSphere, kKeepSmallClose, kKeepBig, kCull };
+enum class Judge : uint8_t { kKeepName, kKeepUnreadableName, kKeepUnreadableSphere, kKeepSmallClose, kCull };
 
 inline bool judgeKeeps(Judge j) noexcept { return j != Judge::kCull; }
 
@@ -84,9 +84,7 @@ constexpr float kLiftKeepM = 8.0f;
 // One record. A record whose name is unreadable, or an allowed name, is kept unless its sphere is readable and wholly past kAllowedFarM (distance - radius); the
 // anchor and the hub (`farExempt`, computed from the name by the caller) are kept however far. Then: keep an unreadable sphere (not finite, or no radius); keep a
 // small, close record; cull. `lift` (the player is in a shut lift cabin) replaces all of that by the rule above kLiftKeepM; `farExempt` does not apply to it.
-// `keepRadiusM` (the view test; 0 is off): a record with a readable sphere and a radius of at least this is kept, before the name and far rules; the lift comes first.
-inline Judge concourseJudge(bool nameReadable, bool allowed, bool sphereReadable, float distance, float radius, bool farExempt, bool lift = false,
-                            float keepRadiusM = 0.0f) noexcept {
+inline Judge concourseJudge(bool nameReadable, bool allowed, bool sphereReadable, float distance, float radius, bool farExempt, bool lift = false) noexcept {
     const bool sphereOk = sphereReadable && std::isfinite(distance) && std::isfinite(radius) && radius > 0.0f;
     if (lift) {
         if (!sphereOk) return Judge::kKeepUnreadableSphere;
@@ -94,7 +92,6 @@ inline Judge concourseJudge(bool nameReadable, bool allowed, bool sphereReadable
         if (radius <= kSmallRadiusM && surface <= kLiftKeepM) return Judge::kKeepSmallClose;
         return Judge::kCull;
     }
-    if (keepRadiusM > 0.0f && sphereOk && radius >= keepRadiusM) return Judge::kKeepBig;   // the view test: kept by size, whatever the name or the far rule
     const bool pastRoom = sphereOk && distance - radius > kAllowedFarM;
     if (!nameReadable) return pastRoom ? Judge::kCull : Judge::kKeepUnreadableName;
     if (allowed) return (!farExempt && pastRoom) ? Judge::kCull : Judge::kKeepName;
@@ -580,20 +577,72 @@ private:
     LiftEnd end_ = LiftEnd::kNone;
 };
 
-// ---- The view test (TEMPORARY, hotkey.concourse_view_test; removed when the arc closes, docs\concourse-cull-2026-11-05.md) ------------------------------------------
-// Each press steps a mode: the radius, in metres, from which an outside record is kept whatever its name (0: today's cull and the flat fill). Modes 1 to 5 also leave the
-// panes as plain glass and keep the outside effects withheld; the lift rule still judges inside a shut cabin.
-constexpr uint32_t kViewTestModes = 6;
-struct ViewTest {
-    float keepRadiusM = 0.0f;
-};
-inline ViewTest viewTestOf(uint32_t mode) noexcept {
-    static const float kRadius[kViewTestModes] = {0.0f, 150.0f, 80.0f, 40.0f, 20.0f, 10.0f};
-    ViewTest t;
-    if (mode < kViewTestModes) t.keepRadiusM = kRadius[mode];
-    return t;
-}
+// ---- The backdrop cube (PROTOTYPE on the concourse arc, docs\concourse-cull-2026-11-05.md "The window plan") -----------------------------------------------
+// One capture, on a key press, of the view through the exterior panes, kept in a cube of view directions (6 slices, D3D TextureCube addressing, faces +X -X +Y -Y +Z -Z).
+// The capture shader writes the texel of normalize(v2); the display shader samples the cube with the same direction. The helper below is the C++ twin of the HLSL text
+// beside it (the tests pin the C++; the two are written to be read side by side).
+constexpr uint32_t kBackdropCubeSize = 3072;     // about 27 texels a degree at a face's centre, against about 38 pixels on a 4K screen; 2 textures of 432 MB. Set high to judge the look, and to come down once it is judged
+constexpr uint64_t kBackdropLiftMs = 200;       // the cull is lifted this long before the capture frame is armed
+constexpr uint32_t kBackdropWaitFrames = 3;     // armed frames with no pane captured before the capture is given up
 
+struct CubeTexel {
+    uint32_t face = 0;   // 0 +X, 1 -X, 2 +Y, 3 -Y, 4 +Z, 5 -Z
+    float u = 0.0f, v = 0.0f;   // 0 to 1 across the face
+};
+// False for a direction that is zero or not finite. The major axis is the largest absolute value (a tie goes to x, then y); ma is its magnitude.
+inline bool cubeFaceOf(float x, float y, float z, CubeTexel* out) noexcept {
+    if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z)) return false;
+    const float ax = std::fabs(x), ay = std::fabs(y), az = std::fabs(z);
+    float ma = 0.0f, sc = 0.0f, tc = 0.0f;
+    uint32_t face = 0;
+    if (ax >= ay && ax >= az) {
+        ma = ax;
+        face = x > 0.0f ? 0u : 1u;
+        sc = x > 0.0f ? -z : z;
+        tc = -y;
+    } else if (ay >= az) {
+        ma = ay;
+        face = y > 0.0f ? 2u : 3u;
+        sc = x;
+        tc = y > 0.0f ? z : -z;
+    } else {
+        ma = az;
+        face = z > 0.0f ? 4u : 5u;
+        sc = z > 0.0f ? x : -x;
+        tc = -y;
+    }
+    if (!(ma > 0.0f)) return false;
+    if (out) {
+        out->face = face;
+        out->u = 0.5f * (sc / ma + 1.0f);
+        out->v = 0.5f * (tc / ma + 1.0f);
+    }
+    return true;
+}
+// The texel of a face of `size`: u = 1.0 clamps to the last one.
+inline void cubeTexelOf(const CubeTexel& c, uint32_t size, uint32_t* tx, uint32_t* ty) noexcept {
+    const uint32_t last = size > 0 ? size - 1 : 0;
+    const float fx = c.u * static_cast<float>(size), fy = c.v * static_cast<float>(size);
+    uint32_t x = fx > 0.0f ? static_cast<uint32_t>(fx) : 0u;
+    uint32_t y = fy > 0.0f ? static_cast<uint32_t>(fy) : 0u;
+    if (x > last) x = last;
+    if (y > last) y = last;
+    if (tx) *tx = x;
+    if (ty) *ty = y;
+}
+// The HLSL twin: the face and texel of a direction. Included by the capture shader.
+inline const char* cubeTexelHlsl() noexcept {
+    return "uint3 cubeTexel(float3 d, uint size) {\n"
+           "    float3 a = abs(d);\n"
+           "    float ma, sc, tc; uint face;\n"
+           "    if (a.x >= a.y && a.x >= a.z) { ma = a.x; face = d.x > 0 ? 0u : 1u; sc = d.x > 0 ? -d.z : d.z; tc = -d.y; }\n"
+           "    else if (a.y >= a.z) { ma = a.y; face = d.y > 0 ? 2u : 3u; sc = d.x; tc = d.y > 0 ? d.z : -d.z; }\n"
+           "    else { ma = a.z; face = d.z > 0 ? 4u : 5u; sc = d.z > 0 ? d.x : -d.x; tc = -d.y; }\n"
+           "    float2 uv = 0.5 * (float2(sc, tc) / max(ma, 1e-20) + 1.0);\n"
+           "    uint2 xy = min((uint2)(uv * (float)size), uint2(size - 1, size - 1));\n"
+           "    return uint3(xy, face);\n"
+           "}\n";
+}
 // ---- The glow levels by window type (diag.concourse_glow = "sky,angled,other,bay") ---------------------------------------------------------------------
 // The steady light of a pane: the brightest on overhead skylights, a level between on angled skylights, a middle level on any other window, and its own level on the
 // bay window. Absolute levels, each from 0 to 16. Overhead, angled and other are told by how much the pane faces the anchor's up axis (the pixel shader).

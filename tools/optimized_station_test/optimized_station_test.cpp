@@ -3872,30 +3872,41 @@ int main(int argc, char** argv) {
             check(!to.on(), "lift gate: stop is off");
         }
 
-        // The view test (TEMPORARY): mode to keep radius, and the judgement that uses it.
+        // The backdrop cube's face mapping (PROTOTYPE): D3D TextureCube addressing, faces +X -X +Y -Y +Z -Z.
         {
-            const float want[] = {0.0f, 150.0f, 80.0f, 40.0f, 20.0f, 10.0f, 0.0f, 0.0f};
-            const uint32_t modes[] = {0, 1, 2, 3, 4, 5, 6, 99};
-            bool all = true;
-            for (size_t i = 0; i < 8; ++i) all = all && cc::viewTestOf(modes[i]).keepRadiusM == want[i];
-            check(all && cc::kViewTestModes == 6, "view test: modes 0 to 5 keep from 0 (off), 150, 80, 40, 20 and 10 m, and an unknown mode is off");
+            using CT = cc::CubeTexel;
+            const auto at = [](float x, float y, float z, uint32_t face, float u, float v) {
+                CT c;
+                return cc::cubeFaceOf(x, y, z, &c) && c.face == face && std::fabs(c.u - u) < 1e-6f && std::fabs(c.v - v) < 1e-6f;
+            };
+            check(at(1, 0, 0, 0, 0.5f, 0.5f) && at(-1, 0, 0, 1, 0.5f, 0.5f) && at(0, 1, 0, 2, 0.5f, 0.5f) && at(0, -1, 0, 3, 0.5f, 0.5f) && at(0, 0, 1, 4, 0.5f, 0.5f) && at(0, 0, -1, 5, 0.5f, 0.5f),
+                  "backdrop cube: each axis is the centre of its face, +X -X +Y -Y +Z -Z in order");
+            // Off-centre points on each face: sc and tc per the D3D table, u = 0.5 (sc / ma + 1), v = 0.5 (tc / ma + 1).
+            check(at(2, 1, 1, 0, 0.5f * (-0.5f + 1), 0.5f * (-0.5f + 1)) && at(-2, 1, 1, 1, 0.5f * (0.5f + 1), 0.5f * (-0.5f + 1)),
+                  "backdrop cube: the X faces take sc = -z / +z and tc = -y");
+            check(at(1, 2, 1, 2, 0.5f * (0.5f + 1), 0.5f * (0.5f + 1)) && at(1, -2, 1, 3, 0.5f * (0.5f + 1), 0.5f * (-0.5f + 1)),
+                  "backdrop cube: the Y faces take sc = +x and tc = +z / -z");
+            check(at(1, 1, 2, 4, 0.5f * (0.5f + 1), 0.5f * (-0.5f + 1)) && at(1, 1, -2, 5, 0.5f * (-0.5f + 1), 0.5f * (-0.5f + 1)),
+                  "backdrop cube: the Z faces take sc = +x / -x and tc = -y");
+            check(at(1, 1, 1, 0, 0.0f, 0.0f) && at(1, -1, -1, 0, 1.0f, 1.0f) && at(-3, 3, 3, 1, 1.0f, 0.0f),
+                  "backdrop cube: a corner direction is a tie won by x, then y, and lands on the face's corner");
+            check(at(10, 0, 0, 0, 0.5f, 0.5f) && at(0.0f, 0.0f, -0.001f, 5, 0.5f, 0.5f), "backdrop cube: the length of the direction does not matter");
+            CT c;
+            check(!cc::cubeFaceOf(0, 0, 0, &c) && !cc::cubeFaceOf(NAN, 0, 1, &c) && !cc::cubeFaceOf(INFINITY, 0, 1, &c), "backdrop cube: a zero or non-finite direction has no face");
+            uint32_t tx = 0, ty = 0;
+            cc::cubeTexelOf(CT{0, 1.0f, 1.0f}, 1536, &tx, &ty);
+            const bool clampHigh = tx == 1535 && ty == 1535;
+            cc::cubeTexelOf(CT{0, 0.0f, 0.0f}, 1536, &tx, &ty);
+            const bool lowEdge = tx == 0 && ty == 0;
+            cc::cubeTexelOf(CT{0, 0.5f, 0.25f}, 1536, &tx, &ty);
+            check(clampHigh && lowEdge && tx == 768 && ty == 384, "backdrop cube: u or v of 1.0 clamps to the last texel, 0.0 is the first, the middle is half the size");
+            check(std::strstr(cc::cubeTexelHlsl(), "uint3 cubeTexel(float3 d, uint size)") != nullptr && cc::kBackdropCubeSize == 3072 && cc::kBackdropLiftMs == 200 && cc::kBackdropWaitFrames == 3,
+                  "backdrop cube: the HLSL twin is present, the cube is 1536 square, the lift 200 ms and the wait 3 frames");
             using J = cc::Judge;
-            check(cc::concourseJudge(true, true, true, 600.0f, 300.0f, false, false, 150.0f) == J::kKeepBig && cc::concourseJudge(true, false, true, 900.0f, 150.0f, false, false, 150.0f) == J::kKeepBig,
-                  "view test judge: a record of the keep radius or more is kept, past 200 m, allowed name or not");
-            check(cc::concourseJudge(true, false, true, 900.0f, 149.0f, false, false, 150.0f) == J::kCull && cc::concourseJudge(true, true, true, 900.0f, 100.0f, false, false, 150.0f) == J::kCull &&
-                      cc::concourseJudge(true, false, true, 10.0f, 2.0f, false, false, 150.0f) == J::kKeepSmallClose && cc::concourseJudge(true, true, true, 100.0f, 3.0f, false, false, 150.0f) == J::kKeepName,
-                  "view test judge: a smaller record is judged as before");
-            check(cc::concourseJudge(true, true, true, 600.0f, 300.0f, false, true, 150.0f) == J::kCull && cc::concourseJudge(true, true, true, 3.0f, 3.0f, false, true, 150.0f) == J::kKeepSmallClose,
-                  "view test judge: the lift rule comes first and ignores the keep radius");
-            check(cc::concourseJudge(true, true, true, 600.0f, 300.0f, false, false, 0.0f) == J::kCull && cc::concourseJudge(true, false, true, 900.0f, 1000.0f, false, false) == J::kCull &&
-                      cc::concourseJudge(true, true, true, 150.0f, 3.0f, false, false, 0.0f) == J::kKeepName,
-                  "view test judge: a keep radius of 0 changes nothing");
-            check(cc::concourseJudge(true, false, false, 0.0f, 500.0f, false, false, 150.0f) == J::kKeepUnreadableSphere && cc::concourseJudge(true, false, true, 900.0f, 0.0f, false, false, 150.0f) == J::kKeepUnreadableSphere &&
-                      cc::concourseJudge(false, false, true, 900.0f, 500.0f, false, false, 150.0f) == J::kKeepBig && cc::concourseJudge(false, false, true, 900.0f, 100.0f, false, false, 150.0f) == J::kCull,
-                  "view test judge: an unreadable sphere behaves as before; an unreadable name is kept by size and culled below it");
-            check(cc::judgeKeeps(J::kKeepBig), "view test judge: kept by size is a keep");
+            check(cc::concourseJudge(true, true, true, 600.0f, 300.0f, false, false) == J::kCull && cc::concourseJudge(true, true, true, 600.0f, 300.0f, false, true) == J::kCull &&
+                      cc::concourseJudge(true, true, true, 3.0f, 3.0f, false, true) == J::kKeepSmallClose && cc::concourseJudge(true, true, true, 150.0f, 3.0f, false, false) == J::kKeepName,
+                  "concourse judge: with the size test gone, a big far record is culled as before and the lift rule is unchanged");
         }
-
         // The lift survey's name test and moved test (TEMPORARY, log only).
         {
             check(cc::liftPartName("TurboLiftDoorLeft") && cc::liftPartName("TurboLiftDoorLeft2") && cc::liftPartName("TurboLiftDoorRight") && cc::liftPartName("TurboLiftDoorRight2") &&
