@@ -2,9 +2,12 @@
 
 ## Status
 
-- **State (2026-10-30): DESIGN ONLY.** Nothing built, keyed or flown. From
-  OFXR-Bridge `d7fcca72` and EDVR `6b8ef374`; dated entries add AFW and the
-  flat profile (10-27) and VectorXR (10-30). No issue is filed yet.
+- **State (2026-11-07): Phase 1 first slice BUILT, NOT FLOWN** (branch
+  `framegen-phase1` of the fork `090809/edvr-unofficial-patch`; 2026-11-07
+  entry). Scores far, cockpit and world, and H6; mover, reactive, H4, H8, H9
+  and the surface classifier are not built. Design from OFXR-Bridge
+  `d7fcca72` and EDVR `6b8ef374`; dated entries add AFW and the flat profile
+  (10-27) and VectorXR (10-30). No issue is filed yet.
 - **Recommendation:** take OFXR-Bridge's frame loop, not its synthesizer. Elite
   renders at half the headset rate and EDVR's runtime presents every display
   period. The frame in between is **extrapolated** from Elite's newest frame,
@@ -52,7 +55,7 @@
   pixel class), the stereo score (H8), the surface classifier, the frame GPU
   span while armed (H1), the per-eye GPU share (H9) and the eye-position miss
   (H6). Nothing shown in the headset changes.
-- **Temporary key (proposed, not built):** `fix.frame_generation_shadow`
+- **Temporary key (built 2026-11-07, hidden):** `fix.frame_generation_shadow`
   (off | on), Phase 1 only. The user key `fix.frame_generation` (off | auto)
   comes with Phase 2. Its `on` value (forced, ignoring the gate's performance
   terms) is temporary, for A/B flights.
@@ -896,3 +899,51 @@ read from this session. Paths below are in that repository.
   - The canopy answer from the stereo score (Phase 1).
   - VectorXR as a second Phase 0 reference.
 - **Not taken:** its high-priority D3D12 queue (## Declined).
+
+### 2026-11-07: Phase 1, first slice built (not flown)
+
+Branch `framegen-phase1` (fork `090809/edvr-unofficial-patch`), for a
+Pimax Dream Air on SteamVR's OpenXR runtime (SBoys3 driver), 90 Hz, render
+2817x2448 per eye, output 3756x3264, DLSS.
+
+- **Key:** `fix.frame_generation_shadow` (off | on), hidden, temporary,
+  read in `temporalPassConfigure`. Off: no resources, no dispatches, no
+  lines, and the runtime makes no extra locates.
+- **One owner:** the pixel direction, the metres from depth, the world/ship
+  split, the carry and the projection are five HLSL functions between the
+  `EDVR_TEMPORAL_CARRY` markers in `temporal_shader_source.h`. The history
+  fetch and `mv()` call them, and the scorer's shader is built from that
+  same text. The motion bytecode changed (a hoisted `pp`, a recomputed
+  `rows * d`), not its maths; the temporal rigs and their mutations pass.
+- **The scorer** (`src/d3d11/framegen_shadow.cpp`), per eye after the
+  trained engine's output, at a quarter of render size: capture luma of the
+  upscaled output (before the UI) and the nearest depth of each 4x4; splat
+  the previous real frame A forward with the predicted transforms; score
+  each cell of B against the real B, and against A unwarped. The prediction
+  is constant ship velocity (A's ship part, the world delta less the head's)
+  with B's true head, so the head's own miss is H6's alone. The rig miss is
+  logged as degrees and millimetres.
+- **Cut from the slice:** mover and reactive (no per-pixel signal: no
+  general mover mask, and `dlMask` is written only with the UI track or
+  engine records), interpolation (H4), the stereo score (H8), the surface
+  classifier and H9. Holes are counted, not filled, and the splat winner's
+  edge guard is not built.
+- **Lines:** `frame generation (shadow): armed, ...` once; `frame generation
+  (shadow): frames=... far=... cockpit=... world=... holes=... gpu_ms=...
+  rig_deg=... rig_mm=...` each second in the graphics log; `frame generation
+  (shadow) pose: ... runtime_mm runtime_deg velocity_mm velocity_deg ...`
+  each second in the runtime log (H6, measured at the pair's submit, T_S =
+  T + P, truth located once the clock passes T_S). The flag reaches the
+  runtime as word 18 of `EdvrNativeFrameOutput` version 12.
+- **`gpu_ms`** is sampled only on frames where the GPU census times the
+  scorer (`DoorFrameGenShadow`), so the 1 s line carries `(n=...)`, and
+  `-(n=0)` when none was timed.
+- **Rigs:** `framegen_shadow_test` on WARP (static, head turn, cockpit
+  translation with its hole strip, world with constant and accelerating
+  ship, the far plane and the 1 mm split, the key off) and
+  `framegen_shadow_report_test`; `edvr_log.py --health` rule "frame
+  generation shadow" (NEVER APPLIED when armed with no score line, or with
+  a runtime log and no pose line).
+- **Next flight:** Konovalets Hydroponics Site (Warrapatis 1 b) in a ship,
+  low flight, on foot; then docked with the head still (the floor); then
+  supercruise near a planet.
