@@ -333,6 +333,10 @@ On the ninth build, flat, at the same station.
 
 Then: `python tools\edvr_log.py --target steam --expect-build 4eead728 --grep "concourse"`.
 
+## Flight 9 notes
+
+Log `edvr_gfx_20261106_092241`, build 4eead728. Sean sees rotating shadows on the lit mirrors, with a shadow's edge sharp across a pane. The glow pass is the game's glass shader at F0 1 and roughness 1, and that shader reads the sun's moment shadow map at `t7` (`ps_66B08F89`, four-moment gather, `cb1[297]`, `cb1[261]`), so the pane now shows the sun and its shadows, moving as the station turns. The look depends on the sun's direction, so it also changes over a rotation. He likes the look of the mode he is on.
+
 ## Performance candidates
 
 Ranked by expected gain against risk. The first two and the plume are in the build.
