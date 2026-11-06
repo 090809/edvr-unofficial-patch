@@ -2,7 +2,7 @@
 
 ## Status
 
-State: DIAGNOSED to ranked hypotheses only. No cause proven. The video matches no EDVR log, so nothing here ties a log line to the event. No code, build, install or commit was made.
+State: DIAGNOSED to ranked hypotheses only. No cause proven. The video matches no EDVR log, so nothing here ties a log line to the event. **A defence is built, not flown (see the 2026-11-06 entry in `docs\optimized-station-2026-10-12.md`):** rig bounds are dropped at every seal and origin shift, and a seal that loses its own pad for 3 passes in a row releases, with a line naming why.
 
 **What the video shows (VERIFIED, frames extracted with ffmpeg, 190 frames, 2560x1440, 26.28 fps, 7.21 s, constant frame interval 35-38 ms).**
 - 0-2.1 s: on foot in a hangar at Jameson Memorial (an Orbis), walking to a Diamondback Explorer; blue boarding-volume cylinder, Board panel.
@@ -27,7 +27,7 @@ State: DIAGNOSED to ranked hypotheses only. No cause proven. The video matches n
 
 **Ruled out for this video:** see the last section.
 
-**Next step (cheapest).** When it recurs, immediately press the log mark key (NumLock, as in the 11-03 flights) and keep the log; then read `python tools\edvr_log.py --target steam --expect-build HEAD --grep "optimized station"` at that time. A `sealed in` within 1 s, plus trace dumps or `missing from N`, proves hypothesis 1. Also run one boarding with `fix.optimized_stations` off and flip it on in F8 (a cheap A/B). Ask Sean whether the clip is his and which build; a clip with a log changes everything above.
+**Next step (cheapest).** When it recurs, immediately press the log mark key (NumLock, as in the 11-03 flights) and keep the log; then read `python tools\edvr_log.py --target steam --expect-build HEAD --grep "optimized station"` at that time. A `sealed in` within 1 s, plus trace dumps or `missing from N`, proves hypothesis 1. On a build with the guard, the line to look for is `optimized station: guard:`; the bay vanishing with no such line argues against hypothesis 1. Also run one boarding with `fix.optimized_stations` off and flip it on in F8 (a cheap A/B). Ask Sean whether the clip is his and which build; a clip with a log changes everything above.
 
 ## Detail
 

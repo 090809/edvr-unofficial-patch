@@ -2,7 +2,7 @@
 
 ## Status
 
-- **State:** Flight 9 flown 2026-11-06 flat on Steam, log `edvr_gfx_20261106_092241`, build 4eead728. The build now on Steam is 990a2b44 (the mirror with a steady light behind it; full build green, optimized_station_test 1007 checks), not flown. Not merged. Extends `fix.optimized_stations`; the concourse cull is off unless the temporary keys turn it on, but the sealed-hangar withhold is on with `fix.optimized_stations`.
+- **State:** Flight 9 flown 2026-11-06 flat on Steam, log `edvr_gfx_20261106_092241`, build 4eead728. Flight 10 flown 2026-11-06 on 990a2b44, log `edvr_gfx_20261106_095708`: Sean asked for brighter skylights, dimmer bay windows, a middle level elsewhere, and the shop window to clear like the bay. The next build carries those, the seal guard, the room change on the lift's camera cut and the walk survey (full build green, optimized_station_test 1035 checks), not flown. Not merged. Extends `fix.optimized_stations`; the concourse cull is off unless the temporary keys turn it on, but the sealed-hangar withhold is on with `fix.optimized_stations`.
 - **Goals (Sean, 2026-11-05):** (1) on foot in the large-station concourse, cull everything outside the bay windows; (2) skylights and the window above the lift bank become a permanent mirrored surface, so missing structure is never seen; (3) approaching the bay windows clears the mirror and stops the cull, so the station interior is visible from there. **Added 2026-11-06:** (4) light behind the mirror, for the impression of a brightly lit station beyond it; (5) with `fix.optimized_stations` on, the same outside draws go while the hangar is sealed.
 - **Direction:** identify records by the store's name, keep an allow-list, and make the panes opaque. The fitted hall, the shader-pair lists and the shell read-back from the earlier attempt are not carried over (see Ruled out).
 - **Answered by Flight 1:** H1 yes, with named survivors. H2 yes. H3 yes for the bay window: VS `98397963AAEC45D3` / PS `66B08F89E4926C01`, n=36. H5 yes by eye: the room stayed lit. See "Flight 1 results".
@@ -14,14 +14,18 @@
 - **Answered by Flight 8:** H23 (a): Sean, "the bright washed out look stays on when F2 is off". Elite's own, and not this arc's.
 - **Answered by Flight 9:** H24 half: Sean likes `mirror-brightest`, the best so far, but the pass brings the sun's moving shadows with it. He chose a steady light instead.
 - **Open hypotheses (the next flight answers them):**
+  - **H27** The glass's lighting normal and the anchor's axes share a frame, so `abs(dot(n, up))` finds the skylights. Unproven: the log's `concourse pane: glow levels ... up X Y Z` gives the axis, and the eye says whether skylights are the bright ones. If every pane looks the same, this is refuted or `up` was not read.
+  - **H28** A window that fills the entry share and reads exterior can clear like the bay. `concourse pane: the clearing pane is now n=N (share S%)` and the `concourse clear:` lines with n say which opened. Known risk: looking straight up at a skylight can clear it too, since no camera direction is available here. The same n opens together.
+  - **H29** The lift is one camera cut, so the cull ends on it. `concourse cull: off (the camera cut to another room)` confirms. `the anchor record was not seen for 5 s` after a cut means a late sighting re-armed the anchor.
   - **H26** A flat colour added over the mirror, with no light or shadow in it, reads as a bright station behind the glass and stays still as the station turns. It costs almost nothing, a white pixel shader in place of a third full pass. The scene's HDR scale is unmeasured, so F4 steps 0.25 to 4 around a guess of 1. `mirror-brightest` is on F4 to compare.
   - **H25** The families marked `sealedToo` (lasers, plumes, trails, smoke, the planet, its atmosphere, the sun's glare) draw nothing a sealed hangar needs. No census has been taken in a sealed hangar, so this is by reasoning. Flares, the scatter, the particle batches and engine glows stay for that reason. `concourse withheld 30s:` says what matched there.
   - **H22** The hull is a nameless record. Not reported in Flight 8. If it still draws, an F3 press names what is kept.
   - **H20** and **H21** The ribbon: ask whether either trail is left.
   - **H6** `Standard_SocialArea` marks the large-station concourse at other stations too. Still unflown.
-- **Temporary keys (all removed when the arc closes):** `diag.concourse_cull` (on, off), `diag.concourse_keep` (extra name prefixes), `diag.concourse_pane_mode`, `diag.concourse_panes`, `diag.concourse_clear_share`, `diag.concourse_mirror_beyond`, `hotkey.concourse_cull`, `hotkey.concourse_pane_capture`, `hotkey.concourse_pane_mode`.
+- **Temporary keys (all removed when the arc closes):** `diag.concourse_cull` (on, off), `diag.concourse_keep` (extra name prefixes), `diag.concourse_pane_mode`, `diag.concourse_panes`, `diag.concourse_clear_share`, `diag.concourse_mirror_beyond`, `diag.concourse_glow` (sky, bay, other), `hotkey.concourse_cull`, `hotkey.concourse_pane_capture`, `hotkey.concourse_pane_mode`.
+- **Hangar to concourse and back (Sean, 2026-11-06):** steps 1 to 3 built, not flown; the seal on foot waits on the survey's numbers. See the section of that name at the end.
 - **Ruled out:** see the section of that name. **Issues:** none yet.
-- **Next flight:** the Flight 10 list, on build 990a2b44, installed on Steam 2026-11-06. Keys in both Steam inis: `hotkey.concourse_cull` F2 (the cull and the mirrors), `hotkey.concourse_pane_capture` F3 (logs a ranking by screen coverage and the kept names, changes nothing), `hotkey.concourse_pane_mode` F4.
+- **Next flight:** the Flight 11 list, build named there. Keys in both Steam inis: `hotkey.concourse_cull` F2 (the cull and the mirrors), `hotkey.concourse_pane_capture` F3 (logs a ranking by screen coverage and the kept names, changes nothing), `hotkey.concourse_pane_mode` F4.
 
 ## What the earlier attempt learned
 
@@ -351,6 +355,17 @@ On build 990a2b44, flat, at the same station.
 
 Then: `python tools\edvr_log.py --target steam --expect-build 990a2b44 --grep "concourse"`.
 
+## Flight 11
+
+Flat, Steam. One out-and-back, F2 pressed once while still seated (the walk survey runs only with the key armed).
+
+1. Sit on the pad about 15 s, then get out, cross the bay, take the lift. In the room: do the skylights, bay windows and other windows look right? `diag.concourse_glow` in `edvr-flat.ini` changes them live.
+2. Walk up to the ship services counter: does its window clear, and does it return when you turn away? If not, F4 to `tint` there and read the share from the log.
+3. Look straight up at a skylight: does it stay mirrored?
+4. Lift back, cross the bay, board, sit 15 s. Did anything vanish on the way out of the lift or after boarding?
+
+Then: `python tools\edvr_log.py --target steam --expect-build <build> --grep "walk survey|concourse cull|concourse clear|clearing pane|guard"`.
+
 ## Performance candidates
 
 Ranked by expected gain against risk. The first two and the plume are in the build.
@@ -386,3 +401,29 @@ Ranked by expected gain against risk. The first two and the plume are in the bui
 - `ruled out: B12F7A61/42AC0CAC as all of the green haze, because Flight 4 withheld it and the haze stayed.`
 - `ruled out: the particle batches (2BAE3742, 3789CA20, E54F2A90) as the green ellipses and pale wedges, because Flight 5 withheld them all and the shapes stayed.`
 - `ruled out: the cull as the cause of the washed-out look at the concourse's entrance, because it stays with F2 off (Flight 8).`
+
+## Hangar to concourse and back
+
+Sean's goal, 2026-11-06: leave the ship, cross the bay, take the lift, stay culled the whole way, and do the reverse. Sean approved steps 2 and 3 for the next build; steps 1 to 3 are built and not flown, step 4 is undecided.
+
+**Measured (VERIFIED, log `edvr_gfx_20261106_083104`, flat, Steam, small pad, unless named).**
+
+- The lift is a one-frame camera cut of about 1090 m, both ways: six trips, 1089.4 to 1091.4 m (`flat resolve reset event ... camera-cut=1`). No origin shift line comes with it.
+- Going to the concourse, `concourse cull: on` comes 1 ms after the cut on all three trips, so the anchor is seen on the cut's tick.
+- Coming back, the cull stays on for 5 s after the cut (4.99, 5.00, 5.00 s), which is `kConcAnchorFreshMs`. For those 5 s the concourse rule, which culls `Hanger*` and `LandingPad*`, runs on the hangar side. Nobody has reported it. UNKNOWN whether the lift cabin hides it.
+- Flags2 bit 13 (in hangar) lags the cut by 0.13 to 1.07 s. That was the 2026-10 reason not to seal on foot in `docs\optimized-station-2026-10-12.md`: the flag is too late. The cut is not.
+- The pad: on the 11-03 build (`edvr_gfx_20261103_044624`, no concourse key) the own pad is in every informative pass on foot, in the hangar and in the concourse. On this branch, with the key on, it is in 0 passes on foot, in the concourse and on the hangar side. INFERRED: the concourse store path returns before the seal's gathers.
+- The box for a small pad is 152 x 75 x 258 m. UNKNOWN where the lift door sits against it. After one cut the camera travelled about 84 m in 20 s before it stopped.
+- Frame time at the 144 cap (6.94 ms floor), present p50 per 5 s: hangar side on foot, unculled, 6.94 to 9.61 ms. Seated and sealed, 6.94 ms. Seated and unsealed, up to 11.41 ms. Concourse culled at the lift bank, 12 to 13 ms. So on this rig the on-foot seal has at most about 2.7 ms to save, and the cap hides anything under it. VR is unmeasured.
+
+**Plan.**
+
+1. Prove the seal guard first (build after 990a2b44). A seal on foot means more seals after an origin shift, which is where the boarding flicker is suspected.
+2. Change rooms on the cut. A camera step over 100 m on foot ends the concourse cull on that tick and forgets the anchor. It removes the 5 s overlap whether or not the rest goes ahead.
+3. A log-only walk survey: while on foot on the hangar side, once a second, the camera in the cell's frame, what the seal would veto by name, and frame time by zone. One flight: ship, bay, lift, concourse, and back. It answers whether the lift door, `HangarLobby` and the corridor fall inside the box, and how much the seal would save.
+4. The seal on foot, if step 3 justifies it: held while seated, or on foot with Flags2 bit 13 and the camera in the box. It releases on the cut at once, since `kCameraFrames` (10) would leave the concourse empty for 10 frames. The pad gather comes back on the concourse path while the anchor is absent. The withheld families follow, since `feed.sealed` comes from the same flag.
+5. Close the arc: default on with `fix.optimized_stations`, propose removing the temporary keys, a VR flight and a second station type.
+
+**The walk survey's lines (log only, armed key, docked; removed when the arc closes).** `walk survey: on` once. Then each second, up to 900 a session: `walk survey: zone Z, ... cam in bay x y z of half a b c m, past the box by M m, pad NAME, pad in pass P, seal H, frame mean T ms over N frames`. Zones: `seated`, `bay`, `past the box`, `concourse`, `no cell`. Every 5 s and on a zone change while unsealed, up to 300 a session: `walk survey names (zone Z, cam ...): would cull A of B records (P%), N names within 300 m; nearest would-cull: ...`. A would-cull name close to the camera in the bay or the lift corridor is what a seal on foot would wrongly remove. `on` with per-second lines and no names line means the report never ran. `would cull 0 of 0` means the armed pass saw no records.
+
+**Not in this plan:** the sun, which Sean wants decoupled and has its own doc. A player with no own pad (arrived by taxi) gets no seal on foot, the same as today.

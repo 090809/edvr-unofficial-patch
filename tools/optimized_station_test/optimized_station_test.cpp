@@ -24,6 +24,7 @@
 #include <vector>   // the build-334925 PE identity constants (store hook gate)
 
 #include <cmath>
+#include <limits>
 #include <cstddef>
 #include <cstdio>
 #include <cstring>
@@ -2626,6 +2627,62 @@ int main(int argc, char** argv) {
               "transition (a): the release starts the hold (now + kTransitionHoldMs) and asks for no edge");
     }
     {
+        // (a2) the guard: a held seal whose own pad's record is missing from kPadMissingPasses passes in a row is released, held like an origin shift, no edge needed
+        se::SealState st;
+        se::ReleaseWhy w = se::ReleaseWhy::kNone;
+        se::SealInputs in = inHangar(0);
+        check(se::sealStep(in, &st, &w) == se::SealAction::kRequestEngage, "pad missing: the setup seal");
+        in.held = true;
+        in.nowMs = 100;
+        check(se::sealStep(in, &st, &w) == se::SealAction::kNone, "pad missing: a held seal with the pad present stays");
+        in.padMissing = true;
+        in.nowMs = 200;
+        check(se::sealStep(in, &st, &w) == se::SealAction::kRelease && w == se::ReleaseWhy::kPadMissing, "pad missing: a held seal is released with kPadMissing");
+        check(st.holdUntilMs == 200 + se::kTransitionHoldMs && st.shiftHold && st.reseal == 0 && !st.requested && !st.mechanism,
+              "pad missing: the release sets the hold like an origin shift, asks for no edge (reseal stays 0) and withdraws the request");
+        in.held = false;
+        in.padMissing = false;
+        in.nowMs = 300;
+        check(se::sealStep(in, &st, &w) == se::SealAction::kNone && st.holdBlocked, "pad missing: a request right after the release waits for the hold");
+        check(firstEngage(&st, in, 400, 4000) == 2700, "pad missing: the seal comes back at the hold's end (2700 ms), with no fresh edge");
+        // earlier reasons win: an origin shift on the same tick is the origin shift; the guard wins over a hangar change
+        se::SealState st2;
+        se::SealInputs in2 = inHangar(0);
+        se::sealStep(in2, &st2, &w);
+        in2.held = true;
+        in2.padMissing = true;
+        in2.originShifted = true;
+        in2.nowMs = 100;
+        check(se::sealStep(in2, &st2, &w) == se::SealAction::kRelease && w == se::ReleaseWhy::kOriginShift, "pad missing: an origin shift on the same tick is released as the origin shift");
+        se::SealState st3;
+        se::SealInputs in3 = inHangar(0);
+        se::sealStep(in3, &st3, &w);
+        in3.held = true;
+        in3.padMissing = true;
+        in3.hangarChanged = true;
+        in3.nowMs = 100;
+        check(se::sealStep(in3, &st3, &w) == se::SealAction::kRelease && w == se::ReleaseWhy::kPadMissing, "pad missing: tested before a hangar change");
+        // not held: the flag does nothing
+        se::SealState st4;
+        se::SealInputs in4 = inHangar(0);
+        in4.padMissing = true;
+        check(se::sealStep(in4, &st4, &w) == se::SealAction::kRequestEngage && w == se::ReleaseWhy::kNone, "pad missing: the flag does nothing while not sealed");
+    }
+    {
+        // padMissingRun: not held 0; an uninformative pass leaves the run; the pad in the pass 0; else one more
+        check(se::padMissingRun(2, true, false, false) == 0, "padMissingRun: not held gives 0");
+        check(se::padMissingRun(2, false, false, true) == 2 && se::padMissingRun(2, false, true, true) == 2, "padMissingRun: an uninformative pass leaves the run as it was");
+        check(se::padMissingRun(2, true, true, true) == 0, "padMissingRun: the pad in an informative pass resets the run");
+        check(se::padMissingRun(2, true, false, true) == 3 && se::padMissingRun(0, true, false, true) == 1, "padMissingRun: an informative pass without the pad adds one");
+        uint32_t run = 0;
+        bool released = false;
+        for (int i = 0; i < 3; ++i) {
+            run = se::padMissingRun(run, true, false, true);
+            released = run >= se::kPadMissingPasses;
+        }
+        check(released && se::kPadMissingPasses == 3, "padMissingRun: three informative passes without the pad reach the guard's limit");
+    }
+    {
         // (b) a Lift release, then the poses come back within the hold: the pose count runs, the request waits for the hold's end
         se::SealState st;
         se::ReleaseWhy w = se::ReleaseWhy::kNone;
@@ -3667,6 +3724,53 @@ int main(int argc, char** argv) {
             check(std::strcmp(cc::clearPhaseName(CP::kFadingOut), "fading-out") == 0 && std::strcmp(cc::clearPhaseName(CP::kMirror), "mirror") == 0 &&
                       cc::kClearLiftMs == 150 && cc::kClearFadeMs == 600 && cc::kClearReleaseMs == 250 && cc::kClearExitRatio == 0.4f && cc::kClearUnseenShare == 0.01f,
                   "concourse clear: the phase names and the constants (150 ms, 600 ms, 250 ms, 0.4, 0.01)");
+        }
+
+        // A change of room: the camera cut. The constant sits between the boarding shift (16.6 m) and the lift (about 1090 m).
+        {
+            check(cc::kRoomCutM > 16.6f && cc::kRoomCutM < 1090.0f && cc::kRoomCutM == 100.0f, "concourse room cut: the limit is 100 m, between the 16.6 m boarding shift and the 1090 m lift");
+            check(cc::roomCut(1090.0f) && cc::roomCut(100.01f) && !cc::roomCut(100.0f) && !cc::roomCut(16.6f) && !cc::roomCut(0.0f) && !cc::roomCut(-5.0f),
+                  "concourse room cut: a step over 100 m is a cut; the boarding shift and a still camera are not");
+            check(!cc::roomCut(std::nanf("")) && !cc::roomCut(std::numeric_limits<float>::infinity()), "concourse room cut: a step that is not finite is not a cut");
+        }
+
+        // The walk survey's zone (log only).
+        {
+            using WZ = cc::WalkZone;
+            struct Row { bool seated, anchor, cell, camIn; WZ want; };
+            const Row rows[] = {
+                {true, false, true, true, WZ::kSeated},   {true, true, true, true, WZ::kSeated},   {true, false, false, false, WZ::kSeated},
+                {false, true, true, true, WZ::kConcourse}, {false, true, false, false, WZ::kConcourse},
+                {false, false, false, false, WZ::kNoCell}, {false, false, false, true, WZ::kNoCell},
+                {false, false, true, true, WZ::kBay},      {false, false, true, false, WZ::kPastBox},
+            };
+            bool ok = true;
+            for (const Row& r : rows) ok = ok && cc::walkZone(r.seated, r.anchor, r.cell, r.camIn) == r.want;
+            check(ok, "concourse walk zone: seated, then concourse (anchor fresh), then no cell, then bay or past the box");
+            check(std::strcmp(cc::walkZoneName(WZ::kSeated), "seated") == 0 && std::strcmp(cc::walkZoneName(WZ::kConcourse), "concourse") == 0 &&
+                      std::strcmp(cc::walkZoneName(WZ::kBay), "bay") == 0 && std::strcmp(cc::walkZoneName(WZ::kPastBox), "past the box") == 0 &&
+                      std::strcmp(cc::walkZoneName(WZ::kNoCell), "no cell") == 0,
+                  "concourse walk zone: the names");
+        }
+
+        // The glow levels by window type (diag.concourse_glow = sky,bay,other).
+        {
+            float v[3] = {-1, -1, -1};
+            check(cc::parseGlowLevels("4,0.25,1", v) && v[0] == 4.0f && v[1] == 0.25f && v[2] == 1.0f, "concourse glow: the default text parses to sky 4, bay 0.25, other 1");
+            check(cc::kGlowSkyDefault == 4.0f && cc::kGlowBayDefault == 0.25f && cc::kGlowOtherDefault == 1.0f, "concourse glow: the defaults are 4, 0.25, 1");
+            check(cc::parseGlowLevels(" 0 , 16 ,  2.5 ", v) && v[0] == 0.0f && v[1] == 16.0f && v[2] == 2.5f, "concourse glow: spaces are allowed, 0 and 16 are the limits");
+            float keep[3] = {7, 8, 9};
+            check(!cc::parseGlowLevels("", keep) && !cc::parseGlowLevels(nullptr, keep) && !cc::parseGlowLevels("1,2", keep) && !cc::parseGlowLevels("1,2,3,4", keep) &&
+                      !cc::parseGlowLevels("1,2,x", keep) && !cc::parseGlowLevels("1;2;3", keep) && !cc::parseGlowLevels("1,2,3 4", keep) && !cc::parseGlowLevels(",,", keep),
+                  "concourse glow: the wrong count, a letter or a stray character is refused");
+            check(!cc::parseGlowLevels("-0.1,1,1", keep) && !cc::parseGlowLevels("1,16.01,1", keep) && !cc::parseGlowLevels("1,1,100", keep) && !cc::parseGlowLevels("nan,1,1", keep) &&
+                      !cc::parseGlowLevels("inf,1,1", keep),
+                  "concourse glow: a value under 0 or over 16, or not finite, is refused");
+            check(keep[0] == 7.0f && keep[1] == 8.0f && keep[2] == 9.0f, "concourse glow: a refused text leaves the output as it was");
+            check(std::fabs(cc::glowSkyRatio(4.0f, 1.0f) - 4.0f) < 1e-6f && std::fabs(cc::glowSkyRatio(2.0f, 0.5f) - 4.0f) < 1e-6f, "concourse glow: the sky ratio is sky over other");
+            check(cc::glowOtherLevel(1.0f) == 1.0f && cc::glowOtherLevel(0.0f) == cc::kGlowOtherFloor && cc::glowSkyRatio(4.0f, 0.0f) == 4.0f / cc::kGlowOtherFloor,
+                  "concourse glow: other at 0 is floored at 0.001 for the level and the ratio, so a skylight still lands on sky");
+            check(std::fabs(cc::glowOtherLevel(0.0f) * cc::glowSkyRatio(4.0f, 0.0f) - 4.0f) < 1e-3f, "concourse glow: the floored level times the ratio is the sky level");
         }
 
         // The withheld outside draws: named by shader, found by a bloom and a scan.

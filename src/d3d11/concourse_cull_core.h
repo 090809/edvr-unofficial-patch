@@ -15,6 +15,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 
 namespace edvr::concourse {
@@ -432,6 +433,65 @@ private:
     uint64_t maxDrawn_[kPaneSideCap] = {};
     uint32_t count_ = 0, exterior_ = 0, dropped_ = 0;
 };
+
+// ---- A change of room: the camera cut --------------------------------------------------------------------------------------------------------------
+// The lift is a one-frame camera jump of about 1090 m each way; a boarding or disembark shifts the origin by about 16.6 m. A step of the resolved camera over this is
+// another room: the anchor is forgotten at once (Status.json's hangar flag lags the jump by up to a second, so it is not read for this).
+constexpr float kRoomCutM = 100.0f;
+inline bool roomCut(float stepM) noexcept { return std::isfinite(stepM) && stepM > kRoomCutM; }
+
+// ---- The walk survey's zone (TEMPORARY, log only; goes when the arc closes) ------------------------------------------------------------------------------
+enum class WalkZone : uint8_t { kSeated, kConcourse, kBay, kPastBox, kNoCell };
+inline const char* walkZoneName(WalkZone z) noexcept {
+    switch (z) {
+        case WalkZone::kSeated: return "seated";
+        case WalkZone::kConcourse: return "concourse";
+        case WalkZone::kBay: return "bay";
+        case WalkZone::kPastBox: return "past the box";
+        default: return "no cell";
+    }
+}
+// Seated first; the anchor fresh is the concourse; then no pick cell; then the camera in the cell's box (or sphere) or past it.
+inline WalkZone walkZone(bool seated, bool anchorFresh, bool hasCell, bool camIn) noexcept {
+    if (seated) return WalkZone::kSeated;
+    if (anchorFresh) return WalkZone::kConcourse;
+    if (!hasCell) return WalkZone::kNoCell;
+    return camIn ? WalkZone::kBay : WalkZone::kPastBox;
+}
+
+// ---- The glow levels by window type (diag.concourse_glow = "sky,bay,other") -------------------------------------------------------------------------
+// The steady glow behind the mirror: the brightest on overhead skylights, the least on the bay windows, a middle level on any other window. Each from 0 to 16.
+constexpr float kGlowMax = 16.0f;
+constexpr float kGlowSkyDefault = 4.0f, kGlowBayDefault = 0.25f, kGlowOtherDefault = 1.0f;
+// With `other` at 0 the ratio sky / other has no meaning: the blend level of a non-bay pane is then kGlowOtherFloor and the ratio is taken against that, so a
+// pane that is not a skylight shows nothing (a thousandth of the sky level at most) and a skylight still shows `sky`.
+constexpr float kGlowOtherFloor = 0.001f;
+// "a,b,c": three numbers, each 0 to 16, separated by commas, spaces allowed around each. False for anything else (the caller keeps the last value).
+inline bool parseGlowLevels(const char* text, float out[3]) noexcept {
+    if (!text) return false;
+    float v[3] = {};
+    const char* s = text;
+    for (int i = 0; i < 3; ++i) {
+        while (*s == ' ' || *s == '\t') ++s;
+        char* end = nullptr;
+        const double d = std::strtod(s, &end);
+        if (end == s || !std::isfinite(d) || d < 0.0 || d > static_cast<double>(kGlowMax)) return false;
+        v[i] = static_cast<float>(d);
+        s = end;
+        while (*s == ' ' || *s == '\t') ++s;
+        if (i < 2) {
+            if (*s != ',') return false;
+            ++s;
+        }
+    }
+    if (*s != '\0') return false;
+    for (int i = 0; i < 3; ++i) out[i] = v[i];
+    return true;
+}
+// sky over other, the ratio the pixel shader applies to a horizontal pane; other is floored at kGlowOtherFloor.
+inline float glowSkyRatio(float sky, float other) noexcept { return sky / (other > kGlowOtherFloor ? other : kGlowOtherFloor); }
+// The blend level of a pane that is not the clearing pane.
+inline float glowOtherLevel(float other) noexcept { return other > kGlowOtherFloor ? other : kGlowOtherFloor; }
 
 // ---- The bay glass's clearing, following the bay in view ------------------------------------------------------------------------------------------
 // Mirror (the glass stands in, the cull is on) -> Lifting (the cull is off, the glass still opaque, so the station is back before it opens) -> FadingOut ->

@@ -72,7 +72,11 @@ RigTally g_rigTally;
 // (the rig veto). Direct atomic adds: only the pad's record and its rig match, a few calls a frame, so no thread-local staging is needed and the trace rows are exact.
 std::atomic<uint64_t> g_padStage[sealed::kPadStages];
 std::atomic<uintptr_t> g_ownRigA{0};   // the rig the tick last saw the sealed pad's record gathered in (0: not learned yet); the rig veto compares with it
-inline void padStageAdd(sealed::PadStage k) noexcept { g_padStage[k].fetch_add(1, std::memory_order_relaxed); }
+std::atomic<uint64_t> g_padStageSinceSeal[sealed::kPadStages];   // the same events, from the latest seal (reset when a seal is taken): the guard's line
+inline void padStageAdd(sealed::PadStage k) noexcept {
+    g_padStage[k].fetch_add(1, std::memory_order_relaxed);
+    g_padStageSinceSeal[k].fetch_add(1, std::memory_order_relaxed);
+}
 uintptr_t g_ownRig = 0;                // tick only: the rig the sealed pad's record was last gathered in (applyRigNote); g_ownRigA publishes it to the rig veto
 uintptr_t g_ownRigPad = 0;             // the sticky pad g_ownRig was learned for (a different pad clears it)
 sealed::OwnRigTrace g_ownRigTrace;     // the tick's view of that rig, written once a tick; the trace row and the 30 s line read it
@@ -151,6 +155,7 @@ uintptr_t g_passCtx = 0;                    // the context the last informative 
 bool g_engagePublished = false;             // built v14.31: the last published view had an engage pending (every pass gathers the near list, the candidate, the tally)
 uint32_t g_recordsLast = 0;                 // store callbacks the last drained passes held (the waiting line's evidence)
 bool g_stickyPadInPass = false;
+uint32_t g_padMissingRun = 0;   // the guard's run (padMissingRun); the tick's, under the state lock
 // Built 2026-10-15: the seal trace's pass fields, set by drainGather (the tick): the verdict the drained passes earned, and whether it was thin.
 sealed::TraceVerdict g_passVerdictLast = sealed::TraceVerdict::kEmpty;
 bool g_passThinLast = false;
@@ -267,6 +272,11 @@ ConcourseExtra g_concExtra;
 std::atomic<bool> g_concWanted{false};        // armed, on foot in social space and not sealed: the store gate is open (it sights the anchor, and judges while active)
 std::atomic<bool> g_concActive{false};        // the cull runs: wanted, the key or its override on, and the anchor seen within kConcAnchorFreshMs
 std::atomic<bool> g_concSurveyArmed{false};   // the one-shot names are being gathered: the rig and producer vetoes forward so the store judges and names every record
+bool g_roomCutPending = false;   // the camera stepped over kRoomCutM this tick (resolveTickView); the concourse tick takes it, under the state lock
+float g_roomCutM = 0.0f;
+// TEMPORARY (the walk survey, below): the tick's. g_walkPassArmed is published to the callbacks in the snapshot (walkOn) with a copy of the pick cell.
+bool g_walkPassArmed = false;
+sealed::OwnCell g_walkCellCopy;
 std::atomic<uint64_t> g_concAnchorMs{0};      // GetTickCount64() when the store last saw the anchor record
 std::atomic<uintptr_t> g_concAnchorAddr{0};   // the anchor record, latched by address (re-read with a name check at the tick)
 std::atomic<uintptr_t> g_concHubAddr{0};      // SA_StationHub_Compact, the same way
@@ -491,6 +501,8 @@ struct PadSnapshot {
     bool lost = false;            // gathered entries were lost before this publication: the callbacks keep every record
     bool engagePending = false;   // built v14.31: an engage is pending: every pass gathers the near list, the own candidate and the tally
     bool concourse = false;       // built 2026-11-05: the concourse cull is active (the producer veto judges by name)
+    bool walkOn = false;          // TEMPORARY (the walk survey): this publication's passes report what the seal would cull against walkCell; nothing else reads either
+    sealed::OwnCell walkCell;
 };
 sealed::SnapshotRing<PadSnapshot, 40, 32> g_snapRing;
 
@@ -1477,6 +1489,7 @@ const char* releaseText(sealed::ReleaseWhy w) noexcept {
         case sealed::ReleaseWhy::kLaunch: return "launch (the pad's state object flipped)";
         case sealed::ReleaseWhy::kMechanism: return g_releaseWhy;
         case sealed::ReleaseWhy::kInHangarLeft: return "the own pad left the hangar (the game's r1 went from 1 to 0)";
+        case sealed::ReleaseWhy::kPadMissing: return "the own pad's record was missing from the store's passes (the guard); no re-seal for the transition hold";
         case sealed::ReleaseWhy::kOnFoot: {   // the words at the moment of the release, with the bits that matter
             char t[300];
             sealed::describeStatusFlags(t, sizeof(t), g_statusKnownNow, g_statusFlagsNow, g_statusFlags2Now);
@@ -1633,6 +1646,9 @@ void latchRead(uint64_t now) noexcept {
             const float shiftM = std::sqrt(sd[0] * sd[0] + sd[1] * sd[1] + sd[2] * sd[2]);
             g_originShiftM = shiftM;             // built 2026-10-15: the transition hold (the seal step takes the flag this tick, after this read)
             g_originShiftPending = true;
+            // Built 2026-11-06: a rig's bound is a world-frame box, not re-based by a shift and not refreshed while unsealed; one left from before the shift reads as
+            // wholly outside the cell and is vetoed. A new epoch starts every claim empty, and a rig with no bound forwards. (The tick holds g_sealedMutex.)
+            bumpRigEpoch();
             Log::get().note("optimized station: the coordinate origin shifted by %.2f m (the shell and all %u latched records moved together); the bay's "
                             "motion references are re-based and this is not motion.",
                             static_cast<double>(shiftM), static_cast<unsigned>(g_latch.n));
@@ -2356,6 +2372,9 @@ void promoteFrame(uint32_t stamp, uint32_t frame) {
             pickOwnRecord(frame);
             g_heldCell = next;
             g_heldValid = true;
+            bumpRigEpoch();                  // built 2026-11-06: the rig bounds of the unsealed time (possibly from before an origin shift) are dropped; no stale bound can veto
+            for (auto& c : g_padStageSinceSeal) c.store(0, std::memory_order_relaxed);
+            g_padMissingRun = 0;
             snapshotSealPose();              // built v14.24: each latched record's pose at the seal (v14.33: taken again when the mechanism release arms)
             g_mechArm.reset();               // built v14.33: mechanism motion neither releases nor counts until 60 still passes
             setHeldFrame(g_heldCell, frame);
@@ -2444,6 +2463,8 @@ void publishSnapshot() noexcept {
     s.lost = g_lossPublished;
     s.engagePending = g_engagePending;
     s.concourse = g_concActive.load(std::memory_order_acquire);
+    s.walkOn = g_walkPassArmed;
+    if (s.walkOn) s.walkCell = g_walkCellCopy;
     g_engagePublished = g_engagePending;
     g_snapRing.publish();
 }
@@ -2463,6 +2484,13 @@ void resolveTickView() noexcept {
     const bool ok = cameraOf(g_view, cam);
     if (ok) {
         if (g_frameCamValid && sealed::distance(cam, g_frameCam) > kCamJumpM) ++g_winCamJump;
+        if (g_frameCamValid) {
+            const float step = sealed::distance(cam, g_frameCam);
+            if (cc::roomCut(step)) {   // built 2026-11-06: another room (the lift): the concourse tick forgets the anchor
+                g_roomCutPending = true;
+                g_roomCutM = step;
+            }
+        }
         std::memcpy(g_frameCam, cam, sizeof(g_frameCam));
         g_cameraKnown.store(true, std::memory_order_relaxed);
     } else {
@@ -2497,6 +2525,90 @@ void gatherRigNote(GatherWriter& w, uintptr_t bucket, uintptr_t record, const fl
 // the tick needs into its thread's slot, and judges from the view alone. Order: the centre (unreadable: kept), the gathered parts (pads, explicit parts,
 // the near list, the own candidate, the ship's tally, the latch and the hangar names), then (judge only) the named keep, the bay keep, the own ship, and
 // otherwise culled. judge: the sealed judgement; false: gathering only.
+// The anchor's sighting (and the hub's, while the tick wants it): whatever path the store callback takes, this is how the cull finds its room. Shared by the
+// concourse path and the seal's gather path (a docked, on-foot pass with the cull not active), so the pad's gathers and the anchor's sighting both go on.
+void concourseSight(uintptr_t record, uintptr_t node, const NodeInfo& ni) noexcept {
+    if ((ni.flags & sealed::kNodeConcourseAnchor) != 0) {
+        g_concAnchorAddr.store(record, std::memory_order_relaxed);
+        g_concAnchorMs.store(GetTickCount64(), std::memory_order_relaxed);
+    } else if ((ni.flags & sealed::kNodeConcourseAllow) != 0 && g_concHubWanted.load(std::memory_order_relaxed)) {
+        char hn[64] = {};
+        if (cachedNameOfNode(node, hn, sizeof(hn), &ni.validator) && std::strcmp(hn, cc::kHubName) == 0) g_concHubAddr.store(record, std::memory_order_relaxed);
+    }
+}
+
+// The sealed store's keep decision for one record against `cell`: the named-keep rule, the bay volume, the own ship's exemption and the live own sphere. The
+// sealed judge passes the held cell; the walk survey (log only) passes the pick cell, so both use the one rule.
+bool storeKeeps(const PadSnapshot& s, const sealed::OwnCell& cell, uintptr_t record, uintptr_t node, const NodeInfo& ni, const float* centre, float radius, const float* cam,
+                bool containsCam, sealed::NamedKeep* out) noexcept {
+    const sealed::NamedKeep v = sealed::keepNamedCell(centre, radius, cam, kFallbackSphereM, cell, s.explicitPrev, s.explicitCount, record);
+    *out = v;
+    bool keep = v.keep;
+    // The bay: the own hangar's parts inside the bay volume, even where the box alone would cull them. The shaft is the cell's.
+    if (!keep && cell.capsule) {
+        float u[3] = {};
+        if (sealed::unitBetween(cell.capA, cell.capB, u) && sealed::inBayVolume(centre, cell.capA, u, cell.capLen, belowFor(cell.size))) {
+            char bn[64] = {};
+            if (cachedNameOfNode(node, bn, sizeof(bn), &ni.validator) && sealed::bayPartName(bn)) keep = true;
+        }
+    }
+    if (!keep) {
+        char nm[64] = {};
+        if (s.ownPrefix[0] != '\0') cachedNameOfNode(node, nm, sizeof(nm), &ni.validator);
+        if (sealed::ownShipExempt(containsCam, radius, nm, s.ownPrefix)) keep = true;
+    }
+    if (!keep && s.ownLiveValid && sealed::ownSphereKeeps(centre, s.ownLiveCentre, s.ownLiveRadius, kOwnSphereMarginM)) keep = true;
+    return keep;
+}
+
+// ---- TEMPORARY (the walk survey, docs\concourse-cull-2026-11-05.md; log only, removed when the arc closes) ----------------------------------------------------
+// While the key is armed and the ship is docked: one line a second about where the commander is, and, every 5 s and at a zone change while unsealed with a pick
+// cell and out of the concourse, a names report: what the seal's store judgement would cull against the pick cell, from one store pass. The cell reaches the
+// callbacks as the snapshot's walkCell (never as `cell` or `held`, which the vetoes read), and only while walkOn is set.
+struct WalkAgg {
+    struct Name {
+        uint32_t n = 0;
+        float nearest = 0.0f;
+        float radius = 0.0f;
+    };
+    std::mutex m;
+    uint32_t total = 0, culled = 0;
+    std::unordered_map<std::string, Name> names;   // would-cull names within kWalkNearM
+};
+WalkAgg& walkAgg() {
+    static WalkAgg* a = new WalkAgg;   // never destroyed: a callback may still be inside it at unload
+    return *a;
+}
+constexpr float kWalkNearM = 300.0f;
+
+void walkSurveyRecord(const PadSnapshot& s, uintptr_t record, uintptr_t node, const NodeInfo& ni, const float* cam) noexcept {
+    try {
+        const WorldRead wr = worldOfRecord(record);
+        const bool sphere = wr.source != 4 && std::isfinite(wr.radius) && wr.radius > 0.0f && std::isfinite(wr.world[0]) && std::isfinite(wr.world[1]) &&
+                            std::isfinite(wr.world[2]);
+        bool cull = false;
+        float surface = 0.0f;
+        if (sphere) {
+            sealed::NamedKeep nk;
+            cull = !storeKeeps(s, s.walkCell, record, node, ni, wr.world, wr.radius, cam, sealed::containsCamera(wr.world, wr.radius, cam), &nk);
+            surface = std::max(0.0f, sealed::distance(wr.world, cam) - wr.radius);
+        }
+        char nm[64] = {};
+        if (cull && surface <= kWalkNearM && !cachedNameOfNode(node, nm, sizeof(nm), &ni.validator)) std::snprintf(nm, sizeof(nm), "unnamed");
+        WalkAgg& a = walkAgg();
+        std::lock_guard<std::mutex> lock(a.m);
+        ++a.total;
+        if (!cull) return;
+        ++a.culled;
+        if (surface > kWalkNearM) return;
+        WalkAgg::Name& e = a.names[nm];
+        if (e.n == 0 || surface < e.nearest) e.nearest = surface;
+        if (wr.radius > e.radius) e.radius = wr.radius;
+        ++e.n;
+    } catch (...) {
+    }
+}
+
 void afterStoreJudge(uintptr_t bucket, uintptr_t record, bool judge) noexcept {
     // Built v14.27: the callback is one Writer. Its entries all go to the pass of the stamp it read on entry, and the pass is not read while it is inside.
     GatherWriter w(g_gather);
@@ -2530,6 +2642,10 @@ void afterStoreJudge(uintptr_t bucket, uintptr_t record, bool judge) noexcept {
     // and the mechanism and hangar names while they are wanted); every other record returns here.
     uintptr_t node = 0;
     const NodeInfo ni = nodeInfoOf(record, &node);
+    // Built 2026-11-06: a docked, unsealed pass with the cull wanted but not active (on foot in the hangar) goes this way, not the concourse one: the anchor's
+    // sighting goes on from here, so the cull can re-arm, and the pad's gathers below are as they are with the key off.
+    if (!judge && g_concWanted.load(std::memory_order_relaxed)) concourseSight(record, node, ni);
+    if (!judge && s.walkOn) walkSurveyRecord(s, record, node, ni, cam);   // log only: one relaxed load off the survey's pass
     const bool full = sealed::fullGatherPass(stamp, s.engagePending, s.held);
     if (!judge && !sealed::nodeWantsCentre(ni.cls, ni.flags, s.giveUp, s.latchPending, s.namesPending, full)) {
         return;
@@ -2598,24 +2714,10 @@ void afterStoreJudge(uintptr_t bucket, uintptr_t record, bool judge) noexcept {
         ++tc.kept;
         return;
     }
-    const sealed::NamedKeep v = sealed::keepNamedCell(centre, radius, cam, kFallbackSphereM, s.cell, s.explicitPrev, s.explicitCount, record);
-    bool keep = v.keep;
+    sealed::NamedKeep v;
+    const bool keep = storeKeeps(s, s.cell, record, node, ni, centre, radius, cam, containsCam, &v);
     const bool containing = v.containing;
     if (v.why == sealed::KeepWhy::kReach) ++tc.keptReach;   // built 2026-10-21: counted here only (the producer path judges the same record by the same rule)
-    // The bay: the own hangar's parts inside the bay volume, even where the box alone would cull them. The shaft is the cell's.
-    if (!keep && s.cell.capsule) {
-        float u[3] = {};
-        if (sealed::unitBetween(s.cell.capA, s.cell.capB, u) && sealed::inBayVolume(centre, s.cell.capA, u, s.cell.capLen, belowFor(s.cell.size))) {
-            char bn[64] = {};
-            if (cachedNameOfNode(node, bn, sizeof(bn), &ni.validator) && sealed::bayPartName(bn)) keep = true;
-        }
-    }
-    if (!keep) {
-        char nm[64] = {};
-        if (s.ownPrefix[0] != '\0') cachedNameOfNode(node, nm, sizeof(nm), &ni.validator);
-        if (sealed::ownShipExempt(containsCam, radius, nm, s.ownPrefix)) keep = true;
-    }
-    if (!keep && s.ownLiveValid && sealed::ownSphereKeeps(centre, s.ownLiveCentre, s.ownLiveRadius, kOwnSphereMarginM)) keep = true;
     if (keep) {
         ++tc.kept;
     } else {
@@ -2708,13 +2810,7 @@ void afterStoreConcourse(uintptr_t bucket, uintptr_t record) noexcept {
     w.context(ctx);
     uintptr_t node = 0;
     const NodeInfo ni = nodeInfoOf(record, &node);
-    if ((ni.flags & sealed::kNodeConcourseAnchor) != 0) {
-        g_concAnchorAddr.store(record, std::memory_order_relaxed);
-        g_concAnchorMs.store(GetTickCount64(), std::memory_order_relaxed);
-    } else if ((ni.flags & sealed::kNodeConcourseAllow) != 0 && g_concHubWanted.load(std::memory_order_relaxed)) {
-        char hn[64] = {};
-        if (cachedNameOfNode(node, hn, sizeof(hn), &ni.validator) && std::strcmp(hn, cc::kHubName) == 0) g_concHubAddr.store(record, std::memory_order_relaxed);
-    }
+    concourseSight(record, node, ni);
     if (!s.concourse || !g_concActive.load(std::memory_order_acquire)) return;
     if (!s.camValid) {
         ++tc.noCamera;
@@ -2787,8 +2883,11 @@ void optimizedStationNoteSunDraw(SunDrawPath path) noexcept {
 // The store calls this after it has written a record (bucket = the collection, record = its record). While sealed it judges the record; while
 // docked and unsealed it only gathers the frame's pads, explicit parts and camera for the seal trigger (built v14.1).
 void afterStoreDispatch(uintptr_t bucket, uintptr_t record) noexcept {
-    const sealed::StoreMode mode = sealed::storeMode(g_setting.load(std::memory_order_acquire), g_sealedFlag.load(std::memory_order_acquire),
-                                                     g_dockedNow.load(std::memory_order_acquire), g_concWanted.load(std::memory_order_acquire));
+    // Built 2026-11-06: docked with the cull wanted but not active (on foot in the hangar) takes the seal's gather path (the pad's gathers; afterStoreJudge also
+    // sights the anchor); the concourse path is for the cull active, or not docked (a taxi arrival).
+    const bool docked = g_dockedNow.load(std::memory_order_acquire);
+    const bool concourseRoute = g_concWanted.load(std::memory_order_acquire) && !(docked && !g_concActive.load(std::memory_order_acquire));
+    const sealed::StoreMode mode = sealed::storeMode(g_setting.load(std::memory_order_acquire), g_sealedFlag.load(std::memory_order_acquire), docked, concourseRoute);
     if (mode == sealed::StoreMode::kNone) return;
     if (mode == sealed::StoreMode::kConcourse) {
         afterStoreConcourse(bucket, record);
@@ -3177,6 +3276,25 @@ bool concourseCamLocal(float out[3]) {
     return std::isfinite(out[0]) && std::isfinite(out[1]) && std::isfinite(out[2]);
 }
 
+// The anchor's local up axis in world (axes[1] of its pose), for the steady glow's sky test. False when it cannot be read now.
+bool concourseAnchorUp(float out[3]) {
+    const uintptr_t anchor = g_concAnchorAddr.load(std::memory_order_relaxed);
+    if (!anchor) return false;
+    char nm[64] = {};
+    if (!cachedName(anchor, nm, sizeof(nm)) || std::strcmp(nm, cc::kAnchorName) != 0) return false;
+    const WorldRead aw = worldOfRecord(anchor);
+    float axes[3][3] = {};
+    float ext[3] = {};
+    bool extOk = false;
+    uint8_t osrc = 4;
+    if (aw.source == 4 || !poseOrientOf(anchor, axes, ext, &extOk, &osrc)) return false;
+    for (int k = 0; k < 3; ++k) out[k] = axes[1][k];
+    const float len = std::sqrt(out[0] * out[0] + out[1] * out[1] + out[2] * out[2]);
+    if (!std::isfinite(len) || len < 0.5f) return false;
+    for (int k = 0; k < 3; ++k) out[k] /= len;
+    return true;
+}
+
 // The clearing machine's step and its log lines, and the pane share line. Returns the machine's output; `sh` is this frame's reading of the panes.
 cc::ClearOutput concourseClearStep(uint64_t now, bool wantCull, bool gateWanted, const ConcoursePaneShares& sh) {
     cc::ClearInput in;
@@ -3196,7 +3314,8 @@ cc::ClearOutput concourseClearStep(uint64_t now, bool wantCull, bool gateWanted,
         char cam[96] = {};
         if (camOk) std::snprintf(cam, sizeof(cam), "cam_local %.2f %.2f %.2f", static_cast<double>(local[0]), static_cast<double>(local[1]), static_cast<double>(local[2]));
         else std::snprintf(cam, sizeof(cam), "cam_local unreadable");
-        Log::get().note("concourse clear: %s (%spane %s of the view, %s)", cc::clearPhaseName(out.phase), wantCull ? "" : "gate lost, ", pane, cam);
+        Log::get().note("concourse clear: %s (%spane n=%u %s of the view, %s)", cc::clearPhaseName(out.phase), wantCull ? "" : "gate lost, ",
+                        static_cast<unsigned>(concoursePaneClearingN()), pane, cam);
     }
     // The shares line: at most once a second while the gate holds, when a share moved by over half a point or a window type came or went.
     if (gateWanted && sh.valid && sh.seq != g_concShareSeq && now - g_concShareLogMs >= 1000) {
@@ -3227,6 +3346,146 @@ cc::ClearOutput concourseClearStep(uint64_t now, bool wantCull, bool gateWanted,
     return out;
 }
 
+// ---- TEMPORARY: the walk survey's tick (log only; nothing it reads or writes reaches a veto; removed when the arc closes) -----------------------------------
+// Armed key and docked: "walk survey: on" once, then a line a second (900 a session), and the names report (see WalkAgg).
+bool g_walkOn = false;
+uint32_t g_walkLinesSession = 0, g_walkNamesSession = 0;
+uint64_t g_walkLineMs = 0, g_walkNamesDueMs = 0;
+uint32_t g_walkTicks = 0;
+bool g_walkZoneSeen = false;
+cc::WalkZone g_walkZone = cc::WalkZone::kNoCell;
+cc::WalkZone g_walkArmZone = cc::WalkZone::kNoCell;
+char g_walkArmCam[80] = {};
+constexpr uint32_t kWalkLinesCap = 900, kWalkNamesCap = 300;
+
+// The camera's place in the pick cell: the text of "cam in bay ...", and M, how far past the box (0 inside).
+void walkCamText(char* out, size_t cap, float* pastM) noexcept {
+    *pastM = 0.0f;
+    if (!g_frameCamValid) {
+        std::snprintf(out, cap, "cam not known");
+    } else if (!g_pickCell.has) {
+        std::snprintf(out, cap, "cam in bay no cell");
+    } else if (g_pickCell.box) {
+        float x[3] = {};
+        sealed::boxCoordsOf(g_pickCell, g_frameCam, x);
+        for (int k = 0; k < 3; ++k) *pastM = std::max(*pastM, std::fabs(x[k]) - g_pickCell.boxHalf[k]);
+        std::snprintf(out, cap, "cam in bay %.1f %.1f %.1f of half %.1f %.1f %.1f m", static_cast<double>(x[0]), static_cast<double>(x[1]), static_cast<double>(x[2]),
+                      static_cast<double>(g_pickCell.boxHalf[0]), static_cast<double>(g_pickCell.boxHalf[1]), static_cast<double>(g_pickCell.boxHalf[2]));
+    } else {
+        const float d = sealed::distance(g_pickCell.centre, g_frameCam);
+        *pastM = std::max(0.0f, d - g_pickCell.radius);
+        std::snprintf(out, cap, "cam in bay no box, %.1f m from the centre of radius %.1f m", static_cast<double>(d), static_cast<double>(g_pickCell.radius));
+    }
+    if (*pastM < 0.0f) *pastM = 0.0f;
+}
+
+void walkSurveyReport() noexcept {
+    uint32_t total = 0, culled = 0;
+    struct Row {
+        std::string name;
+        WalkAgg::Name e;
+    };
+    std::vector<Row> rows;
+    try {
+        WalkAgg& a = walkAgg();
+        std::lock_guard<std::mutex> lock(a.m);
+        total = a.total;
+        culled = a.culled;
+        for (const auto& kv : a.names) rows.push_back(Row{kv.first, kv.second});
+        a.total = a.culled = 0;
+        a.names.clear();
+    } catch (...) {
+        return;
+    }
+    std::sort(rows.begin(), rows.end(), [](const Row& x, const Row& y) { return x.e.nearest < y.e.nearest; });
+    // Log::note holds 1200 characters a line, so the report runs on over as many lines as the names need.
+    char text[1000] = {};
+    int used = std::snprintf(text, sizeof(text), "walk survey names (zone %s, %s): would cull %u of %u records (%.0f%%), %u names within %.0f m", cc::walkZoneName(g_walkArmZone),
+                             g_walkArmCam, culled, total, total ? 100.0 * static_cast<double>(culled) / static_cast<double>(total) : 0.0,
+                             static_cast<unsigned>(rows.size()), static_cast<double>(kWalkNearM));
+    const size_t shown = std::min<size_t>(rows.size(), 30);
+    for (size_t i = 0; i < shown && used > 0; ++i) {
+        char one[160] = {};
+        const int w = std::snprintf(one, sizeof(one), "%s %s (%u records, nearest %.1f m, radius %.1f m)", i == 0 ? "; nearest would-cull:" : ";", rows[i].name.c_str(), rows[i].e.n,
+                                    static_cast<double>(rows[i].e.nearest), static_cast<double>(rows[i].e.radius));
+        if (w <= 0) break;
+        if (static_cast<size_t>(used) + static_cast<size_t>(w) + 1 >= sizeof(text)) {
+            Log::get().note("%s", text);
+            used = std::snprintf(text, sizeof(text), "walk survey names (cont.)");
+        }
+        std::snprintf(text + used, sizeof(text) - static_cast<size_t>(used), "%s", one);
+        used += std::min(w, static_cast<int>(sizeof(one)) - 1);
+    }
+    Log::get().note("%s", text);
+}
+
+void walkSurveyTick(uint64_t now, bool camIn) {
+    const bool gate = concourseArmed() && g_dockedNow.load(std::memory_order_acquire);
+    if (!gate) {
+        g_walkOn = false;
+        g_walkPassArmed = false;
+        g_walkZoneSeen = false;
+        return;
+    }
+    const uint64_t anchorMs = g_concAnchorMs.load(std::memory_order_relaxed);
+    const bool anchorFresh = anchorMs != 0 && now - anchorMs <= kConcAnchorFreshMs;
+    const cc::WalkZone zone = cc::walkZone(g_aboardNow, anchorFresh, g_pickCell.has, camIn);
+    if (!g_walkOn) {
+        g_walkOn = true;
+        g_walkLineMs = now;
+        g_walkNamesDueMs = now;
+        g_walkTicks = 0;
+        if (g_walkLinesSession < kWalkLinesCap) Log::get().note("walk survey: on");
+    }
+    ++g_walkTicks;
+    // The pass armed on the last tick has been read by the store: the report, then the pass is off for this publication.
+    if (g_walkPassArmed) {
+        g_walkPassArmed = false;
+        walkSurveyReport();
+    }
+    const bool zoneChanged = !g_walkZoneSeen || zone != g_walkZone;
+    g_walkZoneSeen = true;
+    g_walkZone = zone;
+    if (now - g_walkLineMs >= 1000 && g_walkLinesSession <= kWalkLinesCap) {
+        char camText[160] = {};
+        float past = 0.0f;
+        walkCamText(camText, sizeof(camText), &past);
+        const double meanMs = g_walkTicks ? static_cast<double>(now - g_walkLineMs) / static_cast<double>(g_walkTicks) : 0.0;
+        if (g_walkLinesSession < kWalkLinesCap) {
+            Log::get().note("walk survey: zone %s, seated %d, on foot %d, in hangar %d, social %d, anchor age %lld ms, %s, past the box by %.1f m, pad %s, pad in pass %d, seal %s, "
+                            "frame mean %.2f ms over %u frames",
+                            cc::walkZoneName(zone), g_aboardNow ? 1 : 0, (g_statusFlags2Now & sealed::kFlags2OnFoot) != 0 ? 1 : 0,
+                            (g_statusFlags2Now & sealed::kFlags2OnFootInHangar) != 0 ? 1 : 0, (g_statusFlags2Now & sealed::kFlags2OnFootSocialSpace) != 0 ? 1 : 0,
+                            anchorMs != 0 ? static_cast<long long>(now - anchorMs) : -1ll, camText, static_cast<double>(past), g_pickCell.has ? g_pickCell.padName : "none",
+                            g_stickyPadInPass ? 1 : 0, g_heldValid ? "held" : "not held", meanMs, static_cast<unsigned>(g_walkTicks));
+        } else {
+            Log::get().note("walk survey: %u lines written; no more lines this session", kWalkLinesCap);
+        }
+        ++g_walkLinesSession;
+        g_walkLineMs = now;
+        g_walkTicks = 0;
+    }
+    // The names report: unsealed, with a pick cell, out of the concourse; every 5 s and at a zone change. One store pass judges against the pick cell.
+    if (!g_heldValid && g_pickCell.has && g_frameCamValid && zone != cc::WalkZone::kConcourse && (zoneChanged || now >= g_walkNamesDueMs)) {
+        if (g_walkNamesSession < kWalkNamesCap) {
+            try {
+                WalkAgg& a = walkAgg();
+                std::lock_guard<std::mutex> lock(a.m);
+                a.total = a.culled = 0;
+                a.names.clear();
+            } catch (...) {
+            }
+            float past = 0.0f;
+            walkCamText(g_walkArmCam, sizeof(g_walkArmCam), &past);
+            g_walkArmZone = zone;
+            g_walkCellCopy = g_pickCell;
+            g_walkPassArmed = true;   // published with this tick's snapshot (publishSnapshot, later in the tick)
+            if (++g_walkNamesSession == kWalkNamesCap) Log::get().note("walk survey names: %u reports written; no more this session", kWalkNamesCap);
+        }
+        g_walkNamesDueMs = now + 5000;
+    }
+}
+
 // The tick, under the state lock, before the store gate is set (storeHookGate reads g_concWanted).
 void concourseTick(uint64_t now, uint32_t frame) {
     g_concSettingOffLogged = false;
@@ -3244,6 +3503,19 @@ void concourseTick(uint64_t now, uint32_t frame) {
     const bool sealedNow = g_heldValid;
     const bool armed = concourseArmed();
     const bool effective = concourseEffective();
+    // Built 2026-11-06: a camera cut over kRoomCutM in one frame is another room (the lift). The anchor is forgotten before it is read, so the cull's gate follows the
+    // jump at once both ways (going down it would otherwise stay on until the anchor ages out). resolveTickView runs earlier in the same tick, so this is the same tick.
+    bool cutNow = false;
+    if (g_roomCutPending) {
+        cutNow = true;
+        g_roomCutPending = false;
+        const uint64_t was = g_concAnchorMs.exchange(0, std::memory_order_relaxed);
+        const bool wasFresh = was != 0 && now - was <= kConcAnchorFreshMs;
+        if (armed || wasFresh)
+            Log::get().note("concourse cull: the camera cut %.0f m in one frame (another room): the anchor is forgotten; anchor was %lld ms old, in hangar %d, social %d",
+                            static_cast<double>(g_roomCutM), was != 0 ? static_cast<long long>(now - was) : -1ll, (g_statusFlags2Now & sealed::kFlags2OnFootInHangar) != 0 ? 1 : 0,
+                            (g_statusFlags2Now & sealed::kFlags2OnFootSocialSpace) != 0 ? 1 : 0);
+    }
     const uint64_t anchorMs = g_concAnchorMs.load(std::memory_order_relaxed);
     const bool anchor = anchorMs != 0 && now - anchorMs <= kConcAnchorFreshMs;
     const bool gateWanted = armed && social && !sealedNow;
@@ -3256,6 +3528,22 @@ void concourseTick(uint64_t now, uint32_t frame) {
     feed.withhold = active;
     feed.bayOpacity = clr.bayOpacity;
     feed.sealed = g_sealedFlag.load(std::memory_order_acquire);   // the hangar is sealed: what can only be outside is not issued, with no diag key
+    feed.enterShare = g_concEnterShare;
+    {
+        // The anchor's up axis, read at most once a second while the cull is wanted (the pose read is not free), and held between reads.
+        static float up[3] = {};
+        static bool upValid = false;
+        static uint64_t upMs = 0;
+        if (!wantCull) {
+            upValid = false;
+            upMs = 0;
+        } else if (now - upMs >= 1000) {
+            upMs = now;
+            upValid = concourseAnchorUp(up);
+        }
+        feed.upValid = upValid;
+        for (int k = 0; k < 3; ++k) feed.up[k] = upValid ? up[k] : 0.0f;
+    }
     concoursePaneSetFeed(feed);
     g_concWanted.store(gateWanted, std::memory_order_release);
     g_concHubWanted.store(gateWanted && g_concHubAddr.load(std::memory_order_relaxed) == 0, std::memory_order_relaxed);
@@ -3277,6 +3565,7 @@ void concourseTick(uint64_t now, uint32_t frame) {
             g_concSurveyDueMs = 0;
             const char* why = !effective ? "the key or its override is off"
                               : sealedNow ? "the hangar seal engaged"
+                              : cutNow    ? "the camera cut to another room"
                               : !social   ? "no longer on foot in social space"
                               : wantCull  ? "the bay glass was approached: the view is clearing (diag.concourse_clear_share)"
                                           : "the anchor record was not seen for 5 s";
@@ -3540,6 +3829,7 @@ void optimizedStationFrameBody(uint32_t frame) {
             camIn = sealed::distance(g_pickCell.centre, g_frameCam) <= g_pickCell.radius;
         }
     }
+    walkSurveyTick(now, camIn);   // TEMPORARY, log only (the walk survey)
     // Built v14.12: the latch is kept while docked, unsealed, after a descent; the candidates of this frame are consumed here.
     g_watchNowMs = now;
     g_bayWatching = bayWatchKeep();
@@ -3665,6 +3955,10 @@ void optimizedStationFrameBody(uint32_t frame) {
     in.launched = false;   // the pad state object's reader is not in this build: the launch is the r1 edge and the mechanism
     // Built 2026-10-15: the origin shift latchRead read this tick (before this point, on the same tick): the seal step takes it once.
     in.originShifted = g_originShiftPending;
+    // Built 2026-11-06: the guard. g_stickyPadInPass and g_passInformative were set by drainGather earlier in this same tick (the T4 trigger reads the same two at
+    // the end of it), so they are valid here. The run counts informative passes without the sealed own pad; at kPadMissingPasses the seal is released.
+    g_padMissingRun = sealed::padMissingRun(g_padMissingRun, g_passInformative && g_ownSticky.pad != 0, g_stickyPadInPass, g_heldValid);
+    in.padMissing = g_padMissingRun >= sealed::kPadMissingPasses;
     in.nowMs = now;
     sealed::ReleaseWhy why = sealed::ReleaseWhy::kNone;
     const uint64_t holdBefore = g_sealState.holdUntilMs;
@@ -3673,6 +3967,7 @@ void optimizedStationFrameBody(uint32_t frame) {
     // Built 2026-10-15: what set the hold, for its line: an origin-shift or Lift release, or an origin shift read while docked.
     if (act == sealed::SealAction::kRelease && why == sealed::ReleaseWhy::kOriginShift) g_holdCause = "origin shift";
     else if (act == sealed::SealAction::kRelease && why == sealed::ReleaseWhy::kMechanism) g_holdCause = "mechanism release";
+    else if (act == sealed::SealAction::kRelease && why == sealed::ReleaseWhy::kPadMissing) g_holdCause = "guard release (the own pad's record was missing)";
     else if (in.originShifted && !in.held) g_holdCause = "origin shift";
     const bool holdStarted = g_sealState.holdUntilMs != holdBefore && g_sealState.holdUntilMs != 0;
     g_flagPadMoved = false;
@@ -3683,7 +3978,25 @@ void optimizedStationFrameBody(uint32_t frame) {
         sealed::engageTrigger(&er, g_sealState);
         g_engagePending = er.pending;
     }
+    float releasedCentre[3] = {};   // the held cell's centre at a release, for that tick's trace row (releaseSeal clears the cell)
     if (act == sealed::SealAction::kRelease) {
+        std::memcpy(releasedCentre, g_heldCell.centre, sizeof(releasedCentre));   // for the trace row of the release tick (releaseSeal clears the cell)
+        if (why == sealed::ReleaseWhy::kPadMissing) {
+            // The guard says what it saw before it lets go: the own pad's rig as the tick last saw it, and the pad's stage counts since the seal.
+            const sealed::OwnRigTrace& o = g_ownRigTrace;
+            const char* verdictText = o.verdict == 0 ? "unknown" : o.verdict == 1 ? "mixed" : o.verdict == 2 ? "outside" : "none";
+            static const char* const kPub[] = {"current", "not published", "earlier epoch", "collection moved"};
+            const auto st = [](sealed::PadStage k) { return static_cast<unsigned long long>(g_padStageSinceSeal[k].load(std::memory_order_relaxed)); };
+            Log::get().note("optimized station: guard: the own pad's record was missing from %u passes in a row while sealed; releasing, because a cell that drops its own "
+                            "pad may be wrong. Pad rig: known %s, publication %s, verdict %s, run %u, bounded %s, dist %.1f m, radius %.1f m; pad stages since the seal: "
+                            "store %llu, early %llu, unread %llu, gathered %llu, producer vetoed %llu, kept %llu.",
+                            static_cast<unsigned>(g_padMissingRun), o.known ? "yes" : "no", o.known ? kPub[o.publication < 4 ? o.publication : 1] : "-",
+                            o.known ? verdictText : "-", static_cast<unsigned>(o.run), o.bounded ? "yes" : "no", o.bounded ? static_cast<double>(o.distM) : 0.0,
+                            o.bounded ? static_cast<double>(o.radiusM) : 0.0, st(sealed::kPadStore), st(sealed::kPadEarly), st(sealed::kPadUnread),
+                            st(sealed::kPadGathered), st(sealed::kPadProdVetoed), st(sealed::kPadProdKept));
+            bumpRigEpoch();   // the rigs are judged afresh from the next pass
+            g_padMissingRun = 0;
+        }
         releaseSeal(releaseText(why), frame);
     } else if (act == sealed::SealAction::kRequestEngage) {
         if (g_sealGuard.tripped) {
@@ -3768,7 +4081,7 @@ void optimizedStationFrameBody(uint32_t frame) {
         tr.frame = frame;
         tr.nowMs = now;
         tr.docked = g_dockedNow.load(std::memory_order_acquire);
-        tr.held = g_heldValid;
+        tr.held = g_heldValid || why == sealed::ReleaseWhy::kPadMissing;   // the guard's release tick still counts as held, so T4 (the same three passes) dumps its trace
         tr.verdict = g_passVerdictLast;
         tr.thin = g_passThinLast;
         tr.passCalls = g_passCalls;
@@ -3777,6 +4090,7 @@ void optimizedStationFrameBody(uint32_t frame) {
         tr.ownUnseen = static_cast<uint32_t>(g_ownSticky.unseen);
         tr.refresh = heldRefresh;
         if (g_heldValid) std::memcpy(tr.centre, g_heldCell.centre, sizeof(tr.centre));
+        else if (why == sealed::ReleaseWhy::kPadMissing) std::memcpy(tr.centre, releasedCentre, sizeof(tr.centre));
         tr.frameShiftM = g_frameShiftM;
         tr.camValid = g_frameCamValid;
         std::memcpy(tr.cam, g_frameCam, sizeof(tr.cam));

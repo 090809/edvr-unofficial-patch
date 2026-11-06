@@ -1063,7 +1063,7 @@ constexpr uint8_t kReaderMoving = 1;    // r0 1: moving in or locked in
 constexpr uint8_t kReaderDescent = 3;   // r0 3: the descent has started
 
 enum class SealAction : uint8_t { kNone = 0, kRequestEngage = 1, kRelease = 2 };
-enum class ReleaseWhy : uint8_t { kNone = 0, kSettingOff, kUndocked, kCameraLeft, kPadMoved, kHangarChanged, kLaunch, kMechanism, kInHangarLeft, kOnFoot, kOriginShift };
+enum class ReleaseWhy : uint8_t { kNone = 0, kSettingOff, kUndocked, kCameraLeft, kPadMoved, kHangarChanged, kLaunch, kMechanism, kInHangarLeft, kOnFoot, kOriginShift, kPadMissing };
 
 // Release blocker for v0.20.0 (2026-10-14): the seal is for the commander sitting in the ship on the pad. The sealed box is tall (152 x 75 x 258 m for a small pad), so the lift
 // shaft and the concourse above it can lie inside it, and a camera that rode the lift up stayed "in the bay" while the culling hid the station's geometry. The game states the seat
@@ -1102,6 +1102,7 @@ struct SealInputs {
     bool hangarChanged = false;  // the held pad is gone from the store, or another own pad is the nearest for kHeldLostFrames
     bool launched = false;       // not used (no reader for the launch): always false
     bool originShifted = false;  // built 2026-10-15: a common-frame origin shift was detected this tick (the latch read, before the step): a transition
+    bool padMissing = false;     // built 2026-11-06: the sealed own pad's record was missing from kPadMissingPasses informative passes in a row (padMissingRun)
     uint64_t nowMs = 0;
 };
 
@@ -1128,6 +1129,17 @@ struct SealState {
     // This call's request was kept back by holdUntilMs (set per call; the tick logs the first such call of a hold once).
     bool holdBlocked = false;
 };
+
+// Built 2026-11-06: the guard against a sealed cell that has lost its own pad. Informative passes in a row without the own pad's record (the same count as the
+// seal trace's T4). `run` is the count so far; `informative` is whether this pass counts (a complete pass that held a store callback, with the own pad known);
+// `ownInPass` whether the pad's record was in it; `held` whether the seal is on. Not held: 0. An uninformative pass: unchanged. The pad in the pass: 0. Else run + 1.
+constexpr uint32_t kPadMissingPasses = 3;
+inline uint32_t padMissingRun(uint32_t run, bool informative, bool ownInPass, bool held) noexcept {
+    if (!held) return 0;
+    if (!informative) return run;
+    if (ownInPass) return 0;
+    return run + 1;
+}
 
 // A release, or the trigger lapsing: the request starts again.
 inline void clearTrigger(SealState* st) noexcept {
@@ -1902,6 +1914,7 @@ inline SealAction sealStep(const SealInputs& in, SealState* st, ReleaseWhy* why)
         else if (st->camOutRun >= kCameraFrames) w = ReleaseWhy::kCameraLeft;
         else if (in.mechanismMoved) w = ReleaseWhy::kMechanism;   // the hatch or the lift moved: the launch
         else if (in.padMoved) w = ReleaseWhy::kPadMoved;
+        else if (in.padMissing) w = ReleaseWhy::kPadMissing;   // built 2026-11-06: a cell that drops its own pad may be wrong: released, held like an origin shift
         else if (in.hangarChanged) w = ReleaseWhy::kHangarChanged;
         else if (in.launched) w = ReleaseWhy::kLaunch;
         else if (in.r1Fresh && !in.inHangar) w = ReleaseWhy::kInHangarLeft;   // the game's r1 1 to 0: the pad left the bay
@@ -1915,9 +1928,9 @@ inline SealAction sealStep(const SealInputs& in, SealState* st, ReleaseWhy* why)
             st->camOutRun = 0;
             if (w == ReleaseWhy::kCameraLeft) st->camInRun = 0;   // the re-seal waits kCameraFrames inside the bay
             // Built 2026-10-15: the transition hold. The origin shift and the Lift keep the re-seal waiting; their Status.json seat reads a second late.
-            if (w == ReleaseWhy::kOriginShift || w == ReleaseWhy::kMechanism) {
+            if (w == ReleaseWhy::kOriginShift || w == ReleaseWhy::kMechanism || w == ReleaseWhy::kPadMissing) {
                 st->holdUntilMs = in.nowMs + kTransitionHoldMs;
-                st->shiftHold = (w == ReleaseWhy::kOriginShift);
+                st->shiftHold = (w == ReleaseWhy::kOriginShift || w == ReleaseWhy::kPadMissing);   // a pad-missing hold is not stepped over by an old edge
             }
             *why = w;
             return SealAction::kRelease;

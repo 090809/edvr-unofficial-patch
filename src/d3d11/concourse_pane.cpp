@@ -30,17 +30,13 @@ namespace {
 
 namespace cc = edvr::concourse;
 
-enum Mode : uint32_t { kModeMirror = 0, kModeMirrorSoft = 1, kModeTint = 2, kModeOff = 3, kModeLit = 4, kModeBright = 5, kModeBrightest = 6,
-                       kModeSteady25 = 7, kModeSteady50 = 8, kModeSteady100 = 9, kModeSteady200 = 10, kModeSteady400 = 11 };
+enum Mode : uint32_t { kModeMirror = 0, kModeMirrorSoft = 1, kModeTint = 2, kModeOff = 3, kModeLit = 4, kModeBright = 5, kModeBrightest = 6, kModeSteady = 7 };
 
 // The lit modes' glow pass, as a factor on the white, rough material: how much of the room's own light the pane gives back on top of its mirror. That pass is the
 // glass shader, so it carries the sun and its shadow map, and they move as the station turns.
 float glowOf(uint32_t m) noexcept { return m == kModeLit ? 1.0f : m == kModeBright ? 2.0f : m == kModeBrightest ? 4.0f : 0.0f; }
-// The steady modes' glow pass: a flat HDR colour added over the mirror, with no light or shadow in it, so it does not change as the station turns. The scene's HDR scale
-// has not been measured, so the five steps bracket a guess of 1.0 by four times each way.
-float steadyOf(uint32_t m) noexcept {
-    return m == kModeSteady25 ? 0.25f : m == kModeSteady50 ? 0.5f : m == kModeSteady100 ? 1.0f : m == kModeSteady200 ? 2.0f : m == kModeSteady400 ? 4.0f : 0.0f;
-}
+// The steady mode's glow pass: a flat HDR colour added over the mirror, with no light or shadow in it, so it does not change as the station turns. Its level is by
+// window type (diag.concourse_glow: sky, bay, other); a pixel shader scales it by how much the pane faces the anchor's up axis.
 constexpr float kSteadyColour[3] = {0.95f, 0.97f, 0.92f};   // a pale white, a little to the green of the station's light
 
 const char* modeText(uint32_t m) noexcept {
@@ -51,11 +47,7 @@ const char* modeText(uint32_t m) noexcept {
         case kModeLit: return "mirror-lit";
         case kModeBright: return "mirror-bright";
         case kModeBrightest: return "mirror-brightest";
-        case kModeSteady25: return "mirror-steady-25";
-        case kModeSteady50: return "mirror-steady-50";
-        case kModeSteady100: return "mirror-steady-100";
-        case kModeSteady200: return "mirror-steady-200";
-        case kModeSteady400: return "mirror-steady-400";
+        case kModeSteady: return "mirror-steady";
         default: return "mirror";
     }
 }
@@ -68,11 +60,7 @@ bool parseMode(const std::string& t, uint32_t* out) noexcept {
     else if (t == "mirror-lit") *out = kModeLit;
     else if (t == "mirror-bright") *out = kModeBright;
     else if (t == "mirror-brightest") *out = kModeBrightest;
-    else if (t == "mirror-steady-25") *out = kModeSteady25;
-    else if (t == "mirror-steady-50") *out = kModeSteady50;
-    else if (t == "mirror-steady-100") *out = kModeSteady100;
-    else if (t == "mirror-steady-200") *out = kModeSteady200;
-    else if (t == "mirror-steady-400") *out = kModeSteady400;
+    else if (t == "mirror-steady") *out = kModeSteady;
     else return false;
     return true;
 }
@@ -89,7 +77,7 @@ constexpr uint32_t kFlagTestDrawn = 1u << 7;    // the side test's first query (
 constexpr uint32_t kFlagTestMirror = 1u << 8;   // the side test's second query (the mirror draw) is open
 
 // ---- The list, the mode and the feed (the draw threads read them; the tick and the feed write them) --------------------------------------------
-std::atomic<uint32_t> g_mode{kModeSteady100};
+std::atomic<uint32_t> g_mode{kModeSteady};
 cc::PaneTriple g_list[cc::kPaneListCap] = {{cc::kPaneFamilyVs, cc::kPaneFamilyPs, 0}};   // entry 0 is the built-in glass family; diag.concourse_panes adds
 std::atomic<uint32_t> g_listN{1};
 std::atomic<bool> g_feedMeasure{false}, g_feedTreat{false}, g_feedWithhold{false}, g_feedSealed{false};
@@ -122,6 +110,22 @@ std::atomic<ID3D11ShaderResourceView*> g_glowT10{nullptr};    // t10 of the glow
 std::atomic<ID3D11Buffer*> g_cbMirror{nullptr};       // mirror-soft: the pixel shader's constant buffer 2
 std::atomic<bool> g_statesReady{false};
 bool g_psWhiteTried = false;   // the tick's: one compile per device
+// The steady glow's own pixel shader and its constant buffer (b2: up.xyz, then the sky ratio in the second row's x), the levels, and the anchor's up axis.
+std::atomic<ID3D11PixelShader*> g_psSky{nullptr};
+std::atomic<ID3D11Buffer*> g_cbGlow{nullptr};
+bool g_psSkyTried = false;
+std::atomic<float> g_glowSky{cc::kGlowSkyDefault}, g_glowBay{cc::kGlowBayDefault}, g_glowOther{cc::kGlowOtherDefault};   // diag.concourse_glow
+std::string g_glowAppliedText;
+bool g_glowTextSeen = false;
+std::atomic<float> g_upFed[3] = {};
+std::atomic<bool> g_upFedValid{false};
+float g_glowCbSent[8] = {};      // the tick's: what the buffer holds
+bool g_glowCbSentValid = false;
+bool g_glowLogged = false;
+float g_glowLoggedLv[3] = {};
+// The index count treated as the clearing pane (36, the bay window, until an exterior pane fills the view), and the entry share the feed carries.
+std::atomic<uint32_t> g_clearN{cc::kBayIndexCount};
+std::atomic<float> g_enterShareFed{0.0f};
 
 // The mark pass's own objects (made by the tick; the draw threads read the atomics).
 std::atomic<ID3D11VertexShader*> g_vsMark{nullptr};      // the fullscreen triangle at the beyond depth
@@ -226,6 +230,7 @@ struct TestSlot {
     uint8_t state = 0;   // 0 free, 1 the game's draw open, 2 closed and waiting for the mirror, 3 the mirror open, 4 both closed, not yet read
     uint32_t frame = 0;
     cc::PaneKey key;
+    double pixels = 0.0;   // the viewport's area at the draw (the share's denominator)
 };
 std::mutex g_sideMutex;   // the table and the ring: the draw thread and the tick both touch them
 TestSlot g_tests[kTestSlots];
@@ -333,6 +338,10 @@ void releaseStates() noexcept {
     g_bsGlow.store(nullptr, std::memory_order_release);
     g_glowT10.store(nullptr, std::memory_order_release);
     g_psWhite.store(nullptr, std::memory_order_release);
+    g_psSky.store(nullptr, std::memory_order_release);
+    g_cbGlow.store(nullptr, std::memory_order_release);
+    g_psSkyTried = false;
+    g_glowCbSentValid = false;
     for (auto& s : g_mirrorSrv) s.store(nullptr, std::memory_order_release);
     g_cbMirror.store(nullptr, std::memory_order_release);
     g_psWhiteTried = false;
@@ -383,6 +392,50 @@ void makeWhitePs(ID3D11Device* device) noexcept {
     imm->Release();
     g_psWhite.store(ps, std::memory_order_release);
     if (!ps) Log::get().note("concourse pane: the white pixel shader did not compile; tint multiplies the game's own colour, so a dark pane stays dark");
+}
+
+// The steady glow's pixel shader: its inputs are the first two outputs of the glass vertex shader (matched by name and order), its result a scalar that is 1 on a
+// vertical pane and the sky ratio on a horizontal one. A zero `up` gives 1. A failed compile is logged once and the steady glow pass is not drawn.
+void makeSkyPs(ID3D11Device* device) noexcept {
+    if (g_psSkyTried) return;
+    g_psSkyTried = true;
+    ID3D11DeviceContext* imm = nullptr;
+    device->GetImmediateContext(&imm);
+    if (!imm) return;
+    static const char kSky[] =
+        "cbuffer GlowCb : register(b2) { float4 up; float4 lv; };\n"
+        "struct PsIn { nointerpolation uint face : __USER_VERTEX_FACEINVARIANT0; float3 n : __USER_VERTEX_M_LIGHTINGNORMAL0; };\n"
+        "float4 main(PsIn i) : SV_Target {\n"
+        "    float ul = length(up.xyz);\n"
+        "    float3 nn = i.n * rsqrt(max(dot(i.n, i.n), 1e-12));\n"
+        "    float s = ul > 0.5 ? smoothstep(0.5, 0.85, abs(dot(nn, up.xyz / ul))) : 0.0;\n"
+        "    float v = lerp(1.0, lv.x, s);\n"
+        "    return float4(v, v, v, v);\n"
+        "}\n";
+    ID3D11PixelShader* ps = shaderSwapCompilePs(imm, kSky, sizeof(kSky) - 1, "main", "concourse_pane_sky", nullptr, "concourse pane");
+    imm->Release();
+    g_psSky.store(ps, std::memory_order_release);
+    if (!ps) Log::get().note("concourse pane: the sky glow pixel shader did not compile; the steady glow pass is not drawn");
+}
+
+bool makeGlowCb(ID3D11Device* device) noexcept {
+    static const float kInit[8] = {0, 0, 0, 0, 1, 0, 0, 0};
+    D3D11_BUFFER_DESC bd{};
+    bd.ByteWidth = sizeof(kInit);
+    bd.Usage = D3D11_USAGE_DEFAULT;
+    bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+    D3D11_SUBRESOURCE_DATA sd{};
+    sd.pSysMem = kInit;
+    ID3D11Buffer* b = nullptr;
+    const HRESULT h = device->CreateBuffer(&bd, &sd, &b);
+    if (FAILED(h) || !b) {
+        Log::get().note("concourse pane: the glow constant buffer could not be made (hr %08X); the steady glow pass is not drawn", static_cast<unsigned>(h));
+        return false;
+    }
+    std::memcpy(g_glowCbSent, kInit, sizeof(kInit));
+    g_glowCbSentValid = true;
+    g_cbGlow.store(b, std::memory_order_release);
+    return true;
 }
 
 bool makeBlendStates(ID3D11Device* device) noexcept {
@@ -602,6 +655,8 @@ bool makeStates(ID3D11Device* device) noexcept {
     if (!device) return false;
     if (g_statesReady.load(std::memory_order_acquire)) return true;
     makeWhitePs(device);
+    makeSkyPs(device);
+    if (!g_cbGlow.load(std::memory_order_acquire)) makeGlowCb(device);
     makeMarkStates(device);
     ensureMarkVs(device);
     g_markReady.store(g_rsMark.load(std::memory_order_acquire) != nullptr && g_vsMark.load(std::memory_order_acquire) != nullptr, std::memory_order_release);
@@ -768,7 +823,7 @@ void pollShares(ID3D11Device* device, uint32_t prevFrame, uint32_t frame, bool m
             for (uint32_t k = 0; k < best->count; ++k) {
                 r.n[k] = best->n[k];
                 r.share[k] = best->share[k];
-                if (best->n[k] == cc::kBayIndexCount && best->share[k] > r.bay) r.bay = best->share[k];
+                if (best->n[k] == g_clearN.load(std::memory_order_relaxed) && best->share[k] > r.bay) r.bay = best->share[k];
             }
             g_latest = r;
             g_latestMs = nowMs;
@@ -1074,6 +1129,10 @@ int captureBegin(ID3D11DeviceContext* ctx, UINT indexCount) noexcept {
 // ---- The side tests -----------------------------------------------------------------------------------------------------------------------------
 int testOpen(ID3D11DeviceContext* ctx, const cc::PaneKey& key) noexcept {
     int idx = -1;
+    D3D11_VIEWPORT vp{};
+    UINT nvp = 1;
+    ctx->RSGetViewports(&nvp, &vp);
+    const double pixels = nvp >= 1 ? static_cast<double>(vp.Width) * static_cast<double>(vp.Height) : 0.0;
     {
         std::lock_guard<std::mutex> lock(g_sideMutex);
         if (!g_testsMade) return -1;
@@ -1086,6 +1145,7 @@ int testOpen(ID3D11DeviceContext* ctx, const cc::PaneKey& key) noexcept {
         g_tests[idx].state = 1;
         g_tests[idx].frame = g_frameNow.load(std::memory_order_relaxed);
         g_tests[idx].key = key;
+        g_tests[idx].pixels = pixels;
     }
     FlatComputeInternalScope internal;
     ctx->Begin(g_tests[idx].qDrawn);
@@ -1136,6 +1196,11 @@ void pollTests(ID3D11Device* device, uint32_t frame) noexcept {
     ID3D11DeviceContext* imm = nullptr;
     device->GetImmediateContext(&imm);
     if (!imm) return;
+    // The clearing pane: in the plain phase, an exterior mesh whose glass fills the view as much as the entry share is a candidate (the largest wins).
+    uint32_t candN = 0;
+    float candShare = 0.0f;
+    const bool plainNow = g_withholdNow.load(std::memory_order_relaxed);
+    const float enterShare = g_enterShareFed.load(std::memory_order_relaxed);
     {
         std::lock_guard<std::mutex> lock(g_sideMutex);
         if (g_testsMade) {
@@ -1149,9 +1214,17 @@ void pollTests(ID3D11Device* device, uint32_t frame) noexcept {
                 if (imm->GetData(t.qDrawn, &drawn, sizeof(drawn), D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK) continue;
                 if (imm->GetData(t.qMirror, &mirrored, sizeof(mirrored), D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK) continue;
                 const cc::PaneKey key = t.key;
+                const double pixels = t.pixels;
                 t.state = 0;
                 g_testsRead.fetch_add(1, std::memory_order_relaxed);
                 const cc::PaneSides::Change c = g_sides.note(key, drawn, mirrored);
+                if (plainNow && enterShare > 0.0f && pixels > 0.0 && g_sides.side(key) == cc::PaneSide::kExterior) {
+                    const float share = static_cast<float>(static_cast<double>(drawn) / pixels);
+                    if (share >= enterShare && share > candShare && key.n != g_clearN.load(std::memory_order_relaxed)) {
+                        candN = key.n;
+                        candShare = share;
+                    }
+                }
                 if (c == cc::PaneSides::Change::kNone) continue;
                 const bool ext = g_sides.side(key) == cc::PaneSide::kExterior;
                 uint32_t& cap = (c == cc::PaneSides::Change::kFirst && ext) ? g_sideLogExterior : g_sideLogOther;
@@ -1164,6 +1237,18 @@ void pollTests(ID3D11Device* device, uint32_t frame) noexcept {
         }
     }
     imm->Release();
+    if (candN != 0) {
+        // Against the latest share of the pane that is the clearing pane now (0 when it is not on screen). The shares' lock is taken after the table's is let go.
+        float cur = 0.0f;
+        {
+            std::lock_guard<std::mutex> lock(g_shareMutex);
+            const uint32_t now = g_clearN.load(std::memory_order_relaxed);
+            for (uint32_t k = 0; g_latest.valid && k < g_latest.count; ++k)
+                if (g_latest.n[k] == now) cur = g_latest.share[k];
+        }
+        if (candShare > cur && g_clearN.exchange(candN, std::memory_order_relaxed) != candN)
+            Log::get().note("concourse pane: the clearing pane is now n=%u (share %.1f%%)", candN, 100.0 * static_cast<double>(candShare));
+    }
 }
 
 // ---- The mark pass -----------------------------------------------------------------------------------------------------------------------------
@@ -1406,7 +1491,7 @@ void ConcoursePaneScope::begin(ID3D11DeviceContext* ctx, UINT indexCount, UINT s
         // The cull is lifted (lifting, fading, clear): only a pane known to be exterior is still mirrored, and over its whole area.
         const cc::PaneKey key{indexCount, startIndex, baseVertex};
         if (sideOf(key) != cc::PaneSide::kExterior) return;
-        if (indexCount == cc::kBayIndexCount) {
+        if (indexCount == g_clearN.load(std::memory_order_relaxed)) {
             opacity = std::min(1.0f, std::max(0.0f, g_bayOpacity.load(std::memory_order_relaxed)));
             if (opacity <= 0.001f) return;   // the bay glass is clear: the game's own glass, alone
             if (opacity < 0.999f) opaque = false;
@@ -1418,8 +1503,17 @@ void ConcoursePaneScope::begin(ID3D11DeviceContext* ctx, UINT indexCount, UINT s
     planOpaque_ = opaque;
     planTint_ = tint;
     planSoft_ = mode == kModeMirrorSoft;
-    planSteady_ = steadyOf(mode) > 0.0f;
-    planGlow_ = tint ? 0.0f : (planSteady_ ? steadyOf(mode) : glowOf(mode)) * opacity;
+    planSteady_ = mode == kModeSteady;
+    if (tint) {
+        planGlow_ = 0.0f;
+    } else if (planSteady_) {
+        // The level by window type, whatever the phase: the bay window gets `bay`, every other pane `other`, and a pane that clears keeps its level as it fades. The
+        // pixel shader multiplies a horizontal pane by sky / other, so a skylight lands on `sky`.
+        const float level = indexCount == cc::kBayIndexCount ? g_glowBay.load(std::memory_order_relaxed) : cc::glowOtherLevel(g_glowOther.load(std::memory_order_relaxed));
+        planGlow_ = level * opacity;
+    } else {
+        planGlow_ = glowOf(mode) * opacity;
+    }
     if (tint) {
         const float* c = cc::kPaneColours[tintSlotOf(indexCount) % cc::kPaneColourCount];
         for (int k = 0; k < 3; ++k) planFactor_[k] = c[k] * cc::kPaneTintIntensity;
@@ -1457,11 +1551,13 @@ bool ConcoursePaneScope::nextMirrorPassSlow() noexcept {
     ID3D11BlendState* bs = g_bsGlow.load(std::memory_order_acquire);
     if (!bs) return false;
     if (planSteady_) {
-        ID3D11PixelShader* white = g_psWhite.load(std::memory_order_acquire);
-        if (!white) return false;
+        ID3D11PixelShader* sky = g_psSky.load(std::memory_order_acquire);
+        ID3D11Buffer* glowCb = g_cbGlow.load(std::memory_order_acquire);
+        if (!sky || !glowCb) return false;   // the compile or the buffer failed (said once): no glow pass
         ctx_->PSGetShader(&prevPs_, nullptr, nullptr);
-        calls_->setPs(ctx_, white, nullptr, 0);
+        calls_->setPs(ctx_, sky, nullptr, 0);
         flags_ |= kFlagPs;
+        bindPsCb(glowCb);   // restored by end() through kFlagCb
         const FLOAT steady[4] = {kSteadyColour[0] * planGlow_, kSteadyColour[1] * planGlow_, kSteadyColour[2] * planGlow_, planGlow_};
         calls_->setBlend(ctx_, bs, steady, 0xFFFFFFFFu);
         return true;
@@ -1473,6 +1569,25 @@ bool ConcoursePaneScope::nextMirrorPassSlow() noexcept {
     const FLOAT factor[4] = {planGlow_, planGlow_, planGlow_, planGlow_};
     calls_->setBlend(ctx_, bs, factor, 0xFFFFFFFFu);
     return true;
+}
+
+// Constant buffer 2 of the pixel stage becomes `own`; the game's is kept for end() (once: a second call only changes the buffer).
+void ConcoursePaneScope::bindPsCb(ID3D11Buffer* own) noexcept {
+    if ((flags_ & kFlagCb) != 0) {
+        if (ctx1_) ctx1_->PSSetConstantBuffers1(kPaneCbSlot, 1, &own, nullptr, nullptr);
+        else ctx_->PSSetConstantBuffers(kPaneCbSlot, 1, &own);
+        return;
+    }
+    ctx_->QueryInterface(IID_PPV_ARGS(&ctx1_));
+    if (ctx1_) {
+        // The *ConstantBuffers1 methods are not hooked, so this passes no thunk, and the saved offset window is put back exactly.
+        ctx1_->PSGetConstantBuffers1(kPaneCbSlot, 1, &prevCb_, &prevCbFirst_, &prevCbNum_);
+        ctx1_->PSSetConstantBuffers1(kPaneCbSlot, 1, &own, nullptr, nullptr);
+    } else {
+        ctx_->PSGetConstantBuffers(kPaneCbSlot, 1, &prevCb_);
+        ctx_->PSSetConstantBuffers(kPaneCbSlot, 1, &own);
+    }
+    flags_ |= kFlagCb;
 }
 
 bool ConcoursePaneScope::beginMirrorSlow() noexcept {
@@ -1537,18 +1652,7 @@ bool ConcoursePaneScope::beginMirrorSlow() noexcept {
         calls_->setDepth(ctx_, derived, stencilRef);
         flags_ |= kFlagDepth;
     }
-    if (ownCb) {
-        ctx_->QueryInterface(IID_PPV_ARGS(&ctx1_));
-        if (ctx1_) {
-            // The *ConstantBuffers1 methods are not hooked, so this passes no thunk, and the saved offset window is put back exactly.
-            ctx1_->PSGetConstantBuffers1(kPaneCbSlot, 1, &prevCb_, &prevCbFirst_, &prevCbNum_);
-            ctx1_->PSSetConstantBuffers1(kPaneCbSlot, 1, &ownCb, nullptr, nullptr);
-        } else {
-            ctx_->PSGetConstantBuffers(kPaneCbSlot, 1, &prevCb_);
-            ctx_->PSSetConstantBuffers(kPaneCbSlot, 1, &ownCb);
-        }
-        flags_ |= kFlagCb;
-    }
+    if (ownCb) bindPsCb(ownCb);
     if (testSlot_ >= 0) {
         testOpenMirror(ctx_, testSlot_);
         flags_ |= kFlagTestMirror;
@@ -1717,13 +1821,32 @@ void pollConfig(uint64_t nowMs) {
     bindKey(g_keyCapture, g_keyCaptureText, Config::get().getString("hotkey.concourse_pane_capture", ""), "hotkey.concourse_pane_capture", "capture key");
     bindKey(g_keyMode, g_keyModeText, Config::get().getString("hotkey.concourse_pane_mode", ""), "hotkey.concourse_pane_mode", "mode key");
     g_keysBound = true;
-    const std::string modeT = Config::get().getString("diag.concourse_pane_mode", "mirror-steady-100");
+    const std::string modeT = Config::get().getString("diag.concourse_pane_mode", "mirror-steady");
     if (!g_modeTextSeen || modeT != g_modeAppliedText) {
         g_modeTextSeen = true;
         g_modeAppliedText = modeT;
-        uint32_t m = kModeSteady100;
+        uint32_t m = kModeSteady;
         if (parseMode(modeT, &m)) setMode(m, "diag.concourse_pane_mode");
-        else Log::get().note("concourse pane: diag.concourse_pane_mode = \"%s\" is not mirror-steady-25, -50, -100, -200 or -400, mirror-lit, mirror-bright, mirror-brightest, mirror, mirror-soft, tint or off; the mode is unchanged", modeT.c_str());
+        else Log::get().note("concourse pane: diag.concourse_pane_mode = \"%s\" is not mirror-steady, mirror-brightest, mirror-lit, mirror-bright, mirror-soft, mirror, tint or off; the mode is unchanged", modeT.c_str());
+    }
+    const std::string glowT = Config::get().getString("diag.concourse_glow", "");
+    if (!g_glowTextSeen || glowT != g_glowAppliedText) {
+        g_glowTextSeen = true;
+        g_glowAppliedText = glowT;
+        float lv[3] = {};
+        if (glowT.empty()) {
+            g_glowSky.store(cc::kGlowSkyDefault, std::memory_order_relaxed);   // unset: the defaults
+            g_glowBay.store(cc::kGlowBayDefault, std::memory_order_relaxed);
+            g_glowOther.store(cc::kGlowOtherDefault, std::memory_order_relaxed);
+        } else if (cc::parseGlowLevels(glowT.c_str(), lv)) {
+            g_glowSky.store(lv[0], std::memory_order_relaxed);
+            g_glowBay.store(lv[1], std::memory_order_relaxed);
+            g_glowOther.store(lv[2], std::memory_order_relaxed);
+        } else {
+            Log::get().note("concourse pane: diag.concourse_glow = \"%s\" is not three numbers from 0 to %.0f (sky,bay,other); the levels stay sky %g bay %g other %g", glowT.c_str(),
+                            static_cast<double>(cc::kGlowMax), static_cast<double>(g_glowSky.load(std::memory_order_relaxed)),
+                            static_cast<double>(g_glowBay.load(std::memory_order_relaxed)), static_cast<double>(g_glowOther.load(std::memory_order_relaxed)));
+        }
     }
     const std::string beyondT = Config::get().getString("diag.concourse_mirror_beyond", "");
     if (!g_beyondTextSeen || beyondT != g_beyondAppliedText) {
@@ -1787,6 +1910,38 @@ void updateArmed() noexcept {
 uint64_t concoursePaneTakeTreated() noexcept { return g_treated.exchange(0, std::memory_order_relaxed); }
 bool concoursePaneTakeSurveyRequest() noexcept { return g_surveyRequested.exchange(false, std::memory_order_relaxed); }
 namespace {
+// The glow constant buffer follows the levels and the anchor's up axis: written at the tick, only when a value changed. The one-shot line says the levels at first use
+// (the steady mode treating panes) and again when they change.
+void updateGlowCb(ID3D11Device* device) noexcept {
+    ID3D11Buffer* cb = g_cbGlow.load(std::memory_order_acquire);
+    if (!cb) return;
+    const float sky = g_glowSky.load(std::memory_order_relaxed), bay = g_glowBay.load(std::memory_order_relaxed), other = g_glowOther.load(std::memory_order_relaxed);
+    float data[8] = {};
+    const bool upOk = g_upFedValid.load(std::memory_order_relaxed);
+    for (int k = 0; k < 3; ++k) data[k] = upOk ? g_upFed[k].load(std::memory_order_relaxed) : 0.0f;
+    data[4] = cc::glowSkyRatio(sky, other);
+    if (!g_glowCbSentValid || std::memcmp(data, g_glowCbSent, sizeof(data)) != 0) {
+        ID3D11DeviceContext* imm = nullptr;
+        device->GetImmediateContext(&imm);
+        if (imm) {
+            FlatComputeInternalScope internal;
+            imm->UpdateSubresource(cb, 0, nullptr, data, 0, 0);
+            imm->Release();
+            std::memcpy(g_glowCbSent, data, sizeof(data));
+            g_glowCbSentValid = true;
+        }
+    }
+    if (g_mode.load(std::memory_order_relaxed) == kModeSteady && g_treatNow.load(std::memory_order_relaxed) &&
+        (!g_glowLogged || g_glowLoggedLv[0] != sky || g_glowLoggedLv[1] != bay || g_glowLoggedLv[2] != other)) {
+        g_glowLogged = true;
+        g_glowLoggedLv[0] = sky;
+        g_glowLoggedLv[1] = bay;
+        g_glowLoggedLv[2] = other;
+        Log::get().note("concourse pane: glow levels sky %g bay %g other %g, up %.3f %.3f %.3f%s", static_cast<double>(sky), static_cast<double>(bay), static_cast<double>(other),
+                        static_cast<double>(data[0]), static_cast<double>(data[1]), static_cast<double>(data[2]), upOk ? "" : " (not read: the sky level cannot be told from the others)");
+    }
+}
+
 // Every 30 s, while any family was withheld: one line naming the families that were (a family that never matched is absent).
 void logWithheld(uint64_t nowMs) noexcept {
     if (nowMs - g_withheldLogMs < 30000) return;
@@ -1824,6 +1979,7 @@ ConcoursePaneMirrorStats concoursePaneTakeMirrorStats() noexcept {
     r.dropped = g_sides.dropped();
     return r;
 }
+uint32_t concoursePaneClearingN() noexcept { return g_clearN.load(std::memory_order_relaxed); }
 const char* concoursePaneModeName() noexcept { return modeText(g_mode.load(std::memory_order_relaxed)); }
 uint32_t concoursePaneSlotCount() noexcept { return g_listN.load(std::memory_order_relaxed); }
 bool concoursePaneTreating() noexcept { return g_treatNow.load(std::memory_order_relaxed); }
@@ -1835,10 +1991,15 @@ void concoursePaneSetFeed(const ConcoursePaneFeed& feed) noexcept {
         std::lock_guard<std::mutex> lock(g_sideMutex);
         g_sides.reset();
     }
-    if (!g_feedWithhold.exchange(feed.withhold, std::memory_order_relaxed) && feed.withhold)
+    if (!g_feedWithhold.exchange(feed.withhold, std::memory_order_relaxed) && feed.withhold) {
         g_plainFrom.store(g_frameNow.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        g_clearN.store(cc::kBayIndexCount, std::memory_order_relaxed);   // back in the plain mirror phase: the next approach starts from the bay window
+    }
     g_feedSealed.store(feed.sealed, std::memory_order_relaxed);
     g_bayOpacity.store(feed.bayOpacity, std::memory_order_relaxed);
+    g_enterShareFed.store(feed.enterShare, std::memory_order_relaxed);
+    for (int k = 0; k < 3; ++k) g_upFed[k].store(feed.upValid ? feed.up[k] : 0.0f, std::memory_order_relaxed);
+    g_upFedValid.store(feed.upValid, std::memory_order_relaxed);
     updateArmed();
 }
 
@@ -1862,6 +2023,7 @@ void concoursePaneTick(ID3D11Device* device, uint32_t frame, uint64_t nowMs) noe
         g_immediate.store(imm, std::memory_order_relaxed);
         if (imm) imm->Release();
     }
+    if (device) updateGlowCb(device);   // after the device check: the buffer belongs to g_device
     const uint32_t prevFrame = g_frameNow.exchange(frame, std::memory_order_relaxed);
     pollConfig(nowMs);
     const JournalRawStatus raw = journalRawStatus();
@@ -1869,9 +2031,8 @@ void concoursePaneTick(ID3D11Device* device, uint32_t frame, uint64_t nowMs) noe
     g_social = cc::concourseSocialOnFoot(journalStatusFlags2(), known, raw.gameplay);
     if (g_keyMode && g_keyMode->pressed()) {
         const uint32_t cur = g_mode.load(std::memory_order_relaxed);
-        // mirror-lit, mirror-bright and mirror-soft are set by the key only: the press steps the five steady levels, then the look to compare them with.
-        const uint32_t next = cur == kModeSteady100 ? kModeSteady200 : cur == kModeSteady200 ? kModeSteady400 : cur == kModeSteady400 ? kModeBrightest : cur == kModeBrightest ? kModeMirror
-                              : cur == kModeMirror ? kModeTint : cur == kModeTint ? kModeOff : cur == kModeOff ? kModeSteady25 : cur == kModeSteady25 ? kModeSteady50 : kModeSteady100;
+        // mirror-lit, mirror-bright and mirror-soft are set by the key only: the press steps mirror-steady, mirror-brightest, mirror, tint, off.
+        const uint32_t next = cur == kModeSteady ? kModeBrightest : cur == kModeBrightest ? kModeMirror : cur == kModeMirror ? kModeTint : cur == kModeTint ? kModeOff : kModeSteady;
         setMode(next, g_social ? "hotkey.concourse_pane_mode" : "hotkey.concourse_pane_mode; it applies on foot in social space");
     }
     if (g_keyCapture && g_keyCapture->pressed()) {

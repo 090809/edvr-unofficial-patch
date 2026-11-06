@@ -67,6 +67,7 @@ public:
 private:
     void begin(ID3D11DeviceContext* ctx, UINT indexCount, UINT startIndex, INT baseVertex, const ConcoursePaneCalls& calls) noexcept;
     bool nextMirrorPassSlow() noexcept;
+    void bindPsCb(ID3D11Buffer* own) noexcept;   // constant buffer 2 of the pixel stage, the previous one kept for end()
     bool beginMirrorSlow() noexcept;
     void end() noexcept;
 
@@ -108,7 +109,10 @@ struct ConcoursePaneFeed {
     bool treat = false;         // the cull is wanted: family draws are treated by the mode
     bool withhold = false;      // the cull is on and the phase is the plain mirror phase: the outside draws are not issued, the mirror is marked
     bool sealed = false;        // the hangar is sealed: the families that can only be outside are not issued (concourse_cull_core.h, sealedToo)
-    float bayOpacity = 1.0f;    // the bay window's opacity, 0 to 1
+    float bayOpacity = 1.0f;    // the clearing pane's opacity, 0 to 1
+    float enterShare = 0.0f;    // the share of the view at which the clearing starts (diag.concourse_clear_share); 0 never: a pane read as exterior that fills this much becomes the clearing pane
+    float up[3] = {};           // the anchor's local up axis in world (the steady glow's sky test); zero when not valid
+    bool upValid = false;
 };
 void concoursePaneSetFeed(const ConcoursePaneFeed& feed) noexcept;
 
@@ -116,7 +120,7 @@ void concoursePaneSetFeed(const ConcoursePaneFeed& feed) noexcept;
 struct ConcoursePaneShares {
     bool valid = false;     // a reading from the last 250 ms
     uint32_t seq = 0;       // moves with each new frame read
-    float bay = -1.0f;      // the largest share of a bay-window (36 indices) draw; 0 when none was drawn; negative when not valid
+    float bay = -1.0f;      // the largest share of a clearing-pane draw (n == the clearing pane's index count: 36, the bay window, until another exterior pane is approached); 0 when none was drawn; negative when not valid
     uint32_t count = 0;
     uint32_t n[8] = {};
     float share[8] = {};    // 0 to 1
@@ -141,6 +145,8 @@ struct ConcoursePaneMirrorStats {
 ConcoursePaneMirrorStats concoursePaneTakeMirrorStats() noexcept;
 // The mode ("mirror", "mirror-soft", "tint", "off") and the number of panes in the list, for the summary.
 const char* concoursePaneModeName() noexcept;
+// The index count treated as the clearing pane now (36 until an exterior pane fills the view).
+uint32_t concoursePaneClearingN() noexcept;
 uint32_t concoursePaneSlotCount() noexcept;
 // Panes are being treated: the feed says treat, the mode is not off and the replacement states are made.
 bool concoursePaneTreating() noexcept;
