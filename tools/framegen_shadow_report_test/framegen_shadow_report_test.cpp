@@ -1,9 +1,11 @@
 // framegen_shadow_report_test: the pure half of the frame-generation shadow scorer (src/common/framegen_shadow_report.h; fix.frame_generation_shadow,
 // TEMPORARY, docs/design-frame-generation-2026-10-26.md Phase 1): the histogram binning, the percentile and share-over arithmetic, the merge, and the exact
-// text of the armed and report lines.
+// text of the armed and report lines; and the pure half of the head-pose miss (src/common/framegen_pose_report.h, H6): the miss arithmetic, the summaries, the probe's ring
+// and the exact text of its line.
 //
 //   --dry-run    the same run (the rig never writes a file), for the gate's --dry-run convention
 //   --self-test  every check
+#include "framegen_pose_report.h"
 #include "framegen_shadow_report.h"
 
 #include <cmath>
@@ -148,6 +150,134 @@ void caseLines() {
               "an empty window");
 }
 
+// ---- the head-pose miss (framegen_pose_report.h) ----
+
+FgPose poseAt(int64_t ns, double vx, double yawRate) {   // a head moving along x at vx m/s and turning about y at yawRate rad/s, from zero at t = 0
+    FgPose p;
+    p.pos[0] = static_cast<float>(vx * static_cast<double>(ns) * 1e-9);
+    const double a = yawRate * static_cast<double>(ns) * 1e-9;
+    p.q[1] = static_cast<float>(std::sin(a * 0.5));
+    p.q[3] = static_cast<float>(std::cos(a * 0.5));
+    return p;
+}
+
+void casePoseMath() {
+    const float a[3] = {1.0f, 2.0f, 3.0f}, b[3] = {4.0f, 6.0f, 3.0f};
+    check(std::fabs(fgPositionMissMm(a, b) - 5000.0f) < 0.01f, "a 3-4-5 miss is 5000 mm");
+    const FgPose p0 = poseAt(0, 0, 0), p90 = poseAt(1000000000, 0, 1.5707963267948966);
+    check(std::fabs(fgRotationMissDeg(p90.q, p0.q) - 90.0f) < 0.001f && std::fabs(fgRotationMissDeg(p0.q, p90.q) - 90.0f) < 0.001f, "a quarter turn is 90 degrees either way");
+    const FgPose tiny = poseAt(1000000, 0, 0.001745329252);   // 1 ms at 0.1 degree per millisecond
+    check(std::fabs(fgRotationMissDeg(tiny.q, p0.q) - 0.0001f) < 0.00002f, "a ten-thousandth of a degree is measured as one");
+    float out[4];
+    const float omega[3] = {0, 2.0f, 0};
+    fgRotateByVelocity(p0.q, omega, 0.25, out);
+    check(std::fabs(fgRotationMissDeg(out, poseAt(250000000, 0, 2.0).q)) < 0.001f, "turning by the angular velocity matches the pose at that time");
+    float w[3];
+    fgVelocityBetween(p0.q, poseAt(5000000, 0, 2.0).q, 0.005, w);
+    check(std::fabs(w[1] - 2.0f) < 0.001f && std::fabs(w[0]) < 0.001f && std::fabs(w[2]) < 0.001f, "the angular velocity between two poses is the one that turned them");
+    std::vector<float> v;
+    for (int i = 20; i >= 1; --i) v.push_back(static_cast<float>(i));
+    float s[3];
+    fgSummarise(v, s);
+    check(s[0] == 11.0f && s[1] == 19.0f && s[2] == 20.0f, "median, p95 and max of 1..20 are 11, 19, 20");
+    std::vector<float> none;
+    fgSummarise(none, s);
+    check(s[0] == 0.0f && s[1] == 0.0f && s[2] == 0.0f, "no values summarise to zero");
+}
+
+constexpr int64_t kPeriod = 11111111;   // 90 Hz
+constexpr int64_t kBase = 100000000;
+constexpr double kVx = 1.0, kYaw = 2.0;
+
+// Six real frames at T_i = base + i P, each predicted 3 ms before T; the runtime answers a time past now + 10 ms with the pose at now + 10 ms.
+FrameGenPoseWindow runProbe(bool angularValid, bool refuseTruth, bool refusePrediction, bool resolveEach) {
+    FrameGenPoseProbe probe;
+    for (int i = 0; i < 6; ++i) {
+        FrameGenPoseProbe::Frame f;
+        f.displayTime = kBase + i * kPeriod;
+        f.period = kPeriod;
+        f.now = f.displayTime - 3000000;
+        f.angularValid = angularValid;
+        f.omega[1] = static_cast<float>(kYaw);
+        const int64_t now = f.now;
+        const auto early = [&](int64_t t, FgPose& out) {
+            if (refusePrediction && t > f.displayTime) return FgLocate::Refused;
+            out = poseAt(t > now + 10000000 ? now + 10000000 : t, kVx, kYaw);   // the runtime's limit: it does not predict past 10 ms
+            return FgLocate::Ok;
+        };
+        const auto late = [&](int64_t t, FgPose& out) {
+            if (refuseTruth) return FgLocate::Refused;
+            out = poseAt(t, kVx, kYaw);
+            return FgLocate::Ok;
+        };
+        probe.onFrame(f, poseAt(f.displayTime, kVx, kYaw), early);
+        if (resolveEach) probe.resolve(now, late);
+    }
+    FrameGenPoseWindow w;
+    probe.takeWindow(w);
+    return w;
+}
+
+void casePoseProbe() {
+    const FrameGenPoseWindow w = runProbe(true, false, false, true);
+    check(w.frames == 4 && w.expired == 0 && w.refused == 0 && w.unpredicted == 0, "six frames, 3 ms before T each: the first four are scored once the clock passes their T_S");
+    checkText(formatFrameGenPoseReport(w),
+              "frame generation (shadow) pose: frames=4 lead_ms=14.1 runtime_mm=4.11/4.11/4.11 runtime_deg=0.471/0.471/0.471 velocity_mm=0.00/0.00/0.00 "
+              "velocity_deg=0.000/0.000/0.000 vel_src=3/0/1 expired=0 refused=0 unpredicted=0",
+              "a runtime that stops predicting at 10 ms misses by the rest of the lead at the head's speed; the velocity fallback does not");
+    const FrameGenPoseWindow pair = runProbe(false, false, false, true);
+    check(pair.frames == 4 && pair.srcXr == 0 && pair.srcPair == 3 && pair.srcNone == 1 && pair.vDeg[2] < 0.001f && pair.vMm[2] < 0.01f,
+          "without the runtime's angular velocity the two locates 5 ms apart carry the rotation: the same fallback, counted as pair");
+    const FrameGenPoseWindow refused = runProbe(true, true, false, true);
+    check(refused.frames == 0 && refused.refused == 4 && refused.rtMm[2] == 0.0f, "a runtime that refuses a past time scores nothing and counts the refusals");
+    const FrameGenPoseWindow unpredicted = runProbe(true, false, true, true);
+    check(unpredicted.unpredicted == 6 && unpredicted.frames == 4 && unpredicted.rtMm[2] == 0.0f && unpredicted.vMm[2] < 0.01f,
+          "a runtime that refuses T_S at t0 is counted as unpredicted and the fallback is still scored");
+    const FrameGenPoseWindow ring = runProbe(true, false, false, false);
+    check(ring.frames == 0 && ring.expired == 0, "six unresolved frames fit the ring of eight");
+    FrameGenPoseProbe probe;
+    for (int i = 0; i < 10; ++i) {
+        FrameGenPoseProbe::Frame f;
+        f.displayTime = kBase + i * kPeriod;
+        f.period = kPeriod;
+        f.now = f.displayTime - 3000000;
+        probe.onFrame(f, poseAt(f.displayTime, kVx, kYaw), [](int64_t t, FgPose& o) { o = poseAt(t, kVx, kYaw); return FgLocate::Ok; });
+    }
+    FrameGenPoseWindow full;
+    probe.takeWindow(full);
+    check(full.expired == 2, "ten frames never resolved: the two oldest fall out of the ring unscored");
+    FrameGenPoseProbe stale;
+    FrameGenPoseProbe::Frame f;
+    f.displayTime = kBase;
+    f.period = kPeriod;
+    f.now = kBase - 3000000;
+    stale.onFrame(f, poseAt(f.displayTime, kVx, kYaw), [](int64_t t, FgPose& o) { o = poseAt(t, kVx, kYaw); return FgLocate::Ok; });
+    stale.resolve(kBase + kPeriod + 2000000000, [](int64_t t, FgPose& o) { o = poseAt(t, kVx, kYaw); return FgLocate::Ok; });
+    FrameGenPoseWindow late;
+    check(stale.takeWindow(late) && late.expired == 1 && late.frames == 0, "a frame whose T_S is more than a second behind the clock is dropped unscored");
+    FrameGenPoseProbe quiet;
+    FrameGenPoseWindow nothing;
+    check(!quiet.takeWindow(nothing), "a window with nothing in it says nothing");
+}
+
+void casePoseLine() {
+    FrameGenPoseWindow w;
+    w.frames = 60;
+    w.leadMsMedian = 14.1f;
+    w.rtMm[0] = 1.5f; w.rtMm[1] = 2.5f; w.rtMm[2] = 3.5f;
+    w.rtDeg[0] = 0.25f; w.rtDeg[1] = 0.5f; w.rtDeg[2] = 0.75f;
+    w.vMm[0] = 0.5f; w.vMm[1] = 1.0f; w.vMm[2] = 1.5f;
+    w.vDeg[0] = 0.1f; w.vDeg[1] = 0.2f; w.vDeg[2] = 0.3f;
+    w.srcXr = 50; w.srcPair = 5; w.srcNone = 5;
+    w.expired = 1; w.refused = 2; w.unpredicted = 3;
+    const std::string line = formatFrameGenPoseReport(w);
+    checkText(line,
+              "frame generation (shadow) pose: frames=60 lead_ms=14.1 runtime_mm=1.50/2.50/3.50 runtime_deg=0.250/0.500/0.750 velocity_mm=0.50/1.00/1.50 "
+              "velocity_deg=0.100/0.200/0.300 vel_src=50/5/5 expired=1 refused=2 unpredicted=3",
+              "the pose line");
+    check(line.find('\n') == std::string::npos && line.find("(shadow):") == std::string::npos, "the pose line is one line and does not carry the scorer's label");
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -167,6 +297,9 @@ int main(int argc, char** argv) {
     caseStats();
     caseMerge();
     caseLines();
+    casePoseMath();
+    casePoseProbe();
+    casePoseLine();
     if (g_fail) {
         std::printf("framegen_shadow_report_test: %d check(s) FAILED\n", g_fail);
         return 1;

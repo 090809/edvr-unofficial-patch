@@ -62,6 +62,7 @@
 #include "openvr_system.h"
 #include "system_publication.h"
 #include "head_locator.h"
+#include "../common/framegen_pose_report.h"
 #include "head_track_probe.h"   // F87h: the headset's tracking, one line a second (read only)
 #include "view_fov_note.h"   // F194: the views' field of view, said at the first located views and when it changes
 #include "pose_gap.h"
@@ -571,6 +572,11 @@ class NativeRuntimeHost : public SystemSource, public FrameSink, public Composit
   uint64_t displayTimeRefusals=0;
   HeadPoseSightings poseSightings;
   PoseGapStats poseGap;
+  // Frame generation, Phase 1 (fix.frame_generation_shadow, framegen_pose_report.h): the head-pose miss for the synthetic slot's display time, measured at each real
+  // frame's second Submit on the owner thread. Idle (and empty) while the key is off or the provider is older than version 12.
+  FrameGenPoseProbe framegenPose;
+  uint64_t framegenPoseWindowUs=0;
+  bool framegenPoseWas=false;
   // Diagnostic only (docs/linux-native-openxr-launch-centre-2026-09-22.md).
   uint64_t headLocateFailures=0,headLocateConsecutiveFailures=0;
   XrViewConfigurationView sizes[2]{};
@@ -1891,6 +1897,7 @@ class NativeRuntimeHost : public SystemSource, public FrameSink, public Composit
     bool pairReady=false;
     // Not `captured`: that name is the EyeCapture member (C4458).
     const auto published=boundary.publish(eye,texture,bounds,flags,pairReady);
+    if(published==vr::VRCompositorError_None&&pairReady)measureFramegenPose();   // frame generation Phase 1: locates and a log line only, nothing the frame reads
     // frame_end_overlap scope: separate device (finishPair below then needs
     // no graphicsCalls rendezvous with Elite's thread -- capture() above,
     // reached from publish(), already ran any producer copy that did),
@@ -2877,6 +2884,62 @@ class NativeRuntimeHost : public SystemSource, public FrameSink, public Composit
       report.frames,report.refusedFrames,report.sharedFrames,double(report.seconds),double(report.radiusDeg),double(report.radiusMinDeg),double(report.radiusMaxDeg),double(report.edgeDeg),
       double(report.weightPeak),double(report.centre[0]),double(report.centre[1]),double(report.centre[2]),double(report.centre[3]),
       double(report.pitchDeg),double(report.fieldUpDeg),double(report.fieldDownDeg),told==S_OK?"yes":told==S_FALSE?"no_export":"refused");
+  }
+  // Frame generation, Phase 1: the provider's version 12 answer carries fix.frame_generation_shadow in one word of the retired guard (native_frame.h); anything older reads off.
+  bool framegenShadowOn() const {
+    return features.acquired()&&featureFrameKnown&&featureFrame.version>=EDVR_NATIVE_FRAME_VERSION_12&&
+      featureFrame.reservedTerrainGuard[EDVR_NATIVE_FRAME_FRAMEGEN_SHADOW_WORD]==1u;
+  }
+  // Owner thread, at a real frame's second Submit (submitEyeAdmitted, where the pair becomes ready): t0 is now, T and P the frame's display time and period (boundary.frame()),
+  // T_S = T + P. Locates the head in the natural space (so a seat change between t0 and T_S cannot enter the miss) at T_S, at T (with its velocity) and, when the runtime gave no
+  // angular velocity, 5 ms before T; scores the earlier frames whose T_S has come with a locate at T_S. Only locates: no wait, no write to the frame, one line a second.
+  void measureFramegenPose() {
+    if(GetCurrentThreadId()!=ownerThread)return;
+    if(!framegenShadowOn()) {
+      if(framegenPoseWas){framegenPose.reset();framegenPoseWas=false;framegenPoseWindowUs=0;}
+      return;
+    }
+    framegenPoseWas=true;
+    const SeatedFrame seat=seated.frame();
+    if(!seat.space||!view)return;
+    const Frame frame=boundary.frame();
+    const LocatorDispatch dispatch{api.convertTime,api.locateSpace};
+    XrTime now=0;HeadLocatorStage stage=HeadLocatorStage::None;
+    if(HeadLocator{}.currentTime(dispatch,instance,headClock,&stage,boundary.estimateNow(),now)!=XR_SUCCESS)return;
+    constexpr auto both=XR_SPACE_LOCATION_POSITION_VALID_BIT|XR_SPACE_LOCATION_ORIENTATION_VALID_BIT;
+    const auto fill=[](const XrPosef& p,FgPose& out){
+      out.pos[0]=p.position.x;out.pos[1]=p.position.y;out.pos[2]=p.position.z;
+      out.q[0]=p.orientation.x;out.q[1]=p.orientation.y;out.q[2]=p.orientation.z;out.q[3]=p.orientation.w;
+    };
+    const auto locate=[&](int64_t time,FgPose& out){
+      XrSpaceLocation head{XR_TYPE_SPACE_LOCATION};
+      const XrResult r=HeadLocator{}.locateAt(dispatch,view,seat.space,XrTime(time),head);
+      if(r==XR_ERROR_TIME_INVALID)return FgLocate::Refused;
+      if(r!=XR_SUCCESS||(head.locationFlags&both)!=both)return FgLocate::Invalid;
+      fill(head.pose,out);
+      return FgLocate::Ok;
+    };
+    if(frame.predictedDisplayTime>0&&frame.predictedDisplayPeriod>0) {
+      XrSpaceVelocity velocity{XR_TYPE_SPACE_VELOCITY};
+      XrSpaceLocation atT{XR_TYPE_SPACE_LOCATION};atT.next=&velocity;
+      const XrResult r=api.locateSpace(view,seat.space,frame.predictedDisplayTime,&atT);
+      if(r==XR_SUCCESS&&atT.type==XR_TYPE_SPACE_LOCATION&&(atT.locationFlags&both)==both&&detail::poseValid(atT.pose)) {
+        FgPose pose;fill(atT.pose,pose);
+        FrameGenPoseProbe::Frame f;
+        f.displayTime=frame.predictedDisplayTime;f.period=frame.predictedDisplayPeriod;f.now=now;
+        const XrVector3f& w=velocity.angularVelocity;
+        f.angularValid=(velocity.velocityFlags&XR_SPACE_VELOCITY_ANGULAR_VALID_BIT)!=0&&std::isfinite(w.x)&&std::isfinite(w.y)&&std::isfinite(w.z);
+        if(f.angularValid){f.omega[0]=w.x;f.omega[1]=w.y;f.omega[2]=w.z;}
+        framegenPose.onFrame(f,pose,locate);
+      }
+    }
+    framegenPose.resolve(now,locate);
+    const uint64_t nowUs=frameCycleUs();
+    if(!framegenPoseWindowUs){framegenPoseWindowUs=nowUs;return;}
+    if(nowUs-framegenPoseWindowUs<1000000)return;
+    framegenPoseWindowUs=nowUs;
+    FrameGenPoseWindow window;
+    if(framegenPose.takeWindow(window))nativeTracePuts(formatFrameGenPoseReport(window).c_str());
   }
   // B3, the scope zoom's window (scope_zoom_state.h; the request is the provider's version 11 answer, scope_zoom_window.h): whether eye 0's told frustum is narrowed this frame. Set in
   // WaitGetPoses where the trim sets the frame's frusta; the located views the layer lies on, the raw getter's answer, the temporal pass's announcements and the hidden-area mesh stay

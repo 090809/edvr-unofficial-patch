@@ -28,6 +28,7 @@ struct Provider {
     if(o.version>=10||scribble)o.reservedYaw=0.4f;   // F62b: the ADS head-aim's pitch rides a version 10 answer only
     if(o.version>=10||scribble)o.leftEyeShare=0x3F19999Au;   // F106: the left eye's share (0.6f's bits; F89's darkening before) rides a version 10 answer only
     if(o.version>=11||scribble)o.worldScalePercent=worldScale;   // world scale: rides a version 11 answer only
+    if(o.version>=12||scribble)o.reservedTerrainGuard[EDVR_NATIVE_FRAME_FRAMEGEN_SHADOW_WORD]=1u;   // frame generation shadow: rides a version 12 answer only
     return S_OK;
   }
 };
@@ -93,8 +94,8 @@ template<class Check> void runComfortFadeCases(Check&& check) {
   {   // F62b: version 10 (input version 3) carries the ADS head-aim's pitch; a version 9 d3d11.dll refuses 10 and the client reads no pitch
     Provider p;p.maxVersion=10;uint32_t v=10;EdvrNativeFrameOutput out{};
     check(ladder(p,v,out)==S_OK&&out.version==10&&v==10&&p.calls==1&&out.reservedYaw==0.4f&&Client::ask(10).version==10&&Client::ask(10).size==sizeof(EdvrNativeFrameOutput)&&
-          Client::ask(10).version==10&&Client::ask(11).version==11&&Client::ask(11).size==sizeof(EdvrNativeFrameOutput)&&Client::ask(12).version==11,
-          "F62b: a version 10 d3d11.dll: one call, the ADS pitch arrives; 10 asks 10, 11 and above asks 11, both the whole struct");
+          Client::ask(10).version==10&&Client::ask(11).version==11&&Client::ask(11).size==sizeof(EdvrNativeFrameOutput)&&Client::ask(12).version==12&&Client::ask(13).version==12&&Client::ask(12).size==sizeof(EdvrNativeFrameOutput),
+          "F62b: a version 10 d3d11.dll: one call, the ADS pitch arrives; 10 asks 10, 11 asks 11, 12 and above asks 12, each the whole struct");
     Provider old;old.maxVersion=9;old.scribble=true;uint32_t v9=10;EdvrNativeFrameOutput out9{};
     check(ladder(old,v9,out9)==S_OK&&out9.version==9&&v9==9&&old.calls==2&&out9.reservedYaw==0.0f&&out9.eyeAlign[0]==0.1f,
           "F62b: a version 9 d3d11.dll: the 10 ask is refused, 9 is answered, and a pitch it scribbles into reservedYaw is not believed");
@@ -124,6 +125,18 @@ template<class Check> void runComfortFadeCases(Check&& check) {
     }
     check(held,"world scale: a version 11 word of 0 reads 100 and one outside 50..200 is held to the nearest end");
     check(Client::ask(11).worldScalePercent==0,"world scale: a fresh ask carries no percent");
+  }
+  {   // Frame generation, Phase 1: a version 12 answer carries the shadow's flag in word 18; every older answer, a failed frame and an old provider read off
+    const uint32_t w=EDVR_NATIVE_FRAME_FRAMEGEN_SHADOW_WORD;
+    Provider p;p.maxVersion=12;uint32_t v=12;EdvrNativeFrameOutput out{};
+    check(ladder(p,v,out)==S_OK&&out.version==12&&v==12&&p.calls==1&&out.reservedTerrainGuard[w]==1u&&out.worldScalePercent==130,
+          "frame generation shadow: a version 12 d3d11.dll: one call, the flag arrives beside the world scale");
+    Provider old;old.maxVersion=11;old.scribble=true;uint32_t v11=12;EdvrNativeFrameOutput out11{};
+    check(ladder(old,v11,out11)==S_OK&&out11.version==11&&v11==11&&old.calls==2&&out11.reservedTerrainGuard[w]==0u&&out11.worldScalePercent==130,
+          "frame generation shadow: an old d3d11.dll refuses the 12 ask, is answered at 11, and a flag it scribbles into the word is not believed: off");
+    Provider failing;failing.fail=E_FAIL;uint32_t vf=12;EdvrNativeFrameOutput outf{};outf.reservedTerrainGuard[w]=1u;
+    check(ladder(failing,vf,outf)==E_FAIL&&outf.reservedTerrainGuard[w]==0u&&vf==12,"frame generation shadow: a provider that fails the frame leaves no flag behind");
+    check(Client::ask(12).reservedTerrainGuard[w]==0u,"frame generation shadow: a fresh ask carries no flag");
   }
 }
 } // namespace edvr::openxr::test

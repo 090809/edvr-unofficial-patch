@@ -62,6 +62,7 @@
 #include "gpu_census.h"   // issue #38: the per-feature GPU cost census
 #include "binding_shadow.h"   // the render target a camera write is drawn into (bindingGet, bindingResolve)
 #include "framegen_shadow.h"   // frame generation Phase 1 (fix.frame_generation_shadow, TEMPORARY)
+#include "../common/native_frame.h"   // nativeFrameSetFrameGenShadow: the key, carried to the runtime in a version 12 answer
 #include "sky_ring.h"   // I-2: the sky ring (diag.sky_ring, TEMPORARY; docs/sky-flicker-2026-10-13.md)
 #include "../common/camera_nearest.h"       // the nearest write: a veto on the legacy pick (fix.camera_nearest, TEMPORARY A/B)
 #include "../common/camera_jump_guard.h"    // the jump guard: a legacy pick's jump replaced by the next-best candidate (fix.camera_jump_guard, TEMPORARY A/B)
@@ -5733,6 +5734,7 @@ void temporalPassConfigure(Config& cfg) {
         skyRingConfigure(cfg.getString("diag.sky_ring", "off") == "on");
         // Frame generation, Phase 1 (TEMPORARY; docs/design-frame-generation-2026-10-26.md): live, VR only (the flat allow-list does not list it, so flat reads off).
         frameGenShadowConfigure(cfg.getString("fix.frame_generation_shadow", "off") == "on");
+        nativeFrameSetFrameGenShadow(frameGenShadowOn());
     }
     // The same test native_temporal.cpp's Settings::dlaa makes (flags bit 1
     // at the treat): only an external engine (dlaa, dlss, fsr) touches NGX

@@ -10609,6 +10609,14 @@ H_DESKTOP_OTHER = r"desktop window: (?!setting |10 s: |stopped \()"
 # window's are. The armed line is said once per change to on (so health_scan keeps it whatever --since says); the report line every second.
 H_FRAMEGEN = "frame generation shadow"
 H_FRAMEGEN_LABEL = "frame generation (shadow):"
+# The head-pose miss (src\common\framegen_pose_report.h kFrameGenPoseReportFmt, written by the OpenXR runtime): a line of the runtime log, which carries no build tag and a UTC clock, so
+# health_scan_runtime reads it, as it reads the world scale's, and --since/--until do not cut it.
+H_FRAMEGEN_POSE_LABEL = "frame generation (shadow) pose:"
+_HFGP_TRIPLE = r"(?P<{n}0>[\d.]+)/(?P<{n}1>[\d.]+)/(?P<{n}2>[\d.]+)"
+H_FRAMEGEN_POSE = (r"frame generation \(shadow\) pose: frames=(?P<frames>\d+) lead_ms=(?P<lead>-?[\d.]+) runtime_mm=" + _HFGP_TRIPLE.format(n="rmm") + " runtime_deg=" +
+                   _HFGP_TRIPLE.format(n="rdeg") + " velocity_mm=" + _HFGP_TRIPLE.format(n="vmm") + " velocity_deg=" + _HFGP_TRIPLE.format(n="vdeg") +
+                   r" vel_src=(?P<sxr>\d+)/(?P<spair>\d+)/(?P<snone>\d+) expired=(?P<expired>\d+) refused=(?P<refused>\d+) unpredicted=(?P<unpredicted>\d+)$")
+H_FRAMEGEN_RUNTIME_READ = "_framegen runtime log read"   # a pseudo-entry of the scan's rows (as H_CARRIED is): the runtime log was read, so a missing pose line can be judged
 H_FRAMEGEN_ARMED = r"frame generation \(shadow\): armed, quarter (?P<qw>\d+)x(?P<qh>\d+) per eye, classes far cockpit world"
 _HFG_CLASS = r" {n}=(?P<{n}_share>[\d.]+)%,(?P<{n}_mean>\d+),(?P<{n}_p50>\d+),(?P<{n}_p95>\d+),(?P<{n}_o02>[\d.]+)%,(?P<{n}_o05>[\d.]+)%\|id:(?P<{n}_idmean>\d+),(?P<{n}_idp95>\d+)"
 H_FRAMEGEN_REPORT = (r"frame generation \(shadow\): frames=(?P<frames>\d+) skipped=(?P<s0>\d+)/(?P<s1>\d+)/(?P<s2>\d+)/(?P<s3>\d+)/(?P<s4>\d+)"
@@ -16823,14 +16831,17 @@ def _hj_desktop_window(rows, ctx):
     return ("OK", text)
 
 
-def _hj_framegen_shadow(rows, ctx):
+def _hj_framegen_shadow(rows, ctx=None):
     """Frame generation, Phase 1 (fix.frame_generation_shadow, TEMPORARY): ran is the armed line (the first treated eye with the key on), applied is a report line (the
     scorer's one-second line). OK when at least one report line is in the window; NEVER APPLIED when the armed line is there and no report line is (the scorer armed and
     never reported: no trained-engine eye after it, or the report path is dead); None (nothing said) when neither is there, which is the key off."""
     armed = rows.get("armed", [])
     reports = rows.get("report", [])
-    if not armed and not reports:
+    poses = rows.get("pose", [])
+    if not armed and not reports and not poses:
         return None
+    if not reports and not armed:
+        return ("PARTIAL", "%d pose line(s) in the runtime log but no scorer line in the graphics log (the graphics log of another flight, or the scorer's lines are cut)" % len(poses))
     if not reports:
         return ("NEVER APPLIED", "the key was on (armed, quarter %sx%s per eye) but no 'frame generation (shadow): frames=' report line follows in the window: the scorer "
                                  "never reported (no trained-engine VR eye ran after it armed, or the report path is dead)" % (armed[-1]["qw"], armed[-1]["qh"]))
@@ -16843,6 +16854,17 @@ def _hj_framegen_shadow(rows, ctx):
         text += "; the armed line is before the window"
     if not frames:
         text += "; no frame was scored (every frame skipped)"
+    if poses:
+        scored = sum(int(r["frames"]) for r in poses)
+        text += ("; pose: %d line(s), %d frame(s) scored, runtime miss max %.2f mm / %.3f deg, velocity miss max %.2f mm / %.3f deg, lead median %s ms (last line), %d refused, %d expired, "
+                 "%d unpredicted" % (len(poses), scored, max(float(r["rmm2"]) for r in poses), max(float(r["rdeg2"]) for r in poses), max(float(r["vmm2"]) for r in poses),
+                                     max(float(r["vdeg2"]) for r in poses), poses[-1]["lead"], sum(int(r["refused"]) for r in poses), sum(int(r["expired"]) for r in poses),
+                                     sum(int(r["unpredicted"]) for r in poses)))
+    elif armed and _hrows(ctx or {}, H_FRAMEGEN_RUNTIME_READ, "read"):
+        return ("NEVER APPLIED", "the scorer reported (%d line(s)) but the runtime log has no 'frame generation (shadow) pose:' line: the head-pose measure never ran (the runtime or the "
+                                 "d3d11.dll is older than the version 12 frame answer, or the measure is dead)" % len(reports))
+    elif armed:
+        text += "; the runtime log was not read, so the pose measure is not judged"
     return ("OK", text)
 
 
@@ -18027,6 +18049,7 @@ HEALTH_RULES = (
     _hrule(H_FRAMEGEN, (), (H_FRAMEGEN_LABEL,), (
         ("armed", H_FRAMEGEN_ARMED),
         ("report", H_FRAMEGEN_REPORT),
+        ("pose", H_FRAMEGEN_POSE),
     ), _hj_framegen_shadow),
     # The SRV turret view (issue 140): lines of the graphics log that carry no build tag (health_scan reads them, as it reads the desktop window's, before it drops the untagged lines).
     _hrule(H_SRV_TURRET, (), H_SRV_TURRET_LABELS, (
@@ -18241,7 +18264,18 @@ def health_scan_runtime(scan, text):
     label and matches neither pattern is counted as unparsed, as health_scan counts the graphics log's."""
     rule = next(r for r in HEALTH_RULES if r.name == H_WORLD)
     rows = scan["rows"][H_WORLD]
+    pose_rx = dict(next(r for r in HEALTH_RULES if r.name == H_FRAMEGEN).kinds)["pose"]
+    scan["rows"][H_FRAMEGEN_RUNTIME_READ] = {"read": [{}]}
     for order, raw in enumerate(text.splitlines()):
+        if H_FRAMEGEN_POSE_LABEL in raw:
+            g = pose_rx.search(raw)
+            if g:
+                scan["rows"][H_FRAMEGEN].setdefault("pose", []).append(dict(g.groupdict(), _order=order, _t=None))
+            else:
+                u = scan["unparsed"][H_FRAMEGEN]
+                u[0] += 1
+                u[1] = u[1] or raw.strip()[:160]
+            continue
         if H_WORLD_LABEL not in raw:
             continue
         for kind, rx in rule.kinds:
@@ -25027,6 +25061,28 @@ def self_test_health():
         check("frame generation shadow: a report line without the armed line is OK, and says so", fg_ok + [fg_report()], 0, [("OK", FG)], has=["the armed line is before the window"])
         check("frame generation shadow: a drifted report line is UNPARSED, not a report", fg_ok + [fg_armed(), fg_report().replace("holes=", "gaps=")], 3, [("NEVER APPLIED", FG)],
               has=["line(s) the rule's patterns do not match"])
+        # The head-pose miss: the runtime log's line, rendered from the C format string in src\common\framegen_pose_report.h
+        fgpsrc = read_text(os.path.join(repo_root(), "src", "common", "framegen_pose_report.h"))
+
+        def fg_pose(frames=4, refused=0):
+            key = "fgp:pose"
+            if key not in fmts:
+                fmts[key] = health_c_format(fgpsrc, "frame generation (shadow) pose: frames=%u")
+            if fmts[key] is None:
+                raise AssertionError("frame generation shadow: no pose log format: the --health rule that reads it is out of date")
+            return health_render(fmts[key], (frames, 14.1, 4.11, 4.11, 4.11, 0.471, 0.471, 0.471, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 3, 0, 1, 0, refused, 0))
+
+        fg_all = fg_ok + [fg_armed(), fg_report()]
+        check("frame generation shadow: armed, reporting and a pose line in the runtime log is OK", fg_all, 0, [("OK", FG)], lacks=["UNPARSED"],
+              has=["pose: 1 line(s), 4 frame(s) scored, runtime miss max 4.11 mm / 0.471 deg, velocity miss max 0.00 mm / 0.000 deg, lead median 14.1 ms (last line), 0 refused, 0 expired, 0 unpredicted"],
+              extra=["--runtime-file", runtime([fg_pose()])])
+        check("frame generation shadow: armed, reporting and no pose line in the runtime log is NEVER APPLIED", fg_all, 3, [("NEVER APPLIED", FG)],
+              has=["the runtime log has no 'frame generation (shadow) pose:' line", "exit 3"], extra=["--runtime-file", runtime(["native_frame: unrelated runtime line"])])
+        check("frame generation shadow: no runtime log read leaves the pose part unjudged, and says so", fg_all, 0, [("OK", FG)], has=["the runtime log was not read, so the pose measure is not judged"])
+        check("frame generation shadow: a drifted pose line is not a pose line", fg_all, 3, [("NEVER APPLIED", FG)],
+              has=["line(s) the rule's patterns do not match"], extra=["--runtime-file", runtime([fg_pose().replace("refused=", "denied=")])])
+        check("frame generation shadow: no scorer line and no pose line, nothing said (the key off)", fg_ok, 0, [("OK", F90S)], lacks=["frame generation", "NEVER APPLIED"],
+              extra=["--runtime-file", runtime(["native_frame: unrelated runtime line"])])
 
         # ---- the SRV turret view: the graphics log's untagged lines, rendered from the C format strings in src\d3d11\srv_turret.cpp and (the geometry shader's creation line) shader_swap.cpp ----
         stsrc = read_text(os.path.join(repo_root(), "src", "d3d11", "srv_turret.cpp"))
