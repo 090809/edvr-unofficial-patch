@@ -14,7 +14,7 @@
   - **H6** `Standard_SocialArea` marks the large-station concourse, and a point fixed in the room keeps its coordinates in that record's frame across stations. `concourse frame:` logs the camera in that frame.
 - **Temporary keys (all removed when the arc closes):** `diag.concourse_cull` (on, off), `diag.concourse_keep` (extra name prefixes), `hotkey.concourse_cull`, `hotkey.concourse_pane_capture`, `hotkey.concourse_pane_mode`.
 - **Ruled out:** see the section of that name. **Issues:** none yet.
-- **Next flight:** the Flight 1 list below, on this branch's build.
+- **Next flight:** the Flight 1 list below, on build `v0.22.0-rc.7-2-gc9f096db`, installed on Steam 2026-11-05. Keys in both Steam inis: `hotkey.concourse_cull` F2, `hotkey.concourse_pane_capture` F3, `hotkey.concourse_pane_mode` F4. The cull starts off; F2 turns it on.
 
 ## What the earlier attempt learned
 
@@ -87,7 +87,7 @@ Flat on Steam is enough; VR after. Fly from the hangar, so the lift transition i
 6. Take the lift to the hangar and come back, cull on. Note any flash at the doors.
 7. If it is cheap, repeat steps 1 and 5 at a second station type.
 
-After the flight: `python tools\edvr_log.py --target steam --expect-build HEAD --grep "concourse"`.
+After the flight: `python tools\edvr_log.py --target steam --expect-build c9f096db --grep "concourse"`.
 
 ## Performance candidates
 
