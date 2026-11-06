@@ -20,7 +20,7 @@
   - **H6** `Standard_SocialArea` marks the large-station concourse at other stations too. Still unflown.
 - **Temporary keys (all removed when the arc closes):** `diag.concourse_cull` (on, off), `diag.concourse_keep` (extra name prefixes), `diag.concourse_pane_mode`, `diag.concourse_panes`, `diag.concourse_clear_share`, `diag.concourse_mirror_beyond`, `hotkey.concourse_cull`, `hotkey.concourse_pane_capture`, `hotkey.concourse_pane_mode`.
 - **Ruled out:** see the section of that name. **Issues:** none yet.
-- **Next flight:** the Flight 9 list, on build 2b487014, installed on Steam 2026-11-06. Keys in both Steam inis: `hotkey.concourse_cull` F2 (the cull and the mirrors), `hotkey.concourse_pane_capture` F3 (logs a ranking by screen coverage and the kept names, changes nothing), `hotkey.concourse_pane_mode` F4.
+- **Next flight:** the Flight 9 list, on build 4eead728 (2b487014 plus the census's `rs=` column), installed on Steam 2026-11-06. Keys in both Steam inis: `hotkey.concourse_cull` F2 (the cull and the mirrors), `hotkey.concourse_pane_capture` F3 (logs a ranking by screen coverage and the kept names, changes nothing), `hotkey.concourse_pane_mode` F4.
 
 ## What the earlier attempt learned
 
@@ -329,8 +329,9 @@ On the ninth build, flat, at the same station.
 3. With a ship in the docking area, F4 at `off`: is it gone? If not, F3 with it in view.
 4. Are the two trails gone?
 5. If it is cheap, a second station type.
+6. For `docs\sun-switch-re-2026-11-06.md`: in the concourse, F2 off, one NumLock.
 
-Then: `python tools\edvr_log.py --target steam --expect-build 2b487014 --grep "concourse"`.
+Then: `python tools\edvr_log.py --target steam --expect-build 4eead728 --grep "concourse"`.
 
 ## Performance candidates
 
