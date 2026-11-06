@@ -13,6 +13,7 @@
 #include "../common/hotkey.h"
 #include "../common/log.h"
 #include "../common/runtime_profile.h"
+#include "binding_shadow.h"
 #include "concourse_cull_core.h"
 #include "exposure_fix.h"
 #include "flat_compute_readback.h"
@@ -66,6 +67,7 @@ std::atomic<float> g_bayOpacity{1.0f};
 std::atomic<bool> g_treatNow{false};      // treat fed, a mode other than off, and the replacement states made
 std::atomic<bool> g_withholdNow{false};   // withhold fed and a mode other than off
 std::atomic<bool> g_shareOn{false};       // measure fed and the query pool made
+std::atomic<ID3D11DeviceContext*> g_immediate{nullptr};   // not held: the device's immediate context, the one the binding shadow follows
 std::atomic<bool> g_capturing{false};     // a capture frame is open
 std::atomic<uint64_t> g_treated{0};
 std::atomic<uint64_t> g_withheld{0};
@@ -831,7 +833,10 @@ void ConcoursePaneScope::begin(ID3D11DeviceContext* ctx, UINT indexCount, const 
         }
         return;
     }
-    const uint64_t ps = pixelShaderHash(ctx);
+    // Every draw of the frame passes here while the gate holds. The shadow answers without a COM call on the context it follows; 0 (no pixel shader, or never
+    // set) falls back to the context.
+    uint64_t ps = ctx == g_immediate.load(std::memory_order_relaxed) ? bindingShaderHash(BindSlot::Ps) : 0;
+    if (!ps) ps = pixelShaderHash(ctx);
     if (!ps) return;
     if (g_withholdNow.load(std::memory_order_relaxed) && (ps == cc::kPlumePs || ps == cc::kTwinPs)) {
         withheld_ = true;
@@ -863,6 +868,7 @@ void ConcoursePaneScope::begin(ID3D11DeviceContext* ctx, UINT indexCount, const 
     const bool tint = mode == kModeTint;
     float opacity = 1.0f;
     if (!tint && indexCount == cc::kBayIndexCount) opacity = std::min(1.0f, std::max(0.0f, g_bayOpacity.load(std::memory_order_relaxed)));
+    if (opacity <= 0.001f) return;   // the bay glass is clear: the game's own glass draws, unchanged
     const bool opaque = opacity >= 0.999f;
     ID3D11BlendState* repl = tint ? g_bsFactor.load(std::memory_order_acquire) : opaque ? g_bsMirror.load(std::memory_order_acquire) : g_bsFade.load(std::memory_order_acquire);
     if (!repl) return;
@@ -1141,6 +1147,10 @@ void concoursePaneTick(ID3D11Device* device, uint32_t frame, uint64_t nowMs) noe
         g_poolMade = false;   // the old queries belong to the old device and are left alone
         for (size_t i = 0; i < kPool; ++i) g_pool[i] = nullptr;
         g_device = device;
+        ID3D11DeviceContext* imm = nullptr;
+        if (device) device->GetImmediateContext(&imm);
+        g_immediate.store(imm, std::memory_order_relaxed);
+        if (imm) imm->Release();
     }
     const uint32_t prevFrame = g_frameNow.exchange(frame, std::memory_order_relaxed);
     pollConfig(nowMs);

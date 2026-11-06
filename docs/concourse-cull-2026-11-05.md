@@ -2,19 +2,19 @@
 
 ## Status
 
-- **State:** BUILT (2026-11-05): the branch head is the first instrument build, full `build.bat` green (optimized_station_test 904 checks), `--dll-only` promoted. Design plus all of Flight 1's instruments: Extends `fix.optimized_stations`. The cull and the pane work are off unless the temporary keys below turn them on. Nothing is flown. Built: name allow-list cull at the rig, producer and store (`concourse_cull_core.h`, `optimized_station.cpp`), the names survey (runs for the first 2 frames of each engage, before the rig and producer vetoes start, so it shows nothing extra), `concourse frame:` trace, panes (`concourse_pane.cpp`, hooked in the four draw thunks).
+- **State:** Flight 1 flown 2026-11-05 flat on Steam, log `edvr_gfx_20261105_194826`, build c9f096db. The cull works and saves about 1.9 ms a frame; the glass is named. The second build (mirror by texture swap, clearing on approach) is being built. Not merged. Extends `fix.optimized_stations`; off unless the temporary keys turn it on.
 - **Goals (Sean, 2026-11-05):** (1) on foot in the large-station concourse, cull everything outside the bay windows; (2) skylights and the window above the lift bank become a permanent mirrored surface, so missing structure is never seen; (3) approaching the bay windows clears the mirror and stops the cull, so the station interior is visible from there.
 - **Direction:** identify records by the store's name, keep an allow-list, and make the panes opaque. The fitted hall, the shader-pair lists and the shell read-back from the earlier attempt are not carried over (see Ruled out).
-- **Open hypotheses (Flight 1 answers all of them):**
-  - **H1** the name allow-list removes the ring, spokes and ships and keeps the room. Survivors and false culls are named by `concourse names:`.
-  - **H2** the rig veto on foot gives a measurable CPU saving; the cull shrinks the shadow and probe views too. Read from `flat cpu 5s` or fpsVR, and a census, with the cull toggled at a fixed view.
-  - **H3** each glass surface is a blended draw that can be named by its covered pixels. `concourse pane capture:` ranks them at each window. If no blended draw covers the pane, Elite has no pane mesh and EDVR must supply one.
-  - **H4** Elite's own glass shader, drawn with no transmission, looks acceptable as a mirror (pane mode `mirror`). If it reads black, an EDVR pixel shader is the next step.
-  - **H5** the room keeps its fill light with exterior rigs vetoed. The record-level hall cull kept it (18:45 flight); the rig veto is untested on foot.
-  - **H6** `Standard_SocialArea` marks the large-station concourse, and a point fixed in the room keeps its coordinates in that record's frame across stations. `concourse frame:` logs the camera in that frame.
-- **Temporary keys (all removed when the arc closes):** `diag.concourse_cull` (on, off), `diag.concourse_keep` (extra name prefixes), `hotkey.concourse_cull`, `hotkey.concourse_pane_capture`, `hotkey.concourse_pane_mode`.
+- **Answered by Flight 1:** H1 yes, with named survivors. H2 yes. H3 yes for the bay window: VS `98397963AAEC45D3` / PS `66B08F89E4926C01`, n=36. H5 yes by eye: the room stayed lit. See "Flight 1 results".
+- **Open hypotheses (Flight 2 answers them):**
+  - **H4b** Elite's own glass shader with EDVR's textures in its material slots (metal 1, bright base, low roughness, `t8`-`t10`) reads as a mirror lit by the real probes. If `cb2[2].y` scales it down, mode `mirror-cb` replaces that row. The `material` log line gives the values.
+  - **H6b** the same family, at other index counts, is the skylights and the lift-bank window. `concourse pane shares:` and mode `tint` name them. If a permanent window shares n=36 with the bay, the n test needs another discriminator.
+  - **H7** pane coverage is a good approach trigger: no room coordinates, so no per-station table. Clear at 20% of the view (12% in VR), released after 10 m of walking away.
+  - **H8** nothing visible draws over the opaque pane once the plume is withheld and the pane writes depth. Screenshots of the mirror will show any survivor.
+  - **H6** `Standard_SocialArea` marks the large-station concourse at other stations too. The second station in the flight list answers it.
+- **Temporary keys (all removed when the arc closes):** `diag.concourse_cull` (on, off), `diag.concourse_keep` (extra name prefixes), `diag.concourse_pane_mode`, `diag.concourse_panes`, `diag.concourse_clear_share`, `hotkey.concourse_cull`, `hotkey.concourse_pane_capture`, `hotkey.concourse_pane_mode`.
 - **Ruled out:** see the section of that name. **Issues:** none yet.
-- **Next flight:** the Flight 1 list below, on build `v0.22.0-rc.7-2-gc9f096db`, installed on Steam 2026-11-05. Keys in both Steam inis: `hotkey.concourse_cull` F2, `hotkey.concourse_pane_capture` F3, `hotkey.concourse_pane_mode` F4. The cull starts off; F2 turns it on.
+- **Next flight:** the Flight 2 list under "Flight 1 results", once the build is installed.
 
 ## What the earlier attempt learned
 
@@ -56,20 +56,32 @@ Grok session `render-thread-optimization`, branch `interior-portal-clear`, uncom
 
 ### The panes
 
-Elite's glass is drawn after lighting. Changing only the blend state around the draw changes what it does, with no new shader and no extra geometry:
+The glass is VS `98397963AAEC45D3` / PS `66B08F89E4926C01`, which is Elite's full forward PBR material drawn `One`, `DestAlpha`, depth test on, no depth write. It draws after sky, fog, flares and light volumes, so an opaque pane overwrites them. A pixel shader is not needed: the material takes its values from textures, so EDVR's own textures in its slots turn glass into a metal.
 
-| Mode | Blend | Result |
+| Slot | Reads | Glass | The mirror |
+|---|---|---|---|
+| `t8` | x metalness, y output alpha | metal 0, F0 0.04 | metal 1 |
+| `t9` | normal xy | | flat, with a tile seam grid and light noise |
+| `t10` | rgb base colour, a roughness | | bright grey, low roughness, seams darker and rougher |
+
+The reflection is the game's own probe cube array at `t5`, and the lights and shadows are the game's. `cb2[2].y` scales F0 and `cb2[2].z` scales roughness, and only row 2 of that buffer is read, so mode `mirror-cb` can replace it if the material's values mute the result.
+
+| Mode | Around the draw | Result |
 |---|---|---|
-| normal | game's (`One`, `Src1Color`) | transmission |
-| `tint` | `BlendFactor`, `Zero`, white pixel shader | flat colour, one per slot, for identification |
-| `mirror` | `One`, `Zero` | the game's own reflection and lighting, nothing behind |
-| `grey` | `BlendFactor`, `Zero` | constant colour |
+| normal | nothing | the game's glass |
+| `mirror` | the three textures; `One`, `Zero`, RGB only; depth write on | a lit metal mirror, nothing behind |
+| `mirror-cb` | as `mirror`, plus `cb2` row 2 = 0, 1, 1, 0 | the same with the material's scales forced |
+| `tint` | white pixel shader; `BlendFactor`, `Zero`; colour per index count | identifies each window type by eye |
 
-A draw is identified by VS hash, PS hash and index count. The start index is not stable across a reload.
+A draw is identified by VS and PS hash; the index count separates the bay (n=36, opens on approach) from the permanent panes. The start index is not stable across a reload.
 
-**The fade (goal 3), after Flight 1.** Draw the pane first with a blend that scales the destination by `1 - k` (`Zero`, `BlendFactor`), then the game's own draw unchanged. `k = 1` is the mirror and `k = 0` is the original, with no pop.
+**What draws after the panes.** The plume (census VS `EB787F98`, but PS `3B0B38CD` is the match because EDVR swaps the plume's VS) and its 1024 twin (`78F5F08D/34A1475B`) have depth test off, so they are withheld while the panes are opaque. Depth-tested late draws (`BBAD1CA8`, `820E5C13`) fail against the pane's depth write.
 
-**The trigger (goal 3), after Flight 1.** A zone in the `Standard_SocialArea` record's frame, as the hangar cell is held in the pad's frame. On entering: stop the cull, wait for the rigs to rebuild, then fade the mirror out. On leaving: fade in, then cull.
+**A known loss:** the logo on the glass (same VS, PS `98337732`, n=162) draws before the pane, so the mirror covers it. It returns when the bay clears.
+
+**The trigger (goal 3).** Pane coverage, not a room coordinate: an occlusion query around the n=36 draws gives its share of the view. This needs no table per station and covers every bay window at once. At 20% of the view (12% in VR), on two readings running: the camera position is latched, the cull lifts, 150 ms later the pane fades to the game's glass over 600 ms. It stays clear while the pane is large, and looking away does nothing. After walking 10 m from the last latched position it fades back, then the cull returns behind the opaque glass. Coordinates were the first plan, but Flight 1's walk could not place the pane, and a table would have needed flights at each station type.
+
+**The fade.** `BlendFactor`, `InvBlendFactor` with the mirror's textures. At 0 the game's own draw returns, a small step to its faint reflection.
 
 ### Later, if the numbers ask for it
 
@@ -89,17 +101,75 @@ Flat on Steam is enough; VR after. Fly from the hangar, so the lift transition i
 
 After the flight: `python tools\edvr_log.py --target steam --expect-build c9f096db --grep "concourse"`.
 
+## Flight 1 results
+
+Flown 2026-11-05 flat, 3840x2160, log `edvr_gfx_20261105_194826`, build c9f096db. One census, cull on, at the bay window (19:51:12).
+
+**The cull.** The ring, spokes and ships are gone and the room stayed lit (Sean's screenshots). 71 names kept, 768 culled; about 45% of rigs vetoed outright (119k of 263k in a 5 s window).
+
+**Frame time.** At the bay the game sat at its 90 fps cap, so the A/Bs there read nothing. At cam_local (-4.7, 21.7, -18.7) it ran uncapped, and the cull was toggled twice:
+
+| Window | Cull | Present p50 | Frames in 5 s |
+|---|---|---|---|
+| 19:53:58-19:54:03 | on | 12.29 ms | 404 |
+| 19:54:03-19:54:08 | off for 2.9 s of it | 14.31 ms | 365 |
+| 19:54:53-19:54:58 | on | 12.51 ms | 390 |
+| 19:54:58-19:55:03 | off | 14.53 ms | 335 |
+| 19:55:03-19:55:08 | on | 12.64 ms | 382 |
+
+So the cull saves about 1.9 ms a frame there (13%). CPU timing was off, so the split between CPU and GPU is not known.
+
+**The census.** Against the uncut census at the glass from 10-25 (log `133258`, census 2, frame 0, a different day, same kinds of names):
+
+| View | Uncut indices | Cull on | Change | Uncut draws | Cull on |
+|---|---|---|---|---|---|
+| Main 3840x2160 | 7.38M | 0.88M | -88% | 2293 | 1355 |
+| Shadow tiles 2048 | 29.41M | 11.67M | -60% | 10583 | 5642 |
+| Probes 512 | 12.40M | 9.87M | -20% | 3322 | 3317 |
+| Total | 49.2M | 22.4M | -54% | 16198 | 10314 |
+
+The remaining 21.5M of shadow and probe indices is about what the middle of the room drew uncut on 10-25 (23.2M), so the room's own casters now dominate.
+
+**What is still visible through the glass with the cull on.**
+
+- Green plate cluster: probably the single mesh of 81,744 indices, `EB5234DB/E06E61AE`, one draw in the main view, 3 in the tiles and 4 in the probes. `SA_StationHub_Agricultural` (one record per frame) fits; not proven. It costs about 650k indices a frame.
+- Orange gantry and crates below the bay window: a kept name, unidentified. Flight 2's `kept` lines add radius and distance.
+- Glows `1C506222/2519C905` and `359BF8FF/92FF8499`, fog `B12F7A61/42AC0CAC`, stars `68DDDEF0` (8232 instances), plumes `EB787F98`. All but the plume draw before the pane.
+- Light volumes: about 4700 instances (`0357BBB2` 3900, `8289669D` 780), many of them exterior. 33.9M samples (409% of the screen) on `A1B7CFCD` alone in one capture.
+
+**The glass.** `98397963/66B08F89` n=36 covers 87.3% of the screen close up in the bay and 33-45% from about 7 m. The logo on the glass (same VS, PS `98337732`, n=162) rises and falls with it. n=192 and n=864 are in the same family; which windows they are was not captured.
+
+**Why the tint showed only the visor.** The picks included `3064D7F4/CCDB2A91` n=192, the helmet visor (no depth test, 100.0% of the screen in every capture), and `C4B4B334/0146ABCC` n=3600, the GUI layer (a constant 83.2%). Both draw after the panes and, tinted, cover them. The mirror and grey keypresses went the same way, so H4 was not tested. The panes' PS has metal 0 and F0 0.04, so a plain opaque draw would have been nearly black anyway: hence the texture swap.
+
+**Bugs in the instrument.** `callback cost` printed garbage about every 30 s. `TurboLiftDoor*` was culled beyond 40 m and kept inside it, a pop-in risk. Both are fixed in the second build.
+
+**The room's coordinates.** Bar platform y 26.16, lower floor y 22.16, lift area y 21.68. Near the bay: (-17.5, 26.16, 39.6). Lift bank: (-4.7, 21.68, -18.7). `Standard_SocialArea` reports r=130.7 centred 256 m from the camera in the same frame, so its sphere does not bound the room.
+
+## Flight 2
+
+On the second build, flat. Start with F2 off, in the hangar, so the lift transition is seen. Screenshot each step.
+
+1. F2 on in the room. Look at the bay window from across the room, a skylight, and the window above the lift bank: all mirrored? Anything mirrored that should not be? Anything drawing on top of a mirror?
+2. Cycle F4 once at each window: `mirror-cb`, `tint`, `off`, back to `mirror`. Screenshot each. `tint` names each window type by colour, and the log says which index count it was.
+3. With the mirror on, walk slowly up to the bay window, stop at the glass, look away and back, then walk at least 15 m away. Note the distance it opened at, whether the station was missing when it opened, and any flash.
+4. Stand at the bay with `off`: is the view right? Look at the logo, then at a skylight (still mirrored?).
+5. Lift to the hangar and back, cull on. Any flash at the doors?
+6. If it is cheap, repeat steps 1 and 3 at a second station type.
+
+Then: `python tools\edvr_log.py --target steam --expect-build <commit> --grep "concourse"`.
+
 ## Performance candidates
 
-Ranked by expected gain against risk. Only the first two are in the build.
+Ranked by expected gain against risk. The first two and the plume are in the build.
 
-1. **Rig veto on foot.** In the build. Expect the hangar's -1.4 ms or better, since the same records are involved.
-2. **Cull by name in every view.** In the build. Reaches the shadow and probe draws (about 85% of draw calls).
-3. **Withhold what only the glass shows, while the panes are opaque:** plumes `EB787F98`, fog `B12F7A61`, flares `529D6238` (about 1000 draws a frame), sky `68DDDEF0/F7A6E916`. Needs proof that none of them is inside the room; flares may be.
-4. **Seed the panes' depth at the start of the frame.** Exterior light volumes, sky and fog then fail the depth test where a pane covers them. Saves GPU in proportion to the pane's screen area; worth it only if the GPU profile shows those passes costing.
-5. **The sun in the concourse.** The sun pair (`7E38A6AA/7CECABDE`) still draws. With mirrored skylights it may contribute nothing; the seal's sun skip can be A/B tested with one line.
-6. **The reverse cull.** From the cockpit (docked with the pad raised, or flying inside), veto `Standard_SocialArea` and `SA_*` and show the panes as mirrors. The name list makes this cheap, and it was the original report (the concourse fully rendered while in the ship).
-7. **Reflection probes and shadow tiles.** Three `2048` tiles draw identical caster sets each frame. Refreshing static tiles or probes less often could save more than any of the above, but it needs reverse engineering first, and moving NPCs complicate it.
+1. **Rig veto on foot.** In the build. Part of the measured 1.9 ms.
+2. **Cull by name in every view.** In the build. Shadow tiles -60%, probes -20%.
+3. **Withhold what only the glass shows, while every pane is opaque:** fog `B12F7A61`, stars `68DDDEF0/F7A6E916`, glows `1C506222`, `359BF8FF`. They draw and are then overwritten, so skipping them is pure saving. Needs proof that none is inside the room; glows may be. (Not `529D6238`: see Ruled out.) Plumes are withheld in this build.
+4. **Exterior light volumes.** About 4700 instances a frame in the main view. Most effective GPU target left, and hard: earlier work showed they cannot be cut by centre position. A pane depth write early in the frame would reject the part behind glass.
+5. **Drop kept names that are outside the room:** the 81,744-index mesh alone is about 650k indices a frame. Flight 2's distances should say which are safe.
+6. **The sun in the concourse.** The sun pair (`7E38A6AA/7CECABDE`) still draws. With mirrored skylights it may contribute nothing; the seal's sun skip can be A/B tested with one line.
+7. **The reverse cull.** From the cockpit (docked with the pad raised, or flying inside), veto `Standard_SocialArea` and `SA_*` and show the panes as mirrors. The name list makes this cheap, and it was the original report (the concourse fully rendered while in the ship).
+8. **Reflection probes and shadow tiles.** Three `2048` tiles draw identical caster sets each frame. With 21.5M of the remaining 22.4M indices here, refreshing static tiles or probes less often could save more than any of the above, but it needs reverse engineering first, and moving NPCs complicate it.
 
 ## Ruled out
 
@@ -109,4 +179,8 @@ Ranked by expected gain against risk. Only the first two are in the build.
 - `ruled out: Elite+0x1600DD0 (the portal update) as the glass-clear gate, because three flights never saw it arm (logs 10-24).`
 - `ruled out: culling light volumes by centre position, because it removes the room's fill (flights 10-26 16:47 to 17:13).`
 - `ruled out: reading pool records back from the GPU to cull shell draws, because it pays traversal, submission and staging copies, and crashed once on a reused staging buffer; the store has the same answer earlier.`
-- `ruled out: bay windows named by dual-source blend alone, because the pairs that survive the hall cull look like visors, not panes (not yet proven; the capture decides).`
+- `ruled out: bay windows named by dual-source blend, because the bay pane is 98397963/66B08F89 with One, DestAlpha, 87% of the screen at the glass; no dual-source pair reached the capture's top 24 (log 194826).`
+- `ruled out: picking panes automatically from the capture's top draws, because the visor and the GUI layer cover the screen in every capture and, tinted, hide the panes (log 194826).`
+- `ruled out: the game's glass drawn opaque with its own material as the mirror, because its metalness is 0 and F0 is 0.04, so it would be nearly black (PS 66B08F89 disassembly; not flown, the visor hid the test).`
+- `ruled out: 529D6238 as flares, because it draws last into its own target with no depth view and is what docs\desktop-window.md found Elite drawing into its desktop window; earlier notes here were wrong.`
+- `ruled out: a room-coordinate zone as the approach trigger for now, because Flight 1's walk could not place the pane and pane coverage needs no per-station table (not flown; Flight 2 tests coverage).`
