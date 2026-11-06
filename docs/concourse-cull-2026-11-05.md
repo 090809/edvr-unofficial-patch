@@ -2,7 +2,7 @@
 
 ## Status
 
-- **State:** Flight 9 flown 2026-11-06 flat on Steam, log `edvr_gfx_20261106_092241`, build 4eead728. Flight 10 flown 2026-11-06 on 990a2b44, log `edvr_gfx_20261106_095708`: Sean asked for brighter skylights, dimmer bay windows, a middle level elsewhere, and the shop window to clear like the bay. Flight 11 flown 2026-11-06 on 481d97b0, log `edvr_gfx_20261106_110851` (results below; the log hit its size cap at 11:22:26, so the trip back is lost). Flight 12 flown 2026-11-06 on f09f42df, log `edvr_gfx_20261106_114951`: results below. The next build sets angled skylights to the bar window's level and adds a log-only lift door survey (full build green, optimized_station_test 1038 checks), not flown. Not merged. Extends `fix.optimized_stations`; the concourse cull is off unless the temporary keys turn it on, but the sealed-hangar withhold is on with `fix.optimized_stations`.
+- **State:** Flight 9 flown 2026-11-06 flat on Steam, log `edvr_gfx_20261106_092241`, build 4eead728. Flight 10 flown 2026-11-06 on 990a2b44, log `edvr_gfx_20261106_095708`: Sean asked for brighter skylights, dimmer bay windows, a middle level elsewhere, and the shop window to clear like the bay. Flight 11 flown 2026-11-06 on 481d97b0, log `edvr_gfx_20261106_110851` (results below; the log hit its size cap at 11:22:26, so the trip back is lost). Flight 12 flown 2026-11-06 on f09f42df, log `edvr_gfx_20261106_114951`: results below. Build eb9b6b8e sets angled skylights to the bar window's level and adds a log-only lift door survey (full build green, optimized_station_test 1038 checks), installed on Steam 2026-11-06, not flown. Not merged. Extends `fix.optimized_stations`; the concourse cull is off unless the temporary keys turn it on, but the sealed-hangar withhold is on with `fix.optimized_stations`.
 - **Goals (Sean, 2026-11-05):** (1) on foot in the large-station concourse, cull everything outside the bay windows; (2) skylights and the window above the lift bank become a permanent mirrored surface, so missing structure is never seen; (3) approaching the bay windows clears the mirror and stops the cull, so the station interior is visible from there. **Added 2026-11-06:** (4) light behind the mirror, for the impression of a brightly lit station beyond it; (5) with `fix.optimized_stations` on, the same outside draws go while the hangar is sealed.
 - **Direction:** identify records by the store's name, keep an allow-list, and make the panes opaque. The fitted hall, the shader-pair lists and the shell read-back from the earlier attempt are not carried over (see Ruled out).
 - **Answered by Flight 1:** H1 yes, with named survivors. H2 yes. H3 yes for the bay window: VS `98397963AAEC45D3` / PS `66B08F89E4926C01`, n=36. H5 yes by eye: the room stayed lit. See "Flight 1 results".
@@ -31,7 +31,7 @@
 - **Temporary keys (all removed when the arc closes):** `diag.concourse_cull` (on, off), `diag.concourse_keep` (extra name prefixes), `diag.concourse_pane_mode`, `diag.concourse_panes`, `diag.concourse_clear_share`, `diag.concourse_mirror_beyond`, `diag.concourse_glow` (sky, angled, other, bay), `hotkey.concourse_cull`, `hotkey.concourse_pane_capture`, `hotkey.concourse_pane_mode`.
 - **Hangar to concourse and back (Sean, 2026-11-06):** steps 1 to 3 built, not flown; the seal on foot waits on the survey's numbers. See the section of that name at the end.
 - **Ruled out:** see the section of that name. **Issues:** none yet.
-- **Next flight:** the Flight 13 list. Keys: `hotkey.concourse_cull` F2, `hotkey.concourse_pane_capture` F3, `hotkey.concourse_pane_mode` F4 in both Steam inis, `diag.concourse_glow` in `edvr-flat.ini`, and `log.max_mb = 200` there for these flights only (two censuses filled the default). Keys in both Steam inis: `hotkey.concourse_cull` F2 (the cull and the mirrors), `hotkey.concourse_pane_capture` F3 (logs a ranking by screen coverage and the kept names, changes nothing), `hotkey.concourse_pane_mode` F4.
+- **Next flight:** the Flight 13 list, on build eb9b6b8e. Keys: `hotkey.concourse_cull` F2, `hotkey.concourse_pane_capture` F3, `hotkey.concourse_pane_mode` F4 in both Steam inis, `diag.concourse_glow` in `edvr-flat.ini`, and `log.max_mb = 200` there for these flights only (two censuses filled the default). Keys in both Steam inis: `hotkey.concourse_cull` F2 (the cull and the mirrors), `hotkey.concourse_pane_capture` F3 (logs a ranking by screen coverage and the kept names, changes nothing), `hotkey.concourse_pane_mode` F4.
 
 ## What the earlier attempt learned
 
@@ -404,14 +404,14 @@ Log `edvr_gfx_20261106_114951`, build f09f42df, flat, Steam, small pad.
 
 ## Flight 13
 
-Flat, Steam. F2 once while still seated, as before. No NumLock is needed: this flight is for the log. Move at an ordinary pace and pause where it says, so the log's positions can be told apart.
+On build eb9b6b8e, flat, Steam. F2 once while still seated, as before. No NumLock is needed: this flight is for the log. Move at an ordinary pace and pause where it says, so the log's positions can be told apart.
 
 1. Get out, walk to the lift door, stand just outside it for 3 s. If it opens for you, step back 3 m and wait until it has closed, then walk up again.
 2. Go in and ride up. Stay still until the doors have opened, then step out 5 m.
 3. Turn round, stand just outside a lift door for 3 s, go in and ride down. Stay still until the doors have opened, then walk out. Board if you like.
 4. Are the angled skylights right at the bar window's colour?
 
-Then: `python tools\edvr_log.py --target steam --expect-build <build> --grep "lift survey|concourse cull: the camera"`.
+Then: `python tools\edvr_log.py --target steam --expect-build eb9b6b8e --grep "lift survey|concourse cull: the camera"`.
 
 ## Performance candidates
 
