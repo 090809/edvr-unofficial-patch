@@ -119,7 +119,7 @@ constexpr uint64_t kTwinPs = 0x34A1475B2C790DFAull;
 // ---- The draws withheld while the cull is on: what is outside the room (smoke, volumetrics, ship lasers, engine trails, the planet) --------------------
 // Named by pixel shader hash or vertex shader hash (a draw with either is not issued). A terrain patch has no pixel shader, so it is named by its vertex
 // shader. Not here, on purpose: the player's first-person laser (0x88DCF1164C640EC3 / 494506A6), the room's glows (1C506222, 359BF8FF), the sky (F8FA801F),
-// the stars (68DDDEF0, F7A6E916), the dust (E904D334), AFFEF018.
+// the stars (68DDDEF0, F7A6E916), the dust (E904D334). Beams, flares and the scatter are non-indexed draws, so the plain draw thunks carry the scope too.
 struct WithheldFamily {
     uint64_t hash;
     const char* name;
@@ -139,6 +139,11 @@ constexpr WithheldFamily kWithheldPs[] = {
     {0x97DBC87FCAA429C4ull, "atmosphere quad B"},
     {0xD56F859BE4781431ull, "flares"},
     {0x43E5E6EB67AC751Bull, "planet surface"},
+    {0x41152F82C6E8BE1Full, "scatter"},               // VS AFFEF018: fullscreen, additive, no depth test, reads only the depth
+    {0x2BAE3742FEB916D9ull, "particles A"},           // VS AFBCD3AD, 9F4BBCFC (docs\billboard-root-cause-2026-10-16.md)
+    {0x3789CA2062E196FBull, "particles B"},           // VS 9AEC596A
+    {0xE54F2A902E5631F6ull, "particles C"},           // VS BBAD1CA8
+    {0x6EAA86EFE135B2D4ull, "shield strike part 2"},  // VS 820E5C13, the same 3984 indices as the shield strike
 };
 constexpr WithheldFamily kWithheldVs[] = {
     {0x72BDD292154158ADull, "body surface"},

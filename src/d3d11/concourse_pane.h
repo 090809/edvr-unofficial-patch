@@ -14,7 +14,8 @@
 // occlusion queries (the game's glass samples, the mirror's samples), decides which panes still mirror once the cull is lifted (the bay window clearing).
 // Family draws are also measured: an occlusion query around the game's draw gives the share of the viewport it covers, whatever the mode.
 //
-// The draw thunks of vscreen.cpp (hookedDrawIndexed and hookedDrawIndexedInstanced, the flat branch and the VR path) build one ConcoursePaneScope around the
+// The draw thunks of vscreen.cpp (hookedDraw and hookedDrawInstanced for what is withheld; hookedDrawIndexed and hookedDrawIndexedInstanced for that and the
+// mirror; the flat branch and the VR path of each) build one ConcoursePaneScope around the
 // real draw call, skip the real call when withheld() says so, and issue the second draw when beginMirror() says so. With nothing armed the scope is one
 // relaxed atomic load, and beginMirror() is a check of one member that is false for every draw that is not the family's.
 #include <d3d11_1.h>

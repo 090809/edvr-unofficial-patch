@@ -3669,7 +3669,7 @@ int main(int argc, char** argv) {
         // The withheld outside draws: named by shader, found by a bloom and a scan.
         {
             static_assert(cc::kWithheldPs[0].hash == cc::kPlumePs && cc::kWithheldPs[1].hash == cc::kTwinPs, "the plume pair leads the list");
-            check(cc::kWithheldPsCount == 14 && cc::kWithheldVsCount == 10, "concourse withheld: 14 pixel shaders and 10 vertex shaders");
+            check(cc::kWithheldPsCount == 19 && cc::kWithheldVsCount == 10, "concourse withheld: 19 pixel shaders and 10 vertex shaders");
             check(!cc::withheldHasDuplicate(cc::kWithheldPs, cc::kWithheldPsCount) && !cc::withheldHasDuplicate(cc::kWithheldVs, cc::kWithheldVsCount),
                   "concourse withheld: no list holds a hash twice");
             const cc::WithheldFamily dup[] = {{1, "a"}, {2, "b"}, {1, "c"}};
@@ -3697,7 +3697,7 @@ int main(int argc, char** argv) {
             check(missed, "concourse withheld: near-miss hashes are not found");
             check(cc::withheldPsIndex(0) == -1 && cc::withheldVsIndex(0) == -1, "concourse withheld: no shader (hash 0) is not found");
             check(cc::withheldPsIndex(cc::kPaneFamilyPs) == -1 && cc::withheldVsIndex(cc::kPaneFamilyVs) == -1, "concourse withheld: the glass family is not withheld");
-            const uint64_t keep[] = {0x88DCF1164C640EC3ull, 0x494506A6ull, 0x1C506222ull, 0x359BF8FFull, 0xF8FA801Full, 0x68DDDEF0ull, 0xF7A6E916ull, 0xE904D334ull, 0xAFFEF018ull};
+            const uint64_t keep[] = {0x88DCF1164C640EC3ull, 0x494506A6ull, 0x1C506222ull, 0x359BF8FFull, 0xF8FA801Full, 0x68DDDEF0ull, 0xF7A6E916ull, 0xE904D334ull};
             bool kept = true;
             for (uint64_t h : keep) kept = kept && cc::withheldPsIndex(h) == -1 && cc::withheldVsIndex(h) == -1;
             check(kept, "concourse withheld: the player's laser, the room's glows, the sky, the stars and the dust are not withheld");

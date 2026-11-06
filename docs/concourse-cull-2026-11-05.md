@@ -2,21 +2,23 @@
 
 ## Status
 
-- **State:** Flight 3 flown 2026-11-06 flat on Steam, log `edvr_gfx_20261106_050431`, build b19b368d. Sean: the mirror is much better. The fourth build bc09083f (outside effects withheld, the clear follows the view; full build green, optimized_station_test 998 checks) is installed on Steam and not flown. Not merged. Extends `fix.optimized_stations`; off unless the temporary keys turn it on.
+- **State:** Flight 4 flown 2026-11-06 flat on Steam, log `edvr_gfx_20261106_055426`, build bc09083f. The clear following the view works, nothing in the room is missing, and F2 moves frame time from 15-24 ms to the 90 fps cap. The green haze and the lasers stayed. The fifth build (non-indexed draws withheld, the haze's families added) is not flown. Not merged. Extends `fix.optimized_stations`; off unless the temporary keys turn it on.
 - **Goals (Sean, 2026-11-05):** (1) on foot in the large-station concourse, cull everything outside the bay windows; (2) skylights and the window above the lift bank become a permanent mirrored surface, so missing structure is never seen; (3) approaching the bay windows clears the mirror and stops the cull, so the station interior is visible from there.
 - **Direction:** identify records by the store's name, keep an allow-list, and make the panes opaque. The fitted hall, the shader-pair lists and the shell read-back from the earlier attempt are not carried over (see Ruled out).
 - **Answered by Flight 1:** H1 yes, with named survivors. H2 yes. H3 yes for the bay window: VS `98397963AAEC45D3` / PS `66B08F89E4926C01`, n=36. H5 yes by eye: the room stayed lit. See "Flight 1 results".
 - **Answered by Flight 2:** H4b yes, by eye. H7 yes: lifts at 20.2-22.3% of the view, all near the bay. H6b no: the family covers every pane in the room at about 20 index counts, so no count names the exterior. See "Flight 2 results".
 - **Answered by Flight 3:** H9 yes as far as the eye went: Sean called the mirror much better and reported no wrong pane, with 0 mark refusals. H10 yes: `culled PlantStack0-4` logged, and his screenshot has no plates. H11 not asked directly: no complaint about the grid, and the log shows `mirror-soft` tried. The side table needed one fix: one mesh drawn in two places flipped within a frame. See "Flight 3 results".
-- **Open hypotheses (Flight 4 answers them):**
-  - **H12** The withheld lists remove the smoke, the trails, the lasers and the planet, and nothing in the room. `concourse withheld 30s:` names what matched. F4 at `off` shows what is left. The planet's vertex shaders come from older docs, because no census here had the planet in view: if it stays, take a NumLock looking at it.
-  - **H13** The flares (`B75A6FF2/D56F859B`, about 1300 instances) are outside only. They draw after the panes with no depth test, so they paint on the mirror. If room lamps lose their glints, this family is why.
-  - **H14** 20% in, 8% out, 250 ms held is a comfortable rule for following the view.
-  - **H8** nothing visible draws over the pane once the outside is withheld and the pane writes depth. `AFFEF018/41152F82` (a fullscreen additive, no depth test) is the candidate left.
+- **Answered by Flight 4:** H14 yes: Sean, "the turn away from the bay windows works well". H12 half: "I don't see anything missing or incorrect on the interior", no planet in his screenshot or his report, and the lists matched 15 of 24 families, but the haze and lasers stayed. See "Flight 4 results".
+- **Open hypotheses (Flight 5 answers them):**
+  - **H15** The white bars and lines are beams and bolts, and they stayed only because they are non-indexed draws. `beams and bolts` must now appear in `concourse withheld 30s:`.
+  - **H13** The flares (`B75A6FF2/D56F859B`) are outside only, and they stayed for the same reason. `flares` must now appear in the line. If room lamps lose their glints, this family is why.
+  - **H16** The green haze is `AFFEF018/41152F82` (`scatter`): fullscreen, additive, no depth test, reading only the depth, so the far pixels take all of it. The green ellipses and pale wedges are the particle batches `2BAE3742`, `3789CA20`, `E54F2A90`. Neither is proven: the plume and the trail families were withheld and the shapes stayed, which is what points here. If a shape stays, the F2 toggle at the glass and a NumLock answer it.
+  - **H17** None of these is in the room. The scatter also lands on near surfaces, faintly, so the room may lose a slight wash. Compare with F2 at a fixed view.
+  - **H8** nothing visible draws over the pane once the outside is withheld and the pane writes depth.
   - **H6** `Standard_SocialArea` marks the large-station concourse at other stations too. Still unflown.
 - **Temporary keys (all removed when the arc closes):** `diag.concourse_cull` (on, off), `diag.concourse_keep` (extra name prefixes), `diag.concourse_pane_mode`, `diag.concourse_panes`, `diag.concourse_clear_share`, `diag.concourse_mirror_beyond`, `hotkey.concourse_cull`, `hotkey.concourse_pane_capture`, `hotkey.concourse_pane_mode`.
 - **Ruled out:** see the section of that name. **Issues:** none yet.
-- **Next flight:** the Flight 4 list, on build bc09083f, installed on Steam 2026-11-06. Keys in both Steam inis: `hotkey.concourse_cull` F2 (the cull and the mirrors), `hotkey.concourse_pane_capture` F3 (logs a ranking, changes nothing), `hotkey.concourse_pane_mode` F4.
+- **Next flight:** the Flight 5 list. Keys in both Steam inis: `hotkey.concourse_cull` F2 (the cull and the mirrors), `hotkey.concourse_pane_capture` F3 (logs a ranking, changes nothing), `hotkey.concourse_pane_mode` F4.
 
 ## What the earlier attempt learned
 
@@ -90,9 +92,12 @@ A draw is identified by VS and PS hash; the index count only separates the bay (
 | ship lasers | beams and bolts `1F17BF54/A75C1DB6`, multicannon `939D01F2/C5DF9CC9`, shield strike `5C1D8EF5/C49F999F` | `docs\dlss-blur-elements-2026-10-14.md` |
 | the planet | atmosphere `41E245D4`, `D95905C1`, `D1281DF4` (`docs\scanner-body.md`); body VS `72BDD292`, `26FC402B`, `9FFA5D5E`, `3530A6FD`, `71DD9863`, `ACE405F4`, `19F70CE8`, `C7FA0C0F` (`docs\eye-split.md`, `docs\fss-scanner.md`, `eye_draw_snapshot.h`) | older docs; not in view in any census here |
 | the sun's glare | `8BD7C37A`, `1F3AD158` | `eye_draw_snapshot.h` |
+| the haze (from the fifth build) | scatter `AFFEF018/41152F82`; particles `AFBCD3AD` and `9F4BBCFC/2BAE3742`, `9AEC596A/3789CA20`, `BBAD1CA8/E54F2A90`; shield strike part 2 `820E5C13/6EAA86EF` | Flight 4's census: what was left after the rest went; `docs\billboard-root-cause-2026-10-16.md` for the particles |
 | not asked, paints on the mirror | flares `B75A6FF2/D56F859B` | after the panes, no depth test |
 
-Not withheld: `88DCF116/494506A6` (the first-person laser), the room's glows `1C506222` and `359BF8FF`, the sky `F8FA801F`, the stars and the space dust `E904D334` (see "Performance candidates"), and `AFFEF018` (unknown; no shader dump).
+Not withheld: `88DCF116/494506A6` (the first-person laser), the room's glows `1C506222` and `359BF8FF`, the sky `F8FA801F`, the stars and the space dust `E904D334` (see "Performance candidates").
+
+The scope is on all four draw thunks. Beams, flares, stars, dust and the scatter are non-indexed, and until the fifth build only the indexed thunks looked at the lists.
 
 Depth-tested late draws (`BBAD1CA8`, `820E5C13`) fail against the pane's depth write.
 
@@ -211,7 +216,7 @@ Log `edvr_gfx_20261106_050431`, build b19b368d, flat, Steam, the same station ty
 - **The sides.** Exteriors read 99-100% (n=18: 7636 of 7656; n=30: 11659 of 11659), and interiors mostly 0%, with some in between (n=24: 496 of 1079). One mesh (n=12, start 12078150) logged 84 `changed side` lines: see "Each pane's side".
 - **The plates.** All of `PlantStack0-4` culled. The farthest kept name is now at about 50 m.
 - **NumLock.** Shift+NumLock worked: census at 05:14:00, phase clear, at the glass (z 39.6), with the cull lifted. So it shows the families but not what the cull leaves, and the planet was not in view.
-- **Sean's screenshot, F4 at `off`, cull on.** Pale haze, a planet, stars, white bars and a long white line, pale wedges, a small white cloud, orange flares. The wedges are the plume, shown because the withhold was off in mode `off`.
+- **Sean's screenshot, F4 at `off`, cull on.** Pale haze, a planet, stars, white bars and a long white line, pale wedges, a small white cloud, orange flares.
 - **Frame time.** Mostly the 90 fps cap (p50 11.1 ms), with stretches at 12-13 ms; 16.9 ms in the 5 s window of the clear at 05:07:29-37.
 
 ## Flight 4
@@ -226,6 +231,27 @@ On the fourth build, flat, at the same station. Start with F2 off.
 6. If it is cheap, repeat 3 and 4 at a second station type.
 
 Then: `python tools\edvr_log.py --target steam --expect-build bc09083f --grep "concourse"`.
+
+## Flight 4 results
+
+Log `edvr_gfx_20261106_055426`, build bc09083f, flat, Steam, the same station type. NumLock at 06:00:41, cull on, F4 at `off`, in the mirror phase, looking out through the glass.
+
+- **The clear.** Sean: the turn away works well, and nothing is missing or wrong in the room. Lifts at 20.2-23.1%, and it returns straight to the mirror at 0.0%.
+- **Frame time, by F2.** `flat cpu` present p50, F2 off: 15-21 ms before the press at 05:56:53, 17-24 ms after the release at 05:56:57. F2 on: 11.3 ms in the 5 s window that held it, and 11.1 ms for most of the flight after, the 90 fps cap. So at least 4 ms and more often 6 or more, with the cap hiding the rest. The camera's position with F2 off is not logged.
+- **The lists.** 15 families matched, including `planet surface`, `planetary 2` and `3`, and neither Sean's screenshot nor his report has a planet. Never matched: `beams and bolts`, `flares`, and with no ship or planet to show them `trail haze`, `body surface`, `planetary pipeline`, `terrain patch`, `beside the bodies`, `sun`, `sun arcs`.
+- **Why the lasers and flares stayed.** The census's kind column: `1F17BF54` and `B75A6FF2` are `N`, DrawInstanced, and the scope was only on the indexed thunks. A census records a draw at the thunk's head, so a withheld draw still appears in it; the 30 s line is the evidence for what was skipped.
+- **Why the haze stayed.** The plume was withheld at 12 draws a frame, yet the pale wedges are in the screenshot, so the wedges were never the plume; the "plume" label in the Flight 3 results was a guess. The trail ribbon and volume were withheld too, so the older note here calling `B12F7A61` the green fog is wrong, or at least not all of it.
+
+## Flight 5
+
+On the fifth build, flat, at the same station.
+
+1. F2 on, F4 at `off`, looking out through the bay. Are the haze, the white bars, the flares and the ellipses gone? What is left? If anything stays, a NumLock with it in view.
+2. F2 off and on, F4 at `off`, at a fixed view of the room: does the room change, a slight wash or a lamp's glint?
+3. F4 at `mirror`: clean panes? Then the bay's clear once, for the view through it with everything back.
+4. If it is cheap, a second station type.
+
+Then: `python tools\edvr_log.py --target steam --expect-build <this build> --grep "concourse"`.
 
 ## Performance candidates
 
@@ -258,3 +284,5 @@ Ranked by expected gain against risk. The first two and the plume are in the bui
 - `ruled out for now: naming each draw's record through t33 and the instance stream, because it needs both mapped each frame and a proven join of record to pool row, and the depth rule needs neither. Worth returning to only if the depth rule fails.`
 - `ruled out: a walk-away latch as the clear's release, because turning round at the bay left the cull off until Sean walked 10 m (Flight 3).`
 - `ruled out: 88DCF116 as a ship's laser, because docs\design-flat-temporal-aa-2026-09-23.md names it the first-person laser, a pool draw; it stays in the room's list.`
+- `ruled out: EB787F98/3B0B38CD as the pale wedges, because Flight 4 withheld it at 12 draws a frame and the wedges stayed in the screenshot.`
+- `ruled out: B12F7A61/42AC0CAC as all of the green haze, because Flight 4 withheld it and the haze stayed.`

@@ -5546,7 +5546,8 @@ void STDMETHODCALLTYPE hookedDraw(ID3D11DeviceContext* self, UINT count, UINT st
         FlatStationSunGate sun(self, flatDraw, stationSkip);   // built 2026-10-21: only a skipped sun draw is changed (no real call, or a masked one)
         {
             FlatParticleScope particle(self, 'D', count, 1);
-            if (sun.issues()) g_state->realDraw(self, count, start);
+            ConcoursePaneScope pane(self, count, start, 0, kConcoursePaneCalls);   // TEMPORARY (concourse_pane.h): the outside's non-indexed draws (beams, flares, the scatter) are withheld here; no mirror, the glass is indexed
+            if (sun.issues() && !pane.withheld()) g_state->realDraw(self, count, start);
         }
         sun.restore();
         if (flatDraw.needsActualDraw()) flatDraw.endActualDraw();
@@ -5581,14 +5582,18 @@ void STDMETHODCALLTYPE hookedDraw(ID3D11DeviceContext* self, UINT count, UINT st
         // forwardWithVerdict's own return for the owner's blocked UI layer is kept; the game's draw otherwise as it is issued there.
         if (!(self == g_state->ownerCtx && uiLayerIssueBlocked())) {
             const int64_t r0 = clock.on ? qpcNow() : 0;
-            g_state->realDraw(self, count, start);
+            {
+                ConcoursePaneScope pane(self, count, start, 0, kConcoursePaneCalls);   // TEMPORARY (concourse_pane.h): the outside's non-indexed draws (beams, flares, the scatter) are withheld here; no mirror, the glass is indexed
+                if (!pane.withheld()) g_state->realDraw(self, count, start);
+            }
             if (clock.on) clock.realCall(r0);
         }
     } else forwardWithVerdict(self, v, flags, 'D', count, 1, args, [&](AlteredDraw altered) {
         const int64_t r0 = clock.on ? qpcNow() : 0;
         {
             GpuCensusAlteredScope timed(self, altered);   // the game's own draw, and only it (gpu_census.h)
-            g_state->realDraw(self, count, start);
+            ConcoursePaneScope pane(self, count, start, 0, kConcoursePaneCalls);   // TEMPORARY (concourse_pane.h): the outside's non-indexed draws (beams, flares, the scatter) are withheld here; no mirror, the glass is indexed
+            if (!pane.withheld()) g_state->realDraw(self, count, start);
         }
         srvTurretHudCountIssue(self);   // issue 140: the game's own issue; a family's first scope says its state (one relaxed load otherwise)
         if (clock.on) clock.realCall(r0);
@@ -5746,7 +5751,8 @@ void STDMETHODCALLTYPE hookedDrawInstanced(ID3D11DeviceContext* self, UINT perIn
         FlatStationSunGate sun(self, flatDraw, stationSkip);
         {
             FlatParticleScope particle(self, 'N', perInstance, instances);
-            if (sun.issues()) g_state->realDrawInstanced(self, perInstance, instances, startVertex, startInstance);
+            ConcoursePaneScope pane(self, perInstance, startVertex, 0, kConcoursePaneCalls);   // TEMPORARY (concourse_pane.h): the outside's non-indexed draws (beams, flares, the scatter) are withheld here; no mirror, the glass is indexed
+            if (sun.issues() && !pane.withheld()) g_state->realDrawInstanced(self, perInstance, instances, startVertex, startInstance);
         }
         sun.restore();
         if (flatDraw.needsActualDraw()) flatDraw.endActualDraw();
@@ -5789,15 +5795,20 @@ void STDMETHODCALLTYPE hookedDrawInstanced(ID3D11DeviceContext* self, UINT perIn
         uiLayerMapRunEnd(self);   // as in hookedDraw
         if (!(self == g_state->ownerCtx && uiLayerIssueBlocked())) {
             const int64_t r0 = clock.on ? qpcNow() : 0;
-            g_state->realDrawInstanced(self, perInstance, drawn, startVertex, startInstance);
+            {
+                ConcoursePaneScope pane(self, perInstance, startVertex, 0, kConcoursePaneCalls);   // TEMPORARY (concourse_pane.h): the outside's non-indexed draws (beams, flares, the scatter) are withheld here; no mirror, the glass is indexed
+                if (!pane.withheld()) g_state->realDrawInstanced(self, perInstance, drawn, startVertex, startInstance);
+            }
             if (clock.on) clock.realCall(r0);
         }
     } else forwardWithVerdict(self, v, flags, 'N', perInstance, drawn, args, [&](AlteredDraw altered) {
         const int64_t r0 = clock.on ? qpcNow() : 0;
         {
             GpuCensusAlteredScope timed(self, altered);   // the game's own draw, and only it (gpu_census.h)
-            g_state->realDrawInstanced(self, perInstance, drawn, startVertex,
-                                       startInstance);
+            ConcoursePaneScope pane(self, perInstance, startVertex, 0, kConcoursePaneCalls);   // TEMPORARY (concourse_pane.h): the outside's non-indexed draws (beams, flares, the scatter) are withheld here; no mirror, the glass is indexed
+            if (!pane.withheld())
+                g_state->realDrawInstanced(self, perInstance, drawn, startVertex,
+                                           startInstance);
         }
         srvTurretHudCountIssue(self);   // issue 140: the game's own issue; a family's first scope says its state (one relaxed load otherwise)
         if (clock.on) clock.realCall(r0);
