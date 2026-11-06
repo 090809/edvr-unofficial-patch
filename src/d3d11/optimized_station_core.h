@@ -954,7 +954,7 @@ constexpr uint32_t kNodeHangarLike = 2;   // the name could name the hangar (Han
 constexpr uint32_t kNodeShipPrefix = 4;   // the name has a type prefix up to an underscore (the ship tally counts it)
 constexpr uint32_t kNodeConcourseAllow = 8;    // built 2026-11-05: the name is on the concourse cull's allow-list (concourse_cull_core.h), extra prefixes included
 constexpr uint32_t kNodeConcourseAnchor = 16;  // built 2026-11-05: the name is the concourse anchor, Standard_SocialArea
-constexpr uint32_t kNodeConcourseFarExempt = 32;   // built 2026-11-06: the name is the anchor or the hub (SA_StationHub_Compact): kept however far, the gate reads them
+constexpr uint32_t kNodeConcourseFarExempt = 32;   // built 2026-11-06: the name is the anchor, the hub (SA_StationHub_Compact) or an extra keep name (diag.concourse_keep): kept however far; the lift ignores it
 constexpr uint32_t kNodeLiftPart = 64;   // built 2026-11-06: the name contains TurboLift (the lift's cabin and doors): the lift gate and its survey read these
 
 inline bool slotFits(uintptr_t node) noexcept { return (node & 7u) == 0 && (uint64_t(node) >> 3) <= kSlotNodeMask; }

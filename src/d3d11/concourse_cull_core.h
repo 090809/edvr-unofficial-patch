@@ -35,13 +35,11 @@ constexpr size_t kAllowPrefixCount = sizeof(kAllowPrefixes) / sizeof(kAllowPrefi
 
 inline bool hasPrefixExact(const char* name, const char* prefix, size_t n) noexcept { return n > 0 && std::strncmp(name, prefix, n) == 0; }
 
-// True when `name` starts with one of the allow-list prefixes, or with one of the comma-separated extra prefixes (spaces around an entry are ignored,
-// an empty entry matches nothing). A null or empty name is not allowed (the judge keeps an unreadable name by its own rule).
-inline bool concourseAllowName(const char* name, const char* extraPrefixes) noexcept {
-    if (!name || !*name) return false;
-    for (const char* p : kAllowPrefixes)
-        if (hasPrefixExact(name, p, std::strlen(p))) return true;
-    if (!extraPrefixes) return false;
+// True when `name` starts with one of the comma-separated extra prefixes (diag.concourse_keep; spaces around an entry are ignored, an empty entry matches nothing),
+// and only those: the built-in allow-list is not looked at. These names are far-exempt as well as allowed. A null or empty name or list matches nothing.
+// concourseAllowName is the built-in allow-list or an extra prefix. (The judge keeps an unreadable name by its own rule.)
+inline bool extraKeepName(const char* name, const char* extraPrefixes) noexcept {
+    if (!name || !*name || !extraPrefixes) return false;
     const char* s = extraPrefixes;
     while (*s) {
         while (*s == ' ' || *s == '\t' || *s == ',') ++s;
@@ -53,6 +51,12 @@ inline bool concourseAllowName(const char* name, const char* extraPrefixes) noex
         s = e;
     }
     return false;
+}
+inline bool concourseAllowName(const char* name, const char* extraPrefixes) noexcept {
+    if (!name || !*name) return false;
+    for (const char* p : kAllowPrefixes)
+        if (hasPrefixExact(name, p, std::strlen(p))) return true;
+    return extraKeepName(name, extraPrefixes);
 }
 
 // The gate: on foot and in social space by Status.json, the on-foot word known, and gameplay seen in this process. Gameplay is required: a leftover
@@ -72,18 +76,18 @@ enum class Judge : uint8_t { kKeepName, kKeepUnreadableName, kKeepUnreadableSphe
 
 inline bool judgeKeeps(Judge j) noexcept { return j != Judge::kCull; }
 
-// The lift: while the player stands in a shut cabin the room is not drawn. Kept: an unreadable sphere, the anchor and the hub (`farExempt`), and a small record
-// (radius up to kSmallRadiusM) whose surface is within kLiftKeepM. Everything else is culled, whatever its name.
+// The lift: while the player stands in a shut cabin the room is not drawn. Kept: an unreadable sphere, and a small record (radius up to kSmallRadiusM) whose
+// surface is within kLiftKeepM. Everything else is culled, whatever its name, the anchor, the hub and the extra keep names included: the cabin does not need them,
+// and a rig holding them would carry the room's records with it.
 constexpr float kLiftKeepM = 8.0f;
 
 // One record. A record whose name is unreadable, or an allowed name, is kept unless its sphere is readable and wholly past kAllowedFarM (distance - radius); the
 // anchor and the hub (`farExempt`, computed from the name by the caller) are kept however far. Then: keep an unreadable sphere (not finite, or no radius); keep a
-// small, close record; cull. `lift` (the player is in a shut lift cabin) replaces all of that by the rule above kLiftKeepM.
+// small, close record; cull. `lift` (the player is in a shut lift cabin) replaces all of that by the rule above kLiftKeepM; `farExempt` does not apply to it.
 inline Judge concourseJudge(bool nameReadable, bool allowed, bool sphereReadable, float distance, float radius, bool farExempt, bool lift = false) noexcept {
     const bool sphereOk = sphereReadable && std::isfinite(distance) && std::isfinite(radius) && radius > 0.0f;
     if (lift) {
         if (!sphereOk) return Judge::kKeepUnreadableSphere;
-        if (farExempt) return Judge::kKeepName;
         const float surface = distance - radius > 0.0f ? distance - radius : 0.0f;
         if (radius <= kSmallRadiusM && surface <= kLiftKeepM) return Judge::kKeepSmallClose;
         return Judge::kCull;
@@ -572,6 +576,42 @@ private:
     uint64_t onSinceMs_ = 0;
     LiftEnd end_ = LiftEnd::kNone;
 };
+
+// ---- The view test (TEMPORARY, hotkey.concourse_view_test; removed when the arc closes, docs\concourse-cull-2026-11-05.md) ------------------------------------------
+// Which of the rig's three view-class masks (u16 at rig+0x3DA, +0x3DC; build 334925) are zeroed around the forward of a rig the veto would refuse, whether the outside
+// effects are drawn, and whether the sun pair is skipped. Mode 0 is today's cull and veto. Modes 1 to 5 forward the vetoed rigs with the masks zeroed instead, keep the
+// records and leave the panes untreated; the lift rule still judges inside a shut cabin.
+constexpr uint32_t kViewTestModes = 6;
+constexpr uint8_t kViewMask3DC = 1, kViewMask3DA = 2;   // the bits of ViewTest::masks
+struct ViewTest {
+    uint8_t masks = 0;           // kViewMask3DC | kViewMask3DA
+    bool active = false;         // modes 1 to 5: forward masked, keep the records, leave the panes
+    bool effectsDrawn = false;   // the withheld families and the far-glow limit are off
+    bool sunSkipped = false;     // the sun pair is not drawn
+};
+inline ViewTest viewTestOf(uint32_t mode) noexcept {
+    ViewTest t;
+    switch (mode) {
+        case 1: t.masks = kViewMask3DC; t.effectsDrawn = true; break;
+        case 2: t.masks = kViewMask3DA; t.effectsDrawn = true; break;
+        case 3: t.masks = kViewMask3DC | kViewMask3DA; t.effectsDrawn = true; break;
+        case 4: t.masks = kViewMask3DC | kViewMask3DA; break;
+        case 5: t.masks = kViewMask3DC | kViewMask3DA; t.sunSkipped = true; break;
+        default: return t;
+    }
+    t.active = true;
+    return t;
+}
+inline const char* viewTestText(uint32_t mode) noexcept {
+    switch (mode) {
+        case 1: return "rig+0x3DC zeroed on outside rigs, outside effects drawn, sun as now";
+        case 2: return "rig+0x3DA zeroed on outside rigs, outside effects drawn, sun as now";
+        case 3: return "rig+0x3DC and +0x3DA zeroed on outside rigs, outside effects drawn, sun as now";
+        case 4: return "rig+0x3DC and +0x3DA zeroed on outside rigs, outside effects withheld, sun as now";
+        case 5: return "rig+0x3DC and +0x3DA zeroed on outside rigs, outside effects withheld, sun pair skipped";
+        default: return "no masks zeroed: today's cull and veto, outside effects withheld, sun as now";
+    }
+}
 
 // ---- The glow levels by window type (diag.concourse_glow = "sky,angled,other,bay") ---------------------------------------------------------------------
 // The steady light of a pane: the brightest on overhead skylights, a level between on angled skylights, a middle level on any other window, and its own level on the

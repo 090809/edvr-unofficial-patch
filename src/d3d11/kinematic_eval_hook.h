@@ -149,6 +149,10 @@ void kinematicEvalDirectVetoDetach() noexcept;
 // The early rig veto (0x431DC40's entry): the decision returns true to veto; the hook then performs Elite's off-screen branch for the rig and
 // returns without the forward. Attach/detach hold the relay gate.
 using RigVetoFn = bool (*)(uintptr_t rig, uintptr_t ctx) noexcept;
+// TEMPORARY (the concourse view test, docs\concourse-cull-2026-11-05.md): asked for a rig the veto refused. 0 (the answer when unset): the off-screen branch as ever.
+// Else the rig is forwarded with its view-class masks zeroed around the forward and restored after: bit 0 rig+0x3DC, bit 1 rig+0x3DA (build 334925's offsets).
+using RigMaskFn = uint8_t (*)(uintptr_t rig, uintptr_t ctx) noexcept;
+void kinematicEvalSetRigMasks(RigMaskFn fn) noexcept;
 void kinematicEvalSetRigVeto(RigVetoFn fn) noexcept;
 const char* kinematicEvalRigVetoAttach() noexcept;
 void kinematicEvalRigVetoDetach() noexcept;

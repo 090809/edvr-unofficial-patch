@@ -17,6 +17,7 @@
 #include <vector>
 
 #include "../common/config.h"
+#include "../common/game_build.h"
 #include "../common/hotkey.h"
 #include "../common/log.h"
 #include "../common/runtime_profile.h"
@@ -272,6 +273,13 @@ ConcourseExtra g_concExtra;
 std::atomic<bool> g_concWanted{false};        // armed, on foot in social space and not sealed: the store gate is open (it sights the anchor, and judges while active)
 std::atomic<bool> g_concActive{false};        // the cull runs: wanted, the key or its override on, and the anchor seen within kConcAnchorFreshMs
 std::atomic<bool> g_liftGateOn{false};        // the tick's: the lift gate is on, the player is in a shut lift cabin (published in the snapshot as `lift`; part of g_concActive)
+// TEMPORARY (the concourse view test, hotkey.concourse_view_test; docs\concourse-cull-2026-11-05.md; removed when the arc closes): the mode applied this tick (1 to 5; 0: none), and the dump's state.
+std::atomic<uint8_t> g_viewTestRun{0};
+std::atomic<bool> g_viewTestBusy{false};   // a press is waiting for its dump, or its histogram window is open: the rig veto hook does the work
+std::atomic<bool> g_viewDumpPending{false};
+std::atomic<uint32_t> g_viewDumpMode{0};
+std::atomic<uint64_t> g_histEndMs{0};      // 0: no histogram window open
+std::atomic<uint32_t> g_histMasked{0};
 std::atomic<bool> g_concSurveyArmed{false};   // the one-shot names are being gathered: the rig and producer vetoes forward so the store judges and names every record
 bool g_roomCutPending = false;   // the camera stepped over kRoomCutM this tick (resolveTickView); the concourse tick takes it, under the state lock
 float g_roomCutM = 0.0f;
@@ -288,11 +296,13 @@ uint32_t concourseNodeFlagsOf(const char* name) noexcept {
     if (cc::concourseAllowName(name, g_concExtra.get())) f |= sealed::kNodeConcourseAllow;
     if (std::strcmp(name, cc::kAnchorName) == 0) f |= sealed::kNodeConcourseAnchor | sealed::kNodeConcourseFarExempt;
     if (std::strcmp(name, cc::kHubName) == 0) f |= sealed::kNodeConcourseFarExempt;
+    if (cc::extraKeepName(name, g_concExtra.get())) f |= sealed::kNodeConcourseFarExempt;   // diag.concourse_keep: the extra names are kept however far (an empty list matches nothing)
     if (cc::liftPartName(name)) f |= sealed::kNodeLiftPart;
     return f;
 }
 struct ConcourseWin {   // the 5 s summary's window (the callbacks' counters flush here, tcFlush)
     std::atomic<uint64_t> rigSeen{0}, rigVetoed{0}, prodVetoed{0}, prodKept{0}, storeCleared{0};
+    std::atomic<uint64_t> tot[6] = {};    // the same counts, never reset: rig seen, rig vetoed, producer vetoed, producer kept, small-close kept, store cleared (the lift's summary takes differences)
     std::atomic<uint64_t> kept[4] = {};   // name, small-close, unreadable-name, unreadable-sphere (the producer's keeps)
 };
 ConcourseWin g_concWin;
@@ -1446,6 +1456,12 @@ void tcFlush(TlsCounters& t) noexcept {
     g_concWin.prodVetoed.fetch_add(t.concProdVetoed, std::memory_order_relaxed);
     g_concWin.prodKept.fetch_add(t.concProdKept, std::memory_order_relaxed);
     g_concWin.storeCleared.fetch_add(t.concStoreCleared, std::memory_order_relaxed);
+    g_concWin.tot[0].fetch_add(t.concRigSeen, std::memory_order_relaxed);
+    g_concWin.tot[1].fetch_add(t.concRigVetoed, std::memory_order_relaxed);
+    g_concWin.tot[2].fetch_add(t.concProdVetoed, std::memory_order_relaxed);
+    g_concWin.tot[3].fetch_add(t.concProdKept, std::memory_order_relaxed);
+    g_concWin.tot[4].fetch_add(t.concKept[1], std::memory_order_relaxed);
+    g_concWin.tot[5].fetch_add(t.concStoreCleared, std::memory_order_relaxed);
     for (int k = 0; k < 4; ++k) g_concWin.kept[k].fetch_add(t.concKept[k], std::memory_order_relaxed);
     const uint32_t keepStamp = t.stamp;
     const uint32_t s0 = t.sampleStore, s1 = t.sampleProducer, s2 = t.sampleRig;
@@ -1947,6 +1963,7 @@ bool concourseProducerVeto(uintptr_t rec) noexcept {
         concourseCountKept(tc, j);
         return false;
     }
+    if (g_viewTestRun.load(std::memory_order_relaxed) != 0 && !s.lift) return false;   // TEMPORARY (the view test): nothing is culled; the judgement above and the rig tally still ran
     ++tc.concProdVetoed;
     return true;
 }
@@ -1994,8 +2011,139 @@ bool rigVetoBody(uintptr_t rig) noexcept {
 }
 
 // The rig early veto, timed one call in 32 (built v14.24; the sample is gathered since v14.26).
-bool rigVetoHook(uintptr_t rig, uintptr_t ctx) noexcept {
+// ---- TEMPORARY (the concourse view test's dump; docs\concourse-cull-2026-11-05.md, removed when the arc closes) ------------------------------------------------------------------
+// Runs on whichever thread's rig evaluation first sees the press pending (the claim is an atomic exchange, so once), from rigVetoHook, so before that rig's own forward. It
+// reads only the views of the pose context (ctx+0x40, 0x6A0 each, count at ctx+0x1A940), every read guarded, and never a rig's masks, so it cannot race the mask restore
+// (a rig's masks are written, and restored, only by the thread that evaluates that rig). The histogram reads a vetoed rig's own bytes on that rig's thread, before its zeroing.
+struct ViewHist {
+    struct Row {
+        uint8_t b5 = 0, b6 = 0;
+        uint16_t m8 = 0, mA = 0, mC = 0;
+        uint32_t n = 0;
+    };
+    std::mutex m;
+    Row rows[12];
+    uint32_t used = 0, overflow = 0, outside = 0;
+};
+ViewHist& viewHist() {
+    static ViewHist* h = new ViewHist;   // never destroyed: a callback may still be inside it at unload
+    return *h;
+}
+
+void viewTestDump(uintptr_t ctx) noexcept {
+    try {
+        const uint32_t mode = g_viewDumpMode.load(std::memory_order_relaxed);
+        const bool applied = g_viewTestRun.load(std::memory_order_relaxed) != 0;
+        Log::get().note("concourse view test: mode %u: %s%s", mode, cc::viewTestText(mode), applied || mode == 0 ? "" : " (not applied now: the concourse cull is not on)");
+        uint64_t count = 0;
+        if (!readVal(&count, ctx + 0x1A940)) {
+            Log::get().note("concourse view test: the view count at ctx+0x1A940 is unreadable");
+        } else {
+            const uint64_t n = count < 64 ? count : 64;
+            for (uint64_t i = 0; i < n; ++i) {
+                const uintptr_t v = ctx + 0x40 + 0x6A0 * static_cast<uintptr_t>(i);
+                uint32_t flags = 0, idx = 0;
+                uint16_t layer = 0;
+                uint64_t b570 = 0, b580 = 0;
+                float cam[3] = {}, pa = 0.0f, pb = 0.0f;
+                const bool ok = readVal(&flags, v + 0x688) && readVal(&layer, v + 0x68C) && readVal(&b570, v + 0x570) && readVal(&idx, v + 0x578) && readVal(&b580, v + 0x580) &&
+                                readMem(cam, v + 0x540, sizeof(cam)) && readVal(&pa, v + 0x550) && readVal(&pb, v + 0x560);
+                if (!ok) {
+                    Log::get().note("concourse view test: view %u: unreadable", static_cast<unsigned>(i));
+                    continue;
+                }
+                Log::get().note("concourse view test: view %u: flags 0x%X layer 0x%X bit570 0x%llX idx578 %u bit580 0x%llX cam %.2f %.2f %.2f A %.6g B %.6g", static_cast<unsigned>(i), flags,
+                                static_cast<unsigned>(layer), static_cast<unsigned long long>(b570), idx, static_cast<unsigned long long>(b580), static_cast<double>(cam[0]),
+                                static_cast<double>(cam[1]), static_cast<double>(cam[2]), static_cast<double>(pa), static_cast<double>(pb));
+            }
+            if (count > n) Log::get().note("concourse view test: %llu views, the first %llu shown", static_cast<unsigned long long>(count), static_cast<unsigned long long>(n));
+        }
+        ViewHist& h = viewHist();
+        {
+            std::lock_guard<std::mutex> lock(h.m);
+            for (ViewHist::Row& r : h.rows) r = ViewHist::Row();
+            h.used = h.overflow = h.outside = 0;
+        }
+        g_histMasked.store(0, std::memory_order_relaxed);
+        g_histEndMs.store(GetTickCount64() + 1000, std::memory_order_release);
+    } catch (...) {
+    }
+}
+
+void viewTestHist(uintptr_t rig) noexcept {
+    ViewHist::Row r;
+    if (!readVal(&r.b5, rig + 0x3D5) || !readVal(&r.b6, rig + 0x3D6) || !readVal(&r.m8, rig + 0x3D8) || !readVal(&r.mA, rig + 0x3DA) || !readVal(&r.mC, rig + 0x3DC)) return;
+    try {
+        ViewHist& h = viewHist();
+        std::lock_guard<std::mutex> lock(h.m);
+        ++h.outside;
+        for (uint32_t i = 0; i < h.used; ++i) {
+            ViewHist::Row& x = h.rows[i];
+            if (x.b5 == r.b5 && x.b6 == r.b6 && x.m8 == r.m8 && x.mA == r.mA && x.mC == r.mC) {
+                ++x.n;
+                return;
+            }
+        }
+        if (h.used < 12) {
+            r.n = 1;
+            h.rows[h.used++] = r;
+        } else {
+            ++h.overflow;
+        }
+    } catch (...) {
+    }
+}
+
+void viewTestFinish() noexcept {
+    try {
+        ViewHist& h = viewHist();
+        ViewHist::Row rows[12];
+        uint32_t used = 0, overflow = 0, outside = 0;
+        {
+            std::lock_guard<std::mutex> lock(h.m);
+            used = h.used;
+            overflow = h.overflow;
+            outside = h.outside;
+            for (uint32_t i = 0; i < used; ++i) rows[i] = h.rows[i];
+        }
+        std::sort(rows, rows + used, [](const ViewHist::Row& a, const ViewHist::Row& b) { return a.n > b.n; });
+        char text[900] = {};
+        int n = std::snprintf(text, sizeof(text), "concourse view test: over about a second: %u outside rigs, %u masked, %u distinct (3D5 3D6 3D8 3DA 3DC: rigs):", outside,
+                              g_histMasked.load(std::memory_order_relaxed), used + (overflow ? 1u : 0u));
+        for (uint32_t i = 0; i < used && n > 0 && static_cast<size_t>(n) < sizeof(text) - 64; ++i)
+            n += std::snprintf(text + n, sizeof(text) - static_cast<size_t>(n), " (%02X %02X %04X %04X %04X: %u)", rows[i].b5, rows[i].b6, rows[i].m8, rows[i].mA, rows[i].mC, rows[i].n);
+        if (overflow && n > 0 && static_cast<size_t>(n) < sizeof(text) - 40) std::snprintf(text + n, sizeof(text) - static_cast<size_t>(n), " (+%u rigs in more rows)", overflow);
+        Log::get().note("%s", text);
+    } catch (...) {
+    }
+}
+
+// The rig veto hook's share of the test: the dump on the first rig evaluation after a press, the histogram of vetoed rigs for about a second, then its line.
+void viewTestStep(uintptr_t rig, uintptr_t ctx, bool vetoed) noexcept {
+    if (g_viewDumpPending.exchange(false, std::memory_order_acq_rel)) viewTestDump(ctx);
+    const uint64_t end = g_histEndMs.load(std::memory_order_acquire);
+    if (end == 0) return;
+    if (GetTickCount64() >= end) {
+        if (g_histEndMs.exchange(0, std::memory_order_acq_rel) != 0) {
+            viewTestFinish();
+            if (!g_viewDumpPending.load(std::memory_order_acquire)) g_viewTestBusy.store(false, std::memory_order_release);
+        }
+        return;
+    }
+    if (vetoed) viewTestHist(rig);
+}
+
+// kinematic_eval_hook asks, for a rig the veto refused: which masks to zero around its forward (0: the off-screen branch as ever).
+uint8_t rigMaskPick(uintptr_t rig, uintptr_t ctx) noexcept {
+    (void)rig;
     (void)ctx;
+    const uint8_t run = g_viewTestRun.load(std::memory_order_relaxed);
+    if (run == 0 || g_sealedFlag.load(std::memory_order_acquire)) return 0;
+    if (g_viewTestBusy.load(std::memory_order_relaxed)) g_histMasked.fetch_add(1, std::memory_order_relaxed);
+    return cc::viewTestOf(run).masks;
+}
+
+bool rigVetoHook(uintptr_t rig, uintptr_t ctx) noexcept {
     CallbackScope scope;
     TlsCounters& tc = tcFor(g_frameStamp.load(std::memory_order_relaxed));
     ++tc.callsRig;
@@ -2003,6 +2151,7 @@ bool rigVetoHook(uintptr_t rig, uintptr_t ctx) noexcept {
     const int64_t t0 = sample ? costTicks() : 0;
     const bool veto = rigVetoBody(rig);
     if (sample) costPush(2, costMs(t0, costTicks()));
+    if (g_viewTestBusy.load(std::memory_order_relaxed)) viewTestStep(rig, ctx, veto);   // TEMPORARY (the view test): one relaxed load while idle
     return veto;
 }
 
@@ -2015,6 +2164,7 @@ void applySetting(bool on, uint32_t frame) noexcept {
     if (!on) {
         kinematicEvalSetDirectVeto(nullptr);
         kinematicEvalSetRigVeto(nullptr);
+        kinematicEvalSetRigMasks(nullptr);
         kinematicEvalDirectVetoDetach();
         kinematicEvalRigVetoDetach();
         g_storeWanted = false;
@@ -2039,6 +2189,7 @@ void applySetting(bool on, uint32_t frame) noexcept {
         const char* rig = kinematicEvalRigVetoAttach();
         kinematicEvalSetDirectVeto(&producerVetoHook);
         kinematicEvalSetRigVeto(&rigVetoHook);
+        kinematicEvalSetRigMasks(&rigMaskPick);   // TEMPORARY (the view test)
         g_storeWanted = true;
         storeHookRecompute();
         Log::get().note("optimized station: on (frame %u). Producer veto: %s; rig veto: %s; store observer: %s.", frame, direct, rig,
@@ -2927,7 +3078,7 @@ void afterStoreConcourse(uintptr_t bucket, uintptr_t record) noexcept {
     }
     if (keep) {
         ++tc.kept;
-    } else if (cullCounted(record, false)) {
+    } else if (!(g_viewTestRun.load(std::memory_order_relaxed) != 0 && !s.lift) && cullCounted(record, false)) {   // the view test keeps the records (not in a shut cabin)
         ++tc.culled;
         ++tc.concStoreCleared;
     }
@@ -3108,6 +3259,11 @@ uint64_t g_concNextPollMs = 0;
 std::string g_concExtraApplied;
 bool g_concExtraSeen = false;
 Hotkey* g_concHotkey = nullptr;
+// TEMPORARY (the concourse view test, docs\concourse-cull-2026-11-05.md; removed when the arc closes): its hotkey and mode. A press steps the mode 0 to 5 and wraps.
+Hotkey* g_viewHotkey = nullptr;
+std::string g_viewHotkeyText;
+bool g_viewHotkeyBound = false;
+uint32_t g_viewTestMode = 0;
 std::string g_concHotkeyText;
 bool g_concHotkeyBound = false;
 bool g_concWasActive = false;
@@ -3127,6 +3283,9 @@ bool g_concSettingOffLogged = false;
 cc::ClearMachine g_concClear;             // the bay glass's clearing on approach (concourse_cull_core.h)
 cc::LiftGate g_liftGate;                  // the lift gate (concourse_cull_core.h), the tick's alone
 bool g_liftWasOn = false;                 // the gate's state at the last tick
+uint64_t g_liftStartMs = 0;               // the tick the gate came on
+uint64_t g_liftTicks = 0;                 // the ticks from then, the first included, while it stayed on
+uint64_t g_liftTot0[6] = {};              // g_concWin.tot when it came on
 bool g_concWasCull = false;               // the cull's own part of `active` at the last tick (wantCull and the clearing machine), apart from the lift
 bool g_concWasWant = false;               // wantCull at the last tick: the gate's rising edge starts the names survey, a re-engage from the latch does not
 float g_concEnterShare = 0.0f;            // diag.concourse_clear_share as a fraction of the view; 0 never clears
@@ -3195,6 +3354,30 @@ void concoursePoll(uint64_t now) {
         else if (!keyText.empty()) Log::get().note("concourse cull: hotkey.concourse_cull = \"%s\" bound nothing, so the override cannot be used this session", keyText.c_str());
         else if (!first) Log::get().note("concourse cull: hotkey.concourse_cull cleared");
     }
+    const std::string viewKey = cfg.getString("hotkey.concourse_view_test", "");
+    if (!g_viewHotkeyBound || viewKey != g_viewHotkeyText) {
+        const bool first = !g_viewHotkeyBound;
+        if (!g_viewHotkey) g_viewHotkey = new Hotkey();
+        g_viewHotkeyBound = true;
+        g_viewHotkeyText = viewKey;
+        g_viewHotkey->setBinding(viewKey.c_str());
+        if (g_viewHotkey->bound()) Log::get().note("concourse view test: hotkey.concourse_view_test = \"%s\" bound (TEMPORARY: a press steps the mode 0 to 5; each step logs the views)", viewKey.c_str());
+        else if (!viewKey.empty()) Log::get().note("concourse view test: hotkey.concourse_view_test = \"%s\" bound nothing, so the test cannot be used this session", viewKey.c_str());
+        else if (!first) Log::get().note("concourse view test: hotkey.concourse_view_test cleared");
+    }
+}
+
+// A press of hotkey.concourse_view_test: the next mode, its dump on the next rig evaluation. Refused, with one line, off the build the offsets were read on.
+void concourseViewTestPress() {
+    if (!gameBuildKnown()) {
+        g_viewTestMode = 0;
+        Log::get().note("concourse view test: refused: the rig's mask offsets (+0x3DA, +0x3DC) and the view fields were read on build 334925, and this is %s", gameBuildText());
+        return;
+    }
+    g_viewTestMode = (g_viewTestMode + 1) % cc::kViewTestModes;
+    g_viewDumpMode.store(g_viewTestMode, std::memory_order_relaxed);
+    g_viewDumpPending.store(true, std::memory_order_release);
+    g_viewTestBusy.store(true, std::memory_order_release);
 }
 
 // The setting is off (fix.optimized_stations): nothing runs. One line says so when the concourse key is on.
@@ -3203,6 +3386,8 @@ void concourseSettingOffTick(uint64_t now) {
     const bool wasActive = g_concWasActive;
     g_concWanted.store(false, std::memory_order_release);
     g_liftGateOn.store(false, std::memory_order_release);
+    g_viewTestRun.store(0, std::memory_order_release);
+    detail::g_sunOff.store(g_sun.off, std::memory_order_release);   // the view test's sun override (mode 5) is off with the cull
     g_liftGate.reset();
     g_liftWasOn = false;
     g_concWasCull = false;
@@ -3831,11 +4016,28 @@ void concourseTick(uint64_t now, uint32_t frame) {
     } else {
         g_liftGate.stop();
     }
+    if (liftOn && !g_liftWasOn) {
+        g_liftStartMs = now;
+        g_liftTicks = 0;
+        for (int k = 0; k < 6; ++k) g_liftTot0[k] = g_concWin.tot[k].load(std::memory_order_relaxed);
+    }
+    if (liftOn) ++g_liftTicks;
     if (liftOn && !g_liftWasOn)
         Log::get().note("concourse cull: lift: doors shut with the player inside, the room is off (cabin %.2f m, gaps %.2f %.2f)", static_cast<double>(liftRead.cabinDistM),
                         static_cast<double>(liftRead.gap1), static_cast<double>(liftRead.gap2));
     if (!liftOn && g_liftWasOn)
         Log::get().note("concourse cull: lift: the room is back (%s), after %llu ms", cc::liftEndName(g_liftGate.lastEnd()), static_cast<unsigned long long>(now - g_liftGate.onSinceMs()));
+    // The counts across the lift, from the never-reset totals the callbacks' counters flush into (the 5 s line's window is left alone). Counters not yet flushed at this
+    // tick belong to the next line's difference. Elapsed time over the ticks counted from the first to the last in the period.
+    if (!liftOn && g_liftWasOn) {
+        uint64_t d[6] = {};
+        for (int k = 0; k < 6; ++k) d[k] = g_concWin.tot[k].load(std::memory_order_relaxed) - g_liftTot0[k];
+        const uint64_t ms = now - g_liftStartMs;
+        Log::get().note("concourse cull: lift: over %llu ms: rigs seen %llu vetoed %llu, producer vetoed %llu kept %llu (close %llu), store cleared %llu, frame mean %.2f ms over %llu frames",
+                        static_cast<unsigned long long>(ms), static_cast<unsigned long long>(d[0]), static_cast<unsigned long long>(d[1]), static_cast<unsigned long long>(d[2]),
+                        static_cast<unsigned long long>(d[3]), static_cast<unsigned long long>(d[4]), static_cast<unsigned long long>(d[5]),
+                        g_liftTicks > 0 ? static_cast<double>(ms) / static_cast<double>(g_liftTicks) : 0.0, static_cast<unsigned long long>(g_liftTicks));
+    }
     const bool liftEnded = g_liftWasOn && !liftOn;
     // The room's rigs were judged by the lift's rule: a verdict that outlives it would hold them back up to kRigRefreshN calls as the doors open. A new epoch starts them
     // empty, and a rig with no bound forwards. It matters when the cull stays on (the doors reopen in the concourse with no cut); an `active` that falls bumps it anyway.
@@ -3844,10 +4046,18 @@ void concourseTick(uint64_t now, uint32_t frame) {
     g_liftGateOn.store(liftOn, std::memory_order_release);
     const bool cullPart = wantCull && clr.cullOn;
     const bool active = cullPart || liftOn;
+    // TEMPORARY (the concourse view test): a press steps the mode; it applies only while the cull itself is on (the lift's own rule is unchanged).
+    if (g_viewHotkey && g_viewHotkey->pressed()) concourseViewTestPress();
+    const cc::ViewTest vt = cc::viewTestOf(cullPart ? g_viewTestMode : 0);
+    g_viewTestRun.store(vt.active ? static_cast<uint8_t>(g_viewTestMode) : 0, std::memory_order_release);
+    // Mode 5 skips the sun pair through the sun skip's own gate (optimizedStationSunOff, which vscreen.cpp tests in the flat and the VR draw path): g_sunOff is the pad's
+    // verdict (g_sun.off) or the test's. Written only when it differs, so a sunStep that stores g_sun.off later in this tick is put right on the next.
+    const bool sunWant = g_sun.off || vt.sunSkipped;
+    if (detail::g_sunOff.load(std::memory_order_relaxed) != sunWant) detail::g_sunOff.store(sunWant, std::memory_order_release);
     ConcoursePaneFeed feed;
     feed.measure = gateWanted;
-    feed.treat = wantCull;
-    feed.withhold = active;
+    feed.treat = wantCull && !vt.active;   // the view test: the panes are left as the game draws them, as with F4 at off
+    feed.withhold = active && !(vt.effectsDrawn && !liftOn);   // the view test: the withheld families and the far-glow limit are off (F2 off)
     feed.bayOpacity = clr.bayOpacity;
     feed.sealed = g_sealedFlag.load(std::memory_order_acquire);   // the hangar is sealed: what can only be outside is not issued, with no diag key
     feed.enterShare = g_concEnterShare;

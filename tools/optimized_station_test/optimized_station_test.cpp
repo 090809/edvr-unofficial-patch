@@ -3773,7 +3773,15 @@ int main(int argc, char** argv) {
                   "lift judge: a small record within 8 m of the surface is kept (the cabin, 2.4 m radius, 0.9 m away)");
             check(cc::concourseJudge(true, true, true, 10.5f, 2.4f, false, true) == cc::Judge::kCull, "lift judge: a surface just over 8 m is culled");
             check(cc::concourseJudge(true, true, true, 8.0f, 30.0f, false, true) == cc::Judge::kCull, "lift judge: a large record (radius over 25 m) is culled even when the camera is inside it");
-            check(cc::concourseJudge(true, true, true, 5000.0f, 900.0f, true, true) == cc::Judge::kKeepName, "lift judge: the anchor and the hub (far exempt) are kept however far");
+            check(cc::concourseJudge(true, true, true, 5000.0f, 900.0f, true, true) == cc::Judge::kCull && cc::concourseJudge(true, true, true, 40.0f, 3.0f, true, true) == cc::Judge::kCull &&
+                      cc::concourseJudge(true, true, true, 3.0f, 3.0f, true, true) == cc::Judge::kKeepSmallClose && cc::concourseJudge(true, true, true, 5000.0f, 900.0f, true, false) == cc::Judge::kKeepName,
+                  "lift judge: the far exemption (the anchor, the hub, extra keep names) does not apply: a far one is culled, a near small one kept; without the lift it is still kept"); 
+            check(cc::extraKeepName("WheelSection03", "WheelSection, Spoke") && cc::extraKeepName("SpokeA", "WheelSection, Spoke") && !cc::extraKeepName("TurboLiftDoor", "WheelSection, Spoke") &&
+                      !cc::extraKeepName("SA_Bar", "WheelSection") && !cc::extraKeepName("WheelSection03", "") && !cc::extraKeepName("WheelSection03", nullptr) && !cc::extraKeepName("", "WheelSection") &&
+                      !cc::extraKeepName(nullptr, "WheelSection") && !cc::extraKeepName("WheelSection03", " , ,") && cc::extraKeepName("WheelSection03", ",,  WheelSection "),
+                  "extra keep: only the extra list matches, the built-in allow-list does not (SA_ and TurboLift are not extra), empty entries match nothing");
+            check(cc::concourseAllowName("SA_Bar", "WheelSection") && cc::concourseAllowName("WheelSection03", "WheelSection") && !cc::concourseAllowName("WheelSection03", ""),
+                  "extra keep: concourseAllowName is still the allow-list or an extra prefix");
             check(cc::concourseJudge(false, false, false, 0.0f, 0.0f, false, true) == cc::Judge::kKeepUnreadableSphere && cc::concourseJudge(true, true, true, 20.0f, 0.0f, false, true) == cc::Judge::kKeepUnreadableSphere,
                   "lift judge: an unreadable sphere is kept, whatever the name");
             check(cc::concourseJudge(false, false, true, 250.0f, 3.0f, false, true) == cc::Judge::kCull && cc::concourseJudge(true, true, true, 300.0f, 3.0f, false, false) == cc::Judge::kCull &&
@@ -3862,6 +3870,23 @@ int main(int argc, char** argv) {
             check(!rearm, "lift gate: after a timeout the doors must be seen open again before it re-arms");
             to.stop();
             check(!to.on(), "lift gate: stop is off");
+        }
+
+        // The view test's table (TEMPORARY): mode to masks, effects, sun.
+        {
+            struct Row { uint32_t mode; uint8_t masks; bool active, effects, sun; };
+            const Row table[] = {{0, 0, false, false, false}, {1, cc::kViewMask3DC, true, true, false}, {2, cc::kViewMask3DA, true, true, false},
+                                 {3, static_cast<uint8_t>(cc::kViewMask3DC | cc::kViewMask3DA), true, true, false}, {4, static_cast<uint8_t>(cc::kViewMask3DC | cc::kViewMask3DA), true, false, false},
+                                 {5, static_cast<uint8_t>(cc::kViewMask3DC | cc::kViewMask3DA), true, false, true}, {6, 0, false, false, false}, {99, 0, false, false, false}};
+            bool all = true;
+            for (const Row& r : table) {
+                const cc::ViewTest t = cc::viewTestOf(r.mode);
+                all = all && t.masks == r.masks && t.active == r.active && t.effectsDrawn == r.effects && t.sunSkipped == r.sun;
+            }
+            check(all && cc::kViewTestModes == 6 && cc::kViewMask3DC != cc::kViewMask3DA, "view test: modes 0 to 5 give the masks, the effects and the sun of the table, and an unknown mode is mode 0");
+            check(std::strlen(cc::viewTestText(0)) > 0 && std::strcmp(cc::viewTestText(0), cc::viewTestText(1)) != 0 && std::strstr(cc::viewTestText(5), "sun pair skipped") != nullptr &&
+                      std::strstr(cc::viewTestText(2), "+0x3DA") != nullptr && std::strstr(cc::viewTestText(1), "+0x3DC") != nullptr,
+                  "view test: each mode's text names its masks, and mode 5 the sun");
         }
 
         // The lift survey's name test and moved test (TEMPORARY, log only).
