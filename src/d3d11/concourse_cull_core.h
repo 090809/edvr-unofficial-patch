@@ -72,11 +72,22 @@ enum class Judge : uint8_t { kKeepName, kKeepUnreadableName, kKeepUnreadableSphe
 
 inline bool judgeKeeps(Judge j) noexcept { return j != Judge::kCull; }
 
+// The lift: while the player stands in a shut cabin the room is not drawn. Kept: an unreadable sphere, the anchor and the hub (`farExempt`), and a small record
+// (radius up to kSmallRadiusM) whose surface is within kLiftKeepM. Everything else is culled, whatever its name.
+constexpr float kLiftKeepM = 8.0f;
+
 // One record. A record whose name is unreadable, or an allowed name, is kept unless its sphere is readable and wholly past kAllowedFarM (distance - radius); the
 // anchor and the hub (`farExempt`, computed from the name by the caller) are kept however far. Then: keep an unreadable sphere (not finite, or no radius); keep a
-// small, close record; cull.
-inline Judge concourseJudge(bool nameReadable, bool allowed, bool sphereReadable, float distance, float radius, bool farExempt) noexcept {
+// small, close record; cull. `lift` (the player is in a shut lift cabin) replaces all of that by the rule above kLiftKeepM.
+inline Judge concourseJudge(bool nameReadable, bool allowed, bool sphereReadable, float distance, float radius, bool farExempt, bool lift = false) noexcept {
     const bool sphereOk = sphereReadable && std::isfinite(distance) && std::isfinite(radius) && radius > 0.0f;
+    if (lift) {
+        if (!sphereOk) return Judge::kKeepUnreadableSphere;
+        if (farExempt) return Judge::kKeepName;
+        const float surface = distance - radius > 0.0f ? distance - radius : 0.0f;
+        if (radius <= kSmallRadiusM && surface <= kLiftKeepM) return Judge::kKeepSmallClose;
+        return Judge::kCull;
+    }
     const bool pastRoom = sphereOk && distance - radius > kAllowedFarM;
     if (!nameReadable) return pastRoom ? Judge::kCull : Judge::kKeepUnreadableName;
     if (allowed) return (!farExempt && pastRoom) ? Judge::kCull : Judge::kKeepName;
@@ -482,6 +493,85 @@ inline bool liftMoved(const float now[3], const float last[3], float limitM) noe
     const float dx = now[0] - last[0], dy = now[1] - last[1], dz = now[2] - last[2];
     return dx * dx + dy * dy + dz * dz > limitM * limitM;
 }
+
+// The lift gate: the room is off while the player is inside a cabin whose doors are shut. The reading is from the survey's table (the cabin record named TurboLift,
+// and the four door records nearest it): the doors' separation is about 1.5 m shut and 2.9 m open (the left and right pair) and about 1.4 and 2.65 (the second pair).
+constexpr float kLiftInsideM = 1.3f;       // the camera to the cabin's centre: inside (0.81 to 0.98 shut inside, 2.32 just outside the door)
+constexpr float kLiftGap1ShutM = 1.55f;    // TurboLiftDoorLeft to TurboLiftDoorRight: over this the doors are open
+constexpr float kLiftGap2ShutM = 1.42f;    // TurboLiftDoorLeft2 to TurboLiftDoorRight2
+constexpr uint32_t kLiftShutReadings = 6;  // both pairs shut, after being seen open, this many ticks running
+constexpr uint64_t kLiftMaxOnMs = 30000;   // a ride is about 6 s shut; a gate stuck on stands down
+struct LiftReading {
+    bool cabin = false;        // a record named TurboLift is in view
+    float cabinDistM = 0.0f;   // the camera to its centre
+    bool doors = false;        // all four door records were read
+    float gap1 = 0.0f, gap2 = 0.0f;
+};
+enum class LiftEnd : uint8_t { kNone, kDoorsMoved, kCut, kLeftCabin, kTimedOut, kGateOff };
+inline const char* liftEndName(LiftEnd e) noexcept {
+    switch (e) {
+        case LiftEnd::kDoorsMoved: return "the doors moved";
+        case LiftEnd::kCut: return "the camera cut";
+        case LiftEnd::kLeftCabin: return "left the cabin";
+        case LiftEnd::kTimedOut: return "timed out";
+        case LiftEnd::kGateOff: return "the cull's conditions ended";
+        default: return "none";
+    }
+}
+class LiftGate {
+public:
+    // One tick. `cut`: the camera cut to another room this tick. Returns whether the room is off.
+    bool step(const LiftReading& r, bool cut, uint64_t nowMs) noexcept {
+        const bool was = on_;
+        LiftEnd why = LiftEnd::kNone;
+        if (cut) {
+            seenOpen_ = false;
+            run_ = 0;
+            on_ = false;
+            why = LiftEnd::kCut;
+        } else if (!r.cabin || !(r.cabinDistM <= kLiftInsideM)) {
+            seenOpen_ = false;
+            run_ = 0;
+            on_ = false;
+            why = LiftEnd::kLeftCabin;
+        } else if (!r.doors) {
+            // the doors are not known this tick: hold
+        } else if (!(r.gap1 <= kLiftGap1ShutM) || !(r.gap2 <= kLiftGap2ShutM)) {
+            seenOpen_ = true;
+            run_ = 0;
+            on_ = false;
+            why = LiftEnd::kDoorsMoved;
+        } else if (seenOpen_ && !on_ && ++run_ >= kLiftShutReadings) {
+            on_ = true;
+            onSinceMs_ = nowMs;
+        }
+        if (on_ && nowMs - onSinceMs_ > kLiftMaxOnMs) {
+            on_ = false;
+            seenOpen_ = false;
+            run_ = 0;
+            why = LiftEnd::kTimedOut;
+        }
+        if (was && !on_) end_ = why;
+        return on_;
+    }
+    // The cull's own conditions are not met this tick (the key is off, not on foot, the hangar sealed): off, and nothing is remembered of the doors.
+    void stop() noexcept {
+        if (on_) end_ = LiftEnd::kGateOff;
+        on_ = false;
+        seenOpen_ = false;
+        run_ = 0;
+    }
+    bool on() const noexcept { return on_; }
+    LiftEnd lastEnd() const noexcept { return end_; }   // why the gate last went from on to off
+    uint64_t onSinceMs() const noexcept { return onSinceMs_; }
+    void reset() noexcept { *this = LiftGate(); }
+
+private:
+    bool on_ = false, seenOpen_ = false;
+    uint32_t run_ = 0;
+    uint64_t onSinceMs_ = 0;
+    LiftEnd end_ = LiftEnd::kNone;
+};
 
 // ---- The glow levels by window type (diag.concourse_glow = "sky,angled,other,bay") ---------------------------------------------------------------------
 // The steady light of a pane: the brightest on overhead skylights, a level between on angled skylights, a middle level on any other window, and its own level on the

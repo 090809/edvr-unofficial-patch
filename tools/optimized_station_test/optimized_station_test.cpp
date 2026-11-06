@@ -3753,6 +3753,117 @@ int main(int argc, char** argv) {
                   "concourse walk zone: the names");
         }
 
+        // The lift: the flag survives the slot beside the others, the judgement while the player is in a shut cabin, and the gate on the flight's own sequence.
+        {
+            const uintptr_t node = 0x7FF612340ull * 8;
+            const uint32_t key = se::classKey(300);
+            const uint32_t all = se::kNodeMechanism | se::kNodeHangarLike | se::kNodeShipPrefix | se::kNodeConcourseAllow | se::kNodeConcourseAnchor | se::kNodeConcourseFarExempt | se::kNodeLiftPart;
+            const uint64_t v = se::packSlot(node, se::NameClass::kOther, all, key);
+            se::NameClass cls = se::NameClass::kNone;
+            uint32_t flags = 0;
+            check(se::unpackSlot(v, node, key, &cls, &flags) && cls == se::NameClass::kOther && flags == all && (se::kNodeLiftPart & se::kSlotFlagMask) == se::kNodeLiftPart,
+                  "lift: all seven flags and the class survive a pack and unpack");
+            check(!se::unpackSlot(v, node, se::classKey(301), &cls, &flags) && se::unpackSlot(se::packSlot(node, se::NameClass::kOther, 0, key), node, key, &cls, &flags) && flags == 0,
+                  "lift: another generation is a miss, and a node with no flags reads none");
+
+            check(cc::concourseJudge(true, true, true, 300.0f, 3.0f, false, true) == cc::Judge::kCull, "lift judge: an allowed name 300 m away is culled");
+            check(cc::concourseJudge(true, true, true, 60.0f, 3.0f, false, true) == cc::Judge::kCull && cc::concourseJudge(true, false, true, 30.0f, 3.0f, false, true) == cc::Judge::kCull,
+                  "lift judge: an allowed name or a small prop 30 m or more away is culled (the room's usual keeps do not apply)");
+            check(cc::concourseJudge(true, true, true, 10.3f, 2.4f, false, true) == cc::Judge::kKeepSmallClose && cc::concourseJudge(true, true, true, 0.9f, 2.4f, false, true) == cc::Judge::kKeepSmallClose,
+                  "lift judge: a small record within 8 m of the surface is kept (the cabin, 2.4 m radius, 0.9 m away)");
+            check(cc::concourseJudge(true, true, true, 10.5f, 2.4f, false, true) == cc::Judge::kCull, "lift judge: a surface just over 8 m is culled");
+            check(cc::concourseJudge(true, true, true, 8.0f, 30.0f, false, true) == cc::Judge::kCull, "lift judge: a large record (radius over 25 m) is culled even when the camera is inside it");
+            check(cc::concourseJudge(true, true, true, 5000.0f, 900.0f, true, true) == cc::Judge::kKeepName, "lift judge: the anchor and the hub (far exempt) are kept however far");
+            check(cc::concourseJudge(false, false, false, 0.0f, 0.0f, false, true) == cc::Judge::kKeepUnreadableSphere && cc::concourseJudge(true, true, true, 20.0f, 0.0f, false, true) == cc::Judge::kKeepUnreadableSphere,
+                  "lift judge: an unreadable sphere is kept, whatever the name");
+            check(cc::concourseJudge(false, false, true, 250.0f, 3.0f, false, true) == cc::Judge::kCull && cc::concourseJudge(true, true, true, 300.0f, 3.0f, false, false) == cc::Judge::kCull &&
+                      cc::concourseJudge(true, true, true, 150.0f, 3.0f, false, false) == cc::Judge::kKeepName,
+                  "lift judge: an unreadable name is culled far away; the default (no lift) is unchanged");
+
+            // The gate. A reading: cabin distance, then the two gaps (doors known).
+            using cc::LiftGate;
+            using cc::LiftReading;
+            const auto rd = [](float dist, float g1, float g2) {
+                LiftReading r;
+                r.cabin = true;
+                r.cabinDistM = dist;
+                r.doors = true;
+                r.gap1 = g1;
+                r.gap2 = g2;
+                return r;
+            };
+            const LiftReading none{};
+            LiftGate g;
+            uint64_t t = 1000;
+            const auto tick = [&](const LiftReading& r, bool cut) { t += 33; return g.step(r, cut, t); };
+            // The flight: outside, shut, 3.24 m (no arm); the doors open while outside; inside, open; inside, shut (six ticks arm it); the ride; the cut at 0.98 m, gap 1.50; the
+            // destination's doors, still shut, then opening.
+            bool early = false;
+            for (int i = 0; i < 20; ++i) early = early || tick(rd(3.24f, 1.49f, 1.37f), false);
+            for (int i = 0; i < 10; ++i) early = early || tick(rd(3.5f, 2.9f, 2.65f), false);
+            check(!early && !g.on(), "lift gate: standing outside, shut or open, never arms");
+            for (int i = 0; i < 10; ++i) early = early || tick(rd(0.85f, 2.9f, 2.65f), false);
+            check(!early, "lift gate: inside with the doors open does not arm");
+            bool on5 = false;
+            for (int i = 0; i < 5; ++i) on5 = tick(rd(0.85f, 1.49f, 1.37f), false);
+            check(!on5, "lift gate: five shut readings inside are not enough");
+            check(tick(rd(0.85f, 1.49f, 1.37f), false) && g.on(), "lift gate: the sixth shut reading inside, after seeing the doors open, arms it");
+            bool stays = true;
+            for (int i = 0; i < 100; ++i) stays = tick(rd(0.98f, 1.50f, 1.40f), false) && stays;
+            check(stays, "lift gate: stays on through the ride");
+            check(!tick(rd(0.98f, 1.50f, 1.40f), true) && !g.on() && g.lastEnd() == cc::LiftEnd::kCut, "lift gate: the camera cut ends it, with the doors still reading shut");
+            bool again = false;
+            for (int i = 0; i < 12; ++i) again = again || tick(rd(0.98f, 1.50f, 1.40f), false);
+            check(!again, "lift gate: the destination's shut doors cannot arm it after the cut");
+            for (int i = 0; i < 5; ++i) again = again || tick(rd(0.98f, 2.2f, 2.0f), false);
+            check(!again && !g.on(), "lift gate: the destination's doors opening does not arm it");
+            for (int i = 0; i < 5; ++i) again = again || tick(rd(2.32f, 2.9f, 2.65f), false);
+            check(!again, "lift gate: leaving by the door stays off");
+
+            // Standing just outside a shut door at 2.32 m, never on.
+            LiftGate o;
+            bool ever = false;
+            for (int i = 0; i < 100; ++i) ever = ever || o.step(rd(2.32f, 1.49f, 1.37f), false, 5000 + 33u * i);
+            check(!ever, "lift gate: standing outside a shut door at 2.32 m is never on");
+            // A door that reopens with no cut: off at once, and it takes a fresh open and shut to arm again.
+            LiftGate r;
+            uint64_t u = 0;
+            const auto rs = [&](const LiftReading& x) { u += 33; return r.step(x, false, u); };
+            for (int i = 0; i < 3; ++i) rs(rd(0.9f, 2.9f, 2.65f));
+            for (int i = 0; i < 6; ++i) rs(rd(0.9f, 1.49f, 1.37f));
+            check(r.on(), "lift gate: armed for the reopening test");
+            check(!rs(rd(0.9f, 1.8f, 1.37f)) && r.lastEnd() == cc::LiftEnd::kDoorsMoved, "lift gate: one pair opening switches it off at once, for the doors");
+            bool re = false;
+            for (int i = 0; i < 8; ++i) re = re || rs(rd(0.9f, 1.49f, 1.37f));
+            check(re, "lift gate: shut again after the doors were seen open arms it again");
+            check(!rs(rd(0.9f, 1.49f, 1.45f)) && r.lastEnd() == cc::LiftEnd::kDoorsMoved, "lift gate: the second pair alone, over 1.42 m, is open");
+            // Doors unknown holds; no cabin or too far ends it.
+            for (int i = 0; i < 3; ++i) rs(rd(0.9f, 2.9f, 2.65f));
+            for (int i = 0; i < 6; ++i) rs(rd(0.9f, 1.49f, 1.37f));
+            LiftReading blind = rd(0.9f, 0, 0);
+            blind.doors = false;
+            const bool held1 = rs(blind);
+            const bool held2 = rs(blind);
+            check(held1 && held2, "lift gate: doors not read this tick hold the state");
+            check(!rs(rd(1.31f, 1.49f, 1.37f)) && r.lastEnd() == cc::LiftEnd::kLeftCabin, "lift gate: the cabin farther than 1.3 m ends it");
+            for (int i = 0; i < 3; ++i) rs(rd(0.9f, 2.9f, 2.65f));
+            for (int i = 0; i < 6; ++i) rs(rd(0.9f, 1.49f, 1.37f));
+            check(r.on() && !rs(none) && r.lastEnd() == cc::LiftEnd::kLeftCabin, "lift gate: no cabin record ends it");
+            // The timeout.
+            LiftGate to;
+            uint64_t w = 0;
+            for (int i = 0; i < 3; ++i) to.step(rd(0.9f, 2.9f, 2.65f), false, w += 33);
+            for (int i = 0; i < 6; ++i) to.step(rd(0.9f, 1.49f, 1.37f), false, w += 33);
+            const uint64_t armedAt = to.onSinceMs();
+            check(to.on() && to.step(rd(0.9f, 1.49f, 1.37f), false, armedAt + cc::kLiftMaxOnMs), "lift gate: on at exactly the limit");
+            check(!to.step(rd(0.9f, 1.49f, 1.37f), false, armedAt + cc::kLiftMaxOnMs + 1) && to.lastEnd() == cc::LiftEnd::kTimedOut, "lift gate: over the limit it is off, for the timeout");
+            bool rearm = false;
+            for (int i = 0; i < 10; ++i) rearm = rearm || to.step(rd(0.9f, 1.49f, 1.37f), false, armedAt + cc::kLiftMaxOnMs + 100 + 33u * i);
+            check(!rearm, "lift gate: after a timeout the doors must be seen open again before it re-arms");
+            to.stop();
+            check(!to.on(), "lift gate: stop is off");
+        }
+
         // The lift survey's name test and moved test (TEMPORARY, log only).
         {
             check(cc::liftPartName("TurboLiftDoorLeft") && cc::liftPartName("TurboLiftDoorLeft2") && cc::liftPartName("TurboLiftDoorRight") && cc::liftPartName("TurboLiftDoorRight2") &&

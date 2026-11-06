@@ -271,6 +271,7 @@ struct ConcourseExtra {
 ConcourseExtra g_concExtra;
 std::atomic<bool> g_concWanted{false};        // armed, on foot in social space and not sealed: the store gate is open (it sights the anchor, and judges while active)
 std::atomic<bool> g_concActive{false};        // the cull runs: wanted, the key or its override on, and the anchor seen within kConcAnchorFreshMs
+std::atomic<bool> g_liftGateOn{false};        // the tick's: the lift gate is on, the player is in a shut lift cabin (published in the snapshot as `lift`; part of g_concActive)
 std::atomic<bool> g_concSurveyArmed{false};   // the one-shot names are being gathered: the rig and producer vetoes forward so the store judges and names every record
 bool g_roomCutPending = false;   // the camera stepped over kRoomCutM this tick (resolveTickView); the concourse tick takes it, under the state lock
 float g_roomCutM = 0.0f;
@@ -287,6 +288,7 @@ uint32_t concourseNodeFlagsOf(const char* name) noexcept {
     if (cc::concourseAllowName(name, g_concExtra.get())) f |= sealed::kNodeConcourseAllow;
     if (std::strcmp(name, cc::kAnchorName) == 0) f |= sealed::kNodeConcourseAnchor | sealed::kNodeConcourseFarExempt;
     if (std::strcmp(name, cc::kHubName) == 0) f |= sealed::kNodeConcourseFarExempt;
+    if (cc::liftPartName(name)) f |= sealed::kNodeLiftPart;
     return f;
 }
 struct ConcourseWin {   // the 5 s summary's window (the callbacks' counters flush here, tcFlush)
@@ -501,6 +503,7 @@ struct PadSnapshot {
     bool lost = false;            // gathered entries were lost before this publication: the callbacks keep every record
     bool engagePending = false;   // built v14.31: an engage is pending: every pass gathers the near list, the own candidate and the tally
     bool concourse = false;       // built 2026-11-05: the concourse cull is active (the producer veto judges by name)
+    bool lift = false;            // built 2026-11-06: the player is in a shut lift cabin: the judgement keeps only what is near (cc::concourseJudge)
     bool walkOn = false;          // TEMPORARY (the walk survey): this publication's passes report what the seal would cull against walkCell; nothing else reads either
     sealed::OwnCell walkCell;
 };
@@ -1938,7 +1941,7 @@ bool concourseProducerVeto(uintptr_t rec) noexcept {
     if (sphere) prodPutGen(rec, centre, radius, s.prodGen);
     const bool nameReadable = ni.cls != sealed::NameClass::kUnnamed && ni.cls != sealed::NameClass::kNone;
     const float d = sphere ? sealed::distance(centre, s.cam) : 0.0f;
-    const cc::Judge j = cc::concourseJudge(nameReadable, (ni.flags & sealed::kNodeConcourseAllow) != 0, sphere, d, radius, (ni.flags & sealed::kNodeConcourseFarExempt) != 0);
+    const cc::Judge j = cc::concourseJudge(nameReadable, (ni.flags & sealed::kNodeConcourseAllow) != 0, sphere, d, radius, (ni.flags & sealed::kNodeConcourseFarExempt) != 0, s.lift);
     if (cc::judgeKeeps(j)) {
         ++tc.concProdKept;
         concourseCountKept(tc, j);
@@ -2463,6 +2466,7 @@ void publishSnapshot() noexcept {
     s.lost = g_lossPublished;
     s.engagePending = g_engagePending;
     s.concourse = g_concActive.load(std::memory_order_acquire);
+    s.lift = g_liftGateOn.load(std::memory_order_acquire);
     s.walkOn = g_walkPassArmed;
     if (s.walkOn) s.walkCell = g_walkCellCopy;
     g_engagePublished = g_engagePending;
@@ -2609,7 +2613,7 @@ void liftSurveyNote(uintptr_t record, uintptr_t node, const NodeInfo& ni) noexce
 // The anchor's sighting (and the hub's, while the tick wants it): whatever path the store callback takes, this is how the cull finds its room. Shared by the
 // concourse path and the seal's gather path (a docked, on-foot pass with the cull not active), so the pad's gathers and the anchor's sighting both go on.
 void concourseSight(uintptr_t record, uintptr_t node, const NodeInfo& ni) noexcept {
-    if (g_liftSurveyOn.load(std::memory_order_relaxed) && (ni.flags & sealed::kNodeConcourseAllow) != 0) liftSurveyNote(record, node, ni);   // log only
+    if (g_liftSurveyOn.load(std::memory_order_relaxed) && (ni.flags & sealed::kNodeLiftPart) != 0) liftSurveyNote(record, node, ni);   // the lift gate's input and the survey's log
     if ((ni.flags & sealed::kNodeConcourseAnchor) != 0) {
         g_concAnchorAddr.store(record, std::memory_order_relaxed);
         g_concAnchorMs.store(GetTickCount64(), std::memory_order_relaxed);
@@ -2727,6 +2731,7 @@ void afterStoreJudge(uintptr_t bucket, uintptr_t record, bool judge) noexcept {
     // Built 2026-11-06: a docked, unsealed pass with the cull wanted but not active (on foot in the hangar) goes this way, not the concourse one: the anchor's
     // sighting goes on from here, so the cull can re-arm, and the pad's gathers below are as they are with the key off.
     if (!judge && g_concWanted.load(std::memory_order_relaxed)) concourseSight(record, node, ni);
+    else if (!judge && g_liftSurveyOn.load(std::memory_order_relaxed) && (ni.flags & sealed::kNodeLiftPart) != 0) liftSurveyNote(record, node, ni);   // the lift gate's input on the hangar side
     if (!judge && s.walkOn) walkSurveyRecord(s, record, node, ni, cam);   // log only: one relaxed load off the survey's pass
     const bool full = sealed::fullGatherPass(stamp, s.engagePending, s.held);
     if (!judge && !sealed::nodeWantsCentre(ni.cls, ni.flags, s.giveUp, s.latchPending, s.namesPending, full)) {
@@ -2909,7 +2914,7 @@ void afterStoreConcourse(uintptr_t bucket, uintptr_t record) noexcept {
     const bool nameReadable = ni.cls != sealed::NameClass::kUnnamed && ni.cls != sealed::NameClass::kNone;
     const float d = sphere ? sealed::distance(wr.world, s.cam) : 0.0f;
     const cc::Judge j = cc::concourseJudge(nameReadable, (ni.flags & sealed::kNodeConcourseAllow) != 0, sphere, d, sphere ? wr.radius : 0.0f,
-                                      (ni.flags & sealed::kNodeConcourseFarExempt) != 0);
+                                      (ni.flags & sealed::kNodeConcourseFarExempt) != 0, s.lift);
     const bool keep = cc::judgeKeeps(j);
     const float zero[3] = {0.0f, 0.0f, 0.0f};
     gatherRigNote(w, bucket, record, sphere ? wr.world : zero, sphere ? wr.radius : 0.0f, stamp,
@@ -3120,6 +3125,9 @@ uint32_t g_concTraceReason = 0;
 uint64_t g_concTraceReasonMs = 0;
 bool g_concSettingOffLogged = false;
 cc::ClearMachine g_concClear;             // the bay glass's clearing on approach (concourse_cull_core.h)
+cc::LiftGate g_liftGate;                  // the lift gate (concourse_cull_core.h), the tick's alone
+bool g_liftWasOn = false;                 // the gate's state at the last tick
+bool g_concWasCull = false;               // the cull's own part of `active` at the last tick (wantCull and the clearing machine), apart from the lift
 bool g_concWasWant = false;               // wantCull at the last tick: the gate's rising edge starts the names survey, a re-engage from the latch does not
 float g_concEnterShare = 0.0f;            // diag.concourse_clear_share as a fraction of the view; 0 never clears
 bool g_concEnterSeen = false;
@@ -3194,6 +3202,10 @@ void concourseSettingOffTick(uint64_t now) {
     concoursePoll(now);
     const bool wasActive = g_concWasActive;
     g_concWanted.store(false, std::memory_order_release);
+    g_liftGateOn.store(false, std::memory_order_release);
+    g_liftGate.reset();
+    g_liftWasOn = false;
+    g_concWasCull = false;
     g_concActive.store(false, std::memory_order_release);
     g_concSurveyArmed.store(false, std::memory_order_release);
     g_concSurveyOn = false;
@@ -3512,7 +3524,7 @@ void walkSurveyReport() noexcept {
 // At most every 33 ms: the lift parts seen in the last 60 frames and within 12 m (surface) of the camera, as one line when a position moved over 0.02 m since
 // it was last logged, the set changed, or a second has passed. Parts unseen for 600 frames are dropped from the table.
 constexpr uint32_t kLiftLinesCap = 3000, kLiftSeenFrames = 60, kLiftDropFrames = 600;
-constexpr float kLiftReachM = 12.0f, kLiftMovedM = 0.02f;
+constexpr float kLiftReachM = 12.0f, kLiftMovedM = 0.02f, kLiftDoorReachM = 4.0f;   // the last: a door record counts as the cabin's within this of its centre
 constexpr uint64_t kLiftPollMs = 33, kLiftRepeatMs = 1000;
 bool g_liftOn = false;
 uint64_t g_liftPollMsLast = 0, g_liftLineMs = 0;
@@ -3556,13 +3568,13 @@ void liftSurveyTick(uint64_t now) noexcept {
             std::lock_guard<std::mutex> lock(a.mtx);
             overflow = a.overflow;
             for (size_t i = 0; i < a.used;) {
-                const uint32_t age = stampNow - a.parts[i].stamp;
-                if (age > kLiftDropFrames && age < 0x80000000u) {
+                const int32_t age = static_cast<int32_t>(stampNow - a.parts[i].stamp);   // negative: seen by a callback that read the next frame's stamp
+                if (age > static_cast<int32_t>(kLiftDropFrames)) {
                     a.parts[i] = a.parts[--a.used];
                     continue;
                 }
                 const LiftPart& e = a.parts[i];
-                if (age <= kLiftSeenFrames) {
+                if (age <= static_cast<int32_t>(kLiftSeenFrames)) {
                     const float surface = std::max(0.0f, sealed::distance(e.c, g_frameCam) - e.r);
                     if (surface <= kLiftReachM) seen.push_back(e);
                 }
@@ -3632,6 +3644,52 @@ void liftSurveyTick(uint64_t now) noexcept {
         }
     } catch (...) {
     }
+}
+
+// ---- The lift gate's reading (the survey's table, `c`): the cabin record named TurboLift nearest the camera, and the four door records nearest it ------------------
+cc::LiftReading liftReadNow() noexcept {
+    cc::LiftReading r;
+    try {
+        const uint32_t stampNow = g_frameStamp.load(std::memory_order_relaxed);
+        LiftAgg& a = liftAgg();
+        std::lock_guard<std::mutex> lock(a.mtx);
+        const LiftPart* cabin = nullptr;
+        float best = 0.0f;
+        for (size_t i = 0; i < a.used; ++i) {
+            const LiftPart& e = a.parts[i];
+            if (static_cast<int32_t>(stampNow - e.stamp) > static_cast<int32_t>(kLiftSeenFrames) || std::strcmp(e.name, "TurboLift") != 0) continue;
+            const float d = sealed::distance(e.c, g_frameCam);
+            if (!cabin || d < best) {
+                cabin = &e;
+                best = d;
+            }
+        }
+        if (!cabin) return r;
+        r.cabin = true;
+        r.cabinDistM = best;
+        static const char* const kDoors[4] = {"TurboLiftDoorLeft", "TurboLiftDoorRight", "TurboLiftDoorLeft2", "TurboLiftDoorRight2"};
+        const LiftPart* door[4] = {};
+        float db[4] = {};
+        for (size_t i = 0; i < a.used; ++i) {
+            const LiftPart& e = a.parts[i];
+            if (static_cast<int32_t>(stampNow - e.stamp) > static_cast<int32_t>(kLiftSeenFrames)) continue;
+            for (int k = 0; k < 4; ++k) {
+                if (std::strcmp(e.name, kDoors[k]) != 0) continue;
+                const float d = sealed::distance(e.c, cabin->c);
+                if (d <= kLiftDoorReachM && (!door[k] || d < db[k])) {
+                    door[k] = &e;
+                    db[k] = d;
+                }
+            }
+        }
+        if (door[0] && door[1] && door[2] && door[3]) {
+            r.doors = true;
+            r.gap1 = sealed::distance(door[0]->c, door[1]->c);
+            r.gap2 = sealed::distance(door[2]->c, door[3]->c);
+        }
+    } catch (...) {
+    }
+    return r;
 }
 
 void walkSurveyTick(uint64_t now, bool camIn) {
@@ -3762,7 +3820,30 @@ void concourseTick(uint64_t now, uint32_t frame) {
     const bool gateWanted = armed && social && !sealedNow;
     const bool wantCull = gateWanted && effective && anchor;   // the cull is wanted: the panes are treated whatever phase the clearing machine is in
     const cc::ClearOutput clr = concourseClearStep(now, wantCull, gateWanted, gateWanted ? concoursePaneShares() : ConcoursePaneShares{});
-    const bool active = wantCull && clr.cullOn;
+    // Built 2026-11-06: the lift. In a shut cabin the room is not drawn, in either room: the lift gate (concourse_cull_core.h) reads the cabin and its doors from the
+    // survey's table. It needs the key on and the commander on foot, with the hangar not sealed; otherwise it stands down.
+    const bool onFoot = (g_statusFlags2Now & sealed::kFlags2OnFoot) != 0;
+    cc::LiftReading liftRead;
+    bool liftOn = false;
+    if (armed && effective && onFoot && !sealedNow && g_frameCamValid) {
+        liftRead = liftReadNow();
+        liftOn = g_liftGate.step(liftRead, cutNow, now);
+    } else {
+        g_liftGate.stop();
+    }
+    if (liftOn && !g_liftWasOn)
+        Log::get().note("concourse cull: lift: doors shut with the player inside, the room is off (cabin %.2f m, gaps %.2f %.2f)", static_cast<double>(liftRead.cabinDistM),
+                        static_cast<double>(liftRead.gap1), static_cast<double>(liftRead.gap2));
+    if (!liftOn && g_liftWasOn)
+        Log::get().note("concourse cull: lift: the room is back (%s), after %llu ms", cc::liftEndName(g_liftGate.lastEnd()), static_cast<unsigned long long>(now - g_liftGate.onSinceMs()));
+    const bool liftEnded = g_liftWasOn && !liftOn;
+    // The room's rigs were judged by the lift's rule: a verdict that outlives it would hold them back up to kRigRefreshN calls as the doors open. A new epoch starts them
+    // empty, and a rig with no bound forwards. It matters when the cull stays on (the doors reopen in the concourse with no cut); an `active` that falls bumps it anyway.
+    if (liftEnded) bumpRigEpoch();
+    g_liftWasOn = liftOn;
+    g_liftGateOn.store(liftOn, std::memory_order_release);
+    const bool cullPart = wantCull && clr.cullOn;
+    const bool active = cullPart || liftOn;
     ConcoursePaneFeed feed;
     feed.measure = gateWanted;
     feed.treat = wantCull;
@@ -3786,7 +3867,7 @@ void concourseTick(uint64_t now, uint32_t frame) {
         for (int k = 0; k < 3; ++k) feed.up[k] = upValid ? up[k] : 0.0f;
     }
     concoursePaneSetFeed(feed);
-    g_concWanted.store(gateWanted, std::memory_order_release);
+    g_concWanted.store(gateWanted || liftOn, std::memory_order_release);   // the lift opens the store route in the hangar too (it is not social space there)
     g_concHubWanted.store(gateWanted && g_concHubAddr.load(std::memory_order_relaxed) == 0, std::memory_order_relaxed);
     const bool transitioned = active != g_concWasActive;
     if (transitioned) {
@@ -3795,16 +3876,19 @@ void concourseTick(uint64_t now, uint32_t frame) {
             g_concActive.store(true, std::memory_order_release);
             // The names first, at a gate or key rising edge only (a return from the clearing, which now follows the bay in view and happens each time you turn round, does not rerun them). No rig has been vetoed yet, so the
             // survey's forwarding shows nothing that was not already on screen.
-            if (!g_concWasWant) g_concSurveyDueMs = now;
+            if (!g_concWasWant && cullPart) g_concSurveyDueMs = now;
             g_concSumMs = now;
             g_concSumFrames = 0;
             for (int k = 0; k < 3; ++k) g_concSumCalls[k] = g_concCallsTotal[k].load(std::memory_order_relaxed);
-            Log::get().note("concourse cull: on");
+            Log::get().note(cullPart ? "concourse cull: on" : "concourse cull: on (the lift: doors shut with the player inside)");
         } else {
             g_concActive.store(false, std::memory_order_release);
             bumpRigEpoch();
             g_concSurveyDueMs = 0;
-            const char* why = !effective ? "the key or its override is off"
+            char liftWhy[96] = {};
+            if (liftEnded && !g_concWasCull) std::snprintf(liftWhy, sizeof(liftWhy), "the lift: %s", cc::liftEndName(g_liftGate.lastEnd()));
+            const char* why = liftWhy[0] != '\0' ? liftWhy
+                              : !effective ? "the key or its override is off"
                               : sealedNow ? "the hangar seal engaged"
                               : cutNow    ? "the camera cut to another room"
                               : !social   ? "no longer on foot in social space"
@@ -3818,6 +3902,7 @@ void concourseTick(uint64_t now, uint32_t frame) {
         g_concSurveyDueMs = now + 2000;   // a toggle-on while the cull stays active (the override flipped back on): the names again
     }
     g_concWasWant = wantCull;
+    g_concWasCull = cullPart;
     if (!wantCull && !transitioned) {
         const uint32_t keyCode = g_concOverride == ConcOverride::kNone ? (g_concKeyOn ? 1u : 0u) : (g_concOverride == ConcOverride::kOn ? 2u : 3u);
         const uint32_t waitKey = (effective ? 1u : 0u) | (social ? 2u : 0u) | (anchor ? 4u : 0u) | (g_frameCamValid ? 8u : 0u) | (sealedNow ? 16u : 0u) | (keyCode << 5);
