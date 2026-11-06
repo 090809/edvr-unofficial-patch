@@ -3938,6 +3938,7 @@ void* temporalInner(void* srcTex, int eye, const float* bounds,
         float tvCam[3] = {0.0f, 0.0f, 0.0f};
         float worldDelta[9] = {1, 0, 0, 0, 1, 0, 0, 0, 1};
         bool worldValid = false;
+        bool gateJump = false;   // the camera gate dropped the translation (a floating-origin jump) or carried the last delta in place of this frame's: the frame-generation shadow scorer skips it
         const uint32_t sceneDraws = depthProbeSceneDraws();
         if (candValid[2]) {
             // The delta and its z flip: temporalWorldFromRows (temporal_math.h).
@@ -4024,6 +4025,7 @@ void* temporalInner(void* srcTex, int eye, const float* bounds,
             // witness on the line.
             const TemporalCameraStep step = temporalCameraGateStep(
                 g_cameraGate, g_prevRows, g_curRows, move, diffDeg, worldDelta, tvCam);
+            gateJump = step.jump || step.carried;
             if (step.jump) {
                 ++g_camDropMove;
                 // The jump's frame, for the eye run's trace and the
@@ -5162,7 +5164,32 @@ void* temporalInner(void* srcTex, int eye, const float* bounds,
                         gpuCensusEnd(ctx, GpuCensusSection::DoorSkyRing);
                     }
                     // Frame generation, Phase 1 (fix.frame_generation_shadow, TEMPORARY): the key off costs the branch.
-                    if (usedDlaa && frameGenShadowOn()) frameGenShadowEyeFrame(static_cast<uint32_t>(eye), w, h);
+                    if (usedDlaa && frameGenShadowOn()) {
+                        FrameGenShadowFrame fg;
+                        fg.renderW = w; fg.renderH = h; fg.outW = oW; fg.outH = oH;
+                        fg.outSrv = e.dlOutSrv;
+                        fg.depthSrv = e.dlDepthSrv;
+                        fg.tanNow = tanNow;
+                        fg.tanPrev = useTanPrev ? tanPrev : nullptr;
+                        fg.depthA = p.knobs[0];
+                        fg.depthB = p.knobs[2];
+                        fg.splitMetres = p.split[0];
+                        for (int i = 0; i < 3; ++i) {
+                            fg.deltas.tv[i] = p.tvCam[i];
+                            fg.deltas.th[i] = p.tvUsed[i];
+                        }
+                        memcpy(fg.deltas.Hd, delta, sizeof(fg.deltas.Hd));
+                        // Without the world path (worldOn false) the pass's tvCam is zero and cand[2] may not be set: the scorer skips the frame on worldValid.
+                        if (worldOn) memcpy(fg.deltas.W, cand[2], sizeof(fg.deltas.W));
+                        fg.depthWritten = zcWritten;
+                        fg.prevDepthValid = e.zPrevValid;
+                        fg.worldValid = worldOn;
+                        fg.cameraJump = gateJump || jumpedNow;
+                        // Timed by the census as "frame generation shadow", on a line of its own (nested inside the temporal whole, in no total); a window without the key never calls it.
+                        gpuCensusBegin(ctx, GpuCensusSection::DoorFrameGenShadow);
+                        frameGenShadowEyeFrame(dev, ctx, static_cast<uint32_t>(eye), g_rowsFrame, fg);
+                        gpuCensusEnd(ctx, GpuCensusSection::DoorFrameGenShadow);
+                    }
                 }
             }
         }
@@ -6352,6 +6379,7 @@ static void temporalPassSkyDiagTick() {
 
 void temporalPassFrameBoundary() {
     g_eyeFinalClock.boundary(g_eyeFinalRun.armed);
+    frameGenShadowFrameBoundary();   // the shadow scorer's one-second line (fix.frame_generation_shadow, TEMPORARY); the key off costs the branch
     if (!detail::g_temporalPassWantedFssChrome) return;
     for (int eye = 0; eye < 2; ++eye) {
         if (g_rigidDraw[eye].seen && g_rigidDraw[eye].frame == g_rowsFrame) {
