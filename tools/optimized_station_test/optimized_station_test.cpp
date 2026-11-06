@@ -3,6 +3,7 @@
 // shell, a hangar change, launch), the pad-local frame's round trip and the release's threshold, the parse of the per-size floors, the own-ship
 // prefix and sphere, the bay's volume, and the unreadable rule. No DLL and no game.
 #include "../../src/d3d11/optimized_station_core.h"
+#include "../../src/d3d11/concourse_cull_core.h"   // the concourse cull: allow-list, gate, judge, rig verdict, pane triples (pure)
 #include "../../src/d3d11/avatar_hooks_core.h"
 #include "../../src/d3d11/journal_watch.h"   // journalSeatedFromFlags (a constexpr; the rig does not link the watcher)
 #include "../../src/d3d11/station_gather_core.h"
@@ -3226,6 +3227,140 @@ int main(int argc, char** argv) {
         check(!idle.active() && !idle.begin(nullptr, nullptr, nullptr), "sun mask: without a context nothing is bound and begin() declines");
         idle.end(nullptr);
         check(!idle.active(), "sun mask: end() without a begin() does nothing");
+    }
+
+
+    // ---- The concourse cull (docs\concourse-cull-2026-11-05.md, src\d3d11\concourse_cull_core.h) ----------------------------------------------------------------
+    {
+        namespace cc = edvr::concourse;
+        char msg[200];
+        const char* const allowed[] = {"Standard_SocialArea", "SA_Station_01_Bar", "PS_Sittable_Sofa_01", "FUI_Python", "PROP_Tablet", "PlantStack0",
+                                       "STAT_HoloBanner_VertA", "GUI_Interactive_Terminal_Standing_Gen_01", "TP_M_Exp01_HelmetLightRig", "HangarLobby"};
+        for (const char* n : allowed) {
+            std::snprintf(msg, sizeof(msg), "concourse allow-list: %s is the room", n);
+            check(cc::concourseAllowName(n, nullptr), msg);
+        }
+        const char* const refused[] = {"WheelSection00", "Spoke03", "RingRoad07", "HabitatRingA", "DockingHub", "HangerMedium", "LandingPadSmallA",
+                                       "Anaconda", "CobraMkV_Rear_Arm_Upper", "Exhaust", "Barrel"};
+        for (const char* n : refused) {
+            std::snprintf(msg, sizeof(msg), "concourse allow-list: %s is not the room", n);
+            check(!cc::concourseAllowName(n, nullptr), msg);
+        }
+        check(!cc::concourseAllowName("sa_station", nullptr) && !cc::concourseAllowName("standard_socialarea", nullptr) && !cc::concourseAllowName("fui_python", nullptr),
+              "concourse allow-list: the prefix match is exact case");
+        check(!cc::concourseAllowName("", nullptr) && !cc::concourseAllowName(nullptr, nullptr), "concourse allow-list: an empty or null name is not allowed");
+        check(!cc::concourseAllowName("XSA_Bar", nullptr), "concourse allow-list: a prefix matches at the start of the name only");
+        check(cc::concourseAllowName("Spoke03", "Spoke,Ring") && cc::concourseAllowName("RingRoad07", "Spoke,Ring"), "concourse extra prefixes: Spoke and Ring are kept");
+        check(cc::concourseAllowName("Spoke03", " Wheel , Spoke ") && cc::concourseAllowName("WheelSection00", " Wheel , Spoke "),
+              "concourse extra prefixes: spaces around an entry are ignored");
+        check(!cc::concourseAllowName("Anaconda", "Spoke,Ring") && !cc::concourseAllowName("HabitatRingA", "Spoke,Ring"),
+              "concourse extra prefixes: another name, and a prefix found inside a name, stay culled");
+        check(!cc::concourseAllowName("Anaconda", "") && !cc::concourseAllowName("Anaconda", ",,  ,") && !cc::concourseAllowName("Anaconda", nullptr),
+              "concourse extra prefixes: an empty list or empty entries match nothing");
+        check(cc::concourseAllowName("SA_Station_01_Bar", "Spoke") && !cc::concourseAllowName("spoke03", "Spoke"), "concourse extra prefixes: the built-in list stays, and the extras are exact case");
+
+        // The gate: Status.json Flags2 0x00014009 is on foot, in station, social space.
+        check(cc::concourseSocialOnFoot(0x00014009u, true, true), "concourse gate: Flags2 0x00014009 with gameplay is on");
+        check(!cc::concourseSocialOnFoot(0x00014009u, true, false), "concourse gate: without gameplay it is off (a leftover on-foot bit must not cull the main menu's hangar)");
+        check(!cc::concourseSocialOnFoot(0x00014009u, false, true), "concourse gate: with the on-foot word unknown it is off");
+        check(!cc::concourseSocialOnFoot(0x00002009u, true, true), "concourse gate: the hangar bits (bit 13) without bit 14 are off");
+        check(!cc::concourseSocialOnFoot(0u, true, true), "concourse gate: Flags2 0 is off");
+        check(!cc::concourseSocialOnFoot(0x00004000u, true, true) && !cc::concourseSocialOnFoot(0x00000001u, true, true), "concourse gate: each of bit 0 and bit 14 alone is off");
+
+        // The judgement.
+        check(cc::concourseJudge(true, false, true, 5.0f, 300.0f) == cc::Judge::kCull, "concourse judge: the ring (WheelSection00, 5 m away, radius 300 m) is culled");
+        check(cc::concourseJudge(true, false, true, 1.0f, 1.0f) == cc::Judge::kKeepSmallClose, "concourse judge: Barrel at 1 m with radius 1 m is kept (small and close)");
+        check(cc::concourseJudge(true, true, true, 500.0f, 3.0f) == cc::Judge::kKeepName, "concourse judge: an allowed name 500 m away is kept");
+        check(cc::concourseJudge(false, false, true, 5.0f, 300.0f) == cc::Judge::kKeepUnreadableName, "concourse judge: an unreadable name is kept");
+        check(cc::concourseJudge(true, false, false, 0.0f, 0.0f) == cc::Judge::kKeepUnreadableSphere, "concourse judge: an unreadable sphere is kept");
+        check(cc::concourseJudge(true, false, true, 300.0f, 10.0f) == cc::Judge::kCull, "concourse judge: Spoke03 at 300 m with radius 10 m is culled");
+        check(cc::concourseJudge(true, false, true, 40.0f, 25.0f) == cc::Judge::kKeepSmallClose && cc::concourseJudge(true, false, true, 40.01f, 25.0f) == cc::Judge::kCull &&
+                  cc::concourseJudge(true, false, true, 40.0f, 25.01f) == cc::Judge::kCull,
+              "concourse judge: small and close is radius at most 25 m and distance at most 40 m, both edges inclusive");
+        check(cc::concourseJudge(true, false, true, std::nanf(""), 10.0f) == cc::Judge::kKeepUnreadableSphere &&
+                  cc::concourseJudge(true, false, true, 10.0f, std::nanf("")) == cc::Judge::kKeepUnreadableSphere &&
+                  cc::concourseJudge(true, false, true, 10.0f, 0.0f) == cc::Judge::kKeepUnreadableSphere,
+              "concourse judge: a sphere that is not finite, or has no radius, is unreadable and kept");
+        check(cc::concourseJudge(true, true, false, 0.0f, 0.0f) == cc::Judge::kKeepName && cc::concourseJudge(false, true, true, 5.0f, 300.0f) == cc::Judge::kKeepUnreadableName,
+              "concourse judge: the name rules come first (an allowed name with no sphere is kept for its name; an unreadable name wins over an allowed flag)");
+        check(cc::judgeKeeps(cc::Judge::kKeepName) && cc::judgeKeeps(cc::Judge::kKeepUnreadableName) && cc::judgeKeeps(cc::Judge::kKeepUnreadableSphere) &&
+                  cc::judgeKeeps(cc::Judge::kKeepSmallClose) && !cc::judgeKeeps(cc::Judge::kCull),
+              "concourse judge: only a cull is not a keep");
+
+        // The rig verdict: vetoed only if a record was judged and none was kept.
+        check(!cc::concourseRigVetoed(0, 0), "concourse rig: a rig with nothing judged forwards");
+        check(cc::concourseRigVetoed(5, 0), "concourse rig: five records judged and none kept is vetoed");
+        check(!cc::concourseRigVetoed(5, 1) && !cc::concourseRigVetoed(5, 5), "concourse rig: one kept record, or all kept, forwards");
+        cc::RigTally t;
+        check(!cc::concourseRigVetoed(t), "concourse rig: an empty tally forwards");
+        t.note(false);
+        t.note(false);
+        check(t.judged == 2 && t.kept == 0 && cc::concourseRigVetoed(t), "concourse rig: two culled records veto the rig");
+        t.note(true);
+        check(t.judged == 3 && t.kept == 1 && !cc::concourseRigVetoed(t), "concourse rig: a kept record among them lifts the veto");
+
+        // The node cache carries the two flags beside the older three, and the key keeps its meaning.
+        {
+            const uintptr_t node = 0x7FF612340ull * 8;
+            const uint32_t key = se::classKey(300);
+            const uint32_t all = se::kNodeMechanism | se::kNodeHangarLike | se::kNodeShipPrefix | se::kNodeConcourseAllow | se::kNodeConcourseAnchor;
+            const uint64_t v = se::packSlot(node, se::NameClass::kOther, all, key);
+            se::NameClass cls = se::NameClass::kNone;
+            uint32_t flags = 0;
+            check(se::unpackSlot(v, node, key, &cls, &flags) && cls == se::NameClass::kOther && flags == all, "concourse node cache: all five flags and the class survive a pack and unpack");
+            check(!se::unpackSlot(v, node, se::classKey(301), &cls, &flags), "concourse node cache: another generation is still a miss");
+            check(se::kNodeConcourseAllow != se::kNodeMechanism && se::kNodeConcourseAllow != se::kNodeHangarLike && se::kNodeConcourseAllow != se::kNodeShipPrefix &&
+                      se::kNodeConcourseAnchor != se::kNodeConcourseAllow && (se::kNodeConcourseAnchor & se::kSlotFlagMask) != 0,
+                  "concourse node cache: the two flags are free bits inside the slot's flag field");
+        }
+        // The store's mode: the concourse mode never outranks the setting or the seal, and ranks above plain gathering.
+        check(se::storeMode(false, false, false, true) == se::StoreMode::kNone, "concourse store mode: the setting off is none, whatever the concourse says");
+        check(se::storeMode(true, true, false, true) == se::StoreMode::kJudge, "concourse store mode: sealed is still the seal's judge");
+        check(se::storeMode(true, false, false, true) == se::StoreMode::kConcourse && se::storeMode(true, false, true, true) == se::StoreMode::kConcourse,
+              "concourse store mode: wanted and unsealed is the concourse mode, docked or not");
+        check(se::storeMode(true, false, true) == se::StoreMode::kGather && se::storeMode(true, false, false) == se::StoreMode::kNone && se::storeMode(true, true, true) == se::StoreMode::kJudge,
+              "concourse store mode: with the concourse not wanted the old modes are unchanged");
+
+        // The pane triples.
+        const cc::PaneTriple list[3] = {{0x1111111111111111ull, 0x2222222222222222ull, 12}, {0xAAAAAAAAAAAAAAAAull, 0xBBBBBBBBBBBBBBBBull, 336}, {0xAAAAAAAAAAAAAAAAull, 0xBBBBBBBBBBBBBBBBull, 804}};
+        check(cc::paneTripleMatch(list, 3, 0xAAAAAAAAAAAAAAAAull, 0xBBBBBBBBBBBBBBBBull, 804) && cc::paneTripleMatch(list, 3, 0x1111111111111111ull, 0x2222222222222222ull, 12),
+              "concourse pane: a listed triple matches");
+        check(!cc::paneTripleMatch(list, 3, 0xAAAAAAAAAAAAAAAAull, 0xBBBBBBBBBBBBBBBBull, 337) && !cc::paneTripleMatch(list, 3, 0xAAAAAAAAAAAAAAAAull, 0xBBBBBBBBBBBBBBBCull, 804) &&
+                  !cc::paneTripleMatch(list, 3, 0xAAAAAAAAAAAAAAABull, 0xBBBBBBBBBBBBBBBBull, 804),
+              "concourse pane: a different index count, pixel shader or vertex shader does not match");
+        check(!cc::paneTripleMatch(list, 0, 0x1111111111111111ull, 0x2222222222222222ull, 12) && !cc::paneTripleMatch(list, 1, 0xAAAAAAAAAAAAAAAAull, 0xBBBBBBBBBBBBBBBBull, 336),
+              "concourse pane: an empty list, and entries past the count, match nothing");
+        check(cc::paneTripleIndex(list, 3, 0xAAAAAAAAAAAAAAAAull, 0xBBBBBBBBBBBBBBBBull, 804) == 2 && cc::paneTripleIndex(list, 3, 1, 2, 3) == -1, "concourse pane: the slot is the triple's place in the list");
+
+        cc::PaneTriple parsed[cc::kPaneListCap];
+        size_t bad = 99;
+        size_t n = cc::parsePaneList("0123456789ABCDEF/FEDCBA9876543210/12,aaaaaaaaaaaaaaaa/bbbbbbbbbbbbbbbb/6", parsed, cc::kPaneListCap, &bad);
+        check(n == 2 && bad == 0 && parsed[0].vs == 0x0123456789ABCDEFull && parsed[0].ps == 0xFEDCBA9876543210ull && parsed[0].n == 12 && parsed[1].vs == 0xAAAAAAAAAAAAAAAAull &&
+                  parsed[1].ps == 0xBBBBBBBBBBBBBBBBull && parsed[1].n == 6,
+              "concourse pane list: two good entries parse, hashes as 16 hex digits in either case");
+        n = cc::parsePaneList(" 0123456789ABCDEF/FEDCBA9876543210/12 , nonsense,0123456789ABCDEF/FEDCBA9876543210/0,123/456/7,0123456789ABCDEF/FEDCBA9876543210/12x,"
+                              "0123456789ABCDEG/FEDCBA9876543210/5,0123456789ABCDEF/FEDCBA9876543210/4294967296,,AAAAAAAAAAAAAAAA/BBBBBBBBBBBBBBBB/336 ,",
+                              parsed, cc::kPaneListCap, &bad);
+        check(n == 2 && bad == 6 && parsed[0].n == 12 && parsed[1].n == 336, "concourse pane list: a bad entry (not a triple, a zero or oversize count, a short hash, a non-hex digit, trailing text) is counted and skipped, and the good ones around it stay");
+        n = cc::parsePaneList("0123456789ABCDEF/FEDCBA9876543210/12,0123456789abcdef/fedcba9876543210/12", parsed, cc::kPaneListCap, &bad);
+        check(n == 1 && bad == 0, "concourse pane list: a duplicate entry is dropped");
+        n = cc::parsePaneList("", parsed, cc::kPaneListCap, &bad);
+        check(n == 0 && bad == 0, "concourse pane list: an empty string is an empty list");
+        n = cc::parsePaneList(nullptr, parsed, cc::kPaneListCap, &bad);
+        check(n == 0 && bad == 0, "concourse pane list: a null string is an empty list");
+        {
+            std::string many;
+            for (int i = 0; i < 20; ++i) {
+                char e[64];
+                std::snprintf(e, sizeof(e), "%s%016X/%016X/%d", i ? "," : "", 0x100 + i, 0x200 + i, 7 + i);
+                many += e;
+            }
+            n = cc::parsePaneList(many.c_str(), parsed, cc::kPaneListCap, &bad);
+            check(n == cc::kPaneListCap && parsed[15].n == 22 && bad == 0, "concourse pane list: the list stops at its cap of 16 entries");
+        }
+        check(cc::kPaneColourCount == 8 && std::strcmp(cc::kPaneColourNames[0], "red") == 0 && std::strcmp(cc::kPaneColourNames[7], "white") == 0 &&
+                  cc::kPaneColours[0][0] == 1.0f && cc::kPaneColours[0][1] == 0.0f && cc::kPaneColours[4][0] == 1.0f && cc::kPaneColours[4][2] == 1.0f,
+              "concourse pane: eight fixed colours per slot, red first, white last, magenta fifth");
     }
 
     std::printf("optimized_station_test: %d checks, %d failures\n", g_checks, g_failures);

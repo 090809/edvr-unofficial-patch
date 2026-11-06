@@ -53,6 +53,16 @@ inline bool flatProfileReadsKey(const char* key) {
         std::strcmp(key, "fix.ui_quality") == 0 ||
         // The optimized station (optimized_station.cpp), on in flat as in VR (built v14.34). Unlisted, getString answers "off" here and the station never starts.
         std::strcmp(key, "fix.optimized_stations") == 0 ||
+        // TEMPORARY (the concourse cull and its glass panes, optimized_station.cpp and concourse_pane.cpp, docs\concourse-cull-2026-11-05.md): flat and VR alike.
+        // Unlisted, getString answers "off" here (the cull and the pane mode stay off, a hotkey reads empty and binds nothing) and the keys log nothing. Remove with the arc.
+        std::strcmp(key, "diag.concourse_cull") == 0 ||
+        std::strcmp(key, "diag.concourse_keep") == 0 ||
+        std::strcmp(key, "diag.concourse_pane_mode") == 0 ||
+        std::strcmp(key, "diag.concourse_panes") == 0 ||
+        std::strcmp(key, "diag.concourse_pane_grey") == 0 ||
+        std::strcmp(key, "hotkey.concourse_cull") == 0 ||
+        std::strcmp(key, "hotkey.concourse_pane_capture") == 0 ||
+        std::strcmp(key, "hotkey.concourse_pane_mode") == 0 ||
         // The flat jitter cycle's length (flat_runtime.cpp, FlatLivePhase::phaseCount; temporal_math.h). Developer tier, no flat panel
         // row. Unlisted, getInt answers 0 here whatever the file says, which the reader takes for out of range and reads as 8.
         std::strcmp(key, "advanced.temporal_aa_jitter_phases") == 0 ||

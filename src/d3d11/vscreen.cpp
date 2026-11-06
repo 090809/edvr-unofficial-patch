@@ -7,6 +7,7 @@
 #include "gpu_census.h"       // issue #38: the per-feature GPU cost census
 #include "gpu_pass_profile.h" // TEMPORARY GPU pass profiler (hotkey.gpu_pass_profile): one bool read per hook unarmed
 #include "blend_probe.h"      // TEMPORARY blend probe (hotkey.blend_probe): one relaxed load per eye draw unarmed
+#include "concourse_pane.h"   // TEMPORARY concourse panes (diag.concourse_pane_mode): one relaxed load per real draw while nothing is armed
 #include "../common/d3d11_gpu_command_slots.h"
 #include "vr_runtime.h"
 
@@ -5620,6 +5621,7 @@ void STDMETHODCALLTYPE hookedDrawIndexed(ID3D11DeviceContext* self, UINT count,
         FlatStationSunGate sun(self, flatDraw, stationSkip);
         {
             FlatParticleScope particle(self, 'I', count, 1);
+            ConcoursePaneScope pane(self, count, &stationMaskSetBlend);
             if (sun.issues()) g_state->realDrawIndexed(self, count, startIndex, baseVertex);
         }
         sun.restore();
@@ -5654,13 +5656,17 @@ void STDMETHODCALLTYPE hookedDrawIndexed(ID3D11DeviceContext* self, UINT count,
         uiLayerMapRunEnd(self);   // as in hookedDraw
         if (!(self == g_state->ownerCtx && uiLayerIssueBlocked())) {
             const int64_t r0 = clock.on ? qpcNow() : 0;
-            g_state->realDrawIndexed(self, count, startIndex, baseVertex);
+            {
+                ConcoursePaneScope pane(self, count, &stationMaskSetBlend);   // TEMPORARY (concourse_pane.h)
+                g_state->realDrawIndexed(self, count, startIndex, baseVertex);
+            }
             if (clock.on) clock.realCall(r0);
         }
     } else forwardWithVerdict(self, v, flags, 'I', count, 1, args, [&](AlteredDraw altered) {
         const int64_t r0 = clock.on ? qpcNow() : 0;
         {
             GpuCensusAlteredScope timed(self, altered);   // the game's own draw, and only it (gpu_census.h)
+            ConcoursePaneScope pane(self, count, &stationMaskSetBlend);   // TEMPORARY (concourse_pane.h)
             g_state->realDrawIndexed(self, count, startIndex, baseVertex);
         }
         srvTurretHudCountIssue(self);   // issue 140: the game's own issue; a family's first scope says its state (one relaxed load otherwise)
@@ -5798,6 +5804,7 @@ void STDMETHODCALLTYPE hookedDrawIndexedInstanced(ID3D11DeviceContext* self,
         FlatStationSunGate sun(self, flatDraw, stationSkip);
         {
             FlatParticleScope particle(self, 'X', perInstance, instances);
+            ConcoursePaneScope pane(self, perInstance, &stationMaskSetBlend);
             if (sun.issues())
                 g_state->realDrawIndexedInstanced(self, perInstance, instances, startIndex,
                                                   baseVertex, startInstance);
@@ -5858,6 +5865,7 @@ void STDMETHODCALLTYPE hookedDrawIndexedInstanced(ID3D11DeviceContext* self,
             // The game's own draw, and only it (gpu_census.h): the weapon and screen motion
             // reissues below have sections of their own.
             GpuCensusAlteredScope timed(self, altered);
+            ConcoursePaneScope pane(self, perInstance, &stationMaskSetBlend);   // TEMPORARY (concourse_pane.h)
             g_state->realDrawIndexedInstanced(self, perInstance, instances, startIndex,
                                               baseVertex, startInstance);
         }

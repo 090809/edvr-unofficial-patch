@@ -942,11 +942,16 @@ inline NamedKeep keepNamedCell(const float centre[3], float radius, const float 
 // lifecycle point (undock, hangar change, ship change, setting toggle) starts every node afresh.
 constexpr uint64_t kSlotNodeMask = (uint64_t(1) << 44) - 1;
 
-constexpr uint32_t kSlotKeyMask = (1u << 14) - 1;
+// Built 2026-11-05 (the concourse cull): the slot carries five flag bits (47..51) and the generation key in the 12 bits above them (52..63).
+constexpr uint32_t kSlotKeyMask = (1u << 12) - 1;
+constexpr uint32_t kSlotKeyShift = 52;
+constexpr uint32_t kSlotFlagMask = 31u;
 
 constexpr uint32_t kNodeMechanism = 1;    // the name is a bay mechanism record (Lift, BlastShield, HangarGate ...): a latch candidate
 constexpr uint32_t kNodeHangarLike = 2;   // the name could name the hangar (Hanger, Pad, Lift, Bay ...): the names note wants it
 constexpr uint32_t kNodeShipPrefix = 4;   // the name has a type prefix up to an underscore (the ship tally counts it)
+constexpr uint32_t kNodeConcourseAllow = 8;    // built 2026-11-05: the name is on the concourse cull's allow-list (concourse_cull_core.h), extra prefixes included
+constexpr uint32_t kNodeConcourseAnchor = 16;  // built 2026-11-05: the name is the concourse anchor, Standard_SocialArea
 
 inline bool slotFits(uintptr_t node) noexcept { return (node & 7u) == 0 && (uint64_t(node) >> 3) <= kSlotNodeMask; }
 
@@ -954,18 +959,18 @@ inline bool slotFits(uintptr_t node) noexcept { return (node & 7u) == 0 && (uint
 inline uint32_t classKey(uint32_t generation) noexcept { return generation & kSlotKeyMask; }
 
 inline uint64_t packSlot(uintptr_t node, NameClass cls, uint32_t flags, uint32_t key) noexcept {
-    return (uint64_t(node) >> 3) | (uint64_t(static_cast<uint8_t>(cls)) << 44) | (uint64_t(flags & 7u) << 47) | (uint64_t(key & kSlotKeyMask) << 50);
+    return (uint64_t(node) >> 3) | (uint64_t(static_cast<uint8_t>(cls)) << 44) | (uint64_t(flags & kSlotFlagMask) << 47) | (uint64_t(key & kSlotKeyMask) << kSlotKeyShift);
 }
 
 // True when the slot holds this node's class and flags under this key; they are written to *cls and *flags.
 inline bool unpackSlot(uint64_t v, uintptr_t node, uint32_t key, NameClass* cls, uint32_t* flags) noexcept {
     if (v == 0) return false;
     if ((v & kSlotNodeMask) != (uint64_t(node) >> 3)) return false;
-    if (((v >> 50) & kSlotKeyMask) != (key & kSlotKeyMask)) return false;
+    if (((v >> kSlotKeyShift) & kSlotKeyMask) != (key & kSlotKeyMask)) return false;
     const uint32_t c = static_cast<uint32_t>((v >> 44) & 7u);
     if (c == 0) return false;
     *cls = static_cast<NameClass>(c);
-    *flags = static_cast<uint32_t>((v >> 47) & 7u);
+    *flags = static_cast<uint32_t>((v >> 47) & kSlotFlagMask);
     return true;
 }
 
@@ -2123,11 +2128,12 @@ inline size_t pickShell(const ExplicitObs* obs, size_t n, const float centre[3],
 // Built v14.1: what the store observer does with a record. Judging (the keep and the cull) is sealed-only. Gathering (the camera, the frame's
 // pads, the explicit parts and so the own-pad pick the seal trigger needs) runs while docked and unsealed, so a pad is in hand before the seal.
 // Setting off: nothing. The v14 flight never sealed because the gathering was inside the sealed-only judge (no pad, so no seal, ever).
-enum class StoreMode : uint8_t { kNone = 0, kGather = 1, kJudge = 2 };
+enum class StoreMode : uint8_t { kNone = 0, kGather = 1, kJudge = 2, kConcourse = 3 };
 
-inline StoreMode storeMode(bool setting, bool isSealed, bool docked) noexcept {
+inline StoreMode storeMode(bool setting, bool isSealed, bool docked, bool concourse = false) noexcept {
     if (!setting) return StoreMode::kNone;
     if (isSealed) return StoreMode::kJudge;
+    if (concourse) return StoreMode::kConcourse;   // built 2026-11-05: on foot in social space with the concourse key on (the cull, or only the anchor's sighting)
     return docked ? StoreMode::kGather : StoreMode::kNone;
 }
 

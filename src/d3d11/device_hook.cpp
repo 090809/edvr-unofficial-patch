@@ -48,6 +48,7 @@ extern "C" IMAGE_DOS_HEADER __ImageBase;
 #include "flat_stationary_camera_capture.h"  // mapCameraFrame (the VR map camera's publisher)
 #include "galaxy_map_pointer.h"                // mapPointerFrame (the VR Galaxy Map's hover and panel depth)
 #include "optimized_station.h"   // fix.optimized_stations: the sealed-hangar station (install, the frame tick, the store and the sun skip)
+#include "concourse_pane.h"   // TEMPORARY (docs\concourse-cull-2026-11-05.md): the concourse panes' frame tick
 #include "store_hook.h"
 #include "flat_world_witness.h"
 #include "native_on_foot_hooks.h"   // nativeOnFootHooksFrameBoundary (the frame tick) and nativeOnFootHooksShutdown (the avatar dither-fade global goes back at an unload)
@@ -1240,6 +1241,7 @@ EDVR_BOUNDARY_TICK(tkSchedulerProbe, "scheduler_probe");
 EDVR_BOUNDARY_TICK(tkVtableWatch, "vtable_watch");
 EDVR_BOUNDARY_TICK(tkVrRuntime, "vr_runtime");
 EDVR_BOUNDARY_TICK(tkOptimizedStation, "optimized_station");
+EDVR_BOUNDARY_TICK(tkConcoursePane, "concourse_pane");   // TEMPORARY: the concourse panes (concourse_pane.h); one key poll and a few atomic stores a frame
 EDVR_BOUNDARY_TICK(tkLightGridCache, "light_grid_cache");
 EDVR_BOUNDARY_TICK(tkHotkeys, "hotkeys");
 EDVR_BOUNDARY_TICK(tkAaCompare, "aa_compare");   // hotkey.compare_aa: the AA comparison toggle (aa_compare.h); one key poll when idle
@@ -1627,6 +1629,7 @@ void presentFrameBoundary() {
     tkVrRuntime.run([] { vrRuntimeTick(); });
     // The optimized station's tick: the setting, the seal and release rules, the held cell in the pad's frame, the 30 s summary.
     tkOptimizedStation.run([] { optimizedStationFrame(static_cast<uint32_t>(g_state->frameCounter)); });
+    tkConcoursePane.run([] { concoursePaneTick(g_state->device, static_cast<uint32_t>(g_state->frameCounter), GetTickCount64()); });
     tkLightGridCache.run([] { lightGridCacheNoteFrame(g_state->frameCounter); });   // the frame count for the grid cache's 30 s line
     tkHotkeys.run(tickHotkeys);
     tkIntroSkipFlat.run([] { introSkipTickFlat(); });

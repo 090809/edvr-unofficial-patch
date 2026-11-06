@@ -13,10 +13,15 @@
 #include <cstring>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "../common/config.h"
+#include "../common/hotkey.h"
 #include "../common/log.h"
+#include "../common/runtime_profile.h"
+#include "concourse_cull_core.h"
+#include "concourse_pane.h"
 #include "journal_watch.h"
 #include "kinematic_eval_hook.h"
 #include "optimized_station_core.h"
@@ -83,6 +88,8 @@ struct TlsCounters {
     uint64_t rigSeen = 0, rigVetoed = 0, rigMixed = 0, rigUnknown = 0, rigRefresh = 0;
     uint64_t rigHitVetoed = 0, rigHitKept = 0, rigHitMoved = 0, rigMiss = 0, rigStale = 0, rigAsked = 0;
     uint32_t sampleStore = 0, sampleProducer = 0, sampleRig = 0;   // the 1-in-32 sampling counters (the thread's own)
+    uint64_t concRigSeen = 0, concRigVetoed = 0, concProdVetoed = 0, concProdKept = 0, concStoreCleared = 0;   // built 2026-11-05: the concourse cull's counts
+    uint64_t concKept[4] = {};
 };
 thread_local TlsCounters tlsTc;
 void tcFlush(TlsCounters& t) noexcept;
@@ -239,6 +246,43 @@ std::atomic<uint64_t> g_winSunDrawsSkipped{0};   // built v14.34: sun-pair draws
 std::atomic<uint64_t> g_winSunNotIssued{0}, g_winSunMasked{0};
 std::atomic<bool> g_flatProfile{false};   // set at install: the 30 s line splits the skips by path only where there is more than one
 std::atomic<uint32_t> g_classGen{0};   // moves at every lifecycle point (bumpRigEpoch): every node's class and name are read afresh
+
+// ---- Built 2026-11-05: the concourse cull (docs\concourse-cull-2026-11-05.md). TEMPORARY, off unless diag.concourse_cull or its hotkey turns it on. ----------
+// On foot in a station's social space the records that are not the room are not drawn. The judgement is by the record's name (the node cache's allow flag),
+// at the same three levels as the hangar seal: the rig veto, the producer-B veto and the store's clear. The rules are concourse_cull_core.h's.
+namespace cc = edvr::concourse;
+constexpr uint64_t kConcAnchorFreshMs = 5000;   // the anchor record was seen by the store within this long
+// diag.concourse_keep: the extra allow prefixes, in two buffers so the lock-free classifier never reads one being written (the tick flips them at most once a second).
+struct ConcourseExtra {
+    char text[2][192] = {};
+    std::atomic<uint32_t> cur{0};
+    void set(const char* s) noexcept {
+        const uint32_t n = 1u - cur.load(std::memory_order_relaxed);
+        std::snprintf(text[n], sizeof(text[n]), "%s", s ? s : "");
+        cur.store(n, std::memory_order_release);
+    }
+    const char* get() const noexcept { return text[cur.load(std::memory_order_acquire)]; }
+};
+ConcourseExtra g_concExtra;
+std::atomic<bool> g_concWanted{false};        // armed, on foot in social space and not sealed: the store gate is open (it sights the anchor, and judges while active)
+std::atomic<bool> g_concActive{false};        // the cull runs: wanted, the key or its override on, and the anchor seen within kConcAnchorFreshMs
+std::atomic<bool> g_concSurveyArmed{false};   // the one-shot names are being gathered: the rig and producer vetoes forward so the store judges and names every record
+std::atomic<uint64_t> g_concAnchorMs{0};      // GetTickCount64() when the store last saw the anchor record
+std::atomic<uintptr_t> g_concAnchorAddr{0};   // the anchor record, latched by address (re-read with a name check at the tick)
+std::atomic<uintptr_t> g_concHubAddr{0};      // SA_StationHub_Compact, the same way
+std::atomic<bool> g_concHubWanted{false};     // the tick wants the hub's address: the store compares the names of the allowed records until it has it
+// What the classifier adds to a node's flags: the allow-list (with the extra prefixes) and the anchor name.
+uint32_t concourseNodeFlagsOf(const char* name) noexcept {
+    uint32_t f = 0;
+    if (cc::concourseAllowName(name, g_concExtra.get())) f |= sealed::kNodeConcourseAllow;
+    if (std::strcmp(name, cc::kAnchorName) == 0) f |= sealed::kNodeConcourseAnchor;
+    return f;
+}
+struct ConcourseWin {   // the 5 s summary's window (the callbacks' counters flush here, tcFlush)
+    std::atomic<uint64_t> rigSeen{0}, rigVetoed{0}, prodVetoed{0}, prodKept{0}, storeCleared{0};
+    std::atomic<uint64_t> kept[4] = {};   // name, small-close, unreadable-name, unreadable-sphere (the producer's keeps)
+};
+ConcourseWin g_concWin;
 
 bool readMem(void* dst, uintptr_t src, size_t n) noexcept {
     if (!src) return false;
@@ -445,6 +489,7 @@ struct PadSnapshot {
     float ownLiveRadius = 0.0f;
     bool lost = false;            // gathered entries were lost before this publication: the callbacks keep every record
     bool engagePending = false;   // built v14.31: an engage is pending: every pass gathers the near list, the own candidate and the tally
+    bool concourse = false;       // built 2026-11-05: the concourse cull is active (the producer veto judges by name)
 };
 sealed::SnapshotRing<PadSnapshot, 40, 32> g_snapRing;
 
@@ -470,6 +515,8 @@ private:
 // the previous pass in the order they were written, and applies them to its own tables.
 enum class GKind : uint8_t { kNone, kPad, kExplicit, kNear, kOwnCand, kTally, kLatch, kHangar, kRigNote, kRigAssoc, kCost };
 constexpr uint8_t kFlagJob = 1;   // kRigNote: the store's bucket path (the rig comes from the bucket's collection, resolved on the tick)
+constexpr uint8_t kFlagJudged = 2;   // kRigNote, built 2026-11-05: the concourse cull judged this record
+constexpr uint8_t kFlagKeep = 4;     // kRigNote with kFlagJudged: the judgement kept it
 struct GatherEntry {
     GKind kind = GKind::kNone;
     uint8_t flags = 0;            // kPad: the PadSize; kRigNote: kFlagJob; kCost: 0 store, 1 producer, 2 rig
@@ -554,7 +601,7 @@ NodeInfo classifyNode(uintptr_t node, char* name) noexcept {
     std::string parsed;
     const bool ok = sealed::textName(bytes, sizeof(bytes), false, &parsed) || sealed::textName(bytes, sizeof(bytes), true, &parsed);
     info.cls = sealed::classifyName(ok, parsed.c_str());
-    info.flags = ok ? sealed::nodeFlagsOf(parsed.c_str()) : 0u;
+    info.flags = ok ? (sealed::nodeFlagsOf(parsed.c_str()) | concourseNodeFlagsOf(parsed.c_str())) : 0u;
     if (ok && name != nullptr) std::snprintf(name, sealed::NodeCache<kNodeCacheSlots>::kNameBytes, "%s", parsed.c_str());
     return info;
 }
@@ -823,6 +870,7 @@ struct RigSlot {
     char name[48] = {};              // the name of the rig's first record (for the own-ship prefix)
     uintptr_t coll = 0;              // the rig's collection (rig+0x348), as last read at a decision
     uint8_t verdict = 0;             // kVerdictUnknown / kVerdictMixed / kVerdictOutside, refreshed once per frame (refreshRigVerdicts)
+    cc::RigTally curTally, lastTally;   // built 2026-11-05: the concourse cull's judgements of the rig's records in the current and the last frame that had any
 };
 
 constexpr uint8_t kVerdictUnknown = 0, kVerdictMixed = 1, kVerdictOutside = 2;
@@ -919,8 +967,10 @@ RigSlot* rigFind(uintptr_t rig, bool insert) noexcept {
 // the own ship's rig, and every rig after a loss of gathered entries are unknown, and forward.
 void refreshRigVerdicts() noexcept {
     g_rigPub.begin();
-    // No cell held, no verdict is published (the veto answers only while sealed).
-    if (!g_heldValid) {
+    // No cell held, no verdict is published (the veto answers only while sealed), except the concourse cull's (built 2026-11-05): a rig is outside when a record
+    // of it was judged in its last pass and none was kept.
+    const bool concourse = !g_heldValid && g_concActive.load(std::memory_order_acquire);
+    if (!g_heldValid && !concourse) {
         g_rigPub.commit();
         return;
     }
@@ -928,6 +978,19 @@ void refreshRigVerdicts() noexcept {
     uint32_t published = 0;
     for (RigSlot& s : g_rigSlots) {
         if (s.rig == 0 || s.epoch != g_rigEpoch) continue;
+        if (concourse) {
+            const cc::RigTally& t = s.curTally.judged > 0 ? s.curTally : s.lastTally;
+            s.verdict = cc::concourseRigVetoed(t) ? kVerdictOutside : kVerdictUnknown;
+            const uint8_t ccode = g_lossPublished ? kVerdictUnknown : s.verdict;
+            uint32_t cCarried = 0;
+            uint8_t cov = 0;
+            uintptr_t coc = 0;
+            size_t coidx = 0;
+            if (g_rigPub.lookup(s.rig, rigIndex(s.rig), &cov, &coc, &coidx)) cCarried = g_rigPub.runAt(coidx);
+            size_t cidx = 0;
+            if (g_rigPub.insert(s.rig, rigIndex(s.rig), ccode, s.coll, &cidx, g_rigEpoch, cCarried)) ++published;
+            continue;
+        }
         const float* mn = nullptr;
         const float* mx = nullptr;
         if (s.curValid) {
@@ -1123,7 +1186,7 @@ void bumpRigEpoch() noexcept {
 bool rigVetoLockFree(uintptr_t rig) noexcept {
     if (!rig) return false;
     SnapshotPin pin;
-    if (!pin.get().held) return false;
+    if (!pin.get().held && !pin.get().concourse) return false;
     const uint32_t stamp = g_frameStamp.load(std::memory_order_relaxed);
     TlsCounters& tc = tcFor(stamp);   // built v14.29: the thread's own counters
     ++tc.rigSeen;
@@ -1358,6 +1421,12 @@ void tcFlush(TlsCounters& t) noexcept {
     g_rigTally.miss.fetch_add(t.rigMiss, std::memory_order_relaxed);
     g_rigTally.stale.fetch_add(t.rigStale, std::memory_order_relaxed);
     g_rigTally.asked.fetch_add(t.rigAsked, std::memory_order_relaxed);
+    g_concWin.rigSeen.fetch_add(t.concRigSeen, std::memory_order_relaxed);
+    g_concWin.rigVetoed.fetch_add(t.concRigVetoed, std::memory_order_relaxed);
+    g_concWin.prodVetoed.fetch_add(t.concProdVetoed, std::memory_order_relaxed);
+    g_concWin.prodKept.fetch_add(t.concProdKept, std::memory_order_relaxed);
+    g_concWin.storeCleared.fetch_add(t.concStoreCleared, std::memory_order_relaxed);
+    for (int k = 0; k < 4; ++k) g_concWin.kept[k].fetch_add(t.concKept[k], std::memory_order_relaxed);
     const uint32_t keepStamp = t.stamp;
     const uint32_t s0 = t.sampleStore, s1 = t.sampleProducer, s2 = t.sampleRig;
     t = TlsCounters{};
@@ -1823,9 +1892,47 @@ void summaryLine(uint64_t now) noexcept {
 #undef SUMMARY_NOTE
 
 // The producer-B and rig vetoes: attached while the setting is on, and they answer only while sealed.
+// Built 2026-11-05: the concourse cull's producer-B veto. Judges the record by name and sphere against the published camera: true skips it. Lock-free, as the
+// sealed decision is. During the names survey it forwards every record (the store judges them and names them).
+void concourseCountKept(TlsCounters& tc, cc::Judge j) noexcept {
+    switch (j) {
+        case cc::Judge::kKeepName: ++tc.concKept[0]; break;
+        case cc::Judge::kKeepSmallClose: ++tc.concKept[1]; break;
+        case cc::Judge::kKeepUnreadableName: ++tc.concKept[2]; break;
+        case cc::Judge::kKeepUnreadableSphere: ++tc.concKept[3]; break;
+        default: break;
+    }
+}
+
+bool concourseProducerVeto(uintptr_t rec) noexcept {
+    SnapshotPin pin;
+    const PadSnapshot& s = pin.get();
+    if (!s.concourse || !s.camValid || s.lost) return false;
+    TlsCounters& tc = tcFor(g_frameStamp.load(std::memory_order_relaxed));
+    uintptr_t node = 0;
+    const NodeInfo ni = nodeInfoOf(rec, &node);
+    float centre[3] = {};
+    float radius = 0.0f;
+    const bool sphere = storeSphereOf(rec, centre, &radius);
+    if (sphere) prodPutGen(rec, centre, radius, s.prodGen);
+    const bool nameReadable = ni.cls != sealed::NameClass::kUnnamed && ni.cls != sealed::NameClass::kNone;
+    const float d = sphere ? sealed::distance(centre, s.cam) : 0.0f;
+    const cc::Judge j = cc::concourseJudge(nameReadable, (ni.flags & sealed::kNodeConcourseAllow) != 0, sphere, d, radius);
+    if (cc::judgeKeeps(j)) {
+        ++tc.concProdKept;
+        concourseCountKept(tc, j);
+        return false;
+    }
+    ++tc.concProdVetoed;
+    return true;
+}
+
 bool producerVetoBody(uintptr_t rec, uintptr_t owner) noexcept {
     (void)owner;
-    if (!g_sealedFlag.load(std::memory_order_acquire)) return false;
+    if (!g_sealedFlag.load(std::memory_order_acquire)) {
+        if (!g_concActive.load(std::memory_order_acquire) || g_concSurveyArmed.load(std::memory_order_relaxed)) return false;
+        return concourseProducerVeto(rec);
+    }
     // Built v14.25: no lock. The decision reads the published view (pinned), and the producer cache is lock-free.
     SnapshotPin pin;   // built v14.29: the thread's own hazard cell
     const PadSnapshot& s = pin.get();
@@ -1848,7 +1955,15 @@ bool producerVetoHook(uintptr_t rec, uintptr_t owner) noexcept {
 }
 
 bool rigVetoBody(uintptr_t rig) noexcept {
-    if (!g_sealedFlag.load(std::memory_order_acquire)) return false;
+    if (!g_sealedFlag.load(std::memory_order_acquire)) {
+        // Built 2026-11-05: the concourse cull's rig veto, from the same publication; forwards while the names survey runs.
+        if (!g_concActive.load(std::memory_order_acquire) || g_concSurveyArmed.load(std::memory_order_relaxed)) return false;
+        TlsCounters& tc = tcFor(g_frameStamp.load(std::memory_order_relaxed));
+        ++tc.concRigSeen;
+        const bool cveto = rigVetoLockFree(rig);
+        if (cveto) ++tc.concRigVetoed;
+        return cveto;
+    }
     const bool veto = rigVetoLockFree(rig);
     if (veto) ++tlsTc.rigVetoes;
     return veto;
@@ -1981,20 +2096,25 @@ void applyRigNote(const GatherEntry& e) {
             }
             s->lastValid = true;
         }
+        if (s->curTally.judged > 0) s->lastTally = s->curTally;   // built 2026-11-05: the concourse judgements rotate with the bounds
         s->curStamp = e.stamp;
         s->curValid = false;
+        s->curTally = cc::RigTally{};
     }
-    for (int k = 0; k < 3; ++k) {
-        const float lo = e.centre[k] - e.radius, hi = e.centre[k] + e.radius;
-        if (!s->curValid) {
-            s->curMn[k] = lo;
-            s->curMx[k] = hi;
-        } else {
-            if (lo < s->curMn[k]) s->curMn[k] = lo;
-            if (hi > s->curMx[k]) s->curMx[k] = hi;
+    if ((e.flags & kFlagJudged) != 0) s->curTally.note((e.flags & kFlagKeep) != 0);
+    if (e.radius > 0.0f && std::isfinite(e.radius)) {   // a concourse judgement of a record with no readable sphere carries none (the hangar's notes always do)
+        for (int k = 0; k < 3; ++k) {
+            const float lo = e.centre[k] - e.radius, hi = e.centre[k] + e.radius;
+            if (!s->curValid) {
+                s->curMn[k] = lo;
+                s->curMx[k] = hi;
+            } else {
+                if (lo < s->curMn[k]) s->curMn[k] = lo;
+                if (hi > s->curMx[k]) s->curMx[k] = hi;
+            }
         }
+        s->curValid = true;
     }
-    s->curValid = true;
     if (!s->named) {
         char name[64] = {};
         if (!cachedName(e.record, name, sizeof(name))) std::snprintf(name, sizeof(name), "(none)");
@@ -2318,6 +2438,7 @@ void publishSnapshot() noexcept {
     s.ownLiveRadius = g_ownLiveRadius;
     s.lost = g_lossPublished;
     s.engagePending = g_engagePending;
+    s.concourse = g_concActive.load(std::memory_order_acquire);
     g_engagePublished = g_engagePending;
     g_snapRing.publish();
 }
@@ -2348,15 +2469,18 @@ void resolveTickView() noexcept {
 
 // The gathered rig sphere of one judged record: the rig on the synchronous path (the evaluation's own stack), or the bucket's owner on the job path (the
 // tick resolves its collection). A record without a sphere is not gathered.
-void gatherRigNote(GatherWriter& w, uintptr_t bucket, uintptr_t record, const float c[3], float r, uint32_t stamp) noexcept {
-    if (!(r > 0.0f) || !std::isfinite(r)) return;
+// Built 2026-11-05: `judged` (kFlagJudged, with kFlagKeep for a kept record) is the concourse cull's: its note is gathered with no sphere too (the rig veto must
+// count a kept record whose sphere is unreadable); the hangar's notes pass 0 and are gathered only with a sphere, as before.
+void gatherRigNote(GatherWriter& w, uintptr_t bucket, uintptr_t record, const float c[3], float r, uint32_t stamp, uint8_t judged = 0) noexcept {
+    if (judged == 0 && (!(r > 0.0f) || !std::isfinite(r))) return;
     GatherEntry e = gatherEntry(GKind::kRigNote, record, c, r, stamp, nullptr);
     e.bucket = bucket;
+    e.flags = judged;
     const uintptr_t rig = kinematicEvalCurrentRig();
     if (rig != 0) {
         e.aux = rig;
     } else {
-        e.flags = kFlagJob;
+        e.flags = static_cast<uint8_t>(e.flags | kFlagJob);
         uintptr_t owner = 0;
         if (bucket != 0) readVal(&owner, bucket + 0x10);
         e.aux = owner;
@@ -2494,6 +2618,113 @@ void afterStoreJudge(uintptr_t bucket, uintptr_t record, bool judge) noexcept {
     }
 }
 
+// ---- Built 2026-11-05: the concourse cull's names survey and store judgement ---------------------------------------------------------------------
+// The one-shot names: armed 2 s after each engage and each toggle-on, gathered over 2 frames. A mutex is taken only while armed and never held across a
+// call into the game. While it runs the rig and producer vetoes forward, so the store sees (and names) every record; the store's clear still applies.
+struct SurveyAgg {
+    uint32_t kept = 0, culled = 0, smallClose = 0, unreadSphere = 0;
+    float radiusMax = 0.0f;
+};
+struct SurveyClose {
+    char name[48] = {};
+    float dist = 0.0f;
+    float radius = 0.0f;
+};
+struct Survey {
+    std::mutex m;
+    std::unordered_map<std::string, SurveyAgg> names;
+    std::vector<SurveyClose> close;
+};
+Survey& survey() {
+    static Survey* s = new Survey;   // never destroyed: a callback may still be inside it at unload
+    return *s;
+}
+constexpr float kSurveyCloseM = 60.0f;
+constexpr size_t kSurveyCloseCap = 8192;
+
+void concourseSurveyNote(const char* name, cc::Judge j, float dist, float radius) noexcept {
+    try {
+        Survey& sv = survey();
+        std::lock_guard<std::mutex> lock(sv.m);
+        SurveyAgg& a = sv.names[name];
+        if (radius > a.radiusMax) a.radiusMax = radius;
+        switch (j) {
+            case cc::Judge::kKeepName: ++a.kept; break;
+            case cc::Judge::kKeepSmallClose: ++a.smallClose; break;
+            case cc::Judge::kKeepUnreadableSphere: ++a.unreadSphere; break;
+            case cc::Judge::kCull:
+                ++a.culled;
+                if (dist <= kSurveyCloseM && sv.close.size() < kSurveyCloseCap) {
+                    SurveyClose c;
+                    std::snprintf(c.name, sizeof(c.name), "%s", name);
+                    c.dist = dist;
+                    c.radius = radius;
+                    sv.close.push_back(c);
+                }
+                break;
+            default: break;
+        }
+    } catch (...) {
+    }
+}
+
+// The store's judgement while the concourse cull is wanted (kConcourse). Whatever the state, a record named Standard_SocialArea is the anchor's sighting (and
+// SA_StationHub_Compact the hub's, while the tick wants it). While active it judges the record: gathers the rig note with its keep bit, and clears a culled
+// record (path A) with cullCounted. It returns before the seal's gathers.
+void afterStoreConcourse(uintptr_t bucket, uintptr_t record) noexcept {
+    GatherWriter w(g_gather);
+    w.call(0);
+    TlsCounters& tc = tcFor(g_frameStamp.load(std::memory_order_relaxed));
+    SnapshotPin pin;
+    const PadSnapshot& s = pin.get();
+    uintptr_t ctx = 0;
+    uint32_t count = 0;
+    if (!bucket || !record || !readVal(&ctx, bucket) || !ctx || !readVal(&count, ctx + kCtxCount) || count == 0) {
+        faultNote(kFaultBucket);
+        return;
+    }
+    w.context(ctx);
+    uintptr_t node = 0;
+    const NodeInfo ni = nodeInfoOf(record, &node);
+    if ((ni.flags & sealed::kNodeConcourseAnchor) != 0) {
+        g_concAnchorAddr.store(record, std::memory_order_relaxed);
+        g_concAnchorMs.store(GetTickCount64(), std::memory_order_relaxed);
+    } else if ((ni.flags & sealed::kNodeConcourseAllow) != 0 && g_concHubWanted.load(std::memory_order_relaxed)) {
+        char hn[64] = {};
+        if (cachedNameOfNode(node, hn, sizeof(hn), &ni.validator) && std::strcmp(hn, cc::kHubName) == 0) g_concHubAddr.store(record, std::memory_order_relaxed);
+    }
+    if (!s.concourse || !g_concActive.load(std::memory_order_acquire)) return;
+    if (!s.camValid) {
+        ++tc.noCamera;
+        return;
+    }
+    if (s.lost || w.lostSinceDrain() != 0) {   // a loss keeps every record (fail-safe)
+        ++tc.kept;
+        return;
+    }
+    const uint32_t stamp = w.stamp();
+    const WorldRead wr = worldOfRecord(record);
+    const bool sphere = wr.source != 4 && std::isfinite(wr.radius) && wr.radius > 0.0f && std::isfinite(wr.world[0]) && std::isfinite(wr.world[1]) &&
+                        std::isfinite(wr.world[2]);
+    const bool nameReadable = ni.cls != sealed::NameClass::kUnnamed && ni.cls != sealed::NameClass::kNone;
+    const float d = sphere ? sealed::distance(wr.world, s.cam) : 0.0f;
+    const cc::Judge j = cc::concourseJudge(nameReadable, (ni.flags & sealed::kNodeConcourseAllow) != 0, sphere, d, sphere ? wr.radius : 0.0f);
+    const bool keep = cc::judgeKeeps(j);
+    const float zero[3] = {0.0f, 0.0f, 0.0f};
+    gatherRigNote(w, bucket, record, sphere ? wr.world : zero, sphere ? wr.radius : 0.0f, stamp,
+                  static_cast<uint8_t>(kFlagJudged | (keep ? kFlagKeep : 0)));
+    if (g_concSurveyArmed.load(std::memory_order_relaxed) && nameReadable) {
+        char nm[64] = {};
+        if (cachedNameOfNode(node, nm, sizeof(nm), &ni.validator)) concourseSurveyNote(nm, j, d, sphere ? wr.radius : 0.0f);
+    }
+    if (keep) {
+        ++tc.kept;
+    } else if (cullCounted(record, false)) {
+        ++tc.culled;
+        ++tc.concStoreCleared;
+    }
+}
+
 }  // namespace
 
 // ---- The engine's entry points (declared in optimized_station.h) -------------------------------------------------------------------------
@@ -2511,7 +2742,10 @@ void optimizedStationInstall(bool flatProfile) {
 }
 
 bool optimizedStationOn() noexcept { return g_setting.load(std::memory_order_acquire); }
-bool optimizedStationGathers() noexcept { return g_setting.load(std::memory_order_acquire) && g_dockedNow.load(std::memory_order_acquire); }
+bool optimizedStationGathers() noexcept {
+    // Built 2026-11-05: also while the concourse cull is wanted (on foot in social space, the key on): the store gate opens so the anchor can be seen.
+    return g_setting.load(std::memory_order_acquire) && (g_dockedNow.load(std::memory_order_acquire) || g_concWanted.load(std::memory_order_acquire));
+}
 bool optimizedStationSealed() noexcept { return g_sealedFlag.load(std::memory_order_acquire); }
 
 // The draw path asks: while sealed, the sun pair is not drawn.
@@ -2529,8 +2763,12 @@ void optimizedStationNoteSunDraw(SunDrawPath path) noexcept {
 // docked and unsealed it only gathers the frame's pads, explicit parts and camera for the seal trigger (built v14.1).
 void afterStoreDispatch(uintptr_t bucket, uintptr_t record) noexcept {
     const sealed::StoreMode mode = sealed::storeMode(g_setting.load(std::memory_order_acquire), g_sealedFlag.load(std::memory_order_acquire),
-                                                     g_dockedNow.load(std::memory_order_acquire));
+                                                     g_dockedNow.load(std::memory_order_acquire), g_concWanted.load(std::memory_order_acquire));
     if (mode == sealed::StoreMode::kNone) return;
+    if (mode == sealed::StoreMode::kConcourse) {
+        afterStoreConcourse(bucket, record);
+        return;
+    }
     afterStoreJudge(bucket, record, mode == sealed::StoreMode::kJudge);
 }
 
@@ -2646,6 +2884,343 @@ bool mechanismPoseTick(uint64_t now) noexcept {
     return false;
 }
 
+// ---- Built 2026-11-05: the concourse cull's tick (docs\concourse-cull-2026-11-05.md). TEMPORARY. ------------------------------------------------------------
+// The keys are polled about once a second (diag.concourse_cull, diag.concourse_keep, hotkey.concourse_cull); the hotkey is polled every tick. The state is
+// the tick's alone; the callbacks see g_concWanted, g_concActive and g_concSurveyArmed (atomics) and the snapshot's `concourse` flag.
+namespace {
+
+enum class ConcOverride : uint8_t { kNone, kOn, kOff };
+ConcOverride g_concOverride = ConcOverride::kNone;   // the hotkey's A/B override of the key; cleared when the key's text changes
+bool g_concKeyOn = false;                            // diag.concourse_cull = on
+bool g_concKeySeen = false;
+uint64_t g_concNextPollMs = 0;
+std::string g_concExtraApplied;
+bool g_concExtraSeen = false;
+Hotkey* g_concHotkey = nullptr;
+std::string g_concHotkeyText;
+bool g_concHotkeyBound = false;
+bool g_concWasActive = false;
+bool g_concWasArmed = false;
+bool g_concWaitSet = false;
+uint32_t g_concWaitKey = 0;
+uint64_t g_concSumMs = 0;
+uint64_t g_concSumFrames = 0;
+uint64_t g_concSumCalls[3] = {};   // the store, producer and rig calls at the last summary
+uint64_t g_concSurveyDueMs = 0;    // 0: none due
+bool g_concSurveyOn = false;
+uint32_t g_concSurveyStamp = 0;
+uint64_t g_concTraceMs = 0;
+uint32_t g_concTraceReason = 0;
+uint64_t g_concTraceReasonMs = 0;
+bool g_concSettingOffLogged = false;
+
+bool concourseEffective() noexcept {
+    return g_concOverride == ConcOverride::kNone ? g_concKeyOn : g_concOverride == ConcOverride::kOn;
+}
+bool concourseArmed() noexcept { return g_concKeyOn || g_concOverride != ConcOverride::kNone; }
+const char* concourseKeyText() noexcept {
+    switch (g_concOverride) {
+        case ConcOverride::kOn: return "override-on";
+        case ConcOverride::kOff: return "override-off";
+        default: return g_concKeyOn ? "on" : "off";
+    }
+}
+
+void concoursePoll(uint64_t now) {
+    if (now < g_concNextPollMs) return;
+    g_concNextPollMs = now + 1000;
+    Config& cfg = Config::get();
+    const bool on = cfg.getString("diag.concourse_cull", "off") == "on";
+    if (!g_concKeySeen || on != g_concKeyOn) {
+        if (g_concKeySeen) {
+            g_concOverride = ConcOverride::kNone;
+            Log::get().note("concourse cull: diag.concourse_cull is now %s (the hotkey's override is cleared)", on ? "on" : "off");
+        }
+        g_concKeySeen = true;
+        g_concKeyOn = on;
+    }
+    const std::string extra = cfg.getString("diag.concourse_keep", "");
+    if (!g_concExtraSeen || extra != g_concExtraApplied) {
+        const bool first = !g_concExtraSeen;
+        g_concExtraSeen = true;
+        g_concExtraApplied = extra;
+        g_concExtra.set(extra.c_str());
+        g_classGen.fetch_add(1, std::memory_order_relaxed);   // every node's flags are read again with the new prefixes
+        if (!(first && extra.empty()))
+            Log::get().note("concourse cull: diag.concourse_keep = \"%s\" (extra name prefixes kept; every node's name is read again)", extra.c_str());
+    }
+    const std::string keyText = cfg.getString("hotkey.concourse_cull", "");
+    if (!g_concHotkeyBound || keyText != g_concHotkeyText) {
+        const bool first = !g_concHotkeyBound;
+        if (!g_concHotkey) g_concHotkey = new Hotkey();
+        g_concHotkeyBound = true;
+        g_concHotkeyText = keyText;
+        g_concHotkey->setBinding(keyText.c_str());
+        if (g_concHotkey->bound()) Log::get().note("concourse cull: hotkey.concourse_cull = \"%s\" bound (a press turns the cull on or off, as an override of the key)", keyText.c_str());
+        else if (!keyText.empty()) Log::get().note("concourse cull: hotkey.concourse_cull = \"%s\" bound nothing, so the override cannot be used this session", keyText.c_str());
+        else if (!first) Log::get().note("concourse cull: hotkey.concourse_cull cleared");
+    }
+}
+
+// The setting is off (fix.optimized_stations): nothing runs. One line says so when the concourse key is on.
+void concourseSettingOffTick(uint64_t now) {
+    concoursePoll(now);
+    const bool wasActive = g_concWasActive;
+    g_concWanted.store(false, std::memory_order_release);
+    g_concActive.store(false, std::memory_order_release);
+    g_concSurveyArmed.store(false, std::memory_order_release);
+    g_concSurveyOn = false;
+    g_concWasActive = false;
+    g_concWaitSet = false;
+    if ((g_concKeyOn || wasActive) && !g_concSettingOffLogged) {
+        g_concSettingOffLogged = true;
+        Log::get().note("concourse cull: off (fix.optimized_stations is off; the cull is part of it)");
+    } else if (!g_concKeyOn && !wasActive) {
+        g_concSettingOffLogged = false;
+    }
+}
+
+// The names survey's report (the tick, once, after its two frames).
+void concourseSurveyReport() {
+    struct Row {
+        std::string name;
+        uint32_t n = 0;
+        float r = 0.0f;
+    };
+    std::vector<Row> kept, culled, smallClose, unreadSphere;
+    std::vector<SurveyClose> close;
+    try {
+        Survey& sv = survey();
+        std::lock_guard<std::mutex> lock(sv.m);
+        for (const auto& kv : sv.names) {
+            const SurveyAgg& a = kv.second;
+            if (a.kept) kept.push_back({kv.first, a.kept, a.radiusMax});
+            if (a.culled) culled.push_back({kv.first, a.culled, a.radiusMax});
+            if (a.smallClose) smallClose.push_back({kv.first, a.smallClose, a.radiusMax});
+            if (a.unreadSphere) unreadSphere.push_back({kv.first, a.unreadSphere, a.radiusMax});
+        }
+        close = sv.close;
+        sv.names.clear();
+        sv.close.clear();
+    } catch (...) {
+        Log::get().note("concourse names: the survey could not be read (out of memory)");
+        return;
+    }
+    auto byCount = [](const Row& a, const Row& b) { return a.n != b.n ? a.n > b.n : a.name < b.name; };
+    std::sort(kept.begin(), kept.end(), byCount);
+    std::sort(culled.begin(), culled.end(), byCount);
+    std::sort(smallClose.begin(), smallClose.end(), byCount);
+    std::sort(unreadSphere.begin(), unreadSphere.end(), byCount);
+    std::sort(close.begin(), close.end(), [](const SurveyClose& a, const SurveyClose& b) { return a.dist < b.dist; });
+    Log::get().note("concourse names: survey over 2 frames: %u kept names, %u culled names, %u small-close names, %u unreadable-sphere names, %u culled records within %.0f m",
+                    static_cast<unsigned>(kept.size()), static_cast<unsigned>(culled.size()), static_cast<unsigned>(smallClose.size()),
+                    static_cast<unsigned>(unreadSphere.size()), static_cast<unsigned>(close.size()), static_cast<double>(kSurveyCloseM));
+    for (size_t i = 0; i < kept.size() && i < 80; ++i) Log::get().note("concourse names: kept %s x%u", kept[i].name.c_str(), kept[i].n);
+    for (size_t i = 0; i < culled.size() && i < 80; ++i)
+        Log::get().note("concourse names: culled %s x%u r=%.1f", culled[i].name.c_str(), culled[i].n, static_cast<double>(culled[i].r));
+    for (size_t i = 0; i < close.size() && i < 40; ++i)
+        Log::get().note("concourse names: culled close %s dist=%.1f r=%.1f", close[i].name, static_cast<double>(close[i].dist), static_cast<double>(close[i].radius));
+    for (size_t i = 0; i < smallClose.size() && i < 40; ++i) Log::get().note("concourse names: small-close %s x%u", smallClose[i].name.c_str(), smallClose[i].n);
+    for (size_t i = 0; i < unreadSphere.size() && i < 40; ++i)
+        Log::get().note("concourse names: unreadable-sphere %s x%u", unreadSphere[i].name.c_str(), unreadSphere[i].n);
+}
+
+// H6: the camera in the anchor record's frame, once a second, while on foot in social space with the key armed (the cull on or off).
+void concourseFrameTrace(uint64_t now) {
+    if (now - g_concTraceMs < 1000) return;
+    g_concTraceMs = now;
+    // A line that says why there is no pose is written when the reason changes, and again every 10 s: never a fake zero.
+    auto said = [&](uint32_t reason) {
+        if (reason == g_concTraceReason && now - g_concTraceReasonMs < 10000) return false;
+        g_concTraceReason = reason;
+        g_concTraceReasonMs = now;
+        return true;
+    };
+    if (!g_frameCamValid) {
+        if (said(1)) Log::get().note("concourse frame: no line: the camera is not known this tick");
+        return;
+    }
+    const uintptr_t anchor = g_concAnchorAddr.load(std::memory_order_relaxed);
+    if (!anchor) {
+        if (said(2)) Log::get().note("concourse frame: no line: no %s record latched yet (the store has not seen one)", cc::kAnchorName);
+        return;
+    }
+    char nm[64] = {};
+    if (!cachedName(anchor, nm, sizeof(nm)) || std::strcmp(nm, cc::kAnchorName) != 0) {
+        uintptr_t expect = anchor;
+        g_concAnchorAddr.compare_exchange_strong(expect, 0, std::memory_order_relaxed);
+        Log::get().note("concourse frame: the latched anchor @%llx no longer reads %s (it reads \"%s\"); the latch is dropped until the store sees it again",
+                        static_cast<unsigned long long>(static_cast<uint64_t>(anchor) & 0xFFFFFFFFFFull), cc::kAnchorName, nm);
+        return;
+    }
+    const WorldRead aw = worldOfRecord(anchor);
+    float axes[3][3] = {};
+    float ext[3] = {};
+    bool extOk = false;
+    uint8_t osrc = 4;
+    if (aw.source == 4 || !poseOrientOf(anchor, axes, ext, &extOk, &osrc)) {
+        if (said(3))
+            Log::get().note("concourse frame: no line: the anchor's pose cannot be read (centre source %u, orientation source %u; 4 is none)", static_cast<unsigned>(aw.source),
+                            static_cast<unsigned>(osrc));
+        return;
+    }
+    float d[3] = {g_frameCam[0] - aw.world[0], g_frameCam[1] - aw.world[1], g_frameCam[2] - aw.world[2]};
+    float local[3] = {};
+    for (int k = 0; k < 3; ++k) local[k] = axes[k][0] * d[0] + axes[k][1] * d[1] + axes[k][2] * d[2];
+    char hub[260] = {};
+    const uintptr_t hubAddr = g_concHubAddr.load(std::memory_order_relaxed);
+    if (!hubAddr) {
+        std::snprintf(hub, sizeof(hub), "hub %s not latched yet", cc::kHubName);
+    } else {
+        char hn[64] = {};
+        if (!cachedName(hubAddr, hn, sizeof(hn)) || std::strcmp(hn, cc::kHubName) != 0) {
+            uintptr_t expect = hubAddr;
+            g_concHubAddr.compare_exchange_strong(expect, 0, std::memory_order_relaxed);
+            std::snprintf(hub, sizeof(hub), "hub %s: the latched record no longer reads that name; latch dropped", cc::kHubName);
+        } else {
+            const WorldRead hw = worldOfRecord(hubAddr);
+            if (hw.source == 4) {
+                std::snprintf(hub, sizeof(hub), "hub %s: the pose cannot be read", cc::kHubName);
+            } else {
+                const float hd[3] = {hw.world[0] - aw.world[0], hw.world[1] - aw.world[1], hw.world[2] - aw.world[2]};
+                float hl[3] = {};
+                for (int k = 0; k < 3; ++k) hl[k] = axes[k][0] * hd[0] + axes[k][1] * hd[1] + axes[k][2] * hd[2];
+                std::snprintf(hub, sizeof(hub), "hub %s centre %.2f %.2f %.2f r %.1f (in the anchor's frame %.2f %.2f %.2f)", hn, static_cast<double>(hw.world[0]),
+                              static_cast<double>(hw.world[1]), static_cast<double>(hw.world[2]), static_cast<double>(hw.radius), static_cast<double>(hl[0]),
+                              static_cast<double>(hl[1]), static_cast<double>(hl[2]));
+            }
+        }
+    }
+    g_concTraceReason = 0;
+    Log::get().note("concourse frame: cam_local %.2f %.2f %.2f anchor centre %.2f %.2f %.2f r %.1f axes (%.3f %.3f %.3f) (%.3f %.3f %.3f) (%.3f %.3f %.3f) src %u/%u, %s",
+                    static_cast<double>(local[0]), static_cast<double>(local[1]), static_cast<double>(local[2]), static_cast<double>(aw.world[0]),
+                    static_cast<double>(aw.world[1]), static_cast<double>(aw.world[2]), static_cast<double>(aw.radius), static_cast<double>(axes[0][0]),
+                    static_cast<double>(axes[0][1]), static_cast<double>(axes[0][2]), static_cast<double>(axes[1][0]), static_cast<double>(axes[1][1]),
+                    static_cast<double>(axes[1][2]), static_cast<double>(axes[2][0]), static_cast<double>(axes[2][1]), static_cast<double>(axes[2][2]),
+                    static_cast<unsigned>(aw.source), static_cast<unsigned>(osrc), hub);
+}
+
+// The tick, under the state lock, before the store gate is set (storeHookGate reads g_concWanted).
+void concourseTick(uint64_t now, uint32_t frame) {
+    g_concSettingOffLogged = false;
+    concoursePoll(now);
+    bool toggledOn = false;
+    if (g_concHotkey && g_concHotkey->pressed()) {
+        const bool was = concourseEffective();
+        g_concOverride = was ? ConcOverride::kOff : ConcOverride::kOn;
+        toggledOn = !was;
+        Log::get().note("concourse cull: hotkey: the cull is %s by override (diag.concourse_cull is %s)", was ? "off" : "on", g_concKeyOn ? "on" : "off");
+    }
+    const JournalRawStatus raw = journalRawStatus();
+    const bool known = journalOnFootKnown() || (runtimeFlatProfile() && raw.gameplay);
+    const bool social = cc::concourseSocialOnFoot(g_statusFlags2Now, known, raw.gameplay);
+    const bool sealedNow = g_heldValid;
+    const bool armed = concourseArmed();
+    const bool effective = concourseEffective();
+    const uint64_t anchorMs = g_concAnchorMs.load(std::memory_order_relaxed);
+    const bool anchor = anchorMs != 0 && now - anchorMs <= kConcAnchorFreshMs;
+    const bool gateWanted = armed && social && !sealedNow;
+    const bool active = gateWanted && effective && anchor;
+    g_concWanted.store(gateWanted, std::memory_order_release);
+    g_concHubWanted.store(gateWanted && g_concHubAddr.load(std::memory_order_relaxed) == 0, std::memory_order_relaxed);
+    const bool transitioned = active != g_concWasActive;
+    if (transitioned) {
+        if (active) {
+            bumpRigEpoch();   // the rigs are judged afresh: every slot and publication of the old epoch forwards
+            g_concActive.store(true, std::memory_order_release);
+            g_concSurveyDueMs = now + 2000;
+            g_concSumMs = now;
+            g_concSumFrames = 0;
+            g_concSumCalls[0] = g_callsStore.load(std::memory_order_relaxed);
+            g_concSumCalls[1] = g_callsProducer.load(std::memory_order_relaxed);
+            g_concSumCalls[2] = g_callsRig.load(std::memory_order_relaxed);
+            Log::get().note("concourse cull: on");
+        } else {
+            g_concActive.store(false, std::memory_order_release);
+            bumpRigEpoch();
+            g_concSurveyDueMs = 0;
+            const char* why = !effective ? "the key or its override is off"
+                              : sealedNow ? "the hangar seal engaged"
+                              : !social   ? "no longer on foot in social space"
+                                          : "the anchor record was not seen for 5 s";
+            Log::get().note("concourse cull: off (%s)", why);
+        }
+        g_concWasActive = active;
+        g_concWaitSet = false;
+    } else if (active && toggledOn) {
+        g_concSurveyDueMs = now + 2000;   // a toggle-on while the cull stays active (the override flipped back on): the names again
+    }
+    if (!active && !transitioned) {
+        const uint32_t keyCode = g_concOverride == ConcOverride::kNone ? (g_concKeyOn ? 1u : 0u) : (g_concOverride == ConcOverride::kOn ? 2u : 3u);
+        const uint32_t waitKey = (effective ? 1u : 0u) | (social ? 2u : 0u) | (anchor ? 4u : 0u) | (g_frameCamValid ? 8u : 0u) | (sealedNow ? 16u : 0u) | (keyCode << 5);
+        if (armed && (!g_concWaitSet || waitKey != g_concWaitKey)) {
+            g_concWaitSet = true;
+            g_concWaitKey = waitKey;
+            Log::get().note("concourse cull: waiting (key=%s social=%d anchor=%d camera=%d sealed=%d)", concourseKeyText(), social ? 1 : 0, anchor ? 1 : 0,
+                            g_frameCamValid ? 1 : 0, sealedNow ? 1 : 0);
+        } else if (!armed && g_concWasArmed) {
+            g_concWaitSet = false;
+            Log::get().note("concourse cull: off (the key is off)");
+        }
+    }
+    g_concWasArmed = armed;
+    // The one-shot names: due 2 s after an engage or a toggle-on, gathered over 2 frames.
+    const uint32_t stamp = g_frameStamp.load(std::memory_order_relaxed);
+    if (!active) {
+        if (g_concSurveyOn) {
+            g_concSurveyArmed.store(false, std::memory_order_release);
+            g_concSurveyOn = false;
+        }
+    } else if (!g_concSurveyOn && g_concSurveyDueMs != 0 && now >= g_concSurveyDueMs) {
+        try {
+            Survey& sv = survey();
+            std::lock_guard<std::mutex> lock(sv.m);
+            sv.names.clear();
+            sv.close.clear();
+        } catch (...) {
+        }
+        g_concSurveyDueMs = 0;
+        g_concSurveyOn = true;
+        g_concSurveyStamp = stamp;
+        g_concSurveyArmed.store(true, std::memory_order_release);
+    } else if (g_concSurveyOn && static_cast<uint32_t>(stamp - g_concSurveyStamp) >= 2) {
+        g_concSurveyArmed.store(false, std::memory_order_release);
+        g_concSurveyOn = false;
+        concourseSurveyReport();
+    }
+    if (gateWanted) concourseFrameTrace(now);
+    if (active) ++g_concSumFrames;
+    // The 5 s summary: while active; the panes' treated draws ride on it (or are said alone while only the panes are in use).
+    if (now - g_concSumMs >= 5000) {
+        g_concSumMs = now;
+        const uint64_t treated = concoursePaneTakeTreated();
+        if (active) {
+            const uint64_t calls[3] = {g_callsStore.load(std::memory_order_relaxed), g_callsProducer.load(std::memory_order_relaxed),
+                                       g_callsRig.load(std::memory_order_relaxed)};
+            const double frames = g_concSumFrames > 0 ? static_cast<double>(g_concSumFrames) : 1.0;
+            const double ms = (ringMean(g_costStore) * static_cast<double>(calls[0] - g_concSumCalls[0]) +
+                               ringMean(g_costProducer) * static_cast<double>(calls[1] - g_concSumCalls[1]) +
+                               ringMean(g_costRig) * static_cast<double>(calls[2] - g_concSumCalls[2])) / frames;
+            for (int k = 0; k < 3; ++k) g_concSumCalls[k] = calls[k];
+            g_concSumFrames = 0;
+            Log::get().note("concourse cull 5s: rigs seen %u vetoed %u, producer vetoed %u kept %u (name %u, small-close %u, unreadable-name %u, unreadable-sphere %u), "
+                            "store cleared %u, callback cost %.3f ms/frame, panes treated %u draws (mode %s, %u slots)",
+                            static_cast<unsigned>(g_concWin.rigSeen.exchange(0)), static_cast<unsigned>(g_concWin.rigVetoed.exchange(0)),
+                            static_cast<unsigned>(g_concWin.prodVetoed.exchange(0)), static_cast<unsigned>(g_concWin.prodKept.exchange(0)),
+                            static_cast<unsigned>(g_concWin.kept[0].exchange(0)), static_cast<unsigned>(g_concWin.kept[1].exchange(0)),
+                            static_cast<unsigned>(g_concWin.kept[2].exchange(0)), static_cast<unsigned>(g_concWin.kept[3].exchange(0)),
+                            static_cast<unsigned>(g_concWin.storeCleared.exchange(0)), ms, static_cast<unsigned>(treated), concoursePaneModeName(),
+                            static_cast<unsigned>(concoursePaneSlotCount()));
+        } else if (concoursePaneTreating()) {
+            Log::get().note("concourse pane 5s: treated %u draws (mode %s, %u slots)", static_cast<unsigned>(treated), concoursePaneModeName(),
+                            static_cast<unsigned>(concoursePaneSlotCount()));
+        }
+    }
+    (void)frame;
+}
+
+}  // namespace
+
 void optimizedStationFrameBody(uint32_t frame);
 
 // Built 2026-10-15: the seal trace's emitter. Each line goes out as one "%s" argument, so the trace's text is never a log format.
@@ -2674,6 +3249,7 @@ void optimizedStationFrameBody(uint32_t frame) {
     const uint64_t now = GetTickCount64();
     if (!g_setting.load(std::memory_order_acquire)) {
         if (g_summaryStartMs == 0) g_summaryStartMs = now;
+        concourseSettingOffTick(now);   // built 2026-11-05: the concourse cull stands down with the setting, and says so once
         return;
     }
     if (g_summaryStartMs == 0) g_summaryStartMs = now;
@@ -2712,7 +3288,8 @@ void optimizedStationFrameBody(uint32_t frame) {
         g_track.reset(padStateNowQpc());   // built v14.23: an undock ends the dock's own pad (the game names a new one on the next dock)
     }
     g_dockedWasNow = g_dockedNow.load(std::memory_order_acquire);
-    storeHookGate();   // built v14.20 (review 7b): the store observer gathers only while docked (an atomic gate: no hook is installed here)
+    concourseTick(now, frame);   // built 2026-11-05: the concourse cull's state, before the gate reads it
+    storeHookGate();   // built v14.20 (review 7b): the store observer gathers only while docked, or while the concourse cull is wanted (an atomic gate: no hook is installed here)
     gameStateTick();   // built v14.23: the own pad from the game, before the sun and the trigger read it
     const sealed::HeldRefresh heldRefresh = refreshHeldWorld();   // built 2026-10-15: the call's result goes to the seal trace
     // The camera against the held box: outside it by more than kCameraLeaveM releases the seal.
