@@ -3234,7 +3234,7 @@ int main(int argc, char** argv) {
     {
         namespace cc = edvr::concourse;
         char msg[200];
-        const char* const allowed[] = {"Standard_SocialArea", "SA_Station_01_Bar", "PS_Sittable_Sofa_01", "FUI_Python", "PROP_Tablet", "PlantStack0",
+        const char* const allowed[] = {"Standard_SocialArea", "SA_Station_01_Bar", "PS_Sittable_Sofa_01", "FUI_Python", "PROP_Tablet",
                                        "STAT_HoloBanner_VertA", "GUI_Interactive_Terminal_Standing_Gen_01", "TP_M_Exp01_HelmetLightRig", "HangarLobby",
                                        "TurboLift_Door_A"};
         for (const char* n : allowed) {
@@ -3242,7 +3242,7 @@ int main(int argc, char** argv) {
             check(cc::concourseAllowName(n, nullptr), msg);
         }
         const char* const refused[] = {"WheelSection00", "Spoke03", "RingRoad07", "HabitatRingA", "DockingHub", "HangerMedium", "LandingPadSmallA",
-                                       "Anaconda", "CobraMkV_Rear_Arm_Upper", "Exhaust", "Barrel"};
+                                       "Anaconda", "CobraMkV_Rear_Arm_Upper", "Exhaust", "Barrel", "PlantStack0", "PlantStack4"};
         for (const char* n : refused) {
             std::snprintf(msg, sizeof(msg), "concourse allow-list: %s is not the room", n);
             check(!cc::concourseAllowName(n, nullptr), msg);
@@ -3269,20 +3269,31 @@ int main(int argc, char** argv) {
         check(!cc::concourseSocialOnFoot(0x00004000u, true, true) && !cc::concourseSocialOnFoot(0x00000001u, true, true), "concourse gate: each of bit 0 and bit 14 alone is off");
 
         // The judgement.
-        check(cc::concourseJudge(true, false, true, 5.0f, 300.0f) == cc::Judge::kCull, "concourse judge: the ring (WheelSection00, 5 m away, radius 300 m) is culled");
-        check(cc::concourseJudge(true, false, true, 1.0f, 1.0f) == cc::Judge::kKeepSmallClose, "concourse judge: Barrel at 1 m with radius 1 m is kept (small and close)");
-        check(cc::concourseJudge(true, true, true, 500.0f, 3.0f) == cc::Judge::kKeepName, "concourse judge: an allowed name 500 m away is kept");
-        check(cc::concourseJudge(false, false, true, 5.0f, 300.0f) == cc::Judge::kKeepUnreadableName, "concourse judge: an unreadable name is kept");
-        check(cc::concourseJudge(true, false, false, 0.0f, 0.0f) == cc::Judge::kKeepUnreadableSphere, "concourse judge: an unreadable sphere is kept");
-        check(cc::concourseJudge(true, false, true, 300.0f, 10.0f) == cc::Judge::kCull, "concourse judge: Spoke03 at 300 m with radius 10 m is culled");
-        check(cc::concourseJudge(true, false, true, 40.0f, 25.0f) == cc::Judge::kKeepSmallClose && cc::concourseJudge(true, false, true, 40.01f, 25.0f) == cc::Judge::kCull &&
-                  cc::concourseJudge(true, false, true, 40.0f, 25.01f) == cc::Judge::kCull,
+        check(cc::concourseJudge(true, false, true, 5.0f, 300.0f, false) == cc::Judge::kCull, "concourse judge: the ring (WheelSection00, 5 m away, radius 300 m) is culled");
+        check(cc::concourseJudge(true, false, true, 1.0f, 1.0f, false) == cc::Judge::kKeepSmallClose, "concourse judge: Barrel at 1 m with radius 1 m is kept (small and close)");
+        check(cc::concourseJudge(true, true, true, 150.0f, 3.0f, false) == cc::Judge::kKeepName, "concourse judge: an allowed name 150 m away is kept");
+        check(cc::concourseJudge(true, true, true, 500.0f, 3.0f, false) == cc::Judge::kCull, "concourse judge: an allowed name 500 m away (radius 3 m) is culled, it is past the far limit");
+        check(cc::concourseJudge(true, true, true, 203.0f, 3.0f, false) == cc::Judge::kKeepName && cc::concourseJudge(true, true, true, 203.01f, 3.0f, false) == cc::Judge::kCull,
+              "concourse judge: the far rule is distance minus radius over 200 m, the edge itself is kept");
+        check(cc::concourseJudge(true, true, true, 400.0f, 90.0f, false) == cc::Judge::kCull && cc::concourseJudge(true, true, true, 280.0f, 90.0f, false) == cc::Judge::kKeepName,
+              "concourse judge: a big far structure (PlantStack, 400 m, radius 90 m) is culled; the same size at 280 m is kept");
+        check(cc::concourseJudge(true, true, true, 500.0f, 3.0f, true) == cc::Judge::kKeepName && cc::concourseJudge(true, true, true, 1190.0f, 50.0f, true) == cc::Judge::kKeepName,
+              "concourse judge: the anchor and the hub (far-exempt) are kept at any distance");
+        check(cc::concourseJudge(true, true, false, 900.0f, 3.0f, false) == cc::Judge::kKeepName && cc::concourseJudge(true, true, true, 900.0f, 0.0f, false) == cc::Judge::kKeepName &&
+                  cc::concourseJudge(true, true, true, std::nanf(""), 3.0f, false) == cc::Judge::kKeepName,
+              "concourse judge: the far rule needs a readable sphere");
+        check(cc::kAllowedFarM == 200.0f, "concourse judge: the far limit is 200 m");
+        check(cc::concourseJudge(false, false, true, 5.0f, 300.0f, false) == cc::Judge::kKeepUnreadableName, "concourse judge: an unreadable name is kept");
+        check(cc::concourseJudge(true, false, false, 0.0f, 0.0f, false) == cc::Judge::kKeepUnreadableSphere, "concourse judge: an unreadable sphere is kept");
+        check(cc::concourseJudge(true, false, true, 300.0f, 10.0f, false) == cc::Judge::kCull, "concourse judge: Spoke03 at 300 m with radius 10 m is culled");
+        check(cc::concourseJudge(true, false, true, 40.0f, 25.0f, false) == cc::Judge::kKeepSmallClose && cc::concourseJudge(true, false, true, 40.01f, 25.0f, false) == cc::Judge::kCull &&
+                  cc::concourseJudge(true, false, true, 40.0f, 25.01f, false) == cc::Judge::kCull,
               "concourse judge: small and close is radius at most 25 m and distance at most 40 m, both edges inclusive");
-        check(cc::concourseJudge(true, false, true, std::nanf(""), 10.0f) == cc::Judge::kKeepUnreadableSphere &&
-                  cc::concourseJudge(true, false, true, 10.0f, std::nanf("")) == cc::Judge::kKeepUnreadableSphere &&
-                  cc::concourseJudge(true, false, true, 10.0f, 0.0f) == cc::Judge::kKeepUnreadableSphere,
+        check(cc::concourseJudge(true, false, true, std::nanf(""), 10.0f, false) == cc::Judge::kKeepUnreadableSphere &&
+                  cc::concourseJudge(true, false, true, 10.0f, std::nanf(""), false) == cc::Judge::kKeepUnreadableSphere &&
+                  cc::concourseJudge(true, false, true, 10.0f, 0.0f, false) == cc::Judge::kKeepUnreadableSphere,
               "concourse judge: a sphere that is not finite, or has no radius, is unreadable and kept");
-        check(cc::concourseJudge(true, true, false, 0.0f, 0.0f) == cc::Judge::kKeepName && cc::concourseJudge(false, true, true, 5.0f, 300.0f) == cc::Judge::kKeepUnreadableName,
+        check(cc::concourseJudge(true, true, false, 0.0f, 0.0f, false) == cc::Judge::kKeepName && cc::concourseJudge(false, true, true, 5.0f, 300.0f, false) == cc::Judge::kKeepUnreadableName,
               "concourse judge: the name rules come first (an allowed name with no sphere is kept for its name; an unreadable name wins over an allowed flag)");
         check(cc::judgeKeeps(cc::Judge::kKeepName) && cc::judgeKeeps(cc::Judge::kKeepUnreadableName) && cc::judgeKeeps(cc::Judge::kKeepUnreadableSphere) &&
                   cc::judgeKeeps(cc::Judge::kKeepSmallClose) && !cc::judgeKeeps(cc::Judge::kCull),
@@ -3394,61 +3405,96 @@ int main(int argc, char** argv) {
             check(n2 == 2 && bad2 == 0 && two[0].n == 0 && two[1].n == 36, "concourse pane list: VS/PS and VS/PS/36 are different entries, a repeat of one is dropped");
         }
 
-        // The mirror textures: deterministic, and the values the game's glass shader decodes.
+        // The mirror textures: uniform, and the values the game's glass shader decodes.
         {
-            static uint8_t t8[cc::kPaneTexSize * cc::kPaneTexSize * 2], t8b[sizeof(t8)];
-            static uint8_t t9[cc::kPaneTexSize * cc::kPaneTexSize * 2], t9b[sizeof(t9)];
-            static uint8_t t10[cc::kPaneTexSize * cc::kPaneTexSize * 4], t10b[sizeof(t10)];
+            check(cc::kPaneTexSize == 4, "concourse mirror textures: 4 texels square");
+            static uint8_t t8[cc::kPaneTexSize * cc::kPaneTexSize * 2];
+            static uint8_t t9[cc::kPaneTexSize * cc::kPaneTexSize * 2];
+            static uint8_t t10[cc::kPaneTexSize * cc::kPaneTexSize * 4];
             cc::fillPaneT8(t8);
             cc::fillPaneT9(t9);
             cc::fillPaneT10(t10);
-            cc::fillPaneT8(t8b);
-            cc::fillPaneT9(t9b);
-            cc::fillPaneT10(t10b);
-            check(std::memcmp(t8, t8b, sizeof(t8)) == 0 && std::memcmp(t9, t9b, sizeof(t9)) == 0 && std::memcmp(t10, t10b, sizeof(t10)) == 0, "concourse mirror textures: the fill is deterministic");
             bool metal = true;
             for (size_t i = 0; i < sizeof(t8); ++i) metal = metal && t8[i] == 255;
             check(metal, "concourse mirror textures: t8 is 255 in both channels (metal 255)");
-            bool inside = true;
-            bool centreOk = true;
-            double maxLen = 0.0;
-            for (uint32_t y = 0; y < cc::kPaneTexSize; ++y)
-                for (uint32_t x = 0; x < cc::kPaneTexSize; ++x) {
-                    const uint8_t* p = t9 + 2 * (y * cc::kPaneTexSize + x);
-                    const double nx = (p[0] / 255.0) * 2.007874 - 0.999985;
-                    const double ny = (p[1] / 255.0) * 2.007874 - 0.999985;
-                    const double len = std::sqrt(nx * nx + ny * ny);
-                    if (len > maxLen) maxLen = len;
-                    if (!(len < 1.0)) inside = false;
-                    const bool seam = x % cc::kPaneSeamPeriod == 0 || y % cc::kPaneSeamPeriod == 0;
-                    if (!seam && (std::abs(static_cast<int>(p[0]) - 127) > 3 || std::abs(static_cast<int>(p[1]) - 127) > 3)) centreOk = false;
+            bool flat = true;
+            for (size_t i = 0; i < sizeof(t9); ++i) flat = flat && t9[i] == 127;
+            check(flat, "concourse mirror textures: t9 is 127, 127 everywhere (flat, no seam, no noise)");
+            const double nx = (127 / 255.0) * 2.007874 - 0.999985;
+            check(std::fabs(nx) < 0.002, "concourse mirror textures: 127 decodes to a normal xy of about zero");
+            bool uniform = true;
+            for (uint32_t i = 1; i < cc::kPaneTexSize * cc::kPaneTexSize; ++i)
+                for (int c = 0; c < 4; ++c) uniform = uniform && t10[4 * i + c] == t10[c];
+            check(uniform, "concourse mirror textures: t10 is one colour and one roughness (smooth)");
+            check(t10[0] == 184 && t10[1] == 191 && t10[2] == 199 && t10[3] == 77, "concourse mirror textures: t10 is (184, 191, 199) with roughness byte 77 (0.30)");
+        }
+
+        // The mark depth: infinite reversed Z, near plane 0.025 m.
+        {
+            check(std::fabs(cc::markDepthForDistance(100.0f) - 0.00025f) < 1e-9f && std::fabs(cc::markDepthForDistance(25.0f) - 0.001f) < 1e-9f,
+                  "concourse mark: the depth for 100 m is 0.00025 and for 25 m 0.001 (0.025 / metres)");
+            check(cc::markDepthForDistance(0.1f) == 0.025f && cc::markDepthForDistance(-5.0f) == 0.025f && cc::markDepthForDistance(1.0f) == 0.025f &&
+                      cc::markDepthForDistance(std::nanf("")) == 0.025f,
+                  "concourse mark: metres under 1 (or not a number) read as 1");
+            check(cc::kMirrorBeyondDefaultM == 100.0f && cc::markDepthForDistance(cc::kMirrorBeyondDefaultM) < cc::markDepthForDistance(50.0f),
+                  "concourse mark: the default is 100 m, and farther means a smaller depth");
+        }
+
+        // Each pane side.
+        {
+            cc::PaneSides sides;
+            const cc::PaneKey a{12, 0, 0}, b{12, 36, 5}, c{36, 0, -7};
+            check(sides.side(a) == cc::PaneSide::kUnknown && sides.knownCount() == 0 && sides.exteriorCount() == 0 && sides.dropped() == 0, "concourse pane sides: a new table knows nothing");
+            sides.note(a, 63, 63);
+            check(sides.side(a) == cc::PaneSide::kUnknown && sides.knownCount() == 0, "concourse pane sides: fewer than 64 drawn samples change nothing");
+            sides.note(a, 64, 38);   // 38 / 64 = 0.594
+            check(sides.side(a) == cc::PaneSide::kInterior && sides.exteriorCount() == 0, "concourse pane sides: 38 of 64 is under the 0.6 ratio: interior");
+            sides.note(a, 64, 39);   // 39 / 64 = 0.609
+            check(sides.side(a) == cc::PaneSide::kExterior && sides.exteriorCount() == 1, "concourse pane sides: 39 of 64 reaches the ratio: exterior, and the latest reading wins");
+            sides.note(a, 100, 60);
+            check(sides.side(a) == cc::PaneSide::kExterior, "concourse pane sides: exactly 0.6 is exterior");
+            sides.note(a, 1000, 10);
+            check(sides.side(a) == cc::PaneSide::kInterior && sides.exteriorCount() == 0 && sides.knownCount() == 1, "concourse pane sides: a later low reading turns it back to interior");
+            sides.note(a, 10, 10);
+            check(sides.side(a) == cc::PaneSide::kInterior, "concourse pane sides: a reading under the minimum leaves the side as it was");
+            sides.note(b, 200, 200);
+            sides.note(c, 200, 0);
+            check(sides.side(b) == cc::PaneSide::kExterior && sides.side(c) == cc::PaneSide::kInterior && sides.side(cc::PaneKey{12, 36, 6}) == cc::PaneSide::kUnknown &&
+                      sides.knownCount() == 3 && sides.exteriorCount() == 1,
+                  "concourse pane sides: the key is the count, the first index and the base vertex together");
+            const cc::PaneKey e{99, 1, 1};
+            const auto c1 = sides.note(e, 200, 200);
+            const auto c2 = sides.note(e, 200, 200);
+            const auto c3 = sides.note(e, 200, 0);
+            check(c1 == cc::PaneSides::Change::kFirst && c2 == cc::PaneSides::Change::kNone && c3 == cc::PaneSides::Change::kChanged,
+                  "concourse pane sides: note says first sight, no change and changed side");
+            sides.reset();
+            check(sides.side(b) == cc::PaneSide::kUnknown && sides.knownCount() == 0 && sides.exteriorCount() == 0 && sides.dropped() == 0, "concourse pane sides: reset forgets everything");
+            for (uint32_t i = 0; i < cc::kPaneSideCap; ++i) sides.note(cc::PaneKey{i + 1, 0, 0}, 100, 100);
+            check(sides.knownCount() == cc::kPaneSideCap && sides.exteriorCount() == cc::kPaneSideCap && sides.dropped() == 0, "concourse pane sides: 256 keys fit");
+            sides.note(cc::PaneKey{9999, 0, 0}, 100, 100);
+            sides.note(cc::PaneKey{9999, 0, 0}, 100, 100);
+            check(sides.side(cc::PaneKey{9999, 0, 0}) == cc::PaneSide::kUnknown && sides.dropped() == 2 && sides.knownCount() == cc::kPaneSideCap,
+                  "concourse pane sides: a full table reports unknown for a new key and counts the drops");
+            sides.note(cc::PaneKey{1, 0, 0}, 100, 0);
+            check(sides.side(cc::PaneKey{1, 0, 0}) == cc::PaneSide::kInterior && sides.exteriorCount() == cc::kPaneSideCap - 1, "concourse pane sides: a full table still updates a known key");
+        }
+
+        // Which frame a pane is tested: one in eight per key.
+        {
+            bool once = true;
+            bool spread = false;
+            const cc::PaneKey keys[] = {{12, 0, 0}, {36, 0, 0}, {12, 36, 5}, {192, 7, -3}, {864, 100, 0}};
+            for (const cc::PaneKey& k : keys)
+                for (uint32_t start = 0; start < 40; ++start) {
+                    uint32_t hits = 0;
+                    for (uint32_t f = start; f < start + 8; ++f) hits += cc::paneTestThisFrame(k, f) ? 1u : 0u;
+                    if (hits != 1) once = false;
                 }
-            check(inside && maxLen > 0.05, "concourse mirror textures: t9's normals decode inside the unit circle, and the seams tilt them");
-            check(centreOk, "concourse mirror textures: t9 is 127 plus or minus 3 away from the seams");
-            const uint8_t* seamTexel = t9 + 2 * (0 * cc::kPaneTexSize + 17);   // a horizontal seam line row 0, between vertical seams
-            check(std::abs(static_cast<int>(seamTexel[1]) - 127) >= 20 && std::abs(static_cast<int>(seamTexel[1]) - 127) <= 27, "concourse mirror textures: a seam is about 24 off flat");
-            double sum[3] = {};
-            double rough = 0.0;
-            uint32_t nonSeam = 0;
-            bool varies = false;
-            bool seamDarker = true;
-            for (uint32_t y = 0; y < cc::kPaneTexSize; ++y)
-                for (uint32_t x = 0; x < cc::kPaneTexSize; ++x) {
-                    const uint8_t* p = t10 + 4 * (y * cc::kPaneTexSize + x);
-                    const bool seam = x % cc::kPaneSeamPeriod == 0 || y % cc::kPaneSeamPeriod == 0;
-                    if (seam) {
-                        if (!(p[0] < 160 && p[3] > 80)) seamDarker = false;
-                        continue;
-                    }
-                    ++nonSeam;
-                    for (int c = 0; c < 3; ++c) sum[c] += p[c] / 255.0;
-                    rough += p[3] / 255.0;
-                    if (p[0] != t10[0 + 4 * (1 * cc::kPaneTexSize + 1)]) varies = true;
-                }
-            const double r = sum[0] / nonSeam, g = sum[1] / nonSeam, b = sum[2] / nonSeam, a = rough / nonSeam;
-            check(std::fabs(r - 0.72) < 0.02 && std::fabs(g - 0.75) < 0.02 && std::fabs(b - 0.78) < 0.02 && std::fabs(a - 0.18) < 0.02,
-                  "concourse mirror textures: t10 is about (0.72, 0.75, 0.78) with roughness about 0.18 away from the seams");
-            check(varies && seamDarker, "concourse mirror textures: t10 varies, and its seams are darker and rougher");
+            for (uint32_t f = 0; f < 8; ++f)
+                if (cc::paneTestThisFrame(keys[0], f) != cc::paneTestThisFrame(keys[1], f) || cc::paneTestThisFrame(keys[0], f) != cc::paneTestThisFrame(keys[2], f)) spread = true;
+            check(once, "concourse pane test frame: a key is tested exactly once in any 8 consecutive frames");
+            check(spread, "concourse pane test frame: the keys are spread over the 8 frames, not all on one");
         }
 
         // The clearing machine.

@@ -2939,13 +2939,13 @@ void testFlatCpuWiring() {
     const auto endBody=endAt!=std::string::npos&&dtorAt!=std::string::npos?runtimeCpp.substr(endAt,dtorAt-endAt):std::string{};
     bool drawOutsideCallbacks=true;size_t hookAt=0;
     // The span from beginActualDraw to endActualDraw is a proximity bound, not a ceiling on useful work: since 2026-11-03 the four instanced/indexed/plain
-    // hooks hold a FlatParticleScope block around the game's issue (fix.particle_billboard), the longest span being DrawIndexedInstanced's at 447 characters. Since 2026-11-05 the ConcoursePaneScope line (concourse_pane.h) adds about 80 more to each of the indexed hooks, so the bound is 600.
+    // hooks hold a FlatParticleScope block around the game's issue (fix.particle_billboard), the longest span being DrawIndexedInstanced's at 447 characters. Since 2026-11-05 the ConcoursePaneScope line (concourse_pane.h) adds about 80 more to each of the indexed hooks. Since 2026-11-06 each of the four indexed hooks also issues the mirror draw (beginMirror), up to 260 more, so the bound is 850.
     for(unsigned i=0;i<7;++i) {
         const auto before=vscreenCpp.find("if (flatDraw.needsActualDraw()) flatDraw.beginActualDraw",hookAt);
         const auto draw=before==std::string::npos?std::string::npos:vscreenCpp.find("g_state->realDraw",before);
         const auto after=before==std::string::npos?std::string::npos:vscreenCpp.find("if (flatDraw.needsActualDraw()) flatDraw.endActualDraw",before);
         drawOutsideCallbacks=drawOutsideCallbacks&&before!=std::string::npos&&draw!=std::string::npos&&
-            after!=std::string::npos&&before<draw&&draw<after&&after-before<600;
+            after!=std::string::npos&&before<draw&&draw<after&&after-before<850;
         hookAt=after==std::string::npos?vscreenCpp.size():after+1;
     }
     check(beginBody.find("if(!ctx)return;")<beginBody.find("flatcpu::Scope callbacks(flatcpu::kIssueCallbacks);")&&

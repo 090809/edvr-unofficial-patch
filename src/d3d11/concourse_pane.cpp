@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <string>
@@ -29,11 +30,11 @@ namespace {
 
 namespace cc = edvr::concourse;
 
-enum Mode : uint32_t { kModeMirror = 0, kModeMirrorCb = 1, kModeTint = 2, kModeOff = 3 };
+enum Mode : uint32_t { kModeMirror = 0, kModeMirrorSoft = 1, kModeTint = 2, kModeOff = 3 };
 
 const char* modeText(uint32_t m) noexcept {
     switch (m) {
-        case kModeMirrorCb: return "mirror-cb";
+        case kModeMirrorSoft: return "mirror-soft";
         case kModeTint: return "tint";
         case kModeOff: return "off";
         default: return "mirror";
@@ -42,7 +43,7 @@ const char* modeText(uint32_t m) noexcept {
 
 bool parseMode(const std::string& t, uint32_t* out) noexcept {
     if (t == "mirror") *out = kModeMirror;
-    else if (t == "mirror-cb") *out = kModeMirrorCb;
+    else if (t == "mirror-soft") *out = kModeMirrorSoft;
     else if (t == "tint") *out = kModeTint;
     else if (t == "off") *out = kModeOff;
     else return false;
@@ -57,6 +58,8 @@ constexpr uint32_t kFlagDepth = 1u << 3;
 constexpr uint32_t kFlagCb = 1u << 4;
 constexpr uint32_t kFlagQuery = 1u << 5;
 constexpr uint32_t kFlagCapQuery = 1u << 6;
+constexpr uint32_t kFlagTestDrawn = 1u << 7;    // the side test's first query (the game's glass draw) is open
+constexpr uint32_t kFlagTestMirror = 1u << 8;   // the side test's second query (the mirror draw) is open
 
 // ---- The list, the mode and the feed (the draw threads read them; the tick and the feed write them) --------------------------------------------
 std::atomic<uint32_t> g_mode{kModeMirror};
@@ -80,9 +83,28 @@ std::atomic<ID3D11BlendState*> g_bsMirror{nullptr};   // src = ONE, dest = ZERO 
 std::atomic<ID3D11BlendState*> g_bsFade{nullptr};     // src = BLEND_FACTOR, dest = INV_BLEND_FACTOR (a pane below full opacity)
 std::atomic<ID3D11PixelShader*> g_psWhite{nullptr};   // tint: the blend factor multiplies this, so it is the pane's colour
 std::atomic<ID3D11ShaderResourceView*> g_mirrorSrv[3] = {};   // t8, t9, t10
-std::atomic<ID3D11Buffer*> g_cbMirror{nullptr};       // mirror-cb: the pixel shader's constant buffer 2
+std::atomic<ID3D11Buffer*> g_cbMirror{nullptr};       // mirror-soft: the pixel shader's constant buffer 2
 std::atomic<bool> g_statesReady{false};
 bool g_psWhiteTried = false;   // the tick's: one compile per device
+
+// The mark pass's own objects (made by the tick; the draw threads read the atomics).
+std::atomic<ID3D11VertexShader*> g_vsMark{nullptr};      // the fullscreen triangle at the beyond depth
+std::atomic<ID3D11RasterizerState*> g_rsMark{nullptr};   // solid, no cull, depth clip, no scissor
+std::atomic<ID3D11BlendState*> g_bsMark{nullptr};        // no colour write
+std::atomic<ID3D11DepthStencilState*> g_dsMark{nullptr};   // depth test greater-equal, no depth write, stencil replace 0x40
+std::atomic<bool> g_markReady{false};
+std::atomic<float> g_beyondM{cc::kMirrorBeyondDefaultM};   // diag.concourse_mirror_beyond
+float g_vsMarkM = 0.0f;       // the metres the compiled vertex shader holds (the tick's)
+bool g_vsMarkTried = false;
+bool g_markStatesTried = false;
+std::string g_beyondAppliedText;
+bool g_beyondTextSeen = false;
+constexpr UINT kMarkRef = 0x40;
+std::atomic<uint64_t> g_markPasses{0}, g_markRefused{0}, g_testsRead{0};
+// The frame the plain mirror phase last began. For kMarkSettleFrames after it, a pane known to be exterior stays whole: the frame in flight may still hold the
+// depth of the structure the cull has just taken away, and the mark would open holes in the pane for that frame.
+constexpr uint32_t kMarkSettleFrames = 8;
+std::atomic<uint32_t> g_plainFrom{0};
 
 constexpr UINT kPaneSrvFirst = 8;
 constexpr UINT kPaneSrvCount = 3;
@@ -159,13 +181,45 @@ std::mutex g_tintMutex;
 uint32_t g_tintN[cc::kPaneColourCount] = {};
 size_t g_tintCount = 0;
 
+// ---- The side tests and the table of each pane's side ----------------------------------------------------------------------------------------------
+// A test is two occlusion queries around two draws of one pane: the game's glass, then the mirror (marked). The ring holds 16 tests; the tick reads what arrived.
+constexpr size_t kTestSlots = 16;
+struct TestSlot {
+    ID3D11Query* qDrawn = nullptr;
+    ID3D11Query* qMirror = nullptr;
+    uint8_t state = 0;   // 0 free, 1 the game's draw open, 2 closed and waiting for the mirror, 3 the mirror open, 4 both closed, not yet read
+    uint32_t frame = 0;
+    cc::PaneKey key;
+};
+std::mutex g_sideMutex;   // the table and the ring: the draw thread and the tick both touch them
+TestSlot g_tests[kTestSlots];
+cc::PaneSides g_sides;
+bool g_testsMade = false;
+std::atomic<bool> g_testsOn{false};
+uint32_t g_sideLogExterior = 0, g_sideLogOther = 0;   // lines said this session, each capped
+constexpr uint32_t kSideLogCap = 96;
+
+// The mark pass runs at most once per (frame, depth view, viewport): the draw thread's (the immediate context only).
+struct MarkKey {
+    uint32_t frame = 0;
+    ID3D11DepthStencilView* dsv = nullptr;   // identity only, never dereferenced
+    float vp[4] = {};
+    bool valid = false;
+};
+MarkKey g_markKey;
+bool g_markLogged = false;
+bool g_markNoStencilLogged = false;
+
 // ---- The derived depth states: the game's, with depth writes on ----------------------------------------------------------------------------------
+// Two variants per original state: `plain` (depth write on, stencil off) for an opaque pane drawn everywhere, and `marked` (depth write on, stencil read mask 0x40,
+// equal to the reference, no stencil write) for an opaque pane drawn where the mark pass set bit 0x40.
 struct DsEntry {
     ID3D11DepthStencilState* orig = nullptr;   // held, so the pointer cannot be reused for another state
-    ID3D11DepthStencilState* derived = nullptr;
+    ID3D11DepthStencilState* plain = nullptr;
+    ID3D11DepthStencilState* marked = nullptr;
 };
 std::mutex g_dsMutex;
-DsEntry g_ds[8];
+DsEntry g_ds[16];
 size_t g_dsN = 0;
 
 // The tick's state.
@@ -242,10 +296,26 @@ void releaseStates() noexcept {
     for (auto& s : g_mirrorSrv) s.store(nullptr, std::memory_order_release);
     g_cbMirror.store(nullptr, std::memory_order_release);
     g_psWhiteTried = false;
+    g_markReady.store(false, std::memory_order_release);
+    g_vsMark.store(nullptr, std::memory_order_release);
+    g_rsMark.store(nullptr, std::memory_order_release);
+    g_bsMark.store(nullptr, std::memory_order_release);
+    g_dsMark.store(nullptr, std::memory_order_release);
+    g_vsMarkTried = false;
+    g_vsMarkM = 0.0f;
+    g_markStatesTried = false;
     {
         std::lock_guard<std::mutex> lock(g_dsMutex);
         for (auto& e : g_ds) e = DsEntry{};
         g_dsN = 0;
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_sideMutex);
+        g_testsOn.store(false, std::memory_order_release);
+        for (auto& t : g_tests) t = TestSlot{};
+        g_testsMade = false;
+        g_sides.reset();
+        g_markKey = MarkKey{};
     }
     {
         std::lock_guard<std::mutex> lock(g_shareMutex);
@@ -366,7 +436,7 @@ bool makeMirrorTextures(ID3D11Device* device) noexcept {
 }
 
 bool makeMirrorCb(ID3D11Device* device) noexcept {
-    static const float kRows[12] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0};   // row 2: F0 scale 1, roughness scale 1
+    static const float kRows[12] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1.8f, 0};   // row 2: F0 scale 1, roughness scale 1.8 (0.30 * 1.8 = 0.54)
     D3D11_BUFFER_DESC bd{};
     bd.ByteWidth = kPaneCbBytes;
     bd.Usage = D3D11_USAGE_IMMUTABLE;
@@ -376,10 +446,107 @@ bool makeMirrorCb(ID3D11Device* device) noexcept {
     ID3D11Buffer* b = nullptr;
     const HRESULT h = device->CreateBuffer(&bd, &sd, &b);
     if (FAILED(h) || !b) {
-        Log::get().note("concourse pane: the mirror constant buffer could not be made (hr %08X); mirror-cb is not available", static_cast<unsigned>(h));
+        Log::get().note("concourse pane: the mirror constant buffer could not be made (hr %08X); mirror-soft is not available", static_cast<unsigned>(h));
         return false;
     }
     g_cbMirror.store(b, std::memory_order_release);
+    return true;
+}
+
+// The mark pass's vertex shader: one fullscreen triangle at the depth of the beyond distance (reversed Z: 0.025 / metres). Recompiled when the key changes; the
+// old shader is not released (a draw thread may hold it for one more draw, and a change of the key is a developer's act).
+void ensureMarkVs(ID3D11Device* device) noexcept {
+    const float want = g_beyondM.load(std::memory_order_relaxed);
+    if (g_vsMarkTried && g_vsMarkM == want) return;
+    g_vsMarkTried = true;
+    g_vsMarkM = want;
+    ID3D11DeviceContext* imm = nullptr;
+    device->GetImmediateContext(&imm);
+    if (!imm) return;
+    const float z = cc::markDepthForDistance(want);
+    char hlsl[400] = {};
+    const int len = std::snprintf(hlsl, sizeof(hlsl),
+                                  "float4 main(uint id : SV_VertexID) : SV_Position { float2 p = float2((id << 1) & 2, id & 2); return float4(p.x * 2 - 1, 1 - p.y * 2, %.9g, 1); }\n",
+                                  static_cast<double>(z));
+    ID3D11VertexShader* vs = len > 0 ? shaderSwapCompileVs(imm, hlsl, static_cast<size_t>(len), "main", "concourse_pane_mark", nullptr, "concourse pane") : nullptr;
+    imm->Release();
+    if (!vs) {
+        Log::get().note("concourse pane: the mark vertex shader did not compile (beyond %.0f m); the mirror cannot be limited to the far pixels, so it does not draw", static_cast<double>(want));
+        g_vsMark.store(nullptr, std::memory_order_release);
+        return;
+    }
+    g_vsMark.store(vs, std::memory_order_release);
+}
+
+bool makeMarkStates(ID3D11Device* device) noexcept {
+    if (g_markStatesTried) return g_rsMark.load(std::memory_order_acquire) != nullptr;
+    g_markStatesTried = true;
+    D3D11_RASTERIZER_DESC rd{};
+    rd.FillMode = D3D11_FILL_SOLID;
+    rd.CullMode = D3D11_CULL_NONE;
+    rd.DepthClipEnable = TRUE;
+    rd.ScissorEnable = FALSE;
+    D3D11_BLEND_DESC bd{};
+    bd.RenderTarget[0].BlendEnable = FALSE;
+    bd.RenderTarget[0].SrcBlend = D3D11_BLEND_ONE;
+    bd.RenderTarget[0].DestBlend = D3D11_BLEND_ZERO;
+    bd.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
+    bd.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
+    bd.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_ZERO;
+    bd.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
+    bd.RenderTarget[0].RenderTargetWriteMask = 0;
+    D3D11_DEPTH_STENCIL_DESC dd{};
+    dd.DepthEnable = TRUE;
+    dd.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ZERO;
+    dd.DepthFunc = D3D11_COMPARISON_GREATER_EQUAL;
+    dd.StencilEnable = TRUE;
+    dd.StencilReadMask = 0;
+    dd.StencilWriteMask = static_cast<UINT8>(kMarkRef);
+    for (D3D11_DEPTH_STENCILOP_DESC* f : {&dd.FrontFace, &dd.BackFace}) {
+        f->StencilFunc = D3D11_COMPARISON_ALWAYS;
+        f->StencilFailOp = D3D11_STENCIL_OP_KEEP;
+        f->StencilDepthFailOp = D3D11_STENCIL_OP_KEEP;
+        f->StencilPassOp = D3D11_STENCIL_OP_REPLACE;
+    }
+    ID3D11RasterizerState* rs = nullptr;
+    ID3D11BlendState* bs = nullptr;
+    ID3D11DepthStencilState* ds = nullptr;
+    const HRESULT h1 = device->CreateRasterizerState(&rd, &rs);
+    const HRESULT h2 = device->CreateBlendState(&bd, &bs);
+    const HRESULT h3 = device->CreateDepthStencilState(&dd, &ds);
+    if (FAILED(h1) || FAILED(h2) || FAILED(h3) || !rs || !bs || !ds) {
+        Log::get().note("concourse pane: the mark pass's states could not be made (hr %08X, %08X, %08X); the mirror does not draw", static_cast<unsigned>(h1),
+                        static_cast<unsigned>(h2), static_cast<unsigned>(h3));
+        if (rs) rs->Release();
+        if (bs) bs->Release();
+        if (ds) ds->Release();
+        return false;
+    }
+    g_bsMark.store(bs, std::memory_order_release);
+    g_dsMark.store(ds, std::memory_order_release);
+    g_rsMark.store(rs, std::memory_order_release);
+    return true;
+}
+
+bool makeTests(ID3D11Device* device) noexcept {
+    std::lock_guard<std::mutex> lock(g_sideMutex);
+    if (g_testsMade) return true;
+    FlatComputeInternalScope internal;
+    D3D11_QUERY_DESC qd{};
+    qd.Query = D3D11_QUERY_OCCLUSION;
+    for (size_t i = 0; i < kTestSlots; ++i) {
+        if (FAILED(device->CreateQuery(&qd, &g_tests[i].qDrawn)) || !g_tests[i].qDrawn || FAILED(device->CreateQuery(&qd, &g_tests[i].qMirror)) || !g_tests[i].qMirror) {
+            Log::get().note("concourse pane: the side test queries could not be made (test %u of %u); the panes' sides are not learned", static_cast<unsigned>(i),
+                            static_cast<unsigned>(kTestSlots));
+            for (size_t k = 0; k <= i; ++k) {
+                if (g_tests[k].qDrawn) g_tests[k].qDrawn->Release();
+                if (g_tests[k].qMirror) g_tests[k].qMirror->Release();
+                g_tests[k] = TestSlot{};
+            }
+            return false;
+        }
+    }
+    g_testsMade = true;
     return true;
 }
 
@@ -387,9 +554,12 @@ bool makeStates(ID3D11Device* device) noexcept {
     if (!device) return false;
     if (g_statesReady.load(std::memory_order_acquire)) return true;
     makeWhitePs(device);
+    makeMarkStates(device);
+    ensureMarkVs(device);
+    g_markReady.store(g_rsMark.load(std::memory_order_acquire) != nullptr && g_vsMark.load(std::memory_order_acquire) != nullptr, std::memory_order_release);
     if (!g_bsMirror.load(std::memory_order_acquire) && !makeBlendStates(device)) return false;
     if (!g_mirrorSrv[0].load(std::memory_order_acquire) && !makeMirrorTextures(device)) return false;
-    if (!g_cbMirror.load(std::memory_order_acquire)) makeMirrorCb(device);   // mirror-cb only: a failure is logged and the plain mirror carries on
+    if (!g_cbMirror.load(std::memory_order_acquire)) makeMirrorCb(device);   // mirror-soft only: a failure is logged and the plain mirror carries on
     g_statesReady.store(true, std::memory_order_release);
     return true;
 }
@@ -569,14 +739,41 @@ void pollShares(ID3D11Device* device, uint32_t prevFrame, uint32_t frame, bool m
 }
 
 // ---- The derived depth state -------------------------------------------------------------------------------------------------------------------
-ID3D11DepthStencilState* derivedDepth(ID3D11DeviceContext* ctx, ID3D11DepthStencilState* orig) noexcept {
+// nullptr when the variant cannot be made (a full cache, or the device refused): the caller does not draw the mirror then.
+ID3D11DepthStencilState* derivedDepth(ID3D11DeviceContext* ctx, ID3D11DepthStencilState* orig, bool marked) noexcept {
     std::lock_guard<std::mutex> lock(g_dsMutex);
+    size_t at = g_dsN;
     for (size_t i = 0; i < g_dsN; ++i)
-        if (g_ds[i].orig == orig) return g_ds[i].derived;
-    if (g_dsN >= sizeof(g_ds) / sizeof(g_ds[0])) return nullptr;
+        if (g_ds[i].orig == orig) {
+            at = i;
+            break;
+        }
+    if (at == g_dsN) {
+        if (g_dsN >= sizeof(g_ds) / sizeof(g_ds[0])) return nullptr;
+        orig->AddRef();
+        g_ds[g_dsN] = DsEntry{};
+        g_ds[g_dsN].orig = orig;
+        ++g_dsN;
+    }
+    ID3D11DepthStencilState*& slot = marked ? g_ds[at].marked : g_ds[at].plain;
+    if (slot) return slot;
     D3D11_DEPTH_STENCIL_DESC d{};
     orig->GetDesc(&d);
     d.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ALL;
+    if (marked) {
+        d.StencilEnable = TRUE;
+        d.StencilReadMask = static_cast<UINT8>(kMarkRef);
+        d.StencilWriteMask = 0;
+        for (D3D11_DEPTH_STENCILOP_DESC* f : {&d.FrontFace, &d.BackFace}) {
+            f->StencilFunc = D3D11_COMPARISON_EQUAL;
+            f->StencilFailOp = D3D11_STENCIL_OP_KEEP;
+            f->StencilDepthFailOp = D3D11_STENCIL_OP_KEEP;
+            f->StencilPassOp = D3D11_STENCIL_OP_KEEP;
+        }
+    } else {
+        d.StencilEnable = FALSE;
+        d.StencilWriteMask = 0;
+    }
     ID3D11Device* dev = nullptr;
     ctx->GetDevice(&dev);
     ID3D11DepthStencilState* derived = nullptr;
@@ -584,10 +781,7 @@ ID3D11DepthStencilState* derivedDepth(ID3D11DeviceContext* ctx, ID3D11DepthStenc
         if (FAILED(dev->CreateDepthStencilState(&d, &derived))) derived = nullptr;
         dev->Release();
     }
-    orig->AddRef();
-    g_ds[g_dsN].orig = orig;
-    g_ds[g_dsN].derived = derived;
-    ++g_dsN;
+    slot = derived;   // a refusal is remembered as null: the variant is not tried again
     return derived;
 }
 
@@ -627,6 +821,13 @@ const char* formatName(DXGI_FORMAT f) noexcept {
         case DXGI_FORMAT_BC5_UNORM: return "BC5_UNORM";
         case DXGI_FORMAT_BC7_UNORM: return "BC7_UNORM";
         case DXGI_FORMAT_BC7_UNORM_SRGB: return "BC7_UNORM_SRGB";
+        case DXGI_FORMAT_D32_FLOAT_S8X24_UINT: return "D32_FLOAT_S8X24_UINT";
+        case DXGI_FORMAT_D24_UNORM_S8_UINT: return "D24_UNORM_S8_UINT";
+        case DXGI_FORMAT_D32_FLOAT: return "D32_FLOAT";
+        case DXGI_FORMAT_D16_UNORM: return "D16_UNORM";
+        case DXGI_FORMAT_R32G8X24_TYPELESS: return "R32G8X24_TYPELESS";
+        case DXGI_FORMAT_R24G8_TYPELESS: return "R24G8_TYPELESS";
+        case DXGI_FORMAT_UNKNOWN: return "UNKNOWN";
         default: return nullptr;
     }
 }
@@ -820,9 +1021,244 @@ int captureBegin(ID3D11DeviceContext* ctx, UINT indexCount) noexcept {
     return idx;
 }
 
+// ---- The side tests -----------------------------------------------------------------------------------------------------------------------------
+int testOpen(ID3D11DeviceContext* ctx, const cc::PaneKey& key) noexcept {
+    int idx = -1;
+    {
+        std::lock_guard<std::mutex> lock(g_sideMutex);
+        if (!g_testsMade) return -1;
+        for (size_t i = 0; i < kTestSlots; ++i)
+            if (g_tests[i].state == 0 && g_tests[i].qDrawn) {
+                idx = static_cast<int>(i);
+                break;
+            }
+        if (idx < 0) return -1;
+        g_tests[idx].state = 1;
+        g_tests[idx].frame = g_frameNow.load(std::memory_order_relaxed);
+        g_tests[idx].key = key;
+    }
+    FlatComputeInternalScope internal;
+    ctx->Begin(g_tests[idx].qDrawn);
+    return idx;
+}
+
+// End of the game's draw: the first query closes and the slot waits for the mirror.
+void testCloseDrawn(ID3D11DeviceContext* ctx, int idx) noexcept {
+    {
+        FlatComputeInternalScope internal;
+        ctx->End(g_tests[idx].qDrawn);
+    }
+    std::lock_guard<std::mutex> lock(g_sideMutex);
+    g_tests[idx].state = 2;
+}
+
+void testOpenMirror(ID3D11DeviceContext* ctx, int idx) noexcept {
+    {
+        FlatComputeInternalScope internal;
+        ctx->Begin(g_tests[idx].qMirror);
+    }
+    std::lock_guard<std::mutex> lock(g_sideMutex);
+    g_tests[idx].state = 3;
+}
+
+void testCloseMirror(ID3D11DeviceContext* ctx, int idx) noexcept {
+    {
+        FlatComputeInternalScope internal;
+        ctx->End(g_tests[idx].qMirror);
+    }
+    std::lock_guard<std::mutex> lock(g_sideMutex);
+    g_tests[idx].state = 4;
+}
+
+// A test that did not get its mirror draw: the slot is free again (a query that ended and was not read may begin again).
+void testAbandon(int idx) noexcept {
+    std::lock_guard<std::mutex> lock(g_sideMutex);
+    g_tests[idx].state = 0;
+}
+
+cc::PaneSide sideOf(const cc::PaneKey& key) noexcept {
+    std::lock_guard<std::mutex> lock(g_sideMutex);
+    return g_sides.side(key);
+}
+
+// The tick: reads the tests that arrived and feeds the table.
+void pollTests(ID3D11Device* device, uint32_t frame) noexcept {
+    ID3D11DeviceContext* imm = nullptr;
+    device->GetImmediateContext(&imm);
+    if (!imm) return;
+    {
+        std::lock_guard<std::mutex> lock(g_sideMutex);
+        if (g_testsMade) {
+            FlatComputeInternalScope internal;
+            for (auto& t : g_tests) {
+                if (t.state != 4) {
+                    if (t.state != 0 && static_cast<uint32_t>(frame - t.frame) > 600u) t.state = 0;   // stuck open (a draw that never reached its end)
+                    continue;
+                }
+                UINT64 drawn = 0, mirrored = 0;
+                if (imm->GetData(t.qDrawn, &drawn, sizeof(drawn), D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK) continue;
+                if (imm->GetData(t.qMirror, &mirrored, sizeof(mirrored), D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK) continue;
+                const cc::PaneKey key = t.key;
+                t.state = 0;
+                g_testsRead.fetch_add(1, std::memory_order_relaxed);
+                const cc::PaneSides::Change c = g_sides.note(key, drawn, mirrored);
+                if (c == cc::PaneSides::Change::kNone) continue;
+                const bool ext = g_sides.side(key) == cc::PaneSide::kExterior;
+                uint32_t& cap = (c == cc::PaneSides::Change::kFirst && ext) ? g_sideLogExterior : g_sideLogOther;
+                if (cap >= kSideLogCap) continue;
+                ++cap;
+                const char* word = c == cc::PaneSides::Change::kChanged ? (ext ? "changed side to exterior" : "changed side to interior") : (ext ? "exterior" : "interior");
+                Log::get().note("concourse pane: %s n=%u start=%u base=%d (drawn %llu, mirrored %llu)", word, key.n, key.startIndex, key.baseVertex,
+                                static_cast<unsigned long long>(drawn), static_cast<unsigned long long>(mirrored));
+            }
+        }
+    }
+    imm->Release();
+}
+
+// ---- The mark pass -----------------------------------------------------------------------------------------------------------------------------
+bool formatHasStencil(DXGI_FORMAT f) noexcept {
+    return f == DXGI_FORMAT_D24_UNORM_S8_UINT || f == DXGI_FORMAT_D32_FLOAT_S8X24_UINT || f == DXGI_FORMAT_R24G8_TYPELESS || f == DXGI_FORMAT_R32G8X24_TYPELESS;
+}
+
+bool markRefuse() noexcept {
+    g_markRefused.fetch_add(1, std::memory_order_relaxed);
+    return false;
+}
+
+// Runs at most once per (frame, depth view, viewport): one fullscreen triangle, no colour, at the depth of the beyond distance; where the scene's stored depth is at
+// or below it (the scene is farther) stencil bit 0x40 is set. Everything touched is put back before returning, through the game's own entry points (past EDVR's
+// thunks: the binding shadow, the shader substitution and the issue epoch do not move) or the context's own methods where no thunk exists (input layout, topology
+// and rasteriser state are not hooked), and no draw thunk is re-entered (the draw goes through the real Draw).
+bool ensureMarked(ID3D11DeviceContext* ctx, const ConcoursePaneCalls& calls) noexcept {
+    if (!g_markReady.load(std::memory_order_acquire) || !calls.draw || !calls.setVs || !calls.setPs || !calls.setBlend || !calls.setDepth) return markRefuse();
+    ID3D11VertexShader* vsMark = g_vsMark.load(std::memory_order_acquire);
+    ID3D11RasterizerState* rsMark = g_rsMark.load(std::memory_order_acquire);
+    ID3D11BlendState* bsMark = g_bsMark.load(std::memory_order_acquire);
+    ID3D11DepthStencilState* dsMark = g_dsMark.load(std::memory_order_acquire);
+    if (!vsMark || !rsMark || !bsMark || !dsMark) return markRefuse();
+    ID3D11DepthStencilView* dsv = nullptr;
+    ctx->OMGetRenderTargets(0, nullptr, &dsv);
+    if (!dsv) return markRefuse();
+    D3D11_VIEWPORT vp{};
+    UINT nvp = 1;
+    ctx->RSGetViewports(&nvp, &vp);
+    const uint32_t frame = g_frameNow.load(std::memory_order_relaxed);
+    if (g_markKey.valid && g_markKey.frame == frame && g_markKey.dsv == dsv && g_markKey.vp[0] == vp.TopLeftX && g_markKey.vp[1] == vp.TopLeftY &&
+        g_markKey.vp[2] == vp.Width && g_markKey.vp[3] == vp.Height) {
+        dsv->Release();
+        return true;
+    }
+    D3D11_DEPTH_STENCIL_VIEW_DESC dd{};
+    dsv->GetDesc(&dd);
+    DXGI_FORMAT fmt = dd.Format;
+    if (fmt == DXGI_FORMAT_UNKNOWN) {   // a view made without a description: the resource's own format
+        ID3D11Resource* res = nullptr;
+        dsv->GetResource(&res);
+        ID3D11Texture2D* tex = nullptr;
+        if (res) res->QueryInterface(IID_PPV_ARGS(&tex));
+        if (tex) {
+            D3D11_TEXTURE2D_DESC td{};
+            tex->GetDesc(&td);
+            fmt = td.Format;
+            tex->Release();
+        }
+        if (res) res->Release();
+    }
+    if (!formatHasStencil(fmt) || (dd.Flags & D3D11_DSV_READ_ONLY_STENCIL) != 0 || nvp < 1 || !(vp.Width > 0.0f) || !(vp.Height > 0.0f)) {
+        if (!g_markNoStencilLogged) {
+            g_markNoStencilLogged = true;
+            const char* fn = formatName(fmt);
+            char fb[24] = {};
+            if (!fn) std::snprintf(fb, sizeof(fb), "format %u", static_cast<unsigned>(fmt));
+            Log::get().note("concourse pane: the mirror cannot work: the depth view (%s, flags %u, %u viewports, %.0fx%.0f) has no writable stencil; the game's glass is left alone",
+                            fn ? fn : fb, static_cast<unsigned>(dd.Flags), static_cast<unsigned>(nvp), static_cast<double>(vp.Width), static_cast<double>(vp.Height));
+        }
+        dsv->Release();
+        return markRefuse();
+    }
+    ID3D11GeometryShader* gs = nullptr;
+    ID3D11HullShader* hs = nullptr;
+    ID3D11DomainShader* dom = nullptr;
+    ctx->GSGetShader(&gs, nullptr, nullptr);
+    ctx->HSGetShader(&hs, nullptr, nullptr);
+    ctx->DSGetShader(&dom, nullptr, nullptr);
+    const bool staged = gs || hs || dom;
+    if (gs) gs->Release();
+    if (hs) hs->Release();
+    if (dom) dom->Release();
+    if (staged) {   // a geometry or tessellation stage would take the triangle: not run (counted)
+        dsv->Release();
+        return markRefuse();
+    }
+    // Save.
+    ID3D11InputLayout* prevLayout = nullptr;
+    D3D11_PRIMITIVE_TOPOLOGY prevTopo = D3D11_PRIMITIVE_TOPOLOGY_UNDEFINED;
+    ID3D11VertexShader* prevVs = nullptr;
+    ID3D11PixelShader* prevPs = nullptr;
+    ID3D11RasterizerState* prevRs = nullptr;
+    ID3D11BlendState* prevBs = nullptr;
+    FLOAT prevFactor[4] = {};
+    UINT prevMask = 0;
+    ID3D11DepthStencilState* prevDs = nullptr;
+    UINT prevRef = 0;
+    ctx->IAGetInputLayout(&prevLayout);
+    ctx->IAGetPrimitiveTopology(&prevTopo);
+    ctx->VSGetShader(&prevVs, nullptr, nullptr);
+    ctx->PSGetShader(&prevPs, nullptr, nullptr);
+    ctx->RSGetState(&prevRs);
+    ctx->OMGetBlendState(&prevBs, prevFactor, &prevMask);
+    ctx->OMGetDepthStencilState(&prevDs, &prevRef);
+    // Draw.
+    const FLOAT zeros[4] = {};
+    ctx->IASetInputLayout(nullptr);
+    ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    calls.setVs(ctx, vsMark, nullptr, 0);
+    calls.setPs(ctx, nullptr, nullptr, 0);
+    ctx->RSSetState(rsMark);
+    calls.setBlend(ctx, bsMark, zeros, 0xFFFFFFFFu);
+    calls.setDepth(ctx, dsMark, kMarkRef);
+    calls.draw(ctx, 3, 0);
+    // Restore.
+    calls.setDepth(ctx, prevDs, prevRef);
+    calls.setBlend(ctx, prevBs, prevFactor, prevMask);
+    ctx->RSSetState(prevRs);
+    calls.setPs(ctx, prevPs, nullptr, 0);
+    calls.setVs(ctx, prevVs, nullptr, 0);
+    ctx->IASetPrimitiveTopology(prevTopo);
+    ctx->IASetInputLayout(prevLayout);
+    if (prevDs) prevDs->Release();
+    if (prevBs) prevBs->Release();
+    if (prevRs) prevRs->Release();
+    if (prevPs) prevPs->Release();
+    if (prevVs) prevVs->Release();
+    if (prevLayout) prevLayout->Release();
+    g_markKey.valid = true;
+    g_markKey.frame = frame;
+    g_markKey.dsv = dsv;   // identity only
+    g_markKey.vp[0] = vp.TopLeftX;
+    g_markKey.vp[1] = vp.TopLeftY;
+    g_markKey.vp[2] = vp.Width;
+    g_markKey.vp[3] = vp.Height;
+    dsv->Release();
+    g_markPasses.fetch_add(1, std::memory_order_relaxed);
+    if (!g_markLogged) {
+        g_markLogged = true;
+        const float beyond = g_vsMarkM;
+        const char* fn = formatName(fmt);
+        char fb[24] = {};
+        if (!fn) std::snprintf(fb, sizeof(fb), "format %u", static_cast<unsigned>(fmt));
+        Log::get().note("concourse pane: mark pass: dsv format %s, viewport %ux%u, beyond %.0f m (z %.6g)", fn ? fn : fb, static_cast<unsigned>(vp.Width),
+                        static_cast<unsigned>(vp.Height), static_cast<double>(beyond), static_cast<double>(cc::markDepthForDistance(beyond)));
+    }
+    return true;
+}
+
 }  // namespace
 
-void ConcoursePaneScope::begin(ID3D11DeviceContext* ctx, UINT indexCount, const ConcoursePaneCalls& calls) noexcept {
+// begin() changes no state. It runs the capture path, the withheld check, the family match, the one-shot material read and the share query, then only DECIDES the
+// plan (a mirror draw or none, marked or not, opaque or fading) and opens the side test's first query when one is due.
+void ConcoursePaneScope::begin(ID3D11DeviceContext* ctx, UINT indexCount, UINT startIndex, INT baseVertex, const ConcoursePaneCalls& calls) noexcept {
     if (!ctx) return;
     if (g_capturing.load(std::memory_order_acquire)) {
         const int q = captureBegin(ctx, indexCount);
@@ -855,6 +1291,10 @@ void ConcoursePaneScope::begin(ID3D11DeviceContext* ctx, UINT indexCount, const 
     if (cc::paneTripleIndex(g_list, listN, vs, ps, indexCount) < 0) return;
     ctx_ = ctx;
     calls_ = &calls;
+    family_ = true;
+    keyN_ = indexCount;
+    keyStart_ = startIndex;
+    keyBase_ = baseVertex;
     const bool immediate = ctx->GetType() == D3D11_DEVICE_CONTEXT_IMMEDIATE;
     if (immediate) {
         materialOnce(ctx, indexCount);
@@ -864,72 +1304,146 @@ void ConcoursePaneScope::begin(ID3D11DeviceContext* ctx, UINT indexCount, const 
         }
     }
     const uint32_t mode = g_mode.load(std::memory_order_relaxed);
-    if (!g_treatNow.load(std::memory_order_acquire) || mode == kModeOff) return;   // measured only
+    if (!immediate || !g_treatNow.load(std::memory_order_acquire) || mode == kModeOff) return;   // measured only, and the game's glass alone
     const bool tint = mode == kModeTint;
+    const bool plain = g_withholdNow.load(std::memory_order_relaxed);   // the cull is on and the phase is the plain mirror phase
+    bool mark = false;
+    bool opaque = true;
     float opacity = 1.0f;
-    if (!tint && indexCount == cc::kBayIndexCount) opacity = std::min(1.0f, std::max(0.0f, g_bayOpacity.load(std::memory_order_relaxed)));
-    if (opacity <= 0.001f) return;   // the bay glass is clear: the game's own glass draws, unchanged
-    const bool opaque = opacity >= 0.999f;
-    ID3D11BlendState* repl = tint ? g_bsFactor.load(std::memory_order_acquire) : opaque ? g_bsMirror.load(std::memory_order_acquire) : g_bsFade.load(std::memory_order_acquire);
-    if (!repl) return;
-    FLOAT factor[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+    if (plain) {
+        mark = true;   // every pane mirrors where the scene behind it is far; the mark pass says where
+        if (g_frameNow.load(std::memory_order_relaxed) - g_plainFrom.load(std::memory_order_relaxed) < kMarkSettleFrames &&
+            sideOf(cc::PaneKey{indexCount, startIndex, baseVertex}) == cc::PaneSide::kExterior)
+            mark = false;
+    } else {
+        // The cull is lifted (lifting, fading, clear): only a pane known to be exterior is still mirrored, and over its whole area.
+        const cc::PaneKey key{indexCount, startIndex, baseVertex};
+        if (sideOf(key) != cc::PaneSide::kExterior) return;
+        if (indexCount == cc::kBayIndexCount) {
+            opacity = std::min(1.0f, std::max(0.0f, g_bayOpacity.load(std::memory_order_relaxed)));
+            if (opacity <= 0.001f) return;   // the bay glass is clear: the game's own glass, alone
+            if (opacity < 0.999f) opaque = false;
+        }
+    }
+    if (tint) opaque = true;
+    planMirror_ = true;
+    planMark_ = mark;
+    planOpaque_ = opaque;
+    planTint_ = tint;
+    planSoft_ = mode == kModeMirrorSoft;
     if (tint) {
         const float* c = cc::kPaneColours[tintSlotOf(indexCount) % cc::kPaneColourCount];
-        for (int k = 0; k < 3; ++k) factor[k] = c[k] * cc::kPaneTintIntensity;
+        for (int k = 0; k < 3; ++k) planFactor_[k] = c[k] * cc::kPaneTintIntensity;
+        planFactor_[3] = 1.0f;
     } else if (!opaque) {
-        factor[0] = factor[1] = factor[2] = factor[3] = opacity;
+        planFactor_[0] = planFactor_[1] = planFactor_[2] = planFactor_[3] = opacity;
     }
-    ctx->OMGetBlendState(&prevBs_, prevFactor_, &prevMask_);
-    calls.setBlend(ctx, repl, factor, 0xFFFFFFFFu);
-    flags_ |= kFlagBlend;
-    g_treated.fetch_add(1, std::memory_order_relaxed);
-    if (tint) {
-        ID3D11PixelShader* white = g_psWhite.load(std::memory_order_acquire);
-        if (white) {
-            ctx->PSGetShader(&prevPs_, nullptr, nullptr);
-            calls.setPs(ctx, white, nullptr, 0);
-            flags_ |= kFlagPs;
-        }
-        return;
-    }
-    ID3D11ShaderResourceView* mine[3] = {g_mirrorSrv[0].load(std::memory_order_acquire), g_mirrorSrv[1].load(std::memory_order_acquire),
-                                         g_mirrorSrv[2].load(std::memory_order_acquire)};
-    if (mine[0] && mine[1] && mine[2]) {
-        ctx->PSGetShaderResources(kPaneSrvFirst, kPaneSrvCount, prevSrv_);
-        calls.setSrv(ctx, kPaneSrvFirst, kPaneSrvCount, mine);
-        flags_ |= kFlagSrv;
-    }
-    if (opaque) {
-        UINT ref = 0;
-        ctx->OMGetDepthStencilState(&prevDs_, &ref);
-        ID3D11DepthStencilState* derived = prevDs_ ? derivedDepth(ctx, prevDs_) : nullptr;
-        if (derived) {
-            prevStencilRef_ = ref;
-            calls.setDepth(ctx, derived, ref);
-            flags_ |= kFlagDepth;
-        } else if (prevDs_) {
-            prevDs_->Release();
-            prevDs_ = nullptr;
-        }
-    }
-    if (mode == kModeMirrorCb) {
-        ID3D11Buffer* own = g_cbMirror.load(std::memory_order_acquire);
-        if (own) {
-            ctx->QueryInterface(IID_PPV_ARGS(&ctx1_));
-            if (ctx1_) {
-                // The *ConstantBuffers1 methods are not hooked, so this passes no thunk, and the saved offset window is put back exactly.
-                ctx1_->PSGetConstantBuffers1(kPaneCbSlot, 1, &prevCb_, &prevCbFirst_, &prevCbNum_);
-                ctx1_->PSSetConstantBuffers1(kPaneCbSlot, 1, &own, nullptr, nullptr);
-            } else {
-                ctx->PSGetConstantBuffers(kPaneCbSlot, 1, &prevCb_);
-                ctx->PSSetConstantBuffers(kPaneCbSlot, 1, &own);
-            }
-            flags_ |= kFlagCb;
-        }
+    // The side test (plain phase, one frame in eight per pane): the first query wraps the game's draw and closes in beginMirror().
+    if (plain && mark && g_testsOn.load(std::memory_order_acquire) && g_markReady.load(std::memory_order_acquire) &&
+        cc::paneTestThisFrame(cc::PaneKey{indexCount, startIndex, baseVertex}, g_frameNow.load(std::memory_order_relaxed))) {
+        testSlot_ = testOpen(ctx, cc::PaneKey{indexCount, startIndex, baseVertex});
+        if (testSlot_ >= 0) flags_ |= kFlagTestDrawn;
     }
 }
 
+// Called right after the game's own draw. Closes the share query (so the bay's coverage is the game's draw alone) and the test's first query, then, if the plan
+// says so and the mark pass could run, binds the mirror's state and returns true. Every false return leaves the context as the game had it.
+bool ConcoursePaneScope::beginMirrorSlow() noexcept {
+    if ((flags_ & kFlagQuery) != 0) {
+        if (query_ >= 0) closeShareQuery(ctx_, query_);
+        flags_ &= ~kFlagQuery;
+    }
+    if ((flags_ & kFlagTestDrawn) != 0) {
+        testCloseDrawn(ctx_, testSlot_);
+        flags_ &= ~kFlagTestDrawn;
+    }
+    const auto no = [&]() noexcept {
+        if (testSlot_ >= 0) {
+            testAbandon(testSlot_);
+            testSlot_ = -1;
+        }
+        return false;
+    };
+    if (!planMirror_) return no();
+    if (planMark_ && !ensureMarked(ctx_, *calls_)) return no();   // runs and restores its own state
+    ID3D11BlendState* repl = planTint_ ? g_bsFactor.load(std::memory_order_acquire)
+                                       : planOpaque_ ? g_bsMirror.load(std::memory_order_acquire) : g_bsFade.load(std::memory_order_acquire);
+    if (!repl) return no();
+    ID3D11ShaderResourceView* mine[3] = {};
+    if (!planTint_) {
+        for (int i = 0; i < 3; ++i) mine[i] = g_mirrorSrv[i].load(std::memory_order_acquire);
+        if (!mine[0] || !mine[1] || !mine[2]) return no();
+    }
+    ID3D11PixelShader* white = planTint_ ? g_psWhite.load(std::memory_order_acquire) : nullptr;
+    ID3D11Buffer* ownCb = planSoft_ && !planTint_ ? g_cbMirror.load(std::memory_order_acquire) : nullptr;
+    // The depth state first: an opaque pane needs a derived one, and without it nothing is bound.
+    ID3D11DepthStencilState* derived = nullptr;
+    UINT stencilRef = 0;
+    if (planOpaque_) {
+        UINT ref = 0;
+        ctx_->OMGetDepthStencilState(&prevDs_, &ref);
+        derived = prevDs_ ? derivedDepth(ctx_, prevDs_, planMark_) : nullptr;
+        if (!derived) {
+            if (prevDs_) prevDs_->Release();
+            prevDs_ = nullptr;
+            return no();
+        }
+        prevStencilRef_ = ref;
+        stencilRef = planMark_ ? kMarkRef : ref;
+    }
+    // Bind.
+    ctx_->OMGetBlendState(&prevBs_, prevFactor_, &prevMask_);
+    calls_->setBlend(ctx_, repl, planFactor_, 0xFFFFFFFFu);
+    flags_ |= kFlagBlend;
+    if (planTint_) {
+        if (white) {
+            ctx_->PSGetShader(&prevPs_, nullptr, nullptr);
+            calls_->setPs(ctx_, white, nullptr, 0);
+            flags_ |= kFlagPs;
+        }
+    } else {
+        ctx_->PSGetShaderResources(kPaneSrvFirst, kPaneSrvCount, prevSrv_);
+        calls_->setSrv(ctx_, kPaneSrvFirst, kPaneSrvCount, mine);
+        flags_ |= kFlagSrv;
+    }
+    if (derived) {
+        calls_->setDepth(ctx_, derived, stencilRef);
+        flags_ |= kFlagDepth;
+    }
+    if (ownCb) {
+        ctx_->QueryInterface(IID_PPV_ARGS(&ctx1_));
+        if (ctx1_) {
+            // The *ConstantBuffers1 methods are not hooked, so this passes no thunk, and the saved offset window is put back exactly.
+            ctx1_->PSGetConstantBuffers1(kPaneCbSlot, 1, &prevCb_, &prevCbFirst_, &prevCbNum_);
+            ctx1_->PSSetConstantBuffers1(kPaneCbSlot, 1, &ownCb, nullptr, nullptr);
+        } else {
+            ctx_->PSGetConstantBuffers(kPaneCbSlot, 1, &prevCb_);
+            ctx_->PSSetConstantBuffers(kPaneCbSlot, 1, &ownCb);
+        }
+        flags_ |= kFlagCb;
+    }
+    if (testSlot_ >= 0) {
+        testOpenMirror(ctx_, testSlot_);
+        flags_ |= kFlagTestMirror;
+    }
+    g_treated.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
 void ConcoursePaneScope::end() noexcept {
+    if (testSlot_ >= 0) {
+        if ((flags_ & kFlagTestMirror) != 0) {
+            testCloseMirror(ctx_, testSlot_);
+        } else {
+            if ((flags_ & kFlagTestDrawn) != 0) {   // the game's draw was never followed by beginMirror(): close its query and drop the test
+                FlatComputeInternalScope internal;
+                ctx_->End(g_tests[testSlot_].qDrawn);
+            }
+            testAbandon(testSlot_);
+        }
+        testSlot_ = -1;
+        flags_ &= ~(kFlagTestMirror | kFlagTestDrawn);
+    }
     if ((flags_ & kFlagCb) != 0) {
         if (ctx1_) {
             if (prevCb_) ctx1_->PSSetConstantBuffers1(kPaneCbSlot, 1, &prevCb_, &prevCbFirst_, &prevCbNum_);
@@ -1082,7 +1596,29 @@ void pollConfig(uint64_t nowMs) {
         g_modeAppliedText = modeT;
         uint32_t m = kModeMirror;
         if (parseMode(modeT, &m)) setMode(m, "diag.concourse_pane_mode");
-        else Log::get().note("concourse pane: diag.concourse_pane_mode = \"%s\" is not mirror, mirror-cb, tint or off; the mode is unchanged", modeT.c_str());
+        else Log::get().note("concourse pane: diag.concourse_pane_mode = \"%s\" is not mirror, mirror-soft, tint or off; the mode is unchanged", modeT.c_str());
+    }
+    const std::string beyondT = Config::get().getString("diag.concourse_mirror_beyond", "");
+    if (!g_beyondTextSeen || beyondT != g_beyondAppliedText) {
+        const bool first = !g_beyondTextSeen;
+        g_beyondTextSeen = true;
+        g_beyondAppliedText = beyondT;
+        if (beyondT.empty()) {
+            g_beyondM.store(cc::kMirrorBeyondDefaultM, std::memory_order_relaxed);   // unset: the default
+        } else {
+            char* end = nullptr;
+            const double v = std::strtod(beyondT.c_str(), &end);
+            while (end && (*end == ' ' || *end == '\t')) ++end;
+            if (end && end != beyondT.c_str() && *end == '\0' && v >= static_cast<double>(cc::kMirrorBeyondMinM) && v <= static_cast<double>(cc::kMirrorBeyondMaxM)) {
+                g_beyondM.store(static_cast<float>(v), std::memory_order_relaxed);
+                if (!first || v != static_cast<double>(cc::kMirrorBeyondDefaultM))
+                    Log::get().note("concourse pane: diag.concourse_mirror_beyond is now %.1f m", v);
+            } else {
+                Log::get().note("concourse pane: diag.concourse_mirror_beyond = \"%s\" is not a number from %.0f to %.0f; the value stays %.1f m", beyondT.c_str(),
+                                static_cast<double>(cc::kMirrorBeyondMinM), static_cast<double>(cc::kMirrorBeyondMaxM),
+                                static_cast<double>(g_beyondM.load(std::memory_order_relaxed)));
+            }
+        }
     }
     const std::string panesT = Config::get().getString("diag.concourse_panes", "");
     if (!g_panesTextSeen || panesT != g_panesAppliedText) {
@@ -1121,14 +1657,30 @@ void updateArmed() noexcept {
 
 uint64_t concoursePaneTakeTreated() noexcept { return g_treated.exchange(0, std::memory_order_relaxed); }
 uint64_t concoursePaneTakeWithheld() noexcept { return g_withheld.exchange(0, std::memory_order_relaxed); }
+ConcoursePaneMirrorStats concoursePaneTakeMirrorStats() noexcept {
+    ConcoursePaneMirrorStats r;
+    r.markPasses = g_markPasses.exchange(0, std::memory_order_relaxed);
+    r.markRefused = g_markRefused.exchange(0, std::memory_order_relaxed);
+    r.tests = g_testsRead.exchange(0, std::memory_order_relaxed);
+    std::lock_guard<std::mutex> lock(g_sideMutex);
+    r.known = g_sides.knownCount();
+    r.exterior = g_sides.exteriorCount();
+    r.dropped = g_sides.dropped();
+    return r;
+}
 const char* concoursePaneModeName() noexcept { return modeText(g_mode.load(std::memory_order_relaxed)); }
 uint32_t concoursePaneSlotCount() noexcept { return g_listN.load(std::memory_order_relaxed); }
 bool concoursePaneTreating() noexcept { return g_treatNow.load(std::memory_order_relaxed); }
 
 void concoursePaneSetFeed(const ConcoursePaneFeed& feed) noexcept {
     g_feedMeasure.store(feed.measure, std::memory_order_relaxed);
-    g_feedTreat.store(feed.treat, std::memory_order_relaxed);
-    g_feedWithhold.store(feed.withhold, std::memory_order_relaxed);
+    const bool treatBefore = g_feedTreat.exchange(feed.treat, std::memory_order_relaxed);
+    if (!treatBefore && feed.treat) {   // a new visit to a concourse: what was learned about the panes is forgotten
+        std::lock_guard<std::mutex> lock(g_sideMutex);
+        g_sides.reset();
+    }
+    if (!g_feedWithhold.exchange(feed.withhold, std::memory_order_relaxed) && feed.withhold)
+        g_plainFrom.store(g_frameNow.load(std::memory_order_relaxed), std::memory_order_relaxed);
     g_bayOpacity.store(feed.bayOpacity, std::memory_order_relaxed);
     updateArmed();
 }
@@ -1159,7 +1711,7 @@ void concoursePaneTick(ID3D11Device* device, uint32_t frame, uint64_t nowMs) noe
     g_social = cc::concourseSocialOnFoot(journalStatusFlags2(), known, raw.gameplay);
     if (g_keyMode && g_keyMode->pressed()) {
         const uint32_t cur = g_mode.load(std::memory_order_relaxed);
-        const uint32_t next = cur == kModeMirror ? kModeMirrorCb : cur == kModeMirrorCb ? kModeTint : cur == kModeTint ? kModeOff : kModeMirror;
+        const uint32_t next = cur == kModeMirror ? kModeMirrorSoft : cur == kModeMirrorSoft ? kModeTint : cur == kModeTint ? kModeOff : kModeMirror;
         setMode(next, g_social ? "hotkey.concourse_pane_mode" : "hotkey.concourse_pane_mode; it applies on foot in social space");
     }
     if (g_keyCapture && g_keyCapture->pressed()) {
@@ -1197,7 +1749,16 @@ void concoursePaneTick(ID3D11Device* device, uint32_t frame, uint64_t nowMs) noe
     }
     if (device) {
         const bool wantStates = g_feedTreat.load(std::memory_order_relaxed) && g_mode.load(std::memory_order_relaxed) != kModeOff;
-        if (wantStates) makeStates(device);
+        if (wantStates) {
+            makeStates(device);
+            if (g_statesReady.load(std::memory_order_acquire)) {
+                ensureMarkVs(device);   // a change of diag.concourse_mirror_beyond compiles the vertex shader again
+                g_markReady.store(g_rsMark.load(std::memory_order_acquire) != nullptr && g_vsMark.load(std::memory_order_acquire) != nullptr,
+                                  std::memory_order_release);
+                if (makeTests(device)) g_testsOn.store(true, std::memory_order_release);
+            }
+        }
+        pollTests(device, frame);
         const bool measuring = g_feedMeasure.load(std::memory_order_relaxed);
         if (measuring && makeSlots(device)) g_shareOn.store(true, std::memory_order_release);
         if (!measuring) g_shareOn.store(false, std::memory_order_release);

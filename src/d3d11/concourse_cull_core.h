@@ -8,7 +8,8 @@
 //   concourseRigVetoed       one rig: vetoed only when a record of it was judged and none was kept
 //   PaneTriple, paneTripleMatch, parsePaneList   a glass pane named by its vertex shader, pixel shader and index count (0: any count)
 //   kPaneFamilyVs, kPaneFamilyPs, kPlumePs, kTwinPs, kBayIndexCount   the glass family, the draws withheld, the bay window's index count
-//   fillPaneT8, fillPaneT9, fillPaneT10   the texels of the mirror materials
+//   fillPaneT8, fillPaneT9, fillPaneT10   the texels of the mirror materials (uniform)
+//   markDepthForDistance, PaneSides, paneTestThisFrame   the mirror's mark depth, and each pane's side (interior or exterior) learned from two occlusion counts
 //   ClearMachine   the bay glass's clearing on approach: a pure state machine
 #include <cmath>
 #include <cstddef>
@@ -27,7 +28,7 @@ constexpr const char* kHubName = "SA_StationHub_Compact";
 
 // The name prefixes that are the room. Exact case.
 constexpr const char* kAllowPrefixes[] = {"Standard_SocialArea", "SA_",         "PS_",        "STAT_", "FUI_",        "PROP_",
-                                          "GUI_Interactive",     "Interactive_", "PlantStack", "TP_",   "HangarLobby", "TurboLift"};
+                                          "GUI_Interactive",     "Interactive_", "TP_",         "HangarLobby", "TurboLift"};
 constexpr size_t kAllowPrefixCount = sizeof(kAllowPrefixes) / sizeof(kAllowPrefixes[0]);
 
 inline bool hasPrefixExact(const char* name, const char* prefix, size_t n) noexcept { return n > 0 && std::strncmp(name, prefix, n) == 0; }
@@ -61,16 +62,21 @@ inline bool concourseSocialOnFoot(uint32_t flags2, bool known, bool gameplay) no
 // A record that is small and close is kept whatever its name: a weapon or a prop whose name is generic (Barrel, Slider, Hinge).
 constexpr float kSmallRadiusM = 25.0f;
 constexpr float kCloseDistanceM = 40.0f;
+// An allowed name whose sphere is wholly farther than this from the camera is culled all the same (the plant stacks, the far hangar lobby, the huge logo);
+// the anchor and the hub are exempt, because the gate reads them from the store.
+constexpr float kAllowedFarM = 200.0f;
 
 enum class Judge : uint8_t { kKeepName, kKeepUnreadableName, kKeepUnreadableSphere, kKeepSmallClose, kCull };
 
 inline bool judgeKeeps(Judge j) noexcept { return j != Judge::kCull; }
 
-// One record. Keep an unreadable name; keep an allowed name; keep an unreadable sphere (not finite, or no radius); keep a small, close record; cull.
-inline Judge concourseJudge(bool nameReadable, bool allowed, bool sphereReadable, float distance, float radius) noexcept {
+// One record. Keep an unreadable name; an allowed name is kept, unless its sphere is readable and wholly past kAllowedFarM (distance - radius) and it is not
+// the anchor or the hub (`farExempt`, computed from the name by the caller); keep an unreadable sphere (not finite, or no radius); keep a small, close record; cull.
+inline Judge concourseJudge(bool nameReadable, bool allowed, bool sphereReadable, float distance, float radius, bool farExempt) noexcept {
     if (!nameReadable) return Judge::kKeepUnreadableName;
-    if (allowed) return Judge::kKeepName;
-    if (!sphereReadable || !std::isfinite(distance) || !std::isfinite(radius) || !(radius > 0.0f)) return Judge::kKeepUnreadableSphere;
+    const bool sphereOk = sphereReadable && std::isfinite(distance) && std::isfinite(radius) && radius > 0.0f;
+    if (allowed) return (!farExempt && sphereOk && distance - radius > kAllowedFarM) ? Judge::kCull : Judge::kKeepName;
+    if (!sphereOk) return Judge::kKeepUnreadableSphere;
     if (radius <= kSmallRadiusM && distance <= kCloseDistanceM) return Judge::kKeepSmallClose;
     return Judge::kCull;
 }
@@ -215,9 +221,57 @@ constexpr float kPaneTintIntensity = 2.0f;
 
 // ---- The mirror materials (the game's glass shader reads three texture arrays; these stand in for them) ------------------------------------------
 // t8 (R8G8) x = metalness, y = the game's o0.w; t9 (R8G8) the normal's xy, decoded by the shader as xy * 2.007874 - 0.999985 (127 is flat); t10 (R8G8B8A8) rgb =
-// base colour, a = roughness. Each texture is kPaneTexSize square; a tile seam one texel wide runs every kPaneSeamPeriod texels.
-constexpr uint32_t kPaneTexSize = 64;
-constexpr uint32_t kPaneSeamPeriod = 16;
+// base colour, a = roughness. Each texture is kPaneTexSize square and uniform: no seam, no noise, so the mirror is smooth.
+constexpr uint32_t kPaneTexSize = 4;
+constexpr uint8_t kPaneT10Rgb[3] = {184, 191, 199};   // 0.72, 0.75, 0.78 of 255
+constexpr uint8_t kPaneT10Roughness = 77;             // 0.30 of 255
+
+// out: kPaneTexSize * kPaneTexSize * 2 bytes. Metalness 255 and the second channel 255 everywhere.
+inline void fillPaneT8(uint8_t* out) noexcept {
+    for (uint32_t i = 0; i < kPaneTexSize * kPaneTexSize; ++i) {
+        out[2 * i] = 255;
+        out[2 * i + 1] = 255;
+    }
+}
+// Flat 127, 127. out: kPaneTexSize * kPaneTexSize * 2 bytes.
+inline void fillPaneT9(uint8_t* out) noexcept {
+    for (uint32_t i = 0; i < kPaneTexSize * kPaneTexSize; ++i) {
+        out[2 * i] = 127;
+        out[2 * i + 1] = 127;
+    }
+}
+// One colour, roughness 0.30. out: kPaneTexSize * kPaneTexSize * 4 bytes.
+inline void fillPaneT10(uint8_t* out) noexcept {
+    for (uint32_t i = 0; i < kPaneTexSize * kPaneTexSize; ++i) {
+        for (int c = 0; c < 3; ++c) out[4 * i + c] = kPaneT10Rgb[c];
+        out[4 * i + 3] = kPaneT10Roughness;
+    }
+}
+
+// ---- The mirror's mark: where the scene behind a pane is farther than the beyond distance -----------------------------------------------------------
+// Scene depth is infinite reversed Z (near plane 0.025 m): ndc z at distance d is 0.025 / d.
+constexpr float kMirrorNearM = 0.025f;
+constexpr float kMirrorBeyondDefaultM = 100.0f;
+constexpr float kMirrorBeyondMinM = 20.0f;
+constexpr float kMirrorBeyondMaxM = 5000.0f;
+inline float markDepthForDistance(float metres) noexcept {
+    if (!(metres >= 1.0f)) metres = 1.0f;
+    return kMirrorNearM / metres;
+}
+
+// ---- Each pane's side, learned by occlusion queries ----------------------------------------------------------------------------------------------
+// A pane is the game's glass draw, named by its index count, first index and base vertex. Interior glass has a wall behind it; exterior glass has nothing near
+// behind it. One test reads two queries: the samples the game's glass passed (drawn) and the samples the marked mirror draw passed (mirrored).
+struct PaneKey {
+    uint32_t n = 0, startIndex = 0;
+    int32_t baseVertex = 0;
+};
+enum class PaneSide : uint8_t { kUnknown, kInterior, kExterior };
+
+constexpr uint64_t kPaneTestMinSamples = 64;
+constexpr double kPaneExteriorRatio = 0.6;
+constexpr uint32_t kPaneTestPeriod = 8;
+constexpr size_t kPaneSideCap = 256;
 
 inline uint32_t paneHash(uint32_t x, uint32_t y, uint32_t salt) noexcept {
     uint32_t h = x * 0x9E3779B1u ^ y * 0x85EBCA77u ^ salt * 0xC2B2AE3Du;
@@ -228,45 +282,59 @@ inline uint32_t paneHash(uint32_t x, uint32_t y, uint32_t salt) noexcept {
     h ^= h >> 15;
     return h;
 }
-inline bool paneSeam(uint32_t x, uint32_t y) noexcept { return x % kPaneSeamPeriod == 0 || y % kPaneSeamPeriod == 0; }
-// A deterministic offset in [-amp, amp].
-inline int paneNoise(uint32_t x, uint32_t y, uint32_t salt, int amp) noexcept {
-    return static_cast<int>(paneHash(x, y, salt) % static_cast<uint32_t>(2 * amp + 1)) - amp;
-}
-inline uint8_t paneClampByte(int v) noexcept { return static_cast<uint8_t>(v < 0 ? 0 : v > 255 ? 255 : v); }
+inline uint32_t paneKeyHash(const PaneKey& k) noexcept { return paneHash(k.n, k.startIndex, static_cast<uint32_t>(k.baseVertex) ^ 0x51ED270Bu); }
 
-// out: kPaneTexSize * kPaneTexSize * 2 bytes. Metalness 255 and the second channel 255 everywhere.
-inline void fillPaneT8(uint8_t* out) noexcept {
-    for (uint32_t i = 0; i < kPaneTexSize * kPaneTexSize; ++i) {
-        out[2 * i] = 255;
-        out[2 * i + 1] = 255;
+// Whether a key is tested this frame: one frame in eight per key, spread by key.
+inline bool paneTestThisFrame(const PaneKey& k, uint32_t frame) noexcept { return (paneKeyHash(k) + frame) % kPaneTestPeriod == 0; }
+
+class PaneSides {
+public:
+    PaneSide side(const PaneKey& k) const noexcept {
+        const int i = find(k);
+        return i < 0 ? PaneSide::kUnknown : sides_[i];
     }
-}
-// Flat 127, a seam of about +-24 (the sign alternates by seam line), noise of +-3. out: kPaneTexSize * kPaneTexSize * 2 bytes.
-inline void fillPaneT9(uint8_t* out) noexcept {
-    for (uint32_t y = 0; y < kPaneTexSize; ++y)
-        for (uint32_t x = 0; x < kPaneTexSize; ++x) {
-            int vx = 127 + paneNoise(x, y, 1, 3);
-            int vy = 127 + paneNoise(x, y, 2, 3);
-            if (x % kPaneSeamPeriod == 0) vx += (x / kPaneSeamPeriod) % 2 ? 24 : -24;
-            if (y % kPaneSeamPeriod == 0) vy += (y / kPaneSeamPeriod) % 2 ? 24 : -24;
-            uint8_t* o = out + 2 * (y * kPaneTexSize + x);
-            o[0] = paneClampByte(vx);
-            o[1] = paneClampByte(vy);
+    // The result of one note: whether the key's side is new or changed, for the log.
+    enum class Change : uint8_t { kNone, kFirst, kChanged };
+    Change note(const PaneKey& k, uint64_t drawn, uint64_t mirrored) noexcept {
+        if (drawn < kPaneTestMinSamples) return Change::kNone;
+        const PaneSide now = static_cast<double>(mirrored) >= kPaneExteriorRatio * static_cast<double>(drawn) ? PaneSide::kExterior : PaneSide::kInterior;
+        int i = find(k);
+        if (i < 0) {
+            if (count_ >= kPaneSideCap) {
+                ++dropped_;
+                return Change::kNone;
+            }
+            i = static_cast<int>(count_++);
+            keys_[i] = k;
+            sides_[i] = now;
+            if (now == PaneSide::kExterior) ++exterior_;
+            return Change::kFirst;
         }
-}
-// rgb about (0.72, 0.75, 0.78) with about 4% variation, a = roughness about 0.18; seams darker and rougher. out: kPaneTexSize * kPaneTexSize * 4 bytes.
-inline void fillPaneT10(uint8_t* out) noexcept {
-    constexpr int kBase[3] = {184, 191, 199};   // 0.72, 0.75, 0.78 of 255
-    for (uint32_t y = 0; y < kPaneTexSize; ++y)
-        for (uint32_t x = 0; x < kPaneTexSize; ++x) {
-            const bool seam = paneSeam(x, y);
-            uint8_t* o = out + 4 * (y * kPaneTexSize + x);
-            const int var = paneNoise(x, y, 3, 7);   // +-7 of about 190 is +-3.7%
-            for (int c = 0; c < 3; ++c) o[c] = paneClampByte(kBase[c] + var - (seam ? 40 : 0));
-            o[3] = paneClampByte(46 + paneNoise(x, y, 4, 3) + (seam ? 50 : 0));   // 46 / 255 = 0.18
-        }
-}
+        if (sides_[i] == now) return Change::kNone;
+        if (sides_[i] == PaneSide::kExterior) --exterior_;
+        if (now == PaneSide::kExterior) ++exterior_;
+        sides_[i] = now;
+        return Change::kChanged;
+    }
+    void reset() noexcept {
+        count_ = 0;
+        exterior_ = 0;
+        dropped_ = 0;
+    }
+    uint32_t exteriorCount() const noexcept { return exterior_; }
+    uint32_t knownCount() const noexcept { return count_; }
+    uint32_t dropped() const noexcept { return dropped_; }
+
+private:
+    int find(const PaneKey& k) const noexcept {
+        for (uint32_t i = 0; i < count_; ++i)
+            if (keys_[i].n == k.n && keys_[i].startIndex == k.startIndex && keys_[i].baseVertex == k.baseVertex) return static_cast<int>(i);
+        return -1;
+    }
+    PaneKey keys_[kPaneSideCap];
+    PaneSide sides_[kPaneSideCap] = {};
+    uint32_t count_ = 0, exterior_ = 0, dropped_ = 0;
+};
 
 // ---- The bay glass's clearing on approach --------------------------------------------------------------------------------------------------------
 // Mirror (the glass stands in, the cull is on) -> Lifting (the cull is off, the glass still opaque, so the station is back before it opens) -> FadingOut ->

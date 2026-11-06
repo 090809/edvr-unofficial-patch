@@ -942,16 +942,18 @@ inline NamedKeep keepNamedCell(const float centre[3], float radius, const float 
 // lifecycle point (undock, hangar change, ship change, setting toggle) starts every node afresh.
 constexpr uint64_t kSlotNodeMask = (uint64_t(1) << 44) - 1;
 
-// Built 2026-11-05 (the concourse cull): the slot carries five flag bits (47..51) and the generation key in the 12 bits above them (52..63).
-constexpr uint32_t kSlotKeyMask = (1u << 12) - 1;
-constexpr uint32_t kSlotKeyShift = 52;
-constexpr uint32_t kSlotFlagMask = 31u;
+// Built 2026-11-05 (the concourse cull): the slot carries five flag bits (47..51) and the generation key in the 12 bits above them (52..63). Built 2026-11-06:
+// a sixth flag (the concourse's far-exempt names), so the key is 11 bits (53..63).
+constexpr uint32_t kSlotKeyMask = (1u << 11) - 1;
+constexpr uint32_t kSlotKeyShift = 53;
+constexpr uint32_t kSlotFlagMask = 63u;
 
 constexpr uint32_t kNodeMechanism = 1;    // the name is a bay mechanism record (Lift, BlastShield, HangarGate ...): a latch candidate
 constexpr uint32_t kNodeHangarLike = 2;   // the name could name the hangar (Hanger, Pad, Lift, Bay ...): the names note wants it
 constexpr uint32_t kNodeShipPrefix = 4;   // the name has a type prefix up to an underscore (the ship tally counts it)
 constexpr uint32_t kNodeConcourseAllow = 8;    // built 2026-11-05: the name is on the concourse cull's allow-list (concourse_cull_core.h), extra prefixes included
 constexpr uint32_t kNodeConcourseAnchor = 16;  // built 2026-11-05: the name is the concourse anchor, Standard_SocialArea
+constexpr uint32_t kNodeConcourseFarExempt = 32;   // built 2026-11-06: the name is the anchor or the hub (SA_StationHub_Compact): kept however far, the gate reads them
 
 inline bool slotFits(uintptr_t node) noexcept { return (node & 7u) == 0 && (uint64_t(node) >> 3) <= kSlotNodeMask; }
 

@@ -1,17 +1,22 @@
 #pragma once
-// The concourse's glass panes (docs\concourse-cull-2026-11-05.md, "The panes"). TEMPORARY. While the concourse cull is wanted (key or override on, on foot in a
-// station's social space, the anchor seen), the station's glass family is treated around the game's own draw, and the draws that come after the panes and paint
-// over them (the plume and its twin) are withheld while the cull is on. The glass family is named by its vertex shader and pixel shader (concourse_cull_core.h,
-// kPaneFamilyVs / kPaneFamilyPs, any index count); diag.concourse_panes adds entries. The modes (diag.concourse_pane_mode, F4):
-//   mirror     the game's shader with three stand-in textures (t8, t9, t10) and an opaque colour write (RGB only), writing depth when fully opaque
-//   mirror-cb  mirror, and the pixel shader's constant buffer 2 replaced by EDVR's own (F0 and roughness scales of 1)
-//   tint       a white pixel shader and a blend-factor colour per index count, opaque, so each window type can be told apart by eye
-//   off        the game's own glass, unchanged
-// The bay window (36 indices) uses the bay opacity the clearing machine feeds (concourse_cull_core.h, ClearMachine); every other family draw is opaque.
-// Family draws are also measured: an occlusion query around the draw gives the share of the viewport it covers, whatever the mode.
+// The concourse's glass panes (docs\concourse-cull-2026-11-05.md, "The panes"). TEMPORARY. While the concourse cull is wanted (key or override on, on foot, in a
+// station's social space, the anchor seen), the station's glass family is treated, and the draws that come after the panes and paint over them (the plume and
+// its twin) are withheld while the cull is on. The glass family is named by its vertex shader and pixel shader (concourse_cull_core.h, kPaneFamilyVs,
+// kPaneFamilyPs, any index count); diag.concourse_panes adds entries. The game's own glass draw is always issued, unchanged; the treatment is a SECOND draw of
+// the same arguments, right after it, that paints the pane over. The modes (diag.concourse_pane_mode, F4):
+//   mirror       the second draw is the game's shader with three stand-in textures (t8, t9, t10), opaque (RGB only), writing depth
+//   mirror-soft  mirror, and the pixel shader's constant buffer 2 replaced by EDVR's own (roughness scaled to 0.54)
+//   tint         the second draw is a white pixel shader and a blend-factor colour per index count, opaque, so each window type can be told apart by eye
+//   off          the game's own glass, unchanged
+// While the cull is on (the plain phase), the second draw is limited to the pixels whose scene behind the pane is farther than diag.concourse_mirror_beyond
+// metres: a mark pass (one fullscreen triangle at that depth, writing stencil bit 0x40 where the scene is farther) runs once a frame before the first mirror
+// draw, and the mirror draw tests that bit. Glass with a wall behind it (a terminal screen) is left as the game drew it. Each pane's side, learned by two
+// occlusion queries (the game's glass samples, the mirror's samples), decides which panes still mirror once the cull is lifted (the bay window clearing).
+// Family draws are also measured: an occlusion query around the game's draw gives the share of the viewport it covers, whatever the mode.
 //
 // The draw thunks of vscreen.cpp (hookedDrawIndexed and hookedDrawIndexedInstanced, the flat branch and the VR path) build one ConcoursePaneScope around the
-// real draw call only, and skip the real call when withheld() says so. With nothing armed the scope is one relaxed atomic load.
+// real draw call, skip the real call when withheld() says so, and issue the second draw when beginMirror() says so. With nothing armed the scope is one
+// relaxed atomic load, and beginMirror() is a check of one member that is false for every draw that is not the family's.
 #include <d3d11_1.h>
 
 #include <atomic>
@@ -24,21 +29,26 @@ extern std::atomic<bool> g_concoursePaneArmed;   // a capture frame is open, or 
 }
 
 // The game's own entry points, past EDVR's thunks (so the binding shadow and the issue epoch do not move; the state is put back before anything else looks).
+// The input layout, topology and rasteriser state setters are not hooked at all, so the context's own methods are used for those.
 using ConcoursePaneSetBlendFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, ID3D11BlendState*, const FLOAT[4], UINT);
 using ConcoursePaneSetPsFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, ID3D11PixelShader*, ID3D11ClassInstance* const*, UINT);
+using ConcoursePaneSetVsFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, ID3D11VertexShader*, ID3D11ClassInstance* const*, UINT);
 using ConcoursePaneSetSrvFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT, UINT, ID3D11ShaderResourceView* const*);
 using ConcoursePaneSetDepthFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, ID3D11DepthStencilState*, UINT);
+using ConcoursePaneDrawFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT, UINT);
 struct ConcoursePaneCalls {
     ConcoursePaneSetBlendFn setBlend;
     ConcoursePaneSetPsFn setPs;
     ConcoursePaneSetSrvFn setSrv;
     ConcoursePaneSetDepthFn setDepth;
+    ConcoursePaneSetVsFn setVs;
+    ConcoursePaneDrawFn draw;
 };
 
 class ConcoursePaneScope {
 public:
-    ConcoursePaneScope(ID3D11DeviceContext* ctx, UINT indexCount, const ConcoursePaneCalls& calls) noexcept {
-        if (detail::g_concoursePaneArmed.load(std::memory_order_relaxed)) begin(ctx, indexCount, calls);
+    ConcoursePaneScope(ID3D11DeviceContext* ctx, UINT indexCount, UINT startIndex, INT baseVertex, const ConcoursePaneCalls& calls) noexcept {
+        if (detail::g_concoursePaneArmed.load(std::memory_order_relaxed)) begin(ctx, indexCount, startIndex, baseVertex, calls);
     }
     ~ConcoursePaneScope() {
         if (flags_ != 0) end();
@@ -48,17 +58,32 @@ public:
 
     // True for a draw that is not issued (the plume and its twin while the cull is on): the site skips only the real draw call.
     bool withheld() const noexcept { return withheld_; }
+    // Called right after the game's own draw was issued: true when the site is to issue the same draw again (the mirror), with the replacement state bound. The
+    // state is put back when the scope ends. False for every draw that is not a family draw.
+    bool beginMirror() noexcept { return family_ && beginMirrorSlow(); }
 
 private:
-    void begin(ID3D11DeviceContext* ctx, UINT indexCount, const ConcoursePaneCalls& calls) noexcept;
+    void begin(ID3D11DeviceContext* ctx, UINT indexCount, UINT startIndex, INT baseVertex, const ConcoursePaneCalls& calls) noexcept;
+    bool beginMirrorSlow() noexcept;
     void end() noexcept;
 
     ID3D11DeviceContext* ctx_ = nullptr;
     const ConcoursePaneCalls* calls_ = nullptr;
     uint32_t flags_ = 0;   // which of the things to put back or close are open
+    bool family_ = false;   // the draw is a pane of the list
     bool withheld_ = false;
+    // The plan begin() decides and beginMirrorSlow() carries out.
+    bool planMirror_ = false;
+    bool planMark_ = false;     // the mirror draw is limited to the marked pixels
+    bool planOpaque_ = true;    // false: the fade (blend factor opacity)
+    bool planTint_ = false;
+    bool planSoft_ = false;     // mirror-soft: EDVR's constant buffer 2
+    FLOAT planFactor_[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+    uint32_t keyN_ = 0, keyStart_ = 0;
+    int32_t keyBase_ = 0;
     int query_ = -1;
     int capQuery_ = -1;
+    int testSlot_ = -1;
     ID3D11BlendState* prevBs_ = nullptr;
     FLOAT prevFactor_[4] = {};
     UINT prevMask_ = 0;
@@ -75,7 +100,7 @@ private:
 struct ConcoursePaneFeed {
     bool measure = false;       // the gate holds: family draws are measured
     bool treat = false;         // the cull is wanted: family draws are treated by the mode
-    bool withhold = false;      // the cull is on and the phase is the plain mirror phase: the plume and its twin are not issued
+    bool withhold = false;      // the cull is on and the phase is the plain mirror phase: the plume and its twin are not issued, the mirror is marked
     float bayOpacity = 1.0f;    // the bay window's opacity, 0 to 1
 };
 void concoursePaneSetFeed(const ConcoursePaneFeed& feed) noexcept;
@@ -95,10 +120,17 @@ ConcoursePaneShares concoursePaneShares() noexcept;
 // the measurement's queries and the material read-back, the armed flag. `device` is the game's device; nowMs is GetTickCount64().
 void concoursePaneTick(ID3D11Device* device, uint32_t frame, uint64_t nowMs) noexcept;
 
-// Treated draws and withheld draws since the last call (the cull's 5 s summary reports them, so "matched nothing" is visible).
+// Treated draws (mirror draws issued) and withheld draws since the last call (the cull's 5 s summary reports them, so "matched nothing" is visible).
 uint64_t concoursePaneTakeTreated() noexcept;
 uint64_t concoursePaneTakeWithheld() noexcept;
-// The mode ("mirror", "mirror-cb", "tint", "off") and the number of panes in the list, for the summary.
+// The mirror's own counters: mark passes run and refused (no depth view, no stencil, a geometry stage bound, states missing) and side tests read since the last
+// call; the side table as it stands now. All zero when the mirror never ran.
+struct ConcoursePaneMirrorStats {
+    uint64_t markPasses = 0, markRefused = 0, tests = 0;
+    uint32_t known = 0, exterior = 0, dropped = 0;
+};
+ConcoursePaneMirrorStats concoursePaneTakeMirrorStats() noexcept;
+// The mode ("mirror", "mirror-soft", "tint", "off") and the number of panes in the list, for the summary.
 const char* concoursePaneModeName() noexcept;
 uint32_t concoursePaneSlotCount() noexcept;
 // Panes are being treated: the feed says treat, the mode is not off and the replacement states are made.

@@ -275,7 +275,8 @@ std::atomic<bool> g_concHubWanted{false};     // the tick wants the hub's addres
 uint32_t concourseNodeFlagsOf(const char* name) noexcept {
     uint32_t f = 0;
     if (cc::concourseAllowName(name, g_concExtra.get())) f |= sealed::kNodeConcourseAllow;
-    if (std::strcmp(name, cc::kAnchorName) == 0) f |= sealed::kNodeConcourseAnchor;
+    if (std::strcmp(name, cc::kAnchorName) == 0) f |= sealed::kNodeConcourseAnchor | sealed::kNodeConcourseFarExempt;
+    if (std::strcmp(name, cc::kHubName) == 0) f |= sealed::kNodeConcourseFarExempt;
     return f;
 }
 struct ConcourseWin {   // the 5 s summary's window (the callbacks' counters flush here, tcFlush)
@@ -1921,7 +1922,7 @@ bool concourseProducerVeto(uintptr_t rec) noexcept {
     if (sphere) prodPutGen(rec, centre, radius, s.prodGen);
     const bool nameReadable = ni.cls != sealed::NameClass::kUnnamed && ni.cls != sealed::NameClass::kNone;
     const float d = sphere ? sealed::distance(centre, s.cam) : 0.0f;
-    const cc::Judge j = cc::concourseJudge(nameReadable, (ni.flags & sealed::kNodeConcourseAllow) != 0, sphere, d, radius);
+    const cc::Judge j = cc::concourseJudge(nameReadable, (ni.flags & sealed::kNodeConcourseAllow) != 0, sphere, d, radius, (ni.flags & sealed::kNodeConcourseFarExempt) != 0);
     if (cc::judgeKeeps(j)) {
         ++tc.concProdKept;
         concourseCountKept(tc, j);
@@ -2714,7 +2715,8 @@ void afterStoreConcourse(uintptr_t bucket, uintptr_t record) noexcept {
                         std::isfinite(wr.world[2]);
     const bool nameReadable = ni.cls != sealed::NameClass::kUnnamed && ni.cls != sealed::NameClass::kNone;
     const float d = sphere ? sealed::distance(wr.world, s.cam) : 0.0f;
-    const cc::Judge j = cc::concourseJudge(nameReadable, (ni.flags & sealed::kNodeConcourseAllow) != 0, sphere, d, sphere ? wr.radius : 0.0f);
+    const cc::Judge j = cc::concourseJudge(nameReadable, (ni.flags & sealed::kNodeConcourseAllow) != 0, sphere, d, sphere ? wr.radius : 0.0f,
+                                      (ni.flags & sealed::kNodeConcourseFarExempt) != 0);
     const bool keep = cc::judgeKeeps(j);
     const float zero[3] = {0.0f, 0.0f, 0.0f};
     gatherRigNote(w, bucket, record, sphere ? wr.world : zero, sphere ? wr.radius : 0.0f, stamp,
@@ -3313,6 +3315,7 @@ void concourseTick(uint64_t now, uint32_t frame) {
         g_concSumMs = now;
         const uint64_t treated = concoursePaneTakeTreated();
         const uint64_t withheld = concoursePaneTakeWithheld();
+        const ConcoursePaneMirrorStats mir = concoursePaneTakeMirrorStats();   // all zero while the mirror never ran
         if (active) {
             const uint64_t calls[3] = {g_concCallsTotal[0].load(std::memory_order_relaxed), g_concCallsTotal[1].load(std::memory_order_relaxed),
                                        g_concCallsTotal[2].load(std::memory_order_relaxed)};
@@ -3323,16 +3326,22 @@ void concourseTick(uint64_t now, uint32_t frame) {
             for (int k = 0; k < 3; ++k) g_concSumCalls[k] = calls[k];
             g_concSumFrames = 0;
             Log::get().note("concourse cull 5s: rigs seen %u vetoed %u, producer vetoed %u kept %u (name %u, small-close %u, unreadable-name %u, unreadable-sphere %u), "
-                            "store cleared %u, callback cost %.3f ms/frame, panes treated %u draws (mode %s, %u slots), plumes withheld %u, phase %s",
+                            "store cleared %u, callback cost %.3f ms/frame, panes treated %u draws (mode %s, %u slots), plumes withheld %u, phase %s, "
+                            "mark passes %u (refused %u), panes known %u exterior %u (dropped %u), tests %u",
                             static_cast<unsigned>(g_concWin.rigSeen.exchange(0)), static_cast<unsigned>(g_concWin.rigVetoed.exchange(0)),
                             static_cast<unsigned>(g_concWin.prodVetoed.exchange(0)), static_cast<unsigned>(g_concWin.prodKept.exchange(0)),
                             static_cast<unsigned>(g_concWin.kept[0].exchange(0)), static_cast<unsigned>(g_concWin.kept[1].exchange(0)),
                             static_cast<unsigned>(g_concWin.kept[2].exchange(0)), static_cast<unsigned>(g_concWin.kept[3].exchange(0)),
                             static_cast<unsigned>(g_concWin.storeCleared.exchange(0)), ms, static_cast<unsigned>(treated), concoursePaneModeName(),
-                            static_cast<unsigned>(concoursePaneSlotCount()), static_cast<unsigned>(withheld), cc::clearPhaseName(clr.phase));
+                            static_cast<unsigned>(concoursePaneSlotCount()), static_cast<unsigned>(withheld), cc::clearPhaseName(clr.phase),
+                            static_cast<unsigned>(mir.markPasses), static_cast<unsigned>(mir.markRefused), static_cast<unsigned>(mir.known),
+                            static_cast<unsigned>(mir.exterior), static_cast<unsigned>(mir.dropped), static_cast<unsigned>(mir.tests));
         } else if (concoursePaneTreating()) {
-            Log::get().note("concourse pane 5s: treated %u draws (mode %s, %u slots), plumes withheld %u, phase %s", static_cast<unsigned>(treated),
-                            concoursePaneModeName(), static_cast<unsigned>(concoursePaneSlotCount()), static_cast<unsigned>(withheld), cc::clearPhaseName(clr.phase));
+            Log::get().note("concourse pane 5s: treated %u draws (mode %s, %u slots), plumes withheld %u, phase %s, mark passes %u (refused %u), panes known %u exterior %u "
+                            "(dropped %u), tests %u",
+                            static_cast<unsigned>(treated), concoursePaneModeName(), static_cast<unsigned>(concoursePaneSlotCount()), static_cast<unsigned>(withheld),
+                            cc::clearPhaseName(clr.phase), static_cast<unsigned>(mir.markPasses), static_cast<unsigned>(mir.markRefused), static_cast<unsigned>(mir.known),
+                            static_cast<unsigned>(mir.exterior), static_cast<unsigned>(mir.dropped), static_cast<unsigned>(mir.tests));
         }
     }
     (void)frame;
