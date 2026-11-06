@@ -42,4 +42,8 @@ void frameGenShadowEyeFrame(ID3D11Device* dev, ID3D11DeviceContext* ctx, uint32_
 // Once a frame: the one-second report when the key is on, the release of the resources when it went off.
 void frameGenShadowFrameBoundary();
 
+// For the WARP rig (tools/framegen_shadow_test): whether any of the scorer's shaders, buffers or textures exist, and a copy of the open one-second window.
+bool frameGenShadowResident();
+FrameGenShadowWindow frameGenShadowOpenWindow();
+
 }  // namespace edvr

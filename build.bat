@@ -2103,6 +2103,26 @@ if errorlevel 1 ( echo [edvr] ERROR: framegen_shadow_report_test build failed & 
 "%OBJ%\framegenshadowreport\framegen_shadow_report_test.exe" --self-test || exit /b 1
 exit /b 0
 
+:rig_framegen_shadow_test
+echo [edvr] === framegen_shadow_test.exe ===
+REM The frame-generation shadow scorer (fix.frame_generation_shadow, TEMPORARY): the production bytecode (kFrameGenShadow*Bytecode, from tools\temporal_shader_build) run on
+REM WARP against a CPU reference built from src\common\framegen_shadow_math.h -- capture, a static scene, a far-plane rotation, a cockpit plane under a head translation, a
+REM world plane at constant and accelerating ship motion, reversed-Z far and the on-foot split -- and the module itself (framegen_shadow.cpp) driven on the same device:
+REM the key off creates nothing, the key on scores a static scene and counts each skip reason. Two mutations (a forward transform not inverted, an identity backward
+REM transform) must each break their case. Needs no real GPU.
+if not exist "%OBJ%\framegenshadow" mkdir "%OBJ%\framegenshadow"
+%CC% /nologo /O2 /MT /std:c++17 /EHsc /W4 /DWIN32_LEAN_AND_MEAN /DNOMINMAX ^
+    /D_CRT_SECURE_NO_WARNINGS /I"%GEN%" /I"src\d3d11" ^
+    /Fo"%OBJ%\framegenshadow"\ /Fe"%OBJ%\framegenshadow\framegen_shadow_test.exe" ^
+    "tools\framegen_shadow_test\framegen_shadow_test.cpp" "src\d3d11\framegen_shadow.cpp" "src\d3d11\shader_swap.cpp" ^
+    "src\d3d11\gpu_timing.cpp" "src\d3d11\gpu_frame_timing.cpp" "src\d3d11\gpu_span_d3d11.cpp" ^
+    "src\common\log.cpp" "src\common\config.cpp" "src\common\proxy.cpp" "src\common\guard.cpp" ^
+    /link /INCREMENTAL:NO d3d11.lib dxguid.lib user32.lib version.lib
+if errorlevel 1 ( echo [edvr] ERROR: framegen_shadow_test build failed & exit /b 1 )
+"%OBJ%\framegenshadow\framegen_shadow_test.exe" --dry-run || exit /b 1
+"%OBJ%\framegenshadow\framegen_shadow_test.exe" --self-test || exit /b 1
+exit /b 0
+
 :rig_ui_depth
 echo [edvr] === private UI depth regression ===
 REM Keep the executable away from build\d3d11.dll: these tests use system

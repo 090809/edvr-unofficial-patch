@@ -255,6 +255,10 @@ void frameGenShadowConfigure(bool on) {
 
 bool frameGenShadowOn() { return g_on.load(); }
 
+bool frameGenShadowResident() { return anyResources(); }
+
+FrameGenShadowWindow frameGenShadowOpenWindow() { return g.win; }
+
 void frameGenShadowEyeFrame(ID3D11Device* dev, ID3D11DeviceContext* ctx, uint32_t eye, uint32_t frame, const FrameGenShadowFrame& f) {
     if (!g_on.load()) return;
     if (!g_told.exchange(true)) {
