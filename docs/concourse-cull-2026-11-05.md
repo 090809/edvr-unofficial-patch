@@ -2,7 +2,7 @@
 
 ## Status
 
-- **State:** Flight 5 flown 2026-11-06 flat on Steam, log `edvr_gfx_20261106_061847`, build 0e586d70. The lasers and the pale wash over the sky are gone. Light cones, green haze and streaks stayed. The sixth build (the cones and glow quads limited to far pixels by the mirror's mark) is not flown. Not merged. Extends `fix.optimized_stations`; off unless the temporary keys turn it on.
+- **State:** Flight 5 flown 2026-11-06 flat on Steam, log `edvr_gfx_20261106_061847`, build 0e586d70. The lasers and the pale wash over the sky are gone. Light cones, green haze and streaks stayed. The sixth build d42c6471 (the cones and glow quads limited to far pixels by the mirror's mark; full build green, optimized_station_test 1001 checks) is installed on Steam and not flown. Not merged. Extends `fix.optimized_stations`; off unless the temporary keys turn it on.
 - **Goals (Sean, 2026-11-05):** (1) on foot in the large-station concourse, cull everything outside the bay windows; (2) skylights and the window above the lift bank become a permanent mirrored surface, so missing structure is never seen; (3) approaching the bay windows clears the mirror and stops the cull, so the station interior is visible from there.
 - **Direction:** identify records by the store's name, keep an allow-list, and make the panes opaque. The fitted hall, the shader-pair lists and the shell read-back from the earlier attempt are not carried over (see Ruled out).
 - **Answered by Flight 1:** H1 yes, with named survivors. H2 yes. H3 yes for the bay window: VS `98397963AAEC45D3` / PS `66B08F89E4926C01`, n=36. H5 yes by eye: the room stayed lit. See "Flight 1 results".
@@ -18,7 +18,7 @@
   - **H6** `Standard_SocialArea` marks the large-station concourse at other stations too. Still unflown.
 - **Temporary keys (all removed when the arc closes):** `diag.concourse_cull` (on, off), `diag.concourse_keep` (extra name prefixes), `diag.concourse_pane_mode`, `diag.concourse_panes`, `diag.concourse_clear_share`, `diag.concourse_mirror_beyond`, `hotkey.concourse_cull`, `hotkey.concourse_pane_capture`, `hotkey.concourse_pane_mode`.
 - **Ruled out:** see the section of that name. **Issues:** none yet.
-- **Next flight:** the Flight 6 list. Keys in both Steam inis: `hotkey.concourse_cull` F2 (the cull and the mirrors), `hotkey.concourse_pane_capture` F3 (logs a ranking by screen coverage, changes nothing), `hotkey.concourse_pane_mode` F4.
+- **Next flight:** the Flight 6 list, on build d42c6471, installed on Steam 2026-11-06. Keys in both Steam inis: `hotkey.concourse_cull` F2 (the cull and the mirrors), `hotkey.concourse_pane_capture` F3 (logs a ranking by screen coverage, changes nothing), `hotkey.concourse_pane_mode` F4.
 
 ## What the earlier attempt learned
 
@@ -270,7 +270,7 @@ On the sixth build, flat, at the same station.
 3. F4 at `mirror`: clean panes? Then the bay's clear once.
 4. If it is cheap, a second station type.
 
-Then: `python tools\edvr_log.py --target steam --expect-build <this build> --grep "concourse"`.
+Then: `python tools\edvr_log.py --target steam --expect-build d42c6471 --grep "concourse"`.
 
 ## Performance candidates
 
