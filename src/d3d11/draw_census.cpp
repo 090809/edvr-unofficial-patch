@@ -1017,6 +1017,7 @@ static void recordDraw(ID3D11DeviceContext* ctx, char kind, uint32_t count,
         ID3D11BlendState*        bs = nullptr;
         ID3D11Predicate*         pred = nullptr;
         UINT  ref = 0;
+        ID3D11RasterizerState* rasterizer = nullptr;
         FLOAT bf[4] = {};
         UINT  sampleMask = 0;
         BOOL  predValue = FALSE;
@@ -1025,6 +1026,7 @@ static void recordDraw(ID3D11DeviceContext* ctx, char kind, uint32_t count,
             ctx->OMGetDepthStencilState(&dss, &ref);
             ctx->OMGetBlendState(&bs, bf, &sampleMask);
             ctx->GetPredication(&pred, &predValue);
+            ctx->RSGetState(&rasterizer);
             got = true;
         });
         if (got) {
@@ -1080,6 +1082,24 @@ static void recordDraw(ID3D11DeviceContext* ctx, char kind, uint32_t count,
                                 static_cast<unsigned>(fr.StencilDepthFailOp),
                                 static_cast<unsigned>(fr.StencilPassOp), bkb);
                 }
+                // rs= is the rasteriser (2026-11-06, the sun through the hull,
+                // docs\sun-switch-re-2026-11-06.md): cull mode N, F or B, then
+                // c when the front face is counter-clockwise or w when it is
+                // clockwise, depth bias, slope-scaled bias, depth clip. Which
+                // faces a shadow pass keeps decides whether a hollow shell
+                // shades what is inside it. A null state prints the API's
+                // defaults.
+                char rsb[56] = "";
+                {
+                    D3D11_RASTERIZER_DESC rd{};
+                    rd.CullMode = D3D11_CULL_BACK;
+                    rd.DepthClipEnable = TRUE;
+                    if (rasterizer) rasterizer->GetDesc(&rd);
+                    _snprintf_s(rsb, sizeof(rsb), _TRUNCATE, " rs=%c%c/%d/%.2f/%d",
+                                rd.CullMode == D3D11_CULL_NONE ? 'N' : rd.CullMode == D3D11_CULL_FRONT ? 'F' : 'B',
+                                rd.FrontCounterClockwise ? 'c' : 'w', rd.DepthBias,
+                                static_cast<double>(rd.SlopeScaledDepthBias), rd.DepthClipEnable ? 1 : 0);
+                }
                 // bl= is the whole slot-0 blend equation and sm= the sample
                 // mask (2026-09-01, the DSS black planet). Every test that
                 // could reject a pixel AFTER the shader had been recorded or
@@ -1090,7 +1110,7 @@ static void recordDraw(ID3D11DeviceContext* ctx, char kind, uint32_t count,
                 // "opaque, writes land".
                 _snprintf_s(sv, sizeof(sv), _TRUNCATE,
                             " ds=%c%uw%c st=%c%u bm=%X pr=%c"
-                            " bl=%c%u,%u,%u/%u,%u,%u%s sm=%X%s",
+                            " bl=%c%u,%u,%u/%u,%u,%u%s sm=%X%s%s",
                             haveDs ? (dd.DepthEnable ? '1' : '0') : '?',
                             haveDs ? static_cast<unsigned>(dd.DepthFunc) : 0u,
                             haveDs ? (dd.DepthWriteMask ==
@@ -1123,12 +1143,13 @@ static void recordDraw(ID3D11DeviceContext* ctx, char kind, uint32_t count,
                                          bd.RenderTarget[0].BlendOpAlpha)
                                    : 1u,
                             haveBs && bd.AlphaToCoverageEnable ? ",a2c" : "",
-                            sampleMask, so);
+                            sampleMask, so, rsb);
             }
         }
         if (dss) dss->Release();
         if (bs) bs->Release();
         if (pred) pred->Release();
+        if (rasterizer) rasterizer->Release();
     }
 
     Log::get().note(
