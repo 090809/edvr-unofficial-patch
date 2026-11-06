@@ -3669,7 +3669,7 @@ int main(int argc, char** argv) {
         // The withheld outside draws: named by shader, found by a bloom and a scan.
         {
             static_assert(cc::kWithheldPs[0].hash == cc::kPlumePs && cc::kWithheldPs[1].hash == cc::kTwinPs, "the plume pair leads the list");
-            check(cc::kWithheldPsCount == 19 && cc::kWithheldVsCount == 10, "concourse withheld: 19 pixel shaders and 10 vertex shaders");
+            check(cc::kWithheldPsCount == 20 && cc::kWithheldVsCount == 10, "concourse withheld: 20 pixel shaders and 10 vertex shaders");
             check(!cc::withheldHasDuplicate(cc::kWithheldPs, cc::kWithheldPsCount) && !cc::withheldHasDuplicate(cc::kWithheldVs, cc::kWithheldVsCount),
                   "concourse withheld: no list holds a hash twice");
             const cc::WithheldFamily dup[] = {{1, "a"}, {2, "b"}, {1, "c"}};

@@ -2,7 +2,7 @@
 
 ## Status
 
-- **State:** Flight 5 flown 2026-11-06 flat on Steam, log `edvr_gfx_20261106_061847`, build 0e586d70. The lasers and the pale wash over the sky are gone. Light cones, green haze and streaks stayed. The sixth build d42c6471 (the cones and glow quads limited to far pixels by the mirror's mark; full build green, optimized_station_test 1001 checks) is installed on Steam and not flown. Not merged. Extends `fix.optimized_stations`; off unless the temporary keys turn it on.
+- **State:** Flight 6 flown 2026-11-06 flat on Steam, log `edvr_gfx_20261106_063641`, build d42c6471. The green haze and the light cones are gone. Two trails stayed: an orange double one, and a thin blue-white streak seen with the mirror on. The seventh build (the ship ribbon withheld, a longer NumLock census) is not flown. Not merged. Extends `fix.optimized_stations`; off unless the temporary keys turn it on.
 - **Goals (Sean, 2026-11-05):** (1) on foot in the large-station concourse, cull everything outside the bay windows; (2) skylights and the window above the lift bank become a permanent mirrored surface, so missing structure is never seen; (3) approaching the bay windows clears the mirror and stops the cull, so the station interior is visible from there.
 - **Direction:** identify records by the store's name, keep an allow-list, and make the panes opaque. The fitted hall, the shader-pair lists and the shell read-back from the earlier attempt are not carried over (see Ruled out).
 - **Answered by Flight 1:** H1 yes, with named survivors. H2 yes. H3 yes for the bay window: VS `98397963AAEC45D3` / PS `66B08F89E4926C01`, n=36. H5 yes by eye: the room stayed lit. See "Flight 1 results".
@@ -10,15 +10,15 @@
 - **Answered by Flight 3:** H9 yes as far as the eye went: Sean called the mirror much better and reported no wrong pane, with 0 mark refusals. H10 yes: `culled PlantStack0-4` logged, and his screenshot has no plates. H11 not asked directly: no complaint about the grid, and the log shows `mirror-soft` tried. The side table needed one fix: one mesh drawn in two places flipped within a frame. See "Flight 3 results".
 - **Answered by Flight 4:** H14 yes: Sean, "the turn away from the bay windows works well". H12 half: "I don't see anything missing or incorrect on the interior", no planet in his screenshot or his report, and the lists matched 15 of 24 families, but the haze and lasers stayed. See "Flight 4 results".
 - **Answered by Flight 5:** H15 yes: `beams and bolts` is no longer on Sean's list, no lasers. H16 half: the wash went with `scatter`, so that is what it was; the ellipses and wedges stayed, so they were not the particles. H13 still open: `flares` matched and no flares in the screenshot; the room was not reported.
-- **Open hypotheses (Flight 6 answers them):**
-  - **H18** The green ellipses, the big green glow and the pale wedges are the light cones `1C506222/2519C905` (n=384), with glow quads `359BF8FF/92FF8499`. Flight 1's F3 capture has them at 39.6% and 9.0% of the screen, additive, 36 draws a frame, and nothing else that big is left. Limited to far pixels, they should vanish past the glass and stay over the room. `far glows limited` in the 30 s line says it ran.
-  - **H19** The thin streaks, if they survive, are another family. An F3 press logs blended draws by screen coverage, which names a big effect better than a census.
-  - **H17** None of the withheld families is in the room. Flight 4 said nothing missing; Flight 5 added the scatter and particles. Compare with F2 at a fixed view.
-  - **H8** nothing visible draws over the pane once the outside is withheld and the pane writes depth.
+- **Answered by Flight 6:** H18 yes: Sean, "the green haze and light fills are gone", with `far glows limited` at about 8000 a second. The room was not reported wrong.
+- **Open hypotheses (Flight 7 answers them):**
+  - **H20** The orange double trail is the ribbon `5EAFFCD0/DD371C57`: a triangle strip of 95-107 indices, two draws a frame, in every census. `ship ribbon` must appear in the 30 s line.
+  - **H21** The blue-white streak on a mirrored pane is that ribbon too, in another ship's engine colour. This is the weak one: the ribbon draws before the panes, and the mirror paints over those pixels and writes depth, so a direct draw should not show. Its NumLock ran out of lines before the main view. If the streak survives, a census now reaches it.
+  - **H17** None of the withheld families is in the room. Compare with F2 at a fixed view.
   - **H6** `Standard_SocialArea` marks the large-station concourse at other stations too. Still unflown.
 - **Temporary keys (all removed when the arc closes):** `diag.concourse_cull` (on, off), `diag.concourse_keep` (extra name prefixes), `diag.concourse_pane_mode`, `diag.concourse_panes`, `diag.concourse_clear_share`, `diag.concourse_mirror_beyond`, `hotkey.concourse_cull`, `hotkey.concourse_pane_capture`, `hotkey.concourse_pane_mode`.
 - **Ruled out:** see the section of that name. **Issues:** none yet.
-- **Next flight:** the Flight 6 list, on build d42c6471, installed on Steam 2026-11-06. Keys in both Steam inis: `hotkey.concourse_cull` F2 (the cull and the mirrors), `hotkey.concourse_pane_capture` F3 (logs a ranking by screen coverage, changes nothing), `hotkey.concourse_pane_mode` F4.
+- **Next flight:** the Flight 7 list. Keys in both Steam inis: `hotkey.concourse_cull` F2 (the cull and the mirrors), `hotkey.concourse_pane_capture` F3 (logs a ranking by screen coverage, changes nothing), `hotkey.concourse_pane_mode` F4.
 
 ## What the earlier attempt learned
 
@@ -93,6 +93,7 @@ A draw is identified by VS and PS hash; the index count only separates the bay (
 | the planet | atmosphere `41E245D4`, `D95905C1`, `D1281DF4` (`docs\scanner-body.md`); body VS `72BDD292`, `26FC402B`, `9FFA5D5E`, `3530A6FD`, `71DD9863`, `ACE405F4`, `19F70CE8`, `C7FA0C0F` (`docs\eye-split.md`, `docs\fss-scanner.md`, `eye_draw_snapshot.h`) | older docs; not in view in any census here |
 | the sun's glare | `8BD7C37A`, `1F3AD158` | `eye_draw_snapshot.h` |
 | the haze (from the fifth build) | scatter `AFFEF018/41152F82`; particles `AFBCD3AD` and `9F4BBCFC/2BAE3742`, `9AEC596A/3789CA20`, `BBAD1CA8/E54F2A90`; shield strike part 2 `820E5C13/6EAA86EF` | Flight 4's census: what was left after the rest went; `docs\billboard-root-cause-2026-10-16.md` for the particles |
+| the orange trail (from the seventh build) | ribbon `5EAFFCD0/DD371C57` | Flight 6's census: a strip, two draws a frame |
 | not asked, paints on the mirror | flares `B75A6FF2/D56F859B` | after the panes, no depth test |
 
 **Limited, not withheld (from the sixth build).** The light cones `1C506222/2519C905` and glow quads `359BF8FF/92FF8499` may also be the room's lamps, and nothing here separates them by draw. So while the cull is on they keep drawing, with the game's depth state plus stencil `NOT_EQUAL 0x40`: the mirror's mark, run first if it has not run this frame. A pixel with nothing within 100 m behind it is dropped, and one over the room stays. A cone outside can only show over far pixels, because the room's surfaces in front of it fail the depth test.
@@ -271,6 +272,25 @@ On the sixth build, flat, at the same station.
 4. If it is cheap, a second station type.
 
 Then: `python tools\edvr_log.py --target steam --expect-build d42c6471 --grep "concourse"`.
+
+## Flight 6 results
+
+Log `edvr_gfx_20261106_063641`, build d42c6471, flat, Steam. NumLocks at 06:39:14 and 06:40:39. Sean: "the green haze and light fills are gone", and two trails left, in screenshots sent to another session by mistake and to this one.
+
+- **The orange double trail** (F4 at `off`), with a loop at its end, on a clean dark sky. In the second census the only thing on screen that fits is `5EAFFCD0/DD371C57`: topology 5 (a strip), n=95, two draws, VB stride 96. This is not the "grey ribbon" of `docs\per-object-motion.md`, which is `5E417E9D` and has been withheld since the fourth build.
+- **The blue-white streak** on a mirrored pane, wavy and soft. Its census, taken at the lift bank (z -14.7), has 16251 lines in frame 0, 15910 of them in the 2048 and 512 passes, so the 16384 line cap ended it before the panes. It names nothing. The cap is 32768 now.
+- **Why the streak is odd.** The glass shader has no screen-space input: `t0`-`t2` are raw lighting buffers, `t3`, `t4`, `t6`, `t7` shadows and lookups, `t5` the probes. And no blended draw of a trail reaches the 512 passes in the census that did complete. So neither a refraction nor a probe capture is shown, and a draw after the panes is the remaining route. The list after the panes in the second census is the visor, a glow, `B553BB47` and `5B0068AF`, none a trail, but that census was not looking at the streak.
+
+## Flight 7
+
+On the seventh build, flat, at the same station.
+
+1. F4 at `off`, looking out: is the orange trail gone? Anything else left?
+2. F4 at `mirror`, at the window where the streak showed: is it gone? If not, a NumLock with it in view. Its census now reaches the main view.
+3. F2 off and on at a fixed view of the room: does anything change?
+4. If it is cheap, a second station type.
+
+Then: `python tools\edvr_log.py --target steam --expect-build <this build> --grep "concourse"`.
 
 ## Performance candidates
 

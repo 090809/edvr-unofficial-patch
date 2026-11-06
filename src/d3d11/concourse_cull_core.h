@@ -144,6 +144,7 @@ constexpr WithheldFamily kWithheldPs[] = {
     {0x3789CA2062E196FBull, "particles B"},           // VS 9AEC596A
     {0xE54F2A902E5631F6ull, "particles C"},           // VS BBAD1CA8
     {0x6EAA86EFE135B2D4ull, "shield strike part 2"},  // VS 820E5C13, the same 3984 indices as the shield strike
+    {0xDD371C57C9093BB8ull, "ship ribbon"},           // VS 5EAFFCD0: a triangle strip of about 100 indices, two draws a frame, the orange double trail
 };
 constexpr WithheldFamily kWithheldVs[] = {
     {0x72BDD292154158ADull, "body surface"},
