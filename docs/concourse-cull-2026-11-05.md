@@ -503,6 +503,15 @@ Log `edvr_gfx_20261106_150756`, build b4f82839, flat, Steam, at cam_local 0.10 2
 
 - ruled out: keeping outside records by size, because even 150 m gives up most of the saving and the sizes barely differ from each other. About 1 ms of each is the plain glass.
 
+## Flight 17 results, first part
+
+Log `edvr_gfx_20261106_163158`, build a2fca02e. One capture, at cam_local -0.17 21.66 -16.75: lifted 328 ms including making the cube, scene 3840x2160 R11G11B10_FLOAT, 18 pane draws. Nothing was refused. Sean's screenshot, from nearer the bay, shows the flat light with patches of station view with stippled edges.
+
+- INFERRED: the patches are the directions the far windows covered from the lift bank, where they subtend few degrees; walking closer, a window covers many directions never captured. The stipple is the capture's point splat. So one capture cannot fill a room. Sean had not yet pressed F6 again nearer the window.
+- Frame time: `mirror-backdrop` and `mirror-steady` read the same at one spot (8.62-8.70 ms against 8.62 ms), so the look-up has no measurable cost.
+
+**Next, if the look holds up when captured from close:** capture when a meaningful share of the visible panes has nothing captured, rate-limited, so the cost falls to nothing once the room has been seen; fill holes and uncovered areas from low mips of the capture instead of the flat colour, so they read as frosted glass in the station's colours. Whether to persist a cube per station is for later.
+
 ## Flight 17
 
 On build a2fca02e, flat, Steam. F2 once. F6 lifts the cull for 200 ms and captures what is in view; the toast says the mode and the result.
