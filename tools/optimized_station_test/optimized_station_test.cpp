@@ -3235,7 +3235,8 @@ int main(int argc, char** argv) {
         namespace cc = edvr::concourse;
         char msg[200];
         const char* const allowed[] = {"Standard_SocialArea", "SA_Station_01_Bar", "PS_Sittable_Sofa_01", "FUI_Python", "PROP_Tablet", "PlantStack0",
-                                       "STAT_HoloBanner_VertA", "GUI_Interactive_Terminal_Standing_Gen_01", "TP_M_Exp01_HelmetLightRig", "HangarLobby"};
+                                       "STAT_HoloBanner_VertA", "GUI_Interactive_Terminal_Standing_Gen_01", "TP_M_Exp01_HelmetLightRig", "HangarLobby",
+                                       "TurboLift_Door_A"};
         for (const char* n : allowed) {
             std::snprintf(msg, sizeof(msg), "concourse allow-list: %s is the room", n);
             check(cc::concourseAllowName(n, nullptr), msg);
@@ -3361,6 +3362,196 @@ int main(int argc, char** argv) {
         check(cc::kPaneColourCount == 8 && std::strcmp(cc::kPaneColourNames[0], "red") == 0 && std::strcmp(cc::kPaneColourNames[7], "white") == 0 &&
                   cc::kPaneColours[0][0] == 1.0f && cc::kPaneColours[0][1] == 0.0f && cc::kPaneColours[4][0] == 1.0f && cc::kPaneColours[4][2] == 1.0f,
               "concourse pane: eight fixed colours per slot, red first, white last, magenta fifth");
+        check(cc::concourseAllowName("TurboLift", nullptr) && cc::concourseAllowName("TurboLift_Shaft_02", nullptr) && !cc::concourseAllowName("turbolift", nullptr) &&
+                  !cc::concourseAllowName("XTurboLift", nullptr),
+              "concourse allow-list: the TurboLift prefix is pinned (the doors popped in at 40 m without it), exact case, at the start of the name");
+
+        // The family: an entry with n = 0 matches any index count, one with a count matches only it.
+        {
+            const cc::PaneTriple fam[2] = {{cc::kPaneFamilyVs, cc::kPaneFamilyPs, 0}, {0x1111111111111111ull, 0x2222222222222222ull, 36}};
+            check(cc::paneTripleMatch(fam, 2, cc::kPaneFamilyVs, cc::kPaneFamilyPs, 36) && cc::paneTripleMatch(fam, 2, cc::kPaneFamilyVs, cc::kPaneFamilyPs, 192) &&
+                      cc::paneTripleMatch(fam, 2, cc::kPaneFamilyVs, cc::kPaneFamilyPs, 864) && cc::paneTripleMatch(fam, 2, cc::kPaneFamilyVs, cc::kPaneFamilyPs, 1),
+                  "concourse pane: an entry with n = 0 matches the family at any index count");
+            check(cc::paneTripleMatch(fam, 2, 0x1111111111111111ull, 0x2222222222222222ull, 36) && !cc::paneTripleMatch(fam, 2, 0x1111111111111111ull, 0x2222222222222222ull, 37),
+                  "concourse pane: an entry with a count still matches only that count");
+            check(cc::paneTripleIndex(fam, 2, cc::kPaneFamilyVs, cc::kPaneFamilyPs, 192) == 0 && cc::paneTripleIndex(fam, 2, cc::kPaneFamilyVs, 0x2222222222222222ull, 36) == -1,
+                  "concourse pane: the family's slot is its place in the list, and a vertex shader with another pixel shader is not it");
+            check(cc::kPaneFamilyVs == 0x98397963AAEC45D3ull && cc::kPaneFamilyPs == 0x66B08F89E4926C01ull && cc::kBayIndexCount == 36 && cc::kPlumePs == 0x3B0B38CD96F53BC1ull &&
+                      cc::kTwinPs == 0x34A1475B2C790DFAull,
+                  "concourse pane: the family, the bay count and the withheld pixel shaders are flight 1's");
+            cc::PaneTriple pe;
+            check(cc::parsePaneEntry("98397963AAEC45D3/66B08F89E4926C01", 33, &pe) && pe.vs == cc::kPaneFamilyVs && pe.ps == cc::kPaneFamilyPs && pe.n == 0,
+                  "concourse pane list: VS/PS is accepted and means any index count");
+            const char* withCount = "98397963AAEC45D3/66B08F89E4926C01/36";
+            check(cc::parsePaneEntry(withCount, std::strlen(withCount), &pe) && pe.n == 36, "concourse pane list: VS/PS/N still reads its count");
+            const char* trailing = "98397963AAEC45D3/66B08F89E4926C01/";
+            check(!cc::parsePaneEntry(trailing, std::strlen(trailing), &pe) && !cc::parsePaneEntry("98397963AAEC45D3/66B08F89E4926C0", 32, &pe) &&
+                      !cc::parsePaneEntry("98397963AAEC45D3/66B08F89E4926C01x", 34, &pe),
+                  "concourse pane list: a trailing slash, a short hash or a trailing letter after VS/PS is refused");
+            cc::PaneTriple two[cc::kPaneListCap];
+            size_t bad2 = 9;
+            const size_t n2 = cc::parsePaneList("98397963AAEC45D3/66B08F89E4926C01,98397963AAEC45D3/66B08F89E4926C01/36,98397963AAEC45D3/66B08F89E4926C01", two, cc::kPaneListCap, &bad2);
+            check(n2 == 2 && bad2 == 0 && two[0].n == 0 && two[1].n == 36, "concourse pane list: VS/PS and VS/PS/36 are different entries, a repeat of one is dropped");
+        }
+
+        // The mirror textures: deterministic, and the values the game's glass shader decodes.
+        {
+            static uint8_t t8[cc::kPaneTexSize * cc::kPaneTexSize * 2], t8b[sizeof(t8)];
+            static uint8_t t9[cc::kPaneTexSize * cc::kPaneTexSize * 2], t9b[sizeof(t9)];
+            static uint8_t t10[cc::kPaneTexSize * cc::kPaneTexSize * 4], t10b[sizeof(t10)];
+            cc::fillPaneT8(t8);
+            cc::fillPaneT9(t9);
+            cc::fillPaneT10(t10);
+            cc::fillPaneT8(t8b);
+            cc::fillPaneT9(t9b);
+            cc::fillPaneT10(t10b);
+            check(std::memcmp(t8, t8b, sizeof(t8)) == 0 && std::memcmp(t9, t9b, sizeof(t9)) == 0 && std::memcmp(t10, t10b, sizeof(t10)) == 0, "concourse mirror textures: the fill is deterministic");
+            bool metal = true;
+            for (size_t i = 0; i < sizeof(t8); ++i) metal = metal && t8[i] == 255;
+            check(metal, "concourse mirror textures: t8 is 255 in both channels (metal 255)");
+            bool inside = true;
+            bool centreOk = true;
+            double maxLen = 0.0;
+            for (uint32_t y = 0; y < cc::kPaneTexSize; ++y)
+                for (uint32_t x = 0; x < cc::kPaneTexSize; ++x) {
+                    const uint8_t* p = t9 + 2 * (y * cc::kPaneTexSize + x);
+                    const double nx = (p[0] / 255.0) * 2.007874 - 0.999985;
+                    const double ny = (p[1] / 255.0) * 2.007874 - 0.999985;
+                    const double len = std::sqrt(nx * nx + ny * ny);
+                    if (len > maxLen) maxLen = len;
+                    if (!(len < 1.0)) inside = false;
+                    const bool seam = x % cc::kPaneSeamPeriod == 0 || y % cc::kPaneSeamPeriod == 0;
+                    if (!seam && (std::abs(static_cast<int>(p[0]) - 127) > 3 || std::abs(static_cast<int>(p[1]) - 127) > 3)) centreOk = false;
+                }
+            check(inside && maxLen > 0.05, "concourse mirror textures: t9's normals decode inside the unit circle, and the seams tilt them");
+            check(centreOk, "concourse mirror textures: t9 is 127 plus or minus 3 away from the seams");
+            const uint8_t* seamTexel = t9 + 2 * (0 * cc::kPaneTexSize + 17);   // a horizontal seam line row 0, between vertical seams
+            check(std::abs(static_cast<int>(seamTexel[1]) - 127) >= 20 && std::abs(static_cast<int>(seamTexel[1]) - 127) <= 27, "concourse mirror textures: a seam is about 24 off flat");
+            double sum[3] = {};
+            double rough = 0.0;
+            uint32_t nonSeam = 0;
+            bool varies = false;
+            bool seamDarker = true;
+            for (uint32_t y = 0; y < cc::kPaneTexSize; ++y)
+                for (uint32_t x = 0; x < cc::kPaneTexSize; ++x) {
+                    const uint8_t* p = t10 + 4 * (y * cc::kPaneTexSize + x);
+                    const bool seam = x % cc::kPaneSeamPeriod == 0 || y % cc::kPaneSeamPeriod == 0;
+                    if (seam) {
+                        if (!(p[0] < 160 && p[3] > 80)) seamDarker = false;
+                        continue;
+                    }
+                    ++nonSeam;
+                    for (int c = 0; c < 3; ++c) sum[c] += p[c] / 255.0;
+                    rough += p[3] / 255.0;
+                    if (p[0] != t10[0 + 4 * (1 * cc::kPaneTexSize + 1)]) varies = true;
+                }
+            const double r = sum[0] / nonSeam, g = sum[1] / nonSeam, b = sum[2] / nonSeam, a = rough / nonSeam;
+            check(std::fabs(r - 0.72) < 0.02 && std::fabs(g - 0.75) < 0.02 && std::fabs(b - 0.78) < 0.02 && std::fabs(a - 0.18) < 0.02,
+                  "concourse mirror textures: t10 is about (0.72, 0.75, 0.78) with roughness about 0.18 away from the seams");
+            check(varies && seamDarker, "concourse mirror textures: t10 varies, and its seams are darker and rougher");
+        }
+
+        // The clearing machine.
+        {
+            using CP = cc::ClearPhase;
+            cc::ClearMachine m;
+            cc::ClearInput in;
+            in.gate = true;
+            in.enterShare = 0.20f;
+            in.cameraValid = true;
+            in.bayShare = 0.05f;
+            uint64_t clk = 1000;
+            auto stepAt = [&](uint64_t now, float share, uint32_t seq, float x) {
+                in.nowMs = now;
+                in.bayShare = share;
+                in.shareSeq = seq;
+                in.cam[0] = x;
+                return m.step(in);
+            };
+            cc::ClearOutput o = stepAt(clk, 0.05f, 1, 0.0f);
+            check(o.cullOn && o.bayOpacity == 1.0f && o.phase == CP::kMirror, "concourse clear: below the share, the mirror phase holds, the cull on, opacity 1");
+            o = stepAt(clk += 16, 0.30f, 2, 1.0f);
+            check(o.phase == CP::kMirror && o.cullOn, "concourse clear: one reading over the share is not enough");
+            o = stepAt(clk += 16, 0.30f, 2, 1.0f);
+            check(o.phase == CP::kMirror, "concourse clear: the same reading seen on a second tick is one reading, not two");
+            o = stepAt(clk += 16, 0.10f, 3, 1.0f);
+            o = stepAt(clk += 16, 0.30f, 4, 1.0f);
+            check(o.phase == CP::kMirror, "concourse clear: a reading under the share between two resets the count");
+            in.cameraValid = false;
+            o = stepAt(clk += 16, 0.30f, 5, 1.0f);
+            check(o.phase == CP::kMirror, "concourse clear: two readings over the share with no camera do not start it");
+            in.cameraValid = true;
+            o = stepAt(clk += 16, 0.30f, 5, 1.0f);
+            check(o.phase == CP::kLifting && !o.cullOn && o.bayOpacity == 1.0f, "concourse clear: two readings in a row and a camera: lifting, the cull off, the glass still opaque");
+            const uint64_t liftAt = clk;
+            o = stepAt(liftAt + 149, 0.30f, 6, 1.0f);
+            check(o.phase == CP::kLifting && o.bayOpacity == 1.0f && !o.cullOn, "concourse clear: lifting lasts 150 ms with the glass opaque");
+            o = stepAt(liftAt + 150, 0.30f, 7, 1.0f);
+            check(o.phase == CP::kFadingOut && !o.cullOn && o.bayOpacity == 1.0f, "concourse clear: after 150 ms the glass begins to fade out");
+            const uint64_t fadeAt = liftAt + 150;
+            o = stepAt(fadeAt + 300, 0.30f, 8, 1.0f);
+            check(o.phase == CP::kFadingOut && std::fabs(o.bayOpacity - 0.5f) < 0.001f, "concourse clear: opacity falls linearly, half at 300 ms");
+            o = stepAt(fadeAt + 600, 0.30f, 9, 1.0f);
+            check(o.phase == CP::kClear && o.bayOpacity == 0.0f && !o.cullOn, "concourse clear: at 600 ms the glass is clear");
+            // Clear: the latch follows the camera while the share holds; the exit distance is from the latest latch.
+            o = stepAt(fadeAt + 700, 0.30f, 10, 4.0f);
+            o = stepAt(fadeAt + 710, 0.30f, 11, 12.0f);
+            check(o.phase == CP::kClear, "concourse clear: while the share holds, the latch moves with the camera, so walking away is not leaving yet");
+            o = stepAt(fadeAt + 720, 0.01f, 12, 21.0f);
+            check(o.phase == CP::kClear, "concourse clear: 9 m from the latch is under the exit distance");
+            o = stepAt(fadeAt + 730, 0.01f, 13, 22.0f);
+            check(o.phase == CP::kFadingIn && !o.cullOn && o.bayOpacity == 0.0f, "concourse clear: 10 m from the latch the glass fades back in, the cull still off");
+            const uint64_t inAt = fadeAt + 730;
+            o = stepAt(inAt + 300, 0.01f, 14, 22.0f);
+            check(o.phase == CP::kFadingIn && std::fabs(o.bayOpacity - 0.5f) < 0.001f && !o.cullOn, "concourse clear: opacity rises linearly, half at 300 ms");
+            // Turned round half-way: back to fading out from the current opacity.
+            o = stepAt(inAt + 360, 0.35f, 15, 22.0f);
+            check(o.phase == CP::kFadingOut && std::fabs(o.bayOpacity - 0.6f) < 0.001f, "concourse clear: the share over the threshold while fading in turns it round from the current opacity");
+            o = stepAt(inAt + 360 + 120, 0.35f, 16, 22.0f);
+            check(o.phase == CP::kFadingOut && std::fabs(o.bayOpacity - 0.4f) < 0.001f, "concourse clear: fading out again at the same rate (0.2 in 120 ms)");
+            o = stepAt(inAt + 360 + 600, 0.35f, 17, 22.0f);
+            check(o.phase == CP::kClear && o.bayOpacity == 0.0f, "concourse clear: it reaches clear again");
+            // Out of the room again and fade in to the end.
+            o = stepAt(inAt + 1000, 0.0f, 18, 40.0f);
+            check(o.phase == CP::kFadingIn, "concourse clear: far enough from the latch, fading in again");
+            o = stepAt(inAt + 1000 + 599, 0.0f, 19, 40.0f);
+            check(o.phase == CP::kFadingIn && o.bayOpacity < 1.0f, "concourse clear: not yet opaque at 599 ms");
+            o = stepAt(inAt + 1000 + 600, 0.0f, 20, 40.0f);
+            check(o.phase == CP::kMirror && o.cullOn && o.bayOpacity == 1.0f, "concourse clear: at opacity 1 the mirror phase returns with the cull on");
+            // The gate dropping resets.
+            o = stepAt(inAt + 3000, 0.9f, 21, 40.0f);
+            o = stepAt(inAt + 3016, 0.9f, 22, 40.0f);
+            check(o.phase == CP::kLifting, "concourse clear: (setup) lifting again");
+            in.gate = false;
+            o = stepAt(inAt + 3032, 0.9f, 23, 40.0f);
+            check(o.phase == CP::kMirror && o.cullOn && o.bayOpacity == 1.0f && m.phase() == CP::kMirror, "concourse clear: no gate resets to the mirror phase, opacity 1");
+            in.gate = true;
+            // enterShare 0 never clears.
+            cc::ClearMachine z;
+            in.enterShare = 0.0f;
+            bool never = true;
+            for (uint32_t i = 0; i < 10; ++i) {
+                in.nowMs = 5000 + i * 16;
+                in.bayShare = 1.0f;
+                in.shareSeq = 100 + i;
+                never = never && z.step(in).phase == CP::kMirror;
+            }
+            check(never, "concourse clear: diag.concourse_clear_share 0 never clears");
+            // No reading (negative) is not a hit.
+            cc::ClearMachine q;
+            in.enterShare = 0.2f;
+            bool noRead = true;
+            for (uint32_t i = 0; i < 10; ++i) {
+                in.nowMs = 9000 + i * 16;
+                in.bayShare = -1.0f;
+                in.shareSeq = 200 + i;
+                noRead = noRead && q.step(in).phase == CP::kMirror;
+            }
+            check(noRead, "concourse clear: no reading never starts it");
+            check(std::strcmp(cc::clearPhaseName(CP::kFadingOut), "fading-out") == 0 && std::strcmp(cc::clearPhaseName(CP::kMirror), "mirror") == 0 &&
+                      cc::kClearExitMetres == 10.0 && cc::kClearLiftMs == 150 && cc::kClearFadeMs == 600,
+                  "concourse clear: the phase names and the constants (10 m, 150 ms, 600 ms)");
+        }
     }
 
     std::printf("optimized_station_test: %d checks, %d failures\n", g_checks, g_failures);

@@ -1117,6 +1117,7 @@ CostRing g_costFrame;
 std::atomic<uint64_t> g_callsStore{0};      // built v14.25: every call (the per-frame counts)
 std::atomic<uint64_t> g_callsProducer{0};
 std::atomic<uint64_t> g_callsRig{0};
+std::atomic<uint64_t> g_concCallsTotal[3] = {};   // the concourse summary's own monotonic totals: the 30 s hangar summary exchanges the three counters above to 0
 
 // The mean of a ring's samples (tick only).
 double ringMean(const CostRing& r) noexcept {
@@ -1400,6 +1401,9 @@ void tcFlush(TlsCounters& t) noexcept {
     g_callsStore.fetch_add(t.callsStore, std::memory_order_relaxed);
     g_callsProducer.fetch_add(t.callsProducer, std::memory_order_relaxed);
     g_callsRig.fetch_add(t.callsRig, std::memory_order_relaxed);
+    g_concCallsTotal[0].fetch_add(t.callsStore, std::memory_order_relaxed);
+    g_concCallsTotal[1].fetch_add(t.callsProducer, std::memory_order_relaxed);
+    g_concCallsTotal[2].fetch_add(t.callsRig, std::memory_order_relaxed);
     g_kept.fetch_add(t.kept, std::memory_order_relaxed);
     g_keptUnknown.fetch_add(t.keptUnknown, std::memory_order_relaxed);
     g_winKeptUnknown.fetch_add(t.keptUnknown, std::memory_order_relaxed);
@@ -2624,6 +2628,7 @@ void afterStoreJudge(uintptr_t bucket, uintptr_t record, bool judge) noexcept {
 struct SurveyAgg {
     uint32_t kept = 0, culled = 0, smallClose = 0, unreadSphere = 0;
     float radiusMax = 0.0f;
+    float nearest = -1.0f;   // the smallest distance of a record with a readable sphere; negative when none
 };
 struct SurveyClose {
     char name[48] = {};
@@ -2648,6 +2653,7 @@ void concourseSurveyNote(const char* name, cc::Judge j, float dist, float radius
         std::lock_guard<std::mutex> lock(sv.m);
         SurveyAgg& a = sv.names[name];
         if (radius > a.radiusMax) a.radiusMax = radius;
+        if (radius > 0.0f && std::isfinite(dist) && (a.nearest < 0.0f || dist < a.nearest)) a.nearest = dist;
         switch (j) {
             case cc::Judge::kKeepName: ++a.kept; break;
             case cc::Judge::kKeepSmallClose: ++a.smallClose; break;
@@ -2913,6 +2919,13 @@ uint64_t g_concTraceMs = 0;
 uint32_t g_concTraceReason = 0;
 uint64_t g_concTraceReasonMs = 0;
 bool g_concSettingOffLogged = false;
+cc::ClearMachine g_concClear;             // the bay glass's clearing on approach (concourse_cull_core.h)
+bool g_concWasWant = false;               // wantCull at the last tick: the gate's rising edge starts the names survey, a re-engage from the latch does not
+float g_concEnterShare = 0.0f;            // diag.concourse_clear_share as a fraction of the view; 0 never clears
+bool g_concEnterSeen = false;
+uint64_t g_concShareLogMs = 0;
+uint32_t g_concShareSeq = 0;
+ConcoursePaneShares g_concShareLast;
 
 bool concourseEffective() noexcept {
     return g_concOverride == ConcOverride::kNone ? g_concKeyOn : g_concOverride == ConcOverride::kOn;
@@ -2938,6 +2951,20 @@ void concoursePoll(uint64_t now) {
         }
         g_concKeySeen = true;
         g_concKeyOn = on;
+    }
+    float clearPct = runtimeFlatProfile() ? 20.0f : 12.0f;
+    {
+        const std::string clearText = cfg.getString("diag.concourse_clear_share", "auto");
+        char* end = nullptr;
+        const float v = std::strtof(clearText.c_str(), &end);
+        if (clearText != "auto" && end != clearText.c_str() && end && *end == '\0') clearPct = v;
+    }
+    if (!(clearPct > 0.0f)) clearPct = 0.0f;
+    if (clearPct > 100.0f) clearPct = 100.0f;
+    if (!g_concEnterSeen || clearPct / 100.0f != g_concEnterShare) {
+        if (g_concEnterSeen) Log::get().note("concourse cull: diag.concourse_clear_share is now %.1f (percent of the view; 0 never clears)", static_cast<double>(clearPct));
+        g_concEnterSeen = true;
+        g_concEnterShare = clearPct / 100.0f;
     }
     const std::string extra = cfg.getString("diag.concourse_keep", "");
     if (!g_concExtraSeen || extra != g_concExtraApplied) {
@@ -2972,6 +2999,9 @@ void concourseSettingOffTick(uint64_t now) {
     g_concSurveyOn = false;
     g_concWasActive = false;
     g_concWaitSet = false;
+    g_concWasWant = false;
+    g_concClear.reset();
+    concoursePaneSetFeed(ConcoursePaneFeed{});
     if ((g_concKeyOn || wasActive) && !g_concSettingOffLogged) {
         g_concSettingOffLogged = true;
         Log::get().note("concourse cull: off (fix.optimized_stations is off; the cull is part of it)");
@@ -2986,6 +3016,7 @@ void concourseSurveyReport() {
         std::string name;
         uint32_t n = 0;
         float r = 0.0f;
+        float nearest = -1.0f;
     };
     std::vector<Row> kept, culled, smallClose, unreadSphere;
     std::vector<SurveyClose> close;
@@ -2994,7 +3025,7 @@ void concourseSurveyReport() {
         std::lock_guard<std::mutex> lock(sv.m);
         for (const auto& kv : sv.names) {
             const SurveyAgg& a = kv.second;
-            if (a.kept) kept.push_back({kv.first, a.kept, a.radiusMax});
+            if (a.kept) kept.push_back({kv.first, a.kept, a.radiusMax, a.nearest});
             if (a.culled) culled.push_back({kv.first, a.culled, a.radiusMax});
             if (a.smallClose) smallClose.push_back({kv.first, a.smallClose, a.radiusMax});
             if (a.unreadSphere) unreadSphere.push_back({kv.first, a.unreadSphere, a.radiusMax});
@@ -3015,7 +3046,9 @@ void concourseSurveyReport() {
     Log::get().note("concourse names: survey over 2 frames: %u kept names, %u culled names, %u small-close names, %u unreadable-sphere names, %u culled records within %.0f m",
                     static_cast<unsigned>(kept.size()), static_cast<unsigned>(culled.size()), static_cast<unsigned>(smallClose.size()),
                     static_cast<unsigned>(unreadSphere.size()), static_cast<unsigned>(close.size()), static_cast<double>(kSurveyCloseM));
-    for (size_t i = 0; i < kept.size() && i < 80; ++i) Log::get().note("concourse names: kept %s x%u", kept[i].name.c_str(), kept[i].n);
+    for (size_t i = 0; i < kept.size() && i < 80; ++i)
+        Log::get().note("concourse names: kept %s x%u r=%.1f nearest=%.1f", kept[i].name.c_str(), kept[i].n, static_cast<double>(kept[i].r),
+                        static_cast<double>(kept[i].nearest));
     for (size_t i = 0; i < culled.size() && i < 80; ++i)
         Log::get().note("concourse names: culled %s x%u r=%.1f", culled[i].name.c_str(), culled[i].n, static_cast<double>(culled[i].r));
     for (size_t i = 0; i < close.size() && i < 40; ++i)
@@ -3100,6 +3133,81 @@ void concourseFrameTrace(uint64_t now) {
                     static_cast<unsigned>(aw.source), static_cast<unsigned>(osrc), hub);
 }
 
+// The camera in the anchor record's frame (the frame trace's coordinates), for the clearing machine and its log lines. False when it cannot be read now.
+bool concourseCamLocal(float out[3]) {
+    if (!g_frameCamValid) return false;
+    const uintptr_t anchor = g_concAnchorAddr.load(std::memory_order_relaxed);
+    if (!anchor) return false;
+    char nm[64] = {};
+    if (!cachedName(anchor, nm, sizeof(nm)) || std::strcmp(nm, cc::kAnchorName) != 0) return false;
+    const WorldRead aw = worldOfRecord(anchor);
+    float axes[3][3] = {};
+    float ext[3] = {};
+    bool extOk = false;
+    uint8_t osrc = 4;
+    if (aw.source == 4 || !poseOrientOf(anchor, axes, ext, &extOk, &osrc)) return false;
+    const float d[3] = {g_frameCam[0] - aw.world[0], g_frameCam[1] - aw.world[1], g_frameCam[2] - aw.world[2]};
+    for (int k = 0; k < 3; ++k) out[k] = axes[k][0] * d[0] + axes[k][1] * d[1] + axes[k][2] * d[2];
+    return std::isfinite(out[0]) && std::isfinite(out[1]) && std::isfinite(out[2]);
+}
+
+// The clearing machine's step and its log lines, and the pane share line. Returns the machine's output; `sh` is this frame's reading of the panes.
+cc::ClearOutput concourseClearStep(uint64_t now, bool wantCull, bool gateWanted, const ConcoursePaneShares& sh) {
+    cc::ClearInput in;
+    in.nowMs = now;
+    in.gate = wantCull;
+    in.bayShare = sh.valid ? sh.bay : -1.0f;
+    in.shareSeq = sh.seq;
+    in.enterShare = g_concEnterShare;
+    const bool bayOver = g_concEnterShare > 0.0f && sh.valid && sh.bay >= g_concEnterShare;
+    const bool needCam = wantCull && (g_concClear.phase() != cc::ClearPhase::kMirror || bayOver);
+    float local[3] = {};
+    bool camOk = false;
+    if (needCam) camOk = concourseCamLocal(local);
+    in.cameraValid = camOk;
+    if (camOk)
+        for (int k = 0; k < 3; ++k) in.cam[k] = local[k];
+    const cc::ClearPhase before = g_concClear.phase();
+    const cc::ClearOutput out = g_concClear.step(in);
+    if (out.phase != before) {
+        if (!camOk) camOk = concourseCamLocal(local);
+        char pane[48] = {};
+        if (sh.valid) std::snprintf(pane, sizeof(pane), "%.1f%%", 100.0 * static_cast<double>(sh.bay));
+        else std::snprintf(pane, sizeof(pane), "unread");
+        char cam[96] = {};
+        if (camOk) std::snprintf(cam, sizeof(cam), "cam_local %.2f %.2f %.2f", static_cast<double>(local[0]), static_cast<double>(local[1]), static_cast<double>(local[2]));
+        else std::snprintf(cam, sizeof(cam), "cam_local unreadable");
+        Log::get().note("concourse clear: %s (%spane %s of the view, %s)", cc::clearPhaseName(out.phase), wantCull ? "" : "gate lost, ", pane, cam);
+    }
+    // The shares line: at most once a second while the gate holds, when a share moved by over half a point or a window type came or went.
+    if (gateWanted && sh.valid && sh.seq != g_concShareSeq && now - g_concShareLogMs >= 1000) {
+        g_concShareSeq = sh.seq;
+        bool changed = sh.count != g_concShareLast.count;
+        for (uint32_t i = 0; i < sh.count && !changed; ++i) {
+            uint32_t k = 0;
+            while (k < g_concShareLast.count && g_concShareLast.n[k] != sh.n[i]) ++k;
+            if (k == g_concShareLast.count || std::fabs(g_concShareLast.share[k] - sh.share[i]) > 0.005f) changed = true;
+        }
+        if (changed) {
+            g_concShareLogMs = now;
+            g_concShareLast = sh;
+            char text[200] = {};
+            size_t used = 0;
+            for (uint32_t i = 0; i < sh.count; ++i) {
+                const int w = std::snprintf(text + used, sizeof(text) - used, "%sn=%u %.1f%%", i ? " " : "", sh.n[i], 100.0 * static_cast<double>(sh.share[i]));
+                if (w > 0 && used + static_cast<size_t>(w) < sizeof(text)) used += static_cast<size_t>(w);
+            }
+            if (sh.count == 0) std::snprintf(text, sizeof(text), "no family draw");
+            float sl[3] = {};
+            if (concourseCamLocal(sl))
+                Log::get().note("concourse pane shares: %s cam_local %.2f %.2f %.2f", text, static_cast<double>(sl[0]), static_cast<double>(sl[1]), static_cast<double>(sl[2]));
+            else
+                Log::get().note("concourse pane shares: %s", text);
+        }
+    }
+    return out;
+}
+
 // The tick, under the state lock, before the store gate is set (storeHookGate reads g_concWanted).
 void concourseTick(uint64_t now, uint32_t frame) {
     g_concSettingOffLogged = false;
@@ -3120,7 +3228,15 @@ void concourseTick(uint64_t now, uint32_t frame) {
     const uint64_t anchorMs = g_concAnchorMs.load(std::memory_order_relaxed);
     const bool anchor = anchorMs != 0 && now - anchorMs <= kConcAnchorFreshMs;
     const bool gateWanted = armed && social && !sealedNow;
-    const bool active = gateWanted && effective && anchor;
+    const bool wantCull = gateWanted && effective && anchor;   // the cull is wanted: the panes are treated whatever phase the clearing machine is in
+    const cc::ClearOutput clr = concourseClearStep(now, wantCull, gateWanted, gateWanted ? concoursePaneShares() : ConcoursePaneShares{});
+    const bool active = wantCull && clr.cullOn;
+    ConcoursePaneFeed feed;
+    feed.measure = gateWanted;
+    feed.treat = wantCull;
+    feed.withhold = active;
+    feed.bayOpacity = clr.bayOpacity;
+    concoursePaneSetFeed(feed);
     g_concWanted.store(gateWanted, std::memory_order_release);
     g_concHubWanted.store(gateWanted && g_concHubAddr.load(std::memory_order_relaxed) == 0, std::memory_order_relaxed);
     const bool transitioned = active != g_concWasActive;
@@ -3128,12 +3244,12 @@ void concourseTick(uint64_t now, uint32_t frame) {
         if (active) {
             bumpRigEpoch();   // the rigs are judged afresh: every slot and publication of the old epoch forwards
             g_concActive.store(true, std::memory_order_release);
-            g_concSurveyDueMs = now;   // the names first: no rig has been vetoed yet, so the survey's forwarding shows nothing that was not already on screen
+            // The names first, at a gate or key rising edge only (a re-engage from the clearing latch does not rerun them). No rig has been vetoed yet, so the
+            // survey's forwarding shows nothing that was not already on screen.
+            if (!g_concWasWant) g_concSurveyDueMs = now;
             g_concSumMs = now;
             g_concSumFrames = 0;
-            g_concSumCalls[0] = g_callsStore.load(std::memory_order_relaxed);
-            g_concSumCalls[1] = g_callsProducer.load(std::memory_order_relaxed);
-            g_concSumCalls[2] = g_callsRig.load(std::memory_order_relaxed);
+            for (int k = 0; k < 3; ++k) g_concSumCalls[k] = g_concCallsTotal[k].load(std::memory_order_relaxed);
             Log::get().note("concourse cull: on");
         } else {
             g_concActive.store(false, std::memory_order_release);
@@ -3142,6 +3258,7 @@ void concourseTick(uint64_t now, uint32_t frame) {
             const char* why = !effective ? "the key or its override is off"
                               : sealedNow ? "the hangar seal engaged"
                               : !social   ? "no longer on foot in social space"
+                              : wantCull  ? "the bay glass was approached: the view is clearing (diag.concourse_clear_share)"
                                           : "the anchor record was not seen for 5 s";
             Log::get().note("concourse cull: off (%s)", why);
         }
@@ -3150,7 +3267,8 @@ void concourseTick(uint64_t now, uint32_t frame) {
     } else if (active && toggledOn) {
         g_concSurveyDueMs = now + 2000;   // a toggle-on while the cull stays active (the override flipped back on): the names again
     }
-    if (!active && !transitioned) {
+    g_concWasWant = wantCull;
+    if (!wantCull && !transitioned) {
         const uint32_t keyCode = g_concOverride == ConcOverride::kNone ? (g_concKeyOn ? 1u : 0u) : (g_concOverride == ConcOverride::kOn ? 2u : 3u);
         const uint32_t waitKey = (effective ? 1u : 0u) | (social ? 2u : 0u) | (anchor ? 4u : 0u) | (g_frameCamValid ? 8u : 0u) | (sealedNow ? 16u : 0u) | (keyCode << 5);
         if (armed && (!g_concWaitSet || waitKey != g_concWaitKey)) {
@@ -3194,9 +3312,10 @@ void concourseTick(uint64_t now, uint32_t frame) {
     if (now - g_concSumMs >= 5000) {
         g_concSumMs = now;
         const uint64_t treated = concoursePaneTakeTreated();
+        const uint64_t withheld = concoursePaneTakeWithheld();
         if (active) {
-            const uint64_t calls[3] = {g_callsStore.load(std::memory_order_relaxed), g_callsProducer.load(std::memory_order_relaxed),
-                                       g_callsRig.load(std::memory_order_relaxed)};
+            const uint64_t calls[3] = {g_concCallsTotal[0].load(std::memory_order_relaxed), g_concCallsTotal[1].load(std::memory_order_relaxed),
+                                       g_concCallsTotal[2].load(std::memory_order_relaxed)};
             const double frames = g_concSumFrames > 0 ? static_cast<double>(g_concSumFrames) : 1.0;
             const double ms = (ringMean(g_costStore) * static_cast<double>(calls[0] - g_concSumCalls[0]) +
                                ringMean(g_costProducer) * static_cast<double>(calls[1] - g_concSumCalls[1]) +
@@ -3204,16 +3323,16 @@ void concourseTick(uint64_t now, uint32_t frame) {
             for (int k = 0; k < 3; ++k) g_concSumCalls[k] = calls[k];
             g_concSumFrames = 0;
             Log::get().note("concourse cull 5s: rigs seen %u vetoed %u, producer vetoed %u kept %u (name %u, small-close %u, unreadable-name %u, unreadable-sphere %u), "
-                            "store cleared %u, callback cost %.3f ms/frame, panes treated %u draws (mode %s, %u slots)",
+                            "store cleared %u, callback cost %.3f ms/frame, panes treated %u draws (mode %s, %u slots), plumes withheld %u, phase %s",
                             static_cast<unsigned>(g_concWin.rigSeen.exchange(0)), static_cast<unsigned>(g_concWin.rigVetoed.exchange(0)),
                             static_cast<unsigned>(g_concWin.prodVetoed.exchange(0)), static_cast<unsigned>(g_concWin.prodKept.exchange(0)),
                             static_cast<unsigned>(g_concWin.kept[0].exchange(0)), static_cast<unsigned>(g_concWin.kept[1].exchange(0)),
                             static_cast<unsigned>(g_concWin.kept[2].exchange(0)), static_cast<unsigned>(g_concWin.kept[3].exchange(0)),
                             static_cast<unsigned>(g_concWin.storeCleared.exchange(0)), ms, static_cast<unsigned>(treated), concoursePaneModeName(),
-                            static_cast<unsigned>(concoursePaneSlotCount()));
+                            static_cast<unsigned>(concoursePaneSlotCount()), static_cast<unsigned>(withheld), cc::clearPhaseName(clr.phase));
         } else if (concoursePaneTreating()) {
-            Log::get().note("concourse pane 5s: treated %u draws (mode %s, %u slots)", static_cast<unsigned>(treated), concoursePaneModeName(),
-                            static_cast<unsigned>(concoursePaneSlotCount()));
+            Log::get().note("concourse pane 5s: treated %u draws (mode %s, %u slots), plumes withheld %u, phase %s", static_cast<unsigned>(treated),
+                            concoursePaneModeName(), static_cast<unsigned>(concoursePaneSlotCount()), static_cast<unsigned>(withheld), cc::clearPhaseName(clr.phase));
         }
     }
     (void)frame;

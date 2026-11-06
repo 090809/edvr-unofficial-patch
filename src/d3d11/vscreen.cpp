@@ -5446,6 +5446,12 @@ static void STDMETHODCALLTYPE stationMaskSetDepth(ID3D11DeviceContext* ctx, ID3D
     if (g_state->realOMSetDepthStencilState) g_state->realOMSetDepthStencilState(ctx, state, stencilRef);
     else ctx->OMSetDepthStencilState(state, stencilRef);
 }
+static void STDMETHODCALLTYPE concoursePaneSetSrv(ID3D11DeviceContext* ctx, UINT start, UINT n, ID3D11ShaderResourceView* const* srvs) {
+    if (g_state->realPSSetShaderResources) g_state->realPSSetShaderResources(ctx, start, n, srvs);
+    else ctx->PSSetShaderResources(start, n, srvs);
+}
+// TEMPORARY (concourse_pane.h): the four entry points the glass panes' scope puts state through.
+static const ConcoursePaneCalls kConcoursePaneCalls = {&stationMaskSetBlend, &concoursePaneSetPs, &concoursePaneSetSrv, &stationMaskSetDepth};
 class FlatStationSunGate {
 public:
     FlatStationSunGate(ID3D11DeviceContext* self, const FlatRuntimeDrawScope& scope, bool stationSkip) : ctx_(self) {
@@ -5625,8 +5631,8 @@ void STDMETHODCALLTYPE hookedDrawIndexed(ID3D11DeviceContext* self, UINT count,
         FlatStationSunGate sun(self, flatDraw, stationSkip);
         {
             FlatParticleScope particle(self, 'I', count, 1);
-            ConcoursePaneScope pane(self, count, &stationMaskSetBlend, &concoursePaneSetPs);
-            if (sun.issues()) g_state->realDrawIndexed(self, count, startIndex, baseVertex);
+            ConcoursePaneScope pane(self, count, kConcoursePaneCalls);
+            if (sun.issues() && !pane.withheld()) g_state->realDrawIndexed(self, count, startIndex, baseVertex);
         }
         sun.restore();
         if (flatDraw.needsActualDraw()) flatDraw.endActualDraw();
@@ -5661,8 +5667,8 @@ void STDMETHODCALLTYPE hookedDrawIndexed(ID3D11DeviceContext* self, UINT count,
         if (!(self == g_state->ownerCtx && uiLayerIssueBlocked())) {
             const int64_t r0 = clock.on ? qpcNow() : 0;
             {
-                ConcoursePaneScope pane(self, count, &stationMaskSetBlend, &concoursePaneSetPs);   // TEMPORARY (concourse_pane.h)
-                g_state->realDrawIndexed(self, count, startIndex, baseVertex);
+                ConcoursePaneScope pane(self, count, kConcoursePaneCalls);   // TEMPORARY (concourse_pane.h)
+                if (!pane.withheld()) g_state->realDrawIndexed(self, count, startIndex, baseVertex);
             }
             if (clock.on) clock.realCall(r0);
         }
@@ -5670,8 +5676,8 @@ void STDMETHODCALLTYPE hookedDrawIndexed(ID3D11DeviceContext* self, UINT count,
         const int64_t r0 = clock.on ? qpcNow() : 0;
         {
             GpuCensusAlteredScope timed(self, altered);   // the game's own draw, and only it (gpu_census.h)
-            ConcoursePaneScope pane(self, count, &stationMaskSetBlend, &concoursePaneSetPs);   // TEMPORARY (concourse_pane.h)
-            g_state->realDrawIndexed(self, count, startIndex, baseVertex);
+            ConcoursePaneScope pane(self, count, kConcoursePaneCalls);   // TEMPORARY (concourse_pane.h)
+            if (!pane.withheld()) g_state->realDrawIndexed(self, count, startIndex, baseVertex);
         }
         srvTurretHudCountIssue(self);   // issue 140: the game's own issue; a family's first scope says its state (one relaxed load otherwise)
         if (clock.on) clock.realCall(r0);
@@ -5808,8 +5814,8 @@ void STDMETHODCALLTYPE hookedDrawIndexedInstanced(ID3D11DeviceContext* self,
         FlatStationSunGate sun(self, flatDraw, stationSkip);
         {
             FlatParticleScope particle(self, 'X', perInstance, instances);
-            ConcoursePaneScope pane(self, perInstance, &stationMaskSetBlend, &concoursePaneSetPs);
-            if (sun.issues())
+            ConcoursePaneScope pane(self, perInstance, kConcoursePaneCalls);
+            if (sun.issues() && !pane.withheld())
                 g_state->realDrawIndexedInstanced(self, perInstance, instances, startIndex,
                                                   baseVertex, startInstance);
         }
@@ -5869,9 +5875,10 @@ void STDMETHODCALLTYPE hookedDrawIndexedInstanced(ID3D11DeviceContext* self,
             // The game's own draw, and only it (gpu_census.h): the weapon and screen motion
             // reissues below have sections of their own.
             GpuCensusAlteredScope timed(self, altered);
-            ConcoursePaneScope pane(self, perInstance, &stationMaskSetBlend, &concoursePaneSetPs);   // TEMPORARY (concourse_pane.h)
-            g_state->realDrawIndexedInstanced(self, perInstance, instances, startIndex,
-                                              baseVertex, startInstance);
+            ConcoursePaneScope pane(self, perInstance, kConcoursePaneCalls);   // TEMPORARY (concourse_pane.h)
+            if (!pane.withheld())
+                g_state->realDrawIndexedInstanced(self, perInstance, instances, startIndex,
+                                                  baseVertex, startInstance);
         }
         // Stop the draw-hook clock here: the weapon-motion re-issue below is EDVR's own work, counted under "draw reissue CPU:" and not inside "draw hook CPU:".
         if (clock.on) clock.realCall(r0);
