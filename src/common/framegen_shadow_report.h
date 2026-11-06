@@ -46,6 +46,7 @@ struct FrameGenShadowWindow {
     uint64_t holes = 0;
     uint64_t cells = 0;
     float gpuMsMedian = 0.0f, gpuMsMax = 0.0f;
+    uint32_t gpuSamples = 0;   // the timed frames behind the two numbers; 0 reads "-" in the line
     float rigDegMedian = 0.0f, rigDegMax = 0.0f, rigMmMedian = 0.0f, rigMmMax = 0.0f;
 };
 
@@ -122,7 +123,10 @@ constexpr const char* kFrameGenShadowArmedFmt =
 constexpr const char* kFrameGenShadowReportHeadFmt = "frame generation (shadow): frames=%u skipped=%u/%u/%u/%u/%u";
 // name=share%,mean,p50,p95,over0.02%,over0.05%|id:mean,p95 -- errors in milli-luma, the shares in percent (the class's share is of all cells, the over shares of the class)
 constexpr const char* kFrameGenShadowReportClassFmt = " %s=%.1f%%,%u,%u,%u,%.1f%%,%.1f%%|id:%u,%u";
-constexpr const char* kFrameGenShadowReportTailFmt = " holes=%.1f%% gpu_ms=%.2f/%.2f rig_deg=%.3f/%.3f rig_mm=%.2f/%.2f";
+constexpr const char* kFrameGenShadowReportTailFmt = " holes=%.1f%% gpu_ms=%s rig_deg=%.3f/%.3f rig_mm=%.2f/%.2f";
+// The gpu_ms field: median/max over the timed frames and how many there were (the timer runs only on frames the GPU census has its scope open), or "-" when none were.
+constexpr const char* kFrameGenShadowGpuFmt = "%.2f/%.2f(n=%u)";
+constexpr const char* kFrameGenShadowGpuNoneFmt = "-(n=0)";
 constexpr const char* kFrameGenShadowClassNames[kFrameGenShadowClasses] = {"far", "cockpit", "world"};
 
 inline std::string formatFrameGenShadowArmed(uint32_t qw, uint32_t qh) {
@@ -152,9 +156,14 @@ inline std::string formatFrameGenShadowReport(const FrameGenShadowWindow& w) {
                            100.0 * frameGenShadowShareOver(s.hist, 0.05f), frameGenShadowMilli(s.pixels ? meanId : 0.0),
                            frameGenShadowMilli(frameGenShadowPercentile(s.histId, 0.95f)));
     }
+    char gpu[48];
+    if (w.gpuSamples)
+        std::snprintf(gpu, sizeof(gpu), kFrameGenShadowGpuFmt, static_cast<double>(w.gpuMsMedian), static_cast<double>(w.gpuMsMax), static_cast<unsigned>(w.gpuSamples));
+    else
+        std::snprintf(gpu, sizeof(gpu), "%s", kFrameGenShadowGpuNoneFmt);
     if (n > 0 && n < static_cast<int>(sizeof(buf)))
-        std::snprintf(buf + n, sizeof(buf) - n, kFrameGenShadowReportTailFmt, 100.0 * static_cast<double>(w.holes) / cells, static_cast<double>(w.gpuMsMedian),
-                      static_cast<double>(w.gpuMsMax), static_cast<double>(w.rigDegMedian), static_cast<double>(w.rigDegMax), static_cast<double>(w.rigMmMedian),
+        std::snprintf(buf + n, sizeof(buf) - n, kFrameGenShadowReportTailFmt, 100.0 * static_cast<double>(w.holes) / cells, gpu,
+                      static_cast<double>(w.rigDegMedian), static_cast<double>(w.rigDegMax), static_cast<double>(w.rigMmMedian),
                       static_cast<double>(w.rigMmMax));
     return buf;
 }

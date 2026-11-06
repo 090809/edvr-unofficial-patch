@@ -10613,7 +10613,7 @@ H_FRAMEGEN_ARMED = r"frame generation \(shadow\): armed, quarter (?P<qw>\d+)x(?P
 _HFG_CLASS = r" {n}=(?P<{n}_share>[\d.]+)%,(?P<{n}_mean>\d+),(?P<{n}_p50>\d+),(?P<{n}_p95>\d+),(?P<{n}_o02>[\d.]+)%,(?P<{n}_o05>[\d.]+)%\|id:(?P<{n}_idmean>\d+),(?P<{n}_idp95>\d+)"
 H_FRAMEGEN_REPORT = (r"frame generation \(shadow\): frames=(?P<frames>\d+) skipped=(?P<s0>\d+)/(?P<s1>\d+)/(?P<s2>\d+)/(?P<s3>\d+)/(?P<s4>\d+)"
                      + "".join(_HFG_CLASS.format(n=n) for n in ("far", "cockpit", "world")) +
-                     r" holes=(?P<holes>[\d.]+)% gpu_ms=(?P<gpu_med>[\d.]+)/(?P<gpu_max>[\d.]+) rig_deg=(?P<deg_med>[\d.]+)/(?P<deg_max>[\d.]+) rig_mm=(?P<mm_med>[\d.]+)/(?P<mm_max>[\d.]+)$")
+                     r" holes=(?P<holes>[\d.]+)% gpu_ms=(?:(?P<gpu_med>[\d.]+)/(?P<gpu_max>[\d.]+)\(n=(?P<gpu_n>[1-9]\d*)\)|-\(n=0\)) rig_deg=(?P<deg_med>[\d.]+)/(?P<deg_max>[\d.]+) rig_mm=(?P<mm_med>[\d.]+)/(?P<mm_max>[\d.]+)$")
 # The SRV turret view (issue 140; src\d3d11\srv_turret.cpp, the vehicle latch's line in journal_watch.cpp, and the geometry shader's creation line in shader_swap.cpp, shaderSwapCreateGs,
 # called with who "srv turret hud"): lines of the graphics log with no build tag, read the way the desktop window's are. The settings and vehicle lines are state, so health_scan keeps
 # every one whatever --since says; the rest are events and are cut by the window. Every kind of line the DLL writes has a pattern of its own, so a labelled line that none matches is
@@ -25011,9 +25011,10 @@ def self_test_health():
         def fg_armed(qw=612, qh=699):
             return RF("armed, quarter %ux%u", qw, qh)
 
-        def fg_report(frames=60, skipped=(1, 2, 3, 4, 5)):
+        def fg_report(frames=60, skipped=(1, 2, 3, 4, 5), timed=True):
             cls = "".join(RF(" %s=%.1f%%,%u", n, 10.0, 12, 8, 40, 5.5, 1.5, 9, 30) for n in ("far", "cockpit", "world"))
-            return (RF("frames=%u skipped=%u/", frames, *skipped) + cls + RF(" holes=%.1f%% gpu_ms=%.2f", 3.5, 0.85, 1.2, 0.012, 0.034, 0.4, 1.25))
+            gpu = RF("%.2f/%.2f(n=%u)", 0.85, 1.2, 3) if timed else health_c_format(fgsrc, "-(n=0)")
+            return (RF("frames=%u skipped=%u/", frames, *skipped) + cls + RF(" holes=%.1f%% gpu_ms=%s", 3.5, gpu, 0.012, 0.034, 0.4, 1.25))
 
         FG, fg_ok = H_FRAMEGEN, [f90_part()]
         check("frame generation shadow: no line at all, nothing said (the key off)", fg_ok, 0, [("OK", F90S)], lacks=["frame generation", "NEVER APPLIED"])

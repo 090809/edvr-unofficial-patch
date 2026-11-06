@@ -128,6 +128,7 @@ void caseLines() {
     w.cls[2].histId[23] = 300;
     w.gpuMsMedian = 0.85f;
     w.gpuMsMax = 1.2f;
+    w.gpuSamples = 3;
     w.rigDegMedian = 0.012f;
     w.rigDegMax = 0.034f;
     w.rigMmMedian = 0.4f;
@@ -135,7 +136,7 @@ void caseLines() {
     const std::string line = formatFrameGenShadowReport(w);
     checkText(line,
               "frame generation (shadow): frames=60 skipped=1/2/3/4/5 far=10.0%,0,0,0,0.0%,0.0%|id:0,0 cockpit=20.0%,50,48,48,100.0%,0.0%|id:0,0 "
-              "world=30.0%,100,0,193,50.0%,50.0%|id:100,48 holes=10.0% gpu_ms=0.85/1.20 rig_deg=0.012/0.034 rig_mm=0.40/1.25",
+              "world=30.0%,100,0,193,50.0%,50.0%|id:100,48 holes=10.0% gpu_ms=0.85/1.20(n=3) rig_deg=0.012/0.034 rig_mm=0.40/1.25",
               "the report line");
     check(line.find('\n') == std::string::npos, "the report is one line");
 
@@ -143,7 +144,7 @@ void caseLines() {
     FrameGenShadowWindow z;
     checkText(formatFrameGenShadowReport(z),
               "frame generation (shadow): frames=0 skipped=0/0/0/0/0 far=0.0%,0,0,0,0.0%,0.0%|id:0,0 cockpit=0.0%,0,0,0,0.0%,0.0%|id:0,0 "
-              "world=0.0%,0,0,0,0.0%,0.0%|id:0,0 holes=0.0% gpu_ms=0.00/0.00 rig_deg=0.000/0.000 rig_mm=0.00/0.00",
+              "world=0.0%,0,0,0,0.0%,0.0%|id:0,0 holes=0.0% gpu_ms=-(n=0) rig_deg=0.000/0.000 rig_mm=0.00/0.00",
               "an empty window");
 }
 

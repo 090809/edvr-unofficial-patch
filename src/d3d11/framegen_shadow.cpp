@@ -400,6 +400,7 @@ void frameGenShadowFrameBoundary() {
         windowReset();
         return;
     }
+    g.win.gpuSamples = static_cast<uint32_t>(g.gpuMs.size());
     g.win.gpuMsMax = 0.0f;
     for (float v : g.gpuMs) if (v > g.win.gpuMsMax) g.win.gpuMsMax = v;
     g.win.gpuMsMedian = frameGenMedian(g.gpuMs.data(), g.gpuMs.size());
