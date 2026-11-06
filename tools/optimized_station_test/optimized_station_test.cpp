@@ -3497,106 +3497,238 @@ int main(int argc, char** argv) {
             check(spread, "concourse pane test frame: the keys are spread over the 8 frames, not all on one");
         }
 
-        // The clearing machine.
+        // The clearing machine: it follows the bay's share of the view, not the camera.
         {
             using CP = cc::ClearPhase;
-            cc::ClearMachine m;
             cc::ClearInput in;
             in.gate = true;
             in.enterShare = 0.20f;
-            in.cameraValid = true;
-            in.bayShare = 0.05f;
-            uint64_t clk = 1000;
-            auto stepAt = [&](uint64_t now, float share, uint32_t seq, float x) {
+            uint32_t seq = 0;
+            auto stepAt = [&](cc::ClearMachine& m, uint64_t now, float share) {
                 in.nowMs = now;
                 in.bayShare = share;
-                in.shareSeq = seq;
-                in.cam[0] = x;
+                in.shareSeq = ++seq;
                 return m.step(in);
             };
-            cc::ClearOutput o = stepAt(clk, 0.05f, 1, 0.0f);
+            // Drives a fresh machine to the start of Clear at the returned time (share 0.30 throughout).
+            auto toClear = [&](cc::ClearMachine& m, uint64_t t0) {
+                stepAt(m, t0, 0.30f);
+                stepAt(m, t0 + 16, 0.30f);                                         // lifting
+                stepAt(m, t0 + 16 + 150, 0.30f);                                   // fading out
+                const cc::ClearOutput o = stepAt(m, t0 + 16 + 150 + 600, 0.30f);   // clear
+                return o.phase == CP::kClear ? t0 + 16 + 150 + 600 : uint64_t(0);
+            };
+            cc::ClearMachine m;
+            cc::ClearOutput o = stepAt(m, 1000, 0.05f);
             check(o.cullOn && o.bayOpacity == 1.0f && o.phase == CP::kMirror, "concourse clear: below the share, the mirror phase holds, the cull on, opacity 1");
-            o = stepAt(clk += 16, 0.30f, 2, 1.0f);
+            o = stepAt(m, 1016, 0.30f);
             check(o.phase == CP::kMirror && o.cullOn, "concourse clear: one reading over the share is not enough");
-            o = stepAt(clk += 16, 0.30f, 2, 1.0f);
+            in.shareSeq = seq;   // the same reading seen again on the next tick
+            o = m.step(in);
             check(o.phase == CP::kMirror, "concourse clear: the same reading seen on a second tick is one reading, not two");
-            o = stepAt(clk += 16, 0.10f, 3, 1.0f);
-            o = stepAt(clk += 16, 0.30f, 4, 1.0f);
+            stepAt(m, 1032, 0.10f);
+            o = stepAt(m, 1048, 0.30f);
             check(o.phase == CP::kMirror, "concourse clear: a reading under the share between two resets the count");
-            in.cameraValid = false;
-            o = stepAt(clk += 16, 0.30f, 5, 1.0f);
-            check(o.phase == CP::kMirror, "concourse clear: two readings over the share with no camera do not start it");
-            in.cameraValid = true;
-            o = stepAt(clk += 16, 0.30f, 5, 1.0f);
-            check(o.phase == CP::kLifting && !o.cullOn && o.bayOpacity == 1.0f, "concourse clear: two readings in a row and a camera: lifting, the cull off, the glass still opaque");
-            const uint64_t liftAt = clk;
-            o = stepAt(liftAt + 149, 0.30f, 6, 1.0f);
+            o = stepAt(m, 1064, 0.30f);
+            check(o.phase == CP::kLifting && !o.cullOn && o.bayOpacity == 1.0f, "concourse clear: two readings in a row, no camera needed: lifting, the cull off, the glass still opaque");
+            const uint64_t liftAt = 1064;
+            o = stepAt(m, liftAt + 149, 0.30f);
             check(o.phase == CP::kLifting && o.bayOpacity == 1.0f && !o.cullOn, "concourse clear: lifting lasts 150 ms with the glass opaque");
-            o = stepAt(liftAt + 150, 0.30f, 7, 1.0f);
+            o = stepAt(m, liftAt + 150, 0.30f);
             check(o.phase == CP::kFadingOut && !o.cullOn && o.bayOpacity == 1.0f, "concourse clear: after 150 ms the glass begins to fade out");
             const uint64_t fadeAt = liftAt + 150;
-            o = stepAt(fadeAt + 300, 0.30f, 8, 1.0f);
+            o = stepAt(m, fadeAt + 300, 0.30f);
             check(o.phase == CP::kFadingOut && std::fabs(o.bayOpacity - 0.5f) < 0.001f, "concourse clear: opacity falls linearly, half at 300 ms");
-            o = stepAt(fadeAt + 600, 0.30f, 9, 1.0f);
+            o = stepAt(m, fadeAt + 600, 0.30f);
             check(o.phase == CP::kClear && o.bayOpacity == 0.0f && !o.cullOn, "concourse clear: at 600 ms the glass is clear");
-            // Clear: the latch follows the camera while the share holds; the exit distance is from the latest latch.
-            o = stepAt(fadeAt + 700, 0.30f, 10, 4.0f);
-            o = stepAt(fadeAt + 710, 0.30f, 11, 12.0f);
-            check(o.phase == CP::kClear, "concourse clear: while the share holds, the latch moves with the camera, so walking away is not leaving yet");
-            o = stepAt(fadeAt + 720, 0.01f, 12, 21.0f);
-            check(o.phase == CP::kClear, "concourse clear: 9 m from the latch is under the exit distance");
-            o = stepAt(fadeAt + 730, 0.01f, 13, 22.0f);
-            check(o.phase == CP::kFadingIn && !o.cullOn && o.bayOpacity == 0.0f, "concourse clear: 10 m from the latch the glass fades back in, the cull still off");
-            const uint64_t inAt = fadeAt + 730;
-            o = stepAt(inAt + 300, 0.01f, 14, 22.0f);
+            // Hysteresis: between the exit share (8%) and the enter share (20%) it stays clear, however long.
+            bool stays = true;
+            for (uint64_t t = fadeAt + 700; t < fadeAt + 3000; t += 100) stays = stays && stepAt(m, t, 0.12f).phase == CP::kClear;
+            check(stays, "concourse clear: between the exit share and the enter share it stays clear (hysteresis)");
+            // A brief dip under the exit share (under 250 ms) stays clear, and coming back over it cancels the hold.
+            const uint64_t d0 = fadeAt + 4000;
+            stepAt(m, d0, 0.05f);
+            o = stepAt(m, d0 + 249, 0.05f);
+            check(o.phase == CP::kClear, "concourse clear: a dip under 250 ms stays clear");
+            stepAt(m, d0 + 260, 0.12f);
+            stepAt(m, d0 + 270, 0.05f);
+            o = stepAt(m, d0 + 270 + 249, 0.05f);
+            check(o.phase == CP::kClear, "concourse clear: a reading back over the exit share restarts the hold");
+            // A sustained dip with the bay still on screen: it fades back in, the cull still off.
+            const uint64_t inAt = d0 + 270 + 250;
+            o = stepAt(m, inAt, 0.05f);
+            check(o.phase == CP::kFadingIn && !o.cullOn && o.bayOpacity == 0.0f, "concourse clear: a dip held for 250 ms with the bay still visible fades the glass back in, the cull still off");
+            o = stepAt(m, inAt + 300, 0.05f);
             check(o.phase == CP::kFadingIn && std::fabs(o.bayOpacity - 0.5f) < 0.001f && !o.cullOn, "concourse clear: opacity rises linearly, half at 300 ms");
-            // Turned round half-way: back to fading out from the current opacity.
-            o = stepAt(inAt + 360, 0.35f, 15, 22.0f);
-            check(o.phase == CP::kFadingOut && std::fabs(o.bayOpacity - 0.6f) < 0.001f, "concourse clear: the share over the threshold while fading in turns it round from the current opacity");
-            o = stepAt(inAt + 360 + 120, 0.35f, 16, 22.0f);
+            // Coming back during the fade turns it round from the current opacity.
+            o = stepAt(m, inAt + 360, 0.35f);
+            check(o.phase == CP::kFadingOut && std::fabs(o.bayOpacity - 0.6f) < 0.001f, "concourse clear: the share over the enter share while fading in turns it round from the current opacity");
+            o = stepAt(m, inAt + 360 + 120, 0.35f);
             check(o.phase == CP::kFadingOut && std::fabs(o.bayOpacity - 0.4f) < 0.001f, "concourse clear: fading out again at the same rate (0.2 in 120 ms)");
-            o = stepAt(inAt + 360 + 600, 0.35f, 17, 22.0f);
+            o = stepAt(m, inAt + 360 + 600, 0.35f);
             check(o.phase == CP::kClear && o.bayOpacity == 0.0f, "concourse clear: it reaches clear again");
-            // Out of the room again and fade in to the end.
-            o = stepAt(inAt + 1000, 0.0f, 18, 40.0f);
-            check(o.phase == CP::kFadingIn, "concourse clear: far enough from the latch, fading in again");
-            o = stepAt(inAt + 1000 + 599, 0.0f, 19, 40.0f);
+            // The fade in runs to the end: the mirror phase returns with the cull on.
+            const uint64_t e0 = inAt + 2000;
+            stepAt(m, e0, 0.05f);
+            o = stepAt(m, e0 + 250, 0.05f);
+            check(o.phase == CP::kFadingIn, "concourse clear: (setup) fading in again");
+            o = stepAt(m, e0 + 250 + 599, 0.05f);
             check(o.phase == CP::kFadingIn && o.bayOpacity < 1.0f, "concourse clear: not yet opaque at 599 ms");
-            o = stepAt(inAt + 1000 + 600, 0.0f, 20, 40.0f);
+            o = stepAt(m, e0 + 250 + 600, 0.05f);
             check(o.phase == CP::kMirror && o.cullOn && o.bayOpacity == 1.0f, "concourse clear: at opacity 1 the mirror phase returns with the cull on");
+            // The bay out of view during the fade in: straight to the mirror phase.
+            {
+                cc::ClearMachine f;
+                uint64_t t = toClear(f, 20000);
+                check(t != 0, "concourse clear: (setup) clear");
+                stepAt(f, t + 100, 0.05f);
+                o = stepAt(f, t + 350, 0.05f);
+                check(o.phase == CP::kFadingIn, "concourse clear: (setup) fading in with the bay visible");
+                o = stepAt(f, t + 400, 0.005f);
+                check(o.phase == CP::kMirror && o.cullOn && o.bayOpacity == 1.0f, "concourse clear: the bay going out of view during the fade in jumps to the mirror phase");
+            }
+            // A sustained dip with the bay out of view: straight to the mirror phase, no fade.
+            {
+                cc::ClearMachine f;
+                uint64_t t = toClear(f, 30000);
+                stepAt(f, t + 100, 0.0f);
+                o = stepAt(f, t + 349, 0.0f);
+                check(o.phase == CP::kClear, "concourse clear: (setup) still clear at 249 ms");
+                o = stepAt(f, t + 350, 0.0f);
+                check(o.phase == CP::kMirror && o.cullOn && o.bayOpacity == 1.0f, "concourse clear: a dip held for 250 ms with the bay out of view goes straight to the mirror phase, the cull on");
+                o = stepAt(f, t + 400, 0.30f);
+                check(o.phase == CP::kMirror, "concourse clear: (setup) hits were cleared on the way back, one reading is not enough");
+            }
+            // A negative share (no reading, no family draw on screen) counts as below.
+            {
+                cc::ClearMachine f;
+                uint64_t t = toClear(f, 40000);
+                stepAt(f, t + 100, -1.0f);
+                o = stepAt(f, t + 350, -1.0f);
+                check(o.phase == CP::kMirror && o.cullOn, "concourse clear: a negative share counts as below, and as out of view");
+            }
+            // Below during lifting returns to the mirror phase at once (the opacity is still 1), seen or not.
+            {
+                cc::ClearMachine f;
+                stepAt(f, 50000, 0.30f);
+                o = stepAt(f, 50016, 0.30f);
+                check(o.phase == CP::kLifting, "concourse clear: (setup) lifting");
+                stepAt(f, 50020, 0.05f);
+                o = stepAt(f, 50270, 0.05f);
+                check(o.phase == CP::kMirror && o.cullOn && o.bayOpacity == 1.0f, "concourse clear: below the exit share for 250 ms during lifting returns to the mirror phase, the bay still visible");
+            }
+            // Below during the fade out (bay still on screen): fades back in from the current opacity.
+            {
+                cc::ClearMachine f;
+                stepAt(f, 60000, 0.30f);
+                stepAt(f, 60016, 0.30f);
+                stepAt(f, 60016 + 150, 0.30f);
+                stepAt(f, 60016 + 150 + 200, 0.30f);   // opacity about 0.67
+                stepAt(f, 60016 + 150 + 200 + 10, 0.05f);
+                o = stepAt(f, 60016 + 150 + 200 + 260, 0.05f);
+                check(o.phase == CP::kFadingIn && o.bayOpacity > 0.3f && o.bayOpacity < 0.7f && !o.cullOn, "concourse clear: below for 250 ms during the fade out fades back in from where it had got to");
+            }
             // The gate dropping resets.
-            o = stepAt(inAt + 3000, 0.9f, 21, 40.0f);
-            o = stepAt(inAt + 3016, 0.9f, 22, 40.0f);
+            cc::ClearMachine g;
+            stepAt(g, 70000, 0.9f);
+            o = stepAt(g, 70016, 0.9f);
             check(o.phase == CP::kLifting, "concourse clear: (setup) lifting again");
             in.gate = false;
-            o = stepAt(inAt + 3032, 0.9f, 23, 40.0f);
-            check(o.phase == CP::kMirror && o.cullOn && o.bayOpacity == 1.0f && m.phase() == CP::kMirror, "concourse clear: no gate resets to the mirror phase, opacity 1");
+            o = stepAt(g, 70032, 0.9f);
+            check(o.phase == CP::kMirror && o.cullOn && o.bayOpacity == 1.0f && g.phase() == CP::kMirror, "concourse clear: no gate resets to the mirror phase, opacity 1");
             in.gate = true;
-            // enterShare 0 never clears.
+            // enterShare 0 never clears, and releases a clear one.
             cc::ClearMachine z;
             in.enterShare = 0.0f;
             bool never = true;
-            for (uint32_t i = 0; i < 10; ++i) {
-                in.nowMs = 5000 + i * 16;
-                in.bayShare = 1.0f;
-                in.shareSeq = 100 + i;
-                never = never && z.step(in).phase == CP::kMirror;
-            }
+            for (uint32_t i = 0; i < 10; ++i) never = never && stepAt(z, 5000 + i * 16, 1.0f).phase == CP::kMirror;
             check(never, "concourse clear: diag.concourse_clear_share 0 never clears");
+            in.enterShare = 0.20f;
+            cc::ClearMachine rel;
+            const uint64_t rt = toClear(rel, 80000);
+            in.enterShare = 0.0f;
+            stepAt(rel, rt + 100, -1.0f);
+            o = stepAt(rel, rt + 350, -1.0f);
+            check(o.phase == CP::kMirror && o.cullOn, "concourse clear: enter share 0 releases a clear machine");
+            in.enterShare = 0.20f;
             // No reading (negative) is not a hit.
             cc::ClearMachine q;
-            in.enterShare = 0.2f;
             bool noRead = true;
-            for (uint32_t i = 0; i < 10; ++i) {
-                in.nowMs = 9000 + i * 16;
-                in.bayShare = -1.0f;
-                in.shareSeq = 200 + i;
-                noRead = noRead && q.step(in).phase == CP::kMirror;
-            }
+            for (uint32_t i = 0; i < 10; ++i) noRead = noRead && stepAt(q, 9000 + i * 16, -1.0f).phase == CP::kMirror;
             check(noRead, "concourse clear: no reading never starts it");
+            // Entering at the threshold itself.
+            cc::ClearMachine th;
+            stepAt(th, 90000, 0.20f);
+            o = stepAt(th, 90016, 0.20f);
+            check(o.phase == CP::kLifting, "concourse clear: two readings at exactly the enter share start it");
             check(std::strcmp(cc::clearPhaseName(CP::kFadingOut), "fading-out") == 0 && std::strcmp(cc::clearPhaseName(CP::kMirror), "mirror") == 0 &&
-                      cc::kClearExitMetres == 10.0 && cc::kClearLiftMs == 150 && cc::kClearFadeMs == 600,
-                  "concourse clear: the phase names and the constants (10 m, 150 ms, 600 ms)");
+                      cc::kClearLiftMs == 150 && cc::kClearFadeMs == 600 && cc::kClearReleaseMs == 250 && cc::kClearExitRatio == 0.4f && cc::kClearUnseenShare == 0.01f,
+                  "concourse clear: the phase names and the constants (150 ms, 600 ms, 250 ms, 0.4, 0.01)");
+        }
+
+        // The withheld outside draws: named by shader, found by a bloom and a scan.
+        {
+            static_assert(cc::kWithheldPs[0].hash == cc::kPlumePs && cc::kWithheldPs[1].hash == cc::kTwinPs, "the plume pair leads the list");
+            check(cc::kWithheldPsCount == 14 && cc::kWithheldVsCount == 10, "concourse withheld: 14 pixel shaders and 10 vertex shaders");
+            check(!cc::withheldHasDuplicate(cc::kWithheldPs, cc::kWithheldPsCount) && !cc::withheldHasDuplicate(cc::kWithheldVs, cc::kWithheldVsCount),
+                  "concourse withheld: no list holds a hash twice");
+            const cc::WithheldFamily dup[] = {{1, "a"}, {2, "b"}, {1, "c"}};
+            check(cc::withheldHasDuplicate(dup, 3), "concourse withheld: the duplicate check finds a duplicate");
+            bool psFound = true, vsFound = true, names = true;
+            for (size_t i = 0; i < cc::kWithheldPsCount; ++i) {
+                psFound = psFound && cc::withheldPsIndex(cc::kWithheldPs[i].hash) == static_cast<int>(i);
+                names = names && cc::kWithheldPs[i].name && *cc::kWithheldPs[i].name;
+            }
+            for (size_t i = 0; i < cc::kWithheldVsCount; ++i) {
+                vsFound = vsFound && cc::withheldVsIndex(cc::kWithheldVs[i].hash) == static_cast<int>(i);
+                names = names && cc::kWithheldVs[i].name && *cc::kWithheldVs[i].name;
+            }
+            check(psFound && vsFound && names, "concourse withheld: every listed hash is found at its own index, and has a name");
+            // Near misses: one bit off, same low six bits, and the hashes that must not be withheld.
+            bool missed = true;
+            for (size_t i = 0; i < cc::kWithheldPsCount; ++i) {
+                const uint64_t h = cc::kWithheldPs[i].hash;
+                missed = missed && cc::withheldPsIndex(h ^ 0x100ull) == -1 && cc::withheldPsIndex(h ^ 1ull) == -1 && cc::withheldPsIndex(h + (1ull << 40)) == -1;
+            }
+            for (size_t i = 0; i < cc::kWithheldVsCount; ++i) {
+                const uint64_t h = cc::kWithheldVs[i].hash;
+                missed = missed && cc::withheldVsIndex(h ^ 0x100ull) == -1 && cc::withheldVsIndex(h ^ 1ull) == -1 && cc::withheldVsIndex(h + (1ull << 40)) == -1;
+            }
+            check(missed, "concourse withheld: near-miss hashes are not found");
+            check(cc::withheldPsIndex(0) == -1 && cc::withheldVsIndex(0) == -1, "concourse withheld: no shader (hash 0) is not found");
+            check(cc::withheldPsIndex(cc::kPaneFamilyPs) == -1 && cc::withheldVsIndex(cc::kPaneFamilyVs) == -1, "concourse withheld: the glass family is not withheld");
+            const uint64_t keep[] = {0x88DCF1164C640EC3ull, 0x494506A6ull, 0x1C506222ull, 0x359BF8FFull, 0xF8FA801Full, 0x68DDDEF0ull, 0xF7A6E916ull, 0xE904D334ull, 0xAFFEF018ull};
+            bool kept = true;
+            for (uint64_t h : keep) kept = kept && cc::withheldPsIndex(h) == -1 && cc::withheldVsIndex(h) == -1;
+            check(kept, "concourse withheld: the player's laser, the room's glows, the sky, the stars and the dust are not withheld");
+            check(cc::withheldPsIndex(0x43E5E6EB67AC751Bull) == 13 && cc::withheldVsIndex(0xACE405F428C17EF6ull) == 5, "concourse withheld: the planet surface (ps) and the terrain patch (vs) are named");
+        }
+
+        // The largest reading wins: one mesh drawn at two places must not flip its side from frame to frame.
+        {
+            cc::PaneSides sd;
+            const cc::PaneKey x{12, 12078150, 0};
+            sd.note(x, 133000, 88000);   // 66% mirrored at the large instance
+            check(sd.side(x) == cc::PaneSide::kExterior, "concourse pane sides: the large instance reads exterior");
+            const auto c1 = sd.note(x, 17000, 5100);   // 30% at the small instance
+            check(c1 == cc::PaneSides::Change::kNone && sd.side(x) == cc::PaneSide::kExterior && sd.exteriorCount() == 1,
+                  "concourse pane sides: the small interior instance does not flip a large exterior one");
+            bool steady = true;
+            for (int i = 0; i < 20; ++i) {
+                sd.note(x, 17000, 5100);
+                sd.note(x, 133000, 88000);
+                steady = steady && sd.side(x) == cc::PaneSide::kExterior;
+            }
+            check(steady, "concourse pane sides: alternating small and large readings never flip it");
+            const auto c2 = sd.note(x, 66500, 5000);   // exactly half of the largest: counts
+            check(c2 == cc::PaneSides::Change::kChanged && sd.side(x) == cc::PaneSide::kInterior, "concourse pane sides: a reading at half the largest can still change the side");
+            sd.note(x, 140000, 130000);
+            check(sd.side(x) == cc::PaneSide::kExterior, "concourse pane sides: a larger reading changes it, and becomes the new largest");
+            sd.note(x, 69000, 100);
+            check(sd.side(x) == cc::PaneSide::kExterior, "concourse pane sides: the largest only grows (69000 is under half of 140000)");
+            sd.reset();
+            sd.note(x, 17000, 5100);
+            check(sd.side(x) == cc::PaneSide::kInterior, "concourse pane sides: reset forgets the largest reading");
         }
     }
 

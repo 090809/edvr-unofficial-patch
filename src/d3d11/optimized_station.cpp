@@ -3135,7 +3135,7 @@ void concourseFrameTrace(uint64_t now) {
                     static_cast<unsigned>(aw.source), static_cast<unsigned>(osrc), hub);
 }
 
-// The camera in the anchor record's frame (the frame trace's coordinates), for the clearing machine and its log lines. False when it cannot be read now.
+// The camera in the anchor record's frame (the frame trace's coordinates), for the log lines. False when it cannot be read now.
 bool concourseCamLocal(float out[3]) {
     if (!g_frameCamValid) return false;
     const uintptr_t anchor = g_concAnchorAddr.load(std::memory_order_relaxed);
@@ -3161,18 +3161,11 @@ cc::ClearOutput concourseClearStep(uint64_t now, bool wantCull, bool gateWanted,
     in.bayShare = sh.valid ? sh.bay : -1.0f;
     in.shareSeq = sh.seq;
     in.enterShare = g_concEnterShare;
-    const bool bayOver = g_concEnterShare > 0.0f && sh.valid && sh.bay >= g_concEnterShare;
-    const bool needCam = wantCull && (g_concClear.phase() != cc::ClearPhase::kMirror || bayOver);
-    float local[3] = {};
-    bool camOk = false;
-    if (needCam) camOk = concourseCamLocal(local);
-    in.cameraValid = camOk;
-    if (camOk)
-        for (int k = 0; k < 3; ++k) in.cam[k] = local[k];
     const cc::ClearPhase before = g_concClear.phase();
     const cc::ClearOutput out = g_concClear.step(in);
     if (out.phase != before) {
-        if (!camOk) camOk = concourseCamLocal(local);
+        float local[3] = {};
+        const bool camOk = concourseCamLocal(local);   // for the log line only: the machine follows the bay's share of the view, not the camera
         char pane[48] = {};
         if (sh.valid) std::snprintf(pane, sizeof(pane), "%.1f%%", 100.0 * static_cast<double>(sh.bay));
         else std::snprintf(pane, sizeof(pane), "unread");
@@ -3246,7 +3239,7 @@ void concourseTick(uint64_t now, uint32_t frame) {
         if (active) {
             bumpRigEpoch();   // the rigs are judged afresh: every slot and publication of the old epoch forwards
             g_concActive.store(true, std::memory_order_release);
-            // The names first, at a gate or key rising edge only (a re-engage from the clearing latch does not rerun them). No rig has been vetoed yet, so the
+            // The names first, at a gate or key rising edge only (a return from the clearing, which now follows the bay in view and happens each time you turn round, does not rerun them). No rig has been vetoed yet, so the
             // survey's forwarding shows nothing that was not already on screen.
             if (!g_concWasWant) g_concSurveyDueMs = now;
             g_concSumMs = now;
@@ -3326,7 +3319,7 @@ void concourseTick(uint64_t now, uint32_t frame) {
             for (int k = 0; k < 3; ++k) g_concSumCalls[k] = calls[k];
             g_concSumFrames = 0;
             Log::get().note("concourse cull 5s: rigs seen %u vetoed %u, producer vetoed %u kept %u (name %u, small-close %u, unreadable-name %u, unreadable-sphere %u), "
-                            "store cleared %u, callback cost %.3f ms/frame, panes treated %u draws (mode %s, %u slots), plumes withheld %u, phase %s, "
+                            "store cleared %u, callback cost %.3f ms/frame, panes treated %u draws (mode %s, %u slots), outside draws withheld %u, phase %s, "
                             "mark passes %u (refused %u), panes known %u exterior %u (dropped %u), tests %u",
                             static_cast<unsigned>(g_concWin.rigSeen.exchange(0)), static_cast<unsigned>(g_concWin.rigVetoed.exchange(0)),
                             static_cast<unsigned>(g_concWin.prodVetoed.exchange(0)), static_cast<unsigned>(g_concWin.prodKept.exchange(0)),
@@ -3337,7 +3330,7 @@ void concourseTick(uint64_t now, uint32_t frame) {
                             static_cast<unsigned>(mir.markPasses), static_cast<unsigned>(mir.markRefused), static_cast<unsigned>(mir.known),
                             static_cast<unsigned>(mir.exterior), static_cast<unsigned>(mir.dropped), static_cast<unsigned>(mir.tests));
         } else if (concoursePaneTreating()) {
-            Log::get().note("concourse pane 5s: treated %u draws (mode %s, %u slots), plumes withheld %u, phase %s, mark passes %u (refused %u), panes known %u exterior %u "
+            Log::get().note("concourse pane 5s: treated %u draws (mode %s, %u slots), outside draws withheld %u, phase %s, mark passes %u (refused %u), panes known %u exterior %u "
                             "(dropped %u), tests %u",
                             static_cast<unsigned>(treated), concoursePaneModeName(), static_cast<unsigned>(concoursePaneSlotCount()), static_cast<unsigned>(withheld),
                             cc::clearPhaseName(clr.phase), static_cast<unsigned>(mir.markPasses), static_cast<unsigned>(mir.markRefused), static_cast<unsigned>(mir.known),

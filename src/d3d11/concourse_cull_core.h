@@ -7,7 +7,8 @@
 //   concourseJudge           one record: keep (and why) or cull
 //   concourseRigVetoed       one rig: vetoed only when a record of it was judged and none was kept
 //   PaneTriple, paneTripleMatch, parsePaneList   a glass pane named by its vertex shader, pixel shader and index count (0: any count)
-//   kPaneFamilyVs, kPaneFamilyPs, kPlumePs, kTwinPs, kBayIndexCount   the glass family, the draws withheld, the bay window's index count
+//   kPaneFamilyVs, kPaneFamilyPs, kPlumePs, kTwinPs, kBayIndexCount   the glass family, the plume pair, the bay window's index count
+//   kWithheldPs, kWithheldVs, withheldPsIndex, withheldVsIndex   the outside draws not issued while the cull is on, named by shader
 //   fillPaneT8, fillPaneT9, fillPaneT10   the texels of the mirror materials (uniform)
 //   markDepthForDistance, PaneSides, paneTestThisFrame   the mirror's mark depth, and each pane's side (interior or exterior) learned from two occlusion counts
 //   ClearMachine   the bay glass's clearing on approach: a pure state machine
@@ -114,6 +115,72 @@ constexpr uint32_t kBayIndexCount = 36;
 // shader at draw time, so the vertex shader is not a stable name).
 constexpr uint64_t kPlumePs = 0x3B0B38CD96F53BC1ull;
 constexpr uint64_t kTwinPs = 0x34A1475B2C790DFAull;
+
+// ---- The draws withheld while the cull is on: what is outside the room (smoke, volumetrics, ship lasers, engine trails, the planet) --------------------
+// Named by pixel shader hash or vertex shader hash (a draw with either is not issued). A terrain patch has no pixel shader, so it is named by its vertex
+// shader. Not here, on purpose: the player's first-person laser (0x88DCF1164C640EC3 / 494506A6), the room's glows (1C506222, 359BF8FF), the sky (F8FA801F),
+// the stars (68DDDEF0, F7A6E916), the dust (E904D334), AFFEF018.
+struct WithheldFamily {
+    uint64_t hash;
+    const char* name;
+};
+constexpr WithheldFamily kWithheldPs[] = {
+    {0x3B0B38CD96F53BC1ull, "plume"},
+    {0x34A1475B2C790DFAull, "plume twin"},
+    {0x42AC0CACC9CDF72Bull, "trail ribbon"},
+    {0xEEAAC839A9F09448ull, "trail volume"},
+    {0x6FD4C38BA927C8C7ull, "trail haze"},
+    {0xA75C1DB6562B8CA7ull, "beams and bolts"},
+    {0xC5DF9CC943476289ull, "multicannon rounds"},
+    {0xC49F999F7D3C801Dull, "shield strike"},
+    {0xBD801F2FB02522EBull, "smoke"},
+    {0x6EF82262EB12A037ull, "atmosphere"},
+    {0x5BCB6B95BE7C0700ull, "atmosphere quad A"},
+    {0x97DBC87FCAA429C4ull, "atmosphere quad B"},
+    {0xD56F859BE4781431ull, "flares"},
+    {0x43E5E6EB67AC751Bull, "planet surface"},
+};
+constexpr WithheldFamily kWithheldVs[] = {
+    {0x72BDD292154158ADull, "body surface"},
+    {0x26FC402B1274EE7Bull, "planetary pipeline"},
+    {0x9FFA5D5E79F04873ull, "planetary 2"},
+    {0x3530A6FD15EDE145ull, "planetary 3"},
+    {0x71DD9863DCFC0986ull, "planet surface vs"},
+    {0xACE405F428C17EF6ull, "terrain patch"},
+    {0x19F70CE80DA3242Bull, "body sphere"},
+    {0xC7FA0C0F5DD49180ull, "beside the bodies"},
+    {0x8BD7C37ABCEE7E45ull, "sun"},
+    {0x1F3AD1584D7FA3C8ull, "sun arcs"},
+};
+constexpr size_t kWithheldPsCount = sizeof(kWithheldPs) / sizeof(kWithheldPs[0]);
+constexpr size_t kWithheldVsCount = sizeof(kWithheldVs) / sizeof(kWithheldVs[0]);
+
+// A 64-bit bloom on (hash & 63): a draw whose bit is clear is in no list, with no scan.
+constexpr uint64_t withheldBloom(const WithheldFamily* list, size_t n) noexcept {
+    uint64_t b = 0;
+    for (size_t i = 0; i < n; ++i) b |= uint64_t(1) << (list[i].hash & 63u);
+    return b;
+}
+constexpr uint64_t kWithheldPsBloom = withheldBloom(kWithheldPs, kWithheldPsCount);
+constexpr uint64_t kWithheldVsBloom = withheldBloom(kWithheldVs, kWithheldVsCount);
+
+// The index of `hash` in the list, or -1. A zero hash (no shader) is never in a list.
+inline int withheldIndex(const WithheldFamily* list, size_t n, uint64_t bloom, uint64_t hash) noexcept {
+    if (hash == 0 || (bloom & (uint64_t(1) << (hash & 63u))) == 0) return -1;
+    for (size_t i = 0; i < n; ++i)
+        if (list[i].hash == hash) return static_cast<int>(i);
+    return -1;
+}
+inline int withheldPsIndex(uint64_t hash) noexcept { return withheldIndex(kWithheldPs, kWithheldPsCount, kWithheldPsBloom, hash); }
+inline int withheldVsIndex(uint64_t hash) noexcept { return withheldIndex(kWithheldVs, kWithheldVsCount, kWithheldVsBloom, hash); }
+
+// True when a list holds the same hash twice (the tests fail on it).
+constexpr bool withheldHasDuplicate(const WithheldFamily* list, size_t n) noexcept {
+    for (size_t i = 0; i < n; ++i)
+        for (size_t k = i + 1; k < n; ++k)
+            if (list[i].hash == list[k].hash) return true;
+    return false;
+}
 
 // An entry whose n is 0 matches any index count.
 inline bool paneEntryMatches(const PaneTriple& e, uint64_t vs, uint64_t ps, uint32_t n) noexcept {
@@ -299,6 +366,11 @@ public:
         if (drawn < kPaneTestMinSamples) return Change::kNone;
         const PaneSide now = static_cast<double>(mirrored) >= kPaneExteriorRatio * static_cast<double>(drawn) ? PaneSide::kExterior : PaneSide::kInterior;
         int i = find(k);
+        if (i >= 0) {
+            // One mesh drawn at two places gives two readings of very different size: only a reading at least half the largest seen can change the side.
+            if (drawn > maxDrawn_[i]) maxDrawn_[i] = drawn;
+            if (drawn * 2 < maxDrawn_[i]) return Change::kNone;
+        }
         if (i < 0) {
             if (count_ >= kPaneSideCap) {
                 ++dropped_;
@@ -307,6 +379,7 @@ public:
             i = static_cast<int>(count_++);
             keys_[i] = k;
             sides_[i] = now;
+            maxDrawn_[i] = drawn;
             if (now == PaneSide::kExterior) ++exterior_;
             return Change::kFirst;
         }
@@ -320,6 +393,7 @@ public:
         count_ = 0;
         exterior_ = 0;
         dropped_ = 0;
+        for (auto& m : maxDrawn_) m = 0;
     }
     uint32_t exteriorCount() const noexcept { return exterior_; }
     uint32_t knownCount() const noexcept { return count_; }
@@ -333,13 +407,16 @@ private:
     }
     PaneKey keys_[kPaneSideCap];
     PaneSide sides_[kPaneSideCap] = {};
+    uint64_t maxDrawn_[kPaneSideCap] = {};
     uint32_t count_ = 0, exterior_ = 0, dropped_ = 0;
 };
 
-// ---- The bay glass's clearing on approach --------------------------------------------------------------------------------------------------------
+// ---- The bay glass's clearing, following the bay in view ------------------------------------------------------------------------------------------
 // Mirror (the glass stands in, the cull is on) -> Lifting (the cull is off, the glass still opaque, so the station is back before it opens) -> FadingOut ->
-// Clear -> (the camera is exitMetres from where the glass was left) FadingIn -> Mirror. A reading of the bay glass's share of the view at or over enterShare,
-// twice in a row in Mirror, starts it; in Clear it holds the latch to the camera; in FadingIn it turns the fade round.
+// Clear. A reading of the bay glass's share of the view at or over enterShare, twice in a row in Mirror, starts it. In Lifting, FadingOut and Clear the share
+// below enterShare * kClearExitRatio for releaseMs running releases it: with the bay out of view (share at most kClearUnseenShare, or no reading) straight back
+// to Mirror, else FadingIn, which returns to Mirror when it is done, turns round to FadingOut if the share is over enterShare again, and jumps to Mirror
+// if the bay goes out of view.
 enum class ClearPhase : uint8_t { kMirror, kLifting, kFadingOut, kClear, kFadingIn };
 
 inline const char* clearPhaseName(ClearPhase p) noexcept {
@@ -352,7 +429,9 @@ inline const char* clearPhaseName(ClearPhase p) noexcept {
     }
 }
 
-constexpr double kClearExitMetres = 10.0;
+constexpr float kClearExitRatio = 0.4f;     // the exit share is enterShare * this (20% in, 8% out)
+constexpr uint64_t kClearReleaseMs = 250;   // the share must stay below the exit share this long
+constexpr float kClearUnseenShare = 0.01f;  // at or under this (or no reading) the bay is out of view
 constexpr uint64_t kClearLiftMs = 150;
 constexpr uint64_t kClearFadeMs = 600;
 constexpr uint32_t kClearReadingsToEnter = 2;
@@ -362,12 +441,10 @@ struct ClearInput {
     bool gate = false;        // the cull is wanted: key on, on foot in social space, the anchor seen, not sealed
     float bayShare = -1.0f;   // the latest completed frame's share of the view (0 to 1); negative when there is no reading
     uint32_t shareSeq = 0;    // moves with each new reading: one frame read on two ticks is one reading
-    bool cameraValid = false;
-    float cam[3] = {};
     float enterShare = 0.0f;   // 0 never clears
-    double exitMetres = kClearExitMetres;
     uint64_t liftMs = kClearLiftMs;
     uint64_t fadeMs = kClearFadeMs;
+    uint64_t releaseMs = kClearReleaseMs;
 };
 struct ClearOutput {
     bool cullOn = true;
@@ -384,6 +461,7 @@ public:
         opacity_ = 1.0f;
         hits_ = 0;
         seqSeen_ = false;
+        holding_ = false;
     }
     ClearOutput step(const ClearInput& in) noexcept {
         if (!in.gate) {
@@ -394,52 +472,51 @@ public:
         seqSeen_ = true;
         lastSeq_ = in.shareSeq;
         const bool over = in.enterShare > 0.0f && in.bayShare >= 0.0f && in.bayShare >= in.enterShare;
+        const bool below = in.enterShare <= 0.0f || in.bayShare < in.enterShare * kClearExitRatio;   // a negative share (no reading) is below
+        const bool unseen = in.bayShare <= kClearUnseenShare;                                         // negative included
         switch (phase_) {
             case ClearPhase::kMirror:
                 opacity_ = 1.0f;
                 if (fresh) hits_ = over ? hits_ + 1 : 0;
-                if (in.enterShare > 0.0f && hits_ >= kClearReadingsToEnter && in.cameraValid) {
-                    latch(in);
-                    enter(ClearPhase::kLifting, in.nowMs);
-                }
+                if (in.enterShare > 0.0f && hits_ >= kClearReadingsToEnter) enter(ClearPhase::kLifting, in.nowMs);
                 break;
             case ClearPhase::kLifting:
-                opacity_ = 1.0f;
-                if (in.nowMs - startMs_ >= in.liftMs) {
-                    fromOpacity_ = 1.0f;
-                    enter(ClearPhase::kFadingOut, in.nowMs);
-                }
-                break;
             case ClearPhase::kFadingOut:
-                opacity_ = fromOpacity_ - fadeFraction(in);
-                if (opacity_ <= 0.0f) {
-                    opacity_ = 0.0f;
-                    enter(ClearPhase::kClear, in.nowMs);
-                }
-                break;
             case ClearPhase::kClear:
-                opacity_ = 0.0f;
-                if (over && in.cameraValid) {
-                    latch(in);
-                } else if (in.cameraValid && distanceFromLatch(in) >= in.exitMetres) {
-                    fromOpacity_ = 0.0f;
-                    enter(ClearPhase::kFadingIn, in.nowMs);
+                if (released(below, in)) {
+                    if (unseen || phase_ == ClearPhase::kLifting) {
+                        toMirror(in.nowMs);
+                    } else {
+                        fromOpacity_ = opacity_;
+                        enter(ClearPhase::kFadingIn, in.nowMs);
+                    }
+                    break;
+                }
+                if (phase_ == ClearPhase::kLifting) {
+                    opacity_ = 1.0f;
+                    if (in.nowMs - startMs_ >= in.liftMs) {
+                        fromOpacity_ = 1.0f;
+                        enter(ClearPhase::kFadingOut, in.nowMs);
+                    }
+                } else if (phase_ == ClearPhase::kFadingOut) {
+                    opacity_ = fromOpacity_ - fadeFraction(in);
+                    if (opacity_ <= 0.0f) {
+                        opacity_ = 0.0f;
+                        enter(ClearPhase::kClear, in.nowMs);
+                    }
+                } else {
+                    opacity_ = 0.0f;
                 }
                 break;
             case ClearPhase::kFadingIn:
                 opacity_ = fromOpacity_ + fadeFraction(in);
                 if (opacity_ > 1.0f) opacity_ = 1.0f;
-                if (over) {   // turned round: fading out from where the fade had got to, and the latch is where the view is
+                if (over) {   // turned round: fading out from where the fade had got to
                     fromOpacity_ = opacity_;
-                    if (in.cameraValid) latch(in);
                     enter(ClearPhase::kFadingOut, in.nowMs);
                     break;
                 }
-                if (opacity_ >= 1.0f) {
-                    opacity_ = 1.0f;
-                    hits_ = 0;
-                    enter(ClearPhase::kMirror, in.nowMs);
-                }
+                if (unseen || opacity_ >= 1.0f) toMirror(in.nowMs);   // done, or the bay went out of view: the cull returns now
                 break;
         }
         return out();
@@ -456,17 +533,24 @@ private:
     void enter(ClearPhase p, uint64_t now) noexcept {
         phase_ = p;
         startMs_ = now;
+        if (p != ClearPhase::kFadingOut && p != ClearPhase::kClear) holding_ = false;   // a hold carries on from Lifting to FadingOut to Clear
     }
-    void latch(const ClearInput& in) noexcept {
-        for (int k = 0; k < 3; ++k) latch_[k] = in.cam[k];
+    void toMirror(uint64_t now) noexcept {
+        opacity_ = 1.0f;
+        hits_ = 0;
+        enter(ClearPhase::kMirror, now);
     }
-    double distanceFromLatch(const ClearInput& in) const noexcept {
-        double s = 0.0;
-        for (int k = 0; k < 3; ++k) {
-            const double d = static_cast<double>(in.cam[k]) - static_cast<double>(latch_[k]);
-            s += d * d;
+    // The release hold: `below` held continuously for releaseMs. A reading at or over the exit share cancels it.
+    bool released(bool below, const ClearInput& in) noexcept {
+        if (!below) {
+            holding_ = false;
+            return false;
         }
-        return std::sqrt(s);
+        if (!holding_) {
+            holding_ = true;
+            holdStart_ = in.nowMs;
+        }
+        return in.nowMs - holdStart_ >= in.releaseMs;
     }
     // The elapsed part of one full fade: the rate is one unit of opacity per fadeMs, so a fade turned round part-way takes only the time it needs.
     float fadeFraction(const ClearInput& in) const noexcept {
@@ -481,7 +565,8 @@ private:
     uint32_t lastSeq_ = 0;
     bool seqSeen_ = false;
     uint64_t startMs_ = 0;
-    float latch_[3] = {};
+    bool holding_ = false;
+    uint64_t holdStart_ = 0;
 };
 
 }  // namespace edvr::concourse

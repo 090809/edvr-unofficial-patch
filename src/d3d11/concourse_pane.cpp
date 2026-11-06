@@ -68,12 +68,16 @@ std::atomic<uint32_t> g_listN{1};
 std::atomic<bool> g_feedMeasure{false}, g_feedTreat{false}, g_feedWithhold{false};
 std::atomic<float> g_bayOpacity{1.0f};
 std::atomic<bool> g_treatNow{false};      // treat fed, a mode other than off, and the replacement states made
-std::atomic<bool> g_withholdNow{false};   // withhold fed and a mode other than off
+std::atomic<bool> g_withholdNow{false};   // withhold fed (the cull is on): outside draws are not issued, whatever the mode; the mirror itself needs a mode other than off
 std::atomic<bool> g_shareOn{false};       // measure fed and the query pool made
 std::atomic<ID3D11DeviceContext*> g_immediate{nullptr};   // not held: the device's immediate context, the one the binding shadow follows
 std::atomic<bool> g_capturing{false};     // a capture frame is open
 std::atomic<uint64_t> g_treated{0};
 std::atomic<uint64_t> g_withheld{0};
+// One counter per withheld family (the pixel shader list, then the vertex shader list), read and cleared every 30 s.
+constexpr size_t kWithheldFamilies = cc::kWithheldPsCount + cc::kWithheldVsCount;
+std::atomic<uint64_t> g_withheldFam[kWithheldFamilies] = {};
+uint64_t g_withheldLogMs = 0;
 std::atomic<uint32_t> g_frameNow{0};
 std::atomic<uint32_t> g_hashEpoch{1};
 
@@ -1269,16 +1273,26 @@ void ConcoursePaneScope::begin(ID3D11DeviceContext* ctx, UINT indexCount, UINT s
         }
         return;
     }
-    // Every draw of the frame passes here while the gate holds. The shadow answers without a COM call on the context it follows; 0 (no pixel shader, or never
-    // set) falls back to the context.
-    uint64_t ps = ctx == g_immediate.load(std::memory_order_relaxed) ? bindingShaderHash(BindSlot::Ps) : 0;
-    if (!ps) ps = pixelShaderHash(ctx);
-    if (!ps) return;
-    if (g_withholdNow.load(std::memory_order_relaxed) && (ps == cc::kPlumePs || ps == cc::kTwinPs)) {
-        withheld_ = true;
-        g_withheld.fetch_add(1, std::memory_order_relaxed);
-        return;
+    // Every draw of the frame passes here while the gate holds. On the immediate context (the one the binding shadow follows) the shadow answers with no COM
+    // call: 0 is no pixel shader (a depth-only draw), and the draw has none to name. Any other context asks the context for its pixel shader.
+    const bool followed = ctx == g_immediate.load(std::memory_order_relaxed);
+    const uint64_t ps = followed ? bindingShaderHash(BindSlot::Ps) : pixelShaderHash(ctx);
+    if (g_withholdNow.load(std::memory_order_relaxed)) {
+        // The outside (smoke, trails, ship lasers, the planet) is not issued while the cull is on. By pixel shader on any context; by vertex shader too on the
+        // immediate one, because a terrain patch has no pixel shader. Checked before `if (!ps) return`.
+        int fam = cc::withheldPsIndex(ps);
+        if (fam < 0 && followed) {
+            const int v = cc::withheldVsIndex(bindingShaderHash(BindSlot::Vs));
+            if (v >= 0) fam = static_cast<int>(cc::kWithheldPsCount) + v;
+        }
+        if (fam >= 0) {
+            withheld_ = true;
+            g_withheld.fetch_add(1, std::memory_order_relaxed);
+            g_withheldFam[fam].fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
     }
+    if (!ps) return;
     const uint32_t listN = std::min<uint32_t>(g_listN.load(std::memory_order_acquire), static_cast<uint32_t>(cc::kPaneListCap));
     bool listed = false;
     for (uint32_t i = 0; i < listN; ++i)
@@ -1646,7 +1660,7 @@ void pollConfig(uint64_t nowMs) {
 void updateArmed() noexcept {
     const uint32_t mode = g_mode.load(std::memory_order_relaxed);
     const bool treat = g_feedTreat.load(std::memory_order_relaxed) && mode != kModeOff && g_statesReady.load(std::memory_order_acquire);
-    const bool withhold = g_feedWithhold.load(std::memory_order_relaxed) && mode != kModeOff;
+    const bool withhold = g_feedWithhold.load(std::memory_order_relaxed);   // whatever the mode: F4 at off shows what the cull leaves
     const bool shares = g_feedMeasure.load(std::memory_order_relaxed) && g_shareOn.load(std::memory_order_relaxed);
     g_treatNow.store(treat, std::memory_order_release);
     g_withholdNow.store(withhold, std::memory_order_release);
@@ -1656,6 +1670,26 @@ void updateArmed() noexcept {
 }  // namespace
 
 uint64_t concoursePaneTakeTreated() noexcept { return g_treated.exchange(0, std::memory_order_relaxed); }
+namespace {
+// Every 30 s, while any family was withheld: one line naming the families that were (a family that never matched is absent).
+void logWithheld(uint64_t nowMs) noexcept {
+    if (nowMs - g_withheldLogMs < 30000) return;
+    g_withheldLogMs = nowMs;
+    char text[900] = {};
+    size_t used = 0;
+    bool any = false;
+    for (size_t i = 0; i < kWithheldFamilies; ++i) {
+        const uint64_t n = g_withheldFam[i].exchange(0, std::memory_order_relaxed);
+        if (n == 0) continue;
+        const char* name = i < cc::kWithheldPsCount ? cc::kWithheldPs[i].name : cc::kWithheldVs[i - cc::kWithheldPsCount].name;
+        const int w = std::snprintf(text + used, sizeof(text) - used, "%s%s %llu", any ? ", " : "", name, static_cast<unsigned long long>(n));
+        any = true;
+        if (w > 0 && used + static_cast<size_t>(w) < sizeof(text)) used += static_cast<size_t>(w);
+    }
+    if (any) Log::get().note("concourse withheld 30s: %s", text);
+}
+}  // namespace
+
 uint64_t concoursePaneTakeWithheld() noexcept { return g_withheld.exchange(0, std::memory_order_relaxed); }
 ConcoursePaneMirrorStats concoursePaneTakeMirrorStats() noexcept {
     ConcoursePaneMirrorStats r;
@@ -1688,12 +1722,13 @@ void concoursePaneSetFeed(const ConcoursePaneFeed& feed) noexcept {
 ConcoursePaneShares concoursePaneShares() noexcept {
     std::lock_guard<std::mutex> lock(g_shareMutex);
     ConcoursePaneShares r = g_latest;
-    if (r.valid && GetTickCount64() - g_latestMs > 1000) r = ConcoursePaneShares{};
+    if (r.valid && GetTickCount64() - g_latestMs > 250) r = ConcoursePaneShares{};   // no family draw on screen makes no reading: the bay is out of view, soon
     return r;
 }
 
 void concoursePaneTick(ID3D11Device* device, uint32_t frame, uint64_t nowMs) noexcept {
     g_lastTickMs = nowMs;
+    logWithheld(nowMs);
     if (device != g_device) {
         releaseStates();
         g_poolMade = false;   // the old queries belong to the old device and are left alone

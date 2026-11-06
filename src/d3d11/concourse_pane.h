@@ -1,7 +1,7 @@
 #pragma once
 // The concourse's glass panes (docs\concourse-cull-2026-11-05.md, "The panes"). TEMPORARY. While the concourse cull is wanted (key or override on, on foot, in a
-// station's social space, the anchor seen), the station's glass family is treated, and the draws that come after the panes and paint over them (the plume and
-// its twin) are withheld while the cull is on. The glass family is named by its vertex shader and pixel shader (concourse_cull_core.h, kPaneFamilyVs,
+// station's social space, the anchor seen), the station's glass family is treated, and the outside is not drawn while the cull is on: the plume and its twin, which
+// paint over the panes, and the smoke, ship lasers, engine trails, atmosphere and planet (concourse_cull_core.h, kWithheldPs and kWithheldVs), whatever the mode. The glass family is named by its vertex shader and pixel shader (concourse_cull_core.h, kPaneFamilyVs,
 // kPaneFamilyPs, any index count); diag.concourse_panes adds entries. The game's own glass draw is always issued, unchanged; the treatment is a SECOND draw of
 // the same arguments, right after it, that paints the pane over. The modes (diag.concourse_pane_mode, F4):
 //   mirror       the second draw is the game's shader with three stand-in textures (t8, t9, t10), opaque (RGB only), writing depth
@@ -56,7 +56,7 @@ public:
     ConcoursePaneScope(const ConcoursePaneScope&) = delete;
     ConcoursePaneScope& operator=(const ConcoursePaneScope&) = delete;
 
-    // True for a draw that is not issued (the plume and its twin while the cull is on): the site skips only the real draw call.
+    // True for a draw that is not issued (an outside draw while the cull is on): the site skips only the real draw call.
     bool withheld() const noexcept { return withheld_; }
     // Called right after the game's own draw was issued: true when the site is to issue the same draw again (the mirror), with the replacement state bound. The
     // state is put back when the scope ends. False for every draw that is not a family draw.
@@ -100,14 +100,14 @@ private:
 struct ConcoursePaneFeed {
     bool measure = false;       // the gate holds: family draws are measured
     bool treat = false;         // the cull is wanted: family draws are treated by the mode
-    bool withhold = false;      // the cull is on and the phase is the plain mirror phase: the plume and its twin are not issued, the mirror is marked
+    bool withhold = false;      // the cull is on and the phase is the plain mirror phase: the outside draws are not issued, the mirror is marked
     float bayOpacity = 1.0f;    // the bay window's opacity, 0 to 1
 };
 void concoursePaneSetFeed(const ConcoursePaneFeed& feed) noexcept;
 
 // The latest completed frame's shares of the viewport, per index count (family draws only).
 struct ConcoursePaneShares {
-    bool valid = false;     // a reading from the last second
+    bool valid = false;     // a reading from the last 250 ms
     uint32_t seq = 0;       // moves with each new frame read
     float bay = -1.0f;      // the largest share of a bay-window (36 indices) draw; 0 when none was drawn; negative when not valid
     uint32_t count = 0;

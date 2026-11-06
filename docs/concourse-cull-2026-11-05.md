@@ -2,20 +2,21 @@
 
 ## Status
 
-- **State:** Flight 2 flown 2026-11-06 flat on Steam, log `edvr_gfx_20261106_040008`, build e7b4b49b. The texture swap reads as a mirror, the clear on approach fired correctly every time, and frame time went from about 16 ms to the 90 fps cap. It also mirrored every piece of glass in the room, and the big plate cluster stayed. The third build b19b368d (mirror by depth, smooth, far names culled; full build green, optimized_station_test 970 checks) is installed on Steam and not flown. Not merged. Extends `fix.optimized_stations`; off unless the temporary keys turn it on.
+- **State:** Flight 3 flown 2026-11-06 flat on Steam, log `edvr_gfx_20261106_050431`, build b19b368d. Sean: the mirror is much better. The fourth build (outside effects withheld, the clear follows the view) is built, not flown. Not merged. Extends `fix.optimized_stations`; off unless the temporary keys turn it on.
 - **Goals (Sean, 2026-11-05):** (1) on foot in the large-station concourse, cull everything outside the bay windows; (2) skylights and the window above the lift bank become a permanent mirrored surface, so missing structure is never seen; (3) approaching the bay windows clears the mirror and stops the cull, so the station interior is visible from there.
 - **Direction:** identify records by the store's name, keep an allow-list, and make the panes opaque. The fitted hall, the shader-pair lists and the shell read-back from the earlier attempt are not carried over (see Ruled out).
 - **Answered by Flight 1:** H1 yes, with named survivors. H2 yes. H3 yes for the bay window: VS `98397963AAEC45D3` / PS `66B08F89E4926C01`, n=36. H5 yes by eye: the room stayed lit. See "Flight 1 results".
-- **Answered by Flight 2:** H4b yes, by eye; `mirror-cb` was not needed. H7 yes: lifts at 20.2-22.3% of the view, all near the bay. H6b no: the family covers every pane in the room at about 20 index counts, so no count names the exterior. See "Flight 2 results".
-- **Open hypotheses (Flight 3 answers them):**
-  - **H9** A pane pixel with nothing within 100 m behind it is exterior glass, and every interior pane has something nearer behind it. `concourse pane: exterior` and `interior` lines list the learned draws; the eye says whether any is wrong.
-  - **H10** `PlantStack0-4` are the big plate structures. The distances fit (r 49-103 m at 350-430 m). The eye and the `culled PlantStack` survey lines answer it.
-  - **H11** Roughness 0.30 and flat textures remove the grid and the mottling. `mirror-soft` (0.54) is the comparison on F4.
-  - **H8** nothing visible draws over the pane once the plume is withheld and the pane writes depth. Now only matters where the mirror draws.
+- **Answered by Flight 2:** H4b yes, by eye. H7 yes: lifts at 20.2-22.3% of the view, all near the bay. H6b no: the family covers every pane in the room at about 20 index counts, so no count names the exterior. See "Flight 2 results".
+- **Answered by Flight 3:** H9 yes as far as the eye went: Sean called the mirror much better and reported no wrong pane, with 0 mark refusals. H10 yes: `culled PlantStack0-4` logged, and his screenshot has no plates. H11 not asked directly: no complaint about the grid, and the log shows `mirror-soft` tried. The side table needed one fix: one mesh drawn in two places flipped within a frame. See "Flight 3 results".
+- **Open hypotheses (Flight 4 answers them):**
+  - **H12** The withheld lists remove the smoke, the trails, the lasers and the planet, and nothing in the room. `concourse withheld 30s:` names what matched. F4 at `off` shows what is left. The planet's vertex shaders come from older docs, because no census here had the planet in view: if it stays, take a NumLock looking at it.
+  - **H13** The flares (`B75A6FF2/D56F859B`, about 1300 instances) are outside only. They draw after the panes with no depth test, so they paint on the mirror. If room lamps lose their glints, this family is why.
+  - **H14** 20% in, 8% out, 250 ms held is a comfortable rule for following the view.
+  - **H8** nothing visible draws over the pane once the outside is withheld and the pane writes depth. `AFFEF018/41152F82` (a fullscreen additive, no depth test) is the candidate left.
   - **H6** `Standard_SocialArea` marks the large-station concourse at other stations too. Still unflown.
 - **Temporary keys (all removed when the arc closes):** `diag.concourse_cull` (on, off), `diag.concourse_keep` (extra name prefixes), `diag.concourse_pane_mode`, `diag.concourse_panes`, `diag.concourse_clear_share`, `diag.concourse_mirror_beyond`, `hotkey.concourse_cull`, `hotkey.concourse_pane_capture`, `hotkey.concourse_pane_mode`.
 - **Ruled out:** see the section of that name. **Issues:** none yet.
-- **Next flight:** the Flight 3 list, on build b19b368d, installed on Steam 2026-11-06. Keys in both Steam inis: `hotkey.concourse_cull` F2 (the cull and the mirrors), `hotkey.concourse_pane_capture` F3 (logs a ranking, changes nothing), `hotkey.concourse_pane_mode` F4.
+- **Next flight:** the Flight 4 list. Keys in both Steam inis: `hotkey.concourse_cull` F2 (the cull and the mirrors), `hotkey.concourse_pane_capture` F3 (logs a ranking, changes nothing), `hotkey.concourse_pane_mode` F4.
 
 ## What the earlier attempt learned
 
@@ -78,13 +79,26 @@ A draw is identified by VS and PS hash; the index count only separates the bay (
 
 **Which pixels mirror (from the third build).** The whole room's glass is this one family, so the draw cannot say which side it is on. The depth buffer can. The game's own glass always draws, unchanged. Once a frame, before the first mirror, a colourless fullscreen triangle at z = 0.025 / D sets stencil bit 6 wherever the scene behind is farther than D metres (infinite reversed Z; 100 m by default, `diag.concourse_mirror_beyond`). Then each pane draws a second time with the mirror's textures and stencil `EQUAL 0x40`. So a pane with a wall behind it keeps the game's look, and a pane facing the emptied outside turns to metal, per pixel, with no table per station. Bit 6 is free: nothing after the opaque pass reads it, and the frame's clear resets it. The opaque pass's own stencil bits cannot serve, because a fullscreen draw clears them before the panes draw.
 
-**Each pane's side.** When the cull lifts there is real structure behind the exterior panes, so the depth test would open holes in them. So one frame in eight each draw (keyed by index count, start index and base vertex) is counted twice: the game's draw and the marked mirror. At least 60% of its pixels mirrored (of at least 64) makes it exterior, otherwise interior, and the latest reading wins. With the cull lifted, exterior panes draw whole without the stencil test, and interior ones not at all. The 60% keeps an interior pane out when the exterior is only seen through part of it. For 8 frames after the cull returns, a known exterior pane stays whole, because the frame in flight may still hold the depth of what was just taken away. The key is the mesh, so a mesh used both inside and out shows as `changed side` lines; the plain mirror phase is unaffected, because its test is per pixel.
+**Each pane's side.** When the cull lifts there is real structure behind the exterior panes, so the depth test would open holes in them. So one frame in eight each draw (keyed by index count, start index and base vertex) is counted twice: the game's draw and the marked mirror. At least 60% of its pixels mirrored (of at least 64) makes it exterior, otherwise interior. A reading under half the mesh's largest so far is ignored, because one mesh can be drawn in two places (Flight 3: 133k pixels at 66% and 17k at 30%, flipping within a frame). So that mesh takes the side of its large instance, and its small one is wrong while the cull is lifted. With the cull lifted, exterior panes draw whole without the stencil test, and interior ones not at all. The 60% keeps an interior pane out when the exterior is only seen through part of it. For 8 frames after the cull returns, a known exterior pane stays whole, because the frame in flight may still hold the depth of what was just taken away. The key is the mesh, so a mesh used both inside and out shows as `changed side` lines; the plain mirror phase is unaffected, because its test is per pixel.
 
-**What draws after the panes.** The plume (census VS `EB787F98`, but PS `3B0B38CD` is the match because EDVR swaps the plume's VS) and its 1024 twin (`78F5F08D/34A1475B`) have depth test off, so they are withheld while the panes are opaque. Depth-tested late draws (`BBAD1CA8`, `820E5C13`) fail against the pane's depth write.
+**What the cull withholds (from the fourth build).** While the cull is on, whatever F4 says, these draws are not issued, so F4 at `off` shows exactly what is left. Nothing here can be seen past a mirror, so it is saving, not looks, except where a draw would paint over the glass. The bay's clear brings them all back.
+
+| Sean's words | Family | Evidence |
+|---|---|---|
+| engine trails | plume `3B0B38CD` and its twin `34A1475B` (matched by PS because EDVR swaps the plume's VS) | depth test off, Flight 1 |
+| smoke, volumetric | ribbon `B12F7A61/42AC0CAC`, volume `203DF517/EEAAC839`, haze `0A298DE7/6FD4C38B`, smoke `5E417E9D/BD801F2F` | `docs\per-object-motion.md` |
+| ship lasers | beams and bolts `1F17BF54/A75C1DB6`, multicannon `939D01F2/C5DF9CC9`, shield strike `5C1D8EF5/C49F999F` | `docs\dlss-blur-elements-2026-10-14.md` |
+| the planet | atmosphere `41E245D4`, `D95905C1`, `D1281DF4` (`docs\scanner-body.md`); body VS `72BDD292`, `26FC402B`, `9FFA5D5E`, `3530A6FD`, `71DD9863`, `ACE405F4`, `19F70CE8`, `C7FA0C0F` (`docs\eye-split.md`, `docs\fss-scanner.md`, `eye_draw_snapshot.h`) | older docs; not in view in any census here |
+| the sun's glare | `8BD7C37A`, `1F3AD158` | `eye_draw_snapshot.h` |
+| not asked, paints on the mirror | flares `B75A6FF2/D56F859B` | after the panes, no depth test |
+
+Not withheld: `88DCF116/494506A6` (the first-person laser), the room's glows `1C506222` and `359BF8FF`, the sky `F8FA801F`, the stars and the space dust `E904D334` (see "Performance candidates"), and `AFFEF018` (unknown; no shader dump).
+
+Depth-tested late draws (`BBAD1CA8`, `820E5C13`) fail against the pane's depth write.
 
 **A known loss:** the logo on the glass (same VS, PS `98337732`, n=162) draws before the pane, so the mirror covers it. It returns when the bay clears.
 
-**The trigger (goal 3).** Pane coverage, not a room coordinate: an occlusion query around the n=36 draws gives its share of the view. This needs no table per station and covers every bay window at once. At 20% of the view (12% in VR), on two readings running: the camera position is latched, the cull lifts, 150 ms later the pane fades to the game's glass over 600 ms. It stays clear while the pane is large, and looking away does nothing. After walking 10 m from the last latched position it fades back, then the cull returns behind the opaque glass. Coordinates were the first plan, but Flight 1's walk could not place the pane, and a table would have needed flights at each station type.
+**The trigger (goal 3).** Pane coverage, not a room coordinate: an occlusion query around the game's n=36 draws gives its share of the view. This needs no table per station and covers every bay window at once. At 20% of the view (12% in VR), on two readings running, the cull lifts, and 150 ms later the pane fades to the game's glass over 600 ms. From the fourth build it follows the view (Sean, after Flight 3: turning round at the glass left the cull off until he walked away). Under 40% of the entry share (8%, or 4.8% in VR) for 250 ms, it closes: straight back to the mirror and the cull if the bay is out of view (1% or less, or no reading), where a fade would only delay the saving, or by a fade if some of the bay is still in view. Coming back over the entry share during the fade turns it round. Coordinates were the first plan, but Flight 1's walk could not place the pane, and a table would have needed flights at each station type.
 
 **The fade.** `BlendFactor`, `InvBlendFactor` with the mirror's textures, over the game's own glass, on exterior panes. At 0 the second draw stops.
 
@@ -189,13 +203,37 @@ On the third build, flat, at the same station. Start with F2 off.
 
 Then: `python tools\edvr_log.py --target steam --expect-build b19b368d --grep "concourse"`.
 
+## Flight 3 results
+
+Log `edvr_gfx_20261106_050431`, build b19b368d, flat, Steam, the same station type. Sean: "much better", with one issue (the cull stayed off after turning round at the bay) and three requests: remove the smoke and volumetrics, the ship lasers and their trails, and the planet.
+
+- **The mark.** D32_FLOAT_S8X24_UINT, z 0.00025, about 440 passes per 5 s, 0 refused. Three sampled 5 s lines show 41-78 meshes known and 10-15 exterior.
+- **The sides.** Exteriors read 99-100% (n=18: 7636 of 7656; n=30: 11659 of 11659), and interiors mostly 0%, with some in between (n=24: 496 of 1079). One mesh (n=12, start 12078150) logged 84 `changed side` lines: see "Each pane's side".
+- **The plates.** All of `PlantStack0-4` culled. The farthest kept name is now at about 50 m.
+- **NumLock.** Shift+NumLock worked: census at 05:14:00, phase clear, at the glass (z 39.6), with the cull lifted. So it shows the families but not what the cull leaves, and the planet was not in view.
+- **Sean's screenshot, F4 at `off`, cull on.** Pale haze, a planet, stars, white bars and a long white line, pale wedges, a small white cloud, orange flares. The wedges are the plume, shown because the withhold was off in mode `off`.
+- **Frame time.** Mostly the 90 fps cap (p50 11.1 ms), with stretches at 12-13 ms; 16.9 ms in the 5 s window of the clear at 05:07:29-37.
+
+## Flight 4
+
+On the fourth build, flat, at the same station. Start with F2 off.
+
+1. F2 on, F4 at `off`, look out through the bay from across the room. What is left? A planet, lasers, trails, smoke or flares still there means a family was missed: take a NumLock with it in view.
+2. F2 off and on with F4 at `off`, looking at the room: does anything in the room change? Lamp glints, haze, a hologram.
+3. F4 at `mirror`. Do the panes look clean, with nothing painted on them?
+4. Walk up until the bay opens. Turn round: the skylights and the cull should return within a moment. Turn back: the bay should open again. Is the wait on turning back acceptable? Try a quick glance away too, which should not close it.
+5. Back away from the bay while looking at it: where does it close, and does it flicker?
+6. If it is cheap, repeat 3 and 4 at a second station type.
+
+Then: `python tools\edvr_log.py --target steam --expect-build <this build> --grep "concourse"`.
+
 ## Performance candidates
 
 Ranked by expected gain against risk. The first two and the plume are in the build.
 
 1. **Rig veto on foot.** In the build. Part of the measured 1.9 ms.
 2. **Cull by name in every view.** In the build. Shadow tiles -60%, probes -20%.
-3. **Withhold what only the glass shows:** fog `B12F7A61`, stars `68DDDEF0/F7A6E916`, glows `1C506222`, `359BF8FF`. They draw and are then overwritten on the mirrored pixels. Harder now that interior panes keep the game's look and can see out, and it needs proof that none is inside the room; glows may be. (Not `529D6238`: see Ruled out.) Plumes are withheld in this build.
+3. **Withhold what only the glass shows.** In the fourth build for smoke, trails, lasers, the planet and flares. Left: stars `68DDDEF0/F7A6E916` (about 9300 instances), space dust `E904D334/095030F2` (512 quads). They only appear past glass, and the mirror covers them, so they are cheap candidates once Flight 4 shows the list is safe.
 4. **Exterior light volumes.** About 4700 instances a frame in the main view. Most effective GPU target left, and hard: earlier work showed they cannot be cut by centre position. A pane depth write early in the frame would reject the part behind glass.
 5. **Drop kept names that are outside the room.** In the third build: `PlantStack` off the list, and any allowed name whose sphere starts more than 200 m from the camera is culled (the anchor and the hub excepted, because the gate reads them). Camera distance on purpose: in the hangar the `HangarLobby` is near and stays.
 6. **The sun in the concourse.** The sun pair (`7E38A6AA/7CECABDE`) still draws. With mirrored skylights it may contribute nothing; the seal's sun skip can be A/B tested with one line.
@@ -218,3 +256,5 @@ Ranked by expected gain against risk. The first two and the plume are in the bui
 - `ruled out: the index count as the test for exterior glass, because about 20 counts pass the family and the interior shares them (Sean's screenshots and log 040008).`
 - `ruled out: the opaque pass's stencil bits as a "nothing behind this pane" mask, because a fullscreen draw (#9100, write mask 0x0D, ref 0) clears them before the panes draw (Flight 1's census).`
 - `ruled out for now: naming each draw's record through t33 and the instance stream, because it needs both mapped each frame and a proven join of record to pool row, and the depth rule needs neither. Worth returning to only if the depth rule fails.`
+- `ruled out: a walk-away latch as the clear's release, because turning round at the bay left the cull off until Sean walked 10 m (Flight 3).`
+- `ruled out: 88DCF116 as a ship's laser, because docs\design-flat-temporal-aa-2026-09-23.md names it the first-person laser, a pool draw; it stays in the room's list.`
