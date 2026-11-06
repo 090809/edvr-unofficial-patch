@@ -2,7 +2,7 @@
 
 ## Status
 
-- **State:** Flight 8 flown 2026-11-06 flat on Steam, build b14a788d. The washed-out entrance stays with F2 off, so it is Elite's own. The ninth build (the mirror lit from behind, the outside's families also withheld in a sealed hangar) is not flown. Not merged. Extends `fix.optimized_stations`; the concourse cull is off unless the temporary keys turn it on, but the sealed-hangar withhold is on with `fix.optimized_stations`.
+- **State:** Flight 8 flown 2026-11-06 flat on Steam, build b14a788d. The washed-out entrance stays with F2 off, so it is Elite's own. The ninth build 2b487014 (the mirror lit from behind, the outside's families also withheld in a sealed hangar; full build green, optimized_station_test 1007 checks) is installed on Steam and not flown. Not merged. Extends `fix.optimized_stations`; the concourse cull is off unless the temporary keys turn it on, but the sealed-hangar withhold is on with `fix.optimized_stations`.
 - **Goals (Sean, 2026-11-05):** (1) on foot in the large-station concourse, cull everything outside the bay windows; (2) skylights and the window above the lift bank become a permanent mirrored surface, so missing structure is never seen; (3) approaching the bay windows clears the mirror and stops the cull, so the station interior is visible from there. **Added 2026-11-06:** (4) light behind the mirror, for the impression of a brightly lit station beyond it; (5) with `fix.optimized_stations` on, the same outside draws go while the hangar is sealed.
 - **Direction:** identify records by the store's name, keep an allow-list, and make the panes opaque. The fitted hall, the shader-pair lists and the shell read-back from the earlier attempt are not carried over (see Ruled out).
 - **Answered by Flight 1:** H1 yes, with named survivors. H2 yes. H3 yes for the bay window: VS `98397963AAEC45D3` / PS `66B08F89E4926C01`, n=36. H5 yes by eye: the room stayed lit. See "Flight 1 results".
@@ -20,7 +20,7 @@
   - **H6** `Standard_SocialArea` marks the large-station concourse at other stations too. Still unflown.
 - **Temporary keys (all removed when the arc closes):** `diag.concourse_cull` (on, off), `diag.concourse_keep` (extra name prefixes), `diag.concourse_pane_mode`, `diag.concourse_panes`, `diag.concourse_clear_share`, `diag.concourse_mirror_beyond`, `hotkey.concourse_cull`, `hotkey.concourse_pane_capture`, `hotkey.concourse_pane_mode`.
 - **Ruled out:** see the section of that name. **Issues:** none yet.
-- **Next flight:** the Flight 9 list. Keys in both Steam inis: `hotkey.concourse_cull` F2 (the cull and the mirrors), `hotkey.concourse_pane_capture` F3 (logs a ranking by screen coverage and the kept names, changes nothing), `hotkey.concourse_pane_mode` F4.
+- **Next flight:** the Flight 9 list, on build 2b487014, installed on Steam 2026-11-06. Keys in both Steam inis: `hotkey.concourse_cull` F2 (the cull and the mirrors), `hotkey.concourse_pane_capture` F3 (logs a ranking by screen coverage and the kept names, changes nothing), `hotkey.concourse_pane_mode` F4.
 
 ## What the earlier attempt learned
 
@@ -330,7 +330,7 @@ On the ninth build, flat, at the same station.
 4. Are the two trails gone?
 5. If it is cheap, a second station type.
 
-Then: `python tools\edvr_log.py --target steam --expect-build <this build> --grep "concourse"`.
+Then: `python tools\edvr_log.py --target steam --expect-build 2b487014 --grep "concourse"`.
 
 ## Performance candidates
 
