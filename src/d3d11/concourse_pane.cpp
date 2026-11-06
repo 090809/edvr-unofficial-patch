@@ -17,6 +17,7 @@
 #include "exposure_fix.h"
 #include "flat_compute_readback.h"
 #include "journal_watch.h"
+#include "shader_swap.h"
 
 namespace edvr {
 namespace detail {
@@ -56,6 +57,8 @@ std::atomic<bool> g_capturing{false};   // a capture frame is open
 std::atomic<uint64_t> g_treated{0};
 std::atomic<ID3D11BlendState*> g_bsFactor{nullptr};   // src = BLEND_FACTOR, dest = ZERO (tint and grey)
 std::atomic<ID3D11BlendState*> g_bsMirror{nullptr};   // src = ONE, dest = ZERO
+std::atomic<ID3D11PixelShader*> g_psWhite{nullptr};   // tint and grey: the blend factor multiplies this, so it is the pane's colour
+bool g_psWhiteTried = false;                          // the tick's: one compile per device
 std::atomic<float> g_grey{0.1f};
 
 // ---- The capture ------------------------------------------------------------------------------------------------------------------------------
@@ -109,10 +112,27 @@ void releaseStates() noexcept {
     // The draw threads may hold the pointers for one more draw, and the old device owns the objects: not released (a device change is rare).
     g_bsFactor.store(nullptr, std::memory_order_release);
     g_bsMirror.store(nullptr, std::memory_order_release);
+    g_psWhite.store(nullptr, std::memory_order_release);
+    g_psWhiteTried = false;
+}
+
+// A failed compile leaves tint and grey multiplying the game's own colour, and the log says so.
+void makeWhitePs(ID3D11Device* device) noexcept {
+    if (g_psWhiteTried) return;
+    g_psWhiteTried = true;
+    ID3D11DeviceContext* imm = nullptr;
+    device->GetImmediateContext(&imm);
+    if (!imm) return;
+    static const char kWhite[] = "float4 main() : SV_Target { return float4(1.0, 1.0, 1.0, 1.0); }\n";
+    ID3D11PixelShader* ps = shaderSwapCompilePs(imm, kWhite, sizeof(kWhite) - 1, "main", "concourse_pane_white", nullptr, "concourse pane");
+    imm->Release();
+    g_psWhite.store(ps, std::memory_order_release);
+    if (!ps) Log::get().note("concourse pane: the white pixel shader did not compile; tint and grey multiply the game's own colour, so a dark pane stays dark");
 }
 
 bool makeStates(ID3D11Device* device) noexcept {
     if (!device) return false;
+    makeWhitePs(device);
     if (g_bsFactor.load(std::memory_order_acquire) && g_bsMirror.load(std::memory_order_acquire)) return true;
     D3D11_BLEND_DESC d{};
     d.AlphaToCoverageEnable = FALSE;
@@ -217,7 +237,7 @@ int captureBegin(ID3D11DeviceContext* ctx, UINT indexCount) noexcept {
 
 }  // namespace
 
-void ConcoursePaneScope::begin(ID3D11DeviceContext* ctx, UINT indexCount, ConcoursePaneSetBlendFn setBlend) noexcept {
+void ConcoursePaneScope::begin(ID3D11DeviceContext* ctx, UINT indexCount, ConcoursePaneSetBlendFn setBlend, ConcoursePaneSetPsFn setPs) noexcept {
     if (!ctx) return;
     if (g_capturing.load(std::memory_order_acquire)) {
         const int q = captureBegin(ctx, indexCount);
@@ -255,6 +275,14 @@ void ConcoursePaneScope::begin(ID3D11DeviceContext* ctx, UINT indexCount, Concou
     }
     ctx->OMGetBlendState(&prev_, prevFactor_, &prevMask_);
     setBlend(ctx, repl, factor, 0xFFFFFFFFu);
+    if (mode != kModeMirror && setPs) {
+        ID3D11PixelShader* white = g_psWhite.load(std::memory_order_acquire);
+        if (white) {
+            ctx->PSGetShader(&prevPs_, nullptr, nullptr);
+            setPs(ctx, white, nullptr, 0);
+            setPs_ = setPs;
+        }
+    }
     ctx_ = ctx;
     setBlend_ = setBlend;
     state_ = 2;
@@ -266,6 +294,12 @@ void ConcoursePaneScope::end() noexcept {
         setBlend_(ctx_, prev_, prevFactor_, prevMask_);
         if (prev_) prev_->Release();
         prev_ = nullptr;
+        if (setPs_) {
+            setPs_(ctx_, prevPs_, nullptr, 0);
+            if (prevPs_) prevPs_->Release();
+            prevPs_ = nullptr;
+            setPs_ = nullptr;
+        }
     } else if (state_ == 1 && query_ >= 0) {
         FlatComputeInternalScope internal;
         ctx_->End(g_pool[query_]);
@@ -292,13 +326,21 @@ void setMode(uint32_t m, const char* why) noexcept {
     if (before != m) Log::get().note("concourse pane: mode %s (%s)", modeText(m), why);
 }
 
-void appendSlot(const cc::PaneTriple& t) noexcept {
-    const uint32_t n = g_listN.load(std::memory_order_relaxed);
-    if (n >= cc::kPaneListCap || cc::paneTripleMatch(g_list, n, t.vs, t.ps, t.n)) return;
-    g_list[n] = t;
-    g_listN.store(n + 1, std::memory_order_release);
-    Log::get().note("concourse pane: slot %u colour %s vs=%016llX ps=%016llX n=%u", n, cc::kPaneColourNames[n % cc::kPaneColourCount],
-                    static_cast<unsigned long long>(t.vs), static_cast<unsigned long long>(t.ps), t.n);
+// A capture replaces the list, so one screenshot's colours name one capture's draws.
+void replaceList(const cc::PaneTriple* picks, uint32_t count) noexcept {
+    g_listN.store(0, std::memory_order_release);
+    char seed[512] = {};
+    size_t used = 0;
+    for (uint32_t i = 0; i < count; ++i) {
+        g_list[i] = picks[i];
+        Log::get().note("concourse pane: slot %u colour %s vs=%016llX ps=%016llX n=%u", i, cc::kPaneColourNames[i % cc::kPaneColourCount],
+                        static_cast<unsigned long long>(picks[i].vs), static_cast<unsigned long long>(picks[i].ps), picks[i].n);
+        const int w = std::snprintf(seed + used, sizeof(seed) - used, "%s%016llX/%016llX/%u", i ? "," : "", static_cast<unsigned long long>(picks[i].vs),
+                                    static_cast<unsigned long long>(picks[i].ps), picks[i].n);
+        if (w > 0 && used + static_cast<size_t>(w) < sizeof(seed)) used += static_cast<size_t>(w);
+    }
+    g_listN.store(count, std::memory_order_release);
+    Log::get().note("concourse pane: this capture as diag.concourse_panes = %s", seed);
 }
 
 void reportCapture(ID3D11Device* device) noexcept {
@@ -340,22 +382,30 @@ void reportCapture(ID3D11Device* device) noexcept {
                         g.vpW, g.vpH, static_cast<unsigned long long>(g.vs), static_cast<unsigned long long>(g.ps), g.n, g.draws, g.src, g.dst, g.depthWrite,
                         g.stencil);
     }
-    // The top five with n > 6 and at least 0.2% of their viewport go into the list.
+    // The top eight candidates, one colour each. A pane darkens or tints what is behind it, so additive draws are skipped: they are the light volumes, the sky
+    // and the light cards, they cover the most pixels, and they would fill the list. So is the green fog, by name. A pane may be a plain quad (n = 6), so a
+    // quad is skipped only at 90% of the viewport or more, which is a full-screen pass. All of them stay in the ranking above.
+    constexpr uint64_t kFogVs = 0xB12F7A618E1BDE98ull;
+    constexpr uint32_t kPicks = 8;
+    cc::PaneTriple picks[kPicks];
     uint32_t taken = 0;
-    for (size_t i = 0; i < gn && taken < 5; ++i) {
+    for (size_t i = 0; i < gn && taken < kPicks; ++i) {
         const Group& g = groups[i];
         const double pixels = static_cast<double>(g.vpW) * static_cast<double>(g.vpH);
-        if (g.n <= 6 || !(pixels > 0.0) || static_cast<double>(g.samples) < 0.002 * pixels) continue;
+        if (!(pixels > 0.0) || g.n < 6 || g.dst == D3D11_BLEND_ONE || g.vs == kFogVs) continue;
+        const double share = static_cast<double>(g.samples) / pixels;
+        if (share < 0.002 || (g.n == 6 && share >= 0.9)) continue;
+        picks[taken].vs = g.vs;
+        picks[taken].ps = g.ps;
+        picks[taken].n = g.n;
         ++taken;
-        cc::PaneTriple t;
-        t.vs = g.vs;
-        t.ps = g.ps;
-        t.n = g.n;
-        appendSlot(t);
     }
     if (gn == 0) Log::get().note("concourse pane capture: no blended draw covered a pixel (or no result arrived); the list is unchanged");
-    else if (taken == 0) Log::get().note("concourse pane capture: no triple with n > 6 covered 0.2%% of its viewport; the list is unchanged");
-    else setMode(kModeTint, "capture");
+    else if (taken == 0) Log::get().note("concourse pane capture: no candidate (not additive, at least 6 indices, at least 0.2%% of its viewport); the list is unchanged");
+    else {
+        replaceList(picks, taken);
+        setMode(kModeTint, "capture");
+    }
     (void)device;
 }
 

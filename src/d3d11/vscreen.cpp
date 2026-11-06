@@ -5438,6 +5438,10 @@ static void STDMETHODCALLTYPE stationMaskSetBlend(ID3D11DeviceContext* ctx, ID3D
     if (g_state->realOMSetBlendState) g_state->realOMSetBlendState(ctx, state, factor, sampleMask);
     else ctx->OMSetBlendState(state, factor, sampleMask);
 }
+static void STDMETHODCALLTYPE concoursePaneSetPs(ID3D11DeviceContext* ctx, ID3D11PixelShader* ps, ID3D11ClassInstance* const* instances, UINT count) {
+    if (g_state->realPSSetShader) g_state->realPSSetShader(ctx, ps, instances, count);
+    else ctx->PSSetShader(ps, instances, count);
+}
 static void STDMETHODCALLTYPE stationMaskSetDepth(ID3D11DeviceContext* ctx, ID3D11DepthStencilState* state, UINT stencilRef) {
     if (g_state->realOMSetDepthStencilState) g_state->realOMSetDepthStencilState(ctx, state, stencilRef);
     else ctx->OMSetDepthStencilState(state, stencilRef);
@@ -5621,7 +5625,7 @@ void STDMETHODCALLTYPE hookedDrawIndexed(ID3D11DeviceContext* self, UINT count,
         FlatStationSunGate sun(self, flatDraw, stationSkip);
         {
             FlatParticleScope particle(self, 'I', count, 1);
-            ConcoursePaneScope pane(self, count, &stationMaskSetBlend);
+            ConcoursePaneScope pane(self, count, &stationMaskSetBlend, &concoursePaneSetPs);
             if (sun.issues()) g_state->realDrawIndexed(self, count, startIndex, baseVertex);
         }
         sun.restore();
@@ -5657,7 +5661,7 @@ void STDMETHODCALLTYPE hookedDrawIndexed(ID3D11DeviceContext* self, UINT count,
         if (!(self == g_state->ownerCtx && uiLayerIssueBlocked())) {
             const int64_t r0 = clock.on ? qpcNow() : 0;
             {
-                ConcoursePaneScope pane(self, count, &stationMaskSetBlend);   // TEMPORARY (concourse_pane.h)
+                ConcoursePaneScope pane(self, count, &stationMaskSetBlend, &concoursePaneSetPs);   // TEMPORARY (concourse_pane.h)
                 g_state->realDrawIndexed(self, count, startIndex, baseVertex);
             }
             if (clock.on) clock.realCall(r0);
@@ -5666,7 +5670,7 @@ void STDMETHODCALLTYPE hookedDrawIndexed(ID3D11DeviceContext* self, UINT count,
         const int64_t r0 = clock.on ? qpcNow() : 0;
         {
             GpuCensusAlteredScope timed(self, altered);   // the game's own draw, and only it (gpu_census.h)
-            ConcoursePaneScope pane(self, count, &stationMaskSetBlend);   // TEMPORARY (concourse_pane.h)
+            ConcoursePaneScope pane(self, count, &stationMaskSetBlend, &concoursePaneSetPs);   // TEMPORARY (concourse_pane.h)
             g_state->realDrawIndexed(self, count, startIndex, baseVertex);
         }
         srvTurretHudCountIssue(self);   // issue 140: the game's own issue; a family's first scope says its state (one relaxed load otherwise)
@@ -5804,7 +5808,7 @@ void STDMETHODCALLTYPE hookedDrawIndexedInstanced(ID3D11DeviceContext* self,
         FlatStationSunGate sun(self, flatDraw, stationSkip);
         {
             FlatParticleScope particle(self, 'X', perInstance, instances);
-            ConcoursePaneScope pane(self, perInstance, &stationMaskSetBlend);
+            ConcoursePaneScope pane(self, perInstance, &stationMaskSetBlend, &concoursePaneSetPs);
             if (sun.issues())
                 g_state->realDrawIndexedInstanced(self, perInstance, instances, startIndex,
                                                   baseVertex, startInstance);
@@ -5865,7 +5869,7 @@ void STDMETHODCALLTYPE hookedDrawIndexedInstanced(ID3D11DeviceContext* self,
             // The game's own draw, and only it (gpu_census.h): the weapon and screen motion
             // reissues below have sections of their own.
             GpuCensusAlteredScope timed(self, altered);
-            ConcoursePaneScope pane(self, perInstance, &stationMaskSetBlend);   // TEMPORARY (concourse_pane.h)
+            ConcoursePaneScope pane(self, perInstance, &stationMaskSetBlend, &concoursePaneSetPs);   // TEMPORARY (concourse_pane.h)
             g_state->realDrawIndexedInstanced(self, perInstance, instances, startIndex,
                                               baseVertex, startInstance);
         }

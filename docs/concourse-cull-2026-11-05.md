@@ -2,7 +2,7 @@
 
 ## Status
 
-- **State:** BUILT (2026-11-05): the branch head is the first instrument build, full `build.bat` green (optimized_station_test 904 checks), `--dll-only` promoted. Design plus all of Flight 1's instruments: Extends `fix.optimized_stations`. The cull and the pane work are off unless the temporary keys below turn them on. Nothing is flown. Built: name allow-list cull at the rig, producer and store (`concourse_cull_core.h`, `optimized_station.cpp`), the names survey (rig and producer vetoes forward for its 2 frames), `concourse frame:` trace, panes (`concourse_pane.cpp`, hooked in the four draw thunks).
+- **State:** BUILT (2026-11-05): the branch head is the first instrument build, full `build.bat` green (optimized_station_test 904 checks), `--dll-only` promoted. Design plus all of Flight 1's instruments: Extends `fix.optimized_stations`. The cull and the pane work are off unless the temporary keys below turn them on. Nothing is flown. Built: name allow-list cull at the rig, producer and store (`concourse_cull_core.h`, `optimized_station.cpp`), the names survey (runs for the first 2 frames of each engage, before the rig and producer vetoes start, so it shows nothing extra), `concourse frame:` trace, panes (`concourse_pane.cpp`, hooked in the four draw thunks).
 - **Goals (Sean, 2026-11-05):** (1) on foot in the large-station concourse, cull everything outside the bay windows; (2) skylights and the window above the lift bank become a permanent mirrored surface, so missing structure is never seen; (3) approaching the bay windows clears the mirror and stops the cull, so the station interior is visible from there.
 - **Direction:** identify records by the store's name, keep an allow-list, and make the panes opaque. The fitted hall, the shader-pair lists and the shell read-back from the earlier attempt are not carried over (see Ruled out).
 - **Open hypotheses (Flight 1 answers all of them):**
@@ -61,7 +61,7 @@ Elite's glass is drawn after lighting. Changing only the blend state around the 
 | Mode | Blend | Result |
 |---|---|---|
 | normal | game's (`One`, `Src1Color`) | transmission |
-| `tint` | `BlendFactor`, `Zero` | flat colour, ranked per triple, for identification |
+| `tint` | `BlendFactor`, `Zero`, white pixel shader | flat colour, one per slot, for identification |
 | `mirror` | `One`, `Zero` | the game's own reflection and lighting, nothing behind |
 | `grey` | `BlendFactor`, `Zero` | constant colour |
 
@@ -81,7 +81,7 @@ Flat on Steam is enough; VR after. Fly from the hangar, so the lift transition i
 
 1. Stand in the middle of the bar, away from the windows. Toggle `hotkey.concourse_cull` on. Note what vanished and anything wrongly missing. Hold still for 15 s, off for 15 s, on for 15 s (the A/B).
 2. With the cull on, press `NumLock` for a census (flat), and capture the GPU profile if bound.
-3. Face a bay window from 2 m. With the cull off, press `hotkey.concourse_pane_capture`. The top five candidates turn red, green, blue, yellow and magenta. Screenshot. Repeat under a skylight, then facing the window above the lift bank.
+3. Face a bay window from 2 m. With the cull off, press `hotkey.concourse_pane_capture`. The top eight candidates turn red, green, blue, yellow, magenta, cyan, orange and white. Screenshot. Each capture replaces the last one's colours, so one screenshot names one capture. Repeat under a skylight, then facing the window above the lift bank.
 4. Press `hotkey.concourse_pane_mode` to see `mirror`, then `grey`. Screenshot each, facing a window, with the cull on.
 5. Walk the bay window's length, then the room's edge, so `concourse frame:` traces the room. Stand still 3 s at each end of the bay window, and at the lift doors.
 6. Take the lift to the hangar and come back, cull on. Note any flash at the doors.

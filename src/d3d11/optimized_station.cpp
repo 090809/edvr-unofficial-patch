@@ -2619,7 +2619,7 @@ void afterStoreJudge(uintptr_t bucket, uintptr_t record, bool judge) noexcept {
 }
 
 // ---- Built 2026-11-05: the concourse cull's names survey and store judgement ---------------------------------------------------------------------
-// The one-shot names: armed 2 s after each engage and each toggle-on, gathered over 2 frames. A mutex is taken only while armed and never held across a
+// The one-shot names: armed at each engage, gathered over 2 frames, before the first record is vetoed. A mutex is taken only while armed and never held across a
 // call into the game. While it runs the rig and producer vetoes forward, so the store sees (and names) every record; the store's clear still applies.
 struct SurveyAgg {
     uint32_t kept = 0, culled = 0, smallClose = 0, unreadSphere = 0;
@@ -3128,7 +3128,7 @@ void concourseTick(uint64_t now, uint32_t frame) {
         if (active) {
             bumpRigEpoch();   // the rigs are judged afresh: every slot and publication of the old epoch forwards
             g_concActive.store(true, std::memory_order_release);
-            g_concSurveyDueMs = now + 2000;
+            g_concSurveyDueMs = now;   // the names first: no rig has been vetoed yet, so the survey's forwarding shows nothing that was not already on screen
             g_concSumMs = now;
             g_concSumFrames = 0;
             g_concSumCalls[0] = g_callsStore.load(std::memory_order_relaxed);
@@ -3164,7 +3164,7 @@ void concourseTick(uint64_t now, uint32_t frame) {
         }
     }
     g_concWasArmed = armed;
-    // The one-shot names: due 2 s after an engage or a toggle-on, gathered over 2 frames.
+    // The one-shot names: due at an engage (or 2 s after a toggle-on that did not re-engage), gathered over 2 frames.
     const uint32_t stamp = g_frameStamp.load(std::memory_order_relaxed);
     if (!active) {
         if (g_concSurveyOn) {
