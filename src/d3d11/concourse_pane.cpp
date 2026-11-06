@@ -77,6 +77,7 @@ std::atomic<uint64_t> g_withheld{0};
 // One counter per withheld family (the pixel shader list, then the vertex shader list), read and cleared every 30 s.
 constexpr size_t kWithheldFamilies = cc::kWithheldPsCount + cc::kWithheldVsCount;
 std::atomic<uint64_t> g_withheldFam[kWithheldFamilies] = {};
+std::atomic<uint64_t> g_farLimited{0};   // glows limited by the mark (farLimitedPs), read and cleared with the families
 uint64_t g_withheldLogMs = 0;
 std::atomic<uint32_t> g_frameNow{0};
 std::atomic<uint32_t> g_hashEpoch{1};
@@ -221,7 +222,9 @@ struct DsEntry {
     ID3D11DepthStencilState* orig = nullptr;   // held, so the pointer cannot be reused for another state
     ID3D11DepthStencilState* plain = nullptr;
     ID3D11DepthStencilState* marked = nullptr;
+    ID3D11DepthStencilState* farOut = nullptr;
 };
+enum class DsVariant { kPlain, kMarked, kFarOut };
 std::mutex g_dsMutex;
 DsEntry g_ds[16];
 size_t g_dsN = 0;
@@ -744,7 +747,9 @@ void pollShares(ID3D11Device* device, uint32_t prevFrame, uint32_t frame, bool m
 
 // ---- The derived depth state -------------------------------------------------------------------------------------------------------------------
 // nullptr when the variant cannot be made (a full cache, or the device refused): the caller does not draw the mirror then.
-ID3D11DepthStencilState* derivedDepth(ID3D11DeviceContext* ctx, ID3D11DepthStencilState* orig, bool marked) noexcept {
+// kPlain and kMarked are the mirror's: depth write on, without and with the mark's test. kFarOut is the far-limited glows': the game's depth state as it is, and only
+// the pixels the mark did not set.
+ID3D11DepthStencilState* derivedDepth(ID3D11DeviceContext* ctx, ID3D11DepthStencilState* orig, DsVariant variant) noexcept {
     std::lock_guard<std::mutex> lock(g_dsMutex);
     size_t at = g_dsN;
     for (size_t i = 0; i < g_dsN; ++i)
@@ -759,17 +764,17 @@ ID3D11DepthStencilState* derivedDepth(ID3D11DeviceContext* ctx, ID3D11DepthStenc
         g_ds[g_dsN].orig = orig;
         ++g_dsN;
     }
-    ID3D11DepthStencilState*& slot = marked ? g_ds[at].marked : g_ds[at].plain;
+    ID3D11DepthStencilState*& slot = variant == DsVariant::kFarOut ? g_ds[at].farOut : variant == DsVariant::kMarked ? g_ds[at].marked : g_ds[at].plain;
     if (slot) return slot;
     D3D11_DEPTH_STENCIL_DESC d{};
     orig->GetDesc(&d);
-    d.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ALL;
-    if (marked) {
+    if (variant != DsVariant::kFarOut) d.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ALL;
+    if (variant != DsVariant::kPlain) {
         d.StencilEnable = TRUE;
         d.StencilReadMask = static_cast<UINT8>(kMarkRef);
         d.StencilWriteMask = 0;
         for (D3D11_DEPTH_STENCILOP_DESC* f : {&d.FrontFace, &d.BackFace}) {
-            f->StencilFunc = D3D11_COMPARISON_EQUAL;
+            f->StencilFunc = variant == DsVariant::kFarOut ? D3D11_COMPARISON_NOT_EQUAL : D3D11_COMPARISON_EQUAL;
             f->StencilFailOp = D3D11_STENCIL_OP_KEEP;
             f->StencilDepthFailOp = D3D11_STENCIL_OP_KEEP;
             f->StencilPassOp = D3D11_STENCIL_OP_KEEP;
@@ -1291,6 +1296,26 @@ void ConcoursePaneScope::begin(ID3D11DeviceContext* ctx, UINT indexCount, UINT s
             g_withheldFam[fam].fetch_add(1, std::memory_order_relaxed);
             return;
         }
+        // The glows that may also be the room's: their far pixels are dropped by the mark (concourse_cull_core.h, farLimitedPs). Immediate context only, as the mark is.
+        if (followed && cc::farLimitedPs(ps)) {
+            if (ensureMarked(ctx, calls)) {
+                UINT ref = 0;
+                ctx->OMGetDepthStencilState(&prevDs_, &ref);
+                ID3D11DepthStencilState* derived = prevDs_ ? derivedDepth(ctx, prevDs_, DsVariant::kFarOut) : nullptr;
+                if (derived) {
+                    ctx_ = ctx;
+                    calls_ = &calls;
+                    prevStencilRef_ = ref;
+                    calls.setDepth(ctx, derived, kMarkRef);
+                    flags_ |= kFlagDepth;
+                    g_farLimited.fetch_add(1, std::memory_order_relaxed);
+                } else if (prevDs_) {
+                    prevDs_->Release();
+                    prevDs_ = nullptr;
+                }
+            }
+            return;
+        }
     }
     if (!ps) return;
     const uint32_t listN = std::min<uint32_t>(g_listN.load(std::memory_order_acquire), static_cast<uint32_t>(cc::kPaneListCap));
@@ -1396,7 +1421,7 @@ bool ConcoursePaneScope::beginMirrorSlow() noexcept {
     if (planOpaque_) {
         UINT ref = 0;
         ctx_->OMGetDepthStencilState(&prevDs_, &ref);
-        derived = prevDs_ ? derivedDepth(ctx_, prevDs_, planMark_) : nullptr;
+        derived = prevDs_ ? derivedDepth(ctx_, prevDs_, planMark_ ? DsVariant::kMarked : DsVariant::kPlain) : nullptr;
         if (!derived) {
             if (prevDs_) prevDs_->Release();
             prevDs_ = nullptr;
@@ -1686,6 +1711,12 @@ void logWithheld(uint64_t nowMs) noexcept {
         any = true;
         if (w > 0 && used + static_cast<size_t>(w) < sizeof(text)) used += static_cast<size_t>(w);
     }
+    const uint64_t limited = g_farLimited.exchange(0, std::memory_order_relaxed);
+    if (limited != 0) {
+        const int w = std::snprintf(text + used, sizeof(text) - used, "%sfar glows limited %llu", any ? ", " : "", static_cast<unsigned long long>(limited));
+        any = true;
+        if (w > 0 && used + static_cast<size_t>(w) < sizeof(text)) used += static_cast<size_t>(w);
+    }
     if (any) Log::get().note("concourse withheld 30s: %s", text);
 }
 }  // namespace
@@ -1783,7 +1814,7 @@ void concoursePaneTick(ID3D11Device* device, uint32_t frame, uint64_t nowMs) noe
         }
     }
     if (device) {
-        const bool wantStates = g_feedTreat.load(std::memory_order_relaxed) && g_mode.load(std::memory_order_relaxed) != kModeOff;
+        const bool wantStates = g_feedTreat.load(std::memory_order_relaxed);   // mode off too: the far-limited glows use the mark whatever the mode
         if (wantStates) {
             makeStates(device);
             if (g_statesReady.load(std::memory_order_acquire)) {

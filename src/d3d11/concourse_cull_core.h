@@ -179,6 +179,11 @@ inline int withheldIndex(const WithheldFamily* list, size_t n, uint64_t bloom, u
 inline int withheldPsIndex(uint64_t hash) noexcept { return withheldIndex(kWithheldPs, kWithheldPsCount, kWithheldPsBloom, hash); }
 inline int withheldVsIndex(uint64_t hash) noexcept { return withheldIndex(kWithheldVs, kWithheldVsCount, kWithheldVsBloom, hash); }
 
+// The light cones (VS 1C506222, n=384) and their glow quads (VS 359BF8FF, n=6): the green haze and the pale wedges past the glass, up to 40% of the screen in Flight 1's
+// capture. Nothing yet says none of them is a room lamp's, so while the cull is on they are not withheld: they are limited by the mirror's stencil mark, so a pixel
+// with nothing near behind it is dropped and one over the room stays.
+inline bool farLimitedPs(uint64_t ps) noexcept { return ps == 0x2519C9050946D545ull || ps == 0x92FF8499ED345759ull; }
+
 // True when a list holds the same hash twice (the tests fail on it).
 constexpr bool withheldHasDuplicate(const WithheldFamily* list, size_t n) noexcept {
     for (size_t i = 0; i < n; ++i)

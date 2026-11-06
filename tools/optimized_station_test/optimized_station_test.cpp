@@ -3697,6 +3697,9 @@ int main(int argc, char** argv) {
             check(missed, "concourse withheld: near-miss hashes are not found");
             check(cc::withheldPsIndex(0) == -1 && cc::withheldVsIndex(0) == -1, "concourse withheld: no shader (hash 0) is not found");
             check(cc::withheldPsIndex(cc::kPaneFamilyPs) == -1 && cc::withheldVsIndex(cc::kPaneFamilyVs) == -1, "concourse withheld: the glass family is not withheld");
+            check(cc::farLimitedPs(0x2519C9050946D545ull) && cc::farLimitedPs(0x92FF8499ED345759ull), "concourse far-limited: the cones and the glow quads");
+            check(!cc::farLimitedPs(0) && !cc::farLimitedPs(cc::kPaneFamilyPs) && !cc::farLimitedPs(0x06332CA168B6DA63ull), "concourse far-limited: nothing else (no shader, the glass, the stars)");
+            check(cc::withheldPsIndex(0x2519C9050946D545ull) == -1 && cc::withheldPsIndex(0x92FF8499ED345759ull) == -1, "concourse far-limited: not also withheld, or the room's would go");
             const uint64_t keep[] = {0x88DCF1164C640EC3ull, 0x494506A6ull, 0x1C506222ull, 0x359BF8FFull, 0xF8FA801Full, 0x68DDDEF0ull, 0xF7A6E916ull, 0xE904D334ull};
             bool kept = true;
             for (uint64_t h : keep) kept = kept && cc::withheldPsIndex(h) == -1 && cc::withheldVsIndex(h) == -1;
