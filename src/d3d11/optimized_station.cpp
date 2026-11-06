@@ -3302,7 +3302,7 @@ cc::ClearOutput concourseClearStep(uint64_t now, bool wantCull, bool gateWanted,
     in.gate = wantCull;
     in.bayShare = sh.valid ? sh.bay : -1.0f;
     in.shareSeq = sh.seq;
-    in.enterShare = g_concEnterShare;
+    in.enterShare = g_concEnterShare * cc::clearEntryScale(concoursePaneClearingN());   // the shop window enters at 0.3 of the share; the exit follows at 0.4 of that
     const cc::ClearPhase before = g_concClear.phase();
     const cc::ClearOutput out = g_concClear.step(in);
     if (out.phase != before) {
@@ -3359,22 +3359,29 @@ char g_walkArmCam[80] = {};
 constexpr uint32_t kWalkLinesCap = 900, kWalkNamesCap = 300;
 
 // The camera's place in the pick cell: the text of "cam in bay ...", and M, how far past the box (0 inside).
-void walkCamText(char* out, size_t cap, float* pastM) noexcept {
+// The pick cell the walk survey reads is the last one with `has` true, kept for kWalkHoldMs: on foot the pick flickers from tick to tick.
+sealed::OwnCell g_walkHeld;
+bool g_walkHeldValid = false;
+uint64_t g_walkHeldMs = 0;
+uint64_t g_walkLastArmMs = 0;
+constexpr uint64_t kWalkHoldMs = 10000;
+
+void walkCamText(const sealed::OwnCell& cell, bool hasCell, char* out, size_t cap, float* pastM) noexcept {
     *pastM = 0.0f;
     if (!g_frameCamValid) {
         std::snprintf(out, cap, "cam not known");
-    } else if (!g_pickCell.has) {
+    } else if (!hasCell) {
         std::snprintf(out, cap, "cam in bay no cell");
-    } else if (g_pickCell.box) {
+    } else if (cell.box) {
         float x[3] = {};
-        sealed::boxCoordsOf(g_pickCell, g_frameCam, x);
-        for (int k = 0; k < 3; ++k) *pastM = std::max(*pastM, std::fabs(x[k]) - g_pickCell.boxHalf[k]);
+        sealed::boxCoordsOf(cell, g_frameCam, x);
+        for (int k = 0; k < 3; ++k) *pastM = std::max(*pastM, std::fabs(x[k]) - cell.boxHalf[k]);
         std::snprintf(out, cap, "cam in bay %.1f %.1f %.1f of half %.1f %.1f %.1f m", static_cast<double>(x[0]), static_cast<double>(x[1]), static_cast<double>(x[2]),
-                      static_cast<double>(g_pickCell.boxHalf[0]), static_cast<double>(g_pickCell.boxHalf[1]), static_cast<double>(g_pickCell.boxHalf[2]));
+                      static_cast<double>(cell.boxHalf[0]), static_cast<double>(cell.boxHalf[1]), static_cast<double>(cell.boxHalf[2]));
     } else {
-        const float d = sealed::distance(g_pickCell.centre, g_frameCam);
-        *pastM = std::max(0.0f, d - g_pickCell.radius);
-        std::snprintf(out, cap, "cam in bay no box, %.1f m from the centre of radius %.1f m", static_cast<double>(d), static_cast<double>(g_pickCell.radius));
+        const float d = sealed::distance(cell.centre, g_frameCam);
+        *pastM = std::max(0.0f, d - cell.radius);
+        std::snprintf(out, cap, "cam in bay no box, %.1f m from the centre of radius %.1f m", static_cast<double>(d), static_cast<double>(cell.radius));
     }
     if (*pastM < 0.0f) *pastM = 0.0f;
 }
@@ -3425,11 +3432,32 @@ void walkSurveyTick(uint64_t now, bool camIn) {
         g_walkOn = false;
         g_walkPassArmed = false;
         g_walkZoneSeen = false;
+        g_walkHeldValid = false;
         return;
+    }
+    // The held pick cell: a copy of the last pick with a cell, good for kWalkHoldMs, and the camera tested against it (the caller's camIn is the raw pick's).
+    if (g_pickCell.has) {
+        g_walkHeld = g_pickCell;
+        g_walkHeldValid = true;
+        g_walkHeldMs = now;
+    } else if (g_walkHeldValid && now - g_walkHeldMs > kWalkHoldMs) {
+        g_walkHeldValid = false;
+    }
+    const sealed::OwnCell& cell = g_walkHeld;
+    const bool hasCell = g_walkHeldValid;
+    camIn = false;
+    if (g_frameCamValid && hasCell) {
+        if (cell.box) {
+            float x[3] = {};
+            sealed::boxCoordsOf(cell, g_frameCam, x);
+            camIn = std::fabs(x[0]) <= cell.boxHalf[0] && std::fabs(x[1]) <= cell.boxHalf[1] && std::fabs(x[2]) <= cell.boxHalf[2];
+        } else {
+            camIn = sealed::distance(cell.centre, g_frameCam) <= cell.radius;
+        }
     }
     const uint64_t anchorMs = g_concAnchorMs.load(std::memory_order_relaxed);
     const bool anchorFresh = anchorMs != 0 && now - anchorMs <= kConcAnchorFreshMs;
-    const cc::WalkZone zone = cc::walkZone(g_aboardNow, anchorFresh, g_pickCell.has, camIn);
+    const cc::WalkZone zone = cc::walkZone(g_aboardNow, anchorFresh, hasCell, camIn);
     if (!g_walkOn) {
         g_walkOn = true;
         g_walkLineMs = now;
@@ -3449,14 +3477,14 @@ void walkSurveyTick(uint64_t now, bool camIn) {
     if (now - g_walkLineMs >= 1000 && g_walkLinesSession <= kWalkLinesCap) {
         char camText[160] = {};
         float past = 0.0f;
-        walkCamText(camText, sizeof(camText), &past);
+        walkCamText(cell, hasCell, camText, sizeof(camText), &past);
         const double meanMs = g_walkTicks ? static_cast<double>(now - g_walkLineMs) / static_cast<double>(g_walkTicks) : 0.0;
         if (g_walkLinesSession < kWalkLinesCap) {
             Log::get().note("walk survey: zone %s, seated %d, on foot %d, in hangar %d, social %d, anchor age %lld ms, %s, past the box by %.1f m, pad %s, pad in pass %d, seal %s, "
                             "frame mean %.2f ms over %u frames",
                             cc::walkZoneName(zone), g_aboardNow ? 1 : 0, (g_statusFlags2Now & sealed::kFlags2OnFoot) != 0 ? 1 : 0,
                             (g_statusFlags2Now & sealed::kFlags2OnFootInHangar) != 0 ? 1 : 0, (g_statusFlags2Now & sealed::kFlags2OnFootSocialSpace) != 0 ? 1 : 0,
-                            anchorMs != 0 ? static_cast<long long>(now - anchorMs) : -1ll, camText, static_cast<double>(past), g_pickCell.has ? g_pickCell.padName : "none",
+                            anchorMs != 0 ? static_cast<long long>(now - anchorMs) : -1ll, camText, static_cast<double>(past), hasCell ? cell.padName : "none",
                             g_stickyPadInPass ? 1 : 0, g_heldValid ? "held" : "not held", meanMs, static_cast<unsigned>(g_walkTicks));
         } else {
             Log::get().note("walk survey: %u lines written; no more lines this session", kWalkLinesCap);
@@ -3466,7 +3494,9 @@ void walkSurveyTick(uint64_t now, bool camIn) {
         g_walkTicks = 0;
     }
     // The names report: unsealed, with a pick cell, out of the concourse; every 5 s and at a zone change. One store pass judges against the pick cell.
-    if (!g_heldValid && g_pickCell.has && g_frameCamValid && zone != cc::WalkZone::kConcourse && (zoneChanged || now >= g_walkNamesDueMs)) {
+    // A zone change may arm a report only if a second has passed since the last one (a flicker of the zone cannot spend the session's reports).
+    if (!g_heldValid && hasCell && g_frameCamValid && zone != cc::WalkZone::kConcourse && ((zoneChanged && now - g_walkLastArmMs >= 1000) || now >= g_walkNamesDueMs)) {
+        g_walkLastArmMs = now;
         if (g_walkNamesSession < kWalkNamesCap) {
             try {
                 WalkAgg& a = walkAgg();
@@ -3476,9 +3506,9 @@ void walkSurveyTick(uint64_t now, bool camIn) {
             } catch (...) {
             }
             float past = 0.0f;
-            walkCamText(g_walkArmCam, sizeof(g_walkArmCam), &past);
+            walkCamText(cell, hasCell, g_walkArmCam, sizeof(g_walkArmCam), &past);
             g_walkArmZone = zone;
-            g_walkCellCopy = g_pickCell;
+            g_walkCellCopy = cell;
             g_walkPassArmed = true;   // published with this tick's snapshot (publishSnapshot, later in the tick)
             if (++g_walkNamesSession == kWalkNamesCap) Log::get().note("walk survey names: %u reports written; no more this session", kWalkNamesCap);
         }

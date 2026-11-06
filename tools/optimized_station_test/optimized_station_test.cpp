@@ -3753,24 +3753,30 @@ int main(int argc, char** argv) {
                   "concourse walk zone: the names");
         }
 
-        // The glow levels by window type (diag.concourse_glow = sky,bay,other).
+        // The glow levels by window type (diag.concourse_glow = sky,angled,other,bay).
         {
-            float v[3] = {-1, -1, -1};
-            check(cc::parseGlowLevels("4,0.25,1", v) && v[0] == 4.0f && v[1] == 0.25f && v[2] == 1.0f, "concourse glow: the default text parses to sky 4, bay 0.25, other 1");
-            check(cc::kGlowSkyDefault == 4.0f && cc::kGlowBayDefault == 0.25f && cc::kGlowOtherDefault == 1.0f, "concourse glow: the defaults are 4, 0.25, 1");
-            check(cc::parseGlowLevels(" 0 , 16 ,  2.5 ", v) && v[0] == 0.0f && v[1] == 16.0f && v[2] == 2.5f, "concourse glow: spaces are allowed, 0 and 16 are the limits");
-            float keep[3] = {7, 8, 9};
-            check(!cc::parseGlowLevels("", keep) && !cc::parseGlowLevels(nullptr, keep) && !cc::parseGlowLevels("1,2", keep) && !cc::parseGlowLevels("1,2,3,4", keep) &&
-                      !cc::parseGlowLevels("1,2,x", keep) && !cc::parseGlowLevels("1;2;3", keep) && !cc::parseGlowLevels("1,2,3 4", keep) && !cc::parseGlowLevels(",,", keep),
-                  "concourse glow: the wrong count, a letter or a stray character is refused");
-            check(!cc::parseGlowLevels("-0.1,1,1", keep) && !cc::parseGlowLevels("1,16.01,1", keep) && !cc::parseGlowLevels("1,1,100", keep) && !cc::parseGlowLevels("nan,1,1", keep) &&
-                      !cc::parseGlowLevels("inf,1,1", keep),
+            float v[4] = {-1, -1, -1, -1};
+            check(cc::parseGlowLevels("4,1.6,1,0.5", v) && v[0] == 4.0f && v[1] == 1.6f && v[2] == 1.0f && v[3] == 0.5f, "concourse glow: the default text parses to sky 4, angled 1.6, other 1, bay 0.5");
+            check(cc::kGlowSkyDefault == 4.0f && cc::kGlowAngledDefault == 1.6f && cc::kGlowOtherDefault == 1.0f && cc::kGlowBayDefault == 0.5f, "concourse glow: the defaults are 4, 1.6, 1, 0.5");
+            check(cc::parseGlowLevels(" 0 , 16 ,  2.5 , 1 ", v) && v[0] == 0.0f && v[1] == 16.0f && v[2] == 2.5f && v[3] == 1.0f, "concourse glow: spaces are allowed, 0 and 16 are the limits");
+            float keep[4] = {7, 8, 9, 10};
+            check(!cc::parseGlowLevels("", keep) && !cc::parseGlowLevels(nullptr, keep) && !cc::parseGlowLevels("1,2,3", keep) && !cc::parseGlowLevels("4,0.25,1", keep) &&
+                      !cc::parseGlowLevels("1,2,3,4,5", keep) && !cc::parseGlowLevels("1,2,3,x", keep) && !cc::parseGlowLevels("1;2;3;4", keep) && !cc::parseGlowLevels("1,2,3,4 5", keep) &&
+                      !cc::parseGlowLevels(",,,", keep),
+                  "concourse glow: the old three-number form, the wrong count, a letter or a stray character is refused");
+            check(!cc::parseGlowLevels("-0.1,1,1,1", keep) && !cc::parseGlowLevels("1,16.01,1,1", keep) && !cc::parseGlowLevels("1,1,1,100", keep) && !cc::parseGlowLevels("nan,1,1,1", keep) &&
+                      !cc::parseGlowLevels("inf,1,1,1", keep),
                   "concourse glow: a value under 0 or over 16, or not finite, is refused");
-            check(keep[0] == 7.0f && keep[1] == 8.0f && keep[2] == 9.0f, "concourse glow: a refused text leaves the output as it was");
-            check(std::fabs(cc::glowSkyRatio(4.0f, 1.0f) - 4.0f) < 1e-6f && std::fabs(cc::glowSkyRatio(2.0f, 0.5f) - 4.0f) < 1e-6f, "concourse glow: the sky ratio is sky over other");
-            check(cc::glowOtherLevel(1.0f) == 1.0f && cc::glowOtherLevel(0.0f) == cc::kGlowOtherFloor && cc::glowSkyRatio(4.0f, 0.0f) == 4.0f / cc::kGlowOtherFloor,
-                  "concourse glow: other at 0 is floored at 0.001 for the level and the ratio, so a skylight still lands on sky");
-            check(std::fabs(cc::glowOtherLevel(0.0f) * cc::glowSkyRatio(4.0f, 0.0f) - 4.0f) < 1e-3f, "concourse glow: the floored level times the ratio is the sky level");
+            check(keep[0] == 7.0f && keep[1] == 8.0f && keep[2] == 9.0f && keep[3] == 10.0f, "concourse glow: a refused text leaves the output as it was");
+        }
+
+        // The entry share of the shop window.
+        {
+            check(cc::clearEntryScale(30) == 0.3f && cc::clearEntryScale(36) == 1.0f && cc::clearEntryScale(12) == 1.0f && cc::clearEntryScale(0) == 1.0f,
+                  "concourse clear: only n=30 (the shop window) enters at 0.3 of the share");
+            check(std::fabs(0.2f * cc::clearEntryScale(30) - 0.06f) < 1e-6f && std::fabs(0.2f * cc::clearEntryScale(30) * cc::kClearExitRatio - 0.024f) < 1e-6f,
+                  "concourse clear: the 20% share becomes 6% in and 2.4% out for the shop window");
+            check(0.073f >= 0.2f * cc::clearEntryScale(30) && 0.03f < 0.2f * cc::clearEntryScale(30), "concourse clear: the 7.3% seen at the counter enters, the under-3% seen elsewhere does not");
         }
 
         // The withheld outside draws: named by shader, found by a bloom and a scan.

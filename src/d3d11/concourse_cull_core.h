@@ -459,19 +459,17 @@ inline WalkZone walkZone(bool seated, bool anchorFresh, bool hasCell, bool camIn
     return camIn ? WalkZone::kBay : WalkZone::kPastBox;
 }
 
-// ---- The glow levels by window type (diag.concourse_glow = "sky,bay,other") -------------------------------------------------------------------------
-// The steady glow behind the mirror: the brightest on overhead skylights, the least on the bay windows, a middle level on any other window. Each from 0 to 16.
+// ---- The glow levels by window type (diag.concourse_glow = "sky,angled,other,bay") ---------------------------------------------------------------------
+// The steady light of a pane: the brightest on overhead skylights, a level between on angled skylights, a middle level on any other window, and its own level on the
+// bay window. Absolute levels, each from 0 to 16. Overhead, angled and other are told by how much the pane faces the anchor's up axis (the pixel shader).
 constexpr float kGlowMax = 16.0f;
-constexpr float kGlowSkyDefault = 4.0f, kGlowBayDefault = 0.25f, kGlowOtherDefault = 1.0f;
-// With `other` at 0 the ratio sky / other has no meaning: the blend level of a non-bay pane is then kGlowOtherFloor and the ratio is taken against that, so a
-// pane that is not a skylight shows nothing (a thousandth of the sky level at most) and a skylight still shows `sky`.
-constexpr float kGlowOtherFloor = 0.001f;
-// "a,b,c": three numbers, each 0 to 16, separated by commas, spaces allowed around each. False for anything else (the caller keeps the last value).
-inline bool parseGlowLevels(const char* text, float out[3]) noexcept {
+constexpr float kGlowSkyDefault = 4.0f, kGlowAngledDefault = 1.6f, kGlowOtherDefault = 1.0f, kGlowBayDefault = 0.5f;
+// "a,b,c,d": four numbers, each 0 to 16, separated by commas, spaces allowed around each. False for anything else (the caller keeps the last value).
+inline bool parseGlowLevels(const char* text, float out[4]) noexcept {
     if (!text) return false;
-    float v[3] = {};
+    float v[4] = {};
     const char* s = text;
-    for (int i = 0; i < 3; ++i) {
+    for (int i = 0; i < 4; ++i) {
         while (*s == ' ' || *s == '\t') ++s;
         char* end = nullptr;
         const double d = std::strtod(s, &end);
@@ -479,19 +477,15 @@ inline bool parseGlowLevels(const char* text, float out[3]) noexcept {
         v[i] = static_cast<float>(d);
         s = end;
         while (*s == ' ' || *s == '\t') ++s;
-        if (i < 2) {
+        if (i < 3) {
             if (*s != ',') return false;
             ++s;
         }
     }
     if (*s != '\0') return false;
-    for (int i = 0; i < 3; ++i) out[i] = v[i];
+    for (int i = 0; i < 4; ++i) out[i] = v[i];
     return true;
 }
-// sky over other, the ratio the pixel shader applies to a horizontal pane; other is floored at kGlowOtherFloor.
-inline float glowSkyRatio(float sky, float other) noexcept { return sky / (other > kGlowOtherFloor ? other : kGlowOtherFloor); }
-// The blend level of a pane that is not the clearing pane.
-inline float glowOtherLevel(float other) noexcept { return other > kGlowOtherFloor ? other : kGlowOtherFloor; }
 
 // ---- The bay glass's clearing, following the bay in view ------------------------------------------------------------------------------------------
 // Mirror (the glass stands in, the cull is on) -> Lifting (the cull is off, the glass still opaque, so the station is back before it opens) -> FadingOut ->
@@ -510,6 +504,11 @@ inline const char* clearPhaseName(ClearPhase p) noexcept {
         default: return "fading-in";
     }
 }
+
+// The shop window (the ship services counter) is the mesh n=30, start 7301760. It reads exterior, and at the counter it fills 7.3 to 8.3% of the view (Flight 11, cam_local
+// 9.2 26.17 30.8), its maximum 9.8%; elsewhere, in three flights, n=30 stayed under 3%. The 20% entry share never reached it, so it enters at 0.3 of the share.
+// The exit follows at kClearExitRatio of that. Any other pane enters at the share itself.
+inline float clearEntryScale(uint32_t n) noexcept { return n == 30 ? 0.3f : 1.0f; }
 
 constexpr float kClearExitRatio = 0.4f;     // the exit share is enterShare * this (20% in, 8% out)
 constexpr uint64_t kClearReleaseMs = 250;   // the share must stay below the exit share this long
