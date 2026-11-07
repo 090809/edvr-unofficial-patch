@@ -1205,6 +1205,30 @@ void frameGenReplayPump() {
 bool frameGenReplayIdle() { return !rp.open && !rp.writing && !rp.workerRunning && rp.count == 0; }
 uint32_t frameGenReplayCaptured() { return rp.count; }
 
+namespace {
+// The Monitor page's copy of the last closed window (frameGenSynthMonitor): written here once a second, read by the page once a second.
+std::mutex g_monitorMu;
+FrameGenMonitorSynth g_monitor;
+void publishMonitor(bool called) {
+    FrameGenMonitorSynth m;
+    m.valid = called;
+    m.built = g.win.frames[0];
+    m.gpuMs = g.win.gpuMedian[0];
+    m.gpuN = g.win.gpuSamples[0];
+    m.finishMs = g.win.gpuMedian[2];
+    m.finishN = g.win.gpuSamples[2];
+    // The game device's bytes, as the VRAM line's groups count them: both eyes and the shared scratch.
+    m.gameBytes = vramOf(g.eye[0], g.scratch).eye() + vramOf(g.eye[1], g.scratch).eye() + vramOf(g.eye[0], g.scratch).scratch();
+    std::lock_guard<std::mutex> l(g_monitorMu);
+    g_monitor = m;
+}
+}  // namespace
+
+FrameGenMonitorSynth frameGenSynthMonitor() {
+    std::lock_guard<std::mutex> l(g_monitorMu);
+    return g_monitor;
+}
+
 void frameGenSynthFrameBoundary() {
     static int64_t s_ticks = 0;
     if (g_on.load()) frameGenReplayPump();
@@ -1212,7 +1236,12 @@ void frameGenSynthFrameBoundary() {
         if (rp.open || rp.writing || rp.count) replayRelease();   // the key went off: nothing captured is kept
         // The key went off: nothing stays resident, and the next time on starts a fresh window.
         if (anyResources() || g.dev || g.failed) releaseAll();
-        if (s_ticks != 0 || g.win.frames[0] || g.win.frames[1] || g.win.skipped) { windowReset(); s_ticks = 0; }
+        if (s_ticks != 0 || g.win.frames[0] || g.win.frames[1] || g.win.skipped) {
+            windowReset();
+            s_ticks = 0;
+            std::lock_guard<std::mutex> l(g_monitorMu);
+            g_monitor = FrameGenMonitorSynth{};
+        }
         return;
     }
     const int64_t now = qpcNow();
@@ -1224,6 +1253,7 @@ void frameGenSynthFrameBoundary() {
     if (freq <= 0 || now - s_ticks < freq) return;
     s_ticks = now;
     if (g.win.frames[0] == 0 && g.win.frames[1] == 0 && g.win.skipped == 0) {   // the module was not called in the window (a menu, a loading screen): nothing to say
+        publishMonitor(false);
         windowReset();
         return;
     }
@@ -1236,6 +1266,7 @@ void frameGenSynthFrameBoundary() {
     fillRotation(g.win);
     const std::string line = formatFrameGenSynthReport(g.win);
     Log::get().note("%s", line.c_str());
+    publishMonitor(true);
     // Phase 2.2: a window that built S and was never handed a slot since the key went on: the runtime does not have the channel (an older openvr_api.dll). Said once per arm.
     if (!g.slotSeen && !g.slotAbsenceSaid && g.win.frames[0] > 0) {
         g.slotAbsenceSaid = true;

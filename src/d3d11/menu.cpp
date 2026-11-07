@@ -2196,6 +2196,23 @@ void buildMonitor(MenuContent& c) {
         l.style = kMenuNote;
         l.badge = kBadgeNone;
     }
+    // FRAME GENERATION, only while fix.frame_generation or fix.frame_generation_shadow is on (perf_monitor.h): a heading and up to four lines, once a second.
+    {
+        char fg[4][96];
+        const int n = perfMonitorFrameGenLines(fg, 4);
+        if (n > 0 && c.lineCount + 1 + n <= kMenuMaxLines) {
+            MenuLine& h = c.lines[c.lineCount++];
+            strncpy(h.left, "FRAME GENERATION", sizeof(h.left) - 1);
+            h.style = kMenuHeading;
+            h.badge = kBadgeNone;
+            for (int i = 0; i < n; ++i) {
+                MenuLine& l = c.lines[c.lineCount++];
+                strncpy(l.left, fg[i], sizeof(l.left) - 1);
+                l.style = kMenuNote;
+                l.badge = kBadgeNone;
+            }
+        }
+    }
     c.compact = true;
     // Two strips, fpsVR's pair: the GPU frame the compositor measured, and
     // the render thread's own busy time.

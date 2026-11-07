@@ -301,6 +301,10 @@ void temporalPassStageFrameGenDump(ID3D11DeviceContext* ctx, int k, ID3D11Textur
 // Frame generation, Phase 2.3 (fix.frame_generation): whether the runtime's slot for the treat being made said Lock 2:1 is engaged (native_temporal.cpp; false with a 2.2
 // runtime, which hands a size 1 slot, or with no slot). Read by the pass right after the treat's note, on the same thread.
 bool nativeTemporalFrameGenLock();
+// The settings menu's Monitor page (common/framegen_monitor_text.h, which a caller includes): the runtime's half of frame generation as its last slot gave it (a size 3 slot; a
+// smaller one reads as unknown), with that slot's age. Any thread; the slot's own lock.
+struct FrameGenMonitorRuntime;
+FrameGenMonitorRuntime nativeTemporalFrameGenMonitor();
 
 // probe.w bits 64 and 256 of the temporal shader: t6 (the smoke's depth) / t7
 // (the private UI depth) NOT bound, so zSceneAt skips the fetch and uses the

@@ -12,6 +12,7 @@
 
 #include <cstdint>
 
+#include "../common/framegen_monitor_text.h"
 #include "../common/framegen_replay_math.h"
 #include "../common/framegen_synth_math.h"
 #include "../common/native_temporal.h"
@@ -112,5 +113,9 @@ uint32_t frameGenReplayCaptured();    // frames held (captured, not yet written 
 // For the WARP rig (tools/framegen_synth_test): whether any shader, buffer or texture exists, and a copy of the open one-second window.
 bool frameGenSynthResident();
 FrameGenSynthWindow frameGenSynthOpenWindow();
+
+// The settings menu's Monitor page (common/framegen_monitor_text.h): the last closed one-second window's build and finish medians and the game-device bytes the synthesizer
+// holds, as its log lines say them. Any thread; empty while the key is off.
+FrameGenMonitorSynth frameGenSynthMonitor();
 
 }  // namespace edvr

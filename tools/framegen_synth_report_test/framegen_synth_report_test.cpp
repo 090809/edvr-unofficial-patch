@@ -6,6 +6,7 @@
 //   --self-test  every check
 #include "framegen_synth_math.h"
 #include "framegen_slot_report.h"
+#include "framegen_monitor_text.h"   // the Monitor page's FRAME GENERATION block
 
 #include <cmath>
 #include <cstdio>
@@ -366,6 +367,109 @@ void caseResidual() {
     check(std::fabs(dS[0] - dRes[0]) > 1e-3f, "and the kept step the wrong way round is a different turn");
 }
 
+// The settings menu's Monitor page, FRAME GENERATION (framegen_monitor_text.h): the exact lines for each state, nothing with both keys off, and a runtime whose slot is older
+// than size 3 reads as unknown.
+void caseMonitor() {
+    char l[kFrameGenMonitorMaxLines][kFrameGenMonitorLineChars];
+    const auto lines = [&](const FrameGenMonitorInput& in) {
+        std::memset(l, 0, sizeof(l));
+        const int n = formatFrameGenMonitor(in, l, kFrameGenMonitorMaxLines);
+        std::string s;
+        for (int i = 0; i < n; ++i) { s += l[i]; s += '\n'; }
+        return s;
+    };
+    FrameGenMonitorInput off;
+    check(formatFrameGenMonitor(off, l, kFrameGenMonitorMaxLines) == 0, "monitor: both keys off draws no block");
+
+    FrameGenMonitorSynth synth;
+    synth.valid = true;
+    synth.built = 90;
+    synth.gpuMs = 1.234f;
+    synth.gpuN = 90;
+    synth.finishMs = 0.21f;
+    synth.finishN = 90;
+    synth.gameBytes = 182ull * 1024 * 1024;
+    FrameGenMonitorRuntime rt;
+    rt.known = kFrameGenMonitorSlot;
+    rt.ageMs = 11;
+    rt.reason = static_cast<uint32_t>(FrameGenLockReason::None);
+    rt.lastSecond = true;
+    rt.sSlots = 45;
+    rt.fromS = 44;
+    rt.lateS = 1;
+    rt.lateReal = 0;
+    rt.slotDegMedian = 0.42f;
+    rt.xrBytes = 63ull * 1024 * 1024;
+
+    FrameGenMonitorInput shadow;
+    shadow.shadowKey = true;
+    shadow.synth = synth;
+    shadow.runtime = rt;
+    checkText(lines(shadow),
+              "State: shadow (S is synthesized, nothing is shown)\n"
+              "Synth 1.23 ms/eye, finish 0.21 ms/eye, slot pose miss 0.42 deg\n"
+              "VRAM: game 182.0 MiB, XR 63.0 MiB\n",
+              "monitor: shadow only");
+
+    FrameGenMonitorInput lock;
+    lock.lockKey = true;
+    lock.synth = synth;
+    lock.runtime = rt;
+    checkText(lines(lock),
+              "State: Lock engaged\n"
+              "Last second: S shown 44/45, B replayed 1, late real 0\n"
+              "Synth 1.23 ms/eye, finish 0.21 ms/eye, slot pose miss 0.42 deg\n"
+              "VRAM: game 182.0 MiB, XR 63.0 MiB\n",
+              "monitor: Lock engaged");
+
+    FrameGenMonitorInput waiting = lock;
+    waiting.runtime.reason = static_cast<uint32_t>(FrameGenLockReason::NoS);
+    waiting.runtime.lastSecond = false;
+    waiting.runtime.slotDegMedian = -1.0f;
+    waiting.synth.finishN = 0;
+    checkText(lines(waiting),
+              "State: Lock waiting (no_s)\n"
+              "Last second: no window closed yet\n"
+              "Synth 1.23 ms/eye, finish - ms/eye\n"
+              "VRAM: game 182.0 MiB, XR 63.0 MiB\n",
+              "monitor: Lock waiting, named by the gate's reason; no window, no miss, no finish timed");
+    waiting.runtime.reason = static_cast<uint32_t>(FrameGenLockReason::DeferredPacing);
+    check(lines(waiting).rfind("State: Lock waiting (deferred_pacing)\n", 0) == 0, "monitor: the reason is the lock's own name (deferred_pacing)");
+    waiting.runtime.reason = 200;
+    check(lines(waiting).rfind("State: Lock waiting (unknown)\n", 0) == 0, "monitor: a reason past the table reads unknown");
+
+    // A runtime from 2.3 or 2.2 hands a size 2 or 1 slot: its Lock state is unknown here, and so is the XR side.
+    FrameGenMonitorInput old = lock;
+    old.runtime = FrameGenMonitorRuntime{};
+    old.runtime.known = kFrameGenMonitorOldSlot;
+    checkText(lines(old),
+              "State: Lock unknown (the runtime is older than this d3d11.dll)\n"
+              "Synth 1.23 ms/eye, finish 0.21 ms/eye\n"
+              "VRAM: game 182.0 MiB, XR unknown\n",
+              "monitor: a size 2 runtime reads unknown");
+    FrameGenMonitorInput none = lock;
+    none.runtime = FrameGenMonitorRuntime{};
+    none.synth = FrameGenMonitorSynth{};
+    checkText(lines(none),
+              "State: Lock unknown (no slot from the runtime yet)\n"
+              "Synth: no S built in the last second\n"
+              "VRAM: game 0.0 MiB, XR unknown\n",
+              "monitor: no slot yet, no synth window");
+    FrameGenMonitorInput stale = lock;
+    stale.runtime.ageMs = 5000;
+    check(lines(stale).rfind("State: Lock unknown (no slot from the runtime for 5 s)\n", 0) == 0, "monitor: a stale slot is not the state now");
+    // Every line fits MenuLine::left with room to spare (the page's notes run to about 80 characters).
+    FrameGenMonitorInput wide = lock;
+    wide.runtime.sSlots = wide.runtime.fromS = wide.runtime.lateS = wide.runtime.lateReal = 4000000000u;
+    wide.runtime.reason = static_cast<uint32_t>(FrameGenLockReason::FinishPending);
+    wide.synth.gpuMs = wide.synth.finishMs = 99999.0f;
+    wide.runtime.slotDegMedian = 180.0f;
+    const int n = formatFrameGenMonitor(wide, l, kFrameGenMonitorMaxLines);
+    bool fits = n == 4;
+    for (int i = 0; i < n; ++i) fits = fits && std::strlen(l[i]) < 90;
+    check(fits, "monitor: the widest lines fit the page");
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -390,6 +494,7 @@ int main(int argc, char** argv) {
     caseHeadStep();
     caseCb();
     caseTarget();
+    caseMonitor();
     if (g_fail) {
         std::printf("framegen_synth_report_test: %d check(s) FAILED\n", g_fail);
         return 1;

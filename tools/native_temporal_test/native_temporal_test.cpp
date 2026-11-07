@@ -21,6 +21,7 @@
 #include "../../src/openxr/native_temporal_client.h"
 #include "../../src/openxr/framegen_slot_transfer.h"   // frame generation 2.2: the runtime's end of the slot channel (FrameGenSlotChannel)
 #include "../../src/common/framegen_synth_math.h"      // ... and the head step the provider computes (frameGenSlotStep)
+#include "../../src/common/framegen_monitor_text.h"    // the Monitor page's read of the slot's size 3 fields
 #include "../../src/common/system_d3d11.h"
 #include "../../src/d3d11/glitch_frame.h"
 #include "../../src/d3d11/transition_flash_eye_base.h"
@@ -478,7 +479,8 @@ void run(){
     fs=frame(11,22);fs.head[3]=.1f;
     float headS[12]={std::cos(a),0,std::sin(a),.11f, 0,1,0,0, -std::sin(a),0,std::cos(a),0};
     const auto slot=FrameGenSlotChannel::slot(22,1000000000,1011111111,headS,true);
-    check(slot.size==EDVR_NATIVE_FRAMEGEN_SLOT_SIZE_2&&slot.version==1&&slot.poseValid==1&&slot.consumer==1&&slot.slotTime==1011111111&&slot.lockEngaged==0,"frame generation slot: the runtime's slot carries the pose, T_S and the consumer (size 2 since 2.3, Lock not engaged)");
+    check(slot.size==EDVR_NATIVE_FRAMEGEN_SLOT_SIZE_3&&slot.version==1&&slot.poseValid==1&&slot.consumer==1&&slot.slotTime==1011111111&&slot.lockEngaged==0,"frame generation slot: the runtime's slot carries the pose, T_S and the consumer (size 3 since the Monitor page, Lock not engaged)");
+    check(slot.lockReason==uint32_t(edvr::FrameGenLockReason::KeyOff)&&slot.lastSecond==0&&slot.slotDegMedian<0.0f&&slot.xrBytes==0,"frame generation slot: its Monitor fields default to Lock's key off, no window, no miss");
     check(edvrFrameGenNoteSlot(&slot)==S_OK,"frame generation slot: the provider takes a version 1 slot");
     begin(t,fs);treat(t,22,0,source.Get());
     float rot[9],tr[3];edvr::frameGenSlotStep(headS,fs.head,fs.eyeToHead[0],rot,tr);
@@ -514,7 +516,8 @@ void run(){
     check(none.poseValid==0&&none.slotTime==0,"frame generation slot: no T_S means no pose, whatever head is passed");
     // Phase 2.3: Lock's bit rides a size 2 slot. Engaged: the treat of that very pair reads it; a size 1 slot (a 2.2 runtime) is read as not engaged whatever its bytes past
     // size 1 say; a slot for another pair is not this treat's; the next treat without a slot reads not engaged.
-    check(EDVR_NATIVE_FRAMEGEN_SLOT_SIZE_1==88u&&EDVR_NATIVE_FRAMEGEN_SLOT_SIZE_2==96u,"frame generation lock: the slot's size 1 is 2.2's 88 bytes and size 2 adds the lock word (96)");
+    check(EDVR_NATIVE_FRAMEGEN_SLOT_SIZE_1==88u&&EDVR_NATIVE_FRAMEGEN_SLOT_SIZE_2==96u&&EDVR_NATIVE_FRAMEGEN_SLOT_SIZE_3==136u,
+          "frame generation lock: the slot's size 1 is 2.2's 88 bytes, size 2 adds the lock word (96), size 3 the Monitor page's fields (136)");
     auto locked=FrameGenSlotChannel::slot(27,1000000000,1011111111,headS,true,true);
     check(locked.lockEngaged==1&&edvrFrameGenNoteSlot(&locked)==S_OK,"frame generation lock: an engaged slot is handed and taken");
     fs=frame(11,27);begin(t,fs);treat(t,27,0,source.Get());
@@ -526,6 +529,23 @@ void run(){
     auto lockedOther=FrameGenSlotChannel::slot(77,1000000000,1011111111,headS,true,true);edvrFrameGenNoteSlot(&lockedOther);
     fs=frame(11,29);begin(t,fs);treat(t,29,0,source.Get());
     check(!edvr::nativeTemporalFrameGenLock(),"frame generation lock: an engaged slot for another pair is not this treat's");
+    // The Monitor page: a size 3 slot's fields are read back as handed; a size 2 slot (a 2.3 runtime) reads as unknown, whatever lies past its size.
+    {
+      auto m3=FrameGenSlotChannel::slot(30,1000000000,1011111111,headS,true,false);
+      m3.lockReason=uint32_t(edvr::FrameGenLockReason::NoS);m3.lastSecond=1;m3.sSlots=45;m3.fromS=44;m3.lateS=1;m3.lateReal=2;m3.slotDegMedian=0.5f;m3.xrBytes=1234;
+      check(edvrFrameGenNoteSlot(&m3)==S_OK,"frame generation monitor: a size 3 slot is taken");
+      const edvr::FrameGenMonitorRuntime got=edvr::nativeTemporalFrameGenMonitor();
+      check(got.known==edvr::kFrameGenMonitorSlot&&got.reason==uint32_t(edvr::FrameGenLockReason::NoS)&&got.lastSecond&&got.sSlots==45&&got.fromS==44&&got.lateS==1&&
+            got.lateReal==2&&got.slotDegMedian==0.5f&&got.xrBytes==1234&&got.ageMs<1000,"frame generation monitor: ...and the page reads its fields as handed");
+      auto m2=m3;m2.sequence=31;m2.size=EDVR_NATIVE_FRAMEGEN_SLOT_SIZE_2;
+      check(edvrFrameGenNoteSlot(&m2)==S_OK,"frame generation monitor: a size 2 slot (a 2.3 runtime) is taken");
+      const edvr::FrameGenMonitorRuntime old=edvr::nativeTemporalFrameGenMonitor();
+      check(old.known==edvr::kFrameGenMonitorOldSlot&&old.sSlots==0&&old.xrBytes==0,"frame generation monitor: ...and reads as unknown on the page, nothing past its size read");
+      char lines[edvr::kFrameGenMonitorMaxLines][edvr::kFrameGenMonitorLineChars]={};
+      edvr::FrameGenMonitorInput in;in.lockKey=true;in.runtime=old;
+      check(edvr::formatFrameGenMonitor(in,lines,edvr::kFrameGenMonitorMaxLines)>0&&std::strcmp(lines[0],"State: Lock unknown (the runtime is older than this d3d11.dll)")==0,
+            "frame generation monitor: ...and the page says so");
+    }
     // The runtime's end. An older d3d11.dll (a module without the exports, here kernel32) has no channel: nothing is handed and nothing is read.
     FrameGenSlotChannel oldD3d;
     check(!oldD3d.resolve(GetModuleHandleW(L"kernel32.dll"))&&!oldD3d.present()&&oldD3d.hand(slot)==S_FALSE,"frame generation slot: an older d3d11.dll (no exports) gives the runtime no channel, and nothing is handed");

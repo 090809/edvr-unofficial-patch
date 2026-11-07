@@ -38,6 +38,10 @@
 #include "sharpen_pass.h"
 #include "stall_watch.h"
 #include "temporal_pass.h"
+#include "framegen_shadow.h"  // frameGenShadowVramBytes: the FRAME GENERATION block's game-side bytes
+#include "framegen_synth.h"   // frameGenSynthMonitor: the block's synthesizer line
+#include "../common/framegen_monitor_text.h"
+#include <mutex>
 // fsr3_engine.h is deliberately NOT included: the EDVR PASSES tile reaches
 // AMD's price through temporal_pass.h's temporalPassTrainedTotals, which
 // answers for the engine fix.temporal_aa names right now (F6).
@@ -366,8 +370,32 @@ void nvArm() {
     if (!ok) snprintf(s.nvWhy, sizeof(s.nvWhy), "n/a (NvAPI refused)");
 }
 
+// FRAME GENERATION (common/framegen_monitor_text.h): the block's lines, made by the slow sampler and read by the menu's model. Empty with both keys off.
+std::mutex g_fgMu;
+char g_fgLines[kFrameGenMonitorMaxLines][kFrameGenMonitorLineChars] = {};
+int g_fgCount = 0;
+
+void sampleFrameGen() {
+    auto& cfg = Config::get();
+    FrameGenMonitorInput in;
+    in.lockKey = cfg.getString("fix.frame_generation", "off") == "on";
+    in.shadowKey = cfg.getString("fix.frame_generation_shadow", "off") == "on";
+    char lines[kFrameGenMonitorMaxLines][kFrameGenMonitorLineChars] = {};
+    int n = 0;
+    if (in.lockKey || in.shadowKey) {
+        in.runtime = nativeTemporalFrameGenMonitor();
+        in.synth = frameGenSynthMonitor();
+        in.synth.gameBytes += frameGenShadowVramBytes();
+        n = formatFrameGenMonitor(in, lines, kFrameGenMonitorMaxLines);
+    }
+    std::lock_guard<std::mutex> l(g_fgMu);
+    std::memcpy(g_fgLines, lines, sizeof(lines));
+    g_fgCount = n;
+}
+
 void slowSample(ID3D11Device* dev) {
     State& s = g_s;
+    sampleFrameGen();
     // CPU, system-wide and this process.
     FILETIME idle{}, kernel{}, user{};
     if (GetSystemTimes(&idle, &kernel, &user)) {
@@ -1371,6 +1399,14 @@ void perfMonitorNoteReissue(size_t caller, bool timed, int64_t ticks) {
     if (!timed) return;
     ++g_s.reissueFrameCalls[caller];
     if (ticks > 0) g_s.reissueFrameTicks[caller] += ticks;
+}
+
+int perfMonitorFrameGenLines(char (*out)[96], int max) {
+    static_assert(kFrameGenMonitorLineChars == 96, "the block's lines are MenuLine::left's width");
+    std::lock_guard<std::mutex> l(g_fgMu);
+    const int n = g_fgCount < max ? g_fgCount : max;
+    for (int i = 0; i < n; ++i) std::memcpy(out[i], g_fgLines[i], sizeof(g_fgLines[i]));
+    return n;
 }
 
 void perfMonitorSetActive(bool active) {

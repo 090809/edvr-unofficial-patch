@@ -11,6 +11,7 @@
 
 #include <cstdint>
 
+#include "../common/framegen_lock_report.h"   // FrameGenLockReason (the slot's size 3 default); it includes framegen_slot_report.h
 #include "../common/framegen_slot_report.h"
 #include "../common/native_temporal.h"
 
@@ -37,7 +38,9 @@ struct FrameGenSlotChannel {
   // whether Lock is engaged as the pair begins.
   static EdvrNativeFrameGenSlot slot(uint64_t sequence, int64_t displayTime, int64_t slotTime, const float* head, bool consumer, bool lockEngaged = false) noexcept {
     EdvrNativeFrameGenSlot s{};
-    s.size = EDVR_NATIVE_FRAMEGEN_SLOT_SIZE_2;
+    s.size = EDVR_NATIVE_FRAMEGEN_SLOT_SIZE_3;   // the size 3 fields (the Monitor page's) are the caller's to fill; left as made: Lock's key off, no window, no miss
+    s.lockReason = static_cast<uint32_t>(FrameGenLockReason::KeyOff);
+    s.slotDegMedian = -1.0f;
     s.lockEngaged = lockEngaged ? 1u : 0u;
     s.version = EDVR_NATIVE_FRAMEGEN_VERSION_1;
     s.sequence = sequence;

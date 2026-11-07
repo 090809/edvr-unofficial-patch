@@ -45,6 +45,8 @@ void frameGenShadowFrameBoundary();
 
 // For the WARP rig (tools/framegen_shadow_test): whether any of the scorer's shaders, buffers or textures exist, and a copy of the open one-second window.
 bool frameGenShadowResident();
+// The settings menu's Monitor page: the game-device bytes the scorer holds (its VRAM line's groups, both eyes), as of the last one-second boundary; 0 while the key is off.
+uint64_t frameGenShadowVramBytes();
 FrameGenShadowWindow frameGenShadowOpenWindow();
 
 }  // namespace edvr

@@ -19,6 +19,7 @@
 #include "../common/frame_flag.h"
 #include "../common/temporal_math.h"
 #include "../common/framegen_synth_math.h"   // frameGenSlotStep: the head step to the synthetic slot (Phase 2.2)
+#include "../common/framegen_monitor_text.h"  // FrameGenMonitorRuntime: the slot's size 3 fields, for the Monitor page
 #include "../common/temporal_mode.h"
 #include "../common/supersample_math.h"
 #include "../common/log.h"
@@ -198,6 +199,8 @@ void eyeDelta(const History& h,const State& s,const float* eyePrev,const float* 
 // pair's treats, and treat() reads it under `mutex`, which the note never takes.
 struct FrameGenSlot { bool have=false,pose=false,consumer=false,lock=false; uint64_t sequence=0; float head[12]{}; };
 FrameGenSlot g_fgSlot; std::mutex g_fgMu;
+// The Monitor page's copy of the last slot's size 3 fields (common/framegen_monitor_text.h), written beside g_fgSlot under the same lock and read once a second by the page.
+edvr::FrameGenMonitorRuntime g_fgMonitor; uint64_t g_fgMonitorMs=0;
 // Before the eye's pass: the head step from this frame's head (B) to the slot's (S) through this eye's own eye-to-head, for the treat of the slot's sequence only. Nothing is noted
 // for any other treat (the key off: the runtime notes nothing), so the pass reads no slot there.
 // Phase 2.3: whether Lock is engaged for the treat being made (the slot of this very sequence said so; anything else reads not engaged). Owner thread, read by the pass.
@@ -870,12 +873,27 @@ extern "C" HRESULT WINAPI edvrFrameGenNoteSlot(const EdvrNativeFrameGenSlot* slo
   next.lock=slot->size>=EDVR_NATIVE_FRAMEGEN_SLOT_SIZE_2&&slot->lockEngaged==1u;   // Phase 2.3: a size 1 slot (a 2.2 runtime) has no such field
   next.pose=slot->poseValid==1u&&rigid(slot->head);
   if(next.pose)std::memcpy(next.head,slot->head,sizeof(next.head));
-  std::lock_guard<std::mutex> l(g_fgMu);g_fgSlot=next;
+  // The Monitor page: a slot of size 3 carries Lock's state; a smaller one (an older runtime) reads as unknown there.
+  edvr::FrameGenMonitorRuntime m;
+  if(slot->size>=EDVR_NATIVE_FRAMEGEN_SLOT_SIZE_3){
+    m.known=edvr::kFrameGenMonitorSlot;m.reason=slot->lockReason;m.lastSecond=slot->lastSecond==1u;
+    m.sSlots=slot->sSlots;m.fromS=slot->fromS;m.lateS=slot->lateS;m.lateReal=slot->lateReal;m.slotDegMedian=slot->slotDegMedian;m.xrBytes=slot->xrBytes;
+  }else m.known=edvr::kFrameGenMonitorOldSlot;
+  const uint64_t nowMs=GetTickCount64();
+  std::lock_guard<std::mutex> l(g_fgMu);g_fgSlot=next;g_fgMonitor=m;g_fgMonitorMs=nowMs;
   return next.pose||slot->poseValid!=1u?S_OK:S_FALSE;   // S_FALSE: a pose was given and refused
 }
 namespace edvr{
 // Phase 2.3 (temporal_pass.h): Lock engaged for the treat being made, as the runtime's slot for its sequence said (false for a 2.2 runtime, or no slot).
 bool nativeTemporalFrameGenLock(){return g_fgLockNow.load(std::memory_order_relaxed);}
+// The Monitor page (temporal_pass.h): the runtime's half as the last slot gave it, with its age.
+FrameGenMonitorRuntime nativeTemporalFrameGenMonitor(){
+  const uint64_t nowMs=GetTickCount64();
+  std::lock_guard<std::mutex> l(g_fgMu);
+  FrameGenMonitorRuntime m=g_fgMonitor;
+  m.ageMs=m.known!=kFrameGenMonitorNoSlot&&nowMs>=g_fgMonitorMs?nowMs-g_fgMonitorMs:0;
+  return m;
+}
 }
 extern "C" HRESULT WINAPI edvrAcquireNativeTemporal(const EdvrNativeTemporalRequest* r,EdvrNativeTemporalTable* t){
   if(!t||t->size!=sizeof(*t)||t->version!=EDVR_NATIVE_TEMPORAL_VERSION_1)return E_INVALIDARG;*t={sizeof(*t),EDVR_NATIVE_TEMPORAL_VERSION_1};

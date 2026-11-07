@@ -86,9 +86,19 @@ struct EdvrNativeFrameGenSlot {
   // field past size 1. The version stays 1: the size alone says which fields are there.
   uint32_t lockEngaged;         // 1: Lock 2:1 is engaged as this pair begins (the d3d11 half builds the f = 0.5 S on every frame and no f = 1 S)
   uint32_t reserved;
+  // Size 3 (the settings menu's Monitor page, FRAME GENERATION): what Lock is doing, for the page only (nothing in the frame loop reads it). A size 2 slot has none of these, and
+  // the page says the runtime's state is unknown. The version stays 1.
+  uint32_t lockReason;          // framegen_lock_report.h FrameGenLockReason as the gate stands now (0 none: engaged; key_off while fix.frame_generation is off)
+  uint32_t lastSecond;          // 1: the four counts below are Lock's last completed one-second window (its log line); 0: no window has closed since the key went on
+  uint32_t sSlots, fromS;       // S slots run / of them, the ones that showed S
+  uint32_t lateS, lateReal;     // S slots that replayed B (late_s) / display periods Elite's frame missed while engaged (late_real)
+  float slotDegMedian;          // the head pose's miss at S's slot, degrees, median over the pose probe's last window (slot_deg); negative: none
+  uint32_t reserved3;
+  uint64_t xrBytes;             // the XR device's bytes the S transfers hold now (both eyes)
 };
 #define EDVR_NATIVE_FRAMEGEN_SLOT_SIZE_1 ((uint32_t)offsetof(EdvrNativeFrameGenSlot, lockEngaged))
-#define EDVR_NATIVE_FRAMEGEN_SLOT_SIZE_2 ((uint32_t)sizeof(EdvrNativeFrameGenSlot))
+#define EDVR_NATIVE_FRAMEGEN_SLOT_SIZE_2 ((uint32_t)offsetof(EdvrNativeFrameGenSlot, lockReason))
+#define EDVR_NATIVE_FRAMEGEN_SLOT_SIZE_3 ((uint32_t)sizeof(EdvrNativeFrameGenSlot))
 // The state of one eye's S after its treat.
 #define EDVR_NATIVE_FRAMEGEN_S_NONE 0u       // no S built for this sequence
 #define EDVR_NATIVE_FRAMEGEN_S_PRODUCED 1u   // S written and published (the producer texture's key released to 1): the runtime consumes it

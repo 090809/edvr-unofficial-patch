@@ -615,7 +615,10 @@ class NativeRuntimeHost : public SystemSource, public FrameSink, public Composit
     bool formatSaid=false;
     uint64_t menuFor=0;               // Phase 2.3b: the last pair EDVR's menu was drawn into (capture(), menuTreated)
     uint32_t unfinishedSaid=~0u;      // Phase 2.3b: the why of the last "not finished" line (~0: none said since the key went on)
+    // The Monitor page (the slot's size 3): the last closed one-second window's counts, as its line said them. lastValid false until one closes after the key went on.
+    bool lastValid=false;uint32_t lastSSlots=0,lastFromS=0,lastLateS=0,lastLateReal=0;
   } framegenLock;
+  float framegenPoseLastSlotDeg=-1.0f;   // the Monitor page: slot_deg's median from the pose probe's last window line (negative: none)
   // Diagnostic only (docs/linux-native-openxr-launch-centre-2026-09-22.md).
   uint64_t headLocateFailures=0,headLocateConsecutiveFailures=0;
   XrViewConfigurationView sizes[2]{};
@@ -2955,7 +2958,7 @@ class NativeRuntimeHost : public SystemSource, public FrameSink, public Composit
   void measureFramegenPose() {
     if(GetCurrentThreadId()!=ownerThread)return;
     if(!framegenSynthKeyOn()) {
-      if(framegenPoseWas){framegenPose.reset();framegenPoseWas=false;framegenPoseWindowUs=0;}
+      if(framegenPoseWas){framegenPose.reset();framegenPoseWas=false;framegenPoseWindowUs=0;framegenPoseLastSlotDeg=-1.0f;}
       return;
     }
     framegenPoseWas=true;
@@ -2998,7 +3001,10 @@ class NativeRuntimeHost : public SystemSource, public FrameSink, public Composit
     if(nowUs-framegenPoseWindowUs<1000000)return;
     framegenPoseWindowUs=nowUs;
     FrameGenPoseWindow window;
-    if(framegenPose.takeWindow(window))nativeTracePuts(formatFrameGenPoseReport(window).c_str());
+    if(framegenPose.takeWindow(window)) {
+      nativeTracePuts(formatFrameGenPoseReport(window).c_str());
+      framegenPoseLastSlotDeg=window.slotFrames?window.slotDeg[0]:-1.0f;
+    }
   }
   // Frame generation, Phase 2.2 (framegen_slot_report.h): the key went off (or the runtime closes): the transfers let go and nothing more is handed; the d3d11 half, handed no
   // slot, lets its producer texture go on its next build.
@@ -3034,7 +3040,15 @@ class NativeRuntimeHost : public SystemSource, public FrameSink, public Composit
     fs.previousT=displayTime>0?displayTime:0;
     fs.slotTime=slotTime;
     if(located)++fs.window.poseRuntime;else ++fs.window.poseNone;
-    fs.channel.hand(FrameGenSlotChannel::slot(sequence,displayTime,slotTime,located?&head.pose.mDeviceToAbsoluteTracking.m[0][0]:nullptr,separateGraphics(),lockNow));
+    auto slot=FrameGenSlotChannel::slot(sequence,displayTime,slotTime,located?&head.pose.mDeviceToAbsoluteTracking.m[0][0]:nullptr,separateGraphics(),lockNow);
+    // Size 3, the Monitor page's: copies of what the lock and the pose probe already keep, no more work than that.
+    const auto& fl=framegenLock;
+    slot.lockReason=uint32_t(fl.was?fl.gate.reason():FrameGenLockReason::KeyOff);
+    slot.lastSecond=fl.lastValid?1u:0u;
+    slot.sSlots=fl.lastSSlots;slot.fromS=fl.lastFromS;slot.lateS=fl.lastLateS;slot.lateReal=fl.lastLateReal;
+    slot.slotDegMedian=framegenPoseLastSlotDeg;
+    slot.xrBytes=fs.eyes[0].xrBytes()+fs.eyes[1].xrBytes();
+    fs.channel.hand(slot);
   }
   // After an eye's treat returned (capture()): what the d3d11 half built for this pair's slot. A produced S opens (or keeps) the eye's transfer and waits for the pair's finish.
   void framegenSlotAfterTreat(vr::EVREye eye) {
@@ -3115,6 +3129,7 @@ class NativeRuntimeHost : public SystemSource, public FrameSink, public Composit
     fl.gate.reset();fl.delivery=FrameGenSDelivery{};fl.window.reset();
     fl.was=false;fl.windowUs=fl.lastStepUs=0;fl.lastPairSequence=fl.deliveryNotedFor=0;fl.slotRan=false;fl.headFor=0;fl.headValid=false;
     fl.menuFor=0;fl.unfinishedSaid=~0u;
+    fl.lastValid=false;fl.lastSSlots=fl.lastFromS=fl.lastLateS=fl.lastLateReal=0;
     fl.sCapture.reset();
   }
   // Frame generation, Phase 2.3 (Lock): at the head of the game's WaitGetPoses (owner thread), before any wait. The key off: returns at once, and the frame loop is today's.
@@ -3181,6 +3196,7 @@ class NativeRuntimeHost : public SystemSource, public FrameSink, public Composit
     if(nowUs-fl.windowUs>=1000000) {
       fl.windowUs=nowUs;
       nativeTracePuts(formatFrameGenLockReport(fl.window,fl.gate.reason()).c_str());
+      fl.lastValid=true;fl.lastSSlots=fl.window.sSlots;fl.lastFromS=fl.window.fromS;fl.lastLateS=fl.window.lateS;fl.lastLateReal=fl.window.lateReal;
       fl.window.reset();
     }
   }

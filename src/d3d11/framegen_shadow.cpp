@@ -300,6 +300,12 @@ bool frameGenShadowOn() { return g_on.load(); }
 
 bool frameGenShadowResident() { return anyResources(); }
 
+// The Monitor page: the scorer's game-device bytes (its VRAM line's groups, both eyes), refreshed by the frame boundary once a second; 0 while the key is off.
+namespace {
+std::atomic<uint64_t> g_vramBytes{0};
+}
+uint64_t frameGenShadowVramBytes() { return g_vramBytes.load(std::memory_order_relaxed); }
+
 FrameGenShadowWindow frameGenShadowOpenWindow() { return g.win; }
 
 void frameGenShadowEyeFrame(ID3D11Device* dev, ID3D11DeviceContext* ctx, uint32_t eye, uint32_t frame, const FrameGenShadowFrame& f) {
@@ -463,6 +469,7 @@ void frameGenShadowFrameBoundary() {
         // The key went off: nothing stays resident, and the next time on starts a fresh window.
         if (anyResources() || g.dev || g.failed) releaseAll();
         if (g.windowTicks != 0 || g.eyeFrames != 0) { windowReset(); g.windowTicks = 0; }
+        g_vramBytes.store(0, std::memory_order_relaxed);
         return;
     }
     const int64_t now = qpcNow();
@@ -473,6 +480,7 @@ void frameGenShadowFrameBoundary() {
     }
     if (freq <= 0 || now - g.windowTicks < freq) return;
     g.windowTicks = now;
+    g_vramBytes.store(eyeVram(g.eye[0]).eye() + eyeVram(g.eye[1]).eye(), std::memory_order_relaxed);
     if (g.eyeFrames == 0) {   // the pass treated no frame in the window (a menu, a loading screen): nothing to say
         windowReset();
         return;
