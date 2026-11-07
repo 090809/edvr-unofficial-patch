@@ -1217,6 +1217,29 @@ byte-identical, S images within the tie-race floor (0.02% of pixels).
 - **Next in 2.2:** S written straight into its transfer texture, about 94
   MiB of the remaining 158.
 
+### 2026-11-07: Phase 2.2, flight 9 (v0.22.0-rc.7-70-ga9f0a796, compile-only)
+
+The slot's pose from the runtime (T_S = T + (T - T_A) / 2, located once a
+pair in `capture()` before the treat) and S's own transfer (the resample
+writes S into a keyed-mutex shared texture; the runtime consumes it after
+the pair's finish). Nothing shown. About 7 minutes, landed and low flight,
+45-51 fps.
+
+- **The transfer works:** `path=uav` (the shared R11G11B10 texture takes
+  the UAV on this NVIDIA card); produced = consumed every second, `s_busy`
+  0, `s_late` 0 after the first second (2 then); S ready 13-52 ms before
+  T_S (`ready_ms` is the CPU handoff, not GPU completion); consume 0.05 ms
+  median, 0.46 max.
+- **The pose:** from the runtime on all but 1-2 builds a second in the
+  first seconds (`pose=89/0` ... `pose=54/0`).
+- **VRAM:** game device 93.5 MiB (the producer textures replace S), XR
+  device +93.5 MiB (the private copies).
+- **Not measured yet:** the miss of the slot pose itself. H6's pose line
+  still measures from Submit to T + P (lead 35-64 ms); the slot pose is
+  located later and for T_S. 2.3 should point H6 at the slot pose.
+- **Next: 2.3**, Lock in the runtime. Vendor smoothing (SteamVR Motion
+  Smoothing for Elite) off first.
+
 ### 2026-11-07: Phase 2.1, the turned score and the VRAM cut (built, not flown)
 
 - **The compositor's turn, scored (the flight 7 discriminator).** At B the f = 1
