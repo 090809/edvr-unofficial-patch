@@ -1258,6 +1258,29 @@ predicted period 11.1 ms, Elite at 57-59 fps unthrottled.
   as B's; terrain marginally softer.
 - **Next:** the first Lock flight.
 
+### 2026-11-07: Phase 2.3, flight 11, the first Lock flight (same build)
+
+`fix.frame_generation = on`, about 12 minutes. Pilot: "a slight flicker".
+`--health`: lock PARTIAL.
+
+- **Lock cycles:** 101 engages and 101 disengages; engaged 8 s in all. Each
+  engage lasts about 80 ms (3-4 S slots), then `disengage reason=no_s`,
+  then a 1 s dwell, then engage again. The flicker is that cycle.
+- **In every engaged burst the first S slot shows S and the rest replay
+  B** (`s_from=1/3`, 52 S shown / 303 B replayed in the flight), while the
+  transfer line says S was produced and consumed every frame (`produced=
+  consumed`, `s_busy=0`, `s_late=0`, pose from the runtime).
+- **Hypothesis (not tested): the S slot looks for the wrong pair's S.**
+  The S slot advances the session's frame sequence by one (2.3's report),
+  and the consumed S is matched by sequence, so after the first S slot the
+  sequence the slot asks for and the one S carries differ by one.
+  Signature: a lock-side count of "S consumed but for another sequence",
+  with the two sequences, nonzero exactly from the second engaged slot.
+- **Also:** `late_real` 1 in the whole flight (Elite fits two periods);
+  S slot wait 7-9 ms; `period_halved` blocked engaging 349 seconds-lines:
+  the runtime's period was 22.2 ms in 16 of 60 metrics samples, so SteamVR
+  still halves at times.
+
 ### 2026-11-07: Phase 2.1, the turned score and the VRAM cut (built, not flown)
 
 - **The compositor's turn, scored (the flight 7 discriminator).** At B the f = 1
