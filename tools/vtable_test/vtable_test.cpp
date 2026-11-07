@@ -41,6 +41,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <vector>
 
 #include "../../src/common/code_hook.h"
 #include "../../src/common/vtable_hook.h"
@@ -546,6 +547,35 @@ static void dominantOtherModuleCells() {
     fill(96, 0, 0);
     hits = vtableDominantOtherModule(table, 96, nullptr, tiny, sizeof(tiny));
     check(hits == 96 && std::strlen(tiny) <= 3, "a name longer than the buffer is cut, not overrun", "the buffer was not respected");
+}
+
+// ---------------------------------------------------------------------------
+// THE SLOT REGISTRY'S CELLS -- fixtures
+//
+// An object that is nothing but a vptr at a table of N executable entries, so a
+// cell can hand a hook as many slots as the real hooks patch. IThing has eight.
+// The d3d11 half patches a context's table at slots past 100.
+struct WideObject {
+    void** vptr = nullptr;
+};
+
+static void** wideTable(size_t entries) {
+    void** t = static_cast<void**>(VirtualAlloc(
+        nullptr, entries * sizeof(void*), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+    if (t) for (size_t i = 0; i < entries; ++i) t[i] = reinterpret_cast<void*>(&thunkOne);
+    return t;
+}
+
+// One hook's worth of slots, staged the way every real install does it: attach,
+// replace() each slot with a forward pointer to capture the entry it displaced,
+// then commit. The forward array is the caller's, one cell per slot.
+static bool commitSlots(VTableHook& hook, WideObject& object, const size_t* slots,
+                        size_t count, void* replacement, void** forwards) {
+    if (!hook.attach(&object)) return false;
+    for (size_t i = 0; i < count; ++i) {
+        if (!hook.replace(slots[i], replacement, &forwards[i])) return false;
+    }
+    return hook.commit();
 }
 
 int main() {
@@ -2950,6 +2980,221 @@ int main() {
                   "a reader accepted a partially overwritten event");
             vtableWatchStop();
             VirtualFree(table, 0, MEM_RELEASE);
+        }
+    }
+
+    // THE SLOT REGISTRY HOLDS A WHOLE SESSION (2026-11-07).
+    //
+    // A contributor's four Windows logs each printed "the slot registry is full,
+    // so re-claiming is OFF for every hook this session" six times, right after
+    // the exposure fix installed. InPlace commit() registers every patched slot;
+    // the registry held 64; and the d3d11 half alone patches more than that.
+    // Counted from the replace() calls, flat profile, in the order they commit:
+    //
+    //     device 19, swap chain 3, factory 2, exposure 5, vScreen 44  = 73
+    //
+    // (VR is 15 + 1 + 2 + 5 + 43 = 66; the DirectInput gate and the graphics
+    // bridge come on top.) vScreen's 44th slot -- ClearState, the one the two
+    // context hooks SHARE -- is registered LAST, so on a registry that stops
+    // short it is exactly the entry that goes missing, and the missing entry is
+    // what makes one hook read the other as an intruder.
+    //
+    // This cell stages that shape on fake objects and then asks the only
+    // question that matters: is re-claiming still ON? A full registry answers
+    // no for every hook, so the cell reclaims a slot of the FIRST hook, a slot
+    // past where a 64-entry registry stops, and the shared slot. It uses only
+    // the public API, so it runs against the unfixed code unchanged.
+    {
+        constexpr size_t kDevSlots = 19, kSwapSlots = 3, kFactorySlots = 2;
+        constexpr size_t kExposureSlots = 5, kVScreenSlots = 44;
+        constexpr size_t kSharedSlot = 110;   // ClearState: both context hooks patch it
+        constexpr size_t kLateVScreenSlot = 62;   // vScreen's 43rd, entry 72 of 73
+
+        void** devTable = wideTable(64);
+        void** swapTable = wideTable(32);
+        void** factoryTable = wideTable(16);
+        void** ctxTable = wideTable(330);   // a context: 327 methods in the logs
+        if (!devTable || !swapTable || !factoryTable || !ctxTable) {
+            fail("tables for the registry-demand cell", "allocation refused");
+        } else {
+            WideObject dev, swap, factory, ctx;
+            dev.vptr = devTable;
+            swap.vptr = swapTable;
+            factory.vptr = factoryTable;
+            ctx.vptr = ctxTable;
+
+            size_t devSlots[kDevSlots], vsSlots[kVScreenSlots];
+            for (size_t i = 0; i < kDevSlots; ++i) devSlots[i] = 3 + i;
+            for (size_t i = 0; i + 1 < kVScreenSlots; ++i) vsSlots[i] = 20 + i;   // 20..62
+            vsSlots[kVScreenSlots - 1] = kSharedSlot;
+            const size_t swapSlots[kSwapSlots] = {8, 13, 14};
+            const size_t factorySlots[kFactorySlots] = {3, 10};
+            const size_t exposureSlots[kExposureSlots] = {7, 8, 9, 10, kSharedSlot};
+
+            void* fwd[kVScreenSlots] = {};
+            void* fwdSwap[kSwapSlots] = {};
+            void* fwdFactory[kFactorySlots] = {};
+            void* fwdExposure[kExposureSlots] = {};
+            void* fwdDev[kDevSlots] = {};
+
+            VTableHook hDev, hSwap, hFactory, hExposure, hVScreen;
+            const bool staged =
+                commitSlots(hDev, dev, devSlots, kDevSlots,
+                            reinterpret_cast<void*>(&thunkOne), fwdDev) &&
+                commitSlots(hSwap, swap, swapSlots, kSwapSlots,
+                            reinterpret_cast<void*>(&thunkOne), fwdSwap) &&
+                commitSlots(hFactory, factory, factorySlots, kFactorySlots,
+                            reinterpret_cast<void*>(&thunkOne), fwdFactory) &&
+                commitSlots(hExposure, ctx, exposureSlots, kExposureSlots,
+                            reinterpret_cast<void*>(&thunkOne), fwdExposure) &&
+                commitSlots(hVScreen, ctx, vsSlots, kVScreenSlots,
+                            reinterpret_cast<void*>(&thunkOneB), fwd);
+            check(staged, "a flat session's five InPlace hooks all commit (73 slots)",
+                  "a hook did not commit, so the cells below measure nothing");
+
+            if (staged) {
+                const size_t quietDev[] = {devSlots[0]};
+                writeTableSlot(devTable, devSlots[0], reinterpret_cast<void*>(&toolkitOne));
+                check(hDev.reclaim("demand-device", quietDev, 1) == 1 && hDev.lastPassRan(),
+                      "after 73 registrations the FIRST hook can still re-claim a "
+                      "vouched slot",
+                      "re-claiming is off for the whole session -- the registry "
+                      "overflowed on a session's ordinary hooks");
+                check(readTableSlot(devTable, devSlots[0]) == reinterpret_cast<void*>(&thunkOne),
+                      "...and the slot is EDVR's again",
+                      "the slot still holds the intruder");
+
+                const size_t quietLate[] = {kLateVScreenSlot};
+                writeTableSlot(ctxTable, kLateVScreenSlot, reinterpret_cast<void*>(&toolkitOne));
+                check(hVScreen.reclaim("demand-vscreen", quietLate, 1) == 1,
+                      "a slot past entry 64 is re-claimed too",
+                      "vScreen's later slots are not covered by re-claiming");
+
+                // The shared slot, taken by a stranger. Both owners must be IN
+                // the registry for this to read as shared: with either entry
+                // missing, the survivor reads itself as the lone owner and
+                // re-patches, splicing the other out of the chain.
+                const size_t quietShared[] = {kSharedSlot};
+                writeTableSlot(ctxTable, kSharedSlot, reinterpret_cast<void*>(&toolkitOne));
+                check(hExposure.reclaim("demand-exposure", quietShared, 1) == 0 &&
+                          hVScreen.reclaim("demand-vscreen", quietShared, 1) == 0 &&
+                          hExposure.lastPassRan() && hVScreen.lastPassRan(),
+                      "the shared slot is inspected, and conceded by both owners",
+                      "a pass did not run, or an owner re-patched a slot it shares");
+                check(hVScreen.lastPassConceded() == 1 &&
+                          readTableSlot(ctxTable, kSharedSlot) ==
+                              reinterpret_cast<void*>(&toolkitOne),
+                      "...counted as conceded, and the stranger keeps it",
+                      "the shared slot was not recognised as shared");
+            }
+
+            // Unwound in reverse, and the intruder's entry put back first so the
+            // uninstalls restore the way a real teardown does.
+            writeTableSlot(ctxTable, kSharedSlot, reinterpret_cast<void*>(&thunkOneB));
+            hVScreen.uninstall();
+            hExposure.uninstall();
+            hFactory.uninstall();
+            hSwap.uninstall();
+            hDev.uninstall();
+        }
+        void* const tables[] = {devTable, swapTable, factoryTable, ctxTable};
+        for (void* t : tables) {
+            if (t) VirtualFree(t, 0, MEM_RELEASE);
+        }
+    }
+
+    // A REGISTRY THAT DOES OVERFLOW STILL TURNS RE-CLAIMING OFF FOR EVERYONE.
+    //
+    // Raising the capacity must not weaken what the poisoning is for. A hook the
+    // registry cannot see is read by its shared-slot co-owner as an intruder,
+    // and adopting an intruder that is really an EDVR hook builds a call loop.
+    // So when the registry fills, a hook that is FULLY registered must stop
+    // re-claiming too: the cell below registers one bystander while there is
+    // room, proves it can re-claim, then commits hooks until the registry is
+    // past full and asks the bystander again.
+    //
+    // THE LAST CELL, and it has to be: the overflow is permanent for the process
+    // (re-claiming never comes back on), so anything after it that reclaims
+    // would fail for a reason that is not its own.
+    {
+        const size_t capacity = vtableSlotRegistryCapacityForTest();
+        constexpr size_t kHogSlots = 64;   // each hog patches slots 0..63 of its own table
+        const size_t hogs = capacity / kHogSlots + 1;   // strictly more than fits
+
+        void** bystanderTable = wideTable(16);
+        std::vector<void**> hogTables;
+        for (size_t i = 0; i < hogs; ++i) hogTables.push_back(wideTable(80));
+        bool tablesOk = bystanderTable != nullptr;
+        for (void** t : hogTables) tablesOk = tablesOk && t != nullptr;
+        if (!tablesOk || capacity < kHogSlots) {
+            fail("tables for the registry-overflow cell", "allocation refused");
+        } else {
+            WideObject bystander;
+            bystander.vptr = bystanderTable;
+            VTableHook bystanderHook;
+            void* bystanderFwd[1] = {};
+            const size_t bystanderSlot[] = {2};
+            const bool bystanderOk =
+                commitSlots(bystanderHook, bystander, bystanderSlot, 1,
+                            reinterpret_cast<void*>(&thunkOne), bystanderFwd);
+            check(bystanderOk && !vtableSlotRegistryOverflowedForTest(),
+                  "the registry has room for the bystander, and has not overflowed",
+                  "the registry was already full before the cell started");
+
+            const size_t quiet2[] = {2};
+            writeTableSlot(bystanderTable, 2, reinterpret_cast<void*>(&toolkitOne));
+            check(bystanderHook.reclaim("overflow-bystander", quiet2, 1) == 1 &&
+                      bystanderHook.lastPassRan(),
+                  "...and while it has room, the bystander re-claims a vouched slot",
+                  "re-claiming was off before the registry overflowed");
+
+            std::vector<VTableHook*> hooks;
+            std::vector<WideObject*> objects;
+            size_t slots[kHogSlots];
+            void*  fwd[kHogSlots];
+            for (size_t i = 0; i < kHogSlots; ++i) slots[i] = i;
+            bool allCommitted = true;
+            for (size_t i = 0; i < hogs; ++i) {
+                WideObject* o = new WideObject();
+                o->vptr = hogTables[i];
+                VTableHook* h = new VTableHook();
+                objects.push_back(o);
+                hooks.push_back(h);
+                // A commit that overflows still returns true: the hooks work,
+                // only re-claiming is refused.
+                allCommitted = commitSlots(*h, *o, slots, kHogSlots,
+                                           reinterpret_cast<void*>(&thunkOneB), fwd) &&
+                               allCommitted;
+            }
+            check(allCommitted && vtableSlotRegistryOverflowedForTest(),
+                  "committing more slots than the registry holds overflows it, and "
+                  "every hook still commits",
+                  "the registry took more than its capacity, or a hook was refused "
+                  "because of it");
+
+            // The bystander's one slot is registered and always was. It must
+            // stop anyway.
+            writeTableSlot(bystanderTable, 2, reinterpret_cast<void*>(&toolkitOne));
+            check(bystanderHook.reclaim("overflow-bystander", quiet2, 1) == 0 &&
+                      !bystanderHook.lastPassRan(),
+                  "once the registry has overflowed, a FULLY registered hook stops "
+                  "re-claiming too",
+                  "a hook re-claimed after the registry overflowed -- a hook the "
+                  "registry cannot see can be adopted as an intruder");
+            check(readTableSlot(bystanderTable, 2) == reinterpret_cast<void*>(&toolkitOne),
+                  "...and the intruder keeps the slot",
+                  "the slot was written after the registry overflowed");
+
+            for (size_t i = hooks.size(); i-- > 0;) {
+                hooks[i]->uninstall();
+                delete hooks[i];
+                delete objects[i];
+            }
+            bystanderHook.uninstall();
+        }
+        if (bystanderTable) VirtualFree(bystanderTable, 0, MEM_RELEASE);
+        for (void** t : hogTables) {
+            if (t) VirtualFree(t, 0, MEM_RELEASE);
         }
     }
 
