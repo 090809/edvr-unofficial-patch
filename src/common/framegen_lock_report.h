@@ -22,6 +22,8 @@ enum class FrameGenLockReason : uint8_t {
     NotSeparate,     // the XR device is the game's: the transfer needs two
     NoProjection,    // the last frame was not a fresh pair the runtime composed (a menu, a load, a flat clear, a withheld or failed frame, a frame still open)
     NoReplay,        // B is not kept for a replay (resubmit off, or the exchange failed): a missing S would have nothing to show
+    Menu,            // Phase 2.3b: EDVR's own menu was drawn into the last pair (the runtime draws it into B only: S would blink it)
+    Unfinished,      // Phase 2.3b: the last pair's S was not finished as B is (framegen_slot_report.h kFrameGenFinish*: the why is said on its own line)
     NoS,             // the synthesizer has not delivered an S for several pairs
     DeferredPacing,  // deferred pacing (turbo, fix.weapon_stability's on-foot deferral) is on this frame: Lock stands aside for it in 2.3
     PeriodHalved,    // the runtime's predicted period is already about twice the display's (the vendor halved the rate)
@@ -39,6 +41,8 @@ inline const char* frameGenLockReasonName(FrameGenLockReason r) {
         case FrameGenLockReason::NotSeparate: return "not_separate";
         case FrameGenLockReason::NoProjection: return "no_projection";
         case FrameGenLockReason::NoReplay: return "no_replay";
+        case FrameGenLockReason::Menu: return "menu";
+        case FrameGenLockReason::Unfinished: return "s_unfinished";
         case FrameGenLockReason::NoS: return "no_s";
         case FrameGenLockReason::DeferredPacing: return "deferred_pacing";
         case FrameGenLockReason::PeriodHalved: return "period_halved";
@@ -56,6 +60,8 @@ struct FrameGenLockConditions {
     bool separate = false;
     bool projection = false;
     bool replay = false;
+    bool noMenu = true;       // Phase 2.3b: true unless EDVR's menu was drawn into the last pair (a host from before 2.3b never sets it)
+    bool sFinished = true;    // Phase 2.3b: true unless the last pair's S was left unfinished (frameGenSFinished)
     bool sDelivering = false;
     bool notDeferred = false;
     bool periodDisplay = false;
@@ -68,6 +74,8 @@ inline FrameGenLockReason frameGenLockBlocker(const FrameGenLockConditions& c) {
     if (!c.separate) return FrameGenLockReason::NotSeparate;
     if (!c.projection) return FrameGenLockReason::NoProjection;
     if (!c.replay) return FrameGenLockReason::NoReplay;
+    if (!c.noMenu) return FrameGenLockReason::Menu;
+    if (!c.sFinished) return FrameGenLockReason::Unfinished;
     if (!c.sDelivering) return FrameGenLockReason::NoS;
     if (!c.notDeferred) return FrameGenLockReason::DeferredPacing;
     if (!c.periodDisplay) return FrameGenLockReason::PeriodHalved;
@@ -164,6 +172,17 @@ inline bool frameGenSReady(uint64_t pair, const uint64_t consumed[2], uint64_t p
     return pair != 0 && consumed[0] == pair && consumed[1] == pair && poseFor == pair && poseValid && headBValid && formatShown;
 }
 
+// Phase 2.3b: one eye's answer for a pair says its S was NOT finished as B is: handed over without the finish (a d3d11.dll from before 2.3b, finish 0), or held back with a reason
+// (finish 2 and up). An S not built, or held back busy, says nothing about finishing. `why` is the finish word to name (kFrameGenFinish*).
+inline bool frameGenSUnfinished(uint32_t state, uint32_t finish, uint32_t& why) {
+    const bool produced = state == 1u;   // EDVR_NATIVE_FRAMEGEN_S_PRODUCED
+    if ((produced && finish != kFrameGenFinishDone) || finish > kFrameGenFinishDone) {
+        why = finish;
+        return true;
+    }
+    return false;
+}
+
 // ---- the lines ----
 // Said once when the runtime first reads the key on (and again after it was off).
 constexpr const char* kFrameGenLockArmedFmt =
@@ -175,6 +194,8 @@ constexpr const char* kFrameGenLockDisengageFmt = "frame generation lock: diseng
 constexpr const char* kFrameGenLockDeferredNote = " (Lock stands aside for deferred pacing in 2.3)";
 // The S slot could not show S because of its format (the stereo renderer takes 8-bit RGBA/BGRA only): said once; the slot replays B.
 constexpr const char* kFrameGenLockFormatFmt = "frame generation lock: S's format %u cannot be shown (8-bit RGBA/BGRA only); the S slot replays B";
+// Phase 2.3b: an S was left unfinished (Lock lets go with reason s_unfinished, or does not engage): said when the why changes from the last one said.
+constexpr const char* kFrameGenLockUnfinishedFmt = "frame generation lock: S is not finished like B (why=%s); the S slot does not show it";
 // Once a second while the key is on. engaged: the seconds of the window Lock was engaged; slots: the real pairs composed while engaged / the S slots run; late_real: the display
 // periods the boundary counted missed across the engaged pairs (Elite's frame late); late_s: S slots that showed B again (S missing, not consumed, busy, no pose, or a format
 // it cannot show); s_from: S slots that showed S / that replayed B; wait_ms: the S slot's xrWaitFrame, median/max; period_ms: the runtime's predicted period, median;

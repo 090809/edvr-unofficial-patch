@@ -10668,7 +10668,9 @@ H_FRAMEGEN_SYNTH_REPORT = (r"frame generation \(synth\): frames=(?P<f05>\d+)/(?P
                            "".join(_HFG_CLASS.format(n=n) for n in ("far", "cockpit", "world")) +
                            r"(?: turned:" + "".join(_HFG_SET_CLASS.format(n=n, p="t_") for n in ("far", "cockpit", "world")) +
                            r" rot_res_deg=(?P<rot_med>[\d.]+|-)/(?P<rot_max>[\d.]+|-) out=(?P<t_out>[\d.]+)%)?"
-                           r"(?: pose=(?P<pose_rt>\d+)/(?P<pose_fb>\d+) s=(?P<spath>[a-z]+) busy=(?P<sbusy>\d+))?$")
+                           r"(?: pose=(?P<pose_rt>\d+)/(?P<pose_fb>\d+) s=(?P<spath>[a-z]+) busy=(?P<sbusy>\d+)"
+                           # Phase 2.3b (kFrameGenSynthFinishTailFmt), in a window that finished an S or left one unfinished: finish=<finished>/<unfinished> finish_ms= why=
+                           r"(?: finish=(?P<fin>\d+)/(?P<unfin>\d+) finish_ms=" + _HFGS_GPU.format(p="gfin") + r" why=(?P<fin_why>[a-z_0-9]+))?)?$")
 # Frame generation, Phase 2.2 (src\common\framegen_slot_report.h, written by the OpenXR runtime): S's transfer once a second, produced=<S handed over> consumed=<copied to the runtime's
 # private texture> s_busy=<held back, the last one unconsumed> s_late=<consumed after T_S> ready_ms=<consume time less T_S, median/max> consume_ms=<median/max> pose=<pairs handed a
 # located slot pose>/<handed none> path=<uav|copy|none|mixed> vram_game_mib= vram_xr_mib=; and a line said once when the d3d11 half has no slot channel (an older d3d11.dll). Lines
@@ -10693,6 +10695,8 @@ H_FRAMEGEN_LOCK_REPORT = (r"frame generation lock: engaged=(?P<engaged>[\d.]+) s
                           r"s_from=(?P<from_s>\d+)/(?P<from_b>\d+) wait_ms=(?P<wait_med>[\d.]+|-)/(?P<wait_max>[\d.]+|-) period_ms=(?P<period>[\d.]+|-) "
                           r"disengages=(?P<disengages>\d+) reason=(?P<reason>[a-z_]+)$")
 H_FRAMEGEN_LOCK_FORMAT = r"frame generation lock: S's format (?P<fmt>\d+) cannot be shown"
+# Phase 2.3b (kFrameGenLockUnfinishedFmt): an S was left unfinished (not finished like B), said when the why changes; Lock lets go with reason s_unfinished.
+H_FRAMEGEN_LOCK_UNFINISHED = r"frame generation lock: S is not finished like B \(why=(?P<why>[a-z_0-9]+)\); the S slot does not show it$"
 H_FRAMEGEN_LOCK_LATE_SHARE = 0.05   # late_s or late_real over this share of the S slots is PARTIAL
 # The SRV turret view (issue 140; src\d3d11\srv_turret.cpp, the vehicle latch's line in journal_watch.cpp, and the geometry shader's creation line in shader_swap.cpp, shaderSwapCreateGs,
 # called with who "srv turret hud"): lines of the graphics log with no build tag, read the way the desktop window's are. The settings and vehicle lines are state, so health_scan keeps
@@ -17007,6 +17011,13 @@ def _hj_framegen_synth(rows, ctx=None):
         paths = sorted(set(r["spath"] for r in slotted))
         text += "; f=0.5 S head: %d on the runtime's slot pose, %d on the extrapolation; S written %s; %d busy" % (
             sum(int(r["pose_rt"]) for r in slotted), sum(int(r["pose_fb"]) for r in slotted), "/".join(paths), sum(int(r["sbusy"]) for r in slotted))
+    # Phase 2.3b: S finished as B is at B's door (its sharpening, its UI layer by the head's step), or left unfinished (not handed over) and why.
+    finishing = [r for r in reports if r.get("fin") is not None]
+    if finishing:
+        fms = [float(r["gfin_med"]) for r in finishing if r.get("gfin_med")]
+        text += "; S finished like B %d / unfinished %d (last why: %s), finish %s ms an eye (median of the lines' medians)" % (
+            sum(int(r["fin"]) for r in finishing), sum(int(r["unfin"]) for r in finishing), finishing[-1]["fin_why"],
+            "%.3f" % sorted(fms)[len(fms) // 2] if fms else "-")
     transfers = rows.get("transfer", [])
     if transfers:
         produced, consumed = sum(int(r["produced"]) for r in transfers), sum(int(r["consumed"]) for r in transfers)
@@ -17069,6 +17080,8 @@ def _hj_framegen_lock(rows, ctx=None):
         text += "; Lock stood aside for deferred pacing"
     if rows.get("format"):
         text += "; S's format %s cannot be shown (every S slot replays B)" % rows["format"][-1]["fmt"]
+    if rows.get("unfinished"):
+        text += "; S left unfinished (not shown), why: %s" % "/".join(sorted(set(r["why"] for r in rows["unfinished"])))
     over = []
     if s and late_s > H_FRAMEGEN_LOCK_LATE_SHARE * s:
         over.append("late_s %d of %d S slots (%.1f%%)" % (late_s, s, 100.0 * late_s / s))
@@ -18278,6 +18291,7 @@ HEALTH_RULES = (
         ("disengage", H_FRAMEGEN_LOCK_DISENGAGE),
         ("report", H_FRAMEGEN_LOCK_REPORT),
         ("format", H_FRAMEGEN_LOCK_FORMAT),
+        ("unfinished", H_FRAMEGEN_LOCK_UNFINISHED),
     ), _hj_framegen_lock),
     # The SRV turret view (issue 140): lines of the graphics log that carry no build tag (health_scan reads them, as it reads the desktop window's, before it drops the untagged lines).
     _hrule(H_SRV_TURRET, (), H_SRV_TURRET_LABELS, (
@@ -18526,8 +18540,8 @@ def health_scan_runtime(scan, text):
     lock_kinds = dict(next(r for r in HEALTH_RULES if r.name == H_FRAMEGEN_LOCK).kinds)
     for order, raw in enumerate(text.splitlines()):
         if H_FRAMEGEN_LOCK_LABEL in raw:
-            # Frame generation 2.3: Lock's lines (armed, an edge, the one-second line, the format note).
-            for kind in ("report", "engage", "disengage", "armed", "format"):
+            # Frame generation 2.3: Lock's lines (armed, an edge, the one-second line, the format note; 2.3b: the unfinished S's why).
+            for kind in ("report", "engage", "disengage", "armed", "format", "unfinished"):
                 g = lock_kinds[kind].search(raw)
                 if g:
                     scan["rows"][H_FRAMEGEN_LOCK].setdefault(kind, []).append(dict(g.groupdict(), _order=order, _t=None))
@@ -25374,7 +25388,7 @@ def self_test_health():
             return RS("frame generation (synth): eye %u VRAM %llu B", eye, 53364996, 50.9, "s=49038336 luma=862920 class=3451680 stats=12060", 58616136, 55.9,
                       "key=27584064 read=27584064 holes=3448008", 165346128, 157.7)
 
-        def fg_synth_report(f05=40, f1=39, scored=38, skipped=2, timed=True, p95=20, filled=0.25, left=0.01, guard=1.5, turned=True, tp95=7, rot=(0.4, 1.2), clamp=0.0, slot=None):
+        def fg_synth_report(f05=40, f1=39, scored=38, skipped=2, timed=True, p95=20, filled=0.25, left=0.01, guard=1.5, turned=True, tp95=7, rot=(0.4, 1.2), clamp=0.0, slot=None, finish=None):
             cls = "".join(RF(" %s=%.1f%%,%u", n, 10.0, 12, 8, p95, 5.5, 1.5, 9, 30) for n in ("far", "cockpit", "world"))
             gpu = RF("%.2f/%.2f(n=%u)", 0.31, 0.8, 40) if timed else health_c_format(fgsrc, "-(n=0)")
             line = RS("frame generation (synth): frames=%u/%u scored=%u skipped=%u", f05, f1, scored, skipped) + RS(" gpu_ms=%s/%s holes=%.2f%%/%.2f%% guard=%.2f%% clamp=%.3f%%", gpu, gpu, filled, left, guard, clamp) + cls
@@ -25383,6 +25397,8 @@ def self_test_health():
                 line += RS(" turned:") + tcls + RS(" rot_res_deg=%s/%s out=%.2f%%", "%.3f" % rot[0], "%.3f" % rot[1], 3.5)
             if slot is not None:   # Phase 2.2: (on the slot pose, on the extrapolation, where S was written, busy)
                 line += RS(" pose=%u/%u s=%s busy=%u", *slot)
+            if finish is not None:   # Phase 2.3b: (finished, unfinished, why)
+                line += RS(" finish=%u/%u finish_ms=%s why=%s", finish[0], finish[1], RF("%.2f/%.2f(n=%u)", 0.21, 0.4, 80), finish[2])
             return line
 
         # fg_off is a log with the key off; fg_ok is one with the key on, whose scorer lines the synthesizer's lines must accompany (its rule judges against them).
@@ -25509,6 +25525,12 @@ def self_test_health():
               extra=["--runtime-file", runtime([fg_pose(), fg_transfer().replace("s_late=", "late=")])], has=["line(s) the rule's patterns do not match"])
         check("frame generation synth: an extrapolated window (no slot pose: an older runtime) on the private path reads as such", fg_off + [fg_armed(), fg_report(), fg_synth_armed(), fg_synth_report(slot=(0, 45, "private", 0))], 0,
               [("OK", FGS)], has=["f=0.5 S head: 0 on the runtime's slot pose, 45 on the extrapolation; S written private"], lacks=["UNPARSED"])
+        # Phase 2.3b: the finish's tail on the synth line (S finished like B at B's door, or left unfinished and why).
+        check("frame generation synth: a report with the finish tail is read and says finished / unfinished, the last why and the finish's time",
+              fg_off + [fg_armed(), fg_report(), fg_synth_armed(), fg_synth_report(slot=(45, 0, "uav", 0), finish=(88, 2, "scope")), fg_synth_report(slot=(45, 0, "uav", 0), finish=(90, 0, "finished"))],
+              0, [("OK", FGS)], lacks=["UNPARSED"], has=["S finished like B 178 / unfinished 2 (last why: finished), finish 0.210 ms an eye"])
+        check("frame generation synth: a drifted finish tail is counted as unparsed", fg_off + [fg_armed(), fg_report(), fg_synth_armed(),
+              fg_synth_report(slot=(45, 0, "uav", 0), finish=(90, 0, "finished")).replace(" why=", " because=")], 3, [("NEVER APPLIED", FGS)], has=["line(s) the rule's patterns do not match"])
 
         # Phase 2.3: Lock (src\common\framegen_lock_report.h, the runtime log's lines) and its key (src\d3d11\temporal_pass.cpp, the graphics log's untagged line).
         flsrc = read_text(os.path.join(repo_root(), "src", "common", "framegen_lock_report.h"))
@@ -25559,6 +25581,10 @@ def self_test_health():
               extra=["--runtime-file", runtime([fl_armed(), fl_engage(), fl_report(), fl_disengage("deferred_pacing", " (Lock stands aside for deferred pacing in 2.3)"),
                                                 fl_report(engaged=0.2, real=9, s=9, from_s=9, disengages=1, reason="deferred_pacing")])],
               has=["1 engage / 1 disengage edge(s)", "reasons when off: deferred_pacing 2", "Lock stood aside for deferred pacing"])
+        check("frame generation lock: an unfinished S's line is read, and the menu and s_unfinished disengages are named", fl_gfx, 0, [("OK", FL)], lacks=["UNPARSED"],
+              extra=["--runtime-file", runtime([fl_armed(), fl_engage(), fl_report(), RL(flsrc, "frame generation lock: S is not finished like B", "layer_only"), fl_disengage("s_unfinished"),
+                                                fl_report(engaged=0.3, real=13, s=13, from_s=13, disengages=1, reason="s_unfinished"), fl_disengage("menu")])],
+              has=["reasons when off: s_unfinished 2, menu 1", "S left unfinished (not shown), why: layer_only"])
         check("frame generation lock: a drifted lock line is counted as unparsed", fl_gfx, 3, [("NEVER APPLIED", FL)],
               extra=["--runtime-file", runtime([fl_armed(), fl_engage(), fl_report().replace("late_s=", "lates=")])], has=["line(s) the rule's patterns do not match"])
         check("frame generation lock: the key off, no lock line, nothing said", fg_off + [fl_key(on=False)], 0, [("OK", F90S)], lacks=["frame generation lock", "NEVER APPLIED"],

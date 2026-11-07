@@ -593,6 +593,9 @@ class NativeRuntimeHost : public SystemSource, public FrameSink, public Composit
     FrameGenSlotWindow window;
     uint64_t windowUs=0;
     uint64_t gameBytes[2]{};      // as the d3d11 half last said for each eye
+    // Phase 2.3b: each eye's answer for pair finishFor[e]: whether its S was finished as B is (kFrameGenFinish*), and the state it came with.
+    uint64_t finishFor[2]{};
+    uint32_t finish[2]{},finishState[2]{};
   } framegenSlot;
   // Frame generation, Phase 2.3 (fix.frame_generation = on, TEMPORARY; framegen_lock.h, common/framegen_lock_report.h): Lock 2:1. At the head of each WaitGetPoses the gate
   // steps and, engaged, the S slot runs (its own wait, begin, layer and end) before the game's wait. Owner thread only. With the key off nothing here is touched, said or
@@ -610,6 +613,8 @@ class NativeRuntimeHost : public SystemSource, public FrameSink, public Composit
     XrPosef headS{{0,0,0,1},{0,0,0}};uint64_t headFor=0;bool headValid=false;   // the head located at T_S for pair headFor (seated)
     EyeCapture sCapture;bool sCaptureReady=false;   // S's two private textures, adopted (no copy), as the stereo renderer reads an eye pair
     bool formatSaid=false;
+    uint64_t menuFor=0;               // Phase 2.3b: the last pair EDVR's menu was drawn into (capture(), menuTreated)
+    uint32_t unfinishedSaid=~0u;      // Phase 2.3b: the why of the last "not finished" line (~0: none said since the key went on)
   } framegenLock;
   // Diagnostic only (docs/linux-native-openxr-launch-centre-2026-09-22.md).
   uint64_t headLocateFailures=0,headLocateConsecutiveFailures=0;
@@ -2418,6 +2423,7 @@ class NativeRuntimeHost : public SystemSource, public FrameSink, public Composit
     else if(!graphicsCalls.invoke([&]{r=captured.capture(eye,selected,region,flags,true);})) { timingInvalidate(); return vr::VRCompositorError_InvalidTexture; }
     const auto transferClockEnd=QueryPerformanceCounter(&transferEnded);
     if(transferClock&&transferClockEnd) timingFrame.transferMs[unsigned(eye)]=elapsedMs(transferBegan,transferEnded);
+    if(menuTreated)framegenLock.menuFor=sequence;   // frame generation 2.3b: the menu is in B (and not in S): Lock lets go (reason menu)
     if(r==vr::VRCompositorError_None&&menuTreated&&menuEyes[unsigned(eye)]++==0)
       nativeTracePrintf("native_menu,first_captured_eye=%u\n",unsigned(eye));
     if(r==vr::VRCompositorError_None && copyPixels){
@@ -3038,6 +3044,7 @@ class NativeRuntimeHost : public SystemSource, public FrameSink, public Composit
     EdvrNativeFrameGenS s{};
     if(fs.channel.answer(e,fs.sequence,s)!=S_OK)return;
     fs.gameBytes[e]=s.gameBytes;
+    fs.finishFor[e]=fs.sequence;fs.finish[e]=s.finish;fs.finishState[e]=s.state;   // 2.3b: whether this S was finished as B is
     if(s.path==EDVR_NATIVE_FRAMEGEN_PATH_UAV)fs.window.pathUav=true;
     else if(s.path==EDVR_NATIVE_FRAMEGEN_PATH_COPY)fs.window.pathCopy=true;
     if(s.state==EDVR_NATIVE_FRAMEGEN_S_BUSY){++fs.window.busy;return;}
@@ -3107,6 +3114,7 @@ class NativeRuntimeHost : public SystemSource, public FrameSink, public Composit
     nativeTracePuts(formatFrameGenLockReport(fl.window,FrameGenLockReason::KeyOff).c_str());
     fl.gate.reset();fl.delivery=FrameGenSDelivery{};fl.window.reset();
     fl.was=false;fl.windowUs=fl.lastStepUs=0;fl.lastPairSequence=fl.deliveryNotedFor=0;fl.slotRan=false;fl.headFor=0;fl.headValid=false;
+    fl.menuFor=0;fl.unfinishedSaid=~0u;
     fl.sCapture.reset();
   }
   // Frame generation, Phase 2.3 (Lock): at the head of the game's WaitGetPoses (owner thread), before any wait. The key off: returns at once, and the frame loop is today's.
@@ -3138,6 +3146,15 @@ class NativeRuntimeHost : public SystemSource, public FrameSink, public Composit
     c.separate=separateGraphics();
     c.projection=fl.lastPairSequence!=0&&fl.lastPairSequence==activeFrameSequence&&!state.frameOpen()&&!frameWithheld;
     c.replay=featureFrameKnown&&featureFrame.resubmitEnabled&&previousPairValid&&previousSpace==frameSpace&&previousReference==poses.read().originGeneration;
+    // Phase 2.3b: EDVR's menu is drawn into B by this runtime and not into S, and an S left unfinished is not shown: either lets Lock go, named. The why of an unfinished S is
+    // said once per change.
+    c.noMenu=fl.menuFor==0||fl.menuFor!=fl.lastPairSequence;
+    {
+      uint32_t why=0;bool unfinished=false;
+      for(unsigned e=0;e<2&&fl.lastPairSequence;++e){uint32_t w=0;if(fs.finishFor[e]==fl.lastPairSequence&&frameGenSUnfinished(fs.finishState[e],fs.finish[e],w)){unfinished=true;why=w;}}
+      c.sFinished=!unfinished;
+      if(unfinished&&why!=fl.unfinishedSaid){fl.unfinishedSaid=why;char line[200];std::snprintf(line,sizeof(line),kFrameGenLockUnfinishedFmt,frameGenFinishName(why));nativeTracePuts(line);}
+    }
     c.sDelivering=fl.delivery.delivering();
     c.notDeferred=!(featureFrameKnown&&featureFrame.deferredPacing)&&!boundary.deferred();
     c.periodDisplay=frameGenLockPeriodIsDisplay(period,displayNs);
@@ -3185,6 +3202,8 @@ class NativeRuntimeHost : public SystemSource, public FrameSink, public Composit
     const uint64_t pair=fl.lastPairSequence;
     const uint64_t consumed[2]={fs.eyes[0].consumedSequence(),fs.eyes[1].consumedSequence()};
     bool shown=true;
+    // Phase 2.3b: only an S finished as B is (B's sharpening, B's UI layer) is shown; an older d3d11.dll's S, never finished, is not.
+    for(unsigned e=0;e<2;++e)if(fs.finishFor[e]!=pair||fs.finish[e]!=kFrameGenFinishDone)shown=false;
     for(auto& e:fs.eyes) {
       ID3D11Texture2D* s=e.privateTexture();
       D3D11_TEXTURE2D_DESC d{};if(s)s->GetDesc(&d);

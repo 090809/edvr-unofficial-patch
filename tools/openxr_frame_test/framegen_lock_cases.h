@@ -92,7 +92,8 @@ void gateTable() {
   struct Row { bool FrameGenLockConditions::*field; FrameGenLockReason reason; };
   const Row rows[] = {{&FrameGenLockConditions::keyOn, FrameGenLockReason::KeyOff}, {&FrameGenLockConditions::channel, FrameGenLockReason::NoChannel},
                       {&FrameGenLockConditions::separate, FrameGenLockReason::NotSeparate}, {&FrameGenLockConditions::projection, FrameGenLockReason::NoProjection},
-                      {&FrameGenLockConditions::replay, FrameGenLockReason::NoReplay}, {&FrameGenLockConditions::sDelivering, FrameGenLockReason::NoS},
+                      {&FrameGenLockConditions::replay, FrameGenLockReason::NoReplay}, {&FrameGenLockConditions::noMenu, FrameGenLockReason::Menu},
+                      {&FrameGenLockConditions::sFinished, FrameGenLockReason::Unfinished}, {&FrameGenLockConditions::sDelivering, FrameGenLockReason::NoS},
                       {&FrameGenLockConditions::notDeferred, FrameGenLockReason::DeferredPacing}, {&FrameGenLockConditions::periodDisplay, FrameGenLockReason::PeriodHalved},
                       {&FrameGenLockConditions::finishDone, FrameGenLockReason::FinishPending}};
   uint64_t t = 3000000;
@@ -112,6 +113,20 @@ void gateTable() {
   FrameGenLockConditions two = allHold();
   two.projection = false; two.notDeferred = false;
   check(frameGenLockBlocker(two) == FrameGenLockReason::NoProjection, "lock gate: two failing: the first in order is said");
+  // Phase 2.3b: the menu and an unfinished S are said before S's delivery (an unfinished S is not handed over, so a run of them would read as no_s).
+  FrameGenLockConditions fin = allHold();
+  fin.sFinished = false; fin.sDelivering = false;
+  check(frameGenLockBlocker(fin) == FrameGenLockReason::Unfinished && std::strcmp(frameGenLockReasonName(FrameGenLockReason::Unfinished), "s_unfinished") == 0 &&
+            std::strcmp(frameGenLockReasonName(FrameGenLockReason::Menu), "menu") == 0,
+        "lock gate: an unfinished S is named before the missing delivery it causes; the reasons read menu and s_unfinished");
+  // Which answers say an S was not finished: a produced S without the finish (an older d3d11.dll), or one held back with a reason; a busy or absent S says nothing.
+  uint32_t why = 99;
+  check(frameGenSUnfinished(1u, kFrameGenFinishOld, why) && why == kFrameGenFinishOld && frameGenSUnfinished(3u, kFrameGenFinishScope, why) && why == kFrameGenFinishScope &&
+            !frameGenSUnfinished(1u, kFrameGenFinishDone, why) && !frameGenSUnfinished(2u, kFrameGenFinishOld, why) && !frameGenSUnfinished(0u, kFrameGenFinishOld, why) &&
+            !frameGenSUnfinished(3u, kFrameGenFinishOld, why),
+        "lock: an S produced unfinished (an older d3d11.dll) or held back with a reason is unfinished; a finished, busy, kept-f=1 or absent one is not");
+  check(std::strcmp(frameGenFinishName(kFrameGenFinishLayerOnly), "layer_only") == 0 && std::strcmp(frameGenFinishName(kFrameGenFinishNoDoor), "no_door") == 0,
+        "lock: the finish's reasons have names");
   FrameGenLockGate f;
   f.step(allHold(), 0); f.step(allHold(), kFrameGenLockDwellUs);
   check(f.fail(FrameGenLockReason::SlotFailed) && !f.engaged() && f.reason() == FrameGenLockReason::SlotFailed && !f.fail(FrameGenLockReason::SlotFailed),
