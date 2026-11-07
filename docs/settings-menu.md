@@ -21,6 +21,13 @@
   - Monitor page: no rows the compositor's frame timing filled (frame_flag v34).
     2026-11-07: a FRAME GENERATION block, only while `fix.frame_generation` or
     `fix.frame_generation_shadow` is on (item 3 below); BUILT, NOT FLOWN.
+  - Performance page, 2026-11-07: `Frame generation (experimental, Lock 2:1)`
+    (`fix.frame_generation`, off / on, live) right after Turbo mode, the
+    page that already carries the experimental [fix] switch; the developer
+    tier's Experimental page lists only `[experimental]` keys, and moving
+    the key there would rename it. `fix.frame_generation_shadow` stays
+    hidden. Live: the d3d11 half re-reads the key on the menu's write and
+    the runtime reads it from the frame answer every frame. BUILT, NOT FLOWN.
   - Single-line overlay: fits its text, keeps its font size across OpenXR
     resolutions, shows application GPU/CPU timings. Full desktop gates
     passed; headset checks: [combined test guide](native-render-benchmark-2026-09-15.md).

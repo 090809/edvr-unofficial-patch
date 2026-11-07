@@ -5835,7 +5835,7 @@ void temporalPassConfigure(Config& cfg) {
         // Frame generation, Phase 1 (TEMPORARY; docs/design-frame-generation-2026-10-26.md): live, VR only (the flat allow-list does not list it, so flat reads off).
         frameGenShadowConfigure(cfg.getString("fix.frame_generation_shadow", "off") == "on");
         nativeFrameSetFrameGenShadow(frameGenShadowOn());
-        // Phase 2.3 (TEMPORARY, hidden; on = Lock 2:1 forced, for A/B flights): live, VR only like the shadow key. Carried to the runtime in a version 12 answer's word 17; it
+        // Phase 2.3 (TEMPORARY; on = Lock 2:1 forced, for test flights; a row of the Performance page since 2026-11-07): live, VR only like the shadow key. Carried to the runtime in a version 12 answer's word 17; it
         // runs the synthesizer as the shadow key does.
         {
             const bool lockKey = cfg.getString("fix.frame_generation", "off") == "on";
