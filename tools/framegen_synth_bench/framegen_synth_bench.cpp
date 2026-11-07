@@ -15,7 +15,7 @@
 //       but no read offer (orphan: fgSynSrc's recompute of a landing disagreeing with fgSynSplat's; 0 so far), and the hole region's error (HoleError: the mean |luma| of the
 //       f = 1 S against C over the output pixels whose render pixel was a hole, the fill's, with B against C beside it).
 //   --define NAME=V (with --bench or --replay): the shader's `#define NAME 1` compiled as V instead, for a comparison (FG_SHARP 0 bilinear, 2 Lanczos-2, 3 unclamped, 5 the
-//       Catmull-Rom as 16 loads, 6 with its corners dropped).
+//       Catmull-Rom as 16 loads, 6 with its corners in 12 fetches).
 //   --self-test
 //       The format reader and writer round trip, the constant block rebuilt from a frame's JSON against the production fill (memcmp), a synthetic capture written, read back and
 //       replayed on WARP (a scene scrolling at the vectors' rate is predicted by the f = 1 S), and a tiny bench on WARP. Needs no real GPU; WARP missing: the GPU parts are skipped.

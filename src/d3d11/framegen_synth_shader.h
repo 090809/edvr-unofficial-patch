@@ -20,7 +20,7 @@
 //                  2026-11-07). That read becomes its offset, counted as filled and no longer left. The neighbour's read is taken in full precision, as fgSynSrc computed it before the store rounded it
 //                  (synWinnerRead finds the neighbour's source pixel again from the stored offset and recomputes its read), so the fill is the same as when every read was computed
 //                  in one pass; the counters (filled, left, guard, clamped) of the three passes add up in the stats words;
-//   fgSynResample  output size: each output pixel to its S pixel, its read offset, B's output there, Catmull-Rom in 12 fetches with its ringing clamped (synSharp, FG_SHARP),
+//   fgSynResample  output size: each output pixel to its S pixel, its read offset, B's output there, Catmull-Rom in 8 fetches with its ringing clamped (synSharp, FG_SHARP),
 //                  into the S texture (dlOut's format);
 //   fgSynLuma      quarter grid: S's luma the way the scorer's capture takes it, B's luma and B's class (the f = 1 S is kept for the next real frame);
 //   fgSynScore     quarter grid, on the next real frame C: C's luma against the kept S luma and against B's (the no-warp comparison), binned per class of B as the scorer bins; and again
@@ -56,7 +56,7 @@ inline constexpr char kFrameGenSynthCs[] = R"HLSL(
 #define FG_SENTINEL 1   // a rejected-history vector (the size * 2 sentinel) borrows its background's (0: taken as motion)
 #define FG_TURN 1        // the score turns S by the residual head rotation (0: it scores it unturned)
 #define FG_TURN_SIGN 1   // the residual is applied the right way round (0: its transpose)
-#define FG_SHARP 1       // S's resample is Catmull-Rom in 12 fetches, its ringing clamped to the 2x2 around the read (0: bilinear; the bench's comparisons: 2 Lanczos-2 clamped, 3 Catmull-Rom unclamped, 4 clamped to the 4x4, 5 the same Catmull-Rom as 16 loads, 6 the corners dropped: 8 fetches)
+#define FG_SHARP 1       // S's resample is Catmull-Rom in 8 fetches, its corners dropped, its ringing clamped to the 2x2 around the read (0: bilinear; the bench's comparisons: 2 Lanczos-2 clamped, 3 Catmull-Rom unclamped, 4 clamped to the 4x4, 5 the Catmull-Rom as 16 loads, 6 with its corners in 12 fetches)
 cbuffer P : register(b0) {
     int4   sz;       // render width, height, output width, height
     int4   qz;       // quarter grid width, height
@@ -150,9 +150,11 @@ float4 synBilinear(Texture2D<float4> t, float2 u, int2 size) {
 // position so an edge does not ring. A bilinear read of an 8-bit source at a sub-pixel position kept about 80% of B's high-frequency energy (the eye dumps of 2026-11-07); the
 // cubic keeps it. A position on a texel centre returns that texel exactly (weights 0, 1, 0, 0). Edges clamped.
 // The pass is bound by its fetches, not by memory (2026-11-08: 4 fetches 0.089 ms, 16 loads 0.161 at the pilot's sizes, the same 98 MB either way), so the production form
-// (synSharpPaired) takes the same 4x4 in 12: the centre 2x2 as point loads (exact, and the clamp's bounds), each edge pair's two centre taps as one bilinear fetch through
-// LinClamp at the ratio of their weights (an edge tap is at most a sixteenth of the sum and the sampler's weights are 8-bit, so a result can differ from the 16-load sum by one
-// step of an 8-bit channel: 0.05% of the S pixels of the 22 replays), the corners as point loads. 5 is the 16-load form it replaced, for the bench's comparison.
+// (synSharpPaired) takes the 4x4 in 8: the centre 2x2 as point loads (exact, and the clamp's bounds), each edge pair's two centre taps as one bilinear fetch through LinClamp
+// at the ratio of their weights (an edge tap is at most a sixteenth of the sum and the sampler's weights are 8-bit, so a result can differ from the 16-load sum by one step of
+// an 8-bit channel: 0.05% of the S pixels of the 22 replays), and the four corners, each at most a sixteenth squared (under 1.6% in all), dropped and the rest renormalised: on
+// the 22 replays no class mean or p95 moved, the hole error at most +0.1%, S/B sharpness +0.003 to +0.006 (a shade more peaked). 5 is the 16-load form (0.161 ms), 6 the same
+// 12 fetches with the corners (0.142), both for the bench's comparison; 1 runs in 0.126.
 float4 synCatmullW(float t) {
     return float4(t * (-0.5 + t * (1.0 - 0.5 * t)), 1.0 + t * t * (-2.5 + 1.5 * t), t * (0.5 + t * (2.0 - 1.5 * t)), t * t * (-0.5 + 0.5 * t));
 }
@@ -168,7 +170,7 @@ float4 synLanczosW(float t) {
     float4 w = float4(synLanczos2(t + 1.0), synLanczos2(t), synLanczos2(1.0 - t), synLanczos2(2.0 - t));
     return w / dot(w, float4(1.0, 1.0, 1.0, 1.0));
 }
-// The Catmull-Rom 4x4 in 12 fetches (above; FG_SHARP 1), or in 8 with the corners dropped and the rest renormalised (6, the bench's comparison).
+// The Catmull-Rom 4x4 in 8 fetches with the corners dropped (above; FG_SHARP 1), or in 12 with them (6, the bench's comparison).
 float4 synSharpPaired(Texture2D<float4> t, float2 u, int2 size) {
     float2 f = u - 0.5;
     int2 i0 = int2(floor(f));
@@ -184,7 +186,7 @@ float4 synSharpPaired(Texture2D<float4> t, float2 u, int2 size) {
     float2 pc = float2(i0) + 0.5 + float2(wx[2] / wxc, wy[2] / wyc);   // the paired position between texels 1 and 2, texel centres at +0.5
     acc += wx[0] * wyc * t.SampleLevel(LinClamp, float2(float(i0.x) - 0.5, pc.y) * inv, 0) + wx[3] * wyc * t.SampleLevel(LinClamp, float2(float(i0.x) + 2.5, pc.y) * inv, 0) +
            wy[0] * wxc * t.SampleLevel(LinClamp, float2(pc.x, float(i0.y) - 0.5) * inv, 0) + wy[3] * wxc * t.SampleLevel(LinClamp, float2(pc.x, float(i0.y) + 2.5) * inv, 0);
-#if FG_SHARP != 6
+#if FG_SHARP == 6
     int2 m = clamp(i0 - 1, int2(0, 0), hi), p = clamp(i0 + 2, int2(0, 0), hi);
     acc += wx[0] * wy[0] * t.Load(int3(m.x, m.y, 0)) + wx[3] * wy[0] * t.Load(int3(p.x, m.y, 0)) + wx[0] * wy[3] * t.Load(int3(m.x, p.y, 0)) + wx[3] * wy[3] * t.Load(int3(p.x, p.y, 0));
 #else
