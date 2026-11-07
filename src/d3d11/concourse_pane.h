@@ -137,6 +137,8 @@ struct ConcoursePaneFeed {
     float enterShare = 0.0f;    // the share of the view at which the clearing starts (diag.concourse_clear_share); 0 never: a pane read as exterior that fills this much becomes the clearing pane
     float up[3] = {};           // the anchor's local up axis in world (the steady glow's sky test); zero when not valid
     bool upValid = false;
+    uint32_t bayN = 0;          // this room's bay window's index count (cc::RoomLayout); 0 is the large station's
+    float backdropRadiusM = 0.0f;   // the sphere this room's bake is shown on, unless diag.concourse_backdrop_radius says; 0 is the large station's
 };
 void concoursePaneSetFeed(const ConcoursePaneFeed& feed) noexcept;
 

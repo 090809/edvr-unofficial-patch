@@ -291,7 +291,7 @@ std::atomic<bool> g_concHubWanted{false};     // the tick wants the hub's addres
 uint32_t concourseNodeFlagsOf(const char* name) noexcept {
     uint32_t f = 0;
     if (cc::concourseAllowName(name, g_concExtra.get())) f |= sealed::kNodeConcourseAllow;
-    if (std::strcmp(name, cc::kAnchorName) == 0) f |= sealed::kNodeConcourseAnchor | sealed::kNodeConcourseFarExempt;
+    if (cc::concourseAnchorName(name)) f |= sealed::kNodeConcourseAnchor | sealed::kNodeConcourseFarExempt;
     if (std::strcmp(name, cc::kHubName) == 0) f |= sealed::kNodeConcourseFarExempt;
     if (cc::extraKeepName(name, g_concExtra.get())) f |= sealed::kNodeConcourseFarExempt;   // diag.concourse_keep: the extra names are kept however far (an empty list matches nothing)
     if (cc::liftPartName(name)) f |= sealed::kNodeLiftPart;
@@ -3216,6 +3216,8 @@ bool g_concSurveyList = false;     // the running survey lists the culled names
 uint32_t g_concSurveyStamp = 0;
 bool g_concNamesOnlyOn = false;    // TEMPORARY: the tick's side of g_concNamesOnly
 uint32_t g_concNamesOnlyStamp = 0;
+const cc::RoomLayout* g_concLayout = &cc::kRoomStation;   // this room's, from the anchor's name (the tick's)
+uintptr_t g_concLayoutAddr = 0;                           // the anchor record it was read from
 uint64_t g_concTraceMs = 0;
 uint32_t g_concTraceReason = 0;
 uint64_t g_concTraceReasonMs = 0;
@@ -3663,7 +3665,7 @@ void concourseFrameTrace(uint64_t now) {
         return;
     }
     char nm[64] = {};
-    if (!cachedName(anchor, nm, sizeof(nm)) || std::strcmp(nm, cc::kAnchorName) != 0) {
+    if (!cachedName(anchor, nm, sizeof(nm)) || !cc::concourseAnchorName(nm)) {
         uintptr_t expect = anchor;
         g_concAnchorAddr.compare_exchange_strong(expect, 0, std::memory_order_relaxed);
         Log::get().note("concourse frame: the latched anchor @%llx no longer reads %s (it reads \"%s\"); the latch is dropped until the store sees it again",
@@ -3723,7 +3725,7 @@ bool concourseCamLocal(float out[3]) {
     const uintptr_t anchor = g_concAnchorAddr.load(std::memory_order_relaxed);
     if (!anchor) return false;
     char nm[64] = {};
-    if (!cachedName(anchor, nm, sizeof(nm)) || std::strcmp(nm, cc::kAnchorName) != 0) return false;
+    if (!cachedName(anchor, nm, sizeof(nm)) || !cc::concourseAnchorName(nm)) return false;
     const WorldRead aw = worldOfRecord(anchor);
     float axes[3][3] = {};
     float ext[3] = {};
@@ -3740,7 +3742,7 @@ bool concourseAnchorUp(float out[3]) {
     const uintptr_t anchor = g_concAnchorAddr.load(std::memory_order_relaxed);
     if (!anchor) return false;
     char nm[64] = {};
-    if (!cachedName(anchor, nm, sizeof(nm)) || std::strcmp(nm, cc::kAnchorName) != 0) return false;
+    if (!cachedName(anchor, nm, sizeof(nm)) || !cc::concourseAnchorName(nm)) return false;
     const WorldRead aw = worldOfRecord(anchor);
     float axes[3][3] = {};
     float ext[3] = {};
@@ -3760,7 +3762,7 @@ bool concourseAnchorFrame(float centre[3], float axes[3][3]) {
     const uintptr_t anchor = g_concAnchorAddr.load(std::memory_order_relaxed);
     if (!anchor) return false;
     char nm[64] = {};
-    if (!cachedName(anchor, nm, sizeof(nm)) || std::strcmp(nm, cc::kAnchorName) != 0) return false;
+    if (!cachedName(anchor, nm, sizeof(nm)) || !cc::concourseAnchorName(nm)) return false;
     const WorldRead aw = worldOfRecord(anchor);
     float ext[3] = {};
     bool extOk = false;
@@ -4220,6 +4222,21 @@ void concourseTick(uint64_t now, uint32_t frame) {
     }
     const uint64_t anchorMs = g_concAnchorMs.load(std::memory_order_relaxed);
     const bool anchor = anchorMs != 0 && now - anchorMs <= kConcAnchorFreshMs;
+    {
+        // Which room this is: the anchor's name says, whatever the journal has said. An anchor gone stale is read afresh when it is next seen, since a record's address can be used again.
+        if (!anchor) g_concLayoutAddr = 0;
+        const uintptr_t anchorAddr = g_concAnchorAddr.load(std::memory_order_relaxed);
+        char anchorName[64] = {};
+        if (anchorAddr != 0 && anchorAddr != g_concLayoutAddr && cachedName(anchorAddr, anchorName, sizeof(anchorName)) && cc::concourseAnchorName(anchorName)) {
+            g_concLayoutAddr = anchorAddr;
+            const cc::RoomLayout* layout = &cc::roomLayoutOf(anchorName);
+            if (layout != g_concLayout) {
+                g_concLayout = layout;
+                Log::get().note("concourse cull: the room is %s (its anchor is %s): the bay window has %u indices, and a bake shows on a sphere of %.0f m unless diag.concourse_backdrop_radius says",
+                                layout->name, anchorName, layout->bayN, static_cast<double>(layout->backdropRadiusM));
+            }
+        }
+    }
     const bool gateWanted = armed && social && !sealedNow;
     // The cull waits for the windows' bake: until there is one, the room and its windows are the game's own, and a bake that never comes costs nothing but the saving. A ride up opens
     // the bake's window at the anchor's first sighting, so this holds for that one tick.
@@ -4474,6 +4491,8 @@ void concourseTick(uint64_t now, uint32_t frame) {
     feed.bayOpacity = clr.bayOpacity;
     feed.sealed = g_sealedFlag.load(std::memory_order_acquire);   // the hangar is sealed: what can only be outside is not issued, with no diag key
     feed.enterShare = g_concEnterShare;
+    feed.bayN = g_concLayout->bayN;
+    feed.backdropRadiusM = g_concLayout->backdropRadiusM;
     {
         // The anchor's up axis, read at most once a second while the cull is wanted (the pose read is not free), and held between reads.
         static float up[3] = {};
@@ -4491,7 +4510,7 @@ void concourseTick(uint64_t now, uint32_t frame) {
     }
     concoursePaneSetFeed(feed);
     g_concWanted.store(gateWanted || liftOn || lookOn, std::memory_order_release);   // the lift opens the store route in the hangar too (it is not social space there)
-    g_concHubWanted.store(gateWanted && g_concHubAddr.load(std::memory_order_relaxed) == 0, std::memory_order_relaxed);
+    g_concHubWanted.store(gateWanted && g_concLayout == &cc::kRoomStation && g_concHubAddr.load(std::memory_order_relaxed) == 0, std::memory_order_relaxed);   // a port's hub is its anchor
     const bool transitioned = active != g_concWasActive;
     if (transitioned) {
         if (active) {

@@ -3349,6 +3349,25 @@ int main(int argc, char** argv) {
               "concourse allow-list: the prefix match is exact case");
         check(!cc::concourseAllowName("", nullptr) && !cc::concourseAllowName(nullptr, nullptr), "concourse allow-list: an empty or null name is not allowed");
         check(!cc::concourseAllowName("XSA_Bar", nullptr), "concourse allow-list: a prefix matches at the start of the name only");
+        // A surface port's room and what stands outside it, with the names two surveys read at a CraterOutpost (Flight 35): the station's list parts them, and nothing it would cull was within 126 m.
+        for (const char* n : {"SA_PlanetPortHub_Compact", "SA_PlanetPort_Exterior", "SA_PlanetPort_Compact_Hitcheck", "SA_PP_Fed_JeromeArcher_Logo_OnGlass_01", "PS_Sittable_Sofa_Seat_01",
+                              "PS_STAT_HoloScreen_Horiz_Apex01", "FUI_Anaconda", "PROP_Tablet", "GUI_Interactive_Terminal_Standing_Gen_01", "STAT_HoloBanner_VertA", "TurboLiftDoorLeft",
+                              "TurboLift_Blocker", "Perturbator", "Root"})
+            check(cc::concourseAllowName(n, nullptr), "concourse surface port: the room's own name is on the list");
+        for (const char* n : {"PB_Gen_BuildingSectionB", "PB_LampPost", "PB_Gen_ScienceStation", "PP_SmallDock", "PP_LargeDock", "HangerLarge", "LargeHangerSkirt", "LandingPadLargeA",
+                              "LandingPadSmall_GuideMarkers", "BakedSkirtBuildings", "CobraMkV_Hull", "Type9", "LargeHardpointBunkerE", "SkimmerDrone", "PlanetPortF"})
+            check(!cc::concourseAllowName(n, nullptr), "concourse surface port: what stands outside is not on the list");
+        check(cc::concourseAnchorName("Standard_SocialArea") && cc::concourseAnchorName("SA_PlanetPortHub_Compact"), "concourse anchors: the station's room and the surface port's");
+        check(!cc::concourseAnchorName("SA_StationHub_Compact") && !cc::concourseAnchorName("SA_PlanetPort_Exterior") && !cc::concourseAnchorName(nullptr) && !cc::concourseAnchorName(""),
+              "concourse anchors: nothing else");
+        check(&cc::roomLayoutOf("Standard_SocialArea") == &cc::kRoomStation && cc::kRoomStation.bayN == cc::kBayIndexCount && cc::kRoomStation.backdropRadiusM == cc::kBackdropRadiusDefaultM,
+              "concourse layouts: a station's room is what it was");
+        check(&cc::roomLayoutOf("SA_PlanetPortHub_Compact") == &cc::kRoomPort && cc::kRoomPort.bayN == 12u && cc::kRoomPort.backdropRadiusM >= cc::kBackdropRadiusMinM && cc::kRoomPort.backdropRadiusM <= cc::kBackdropRadiusMaxM,
+              "concourse layouts: a surface port's bay is n=12, on a sphere the key's range allows");
+        check(&cc::roomLayoutOf(nullptr) == &cc::kRoomStation && &cc::roomLayoutOf("") == &cc::kRoomStation, "concourse layouts: no name is a station's");
+        check(cc::judgeKeeps(cc::concourseJudge(true, true, true, 3.5f, 42.1f, true)), "concourse surface port: its anchor is kept");
+        check(cc::judgeKeeps(cc::concourseJudge(true, true, true, 64.9f, 102.2f, false)), "concourse surface port: its exterior shell is kept");
+        check(!cc::judgeKeeps(cc::concourseJudge(true, false, true, 126.0f, 9.3f, false)), "concourse surface port: the nearest lamp post outside is culled, past the close distance");
         check(cc::concourseAllowName("Spoke03", "Spoke,Ring") && cc::concourseAllowName("RingRoad07", "Spoke,Ring"), "concourse extra prefixes: Spoke and Ring are kept");
         check(cc::concourseAllowName("Spoke03", " Wheel , Spoke ") && cc::concourseAllowName("WheelSection00", " Wheel , Spoke "),
               "concourse extra prefixes: spaces around an entry are ignored");

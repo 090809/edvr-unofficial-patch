@@ -136,6 +136,8 @@ bool g_glowLogged = false;
 float g_glowLoggedLv[4] = {};
 // The index count treated as the clearing pane (36, the bay window, until an exterior pane fills the view), and the entry share the feed carries.
 std::atomic<uint32_t> g_clearN{cc::kBayIndexCount};
+std::atomic<uint32_t> g_bayN{cc::kBayIndexCount};   // this room's bay window (the feed's, from its anchor)
+std::atomic<float> g_radiusFed{cc::kBackdropRadiusDefaultM};   // this room's sphere, unless the key says
 std::atomic<float> g_enterShareFed{0.0f};
 
 // The mark pass's own objects (made by the tick; the draw threads read the atomics).
@@ -2471,7 +2473,7 @@ bool ConcoursePaneScope::beginProbePass() noexcept {
     ID3D11ShaderResourceView* mine[kBdSrvCount] = {g_bdFrontSrv.load(std::memory_order_acquire), g_bdDistFrontSrv.load(std::memory_order_acquire), g_bdOriginSrv.load(std::memory_order_acquire)};
     ID3D11SamplerState* smp = g_bdSampler.load(std::memory_order_acquire);
     ID3D11BlendState* noColour = g_bsMark.load(std::memory_order_acquire);
-    ID3D11Buffer* cb = (keyN_ == cc::kBayIndexCount ? g_cbGlowBay : g_cbGlow).load(std::memory_order_acquire);
+    ID3D11Buffer* cb = (keyN_ == g_bayN.load(std::memory_order_relaxed) ? g_cbGlowBay : g_cbGlow).load(std::memory_order_acquire);
     if (!q || !ps || !mine[0] || !mine[1] || !mine[2] || !smp || !noColour || !cb) return false;
     if (!ensureMarked(ctx_, *calls_)) return false;   // runs and restores its own state
     UINT ref = 0;
@@ -2586,7 +2588,7 @@ bool ConcoursePaneScope::beginMirrorSlow() noexcept {
     ID3D11SamplerState* cubeSmp = nullptr;
     if (planSteady_ && !planTint_) {
         skyPs = g_psSky.load(std::memory_order_acquire);
-        steadyCb = (keyN_ == cc::kBayIndexCount ? g_cbGlowBay : g_cbGlow).load(std::memory_order_acquire);
+        steadyCb = (keyN_ == g_bayN.load(std::memory_order_relaxed) ? g_cbGlowBay : g_cbGlow).load(std::memory_order_acquire);
         if (planBackdrop_) {
             ID3D11PixelShader* show = g_psBdShow.load(std::memory_order_acquire);
             ID3D11ShaderResourceView* srv = g_bdFrontSrv.load(std::memory_order_acquire);
@@ -2911,11 +2913,14 @@ void pollConfig(uint64_t nowMs) {
         }
     }
     const std::string radiusT = Config::get().getString("diag.concourse_backdrop_radius", "");
-    if (!g_radiusTextSeen || radiusT != g_radiusAppliedText) {
+    const float radiusFed = g_radiusFed.load(std::memory_order_relaxed);
+    static float s_radiusFedApplied = cc::kBackdropRadiusDefaultM;
+    if (!g_radiusTextSeen || radiusT != g_radiusAppliedText || radiusFed != s_radiusFedApplied) {
         const bool first = !g_radiusTextSeen;
         g_radiusTextSeen = true;
         g_radiusAppliedText = radiusT;
-        float want = cc::kBackdropRadiusDefaultM;
+        s_radiusFedApplied = radiusFed;
+        float want = radiusFed;
         bool bad = false;
         if (!radiusT.empty()) {
             char* end = nullptr;
@@ -3091,6 +3096,8 @@ uint32_t concoursePaneSlotCount() noexcept { return g_listN.load(std::memory_ord
 bool concoursePaneTreating() noexcept { return g_treatNow.load(std::memory_order_relaxed); }
 
 void concoursePaneSetFeed(const ConcoursePaneFeed& feed) noexcept {
+    g_bayN.store(feed.bayN != 0 ? feed.bayN : cc::kBayIndexCount, std::memory_order_relaxed);
+    g_radiusFed.store(feed.backdropRadiusM > 0.0f ? feed.backdropRadiusM : cc::kBackdropRadiusDefaultM, std::memory_order_relaxed);
     g_feedMeasure.store(feed.measure, std::memory_order_relaxed);
     const bool treatBefore = g_feedTreat.exchange(feed.treat, std::memory_order_relaxed);
     if (!treatBefore && feed.treat) {   // a new visit to a concourse: what was learned about the panes is forgotten
@@ -3100,7 +3107,7 @@ void concoursePaneSetFeed(const ConcoursePaneFeed& feed) noexcept {
     }
     if (!g_feedWithhold.exchange(feed.withhold, std::memory_order_relaxed) && feed.withhold) {
         g_plainFrom.store(g_frameNow.load(std::memory_order_relaxed), std::memory_order_relaxed);
-        g_clearN.store(cc::kBayIndexCount, std::memory_order_relaxed);   // back in the plain mirror phase: the next approach starts from the bay window
+        g_clearN.store(g_bayN.load(std::memory_order_relaxed), std::memory_order_relaxed);   // back in the plain mirror phase: the next approach starts from the bay window
     }
     g_feedEffects.store(feed.effects, std::memory_order_relaxed);
     g_feedSealed.store(feed.sealed, std::memory_order_relaxed);

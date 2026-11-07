@@ -29,6 +29,9 @@ constexpr uint32_t kFlags2SocialSpace = 1u << 14;
 // The anchor record's name: the large station's concourse. Its sighting by the store is the second half of the gate.
 constexpr const char* kAnchorName = "Standard_SocialArea";
 constexpr const char* kHubName = "SA_StationHub_Compact";
+// A surface port's room has no Standard_SocialArea. Its own hub anchors it: r=42.1, centred 3.5 m from where Sean stood in the middle of the room (Flight 35, a CraterOutpost).
+constexpr const char* kPortAnchorName = "SA_PlanetPortHub_Compact";
+inline bool concourseAnchorName(const char* name) noexcept { return name && (std::strcmp(name, kAnchorName) == 0 || std::strcmp(name, kPortAnchorName) == 0); }
 
 // The name prefixes that are the room. Exact case.
 // Root and Perturbator are the room's too: off this list they stayed only while within kCloseDistanceM, so the bar's tables popped in and flickered at that distance (Flight 31).
@@ -911,6 +914,16 @@ constexpr uint32_t kParallaxNone = 0, kParallaxSphere = 1, kParallaxDepth = 2;
 inline uint32_t parallaxNext(uint32_t m) noexcept { return m == kParallaxNone ? kParallaxSphere : m == kParallaxSphere ? kParallaxDepth : kParallaxNone; }
 inline const char* parallaxName(uint32_t m) noexcept { return m == kParallaxSphere ? "sphere" : m == kParallaxDepth ? "depth" : "off"; }
 constexpr float kBackdropRadiusDefaultM = 600.0f, kBackdropRadiusMinM = 10.0f, kBackdropRadiusMaxM = 60000.0f;   // diag.concourse_backdrop_radius
+// What differs between the rooms, named by the anchor. At a surface port the bay is one window of n=12 (85.5% of the view standing at it, Flight 35), and what stands outside begins nearer than in a
+// station: buildings from about 110 m from the hub, the docks past 1100 m, so the sphere the bake is shown on sits nearer. 300 m is a first value, between those.
+struct RoomLayout {
+    uint32_t bayN;
+    float backdropRadiusM;
+    const char* name;
+};
+inline constexpr RoomLayout kRoomStation{kBayIndexCount, kBackdropRadiusDefaultM, "a large station's"};
+inline constexpr RoomLayout kRoomPort{12u, 300.0f, "a surface port's"};
+inline const RoomLayout& roomLayoutOf(const char* anchorName) noexcept { return anchorName && std::strcmp(anchorName, kPortAnchorName) == 0 ? kRoomPort : kRoomStation; }
 constexpr float kBackdropNearZ = 0.025f;       // the game's near plane (reversed infinite Z: view depth = this / z)
 constexpr float kBackdropMinDistM = 5.0f;      // a captured pixel nearer than this along its ray is not backdrop and is not written
 constexpr float kBackdropFarM = 60000.0f;      // the distance written for a pixel with no depth (z = 0), and the largest stored distance
