@@ -33,11 +33,24 @@ struct FrameGenShadowClassStats {
     uint32_t histId[kFrameGenShadowBins] = {};
 };
 
+// The per-class stats of one extra score set of one eye-frame (the mv and bdepth sets of the second kernel).
+struct FrameGenShadowEyeBlock {
+    FrameGenShadowClassStats cls[kFrameGenShadowClasses];
+    uint64_t holes = 0;
+    uint64_t cells = 0;
+};
+
 // One eye's scored result for one frame.
 struct FrameGenShadowEyeResult {
     FrameGenShadowClassStats cls[kFrameGenShadowClasses];
     uint64_t holes = 0;
     uint64_t cells = 0;   // every cell looked at, holes included
+    // The second kernel (fgShadowScoreB, scored on every scored frame whatever its set): each B cell classed by B's own depth and carried back to A two ways, by the
+    // DLSS motion vector (mv) and by B's TRUE backward rows and B's own depth (bdepth), and how far apart the two landings are (the disagreement, 48 log bins in
+    // pixels of render size, bin 0 for under 1/16 px) for the world and cockpit cells where both landed inside the image.
+    FrameGenShadowEyeBlock mv, bdepth;
+    uint32_t disWorld[kFrameGenShadowBins] = {};
+    uint32_t disCockpit[kFrameGenShadowBins] = {};
 };
 
 // Which stats set a scored frame belongs to: the normal one (predicted transforms), the oracle one (frame B's true transforms for far and world, every second
@@ -78,6 +91,9 @@ struct FrameGenShadowWindow {
     uint64_t holes = 0;
     uint64_t cells = 0;
     FrameGenShadowSetStats oracle, jump;
+    FrameGenShadowSetStats mv, bdepth;                  // frames = eye-frames merged, every scored frame of every set
+    uint32_t disWorld[kFrameGenShadowBins] = {};        // |p_mv - p_bdepth| in render px, world cells where both landed inside the image
+    uint32_t disCockpit[kFrameGenShadowBins] = {};
     FrameGenShadowMotion motion;
     float gpuMsMedian = 0.0f, gpuMsMax = 0.0f;
     uint32_t gpuSamples = 0;   // the timed frames behind the two numbers; 0 reads "-" in the line
@@ -157,6 +173,53 @@ inline void frameGenShadowMergeSet(FrameGenShadowSetStats& s, const FrameGenShad
     ++s.frames;
 }
 
+// The same for the second kernel's result: both extra sets and both disagreement histograms. The caller picks the frame's own set (above) separately.
+inline void frameGenShadowMergeProbe(FrameGenShadowWindow& w, const FrameGenShadowEyeResult& eye) {
+    FrameGenShadowSetStats* const to[2] = {&w.mv, &w.bdepth};
+    const FrameGenShadowEyeBlock* const from[2] = {&eye.mv, &eye.bdepth};
+    for (int i = 0; i < 2; ++i) {
+        for (int c = 0; c < kFrameGenShadowClasses; ++c) frameGenShadowAddClass(to[i]->cls[c], from[i]->cls[c]);
+        to[i]->holes += from[i]->holes;
+        to[i]->cells += from[i]->cells;
+        ++to[i]->frames;
+    }
+    for (int i = 0; i < kFrameGenShadowBins; ++i) {
+        w.disWorld[i] += eye.disWorld[i];
+        w.disCockpit[i] += eye.disCockpit[i];
+    }
+}
+
+// The disagreement bins: 0 for d < 1/16 px, else clamp(1 + floor(4 * log2(d * 16)), 1, 47). Bin b >= 1 spans [2^((b-1)/4), 2^(b/4)) / 16 px.
+inline int frameGenShadowDisBin(float d) {
+    if (!(d >= 1.0f / 16.0f)) return 0;   // also catches NaN
+    const float l = 4.0f * std::log2(d * 16.0f);
+    if (!(l < 46.0f)) return kFrameGenShadowBins - 1;
+    const int b = 1 + static_cast<int>(std::floor(l));
+    return b < 1 ? 1 : (b > kFrameGenShadowBins - 1 ? kFrameGenShadowBins - 1 : b);
+}
+
+// The pixels a disagreement bin stands for, the way frameGenShadowBinValue stands for an error bin: the geometric middle of its edges, 2^((bin - 0.5) / 4) / 16 px
+// (so a true 2 px reads 2.18); bin 0 reads 0.
+inline float frameGenShadowDisValue(int bin) {
+    if (bin <= 0) return 0.0f;
+    if (bin > kFrameGenShadowBins - 1) bin = kFrameGenShadowBins - 1;
+    return std::exp2((static_cast<float>(bin) - 0.5f) * 0.25f) / 16.0f;
+}
+
+// The disagreement at quantile q of a histogram in pixels (the bin value where the cumulative count first reaches q of the total); 0 for an empty one (check the total).
+inline float frameGenShadowDisPercentile(const uint32_t hist[kFrameGenShadowBins], float q) {
+    const uint64_t total = frameGenShadowHistTotal(hist);
+    if (total == 0) return 0.0f;
+    uint64_t need = static_cast<uint64_t>(std::ceil(static_cast<double>(q < 0.0f ? 0.0f : (q > 1.0f ? 1.0f : q)) * static_cast<double>(total)));
+    if (need < 1) need = 1;
+    uint64_t run = 0;
+    for (int i = 0; i < kFrameGenShadowBins; ++i) {
+        run += hist[i];
+        if (run >= need) return frameGenShadowDisValue(i);
+    }
+    return frameGenShadowDisValue(kFrameGenShadowBins - 1);
+}
+
 // ---- the two log lines ----
 // The format strings are the single source: the DLL logs with them, the rig renders from them, and tools\edvr_log.py --health reads them from this file.
 constexpr const char* kFrameGenShadowArmedFmt =
@@ -172,6 +235,13 @@ constexpr const char* kFrameGenShadowReportTailFmt = " holes=%.1f%% gpu_ms=%s ri
 // the normal predicted set; in the skipped field the fourth count (camera_jump) is the number of frames routed to the jump set.
 constexpr const char* kFrameGenShadowOracleHeadFmt = " oracle=%u";
 constexpr const char* kFrameGenShadowJumpHeadFmt = " jump=%u";
+// Appended after rig_dt_mm: the second kernel's sets, each as the oracle's (a count of eye-frames merged, then far cockpit world in the class format): mv (B's cell carried
+// to A by the DLSS motion vector read at the cell's centre texel) and bdepth (by B's true backward rows and B's own depth), then the disagreement of the two landings,
+// p50/p95 in render pixels from frameGenShadowDisValue (the bin's geometric middle; "-/-" when no cell had both inside), for the world cells and for the cockpit cells.
+constexpr const char* kFrameGenShadowMvHeadFmt = " mv=%u";
+constexpr const char* kFrameGenShadowBdepthHeadFmt = " bdepth=%u";
+constexpr const char* kFrameGenShadowDisFmt = " mvdis_world_px=%s/%s mvdis_cockpit_px=%s/%s";
+constexpr const char* kFrameGenShadowNumFmtPx = "%.2f";
 constexpr const char* kFrameGenShadowMotionFmt = " motion_mm=%s/%s mag_ratio=%s/%s/%s dt_ratio=%s/%s/%s dt_ms=%s/%s rig_dt_mm=%s/%s";
 constexpr const char* kFrameGenShadowNumFmtMotion = "%.1f";   // motion_mm, dt_ms
 constexpr const char* kFrameGenShadowNumFmtRatio = "%.2f";    // mag_ratio, dt_ratio, rig_dt_mm
@@ -230,8 +300,21 @@ inline std::string formatFrameGenShadowMotion(const FrameGenShadowMotion& m) {
     return buf;
 }
 
+// One disagreement percentile in pixels, or "-" when the histogram is empty.
+inline std::string formatFrameGenShadowDisNum(const uint32_t hist[kFrameGenShadowBins], float q) {
+    return formatFrameGenShadowNum(kFrameGenShadowNumFmtPx, frameGenShadowHistTotal(hist) ? 1u : 0u, frameGenShadowDisPercentile(hist, q));
+}
+
+inline std::string formatFrameGenShadowDis(const FrameGenShadowWindow& w) {
+    const std::string a[4] = {formatFrameGenShadowDisNum(w.disWorld, 0.50f), formatFrameGenShadowDisNum(w.disWorld, 0.95f),
+                              formatFrameGenShadowDisNum(w.disCockpit, 0.50f), formatFrameGenShadowDisNum(w.disCockpit, 0.95f)};
+    char buf[160];
+    std::snprintf(buf, sizeof(buf), kFrameGenShadowDisFmt, a[0].c_str(), a[1].c_str(), a[2].c_str(), a[3].c_str());
+    return buf;
+}
+
 inline std::string formatFrameGenShadowReport(const FrameGenShadowWindow& w) {
-    char buf[1792];
+    char buf[2048];
     int n = std::snprintf(buf, sizeof(buf), kFrameGenShadowReportHeadFmt, static_cast<unsigned>(w.framesScored), static_cast<unsigned>(w.skipped[0]),
                           static_cast<unsigned>(w.skipped[1]), static_cast<unsigned>(w.skipped[2]), static_cast<unsigned>(w.skipped[3]),
                           static_cast<unsigned>(w.skipped[4]));
@@ -255,6 +338,14 @@ inline std::string formatFrameGenShadowReport(const FrameGenShadowWindow& w) {
     }
     std::string out = buf;
     out += formatFrameGenShadowMotion(w.motion);
+    // The second kernel's sets and the disagreement, last.
+    char tail[640];
+    int m = std::snprintf(tail, sizeof(tail), kFrameGenShadowMvHeadFmt, static_cast<unsigned>(w.mv.frames));
+    m = formatFrameGenShadowClasses(tail, sizeof(tail), m, w.mv.cls, w.mv.cells);
+    if (m > 0 && m < static_cast<int>(sizeof(tail))) m += std::snprintf(tail + m, sizeof(tail) - m, kFrameGenShadowBdepthHeadFmt, static_cast<unsigned>(w.bdepth.frames));
+    m = formatFrameGenShadowClasses(tail, sizeof(tail), m, w.bdepth.cls, w.bdepth.cells);
+    out += tail;
+    out += formatFrameGenShadowDis(w);
     return out;
 }
 

@@ -10629,7 +10629,12 @@ H_FRAMEGEN_REPORT = (r"frame generation \(shadow\): frames=(?P<frames>\d+) skipp
                      r"(?: oracle=(?P<oracle_n>\d+)" + "".join(_HFG_SET_CLASS.format(n=n, p="o_") for n in ("far", "cockpit", "world")) +
                      r" jump=(?P<jump_n>\d+)" + "".join(_HFG_SET_CLASS.format(n=n, p="j_") for n in ("far", "cockpit", "world")) +
                      r" motion_mm=(?P<motion_med>{N})/(?P<motion_max>{N}) mag_ratio=(?P<mag5>{N})/(?P<mag50>{N})/(?P<mag95>{N})"
-                     r" dt_ratio=(?P<dtr5>{N})/(?P<dtr50>{N})/(?P<dtr95>{N}) dt_ms=(?P<dtms_med>{N})/(?P<dtms_max>{N}) rig_dt_mm=(?P<rigdt_med>{N})/(?P<rigdt_max>{N}))?$".replace("{N}", _HFG_NUM))
+                     r" dt_ratio=(?P<dtr5>{N})/(?P<dtr50>{N})/(?P<dtr95>{N}) dt_ms=(?P<dtms_med>{N})/(?P<dtms_max>{N}) rig_dt_mm=(?P<rigdt_med>{N})/(?P<rigdt_max>{N})"
+                     # the second kernel, appended after rig_dt_mm (optional: a line from before it ends there): the mv set (the DLSS vector's landing) and the bdepth set (B's true rows
+                     # and own depth), each with a frame count and the three class fields (prefixes m_ and b_), then the disagreement of the two landings in render px, p50/p95
+                     r"(?: mv=(?P<mv_n>\d+)" + "".join(_HFG_SET_CLASS.format(n=n, p="m_") for n in ("far", "cockpit", "world")) +
+                     r" bdepth=(?P<bd_n>\d+)" + "".join(_HFG_SET_CLASS.format(n=n, p="b_") for n in ("far", "cockpit", "world")) +
+                     r" mvdis_world_px=(?P<dw50>{N})/(?P<dw95>{N}) mvdis_cockpit_px=(?P<dc50>{N})/(?P<dc95>{N}))?)?$").replace("{N}", _HFG_NUM)
 # The SRV turret view (issue 140; src\d3d11\srv_turret.cpp, the vehicle latch's line in journal_watch.cpp, and the geometry shader's creation line in shader_swap.cpp, shaderSwapCreateGs,
 # called with who "srv turret hud"): lines of the graphics log with no build tag, read the way the desktop window's are. The settings and vehicle lines are state, so health_scan keeps
 # every one whatever --since says; the rest are events and are cut by the window. Every kind of line the DLL writes has a pattern of its own, so a labelled line that none matches is
@@ -16868,6 +16873,14 @@ def _hj_framegen_shadow(rows, ctx=None):
         text += ("; world p95 %.0f milli-luma predicted vs %.0f oracle (mean of %d line(s)), %d jump frame(s) scored apart" %
                  (sum(int(r["world_p95"]) for r in withOracle) / len(withOracle), sum(int(r["o_world_p95"]) for r in withOracle) / len(withOracle), len(withOracle),
                   sum(int(r.get("jump_n") or 0) for r in withOracle)))
+    # The second kernel (lines from after it only): the world class's p95 error for the four landings, and where the DLSS vector and B's true rows part, in render pixels.
+    withMv = [r for r in withOracle if r.get("m_world_p95") is not None and int(r.get("mv_n") or 0) > 0]
+    if withMv:
+        last = withMv[-1]
+        text += ("; world p95 %.0f predicted vs %.0f oracle vs %.0f mv vs %.0f bdepth milli-luma (mean of %d line(s)); mv vs bdepth landing disagreement p50/p95 %s/%s px world, %s/%s px cockpit (last line)" %
+                 (sum(int(r["world_p95"]) for r in withMv) / len(withMv), sum(int(r["o_world_p95"]) for r in withMv) / len(withMv),
+                  sum(int(r["m_world_p95"]) for r in withMv) / len(withMv), sum(int(r["b_world_p95"]) for r in withMv) / len(withMv), len(withMv),
+                  last["dw50"], last["dw95"], last["dc50"], last["dc95"]))
     if poses:
         scored = sum(int(r["frames"]) for r in poses)
         text += ("; pose: %d line(s), %d frame(s) scored, runtime miss max %.2f mm / %.3f deg, velocity miss max %.2f mm / %.3f deg, lead median %s ms (last line), %d refused, %d expired, "
@@ -25059,7 +25072,7 @@ def self_test_health():
         def fg_armed(qw=612, qh=699):
             return RF("armed, quarter %ux%u", qw, qh)
 
-        def fg_report(frames=60, skipped=(1, 2, 3, 4, 5), timed=True, sets=False, oracle_p95=20, jump=4):
+        def fg_report(frames=60, skipped=(1, 2, 3, 4, 5), timed=True, sets=False, oracle_p95=20, jump=4, probe=False, mv_p95=33, bd_p95=12, dis="2.18"):
             cls = "".join(RF(" %s=%.1f%%,%u", n, 10.0, 12, 8, 40, 5.5, 1.5, 9, 30) for n in ("far", "cockpit", "world"))
             gpu = RF("%.2f/%.2f(n=%u)", 0.85, 1.2, 3) if timed else health_c_format(fgsrc, "-(n=0)")
             line = RF("frames=%u skipped=%u/", frames, *skipped) + cls + RF(" holes=%.1f%% gpu_ms=%s", 3.5, gpu, 0.012, 0.034, 0.4, 1.25)
@@ -25069,6 +25082,10 @@ def self_test_health():
                 line += RF(" oracle=%u", 29) + ocls + RF(" jump=%u", jump) + jcls
                 line += RF(" motion_mm=%s/%s mag_ratio=%s/%s/%s dt_ratio=%s/%s/%s dt_ms=%s/%s rig_dt_mm=%s/%s", "12.3", "80.0", "0.50", "1.00", "2.00", "0.50", "1.00", "2.00",
                            "-", "-", "0.40", "1.25")
+                if probe:   # the second kernel's mv and bdepth sets and the disagreement, appended after rig_dt_mm
+                    mcls = "".join(RF(" %s=%.1f%%,%u", n, 10.0, 12, 8, mv_p95, 5.5, 1.5, 9, 30) for n in ("far", "cockpit", "world"))
+                    bcls = "".join(RF(" %s=%.1f%%,%u", n, 10.0, 12, 8, bd_p95, 5.5, 1.5, 9, 30) for n in ("far", "cockpit", "world"))
+                    line += RF(" mv=%u", 29) + mcls + RF(" bdepth=%u", 29) + bcls + RF(" mvdis_world_px=%s/%s mvdis_cockpit_px=%s/%s", dis, "4.36", "-", "-")
             return line
 
         FG, fg_ok = H_FRAMEGEN, [f90_part()]
@@ -25078,6 +25095,13 @@ def self_test_health():
         check("frame generation shadow: a line with the oracle and jump sets and the motion facts is OK and says oracle world p95 against the prediction's",
               fg_ok + [fg_armed(), fg_report(sets=True), fg_report(sets=True, oracle_p95=10, jump=2)], 0, [("OK", FG)],
               has=["2 report line(s), 120 frame(s) scored", "world p95 40 milli-luma predicted vs 15 oracle (mean of 2 line(s)), 6 jump frame(s) scored apart"], lacks=["UNPARSED"])
+        check("frame generation shadow: a line with the mv and bdepth sets and the disagreement is OK and says the four world p95s and the disagreement",
+              fg_ok + [fg_armed(), fg_report(sets=True, probe=True), fg_report(sets=True, probe=True, oracle_p95=10, mv_p95=31, bd_p95=14, dis="3.00")], 0, [("OK", FG)],
+              has=["world p95 40 predicted vs 15 oracle vs 32 mv vs 13 bdepth milli-luma (mean of 2 line(s))", "disagreement p50/p95 3.00/4.36 px world, -/- px cockpit (last line)"], lacks=["UNPARSED"])
+        check("frame generation shadow: a line from before the mv and bdepth sets still parses and has no such part", fg_ok + [fg_armed(), fg_report(sets=True)], 0, [("OK", FG)],
+              lacks=["vs bdepth", "UNPARSED"])
+        check("frame generation shadow: a drifted mv and bdepth part is UNPARSED, not a report", fg_ok + [fg_armed(), fg_report(sets=True, probe=True).replace(" bdepth=", " depth=")], 3, [("NEVER APPLIED", FG)],
+              has=["line(s) the rule's patterns do not match"])
         check("frame generation shadow: a line from before the oracle fields has no oracle part in its summary", fg_ok + [fg_armed(), fg_report()], 0, [("OK", FG)],
               lacks=["oracle", "UNPARSED"])
         check("frame generation shadow: a drifted oracle part is UNPARSED, not a report", fg_ok + [fg_armed(), fg_report(sets=True).replace(" jump=", " leap=")], 3, [("NEVER APPLIED", FG)],
