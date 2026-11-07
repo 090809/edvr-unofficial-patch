@@ -3277,7 +3277,8 @@ bool concourseBackdropStep(uint64_t now, bool wantCull) {
     const ConcourseBackdropStatus st = concoursePaneBackdropStatus();
     switch (st.phase) {
         case ConcourseBackdropPhase::kDone:
-            Log::get().note("concourse backdrop: capture: lifted %llu ms, scene %ux%u format %s, %u pane draws captured", lifted, st.sceneW, st.sceneH, st.sceneFormat, st.paneDraws);
+            Log::get().note("concourse backdrop: capture: lifted %llu ms, scene %ux%u format %s, %u pane draws captured, origin %s, %u capture%s in this cube", lifted, st.sceneW, st.sceneH,
+                            st.sceneFormat, st.paneDraws, st.originSet ? "set" : "kept", st.captures, st.captures == 1 ? "" : "s");
             return finish();
         case ConcourseBackdropPhase::kRefused:
             Log::get().note("concourse backdrop: capture failed after %llu ms lifted: refused (%s)", lifted, st.refusal[0] ? st.refusal : "no reason recorded");

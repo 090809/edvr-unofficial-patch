@@ -643,6 +643,30 @@ inline const char* cubeTexelHlsl() noexcept {
            "    return uint3(xy, face);\n"
            "}\n";
 }
+// ---- The backdrop's distance (PROTOTYPE, docs\concourse-cull-2026-11-05.md): where the captured view is taken to be --------------------------------------
+// The cube is keyed by direction from a fixed origin O (the camera at the first capture of a visit). A pane pixel looks up a direction from the camera C; off = C - O. None looks up
+// the pixel's own direction (everything infinitely far), Sphere puts the view on a sphere of radius R around O, Depth marches the captured distances (concourse_pane.cpp).
+constexpr uint32_t kParallaxNone = 0, kParallaxSphere = 1, kParallaxDepth = 2;
+inline uint32_t parallaxNext(uint32_t m) noexcept { return m == kParallaxNone ? kParallaxSphere : m == kParallaxSphere ? kParallaxDepth : kParallaxNone; }
+inline const char* parallaxName(uint32_t m) noexcept { return m == kParallaxSphere ? "sphere" : m == kParallaxDepth ? "depth" : "off"; }
+constexpr float kBackdropRadiusDefaultM = 600.0f, kBackdropRadiusMinM = 10.0f, kBackdropRadiusMaxM = 60000.0f;   // diag.concourse_backdrop_radius
+constexpr float kBackdropNearZ = 0.025f;       // the game's near plane (reversed infinite Z: view depth = this / z)
+constexpr float kBackdropMinDistM = 5.0f;      // a captured pixel nearer than this along its ray is not backdrop and is not written
+constexpr float kBackdropFarM = 60000.0f;      // the distance written for a pixel with no depth (z = 0), and the largest stored distance
+// The point s = off + dir * t with |s| = radius, t the far root (off inside the sphere has one). A direction that misses (off outside the sphere) takes the nearest point,
+// as the shader does (the discriminant is clamped at 0). `dir` need not be unit; False for a zero direction. With off = 0 the result is dir * radius.
+inline bool backdropSphereHit(const float off[3], const float dir[3], float radius, float out[3]) noexcept {
+    const float dd = dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2];
+    if (!(dd > 0.0f) || !std::isfinite(dd)) return false;
+    const float inv = 1.0f / std::sqrt(dd);
+    const float d[3] = {dir[0] * inv, dir[1] * inv, dir[2] * inv};
+    const float b = off[0] * d[0] + off[1] * d[1] + off[2] * d[2];
+    const float c = off[0] * off[0] + off[1] * off[1] + off[2] * off[2] - radius * radius;
+    const float disc = b * b - c;
+    const float t = -b + std::sqrt(disc > 0.0f ? disc : 0.0f);
+    for (int i = 0; i < 3; ++i) out[i] = off[i] + d[i] * t;
+    return true;
+}
 // ---- The glow levels by window type (diag.concourse_glow = "sky,angled,other,bay") ---------------------------------------------------------------------
 // The steady light of a pane: the brightest on overhead skylights, a level between on angled skylights, a middle level on any other window, and its own level on the
 // bay window. Absolute levels, each from 0 to 16. Overhead, angled and other are told by how much the pane faces the anchor's up axis (the pixel shader).

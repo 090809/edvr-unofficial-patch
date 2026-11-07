@@ -98,7 +98,7 @@ private:
     FLOAT capPrevFactor_[4] = {};
     UINT capPrevMask_ = 0;
     ID3D11PixelShader* capPrevPs_ = nullptr;
-    ID3D11ShaderResourceView* capPrevSrv_ = nullptr;
+    ID3D11ShaderResourceView* capPrevSrv_[3] = {};
     ID3D11DepthStencilState* capPrevDs_ = nullptr;
     UINT capPrevRef_ = 0;
     ID3D11SamplerState* prevSampler_ = nullptr;   // the display pass's sampler slot, the game's kept for end()
@@ -179,6 +179,8 @@ struct ConcourseBackdropStatus {
     bool sceneCopied = false;        // a frame's first pane draw copied the render target
     uint32_t sceneW = 0, sceneH = 0;
     char sceneFormat[28] = {};
+    bool originSet = false;          // this capture set the cube's origin (false: the visit's earlier origin was kept)
+    uint32_t captures = 0;           // captures that have gone into this cube, this one included once done
     uint32_t paneDraws = 0;          // capture passes issued
     uint32_t framesWaited = 0;
     char refusal[200] = {};          // kRefused: why

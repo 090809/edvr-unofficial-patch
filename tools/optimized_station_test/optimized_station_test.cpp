@@ -3902,7 +3902,27 @@ int main(int argc, char** argv) {
             check(clampHigh && lowEdge && tx == 768 && ty == 384, "backdrop cube: u or v of 1.0 clamps to the last texel, 0.0 is the first, the middle is half the size");
             check(std::strstr(cc::cubeTexelHlsl(), "uint3 cubeTexel(float3 d, uint size)") != nullptr && cc::kBackdropCubeSize == 3072 && cc::kBackdropLiftMs == 200 && cc::kBackdropWaitFrames == 3,
                   "backdrop cube: the HLSL twin is present, the cube is 1536 square, the lift 200 ms and the wait 3 frames");
-            using J = cc::Judge;
+            // The distance modes: the sphere solve, and the cycle.
+            {
+                const float zero[3] = {0, 0, 0}, dir[3] = {0.0f, 3.0f, 4.0f};
+                float s[3] = {};
+                const bool okCentre = cc::backdropSphereHit(zero, dir, 600.0f, s) && std::fabs(s[0]) < 1e-3f && std::fabs(s[1] - 360.0f) < 1e-2f && std::fabs(s[2] - 480.0f) < 1e-2f;
+                const float off[3] = {100.0f, -50.0f, 20.0f}, d2[3] = {1.0f, 2.0f, -2.0f};
+                float p[3] = {};
+                const bool hit = cc::backdropSphereHit(off, d2, 600.0f, p);
+                const float len = std::sqrt(p[0] * p[0] + p[1] * p[1] + p[2] * p[2]);
+                // the point lies on the sphere and along the ray: (p - off) is a positive multiple of d2
+                const float k = (p[0] - off[0]) / 1.0f;
+                const bool along = k > 0.0f && std::fabs((p[1] - off[1]) - 2.0f * k) < 1e-2f && std::fabs((p[2] - off[2]) + 2.0f * k) < 1e-2f;
+                check(okCentre && hit && std::fabs(len - 600.0f) < 0.05f && along, "backdrop distance: the camera at the centre looks up dir * R; off centre it lands on the sphere, along its ray");
+                const float farOff[3] = {1000.0f, 0.0f, 0.0f}, dn[3] = {0.0f, 1.0f, 0.0f};
+                float m[3] = {};
+                check(cc::backdropSphereHit(farOff, dn, 600.0f, m) && std::fabs(m[0] - 1000.0f) < 1e-3f && std::fabs(m[1]) < 1e-3f && !cc::backdropSphereHit(zero, zero, 600.0f, m),
+                      "backdrop distance: a ray that misses the sphere takes its nearest point, a zero direction has none");
+                check(cc::parallaxNext(cc::kParallaxNone) == cc::kParallaxSphere && cc::parallaxNext(cc::kParallaxSphere) == cc::kParallaxDepth && cc::parallaxNext(cc::kParallaxDepth) == cc::kParallaxNone &&
+                          std::strcmp(cc::parallaxName(cc::kParallaxDepth), "depth") == 0 && cc::kBackdropRadiusDefaultM == 600.0f,
+                      "backdrop distance: the key steps none, sphere, depth and round; the radius defaults to 600 m");
+            }            using J = cc::Judge;
             check(cc::concourseJudge(true, true, true, 600.0f, 300.0f, false, false) == J::kCull && cc::concourseJudge(true, true, true, 600.0f, 300.0f, false, true) == J::kCull &&
                       cc::concourseJudge(true, true, true, 3.0f, 3.0f, false, true) == J::kKeepSmallClose && cc::concourseJudge(true, true, true, 150.0f, 3.0f, false, false) == J::kKeepName,
                   "concourse judge: with the size test gone, a big far record is culled as before and the lift rule is unchanged");

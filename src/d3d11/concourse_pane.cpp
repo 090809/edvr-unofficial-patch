@@ -127,8 +127,8 @@ std::string g_glowAppliedText;
 bool g_glowTextSeen = false;
 std::atomic<float> g_upFed[3] = {};
 std::atomic<bool> g_upFedValid{false};
-float g_glowCbSent[12] = {};     // the tick's: what the buffers hold
-float g_glowCbBaySent[12] = {};
+float g_glowCbSent[16] = {};     // the tick's: what the buffers hold (rows: up, levels, colour, then the backdrop's distance mode and radius)
+float g_glowCbBaySent[16] = {};
 bool g_glowCbSentValid = false;
 bool g_glowLogged = false;
 float g_glowLoggedLv[4] = {};
@@ -156,38 +156,56 @@ constexpr uint32_t kMarkSettleFrames = 8;
 std::atomic<uint32_t> g_plainFrom{0};
 
 // ---- The backdrop (PROTOTYPE on the concourse arc, docs\concourse-cull-2026-11-05.md "The window plan") ----------------------------------------------------
-// A cube of view directions captured once, on a key press, from a frame with the cull off: `back` is written by the capture pass (a UAV), `front` is what the display
-// pass samples (the tick copies back to front after the capture frame, so no resource is bound both ways). Everything is made on the first capture, per device.
-constexpr UINT kBdUavSlot = 7;       // u7 of the capture shader; must be at least the bound render target count
-constexpr UINT kBdSceneSlot = 8;     // t8 of the capture shader (the scene copy) and of the display shader (the cube)
+// Two cubes of view directions from a fixed origin O, filled by capture passes on a key press from frames with the cull off: colour (R16G16B16A16_FLOAT, alpha 1 where
+// written, 0 elsewhere) and the distance from O (R16_FLOAT). `back` textures are written by the capture pass (UAVs); `front` textures have a full mip chain, are copied from
+// the back ones by the tick after the capture frame and sampled by the display pass, so no resource is bound both ways. O is the camera's row of constant buffer 1 at the
+// first capture of a visit, kept in a small buffer. Everything is made on the first capture, per device.
+constexpr UINT kBdUavFirst = 6;      // u6 (distance) and u7 (colour) of the capture shader; the bound render target count must not exceed 6
+constexpr UINT kBdUavCount = 2;
+constexpr UINT kBdSceneSlot = 8;     // t8 t9 t10: the capture shader's scene colour, scene depth and origin; the display shader's colour cube, distance cube and origin
+constexpr UINT kBdSrvCount = 3;
 constexpr UINT kBdSamplerSlot = 7;   // s7 of the display shader
+constexpr UINT kBdCb1Row = 275;      // the camera's row of the glass shaders' constant buffer 1 (INFERRED: the vertex shader subtracts cb1[275], the pixel shader rotates v2 without it)
 std::atomic<bool> g_bdArmed{false};                 // a capture frame is open: pane draws copy the scene and issue capture passes
 std::atomic<uint32_t> g_bdSceneFrame{0xFFFFFFFFu};  // the frame whose first pane draw tried the scene copy
-std::atomic<uint32_t> g_bdSceneOkFrame{0xFFFFFFFFu};   // the frame whose scene copy was taken
+std::atomic<uint32_t> g_bdSceneOkFrame{0xFFFFFFFFu};   // the frame whose scene, depth and origin copies were all taken
 std::atomic<uint32_t> g_bdPaneDraws{0};             // capture passes issued since the arm
 std::atomic<bool> g_bdSceneCopied{false};           // a scene copy was taken since the arm
 std::atomic<void*> g_bdSceneSource{nullptr};        // the render target resource the copy came from (identity only; a capture pass needs the same one bound)
-std::atomic<ID3D11Texture2D*> g_bdScene{nullptr};
-std::atomic<ID3D11ShaderResourceView*> g_bdSceneSrv{nullptr};
-std::atomic<ID3D11Texture2D*> g_bdBack{nullptr}, g_bdFront{nullptr};
-std::atomic<ID3D11UnorderedAccessView*> g_bdBackUav{nullptr};
-std::atomic<ID3D11ShaderResourceView*> g_bdFrontSrv{nullptr};
+std::atomic<ID3D11Texture2D*> g_bdScene{nullptr}, g_bdDepth{nullptr};
+std::atomic<ID3D11ShaderResourceView*> g_bdSceneSrv{nullptr}, g_bdDepthSrv{nullptr};
+std::atomic<ID3D11Texture2D*> g_bdBack{nullptr}, g_bdFront{nullptr}, g_bdDistBack{nullptr}, g_bdDistFront{nullptr};
+std::atomic<ID3D11UnorderedAccessView*> g_bdBackUav{nullptr}, g_bdDistBackUav{nullptr};
+std::atomic<ID3D11ShaderResourceView*> g_bdFrontSrv{nullptr}, g_bdDistFrontSrv{nullptr};
+std::atomic<ID3D11Buffer*> g_bdOrigin{nullptr};     // 16 bytes: the camera at the first capture of this visit (Buffer<float4> originBuf)
+std::atomic<ID3D11ShaderResourceView*> g_bdOriginSrv{nullptr};
+std::atomic<bool> g_bdOriginSet{false};             // g_bdOrigin holds this visit's origin
+std::atomic<bool> g_bdOriginSetNow{false};          // the origin was set during the current capture (the capture line says set or kept)
+std::atomic<uint32_t> g_bdCaptures{0};              // captures that went into this cube
+std::atomic<bool> g_bdResetPending{false};          // a new visit (treat rose): the tick empties the cube and forgets the origin
+std::atomic<uint32_t> g_bdParallax{cc::kParallaxDepth};   // the distance mode (hotkey.concourse_backdrop_parallax)
+std::atomic<float> g_bdRadius{cc::kBackdropRadiusDefaultM};   // diag.concourse_backdrop_radius
 std::atomic<ID3D11PixelShader*> g_psBdShow{nullptr}, g_psBdCapture{nullptr};
 std::atomic<ID3D11SamplerState*> g_bdSampler{nullptr};
 std::atomic<bool> g_bdCubeValid{false};             // front holds a capture
 std::atomic<bool> g_bdFallbackSaid{false};
 std::atomic<bool> g_bdSceneRefusedSaid{false};
 std::atomic<bool> g_bdPassRefusedSaid{false};
-std::mutex g_bdMutex;                               // the scene texture's (re)making and the status text below
+std::mutex g_bdMutex;                               // the scene and depth textures' (re)making and the status text below
 uint32_t g_bdSceneW = 0, g_bdSceneH = 0;
 DXGI_FORMAT g_bdSceneFmt = DXGI_FORMAT_UNKNOWN;
+uint32_t g_bdDepthW = 0, g_bdDepthH = 0;
+DXGI_FORMAT g_bdDepthFmt = DXGI_FORMAT_UNKNOWN;
 char g_bdSceneFmtText[28] = {};
 char g_bdRefusal[200] = {};
 std::atomic<uint8_t> g_bdPhase{0};                  // ConcourseBackdropPhase
 std::atomic<bool> g_bdArmRequested{false};
 uint32_t g_bdArmFrame = 0;                          // the tick's
 uint32_t g_bdFramesWaited = 0;
-// The toast, one slot: the newest text wins (hotkey changes of the mode, the capture's result). The tick's thread writes it and menuTick takes it.
+Hotkey* g_keyParallax = nullptr;
+std::string g_keyParallaxText;
+std::string g_radiusAppliedText;
+bool g_radiusTextSeen = false;// The toast, one slot: the newest text wins (hotkey changes of the mode, the capture's result). The tick's thread writes it and menuTick takes it.
 std::mutex g_toastMutex;
 char g_toastText[64] = {};
 bool g_toastDue = false;
@@ -454,7 +472,7 @@ void makeWhitePs(ID3D11Device* device) noexcept {
 // overhead (sky), angled, other. A zero `up` gives `other`. A failed compile is logged once and the steady mode falls back to the plain mirror.
 // The steady colour of a pane from its lighting normal and b2 (up, the levels, the colour): shared by the steady shader and the backdrop's fallback, so the two are the same text.
 static const char kSkyCommon[] =
-    "cbuffer GlowCb : register(b2) { float4 up; float4 lv; float4 colour; };\n"
+    "cbuffer GlowCb : register(b2) { float4 up; float4 lv; float4 colour; float4 par; };\n"
     "float3 fallbackColour(float3 n) {\n"
     "    float ul = length(up.xyz);\n"
     "    float3 nn = n * rsqrt(max(dot(n, n), 1e-12));\n"
@@ -482,7 +500,7 @@ void makeSkyPs(ID3D11Device* device) noexcept {
 }
 
 bool makeGlowCb(ID3D11Device* device) noexcept {
-    float init[12] = {0, 0, 0, 0, 1, 1, 1, 0, kSteadyColour[0], kSteadyColour[1], kSteadyColour[2], 0};
+    float init[16] = {0, 0, 0, 0, 1, 1, 1, 0, kSteadyColour[0], kSteadyColour[1], kSteadyColour[2], 0, static_cast<float>(cc::kParallaxDepth), cc::kBackdropRadiusDefaultM, 0, 0};
     ID3D11Buffer* made[2] = {};
     for (int i = 0; i < 2; ++i) {
         D3D11_BUFFER_DESC bd{};
@@ -1332,24 +1350,35 @@ void releaseAtomic(std::atomic<T*>& a) noexcept {
 void releaseBackdrop() noexcept {
     g_bdArmed.store(false, std::memory_order_release);
     g_bdCubeValid.store(false, std::memory_order_release);
+    g_bdOriginSet.store(false, std::memory_order_release);
+    g_bdCaptures.store(0, std::memory_order_release);
     g_bdSceneSource.store(nullptr, std::memory_order_release);
     g_bdSceneFrame.store(0xFFFFFFFFu, std::memory_order_relaxed);
     g_bdSceneOkFrame.store(0xFFFFFFFFu, std::memory_order_relaxed);
     releaseAtomic(g_bdSceneSrv);
     releaseAtomic(g_bdScene);
+    releaseAtomic(g_bdDepthSrv);
+    releaseAtomic(g_bdDepth);
+    releaseAtomic(g_bdOriginSrv);
+    releaseAtomic(g_bdOrigin);
     releaseAtomic(g_bdBackUav);
+    releaseAtomic(g_bdDistBackUav);
     releaseAtomic(g_bdFrontSrv);
+    releaseAtomic(g_bdDistFrontSrv);
     releaseAtomic(g_bdBack);
     releaseAtomic(g_bdFront);
+    releaseAtomic(g_bdDistBack);
+    releaseAtomic(g_bdDistFront);
     releaseAtomic(g_psBdShow);
     releaseAtomic(g_psBdCapture);
     releaseAtomic(g_bdSampler);
     std::lock_guard<std::mutex> lock(g_bdMutex);
     g_bdSceneW = g_bdSceneH = 0;
     g_bdSceneFmt = DXGI_FORMAT_UNKNOWN;
+    g_bdDepthW = g_bdDepthH = 0;
+    g_bdDepthFmt = DXGI_FORMAT_UNKNOWN;
     g_bdSceneFmtText[0] = '\0';
 }
-
 const char* bdFormatName(DXGI_FORMAT f, char* fb, size_t cap) noexcept {
     switch (f) {
         case DXGI_FORMAT_R16G16B16A16_FLOAT: return "R16G16B16A16_FLOAT";
@@ -1387,35 +1416,147 @@ bool bdRefuse(const char* why) noexcept {
     return false;
 }
 
-// The capture shader (an exterior pane''s pixel: the scene behind it goes to the texel of its view direction) and the display shader (the cube sampled by that direction,
-// the steady colour where nothing was captured). Both declare the glass vertex shader''s outputs in order (v0 face, v1 lighting normal, v2 lighting position = the world
-// position relative to the camera, INFERRED); the capture shader also declares what lies before SV_POSITION in the game''s own pixel shader (v3 tangent, v4 texcoord).
+UINT bdMipCount() noexcept {
+    UINT n = 1;
+    for (UINT s = cc::kBackdropCubeSize; s > 1; s >>= 1) ++n;
+    return n;
+}
+
+// The back textures' mip 0 goes into the front ones slice by slice (their mip counts differ, so not CopyResource), then the front mips are built. Unwritten texels are zero
+// in every channel and written ones have alpha 1, so each mip is premultiplied by coverage (its alpha), in the colour cube and in the distance cube alike.
+void backdropPublishFront(ID3D11DeviceContext* imm) noexcept {
+    ID3D11Texture2D* back = g_bdBack.load(std::memory_order_acquire);
+    ID3D11Texture2D* front = g_bdFront.load(std::memory_order_acquire);
+    ID3D11Texture2D* dback = g_bdDistBack.load(std::memory_order_acquire);
+    ID3D11Texture2D* dfront = g_bdDistFront.load(std::memory_order_acquire);
+    ID3D11ShaderResourceView* srv = g_bdFrontSrv.load(std::memory_order_acquire);
+    ID3D11ShaderResourceView* dsrv = g_bdDistFrontSrv.load(std::memory_order_acquire);
+    if (!imm || !back || !front || !dback || !dfront || !srv || !dsrv) return;
+    FlatComputeInternalScope internal;
+    const UINT mips = bdMipCount();
+    for (UINT slice = 0; slice < 6; ++slice) {
+        imm->CopySubresourceRegion(front, D3D11CalcSubresource(0, slice, mips), 0, 0, 0, back, D3D11CalcSubresource(0, slice, 1), nullptr);
+        imm->CopySubresourceRegion(dfront, D3D11CalcSubresource(0, slice, mips), 0, 0, 0, dback, D3D11CalcSubresource(0, slice, 1), nullptr);
+    }
+    imm->GenerateMips(srv);
+    imm->GenerateMips(dsrv);
+}
+
+// A new visit (treat rose): the back cubes are emptied, the front ones follow, the origin is forgotten.
+void backdropReset(ID3D11Device* device) noexcept {
+    const bool had = g_bdCubeValid.load(std::memory_order_relaxed) || g_bdOriginSet.load(std::memory_order_relaxed);
+    ID3D11UnorderedAccessView* u1 = g_bdBackUav.load(std::memory_order_acquire);
+    ID3D11UnorderedAccessView* u2 = g_bdDistBackUav.load(std::memory_order_acquire);
+    if (had && device && u1 && u2) {
+        ID3D11DeviceContext* imm = nullptr;
+        device->GetImmediateContext(&imm);
+        if (imm) {
+            {
+                FlatComputeInternalScope internal;
+                const FLOAT zero[4] = {};
+                imm->ClearUnorderedAccessViewFloat(u1, zero);
+                imm->ClearUnorderedAccessViewFloat(u2, zero);
+            }
+            backdropPublishFront(imm);
+            imm->Release();
+        }
+    }
+    g_bdCubeValid.store(false, std::memory_order_release);
+    g_bdOriginSet.store(false, std::memory_order_release);
+    const uint32_t n = g_bdCaptures.exchange(0, std::memory_order_acq_rel);
+    if (had) Log::get().note("concourse backdrop: the cube is emptied and the origin forgotten (a new visit; it held %u capture%s)", n, n == 1 ? "" : "s");
+}
+
+static std::string bdFloatText(double v) {
+    char b[40];
+    std::snprintf(b, sizeof(b), "%.9g", v);
+    return b;
+}
+
+// The capture shader (an exterior pane's pixel) and the display shader. Both declare the glass vertex shader's outputs in order (v0 face, v1 lighting normal, v2 lighting
+// position = the world position relative to the camera, INFERRED); the capture shader also declares what lies before SV_POSITION in the game's own pixel shader (v3 tangent,
+// v4 texcoord). Both read cb1[275].xyz as the camera in the game's world frame (the glass constant buffer, bound at b1 by the game and left alone) and an origin O from a
+// 16-byte buffer (t10).
+//   Capture: dir = normalize(v2); the scene's depth z gives the view depth 0.025 / z (reversed infinite Z), along the ray t = depth / |dot(cb1[279].xyz, dir)| (cb1[279] is the
+//   view Z axis, INFERRED); the hit H = C + dir * t; rel = H - O. The colour goes to the colour cube's texel of rel (alpha 1) and |rel| to the distance cube's. A hit nearer than
+//   5 m is not backdrop and is not written.
+//   Display, per pixel: 1 constant-buffer row read and 1 buffer load; None: 6 cube samples (lods 0 1 2 3 5 7). Sphere: the same, with the direction moved. Depth: 4 marching steps
+//   of 2 samples each (the colour cube's alpha at lod 1, and the distance cube at lod 1) and the final 6, so 14 cube samples. Mips fill the holes the splat leaves: the lookup
+//   composites lod 0 over the premultiplied coarser lods front to back.
 bool makeBackdropShaders(ID3D11Device* device) noexcept {
     ID3D11DeviceContext* imm = nullptr;
     device->GetImmediateContext(&imm);
     if (!imm) return false;
-    const std::string show = std::string(kSkyCommon) +
+    const std::string cb1 = "cbuffer Cb1 : register(b1) { float4 cb1[327]; };\n";
+    const std::string show = std::string(kSkyCommon) + cb1 +
         "struct PsIn { nointerpolation uint face : __USER_VERTEX_FACEINVARIANT0; float3 n : __USER_VERTEX_M_LIGHTINGNORMAL0; float3 wp : __USER_VERTEX_M_LIGHTINGPOSITION0; };\n"
         "TextureCube<float4> backdrop : register(t8);\n"
+        "TextureCube<float> distMap : register(t9);\n"
+        "Buffer<float4> originBuf : register(t10);\n"
         "SamplerState backdropSmp : register(s7);\n"
+        "float4 lookup(float3 s) {\n"
+        "    float4 acc = backdrop.SampleLevel(backdropSmp, s, 0);\n"
+        "    float4 c = backdrop.SampleLevel(backdropSmp, s, 1); acc.rgb += (1.0 - acc.a) * c.rgb; acc.a += (1.0 - acc.a) * c.a;\n"
+        "    c = backdrop.SampleLevel(backdropSmp, s, 2); acc.rgb += (1.0 - acc.a) * c.rgb; acc.a += (1.0 - acc.a) * c.a;\n"
+        "    c = backdrop.SampleLevel(backdropSmp, s, 3); acc.rgb += (1.0 - acc.a) * c.rgb; acc.a += (1.0 - acc.a) * c.a;\n"
+        "    c = backdrop.SampleLevel(backdropSmp, s, 5); acc.rgb += (1.0 - acc.a) * c.rgb; acc.a += (1.0 - acc.a) * c.a;\n"
+        "    c = backdrop.SampleLevel(backdropSmp, s, 7); acc.rgb += (1.0 - acc.a) * c.rgb; acc.a += (1.0 - acc.a) * c.a;\n"
+        "    return acc;\n"
+        "}\n"
         "float4 main(PsIn i) : SV_Target {\n"
         "    float3 fb = fallbackColour(i.n);\n"
-        "    float3 d = i.wp * rsqrt(max(dot(i.wp, i.wp), 1e-12));\n"
-        "    float4 c = backdrop.SampleLevel(backdropSmp, d, 0);\n"
-        "    return float4(lerp(fb, c.rgb, saturate(c.a)), 1.0);\n"
+        "    float3 dir = i.wp * rsqrt(max(dot(i.wp, i.wp), 1e-12));\n"
+        "    float3 off = cb1[275].xyz - originBuf[0].xyz;\n"
+        "    float3 s = dir;\n"
+        "    float mode = par.x;\n"
+        "    float R = max(par.y, 1.0);\n"
+        "    if (mode > 0.5) {\n"
+        "        float b = dot(off, dir);\n"
+        "        float cq = dot(off, off) - R * R;\n"
+        "        float t = -b + sqrt(max(b * b - cq, 0.0));\n"
+        "        if (mode > 1.5) {\n"
+        "            t = R;\n"
+        "            [unroll] for (int k = 0; k < 4; ++k) {\n"
+        "                float3 rel = off + dir * t;\n"
+        "                float cov = backdrop.SampleLevel(backdropSmp, rel, 1).a;\n"
+        "                if (cov > 0.01) {\n"
+        "                    float r = distMap.SampleLevel(backdropSmp, rel, 1) / max(cov, 1e-3);\n"
+        "                    float3 hit = normalize(rel) * r;\n"
+        "                    t = max(dot(hit - off, dir), 1.0);\n"
+        "                }\n"
+        "            }\n"
+        "        }\n"
+        "        s = off + dir * t;\n"
+        "    }\n"
+        "    float4 acc = lookup(s);\n"
+        "    return float4(acc.rgb + (1.0 - acc.a) * fb, 1.0);\n"
         "}\n";
-    const std::string capture = std::string(cc::cubeTexelHlsl()) +
+    const std::string capture = std::string(cc::cubeTexelHlsl()) + cb1 +
         "struct PsIn { nointerpolation uint face : __USER_VERTEX_FACEINVARIANT0; float3 n : __USER_VERTEX_M_LIGHTINGNORMAL0; float3 wp : __USER_VERTEX_M_LIGHTINGPOSITION0;\n"
         "              float3 tg : __USER_VERTEX_M_LIGHTINGTANGENT0; float2 uv : __USER_VERTEX_M_TEXCOORD0; float4 p : SV_POSITION; };\n"
         "Texture2D<float4> scene : register(t8);\n"
+        "Texture2D<float> sceneDepth : register(t9);\n"
+        "Buffer<float4> originBuf : register(t10);\n"
+        "RWTexture2DArray<float> distCube : register(u6);\n"
         "RWTexture2DArray<float4> cube : register(u7);\n"
         "[earlydepthstencil]\n"
         "void main(PsIn i) {\n"
         "    float3 keep = (i.face == 0xDEADBEEFu) ? float3(i.tg.x, i.n.y + i.uv.x, i.n.z) : float3(0, 0, 0);\n"   // never true: keeps v3 and v4 in the signature
-        "    float3 d = i.wp + keep;\n"
-        "    if (dot(d, d) < 1e-12) return;\n"
+        "    float3 dir = i.wp + keep;\n"
+        "    float dl = dot(dir, dir);\n"
+        "    if (dl < 1e-12) return;\n"
+        "    dir *= rsqrt(dl);\n"
+        "    float z = sceneDepth.Load(int3(i.p.xy, 0));\n"
+        "    float vd = z > 0.0 ? " + bdFloatText(cc::kBackdropNearZ) + " / z : " + bdFloatText(cc::kBackdropFarM) + ";\n"
+        "    float t = min(vd / max(abs(dot(cb1[279].xyz, dir)), 1e-3), " + bdFloatText(cc::kBackdropFarM) + ");\n"
+        "    if (t < " + bdFloatText(cc::kBackdropMinDistM) + ") return;\n"
+        "    float3 rel = cb1[275].xyz + dir * t - originBuf[0].xyz;\n"
+        "    float rl = length(rel);\n"
+        "    if (!(rl > 1e-3)) return;\n"
+        "    uint3 tx = cubeTexel(rel, " + std::to_string(cc::kBackdropCubeSize) + "u);\n"
         "    float3 c = clamp(scene.Load(int3(i.p.xy, 0)).rgb, 0.0, 60000.0);\n"
-        "    cube[cubeTexel(d, " + std::to_string(cc::kBackdropCubeSize) + "u)] = float4(c, 1.0);\n"
+        "    cube[tx] = float4(c, 1.0);\n"
+        "    distCube[tx] = clamp(rl, 1.0, " + bdFloatText(cc::kBackdropFarM) + ");\n"
         "}\n";
     ID3D11PixelShader* psShow = shaderSwapCompilePs(imm, show.c_str(), show.size(), "main", "concourse_backdrop_show", nullptr, "concourse backdrop");
     ID3D11PixelShader* psCap = shaderSwapCompilePs(imm, capture.c_str(), capture.size(), "main", "concourse_backdrop_capture", nullptr, "concourse backdrop");
@@ -1430,58 +1571,99 @@ bool makeBackdropShaders(ID3D11Device* device) noexcept {
     return true;
 }
 
-// The cube pair, the views, the sampler and both shaders; made once per device (releaseBackdrop undoes it). A refusal is one log line and leaves nothing half-made.
-bool makeBackdropResources(ID3D11Device* device) noexcept {
-    if (g_bdBack.load() && g_bdFront.load() && g_bdBackUav.load() && g_bdFrontSrv.load() && g_psBdCapture.load() && g_psBdShow.load() && g_bdSampler.load()) return true;
-    releaseBackdrop();
-    const DXGI_FORMAT fmt = DXGI_FORMAT_R16G16B16A16_FLOAT;
+bool bdFormatOk(ID3D11Device* device, DXGI_FORMAT fmt, const char* name) noexcept {
     UINT sup = 0;
-    const UINT need = D3D11_FORMAT_SUPPORT_TEXTURE2D | D3D11_FORMAT_SUPPORT_TEXTURECUBE | D3D11_FORMAT_SUPPORT_SHADER_SAMPLE | D3D11_FORMAT_SUPPORT_TYPED_UNORDERED_ACCESS_VIEW;
-    if (FAILED(device->CheckFormatSupport(fmt, &sup)) || (sup & need) != need) return bdRefuse("R16G16B16A16_FLOAT cannot be a sampled cube and a typed UAV on this device");
+    const UINT need = D3D11_FORMAT_SUPPORT_TEXTURE2D | D3D11_FORMAT_SUPPORT_TEXTURECUBE | D3D11_FORMAT_SUPPORT_SHADER_SAMPLE | D3D11_FORMAT_SUPPORT_TYPED_UNORDERED_ACCESS_VIEW |
+                      D3D11_FORMAT_SUPPORT_RENDER_TARGET | D3D11_FORMAT_SUPPORT_MIP_AUTOGEN;
+    char why[160];
+    if (FAILED(device->CheckFormatSupport(fmt, &sup)) || (sup & need) != need) {
+        std::snprintf(why, sizeof(why), "%s cannot be a sampled, mip-generated cube and a typed UAV on this device", name);
+        return bdRefuse(why);
+    }
     D3D11_FEATURE_DATA_FORMAT_SUPPORT2 f2{};
     f2.InFormat = fmt;
-    if (FAILED(device->CheckFeatureSupport(D3D11_FEATURE_FORMAT_SUPPORT2, &f2, sizeof(f2))) || (f2.OutFormatSupport2 & D3D11_FORMAT_SUPPORT2_UAV_TYPED_STORE) == 0)
-        return bdRefuse("R16G16B16A16_FLOAT has no typed UAV store on this device");
-    const UINT size = cc::kBackdropCubeSize;
-    const UINT rowBytes = size * 8u;
-    std::vector<uint8_t> zero(static_cast<size_t>(rowBytes) * size, 0);   // alpha 0 everywhere: nothing captured
-    D3D11_SUBRESOURCE_DATA init[6];
-    for (auto& s : init) {
-        s.pSysMem = zero.data();
-        s.SysMemPitch = rowBytes;
-        s.SysMemSlicePitch = rowBytes * size;
+    if (FAILED(device->CheckFeatureSupport(D3D11_FEATURE_FORMAT_SUPPORT2, &f2, sizeof(f2))) || (f2.OutFormatSupport2 & D3D11_FORMAT_SUPPORT2_UAV_TYPED_STORE) == 0) {
+        std::snprintf(why, sizeof(why), "%s has no typed UAV store on this device", name);
+        return bdRefuse(why);
     }
-    D3D11_TEXTURE2D_DESC td{};
-    td.Width = td.Height = size;
-    td.MipLevels = 1;
-    td.ArraySize = 6;
-    td.Format = fmt;
-    td.SampleDesc.Count = 1;
-    td.Usage = D3D11_USAGE_DEFAULT;
-    td.MiscFlags = D3D11_RESOURCE_MISC_TEXTURECUBE;
-    ID3D11Texture2D* back = nullptr;
-    ID3D11Texture2D* front = nullptr;
-    td.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
-    const HRESULT h1 = device->CreateTexture2D(&td, init, &back);
-    td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-    const HRESULT h2 = device->CreateTexture2D(&td, init, &front);
-    ID3D11UnorderedAccessView* uav = nullptr;
-    ID3D11ShaderResourceView* srv = nullptr;
-    HRESULT h3 = E_FAIL, h4 = E_FAIL;
-    if (back && front) {
-        D3D11_UNORDERED_ACCESS_VIEW_DESC ud{};
-        ud.Format = fmt;
-        ud.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2DARRAY;
-        ud.Texture2DArray.MipSlice = 0;
-        ud.Texture2DArray.FirstArraySlice = 0;
-        ud.Texture2DArray.ArraySize = 6;
-        h3 = device->CreateUnorderedAccessView(back, &ud, &uav);
-        D3D11_SHADER_RESOURCE_VIEW_DESC sd{};
-        sd.Format = fmt;
-        sd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURECUBE;
-        sd.TextureCube.MostDetailedMip = 0;
-        sd.TextureCube.MipLevels = 1;
-        h4 = device->CreateShaderResourceView(front, &sd, &srv);
+    return true;
+}
+
+// The cube pairs, the views, the origin buffer, the sampler and both shaders; made once per device (releaseBackdrop undoes it). A refusal is one log line and leaves nothing
+// half-made.
+bool makeBackdropResources(ID3D11Device* device) noexcept {
+    if (g_bdBack.load() && g_bdFront.load() && g_bdDistBack.load() && g_bdDistFront.load() && g_bdBackUav.load() && g_bdDistBackUav.load() && g_bdFrontSrv.load() &&
+        g_bdDistFrontSrv.load() && g_bdOrigin.load() && g_bdOriginSrv.load() && g_psBdCapture.load() && g_psBdShow.load() && g_bdSampler.load())
+        return true;
+    releaseBackdrop();
+    const DXGI_FORMAT cfmt = DXGI_FORMAT_R16G16B16A16_FLOAT, dfmt = DXGI_FORMAT_R16_FLOAT;
+    if (!bdFormatOk(device, cfmt, "R16G16B16A16_FLOAT") || !bdFormatOk(device, dfmt, "R16_FLOAT")) return false;
+    const UINT size = cc::kBackdropCubeSize;
+    const UINT mips = bdMipCount();
+    std::vector<uint8_t> zero(static_cast<size_t>(size) * size * 8u, 0);   // zero everywhere (alpha 0: nothing captured); the distance cube uses its first two bytes a texel
+    D3D11_SUBRESOURCE_DATA cinit[6], dinit[6];
+    for (int k = 0; k < 6; ++k) {
+        cinit[k].pSysMem = zero.data();
+        cinit[k].SysMemPitch = size * 8u;
+        cinit[k].SysMemSlicePitch = size * 8u * size;
+        dinit[k].pSysMem = zero.data();
+        dinit[k].SysMemPitch = size * 2u;
+        dinit[k].SysMemSlicePitch = size * 2u * size;
+    }
+    ID3D11Texture2D* tex[4] = {};   // colour back, colour front, distance back, distance front
+    HRESULT h[4] = {};
+    for (int k = 0; k < 4; ++k) {
+        const bool isBack = (k % 2) == 0;
+        D3D11_TEXTURE2D_DESC td{};
+        td.Width = td.Height = size;
+        td.MipLevels = isBack ? 1u : mips;
+        td.ArraySize = 6;
+        td.Format = k < 2 ? cfmt : dfmt;
+        td.SampleDesc.Count = 1;
+        td.Usage = D3D11_USAGE_DEFAULT;
+        td.BindFlags = isBack ? D3D11_BIND_UNORDERED_ACCESS : (D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE);
+        td.MiscFlags = D3D11_RESOURCE_MISC_TEXTURECUBE | (isBack ? 0u : D3D11_RESOURCE_MISC_GENERATE_MIPS);
+        h[k] = device->CreateTexture2D(&td, isBack ? (k < 2 ? cinit : dinit) : nullptr, &tex[k]);
+    }
+    ID3D11UnorderedAccessView* uav[2] = {};
+    ID3D11ShaderResourceView* srv[2] = {};
+    HRESULT hv[4] = {E_FAIL, E_FAIL, E_FAIL, E_FAIL};
+    if (tex[0] && tex[1] && tex[2] && tex[3]) {
+        for (int k = 0; k < 2; ++k) {
+            D3D11_UNORDERED_ACCESS_VIEW_DESC ud{};
+            ud.Format = k == 0 ? cfmt : dfmt;
+            ud.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2DARRAY;
+            ud.Texture2DArray.MipSlice = 0;
+            ud.Texture2DArray.FirstArraySlice = 0;
+            ud.Texture2DArray.ArraySize = 6;
+            hv[k] = device->CreateUnorderedAccessView(tex[k * 2], &ud, &uav[k]);
+            D3D11_SHADER_RESOURCE_VIEW_DESC sd{};
+            sd.Format = k == 0 ? cfmt : dfmt;
+            sd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURECUBE;
+            sd.TextureCube.MostDetailedMip = 0;
+            sd.TextureCube.MipLevels = static_cast<UINT>(-1);
+            hv[2 + k] = device->CreateShaderResourceView(tex[k * 2 + 1], &sd, &srv[k]);
+        }
+    }
+    // The origin: 16 bytes, a copy destination for the camera's row of the game's constant buffer.
+    const float zero4[4] = {};
+    D3D11_BUFFER_DESC ob{};
+    ob.ByteWidth = 16;
+    ob.Usage = D3D11_USAGE_DEFAULT;
+    ob.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    D3D11_SUBRESOURCE_DATA oi{};
+    oi.pSysMem = zero4;
+    ID3D11Buffer* origin = nullptr;
+    const HRESULT ho = device->CreateBuffer(&ob, &oi, &origin);
+    ID3D11ShaderResourceView* originSrv = nullptr;
+    HRESULT hos = E_FAIL;
+    if (origin) {
+        D3D11_SHADER_RESOURCE_VIEW_DESC od{};
+        od.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+        od.ViewDimension = D3D11_SRV_DIMENSION_BUFFER;
+        od.Buffer.FirstElement = 0;
+        od.Buffer.NumElements = 1;
+        hos = device->CreateShaderResourceView(origin, &od, &originSrv);
     }
     D3D11_SAMPLER_DESC smd{};
     smd.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
@@ -1490,68 +1672,115 @@ bool makeBackdropResources(ID3D11Device* device) noexcept {
     smd.MaxLOD = D3D11_FLOAT32_MAX;
     ID3D11SamplerState* smp = nullptr;
     const HRESULT h5 = device->CreateSamplerState(&smd, &smp);
-    if (FAILED(h1) || FAILED(h2) || FAILED(h3) || FAILED(h4) || FAILED(h5) || !back || !front || !uav || !srv || !smp) {
-        char why[160];
-        std::snprintf(why, sizeof(why), "the cube could not be made (hr %08X %08X %08X %08X %08X)", static_cast<unsigned>(h1), static_cast<unsigned>(h2), static_cast<unsigned>(h3),
-                      static_cast<unsigned>(h4), static_cast<unsigned>(h5));
-        if (back) back->Release();
-        if (front) front->Release();
-        if (uav) uav->Release();
-        if (srv) srv->Release();
+    bool good = smp && origin && originSrv && uav[0] && uav[1] && srv[0] && srv[1];
+    for (int k = 0; k < 4; ++k) good = good && tex[k] != nullptr && SUCCEEDED(h[k]);
+    if (!good) {
+        char why[220];
+        std::snprintf(why, sizeof(why), "the cubes could not be made (textures hr %08X %08X %08X %08X, views %08X %08X %08X %08X, origin %08X %08X, sampler %08X)", static_cast<unsigned>(h[0]),
+                      static_cast<unsigned>(h[1]), static_cast<unsigned>(h[2]), static_cast<unsigned>(h[3]), static_cast<unsigned>(hv[0]), static_cast<unsigned>(hv[1]),
+                      static_cast<unsigned>(hv[2]), static_cast<unsigned>(hv[3]), static_cast<unsigned>(ho), static_cast<unsigned>(hos), static_cast<unsigned>(h5));
+        for (auto* p : tex) if (p) p->Release();
+        for (auto* p : uav) if (p) p->Release();
+        for (auto* p : srv) if (p) p->Release();
+        if (origin) origin->Release();
+        if (originSrv) originSrv->Release();
         if (smp) smp->Release();
         return bdRefuse(why);
     }
-    g_bdBack.store(back, std::memory_order_release);
-    g_bdFront.store(front, std::memory_order_release);
-    g_bdBackUav.store(uav, std::memory_order_release);
-    g_bdFrontSrv.store(srv, std::memory_order_release);
+    g_bdBack.store(tex[0], std::memory_order_release);
+    g_bdFront.store(tex[1], std::memory_order_release);
+    g_bdDistBack.store(tex[2], std::memory_order_release);
+    g_bdDistFront.store(tex[3], std::memory_order_release);
+    g_bdBackUav.store(uav[0], std::memory_order_release);
+    g_bdDistBackUav.store(uav[1], std::memory_order_release);
+    g_bdFrontSrv.store(srv[0], std::memory_order_release);
+    g_bdDistFrontSrv.store(srv[1], std::memory_order_release);
+    g_bdOrigin.store(origin, std::memory_order_release);
+    g_bdOriginSrv.store(originSrv, std::memory_order_release);
     g_bdSampler.store(smp, std::memory_order_release);
     if (!makeBackdropShaders(device)) {
         releaseBackdrop();
         return false;
     }
-    Log::get().note("concourse backdrop: cube made: %u square x 6, R16G16B16A16_FLOAT, 2 textures of %u MB", static_cast<unsigned>(size), static_cast<unsigned>((static_cast<uint64_t>(rowBytes) * size * 6u) >> 20));
+    ID3D11DeviceContext* imm = nullptr;
+    device->GetImmediateContext(&imm);
+    backdropPublishFront(imm);   // the front mips start as zero too
+    if (imm) imm->Release();
+    uint64_t texels = static_cast<uint64_t>(size) * size * 6u;
+    const uint64_t mb = (texels * (8u + 2u) + texels * (8u + 2u) * 4u / 3u) >> 20;
+    Log::get().note("concourse backdrop: cubes made: %u square x 6, colour R16G16B16A16_FLOAT and distance R16_FLOAT, %u mips on the front pair, about %u MB", static_cast<unsigned>(size),
+                    static_cast<unsigned>(mips), static_cast<unsigned>(mb));
     return true;
 }
 
-// The first pane draw of an armed frame, before the game''s glass draws (begin() runs before the real draw): the bound render target is copied to a texture of the same
-// size and format (a typeless format resolves through the view''s own), which the capture shader reads. Remade when the render target''s size or format changes.
-// On any refusal nothing is copied and the capture passes of the frame are not issued (they need g_bdSceneOkFrame to be this frame).
+// The depth view's texture can be read through a view of the same texture only in a typeless-compatible format.
+DXGI_FORMAT bdDepthReadFormat(DXGI_FORMAT f) noexcept {
+    switch (f) {
+        case DXGI_FORMAT_R32G8X24_TYPELESS: case DXGI_FORMAT_D32_FLOAT_S8X24_UINT: return DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
+        case DXGI_FORMAT_R24G8_TYPELESS: case DXGI_FORMAT_D24_UNORM_S8_UINT: return DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+        case DXGI_FORMAT_R32_TYPELESS: case DXGI_FORMAT_D32_FLOAT: return DXGI_FORMAT_R32_FLOAT;
+        case DXGI_FORMAT_R16_TYPELESS: case DXGI_FORMAT_D16_UNORM: return DXGI_FORMAT_R16_UNORM;
+        default: return DXGI_FORMAT_UNKNOWN;
+    }
+}
+
+// The first pane draw of an armed frame, before the game's glass draws (begin() runs before the real draw): the bound render target and the bound depth are copied to
+// textures of the same size and format (a typeless colour format resolves through the view's own), which the capture shader reads, and, at the first capture of a visit, the
+// camera's row of constant buffer 1 is copied into the origin buffer. Remade when the render target's or depth's size or format changes. On any refusal (each has its own
+// line, once per capture) nothing is captured this frame: the capture passes need g_bdSceneOkFrame to be this frame, which is set only when all three copies were taken.
 void backdropSceneCopy(ID3D11DeviceContext* ctx) noexcept {
     const uint32_t frame = g_frameNow.load(std::memory_order_relaxed);
     if (g_bdSceneFrame.exchange(frame, std::memory_order_acq_rel) == frame) return;   // once a frame
-    const auto refuse = [&](const char* why) noexcept {
-        if (!g_bdSceneRefusedSaid.exchange(true, std::memory_order_relaxed)) Log::get().note("concourse backdrop: scene copy refused: %s", why);
+    const auto refuse = [&](const char* what, const char* why) noexcept {
+        if (!g_bdSceneRefusedSaid.exchange(true, std::memory_order_relaxed)) Log::get().note("concourse backdrop: %s refused: %s", what, why);
     };
     ID3D11RenderTargetView* rtv = nullptr;
-    ctx->OMGetRenderTargets(1, &rtv, nullptr);
-    if (!rtv) return refuse("no render target is bound at the first pane draw");
-    D3D11_RENDER_TARGET_VIEW_DESC rd{};
-    rtv->GetDesc(&rd);
+    ID3D11DepthStencilView* dsv = nullptr;
+    ctx->OMGetRenderTargets(1, &rtv, &dsv);
     ID3D11Resource* res = nullptr;
-    rtv->GetResource(&res);
-    rtv->Release();
+    ID3D11Resource* dres = nullptr;
+    D3D11_RENDER_TARGET_VIEW_DESC rd{};
+    if (rtv) {
+        rtv->GetDesc(&rd);
+        rtv->GetResource(&res);
+        rtv->Release();
+    }
+    if (dsv) {
+        dsv->GetResource(&dres);
+        dsv->Release();
+    }
     ID3D11Texture2D* src = nullptr;
+    ID3D11Texture2D* dsrc = nullptr;
     if (res) res->QueryInterface(IID_PPV_ARGS(&src));
-    if (!src) {
-        if (res) res->Release();
-        return refuse("the render target is not a 2D texture");
-    }
-    D3D11_TEXTURE2D_DESC sd{};
-    src->GetDesc(&sd);
-    const DXGI_FORMAT fmt = rd.Format != DXGI_FORMAT_UNKNOWN ? rd.Format : sd.Format;
-    if (formatIsTypeless(fmt) || sd.SampleDesc.Count > 1 || sd.ArraySize != 1 || rd.ViewDimension != D3D11_RTV_DIMENSION_TEXTURE2D || rd.Texture2D.MipSlice != 0) {
-        char why[160];
-        std::snprintf(why, sizeof(why), "the render target is not a single, single-sample, whole 2D texture of a typed format (format %u, %ux%u, %u samples, array %u)", static_cast<unsigned>(fmt),
-                      sd.Width, sd.Height, sd.SampleDesc.Count, sd.ArraySize);
-        src->Release();
-        res->Release();
-        return refuse(why);
-    }
+    if (dres) dres->QueryInterface(IID_PPV_ARGS(&dsrc));
     ID3D11Device* dev = nullptr;
     ctx->GetDevice(&dev);
     bool ok = false;
-    if (dev) {
+    do {
+        if (!rtv) { refuse("scene copy", "no render target is bound at the first pane draw"); break; }
+        if (!src) { refuse("scene copy", "the render target is not a 2D texture"); break; }
+        D3D11_TEXTURE2D_DESC sd{};
+        src->GetDesc(&sd);
+        const DXGI_FORMAT fmt = rd.Format != DXGI_FORMAT_UNKNOWN ? rd.Format : sd.Format;
+        if (formatIsTypeless(fmt) || sd.SampleDesc.Count > 1 || sd.ArraySize != 1 || rd.ViewDimension != D3D11_RTV_DIMENSION_TEXTURE2D || rd.Texture2D.MipSlice != 0) {
+            char why[160];
+            std::snprintf(why, sizeof(why), "the render target is not a single, single-sample, whole 2D texture of a typed format (format %u, %ux%u, %u samples, array %u)", static_cast<unsigned>(fmt),
+                          sd.Width, sd.Height, sd.SampleDesc.Count, sd.ArraySize);
+            refuse("scene copy", why);
+            break;
+        }
+        if (!dsrc) { refuse("depth copy", "no depth view is bound at the first pane draw"); break; }
+        D3D11_TEXTURE2D_DESC dd{};
+        dsrc->GetDesc(&dd);
+        const DXGI_FORMAT dread = bdDepthReadFormat(dd.Format);
+        if (dread == DXGI_FORMAT_UNKNOWN || dd.SampleDesc.Count > 1 || dd.ArraySize != 1 || dd.MipLevels != 1) {
+            char why[160];
+            std::snprintf(why, sizeof(why), "the depth texture cannot be read as one (format %u, %ux%u, %u samples, array %u, %u mips)", static_cast<unsigned>(dd.Format), dd.Width, dd.Height,
+                          dd.SampleDesc.Count, dd.ArraySize, dd.MipLevels);
+            refuse("depth copy", why);
+            break;
+        }
+        if (!dev) { refuse("scene copy", "no device"); break; }
         std::lock_guard<std::mutex> lock(g_bdMutex);
         ID3D11Texture2D* scene = g_bdScene.load(std::memory_order_acquire);
         if (!scene || g_bdSceneW != sd.Width || g_bdSceneH != sd.Height || g_bdSceneFmt != fmt) {
@@ -1576,34 +1805,101 @@ void backdropSceneCopy(ID3D11DeviceContext* ctx) noexcept {
                     made = nullptr;
                 }
             }
-            if (made) {
-                ID3D11Texture2D* oldTex = g_bdScene.exchange(made, std::memory_order_acq_rel);
-                ID3D11ShaderResourceView* oldSrv = g_bdSceneSrv.exchange(madeSrv, std::memory_order_acq_rel);
-                if (oldSrv) oldSrv->Release();
-                if (oldTex) oldTex->Release();
-                scene = made;
-                g_bdSceneW = sd.Width;
-                g_bdSceneH = sd.Height;
-                g_bdSceneFmt = fmt;
-                char fb[24] = {};
-                std::snprintf(g_bdSceneFmtText, sizeof(g_bdSceneFmtText), "%s", bdFormatName(fmt, fb, sizeof(fb)));
-            } else {
-                scene = nullptr;
-            }
+            if (!made) { refuse("scene copy", "the scene texture could not be made"); break; }
+            ID3D11Texture2D* oldTex = g_bdScene.exchange(made, std::memory_order_acq_rel);
+            ID3D11ShaderResourceView* oldSrv = g_bdSceneSrv.exchange(madeSrv, std::memory_order_acq_rel);
+            if (oldSrv) oldSrv->Release();
+            if (oldTex) oldTex->Release();
+            scene = made;
+            g_bdSceneW = sd.Width;
+            g_bdSceneH = sd.Height;
+            g_bdSceneFmt = fmt;
+            char fb[24] = {};
+            std::snprintf(g_bdSceneFmtText, sizeof(g_bdSceneFmtText), "%s", bdFormatName(fmt, fb, sizeof(fb)));
         }
-        if (scene) {
+        ID3D11Texture2D* depth = g_bdDepth.load(std::memory_order_acquire);
+        if (!depth || g_bdDepthW != dd.Width || g_bdDepthH != dd.Height || g_bdDepthFmt != dd.Format) {
+            ID3D11Texture2D* made = nullptr;
+            ID3D11ShaderResourceView* madeSrv = nullptr;
+            D3D11_TEXTURE2D_DESC td{};
+            td.Width = dd.Width;
+            td.Height = dd.Height;
+            td.MipLevels = 1;
+            td.ArraySize = 1;
+            td.Format = dd.Format;
+            td.SampleDesc.Count = 1;
+            td.Usage = D3D11_USAGE_DEFAULT;
+            td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+            if (SUCCEEDED(dev->CreateTexture2D(&td, nullptr, &made)) && made) {
+                D3D11_SHADER_RESOURCE_VIEW_DESC vd{};
+                vd.Format = dread;
+                vd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+                vd.Texture2D.MipLevels = 1;
+                if (FAILED(dev->CreateShaderResourceView(made, &vd, &madeSrv)) || !madeSrv) {
+                    made->Release();
+                    made = nullptr;
+                }
+            }
+            if (!made) { refuse("depth copy", "the depth copy texture or its view could not be made"); break; }
+            ID3D11Texture2D* oldTex = g_bdDepth.exchange(made, std::memory_order_acq_rel);
+            ID3D11ShaderResourceView* oldSrv = g_bdDepthSrv.exchange(madeSrv, std::memory_order_acq_rel);
+            if (oldSrv) oldSrv->Release();
+            if (oldTex) oldTex->Release();
+            depth = made;
+            g_bdDepthW = dd.Width;
+            g_bdDepthH = dd.Height;
+            g_bdDepthFmt = dd.Format;
+        }
+        // The origin, once per visit: the camera's row of the glass's constant buffer 1, copied on the GPU (no read of the game's memory).
+        bool originNow = false;
+        if (!g_bdOriginSet.load(std::memory_order_acquire)) {
+            ID3D11DeviceContext1* c1 = nullptr;
+            ctx->QueryInterface(IID_PPV_ARGS(&c1));
+            ID3D11Buffer* cb = nullptr;
+            UINT first = 0, num = 0;
+            if (c1) c1->PSGetConstantBuffers1(1, 1, &cb, &first, &num);
+            char why[200] = {};
+            ID3D11Buffer* origin = g_bdOrigin.load(std::memory_order_acquire);
+            if (!c1) std::snprintf(why, sizeof(why), "the context has no ID3D11DeviceContext1, so the b1 window cannot be read");
+            else if (!cb) std::snprintf(why, sizeof(why), "no constant buffer is bound at b1");
+            else if (!origin) std::snprintf(why, sizeof(why), "the origin buffer is missing");
+            else {
+                D3D11_BUFFER_DESC bd{};
+                cb->GetDesc(&bd);
+                const UINT byteOff = (first + static_cast<UINT>(kBdCb1Row)) * 16u;
+                if ((num != 0 && kBdCb1Row >= num) || byteOff + 16u > bd.ByteWidth)
+                    std::snprintf(why, sizeof(why), "constant buffer 1 (%u bytes, window start %u, %u constants) has no row %u", bd.ByteWidth, first, num, static_cast<unsigned>(kBdCb1Row));
+                else {
+                    D3D11_BOX box{byteOff, 0, 0, byteOff + 16u, 1, 1};
+                    FlatComputeInternalScope internal;
+                    ctx->CopySubresourceRegion(origin, 0, 0, 0, 0, cb, 0, &box);
+                    originNow = true;
+                }
+            }
+            if (cb) cb->Release();
+            if (c1) c1->Release();
+            if (!originNow) { refuse("origin copy", why); break; }
+        }
+        {
             FlatComputeInternalScope internal;
             ctx->CopySubresourceRegion(scene, 0, 0, 0, 0, src, 0, nullptr);
-            g_bdSceneSource.store(res, std::memory_order_release);   // identity only
-            g_bdSceneOkFrame.store(frame, std::memory_order_release);
-            g_bdSceneCopied.store(true, std::memory_order_release);
-            ok = true;
+            ctx->CopyResource(depth, dsrc);
         }
-        dev->Release();
-    }
-    src->Release();
-    res->Release();
-    if (!ok) refuse("the scene texture could not be made");
+        if (originNow) {
+            g_bdOriginSet.store(true, std::memory_order_release);
+            g_bdOriginSetNow.store(true, std::memory_order_relaxed);
+        }
+        g_bdSceneSource.store(res, std::memory_order_release);   // identity only
+        g_bdSceneOkFrame.store(frame, std::memory_order_release);
+        g_bdSceneCopied.store(true, std::memory_order_release);
+        ok = true;
+    } while (false);
+    (void)ok;
+    if (dev) dev->Release();
+    if (src) src->Release();
+    if (dsrc) dsrc->Release();
+    if (res) res->Release();
+    if (dres) dres->Release();
 }
 bool formatHasStencil(DXGI_FORMAT f) noexcept {
     return f == DXGI_FORMAT_D24_UNORM_S8_UINT || f == DXGI_FORMAT_D32_FLOAT_S8X24_UINT || f == DXGI_FORMAT_R24G8_TYPELESS || f == DXGI_FORMAT_R32G8X24_TYPELESS;
@@ -1962,9 +2258,11 @@ bool ConcoursePaneScope::beginCapturePass() noexcept {
     };
     ID3D11PixelShader* ps = g_psBdCapture.load(std::memory_order_acquire);
     ID3D11ShaderResourceView* sceneSrv = g_bdSceneSrv.load(std::memory_order_acquire);
-    ID3D11UnorderedAccessView* uav = g_bdBackUav.load(std::memory_order_acquire);
+    ID3D11ShaderResourceView* depthSrv = g_bdDepthSrv.load(std::memory_order_acquire);
+    ID3D11ShaderResourceView* originSrv = g_bdOriginSrv.load(std::memory_order_acquire);
+    ID3D11UnorderedAccessView* uavs[kBdUavCount] = {g_bdDistBackUav.load(std::memory_order_acquire), g_bdBackUav.load(std::memory_order_acquire)};   // u6 distance, u7 colour
     ID3D11BlendState* noColour = g_bsMark.load(std::memory_order_acquire);
-    if (!ps || !sceneSrv || !uav || !noColour || !calls_ || !calls_->setBlend || !calls_->setPs || !calls_->setSrv || !calls_->setDepth) return refuse("a shader, view or state is missing");
+    if (!ps || !sceneSrv || !depthSrv || !originSrv || !uavs[0] || !uavs[1] || !noColour || !calls_ || !calls_->setBlend || !calls_->setPs || !calls_->setSrv || !calls_->setDepth) return refuse("a shader, view or state is missing");
     if (g_bdSceneOkFrame.load(std::memory_order_acquire) != g_frameNow.load(std::memory_order_relaxed)) return refuse("the scene was not copied in this frame");
     ID3D11RenderTargetView* rtvs[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT] = {};
     ID3D11DepthStencilView* dsv = nullptr;
@@ -1987,7 +2285,7 @@ bool ConcoursePaneScope::beginCapturePass() noexcept {
     const bool haveDsv = dsv != nullptr;
     if (dsv) dsv->Release();
     if (!sameTarget) return refuse("the render target is not the one the scene was copied from");
-    if (bound > static_cast<int>(kBdUavSlot)) return refuse("a render target is bound at slot 7 or above, so u7 is not free");
+    if (bound > static_cast<int>(kBdUavFirst)) return refuse("a render target is bound at slot 6 or above, so u6 and u7 are not free");
     if (!haveDsv) return refuse("no depth view is bound");
     UINT ref = 0;
     ctx_->OMGetDepthStencilState(&capPrevDs_, &ref);
@@ -2000,16 +2298,17 @@ bool ConcoursePaneScope::beginCapturePass() noexcept {
     capPrevRef_ = ref;
     ctx_->OMGetBlendState(&capPrevBs_, capPrevFactor_, &capPrevMask_);
     ctx_->PSGetShader(&capPrevPs_, nullptr, nullptr);
-    ctx_->PSGetShaderResources(kBdSceneSlot, 1, &capPrevSrv_);
+    ctx_->PSGetShaderResources(kBdSceneSlot, kBdSrvCount, capPrevSrv_);
     const FLOAT zeros[4] = {};
     calls_->setBlend(ctx_, noColour, zeros, 0xFFFFFFFFu);
     calls_->setPs(ctx_, ps, nullptr, 0);
-    calls_->setSrv(ctx_, kBdSceneSlot, 1, &sceneSrv);
+    ID3D11ShaderResourceView* mine[kBdSrvCount] = {sceneSrv, depthSrv, originSrv};
+    calls_->setSrv(ctx_, kBdSceneSlot, kBdSrvCount, mine);
     calls_->setDepth(ctx_, derived, ref);
     {
         // OMSetRenderTargetsAndUnorderedAccessViews is not hooked by EDVR (nothing in src hooks it): this goes to the context directly.
         FlatComputeInternalScope internal;
-        ctx_->OMSetRenderTargetsAndUnorderedAccessViews(D3D11_KEEP_RENDER_TARGETS_AND_DEPTH_STENCIL, nullptr, nullptr, kBdUavSlot, 1, &uav, nullptr);
+        ctx_->OMSetRenderTargetsAndUnorderedAccessViews(D3D11_KEEP_RENDER_TARGETS_AND_DEPTH_STENCIL, nullptr, nullptr, kBdUavFirst, kBdUavCount, uavs, nullptr);
     }
     capBound_ = true;
     flags_ |= kFlagCapPass;
@@ -2023,15 +2322,17 @@ void ConcoursePaneScope::endCapturePass() noexcept {
     flags_ &= ~kFlagCapPass;
     {
         FlatComputeInternalScope internal;
-        ID3D11UnorderedAccessView* none = nullptr;
-        ctx_->OMSetRenderTargetsAndUnorderedAccessViews(D3D11_KEEP_RENDER_TARGETS_AND_DEPTH_STENCIL, nullptr, nullptr, kBdUavSlot, 1, &none, nullptr);
+        ID3D11UnorderedAccessView* none[kBdUavCount] = {};
+        ctx_->OMSetRenderTargetsAndUnorderedAccessViews(D3D11_KEEP_RENDER_TARGETS_AND_DEPTH_STENCIL, nullptr, nullptr, kBdUavFirst, kBdUavCount, none, nullptr);
     }
     calls_->setDepth(ctx_, capPrevDs_, capPrevRef_);
     if (capPrevDs_) capPrevDs_->Release();
     capPrevDs_ = nullptr;
-    calls_->setSrv(ctx_, kBdSceneSlot, 1, &capPrevSrv_);
-    if (capPrevSrv_) capPrevSrv_->Release();
-    capPrevSrv_ = nullptr;
+    calls_->setSrv(ctx_, kBdSceneSlot, kBdSrvCount, capPrevSrv_);
+    for (auto*& v : capPrevSrv_) {
+        if (v) v->Release();
+        v = nullptr;
+    }
     calls_->setPs(ctx_, capPrevPs_, nullptr, 0);
     if (capPrevPs_) capPrevPs_->Release();
     capPrevPs_ = nullptr;
@@ -2058,7 +2359,7 @@ bool ConcoursePaneScope::beginMirrorSlow() noexcept {
     // instead (the textures), said once: a pane is never left transparent with the outside culled.
     ID3D11PixelShader* skyPs = nullptr;
     ID3D11Buffer* steadyCb = nullptr;
-    ID3D11ShaderResourceView* cubeSrv = nullptr;   // mirror-backdrop: the cube, sampled by the display shader, with its sampler
+    ID3D11ShaderResourceView* cubeSrvs[kBdSrvCount] = {};   // mirror-backdrop: the colour cube, the distance cube and the origin, with the sampler (null: not this pass)
     ID3D11SamplerState* cubeSmp = nullptr;
     if (planSteady_ && !planTint_) {
         skyPs = g_psSky.load(std::memory_order_acquire);
@@ -2066,14 +2367,18 @@ bool ConcoursePaneScope::beginMirrorSlow() noexcept {
         if (planBackdrop_) {
             ID3D11PixelShader* show = g_psBdShow.load(std::memory_order_acquire);
             ID3D11ShaderResourceView* srv = g_bdFrontSrv.load(std::memory_order_acquire);
+            ID3D11ShaderResourceView* dsrv = g_bdDistFrontSrv.load(std::memory_order_acquire);
+            ID3D11ShaderResourceView* osrv = g_bdOriginSrv.load(std::memory_order_acquire);
             ID3D11SamplerState* smp = g_bdSampler.load(std::memory_order_acquire);
-            if (show && srv && smp) {
+            if (show && srv && dsrv && osrv && smp) {
                 skyPs = show;
-                cubeSrv = srv;
+                cubeSrvs[0] = srv;
+                cubeSrvs[1] = dsrv;
+                cubeSrvs[2] = osrv;
                 cubeSmp = smp;
             } else if (!g_bdFallbackSaid.exchange(true, std::memory_order_relaxed)) {
                 Log::get().note("concourse backdrop: mirror-backdrop has no %s yet (the cube is made by the first capture, F6); the panes are drawn as mirror-steady",
-                                !show ? "display shader" : !srv ? "cube" : "sampler");
+                                !show ? "display shader" : !srv || !dsrv || !osrv ? "cube" : "sampler");
             }
         }
         if (!skyPs || !steadyCb) {
@@ -2120,9 +2425,9 @@ bool ConcoursePaneScope::beginMirrorSlow() noexcept {
         ctx_->PSGetShader(&prevPs_, nullptr, nullptr);
         calls_->setPs(ctx_, skyPs, nullptr, 0);
         flags_ |= kFlagPs;   // put back by end(), with the buffer below (kFlagCb); no textures are swapped (the backdrop: t8 and s7 below)
-        if (cubeSrv) {
+        if (cubeSrvs[0]) {
             ctx_->PSGetShaderResources(kPaneSrvFirst, kPaneSrvCount, prevSrv_);
-            calls_->setSrv(ctx_, kBdSceneSlot, 1, &cubeSrv);
+            calls_->setSrv(ctx_, kBdSceneSlot, kBdSrvCount, cubeSrvs);
             flags_ |= kFlagSrv;
             ctx_->PSGetSamplers(kBdSamplerSlot, 1, &prevSampler_);
             ctx_->PSSetSamplers(kBdSamplerSlot, 1, &cubeSmp);
@@ -2325,6 +2630,7 @@ void pollConfig(uint64_t nowMs) {
     g_hashEpoch.fetch_add(1, std::memory_order_relaxed);
     bindKey(g_keyCapture, g_keyCaptureText, Config::get().getString("hotkey.concourse_pane_capture", ""), "hotkey.concourse_pane_capture", "capture key");
     bindKey(g_keyMode, g_keyModeText, Config::get().getString("hotkey.concourse_pane_mode", ""), "hotkey.concourse_pane_mode", "mode key");
+    bindKey(g_keyParallax, g_keyParallaxText, Config::get().getString("hotkey.concourse_backdrop_parallax", ""), "hotkey.concourse_backdrop_parallax", "backdrop distance key");
     g_keysBound = true;
     const std::string modeT = Config::get().getString("diag.concourse_pane_mode", "mirror-steady");
     if (!g_modeTextSeen || modeT != g_modeAppliedText) {
@@ -2378,6 +2684,29 @@ void pollConfig(uint64_t nowMs) {
             }
         }
     }
+    const std::string radiusT = Config::get().getString("diag.concourse_backdrop_radius", "");
+    if (!g_radiusTextSeen || radiusT != g_radiusAppliedText) {
+        const bool first = !g_radiusTextSeen;
+        g_radiusTextSeen = true;
+        g_radiusAppliedText = radiusT;
+        float want = cc::kBackdropRadiusDefaultM;
+        bool bad = false;
+        if (!radiusT.empty()) {
+            char* end = nullptr;
+            const double v = std::strtod(radiusT.c_str(), &end);
+            while (end && (*end == ' ' || *end == '\t')) ++end;
+            if (end && end != radiusT.c_str() && *end == '\0' && v >= static_cast<double>(cc::kBackdropRadiusMinM) && v <= static_cast<double>(cc::kBackdropRadiusMaxM)) want = static_cast<float>(v);
+            else bad = true;
+        }
+        if (bad) {
+            Log::get().note("concourse backdrop: diag.concourse_backdrop_radius = \"%s\" is not a number from %.0f to %.0f; the radius stays %.0f m", radiusT.c_str(),
+                            static_cast<double>(cc::kBackdropRadiusMinM), static_cast<double>(cc::kBackdropRadiusMaxM), static_cast<double>(g_bdRadius.load(std::memory_order_relaxed)));
+        } else {
+            g_bdRadius.store(want, std::memory_order_relaxed);
+            if (!first || want != cc::kBackdropRadiusDefaultM)
+                Log::get().note("concourse backdrop: distance mode %s, radius %.0f m", cc::parallaxName(g_bdParallax.load(std::memory_order_relaxed)), static_cast<double>(want));
+        }
+    }
     const std::string panesT = Config::get().getString("diag.concourse_panes", "");
     if (!g_panesTextSeen || panesT != g_panesAppliedText) {
         const bool first = !g_panesTextSeen;
@@ -2428,16 +2757,19 @@ void updateGlowCb(ID3D11Device* device) noexcept {
     if (!cb || !cbBay) return;
     const float sky = g_glowSky.load(std::memory_order_relaxed), angled = g_glowAngled.load(std::memory_order_relaxed), other = g_glowOther.load(std::memory_order_relaxed),
                 bay = g_glowBay.load(std::memory_order_relaxed);
-    float data[12] = {};
+    float data[16] = {};
     const bool upOk = g_upFedValid.load(std::memory_order_relaxed);
     for (int k = 0; k < 3; ++k) data[k] = upOk ? g_upFed[k].load(std::memory_order_relaxed) : 0.0f;
     data[4] = sky;
     data[5] = angled;
     data[6] = other;
     for (int k = 0; k < 3; ++k) data[8 + k] = kSteadyColour[k];
-    float dataBay[12] = {};
+    float dataBay[16] = {};
     dataBay[4] = dataBay[5] = dataBay[6] = bay;
     for (int k = 0; k < 3; ++k) dataBay[8 + k] = kSteadyColour[k];
+    // The backdrop's row 3: the distance mode (cc::kParallax*) and the sphere's radius. Both buffers carry it (the bay window is backdrop too).
+    data[12] = dataBay[12] = static_cast<float>(g_bdParallax.load(std::memory_order_relaxed));
+    data[13] = dataBay[13] = g_bdRadius.load(std::memory_order_relaxed);
     const bool changed = !g_glowCbSentValid || std::memcmp(data, g_glowCbSent, sizeof(data)) != 0;
     const bool changedBay = !g_glowCbSentValid || std::memcmp(dataBay, g_glowCbBaySent, sizeof(dataBay)) != 0;
     if (changed || changedBay) {
@@ -2514,6 +2846,7 @@ void concoursePaneSetFeed(const ConcoursePaneFeed& feed) noexcept {
     if (!treatBefore && feed.treat) {   // a new visit to a concourse: what was learned about the panes is forgotten
         std::lock_guard<std::mutex> lock(g_sideMutex);
         g_sides.reset();
+        g_bdResetPending.store(true, std::memory_order_release);   // and the backdrop cube and its origin (the tick does it)
     }
     if (!g_feedWithhold.exchange(feed.withhold, std::memory_order_relaxed) && feed.withhold) {
         g_plainFrom.store(g_frameNow.load(std::memory_order_relaxed), std::memory_order_relaxed);
@@ -2541,6 +2874,12 @@ namespace {
 // the front one and the phase is Done. With no pane captured for kBackdropWaitFrames frames it is Empty. A resource refusal is Refused (its line is logged by the maker).
 void backdropTick(ID3D11Device* device, uint32_t frame) noexcept {
     const auto phase = static_cast<ConcourseBackdropPhase>(g_bdPhase.load(std::memory_order_relaxed));
+    // A new visit (treat rose): the cube is emptied and the origin forgotten, unless a capture is open (then at the next tick without one).
+    if (g_bdResetPending.load(std::memory_order_acquire) && !g_bdArmed.load(std::memory_order_acquire) && !g_bdArmRequested.load(std::memory_order_acquire) &&
+        phase != ConcourseBackdropPhase::kArmed) {
+        g_bdResetPending.store(false, std::memory_order_release);
+        backdropReset(device);
+    }
     if (phase == ConcourseBackdropPhase::kIdle && g_bdArmRequested.exchange(false, std::memory_order_acq_rel)) {
         if (!device) {
             bdRefuse("no device");
@@ -2553,6 +2892,7 @@ void backdropTick(ID3D11Device* device, uint32_t frame) noexcept {
         } else {
             g_bdPaneDraws.store(0, std::memory_order_relaxed);
             g_bdSceneCopied.store(false, std::memory_order_relaxed);
+            g_bdOriginSetNow.store(false, std::memory_order_relaxed);
             g_bdSceneFrame.store(0xFFFFFFFFu, std::memory_order_relaxed);
             g_bdSceneOkFrame.store(0xFFFFFFFFu, std::memory_order_relaxed);
             g_bdSceneRefusedSaid.store(false, std::memory_order_relaxed);
@@ -2568,13 +2908,11 @@ void backdropTick(ID3D11Device* device, uint32_t frame) noexcept {
     g_bdFramesWaited = frame - g_bdArmFrame;
     if (g_bdPaneDraws.load(std::memory_order_relaxed) > 0) {
         g_bdArmed.store(false, std::memory_order_release);
-        ID3D11Texture2D* back = g_bdBack.load(std::memory_order_acquire);
-        ID3D11Texture2D* front = g_bdFront.load(std::memory_order_acquire);
         ID3D11DeviceContext* imm = nullptr;
         if (device) device->GetImmediateContext(&imm);
-        if (back && front && imm) {
-            FlatComputeInternalScope internal;
-            imm->CopyResource(front, back);
+        if (g_bdBack.load(std::memory_order_acquire) && g_bdFront.load(std::memory_order_acquire) && imm) {
+            backdropPublishFront(imm);   // back to front, mip 0 slice by slice, then the mips of both cubes
+            g_bdCaptures.fetch_add(1, std::memory_order_relaxed);
             g_bdCubeValid.store(true, std::memory_order_release);
             g_bdPhase.store(static_cast<uint8_t>(ConcourseBackdropPhase::kDone), std::memory_order_relaxed);
             queueToast("Windows: view captured");
@@ -2617,6 +2955,12 @@ void concoursePaneTick(ID3D11Device* device, uint32_t frame, uint64_t nowMs) noe
         const uint32_t next = cur == kModeBackdrop ? kModeSteady : cur == kModeSteady ? kModeBrightest : cur == kModeBrightest ? kModeMirror : cur == kModeMirror ? kModeTint
                               : cur == kModeTint ? kModeOff : kModeBackdrop;
         setMode(next, g_social ? "hotkey.concourse_pane_mode" : "hotkey.concourse_pane_mode; it applies on foot in social space", true);
+    }
+    if (g_keyParallax && g_keyParallax->pressed()) {
+        const uint32_t next = cc::parallaxNext(g_bdParallax.load(std::memory_order_relaxed));
+        g_bdParallax.store(next, std::memory_order_relaxed);
+        Log::get().note("concourse backdrop: distance mode %s, radius %.0f m (hotkey.concourse_backdrop_parallax)", cc::parallaxName(next), static_cast<double>(g_bdRadius.load(std::memory_order_relaxed)));
+        queueToast(next == cc::kParallaxNone ? "Windows: distance off" : next == cc::kParallaxSphere ? "Windows: distance by sphere" : "Windows: distance by depth");
     }
     if (g_keyCapture && g_keyCapture->pressed()) {
         g_surveyRequested.store(true, std::memory_order_relaxed);
@@ -2687,6 +3031,8 @@ ConcourseBackdropStatus concoursePaneBackdropStatus() noexcept {
     s.phase = static_cast<ConcourseBackdropPhase>(g_bdPhase.load(std::memory_order_relaxed));
     s.sceneCopied = g_bdSceneCopied.load(std::memory_order_relaxed);
     s.paneDraws = g_bdPaneDraws.load(std::memory_order_relaxed);
+    s.originSet = g_bdOriginSetNow.load(std::memory_order_relaxed);
+    s.captures = g_bdCaptures.load(std::memory_order_relaxed);
     s.framesWaited = g_bdFramesWaited;
     std::lock_guard<std::mutex> lock(g_bdMutex);
     s.sceneW = g_bdSceneW;

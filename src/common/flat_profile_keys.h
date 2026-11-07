@@ -62,10 +62,12 @@ inline bool flatProfileReadsKey(const char* key) {
         std::strcmp(key, "diag.concourse_clear_share") == 0 ||
         std::strcmp(key, "diag.concourse_mirror_beyond") == 0 ||
         std::strcmp(key, "diag.concourse_glow") == 0 ||
+        std::strcmp(key, "diag.concourse_backdrop_radius") == 0 ||
         std::strcmp(key, "hotkey.concourse_cull") == 0 ||
         std::strcmp(key, "hotkey.concourse_pane_capture") == 0 ||
         std::strcmp(key, "hotkey.concourse_pane_mode") == 0 ||
         std::strcmp(key, "hotkey.concourse_view_test") == 0 ||
+        std::strcmp(key, "hotkey.concourse_backdrop_parallax") == 0 ||
         // The flat jitter cycle's length (flat_runtime.cpp, FlatLivePhase::phaseCount; temporal_math.h). Developer tier, no flat panel
         // row. Unlisted, getInt answers 0 here whatever the file says, which the reader takes for out of range and reads as 8.
         std::strcmp(key, "advanced.temporal_aa_jitter_phases") == 0 ||
