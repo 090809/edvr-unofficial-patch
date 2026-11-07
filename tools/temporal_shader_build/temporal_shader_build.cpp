@@ -1477,7 +1477,7 @@ static void selfTest() {
 
     // The frame-generation synthesizer (src/d3d11/framegen_synth_shader.h): seven entries of one text, the carry functions cut from kTemporalCsHlsl and the synthesizer's own.
     // Held as the scorer is: the symbols, the source name, the entries, the profile, the text (the carry region is in it, once, byte for byte), the 8x8 group each is dispatched
-    // with, the bindings each reads at the slots src/d3d11/framegen_synth.cpp sets them at, and the 224-byte parameter block.
+    // with, the bindings each reads at the slots src/d3d11/framegen_synth.cpp sets them at (the resample's clamped sampler at s0 among them), and the 224-byte parameter block.
     {
         struct Binding { const char* name; D3D_SHADER_INPUT_TYPE type; UINT slot; };
         struct SynthContract { const char* symbol; const char* entry; std::vector<Binding> bindings; };
@@ -1486,7 +1486,7 @@ static void selfTest() {
             {"kFrameGenSynthSrcBytecode", "fgSynSrc", {{"Depth", D3D_SIT_TEXTURE, 1}, {"Mv", D3D_SIT_TEXTURE, 2}, {"KeyT", D3D_SIT_TEXTURE, 4}, {"ReadOut", D3D_SIT_UAV_RWTYPED, 3}, {"Stats", D3D_SIT_UAV_RWSTRUCTURED, 5}, {"P", D3D_SIT_CBUFFER, 0}}},
             {"kFrameGenSynthResolveBytecode", "fgSynResolve", {{"KeyT", D3D_SIT_TEXTURE, 4}, {"Holes", D3D_SIT_UAV_RWSTRUCTURED, 0}, {"ReadOut", D3D_SIT_UAV_RWTYPED, 3}, {"Stats", D3D_SIT_UAV_RWSTRUCTURED, 5}, {"P", D3D_SIT_CBUFFER, 0}}},
             {"kFrameGenSynthHolesBytecode", "fgSynHoles", {{"Depth", D3D_SIT_TEXTURE, 1}, {"Mv", D3D_SIT_TEXTURE, 2}, {"KeyT", D3D_SIT_TEXTURE, 4}, {"Holes", D3D_SIT_UAV_RWSTRUCTURED, 0}, {"ReadOut", D3D_SIT_UAV_RWTYPED, 3}, {"Stats", D3D_SIT_UAV_RWSTRUCTURED, 5}, {"P", D3D_SIT_CBUFFER, 0}}},
-            {"kFrameGenSynthResampleBytecode", "fgSynResample", {{"Out", D3D_SIT_TEXTURE, 0}, {"ReadT", D3D_SIT_TEXTURE, 6}, {"SOut", D3D_SIT_UAV_RWTYPED, 4}, {"P", D3D_SIT_CBUFFER, 0}}},
+            {"kFrameGenSynthResampleBytecode", "fgSynResample", {{"Out", D3D_SIT_TEXTURE, 0}, {"ReadT", D3D_SIT_TEXTURE, 6}, {"SOut", D3D_SIT_UAV_RWTYPED, 4}, {"LinClamp", D3D_SIT_SAMPLER, 0}, {"P", D3D_SIT_CBUFFER, 0}}},
             {"kFrameGenSynthLumaBytecode", "fgSynLuma", {{"Out", D3D_SIT_TEXTURE, 0}, {"Depth", D3D_SIT_TEXTURE, 1}, {"SIn", D3D_SIT_TEXTURE, 7}, {"SLumaOut", D3D_SIT_UAV_RWTYPED, 6}, {"BInfoOut", D3D_SIT_UAV_RWTYPED, 7}, {"P", D3D_SIT_CBUFFER, 0}}},
             {"kFrameGenSynthScoreBytecode", "fgSynScore", {{"Out", D3D_SIT_TEXTURE, 0}, {"SLumaIn", D3D_SIT_TEXTURE, 8}, {"BInfoIn", D3D_SIT_TEXTURE, 9}, {"Stats", D3D_SIT_UAV_RWSTRUCTURED, 5}, {"P", D3D_SIT_CBUFFER, 0}}},
             {"kFrameGenSynthFinishBytecode", "fgSynFinish", {{"FinFrame", D3D_SIT_TEXTURE, 3}, {"FinLayer", D3D_SIT_TEXTURE, 5}, {"FinMult", D3D_SIT_TEXTURE, 10}, {"FinOut", D3D_SIT_UAV_RWTYPED, 2}, {"P", D3D_SIT_CBUFFER, 0}}},
