@@ -267,6 +267,13 @@ split zips with fixed timestamps and file order, so packaging twice gives the
 same bytes, and it removes older `ed-up-dlss-*.zip` and `ed-up-xess-*.zip` from
 `dist\` when a runtime's contents change.
 
+Build every release by the same route. `ed-up-launcher.exe` is the same bytes
+from two builds on one machine, but a CI build and a local build differ, and an
+installed launcher replaces itself when the digest changes. Replacing an asset on
+a published release also takes a few minutes to reach everyone: the API lists the
+new digest at once while GitHub's download cache can still serve the old file. The
+launcher skips its check while the two disagree and looks again on its next start.
+
 The draft is the review point before publication. A failed build has no package
 artifact and should never be used for a release.
 

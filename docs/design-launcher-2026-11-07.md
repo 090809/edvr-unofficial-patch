@@ -2,8 +2,29 @@
 
 ## Status
 
-- **State:** design only, 2026-11-07. Nothing built, nothing flown.
+- **State:** build order steps 2 and 3 are built on branch
+  `claude/hungry-heyrovsky-000d7b` (2026-11-07), full build green at `5033812c`. No
+  release carries the launcher yet. Step 4 has not started.
+- **Proven, 2026-11-07 (see Test results):** CI builds the split assets, the signing
+  tool's signature verifies through BCrypt, and a test release on GitHub was refused
+  or accepted correctly over real HTTPS. The launcher downloaded it, verified every
+  file and installed it into a scratch folder with no write to the real folders.
+- **Rig-tested only, not yet run for real:** the first run's copy and registration, a
+  self-update, a real UAC prompt and the elevated copy, and Play through Steam, Epic
+  or EDLaunch, including closing EDLaunch. No one has flown any of it.
+- **Next flight:** `ed-up-launcher.exe --data-root <scratch folder>` shows the real
+  window without copying or registering itself, and offers Play. Press Play on each
+  store and watch EDLaunch close after the game exits. Self-update and the first run
+  need the next real release.
+- **Blocks step 4:** Frontier's terms on third-party launchers are still unread, and
+  they have to be read before direct launch is built, not only before it ships.
+- **Waiting on others:** SignPath had not replied on 2026-11-07. A launcher-only
+  signing answer could still move it to its own repo (see Why this repo).
 - **Decisions:**
+  - The launcher's names are `ed-up-*`, and its private keys are in the maintainer's
+    password manager, with both public keys in the exe (see Updates).
+  - An update needs a click. Nothing downloads or changes until Download is pressed,
+    and a game folder is never updated without the plan and its confirmation.
   - It lives in this repo and grows out of `src\installer`, which it replaces.
   - The repo was renamed to `ed-unofficial-patch` on 2026-11-07 (see Name).
   - It ships as a bare exe that registers itself on first run, with no MSI.
@@ -26,10 +47,8 @@
     Proton on the Deck.
   - T6: a Windows exe inside the Proton prefix can get a Steam ticket.
   - T7: the same launch works in a CrossOver bottle on the Mac.
-- **Next flight:** T5 to T7 on the Deck and the Mac, before step 8 of the build
-  order. Steps 2 to 7 do not wait for them.
-- **Unchecked:** Frontier's terms on third-party launchers. Read them before
-  shipping direct launch as the default.
+- **Also next:** T5 to T7 on the Deck and the Mac, before step 8 of the build order.
+  Steps 4 to 7 do not wait for them.
 - **Issues:** [#196](https://github.com/characterecho-sean/ed-unofficial-patch/issues/196).
 
 ## Why this repo
@@ -175,6 +194,17 @@ launchers. Replacing a leaked key needs a launcher update signed by the other ke
   planner does not need to know where the bytes came from.
 - **Offline install.** `--payload <dir>` reads the same files from an unpacked
   `ed-up-<ver>.zip`. The Linux wrapper uses this too once the embedded payload goes.
+- **Cache lag.** After an asset is replaced on a release, GitHub's API lists the new
+  digest at once while its download cache can serve the old file for a few minutes,
+  and the cache differs by `Accept` header. A download that differs from the listing
+  therefore skips the check rather than refusing, and only the signature refuses a
+  release. Assets are requested with no `Accept` header.
+- **Same route for every release.** The launcher's bytes repeat between two builds on
+  one machine, but a CI build and a local build differ, and an installed launcher
+  replaces itself when the digest changes.
+
+Rolling back is not built yet. The cache and the stored manifests keep what it needs,
+the last three releases, but nothing in the window offers it.
 
 The README has to disclose the network access. The launcher contacts
 `api.github.com`, GitHub's release downloads, and `api.zaonce.net` for sign-in.
@@ -256,6 +286,16 @@ is probably patching and is left alone.
 Whether the Epic URI can carry arguments is unknown. If it cannot, VR or flat on
 Epic needs a Settings.xml write, and that is the only place the launcher writes
 that file.
+
+As built in step 3, only the Frontier route carries VR or flat, so it gets Play VR and
+Play flat and remembers the choice per install. Steam and Epic get one Play button and
+a line saying the game uses the mode it is set to. Nothing writes Settings.xml. Steam
+gains the flags with direct launch in step 4, and Epic's question stays open.
+
+Frontier's store keeps the game under AppData and EDLaunch under Program Files, so that
+route looks in the launcher's install folders as well as above the game. A folder the
+user picked looks only above itself, because the store's EDLaunch would start the
+store's copy of the game, not that folder's.
 
 ### Falling back
 
@@ -378,14 +418,37 @@ past the main menu; and the Frontier launch's process parent, because that query
 failed during a concurrent build. The port's source is v0.14.0, so its changes since
 v0.13.0 need reading during the port.
 
+The update path, 2026-11-07, on a throwaway public pre-release `v0.0.1-ci.2`, built by
+Actions run 42385097986 from `0b9fe4c0` and signed with the main key. The launcher ran
+with `--data-root` on a scratch folder. The release and its tag were deleted afterwards.
+
+| Test | Result | Evidence |
+|---|---|---|
+| CI builds the assets | Pass | Core 5.9 MB, DLSS 29.4 MB, XeSS 56.9 MB, launcher 1.2 MB. All match `SHA256SUMS`, and `sign_manifest.py verify` passes every check on the signed folder |
+| Published with no `.sig` | Not offered | `no release carries a signed update`, and the stable channel did not change |
+| Real signature | Accepted | `Signed by: the main key`, `update available` |
+| `--update` | Pass | The three zips in 13 s, all 11 files verified, manifest adopted with `highest_issued` set |
+| Second check | Up to date | The digest matched, so nothing downloaded |
+| Install from the cache | Pass | Into a scratch folder holding a copy of Elite's exe. The six files checked match the signed manifest, and `d3d11.dll` is stamped `v0.0.1-ci.2` |
+| Real signature on a changed manifest | Refused, not conclusive | `the signature does not match a trusted key`, but GitHub's view was not confirmed settled, so this may have read the previous upload. The rig's flipped-byte case covers it exactly |
+| Real manifest, signed with another key | Refused | The same message, with the API and the downloads both confirmed serving those files |
+| Anonymous rate limit | Skipped | The test's repeated checks hit the real limit: `status 403`, exit 4, and no failure |
+| Real folders | Untouched | No launcher or payload folder under `%LOCALAPPDATA%\EDVR`, no uninstall entry, no Start menu change |
+
+An earlier pass at the refusal tests was refused for the wrong reason: a stale signature
+from the cache lag described under Updates, which this test found and `5033812c` fixes.
+The acceptance, download and install rows used the CI-built launcher at the tag. The
+refusal rows used a local build with the fix, which does not touch the signature check.
+
 ## Build order
 
 1. T1 to T4 (done).
 2. Publish the new assets and the signed manifest beside today's. Nothing breaks.
+   (Built, test release proven.)
 3. Launcher from the installer: file cache in place of the embedded payload, update,
    self-update, and the EDLaunch route with the close after exit. It ships beside the
-   installer.
-4. Direct launch on Steam.
+   installer. (Built, update path proven, not flown.)
+4. Direct launch on Steam. Read Frontier's terms first.
 5. Pre-launch check and `--wrap`.
 6. Direct launch on the Frontier store, with its login window.
 7. The per-eye field, the headset record and the settings table as data.
@@ -413,6 +476,9 @@ Linux, an Arm build, and could not reach the Windows Steam inside a Mac bottle.
 
 ## Ruled out
 
+- ruled out: treating a download that differs from GitHub's listing as a refusal,
+  because the test release showed GitHub's own download cache does that for a few
+  minutes after an asset is replaced.
 - ruled out: the game closing itself after a direct launch, because the two early
   launches that seemed to were closed by hand, and three later launches ran until the
   test closed them.
