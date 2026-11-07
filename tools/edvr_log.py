@@ -25598,6 +25598,12 @@ def self_test_health():
               extra=["--runtime-file", runtime([fl_armed(), fl_engage(), fl_report(), RL(flsrc, "frame generation lock: S is not finished like B", "layer_only"), fl_disengage("s_unfinished"),
                                                 fl_report(engaged=0.3, real=13, s=13, from_s=13, disengages=1, reason="s_unfinished"), fl_disengage("menu")])],
               has=["reasons when off: s_unfinished 2, menu 1", "S left unfinished (not shown), why: layer_only"])
+        # A halved period no longer stops Lock engaging; engaged and halved for over 1 s it lets go (period_halved) and backs off 3 s, the one-second lines saying it.
+        check("frame generation lock: a period_halved disengage and its backoff are read and named", fl_gfx, 0, [("OK", FL)], lacks=["UNPARSED"],
+              extra=["--runtime-file", runtime([fl_armed(), fl_engage(), fl_report(), fl_disengage("period_halved"),
+                                                fl_report(engaged=0.5, real=11, s=11, from_s=11, disengages=1, reason="period_halved"),
+                                                fl_report(engaged=0.0, real=0, s=0, from_s=0, reason="period_halved")])],
+              has=["1 engage / 1 disengage edge(s)", "reasons when off: period_halved 3"])
         check("frame generation lock: the replay reasons line is read and summed (flight 11's instrument)", fl_gfx, 0, [("OK", FL)], lacks=["UNPARSED"],
               extra=["--runtime-file", runtime([fl_armed(), fl_engage(), fl_report(late_s=2, from_s=43, from_b=2),
                                                 RL(flsrc, "frame generation lock: replayed B:", 1, 0, 0, 0, 0, 1, 15, 14, 0, 0, 0),

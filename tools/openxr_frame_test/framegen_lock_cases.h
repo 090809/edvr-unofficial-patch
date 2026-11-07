@@ -38,13 +38,17 @@ struct LockDriver {
   unsigned edges = 0, failEdges = 0, slotsRan = 0;
   uint64_t lateReal = 0;
   vr::Texture_t texture{};
+  XrDuration displayPeriod = 0;   // not 0: cond.periodDisplay is the host's test of the runtime's last period against this display period
+  std::vector<FrameGenLockReason> disengages;
   // One game frame: the pair boundary, the game's wait, and (unless the game drops it) both eyes. Returns the game's wait result.
   XrResult frame(bool submit = true) {
     nowUs += stepUs;
     FrameGenLockPair p;
+    if (displayPeriod) cond.periodDisplay = frameGenLockPeriodIsDisplay(int64_t(boundary.lastPeriodNs()), int64_t(displayPeriod));
     if (wired && cond.keyOn) {   // the host's own key test: off, nothing below is reached
       p = frameGenLockBeforeWait(boundary, gate, cond, nowUs);
       if (p.step.edge) ++edges;
+      if (p.step.edge && !p.step.engaged) disengages.push_back(p.step.reason);
       if (p.failEdge) ++failEdges;
       if (p.slotRan) ++slotsRan;
     }
@@ -94,8 +98,7 @@ void gateTable() {
                       {&FrameGenLockConditions::separate, FrameGenLockReason::NotSeparate}, {&FrameGenLockConditions::projection, FrameGenLockReason::NoProjection},
                       {&FrameGenLockConditions::replay, FrameGenLockReason::NoReplay}, {&FrameGenLockConditions::noMenu, FrameGenLockReason::Menu},
                       {&FrameGenLockConditions::sFinished, FrameGenLockReason::Unfinished}, {&FrameGenLockConditions::sDelivering, FrameGenLockReason::NoS},
-                      {&FrameGenLockConditions::notDeferred, FrameGenLockReason::DeferredPacing}, {&FrameGenLockConditions::periodDisplay, FrameGenLockReason::PeriodHalved},
-                      {&FrameGenLockConditions::finishDone, FrameGenLockReason::FinishPending}};
+                      {&FrameGenLockConditions::notDeferred, FrameGenLockReason::DeferredPacing}, {&FrameGenLockConditions::finishDone, FrameGenLockReason::FinishPending}};
   uint64_t t = 3000000;
   for (const Row& r : rows) {
     FrameGenLockGate e;
@@ -113,6 +116,65 @@ void gateTable() {
   FrameGenLockConditions two = allHold();
   two.projection = false; two.notDeferred = false;
   check(frameGenLockBlocker(two) == FrameGenLockReason::NoProjection, "lock gate: two failing: the first in order is said");
+  // The runtime's period (flight 11, 18:12-18:15: disengaged, SteamVR flipped its period between 11.1 and 22.2 ms and the old blocker restarted the dwell every second).
+  {
+    FrameGenLockConditions halved = allHold();
+    halved.periodDisplay = false;
+    check(frameGenLockBlocker(halved) == FrameGenLockReason::None, "lock gate: a halved period is not a blocker");
+    FrameGenLockGate h;
+    const uint64_t t0 = 10000000;
+    uint64_t tp = t0;
+    bool flipping = true;
+    for (int i = 0; tp - t0 < kFrameGenLockDwellUs; ++i, tp += 22222) {   // the period flipping every boundary, as flight 11's throttle
+      FrameGenLockConditions flip = allHold();
+      flip.periodDisplay = (i & 1) != 0;
+      const auto st = h.step(flip, tp);
+      flipping = flipping && !st.engaged && st.reason == FrameGenLockReason::Dwell;
+    }
+    const auto on = h.step(halved, tp);
+    check(flipping && on.engaged && on.edge, "lock gate: disengaged, a period flipping 1x / 2x does not stop the dwell: it engages after 1 s, on a halved boundary too");
+    // Engaged and halved: up to 1 s it holds; a full-period boundary starts the count over; past 1 s it lets go, an edge, period_halved.
+    const uint64_t e0 = tp;
+    auto st = h.step(halved, e0 + 500000);
+    bool held = st.engaged && !st.edge && st.reason == FrameGenLockReason::None;
+    st = h.step(allHold(), e0 + 900000);   // full again: the count starts over
+    held = held && st.engaged;
+    st = h.step(halved, e0 + 1000000);
+    held = held && st.engaged;
+    st = h.step(halved, e0 + 2000000);     // halved exactly 1 s: not more than 1 s
+    held = held && st.engaged;
+    check(held, "lock gate: engaged, a halved period holds for up to 1 s, and one full-period boundary starts that count over");
+    st = h.step(halved, e0 + 2000001);
+    check(!st.engaged && st.edge && st.reason == FrameGenLockReason::PeriodHalved && h.backingOff(), "lock gate: ...halved for more than 1 s: it lets go, an edge, period_halved");
+    // The backoff: 3 s of full period; a halved boundary starts it over; the reason stays period_halved; other blockers still win.
+    const uint64_t b0 = e0 + 2000001;
+    st = h.step(allHold(), b0 + 100);
+    bool backing = !st.engaged && st.reason == FrameGenLockReason::PeriodHalved;
+    st = h.step(allHold(), b0 + 100 + kFrameGenLockDwellUs);   // the ordinary dwell is not enough
+    backing = backing && !st.engaged && st.reason == FrameGenLockReason::PeriodHalved;
+    st = h.step(halved, b0 + 2000000);     // halved again: starts over
+    backing = backing && !st.engaged;
+    st = h.step(allHold(), b0 + 2100000);
+    st = h.step(allHold(), b0 + 2100000 + kFrameGenLockBackoffUs - 1);
+    backing = backing && !st.engaged && st.reason == FrameGenLockReason::PeriodHalved;
+    FrameGenLockConditions cut = allHold(); cut.projection = false;
+    st = h.step(cut, b0 + 2100000 + kFrameGenLockBackoffUs);
+    backing = backing && !st.engaged && st.reason == FrameGenLockReason::NoProjection && h.backingOff();
+    check(backing, "lock gate: the backoff: 1 s is not enough, a halved boundary starts it over, its reason is period_halved, and another blocker is still said first");
+    const uint64_t b1 = b0 + 2100000 + kFrameGenLockBackoffUs + 1;
+    st = h.step(allHold(), b1);
+    st = h.step(allHold(), b1 + kFrameGenLockBackoffUs);
+    check(st.engaged && st.edge && !h.backingOff(), "lock gate: ...3 s of full period after it: engaged again, and the backoff is over");
+    // A blocker while engaged and halved: the halved count is dropped with it.
+    FrameGenLockGate k;
+    k.step(allHold(), 0); k.step(allHold(), kFrameGenLockDwellUs);
+    k.step(halved, kFrameGenLockDwellUs + 10);
+    k.step(cut, kFrameGenLockDwellUs + 20);
+    k.step(halved, kFrameGenLockDwellUs + 30);
+    st = k.step(halved, 2 * kFrameGenLockDwellUs + 40);   // re-engaged after the dwell, halved throughout
+    st = k.step(halved, 2 * kFrameGenLockDwellUs + 50);
+    check(st.engaged && !k.backingOff(), "lock gate: a blocker drops the halved count, and the dwell after it ignores the halved period");
+  }
   // Phase 2.3b: the menu and an unfinished S are said before S's delivery (an unfinished S is not handed over, so a run of them would read as no_s).
   FrameGenLockConditions fin = allHold();
   fin.sFinished = false; fin.sDelivering = false;
@@ -261,10 +323,11 @@ void schedule() {
     check(d.handed.back().time - d.handed[d.handed.size() - 2].time == 2 * P, "lock schedule: late real: the next pairs are 2P again (no catch-up)");
     session.abandonAfterOwnerDestruction();
   }
-  // A cut (a menu or a load: no projection), deferred pacing arriving, the runtime halving its period: each disengages at the pair boundary; the game's next step is P, not 2P.
+  // A cut (a menu or a load: no projection), deferred pacing arriving, S stopping: each disengages at the pair boundary; the game's next step is P, not 2P. (The runtime
+  // halving its period is not a cut: periodSchedule below.)
   struct Cut { bool FrameGenLockConditions::*field; const char* name; };
   const Cut cuts[] = {{&FrameGenLockConditions::projection, "a cut (menu or load)"}, {&FrameGenLockConditions::notDeferred, "deferred pacing arriving"},
-                      {&FrameGenLockConditions::periodDisplay, "the runtime halving its period"}, {&FrameGenLockConditions::sDelivering, "S stopping"}};
+                      {&FrameGenLockConditions::sDelivering, "S stopping"}};
   for (const Cut& c : cuts) {
     Fake fake; fake.step = fake.period = P; SessionState session; start(session, fake);
     SlotSink sink(fake); FrameBoundary boundary(session, sink);
@@ -360,6 +423,66 @@ void schedule() {
     boundary.drain();
     session.abandonAfterOwnerDestruction();
     pacer.stop();
+  }
+}
+
+// The runtime's period against the fake runtime, cond.periodDisplay as the host computes it (the last real wait's period against the display's).
+void periodSchedule() {
+  const XrDuration P = 11;
+  // Disengaged, the vendor throttles (flight 11, 18:12-18:15: 11.1 / 22.2 ms flipping each second; here every frame): Lock still engages after the 1 s dwell, and with Lock
+  // submitting at the display rate the vendor goes back to full: then 2:1 holds, no disengage, the times increase, and every period the game is told is the runtime's own.
+  {
+    Fake fake; fake.step = fake.period = 2 * P; SessionState session; start(session, fake);
+    SlotSink sink(fake); FrameBoundary boundary(session, sink);
+    LockDriver d{fake, session, sink, boundary};
+    d.cond = allHold(); d.displayPeriod = P;
+    bool sawHalved = false;
+    for (int i = 0; i < 90; ++i) {
+      if (d.gate.engaged()) fake.step = fake.period = P;
+      else fake.step = fake.period = (i & 1) ? 2 * P : P;
+      d.frame();
+      sawHalved = sawHalved || (!d.gate.engaged() && !d.cond.periodDisplay);
+    }
+    size_t firstEngaged = 0;
+    while (firstEngaged < d.handed.size() && !d.handed[firstEngaged].engaged) ++firstEngaged;
+    bool twoP = firstEngaged + 3 < d.handed.size(), runtimes = true;
+    for (size_t i = firstEngaged + 3; i < d.handed.size(); ++i) twoP = twoP && d.handed[i].time - d.handed[i - 1].time == 2 * P;
+    for (const auto& h : d.handed) runtimes = runtimes && (h.period == P || h.period == 2 * P);
+    check(sawHalved && d.edges == 1 && firstEngaged == 46 && d.disengages.empty(),
+          "lock period: halving while disengaged does not block: one engage edge after the 1 s dwell (frame 47), never a disengage");
+    check(twoP && monotonic(d.handed) && runtimes && d.cond.periodDisplay && sink.fromS == d.slotsRan,
+          "lock period: ...the period back to full once engaged: 2P steps, the times increase, every period told is the runtime's, every S slot shows S");
+    session.abandonAfterOwnerDestruction();
+  }
+  // Engaged, the vendor halves and stays halved: Lock holds up to 1 s, lets go (period_halved) past it with no S slot at that boundary and the game told the runtime's own next
+  // slot (one runtime step, its own period: never a doubled one of EDVR's), then backs off 3 s of full period before it engages again.
+  {
+    Fake fake; fake.step = fake.period = P; SessionState session; start(session, fake);
+    SlotSink sink(fake); FrameBoundary boundary(session, sink);
+    LockDriver d{fake, session, sink, boundary};
+    d.cond = allHold(); d.displayPeriod = P;
+    for (int i = 0; i < 50; ++i) d.frame();
+    const bool engaged0 = d.gate.engaged();
+    fake.step = fake.period = 2 * P;
+    int framesToLetGo = 0;
+    unsigned slotsAtEdge = 0;
+    for (int i = 0; i < 80 && d.gate.engaged(); ++i) { slotsAtEdge = d.slotsRan; d.frame(); ++framesToLetGo; }
+    const size_t n = d.handed.size();
+    // Boundary 1 still sees the last full wait; from boundary 2 the period is halved: 46 boundaries (1.022 s) later it is more than 1 s.
+    check(engaged0 && !d.gate.engaged() && d.disengages.size() == 1 && d.disengages[0] == FrameGenLockReason::PeriodHalved && framesToLetGo == 48,
+          "lock period: engaged and halved: held for 1 s, then let go with period_halved (48 frames at 22.2 ms after the halving)");
+    check(d.slotsRan == slotsAtEdge && d.handed[n - 1].time - d.handed[n - 2].time == 2 * P && d.handed[n - 1].period == 2 * P && monotonic(d.handed),
+          "lock period: ...no S slot at that boundary, and the game is told one runtime step on, the runtime's own period (fail-open never doubles)");
+    for (int i = 0; i < 10; ++i) d.frame();
+    const bool stillOff = !d.gate.engaged() && d.gate.reason() == FrameGenLockReason::PeriodHalved;
+    fake.step = fake.period = P;
+    const unsigned slots0 = d.slotsRan;
+    int toEngage = 0;
+    for (int i = 0; i < 200 && !d.gate.engaged(); ++i) { d.frame(); ++toEngage; }
+    // The first boundary after the change still sees the halved wait; full from the next: 3 s is 136 boundaries at 22.2 ms (135 is 2.99997 s).
+    check(stillOff && d.gate.engaged() && toEngage == 138 && d.slotsRan == slots0 + 1 && d.edges == 3 && monotonic(d.handed),
+          "lock period: ...it backs off, period_halved, through the halving and 3 s of full period after it (not the 1 s dwell), then engages again");
+    session.abandonAfterOwnerDestruction();
   }
 }
 
@@ -636,6 +759,6 @@ void lines() {
   check(names, "lock line: every reason has a name");
 }
 
-void run() { gateTable(); slotMath(); schedule(); keyOffIdentity(); mutations(); delivery(); replayWhy(); lines(); }
+void run() { gateTable(); slotMath(); schedule(); periodSchedule(); keyOffIdentity(); mutations(); delivery(); replayWhy(); lines(); }
 
 }  // namespace lockcases

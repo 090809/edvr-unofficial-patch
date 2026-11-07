@@ -26,7 +26,8 @@ enum class FrameGenLockReason : uint8_t {
     Unfinished,      // Phase 2.3b: the last pair's S was not finished as B is (framegen_slot_report.h kFrameGenFinish*: the why is said on its own line)
     NoS,             // the synthesizer has not delivered an S for several pairs
     DeferredPacing,  // deferred pacing (turbo, fix.weapon_stability's on-foot deferral) is on this frame: Lock stands aside for it in 2.3
-    PeriodHalved,    // the runtime's predicted period is already about twice the display's (the vendor halved the rate)
+    PeriodHalved,    // while engaged, the runtime's predicted period stayed about twice the display's for over kFrameGenLockHalvedUs (the vendor's smoothing fighting Lock); said
+                     // again through the backoff after it (kFrameGenLockBackoffUs of full period). A halved period alone never stops Lock engaging.
     FinishPending,   // the previous pair's overlapped finish has not run (the owner FIFO says it cannot be; a guard)
     SlotFailed,      // the S slot itself was refused or failed (no frame was begun, or the runtime returned an error)
     Dwell,           // every condition holds, for less than kFrameGenLockDwellUs so far
@@ -64,7 +65,7 @@ struct FrameGenLockConditions {
     bool sFinished = true;    // Phase 2.3b: true unless the last pair's S was left unfinished (frameGenSFinished)
     bool sDelivering = false;
     bool notDeferred = false;
-    bool periodDisplay = false;
+    bool periodDisplay = false;   // not a blocker: the gate reads it itself (a halved period while engaged, and the backoff after it)
     bool finishDone = false;
 };
 
@@ -77,9 +78,7 @@ inline FrameGenLockReason frameGenLockBlocker(const FrameGenLockConditions& c) {
     if (!c.noMenu) return FrameGenLockReason::Menu;
     if (!c.sFinished) return FrameGenLockReason::Unfinished;
     if (!c.sDelivering) return FrameGenLockReason::NoS;
-    if (!c.notDeferred) return FrameGenLockReason::DeferredPacing;
-    if (!c.periodDisplay) return FrameGenLockReason::PeriodHalved;
-    if (!c.finishDone) return FrameGenLockReason::FinishPending;
+    if (!c.notDeferred) return FrameGenLockReason::DeferredPacing;    if (!c.finishDone) return FrameGenLockReason::FinishPending;
     return FrameGenLockReason::None;
 }
 
@@ -89,10 +88,16 @@ inline bool frameGenLockPeriodIsDisplay(int64_t periodNs, int64_t displayNs) {
     return periodNs > 0 && displayNs > 0 && 2 * periodNs <= 3 * displayNs;
 }
 
-constexpr uint64_t kFrameGenLockDwellUs = 1000000;   // the conditions hold this long before Lock engages (and again after any disengage)
+constexpr uint64_t kFrameGenLockDwellUs = 1000000;     // the conditions hold this long before Lock engages (and again after any disengage)
+constexpr uint64_t kFrameGenLockHalvedUs = 1000000;    // engaged, the runtime's period halved for longer than this: Lock lets go (period_halved)
+constexpr uint64_t kFrameGenLockBackoffUs = 3000000;   // after a period_halved disengage: this long of full period (and every other condition) before Lock engages again
 
 // Engage and disengage, only ever at a pair boundary. Engaged while every condition holds; any failure disengages at once; it engages again once they have held for
 // kFrameGenLockDwellUs. step() returns whether this boundary is an edge, and the reason: the blocker while one stands, Dwell while waiting, None while engaged.
+// The runtime's period is not a blocker. Disengaged, a halved period (the vendor throttling a game that cannot hold the display rate: flight 11 saw SteamVR flip 11.1 / 22.2 ms
+// every second) does not stop the dwell: Lock engaging is what brings the period back. Engaged, the period halved at every boundary for more than kFrameGenLockHalvedUs (wall
+// time, boundary to boundary; one full-period boundary starts it over) is the vendor's smoothing fighting Lock: it lets go (period_halved) and then needs kFrameGenLockBackoffUs of
+// full period, a halved boundary starting it over, before it engages again; the reason through that backoff stays period_halved.
 class FrameGenLockGate {
 public:
     struct Step {
@@ -105,22 +110,43 @@ public:
         const FrameGenLockReason blocker = frameGenLockBlocker(c);
         if (blocker != FrameGenLockReason::None) {
             holding_ = false;
+            halved_ = false;
             s.edge = engaged_;
             engaged_ = false;
             reason_ = blocker;
         } else if (!engaged_) {
-            if (!holding_) {
+            if (backoff_ && !c.periodDisplay) holding_ = false;   // the backoff counts full period only
+            if (!holding_ && (!backoff_ || c.periodDisplay)) {
                 holding_ = true;
                 holdSinceUs_ = nowUs;
             }
-            if (nowUs >= holdSinceUs_ && nowUs - holdSinceUs_ >= kFrameGenLockDwellUs) {
+            const uint64_t need = backoff_ ? kFrameGenLockBackoffUs : kFrameGenLockDwellUs;
+            if (holding_ && nowUs >= holdSinceUs_ && nowUs - holdSinceUs_ >= need) {
                 engaged_ = true;
+                backoff_ = false;
+                halved_ = false;
                 s.edge = true;
                 reason_ = FrameGenLockReason::None;
             } else {
-                reason_ = FrameGenLockReason::Dwell;
+                reason_ = backoff_ ? FrameGenLockReason::PeriodHalved : FrameGenLockReason::Dwell;
+            }
+        } else if (!c.periodDisplay) {
+            if (!halved_) {
+                halved_ = true;
+                halvedSinceUs_ = nowUs;
+            }
+            if (nowUs >= halvedSinceUs_ && nowUs - halvedSinceUs_ > kFrameGenLockHalvedUs) {
+                engaged_ = false;
+                holding_ = false;
+                halved_ = false;
+                backoff_ = true;
+                s.edge = true;
+                reason_ = FrameGenLockReason::PeriodHalved;
+            } else {
+                reason_ = FrameGenLockReason::None;
             }
         } else {
+            halved_ = false;
             reason_ = FrameGenLockReason::None;
         }
         s.engaged = engaged_;
@@ -132,16 +158,18 @@ public:
         const bool edge = engaged_;
         engaged_ = false;
         holding_ = false;
+        halved_ = false;
         reason_ = why;
         return edge;
     }
     bool engaged() const { return engaged_; }
+    bool backingOff() const { return backoff_; }
     FrameGenLockReason reason() const { return reason_; }
     void reset() { *this = FrameGenLockGate{}; }
 
 private:
-    bool engaged_ = false, holding_ = false;
-    uint64_t holdSinceUs_ = 0;
+    bool engaged_ = false, holding_ = false, halved_ = false, backoff_ = false;
+    uint64_t holdSinceUs_ = 0, halvedSinceUs_ = 0;
     FrameGenLockReason reason_ = FrameGenLockReason::KeyOff;
 };
 
