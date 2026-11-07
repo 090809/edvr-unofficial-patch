@@ -391,12 +391,14 @@ void expectAgree(Scope& sc, const GpuResult& g, const Ref& c, const char* tag) {
     sc.ok(k.holeDiff <= 8 && k.pixelDiff <= 8 && k.histL1 <= 32, label);
 }
 
-FrameGenShadowCb makeCb(const Scene& a, const FrameGenDeltas& dA, const FrameGenDeltas& dB, float split, bool mutateForward = false, bool identityBackward = false, float depthA = 0.0f) {
+FrameGenShadowCb makeCb(const Scene& a, const FrameGenDeltas& dA, const FrameGenDeltas& dB, float split, bool mutateForward = false, bool identityBackward = false, float depthA = 0.0f, bool oracle = false) {
     (void)a;
     float Wp[9], tp[3];
     frameGenPredictWorld(dA, dB, Wp, tp);
     FrameGenAffine bwd[kFrameGenShadowClasses];
-    frameGenBackward(dB, Wp, tp, bwd);
+    // An oracle frame uses frame B's own measured transform in place of the prediction (framegen_shadow.cpp).
+    if (oracle) frameGenBackward(dB, dB.W, dB.tv, bwd);
+    else frameGenBackward(dB, Wp, tp, bwd);
     if (identityBackward) for (auto& b : bwd) b = FrameGenAffine{};
     FrameGenShadowCb cb;
     frameGenFillCb(cb, RW, RH, RW, RH, kTan, kTan, depthA, kDepthB, split, bwd);
@@ -662,6 +664,18 @@ World4 case4World(Gpu& g, Scope& sc, bool identityBackward) {
     std::snprintf(label, sizeof(label), "case 4 (acceleration): the score is worse than at constant velocity (%.4f against %.4f)", out.meanAccel, out.meanConst);
     sc.ok(out.meanAccel > 2.5 * out.meanConst, label);
     expectAgree(sc, r, cpuScore(cb, r.lumaA, r.depthA, r.lumaB), "case 4 (acceleration)");
+
+    // The oracle: the same accelerating images scored with B's true transform instead of the prediction reproduce B as well as constant motion does.
+    const FrameGenShadowCb cbO = makeCb(A2, dA, dB2, 10.0f, false, identityBackward, 0.0f, true);
+    const GpuResult ro = runGpu(g, A2, B2, cbO);
+    sc.ok(ro.ok, "case 4 (oracle): the scorer ran");
+    if (!ro.ok) return out;
+    FrameGenShadowEyeResult resO;
+    frameGenDecodeStats(ro.stats.data(), resO);
+    const double meanOracle = meanErr(resO, 2, false);
+    std::snprintf(label, sizeof(label), "case 4 (oracle): B's true transform reproduces the accelerating frame: warped mean %.4f against the prediction's %.4f", meanOracle, out.meanAccel);
+    sc.ok(meanOracle < 0.008 && out.meanAccel > 2.5 * meanOracle, label);
+    expectAgree(sc, ro, cpuScore(cbO, ro.lumaA, ro.depthA, ro.lumaB), "case 4 (oracle)");
     if (g_verbose && !identityBackward) std::printf("  case 4: constant mean %.5f (no-warp %.5f), acceleration mean %.5f, rig miss %.4f deg %.3f mm\n", out.meanConst, idMean, out.meanAccel, static_cast<double>(out.degAccel), static_cast<double>(out.mmAccel));
     return out;
 }
@@ -767,11 +781,19 @@ void case6Module(Gpu& g, Scope& sc) {
     for (int c = 0; c < kFrameGenShadowClasses; ++c) { scored += w.cls[c].pixels; bin0 += w.cls[c].hist[0]; }
     char label[220];
     std::snprintf(label, sizeof(label), "case 6: a static scene scores through the module: %u eye-frames read back, skipped %u/%u/%u/%u/%u", w.framesScored, w.skipped[0], w.skipped[1], w.skipped[2], w.skipped[3], w.skipped[4]);
-    sc.ok(w.framesScored >= 8 && w.skipped[kSkipNoPrevDepth] == 2, label);
+    sc.ok(w.framesScored + w.oracle.frames >= 8 && w.skipped[kSkipNoPrevDepth] == 2, label);
     std::snprintf(label, sizeof(label), "case 6: every scored cell's error is in bin 0 (%llu of %llu) with no hole (%llu)", static_cast<unsigned long long>(bin0), static_cast<unsigned long long>(scored),
                   static_cast<unsigned long long>(w.holes));
     sc.ok(scored > 0 && bin0 == scored && w.holes == 0, label);
     sc.ok(scored == static_cast<uint64_t>(w.framesScored) * QW * QH, "case 6: each scored eye-frame covers all 768 cells");
+    // Every second scored frame of an eye is an oracle frame: the two sets are about equal, and a static scene scores the same in both.
+    uint64_t oScored = 0, oBin0 = 0;
+    for (int c = 0; c < kFrameGenShadowClasses; ++c) { oScored += w.oracle.cls[c].pixels; oBin0 += w.oracle.cls[c].hist[0]; }
+    std::snprintf(label, sizeof(label), "case 6: every second scored frame is an oracle frame (%u predicted, %u oracle), with every oracle error in bin 0 (%llu of %llu)", w.framesScored,
+                  w.oracle.frames, static_cast<unsigned long long>(oBin0), static_cast<unsigned long long>(oScored));
+    sc.ok(w.oracle.frames >= 3 && w.framesScored >= 3 && (w.framesScored > w.oracle.frames ? w.framesScored - w.oracle.frames : w.oracle.frames - w.framesScored) <= 4 &&
+              oScored == static_cast<uint64_t>(w.oracle.frames) * QW * QH && oBin0 == oScored,
+          label);
 
     // The skip reasons, each counted once on its own frame.
     FrameGenShadowWindow before = frameGenShadowOpenWindow();
@@ -794,6 +816,19 @@ void case6Module(Gpu& g, Scope& sc) {
     sc.ok(after.skipped[kSkipRowsInvalid] - before.skipped[kSkipRowsInvalid] == 2 && after.skipped[kSkipCameraJump] - before.skipped[kSkipCameraJump] == 2 &&
               after.skipped[kSkipNoPrevDepth] - before.skipped[kSkipNoPrevDepth] == 2,
           label);
+    // The two jump frames were scored, into the jump set and not the normal one: a few more calls (each a gap, so nothing new is scored) read them back.
+    for (int k = 0; k < 6; ++k) {
+        g.ctx->Flush();
+        Sleep(15);
+        frame += 10;
+        frameGenShadowEyeFrame(g.dev.Get(), g.ctx.Get(), 0, frame, f);
+    }
+    const FrameGenShadowWindow done = frameGenShadowOpenWindow();
+    uint64_t jScored = 0, jBin0 = 0;
+    for (int c = 0; c < kFrameGenShadowClasses; ++c) { jScored += done.jump.cls[c].pixels; jBin0 += done.jump.cls[c].hist[0]; }
+    std::snprintf(label, sizeof(label), "case 6: a camera_jump frame is scored into the jump set (%u frames, %llu of %llu cells in bin 0), not skipped and not in the normal set (%u + %u frames)",
+                  done.jump.frames, static_cast<unsigned long long>(jBin0), static_cast<unsigned long long>(jScored), done.framesScored, done.oracle.frames);
+    sc.ok(done.jump.frames == 2 && jScored == 2ull * QW * QH && jBin0 == jScored, label);
 
     // The key off again: the next boundary releases everything.
     frameGenShadowConfigure(false);

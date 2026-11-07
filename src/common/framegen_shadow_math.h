@@ -147,4 +147,13 @@ inline float frameGenMedian(float* v, size_t n) {
     return v[n / 2];
 }
 
+// The q-quantile (0..1) of a sample set, the element at floor(q * n) clamped to the last; q = 0.5 is frameGenMedian. The vector is reordered; 0 for none.
+inline float frameGenQuantile(float* v, size_t n, float q) {
+    if (n == 0) return 0.0f;
+    frameGenMedian(v, n);   // sorts
+    size_t i = static_cast<size_t>(q * static_cast<float>(n));
+    if (i >= n) i = n - 1;
+    return v[i];
+}
+
 }  // namespace edvr

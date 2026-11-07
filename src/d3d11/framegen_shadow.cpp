@@ -12,6 +12,7 @@
 #include <d3d11.h>
 
 #include <atomic>
+#include <cmath>
 #include <cstring>
 #include <vector>
 
@@ -40,7 +41,11 @@ struct EyeRes {
     ID3D11UnorderedAccessView* statsUav = nullptr;
     ID3D11Buffer* staging[kStagingDepth] = {};
     bool pending[kStagingDepth] = {};
+    uint8_t slotSet[kStagingDepth] = {};   // the stats set (FrameGenShadowSet) each pending slot's frame belongs to
     uint32_t writes = 0;
+    uint32_t normalCount = 0;     // normal (non-jump) scored frames so far: every second one is an oracle frame
+    int64_t lastT = 0;            // QPC at the previous frame call, 0 before the first
+    double prevDtMs = 0.0;        // the previous frame's interval (A minus its own predecessor), 0 when unknown
     int cur = 0;                  // the slot of the latest capture
     bool haveCapture = false;
     uint32_t captureFrame = 0;
@@ -63,7 +68,7 @@ struct State {
     TimerSlot timers[kTimerRing];
     // The one-second window.
     FrameGenShadowWindow win;
-    std::vector<float> gpuMs, rigDeg, rigMm;
+    std::vector<float> gpuMs, rigDeg, rigMm, motionMm, magRatio, dtRatio, dtMs, rigDtMm;
     uint32_t eyeFrames = 0;
     int64_t windowTicks = 0;
 };
@@ -104,6 +109,11 @@ void windowReset() {
     g.gpuMs.clear();
     g.rigDeg.clear();
     g.rigMm.clear();
+    g.motionMm.clear();
+    g.magRatio.clear();
+    g.dtRatio.clear();
+    g.dtMs.clear();
+    g.rigDtMm.clear();
     g.eyeFrames = 0;
 }
 
@@ -209,8 +219,15 @@ void pollReadbacks(ID3D11DeviceContext* ctx, EyeRes& r, uint32_t nextSlot) {
         FrameGenShadowEyeResult res;
         frameGenDecodeStats(static_cast<const uint32_t*>(m.pData), res);
         ctx->Unmap(r.staging[slot], 0);
-        frameGenShadowMerge(g.win, res);
-        ++g.win.framesScored;
+        const int set = r.slotSet[slot];
+        if (set == kSetOracle) {
+            frameGenShadowMergeSet(g.win.oracle, res);
+        } else if (set == kSetJump) {
+            frameGenShadowMergeSet(g.win.jump, res);
+        } else {
+            frameGenShadowMerge(g.win, res);
+            ++g.win.framesScored;
+        }
     }
 }
 
@@ -290,16 +307,26 @@ void frameGenShadowEyeFrame(ID3D11Device* dev, ID3D11DeviceContext* ctx, uint32_
     pollReadbacks(ctx, r, r.writes);
     pollTimers(ctx);
 
-    // Why this frame is not scored, in the plan's order; -1 scores it.
+    // The interval to the eye's previous frame call (B minus A) and the one before it (A minus its own predecessor), in ms; 0 when unknown.
+    const int64_t nowT = qpcNow(), freq = qpcFrequency();
+    const double dtB = (r.lastT != 0 && freq > 0 && nowT > r.lastT) ? static_cast<double>(nowT - r.lastT) * 1000.0 / static_cast<double>(freq) : 0.0;
+    const double dtA = r.prevDtMs;
+    r.lastT = nowT;
+    r.prevDtMs = dtB;
+
+    // Why this frame is not scored, in the plan's order; -1 scores it. A camera_jump frame is scored too, into the jump set.
     int skip = -1;
     if (!r.haveCapture || r.captureFrame + 1u != frame || !f.prevDepthValid || !f.depthWritten) skip = kSkipNoPrevDepth;
     else if (!r.haveDeltas || !f.tanPrev) skip = kSkipNoPrevDelta;
     else if (!f.worldValid || !r.prevWorldValid) skip = kSkipRowsInvalid;
-    else if (f.cameraJump || r.prevJump) skip = kSkipCameraJump;
+    const bool jump = f.cameraJump || r.prevJump;
     const bool canCapture = f.depthWritten && f.outSrv && f.depthSrv;
     if (skip < 0 && !canCapture) skip = kSkipNoPrevDepth;
     const int next = r.haveCapture ? 1 - r.cur : 0;
     bool scored = skip < 0 && canCapture;
+    // The set: jump frames apart, else every second normal frame of the eye is an oracle frame.
+    int set = kSetPredicted;
+    if (scored) set = jump ? kSetJump : ((r.normalCount++ & 1u) ? kSetOracle : kSetPredicted);
 
     // A staging slot still unread when it comes round again is overwritten: counted, not waited for.
     const int slot = static_cast<int>(r.writes % kStagingDepth);
@@ -314,11 +341,30 @@ void frameGenShadowEyeFrame(ID3D11Device* dev, ID3D11DeviceContext* ctx, uint32_
         FrameGenAffine bwd[kFrameGenShadowClasses];
         if (scored) {
             frameGenPredictWorld(r.prev, f.deltas, Wp, tp);
-            frameGenBackward(f.deltas, Wp, tp, bwd);
-            float deg = 0.0f, mm = 0.0f;
-            frameGenRigMiss(Wp, tp, f.deltas, &deg, &mm);
-            g.rigDeg.push_back(deg);
-            g.rigMm.push_back(mm);
+            // An oracle frame scores far and world with frame B's own measured transform instead of the prediction.
+            if (set == kSetOracle) frameGenBackward(f.deltas, f.deltas.W, f.deltas.tv, bwd);
+            else frameGenBackward(f.deltas, Wp, tp, bwd);
+            // The prediction's own miss, and the same with the ship's step scaled by dt_B / dt_A; a jump frame's miss is the jump, so it is left out of both.
+            const float scale = (dtA > 0.0 && dtB > 0.0) ? static_cast<float>(dtB / dtA) : 0.0f;
+            if (!jump) {
+                float deg = 0.0f, mm = 0.0f;
+                frameGenRigMiss(Wp, tp, f.deltas, &deg, &mm);
+                g.rigDeg.push_back(deg);
+                g.rigMm.push_back(mm);
+                if (scale > 0.0f) {
+                    float tpDt[3], dtMm = 0.0f;
+                    for (int i = 0; i < 3; ++i) tpDt[i] = (r.prev.tv[i] - r.prev.th[i]) * scale + f.deltas.th[i];
+                    frameGenRigMiss(Wp, tpDt, f.deltas, nullptr, &dtMm);
+                    g.rigDtMm.push_back(dtMm);
+                }
+            }
+            // The motion facts.
+            const auto mag = [](const float* v) { return static_cast<float>(std::sqrt(static_cast<double>(v[0]) * v[0] + static_cast<double>(v[1]) * v[1] + static_cast<double>(v[2]) * v[2]) * 1000.0); };
+            const float mB = mag(f.deltas.tv), mA = mag(r.prev.tv);
+            g.motionMm.push_back(mB);
+            if (mA > 1.0f) g.magRatio.push_back(mB / mA);
+            if (scale > 0.0f) g.dtRatio.push_back(scale);
+            if (dtB > 0.0) g.dtMs.push_back(static_cast<float>(dtB));
         }
         frameGenFillCb(cb, f.renderW, f.renderH, f.outW, f.outH, scored ? f.tanPrev : f.tanNow, f.tanNow, f.depthA, f.depthB, f.splitMetres, bwd);
         D3D11_MAPPED_SUBRESOURCE m{};
@@ -361,6 +407,8 @@ void frameGenShadowEyeFrame(ID3D11Device* dev, ID3D11DeviceContext* ctx, uint32_
             ctx->CSSetUnorderedAccessViews(0, 4, noUav, nullptr);
             ctx->CopyResource(r.staging[slot], r.stats);
             r.pending[slot] = true;
+            r.slotSet[slot] = static_cast<uint8_t>(set);
+            if (set == kSetJump) ++g.win.skipped[kSkipCameraJump];
             ++r.writes;
         } else {
             ctx->CSSetShaderResources(0, 5, noSrv);
@@ -410,6 +458,25 @@ void frameGenShadowFrameBoundary() {
     g.win.rigMmMax = 0.0f;
     for (float v : g.rigMm) if (v > g.win.rigMmMax) g.win.rigMmMax = v;
     g.win.rigMmMedian = frameGenMedian(g.rigMm.data(), g.rigMm.size());
+    FrameGenShadowMotion& m = g.win.motion;
+    const auto maxOf = [](const std::vector<float>& v) { float x = 0.0f; for (float e : v) if (e > x) x = e; return x; };
+    m.motionN = static_cast<uint32_t>(g.motionMm.size());
+    m.motionMax = maxOf(g.motionMm);
+    m.motionMedian = frameGenMedian(g.motionMm.data(), g.motionMm.size());
+    m.magN = static_cast<uint32_t>(g.magRatio.size());
+    m.magP5 = frameGenQuantile(g.magRatio.data(), g.magRatio.size(), 0.05f);
+    m.magP50 = frameGenQuantile(g.magRatio.data(), g.magRatio.size(), 0.50f);
+    m.magP95 = frameGenQuantile(g.magRatio.data(), g.magRatio.size(), 0.95f);
+    m.dtRatioN = static_cast<uint32_t>(g.dtRatio.size());
+    m.dtRatioP5 = frameGenQuantile(g.dtRatio.data(), g.dtRatio.size(), 0.05f);
+    m.dtRatioP50 = frameGenQuantile(g.dtRatio.data(), g.dtRatio.size(), 0.50f);
+    m.dtRatioP95 = frameGenQuantile(g.dtRatio.data(), g.dtRatio.size(), 0.95f);
+    m.dtN = static_cast<uint32_t>(g.dtMs.size());
+    m.dtMax = maxOf(g.dtMs);
+    m.dtMedian = frameGenMedian(g.dtMs.data(), g.dtMs.size());
+    m.rigDtN = static_cast<uint32_t>(g.rigDtMm.size());
+    m.rigDtMax = maxOf(g.rigDtMm);
+    m.rigDtMedian = frameGenMedian(g.rigDtMm.data(), g.rigDtMm.size());
     const std::string line = formatFrameGenShadowReport(g.win);
     Log::get().note("%s", line.c_str());
     windowReset();
