@@ -3383,6 +3383,14 @@ int main(int argc, char** argv) {
               "concourse layouts: a fleet carrier's anchor and its bar window");
         check(!cc::concourseAnchorName("SA_Carrier_01_Bridge") && !cc::concourseAnchorName("SA_Carrier_01_Bar"), "concourse anchors: the carrier's bridge and bar are not");
         check(cc::anchorMeansRoomHere(cc::kRoomCarrier, true, true, 53.7f) && !cc::anchorMeansRoomHere(cc::kRoomCarrier, true, true, 1331.0f), "concourse layouts: a carrier's reach takes the bridge");
+        // The bridge is the carrier's live room (Flight 41): the camera inside its record's sphere (r=24.8, 12.3 m at the window), not between the rooms (27.4 m).
+        check(cc::kRoomCarrier.liveRoomName != nullptr && std::strcmp(cc::kRoomCarrier.liveRoomName, "SA_Carrier_01_Bridge") == 0 && cc::concourseAllowName(cc::kRoomCarrier.liveRoomName, nullptr),
+              "concourse layouts: a carrier's live room is its bridge, a name the store sees as allowed");
+        check(cc::insideLiveRoom(cc::kRoomCarrier, true, true, 12.3f, 24.8f) && !cc::insideLiveRoom(cc::kRoomCarrier, true, true, 27.4f, 24.8f), "concourse layouts: at the bridge window, and not between");
+        check(!cc::insideLiveRoom(cc::kRoomCarrier, false, true, 12.3f, 24.8f) && !cc::insideLiveRoom(cc::kRoomCarrier, true, false, 12.3f, 24.8f) && !cc::insideLiveRoom(cc::kRoomCarrier, true, true, 12.3f, 0.0f),
+              "concourse layouts: not known is not inside");
+        check(!cc::insideLiveRoom(cc::kRoomStation, true, true, 1.0f, 24.8f) && !cc::insideLiveRoom(cc::kRoomPort, true, true, 1.0f, 24.8f) && !cc::insideLiveRoom(cc::kRoomOutpost, true, true, 1.0f, 24.8f),
+              "concourse layouts: no other room has one");
         for (const char* n : {"SA_Carrier_01", "SA_Carrier_01_Bar", "SA_Carrier_01_Bridge", "SA_Carrier_01_Bar_WindowShutters0", "SA_Carrier_DoorA0", "PS_FUI_STAT_BigScreen_Carrier_01",
                               "FUI_Panel_4x2_Carrier_010", "RandomDirt_NarrowRightA0", "Narrow_Door_Left_Tech", "Arm_Base0"})
             check(cc::concourseAllowName(n, nullptr), "concourse carrier: the room's own name is on the list");

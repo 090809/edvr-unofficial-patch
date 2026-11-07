@@ -931,11 +931,14 @@ constexpr float kBackdropRadiusDefaultM = 600.0f, kBackdropRadiusMinM = 10.0f, k
 // station: buildings from about 110 m from the hub, the docks past 1100 m, so the sphere the bake is shown on sits nearer. 300 m is a first value, between those.
 // roomReachM: a station's room leaves the store when the lift cuts away, so its anchor being seen says the commander is there; 0 says so. A port's hub stays in the store from the hangar, 503 m off,
 // and the cull came on down there and took the hangar's walls (Flight 36). So there the camera must be near it too: 23 m at the bay, the hub's own radius 42 m, the hangar 503 m.
+// liveRoomName: a room inside the anchor's reach that the bake, taken at the anchor's centre, cannot show: while the camera is inside that record's sphere the cull stands down there and
+// its windows are the game's own. Null: none.
 struct RoomLayout {
     uint32_t bayN;
     float backdropRadiusM;
     const char* name;
     float roomReachM;
+    const char* liveRoomName = nullptr;
 };
 inline constexpr RoomLayout kRoomStation{kBayIndexCount, kBackdropRadiusDefaultM, "a large station's", 0.0f};
 inline constexpr RoomLayout kRoomPort{12u, 300.0f, "a surface port's", 100.0f};
@@ -944,7 +947,9 @@ inline constexpr RoomLayout kRoomPort{12u, 300.0f, "a surface port's", 100.0f};
 inline constexpr RoomLayout kRoomOutpost{30u, 300.0f, "an orbital outpost's", 100.0f};
 // A fleet carrier: the bar's windows are n=30 (99.7% of the view at them), the bridge's n=54 (99.9%), 39 m and 54 m from the anchor. Outside, the carrier's own hull, `MS_` records culled by the
 // list: the core 116 m past the bridge window, the command tower around the rooms, the engines 255 m off. The bridge is inside the 100 m reach; the lift to the hangar cuts 1331 m.
-inline constexpr RoomLayout kRoomCarrier{30u, 300.0f, "a fleet carrier's", 100.0f};
+// The bridge is the live room. Its windows lie 50 m from the bake's centre along the room's +a2, with the command tower (MS_Command_Tower4, kept in the bake, its sphere around the centre) in
+// between, and in them the bake showed a flat grey surface (Flight 41, Sean: "some strange artifacting in the window bake for the command deck").
+inline constexpr RoomLayout kRoomCarrier{30u, 300.0f, "a fleet carrier's", 100.0f, "SA_Carrier_01_Bridge"};
 inline const RoomLayout& roomLayoutOf(const char* anchorName) noexcept {
     if (!anchorName) return kRoomStation;
     if (std::strcmp(anchorName, kPortAnchorName) == 0) return kRoomPort;
@@ -956,6 +961,10 @@ inline const RoomLayout& roomLayoutOf(const char* anchorName) noexcept {
 inline bool anchorMeansRoomHere(const RoomLayout& room, bool cameraKnown, bool anchorRead, float cameraDistM) noexcept {
     if (room.roomReachM <= 0.0f) return true;
     return cameraKnown && anchorRead && std::isfinite(cameraDistM) && cameraDistM <= room.roomReachM;
+}
+// Whether the camera is in the room's live room: inside that record's own sphere. Not known is not inside: the cull goes on as in the rest of the room.
+inline bool insideLiveRoom(const RoomLayout& room, bool cameraKnown, bool liveRead, float cameraDistM, float liveRadiusM) noexcept {
+    return room.liveRoomName != nullptr && cameraKnown && liveRead && std::isfinite(cameraDistM) && std::isfinite(liveRadiusM) && liveRadiusM > 0.0f && cameraDistM <= liveRadiusM;
 }
 constexpr float kBackdropNearZ = 0.025f;       // the game's near plane (reversed infinite Z: view depth = this / z)
 constexpr float kBackdropMinDistM = 5.0f;      // a captured pixel nearer than this along its ray is not backdrop and is not written

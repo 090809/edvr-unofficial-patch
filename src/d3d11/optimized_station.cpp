@@ -287,6 +287,8 @@ std::atomic<uint64_t> g_concAnchorMs{0};      // GetTickCount64() when the store
 std::atomic<uintptr_t> g_concAnchorAddr{0};   // the anchor record, latched by address (re-read with a name check at the tick)
 std::atomic<uintptr_t> g_concHubAddr{0};      // SA_StationHub_Compact, the same way
 std::atomic<bool> g_concHubWanted{false};     // the tick wants the hub's address: the store compares the names of the allowed records until it has it
+std::atomic<uintptr_t> g_concLiveAddr{0};     // the room's live room (cc::RoomLayout::liveRoomName), the same way
+std::atomic<const char*> g_concLiveWanted{nullptr};   // its name while the tick wants its address, else null
 // What the classifier adds to a node's flags: the allow-list (with the extra prefixes) and the anchor name.
 uint32_t concourseNodeFlagsOf(const char* name) noexcept {
     uint32_t f = 0;
@@ -2634,9 +2636,14 @@ void concourseSight(uintptr_t record, uintptr_t node, const NodeInfo& ni) noexce
     if ((ni.flags & sealed::kNodeConcourseAnchor) != 0) {
         g_concAnchorAddr.store(record, std::memory_order_relaxed);
         g_concAnchorMs.store(GetTickCount64(), std::memory_order_relaxed);
-    } else if ((ni.flags & sealed::kNodeConcourseAllow) != 0 && g_concHubWanted.load(std::memory_order_relaxed)) {
+    } else if ((ni.flags & sealed::kNodeConcourseAllow) != 0) {
+        const bool hubWanted = g_concHubWanted.load(std::memory_order_relaxed);
+        const char* liveWanted = g_concLiveWanted.load(std::memory_order_relaxed);
+        if (!hubWanted && !liveWanted) return;
         char hn[64] = {};
-        if (cachedNameOfNode(node, hn, sizeof(hn), &ni.validator) && std::strcmp(hn, cc::kHubName) == 0) g_concHubAddr.store(record, std::memory_order_relaxed);
+        if (!cachedNameOfNode(node, hn, sizeof(hn), &ni.validator)) return;
+        if (hubWanted && std::strcmp(hn, cc::kHubName) == 0) g_concHubAddr.store(record, std::memory_order_relaxed);
+        else if (liveWanted && std::strcmp(hn, liveWanted) == 0) g_concLiveAddr.store(record, std::memory_order_relaxed);
     }
 }
 
@@ -4232,6 +4239,7 @@ void concourseTick(uint64_t now, uint32_t frame) {
             const cc::RoomLayout* layout = &cc::roomLayoutOf(anchorName);
             if (layout != g_concLayout) {
                 g_concLayout = layout;
+                g_concLiveAddr.store(0, std::memory_order_relaxed);
                 Log::get().note("concourse cull: the room is %s (its anchor is %s): the bay window has %u indices, and a bake shows on a sphere of %.0f m unless diag.concourse_backdrop_radius says",
                                 layout->name, anchorName, layout->bayN, static_cast<double>(layout->backdropRadiusM));
             }
@@ -4250,6 +4258,30 @@ void concourseTick(uint64_t now, uint32_t frame) {
             saidAway = true;
             Log::get().note("concourse cull: its anchor is in the store but this is not the room: the camera is %.0f m from it, past %.0f m (camera read %d, anchor read %d)", static_cast<double>(away),
                             static_cast<double>(g_concLayout->roomReachM), g_frameCamValid ? 1 : 0, hubRead ? 1 : 0);
+        }
+    }
+    if (anchor && g_concLayout->liveRoomName != nullptr) {
+        // The room's live room (a carrier's bridge): there the cull stands down, as if out of the room. The bake is kept, for the way back. Said once each time it is entered.
+        static bool saidLive = false;
+        uintptr_t liveAddr = g_concLiveAddr.load(std::memory_order_relaxed);
+        char liveName[64] = {};
+        if (liveAddr != 0 && (!cachedName(liveAddr, liveName, sizeof(liveName)) || std::strcmp(liveName, g_concLayout->liveRoomName) != 0)) {
+            uintptr_t expect = liveAddr;
+            g_concLiveAddr.compare_exchange_strong(expect, 0, std::memory_order_relaxed);
+            liveAddr = 0;
+        }
+        const WorldRead live = liveAddr != 0 ? worldOfRecord(liveAddr) : WorldRead{};
+        const bool liveRead = live.source != 4;
+        const float liveAway = liveRead && g_frameCamValid ? sealed::distance(live.world, g_frameCam) : 0.0f;
+        if (cc::insideLiveRoom(*g_concLayout, g_frameCamValid, liveRead, liveAway, live.radius)) {
+            anchor = false;
+            if (!saidLive) {
+                saidLive = true;
+                Log::get().note("concourse cull: the camera is in %s, %.0f m from its centre (its radius %.0f m): the cull stands down there and its windows are the game's own",
+                                g_concLayout->liveRoomName, static_cast<double>(liveAway), static_cast<double>(live.radius));
+            }
+        } else {
+            saidLive = false;
         }
     }
     const bool gateWanted = armed && social && !sealedNow;
@@ -4526,6 +4558,8 @@ void concourseTick(uint64_t now, uint32_t frame) {
     concoursePaneSetFeed(feed);
     g_concWanted.store(gateWanted || liftOn || lookOn, std::memory_order_release);   // the lift opens the store route in the hangar too (it is not social space there)
     g_concHubWanted.store(gateWanted && g_concLayout == &cc::kRoomStation && g_concHubAddr.load(std::memory_order_relaxed) == 0, std::memory_order_relaxed);   // a port's hub is its anchor
+    g_concLiveWanted.store(gateWanted && g_concLayout->liveRoomName != nullptr && g_concLiveAddr.load(std::memory_order_relaxed) == 0 ? g_concLayout->liveRoomName : nullptr,
+                           std::memory_order_relaxed);
     const bool transitioned = active != g_concWasActive;
     if (transitioned) {
         if (active) {
