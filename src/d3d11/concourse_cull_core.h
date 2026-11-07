@@ -31,8 +31,9 @@ constexpr const char* kAnchorName = "Standard_SocialArea";
 constexpr const char* kHubName = "SA_StationHub_Compact";
 
 // The name prefixes that are the room. Exact case.
+// Root and Perturbator are the room's too: off this list they stayed only while within kCloseDistanceM, so the bar's tables popped in and flickered at that distance (Flight 31).
 constexpr const char* kAllowPrefixes[] = {"Standard_SocialArea", "SA_",         "PS_",        "STAT_", "FUI_",        "PROP_",
-                                          "GUI_Interactive",     "Interactive_", "TP_",         "HangarLobby", "TurboLift"};
+                                          "GUI_Interactive",     "Interactive_", "TP_",         "HangarLobby", "TurboLift", "Root", "Perturbator"};
 constexpr size_t kAllowPrefixCount = sizeof(kAllowPrefixes) / sizeof(kAllowPrefixes[0]);
 
 inline bool hasPrefixExact(const char* name, const char* prefix, size_t n) noexcept { return n > 0 && std::strncmp(name, prefix, n) == 0; }
@@ -611,6 +612,14 @@ inline const char* camTestModeName(uint32_t m) noexcept {
         default: return "off";
     }
 }
+// TEMPORARY (hotkey.concourse_light_test, docs\concourse-cull-2026-11-05.md "Flight 31 results"): what lights the room, by pixel shader, the first 32 bits. Each press leaves one out while
+// the cull is on: the sun's quad, the light volumes, the half-size chain's composite and the additive quads after it, as a census of the room lists them. Step 0 leaves nothing out.
+constexpr uint32_t kLightTestPs[] = {0x7CECABDEu, 0xC6E6E419u, 0x50364C9Du, 0x3D8442D2u, 0xAC3CE66Fu, 0x81812EF9u, 0x70E6FCA6u, 0x2DB678B6u,
+                                     0xB98B140Fu, 0x1F64463Bu, 0x37649F54u, 0xDFCBA0ECu, 0x5BCB6B95u, 0x97DBC87Fu, 0xD56F859Bu};
+constexpr uint32_t kLightTestSteps = static_cast<uint32_t>(sizeof(kLightTestPs) / sizeof(kLightTestPs[0])) + 1;
+inline uint32_t lightTestNext(uint32_t step) noexcept { return (step + 1) % kLightTestSteps; }
+inline uint32_t lightTestPsAt(uint32_t step) noexcept { return step == 0 || step >= kLightTestSteps ? 0u : kLightTestPs[step - 1]; }
+
 // The bake's plan (TEMPORARY): one tick a frame, each aiming at the next direction not yet captured, going round until every one has reached the resolve. A write takes about 4 frames to
 // reach it (Flight 25: the first capture 51 ms after the first write), by which time the room's rigs have gone, so no frame waits for them. It is the captures that end the bake, not the
 // count of frames: Flight 28's first two frames with the near plane raised took the flat copy route and never reached the resolve, and an open loop left those two directions out.

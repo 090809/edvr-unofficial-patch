@@ -4046,6 +4046,11 @@ int main(int argc, char** argv) {
                     check(cc::windowClearPercent(20.0f, 10) == 100.0f, "window distance: the share stops at the whole view");
                 }
                 {
+                    check(cc::concourseAllowName("Root", nullptr) && cc::concourseAllowName("Perturbator", nullptr) && !cc::concourseAllowName("Floor07", nullptr), "the keep list: the bar's tables are on it, and the station's floors are not");
+                    check(cc::lightTestPsAt(0) == 0 && cc::lightTestPsAt(1) == 0x7CECABDEu && cc::lightTestPsAt(cc::kLightTestSteps - 1) == 0xD56F859Bu && cc::lightTestPsAt(cc::kLightTestSteps) == 0, "the light test: step 0 leaves nothing out, and each step after it one");
+                    check(cc::lightTestNext(cc::kLightTestSteps - 1) == 0 && cc::lightTestNext(0) == 1, "the light test: it goes round, back to all on");
+                }
+                {
                     // The station's type from the journal (journal_station.h), in the shape of real lines.
                     namespace js = edvr::journal_station;
                     using K = js::Kind;

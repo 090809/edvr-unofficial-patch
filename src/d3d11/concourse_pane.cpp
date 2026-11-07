@@ -227,6 +227,11 @@ double g_missPixels = 0.0;                          // the viewport area of the 
 std::atomic<float> g_missShare{0.0f};               // the tick's result: the share of the viewport missing over the last kMissWindowFrames frames
 Hotkey* g_keyParallax = nullptr;
 std::string g_keyParallaxText;
+Hotkey* g_keyLightTest = nullptr;                // TEMPORARY: hotkey.concourse_light_test
+std::string g_keyLightTestText;
+uint32_t g_lightTestStep = 0;
+std::atomic<uint32_t> g_lightTestPs{0};          // the pixel shader left out, its first 32 bits; 0 is none
+std::atomic<uint64_t> g_lightTestHits{0};        // draws left out since the last press: 0 says the step matched nothing
 std::string g_radiusAppliedText;
 bool g_radiusTextSeen = false;// The toast, one slot: the newest text wins (hotkey changes of the mode, the capture's result). The tick's thread writes it and menuTick takes it.
 std::mutex g_toastMutex;
@@ -2181,6 +2186,13 @@ void ConcoursePaneScope::begin(ID3D11DeviceContext* ctx, UINT indexCount, UINT s
     const bool sealedOn = g_withholdSealedNow.load(std::memory_order_relaxed);
     const bool washOff = g_washOffNow.load(std::memory_order_relaxed);
     if (cullOn || sealedOn || washOff) {
+        // TEMPORARY (hotkey.concourse_light_test): one of the room's lights left out, to name what blows out the lift bank.
+        const uint32_t lightTest = g_lightTestPs.load(std::memory_order_relaxed);
+        if (lightTest != 0 && static_cast<uint32_t>(ps >> 32) == lightTest) {
+            withheld_ = true;
+            g_lightTestHits.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
         // The outside (smoke, trails, ship lasers, the planet) is not issued while the cull is on. By pixel shader on any context; by vertex shader too on the
         // immediate one, because a terrain patch has no pixel shader. Checked before `if (!ps) return`.
         int fam = cc::withheldPsIndex(ps);
@@ -2844,6 +2856,7 @@ void pollConfig(uint64_t nowMs) {
     bindKey(g_keyCapture, g_keyCaptureText, Config::get().getString("hotkey.concourse_pane_capture", ""), "hotkey.concourse_pane_capture", "capture key");
     bindKey(g_keyMode, g_keyModeText, Config::get().getString("hotkey.concourse_pane_mode", ""), "hotkey.concourse_pane_mode", "mode key");
     bindKey(g_keyParallax, g_keyParallaxText, Config::get().getString("hotkey.concourse_backdrop_parallax", ""), "hotkey.concourse_backdrop_parallax", "backdrop distance key");
+    bindKey(g_keyLightTest, g_keyLightTestText, Config::get().getString("hotkey.concourse_light_test", ""), "hotkey.concourse_light_test", "light test key");
     g_keysBound = true;
     const std::string modeT = Config::get().getString("diag.concourse_pane_mode", "mirror-steady");
     if (!g_modeTextSeen || modeT != g_modeAppliedText) {
@@ -3589,6 +3602,17 @@ void concoursePaneTick(ID3D11Device* device, uint32_t frame, uint64_t nowMs) noe
         g_bdParallax.store(next, std::memory_order_relaxed);
         Log::get().note("concourse backdrop: distance mode %s, radius %.0f m (hotkey.concourse_backdrop_parallax)", cc::parallaxName(next), static_cast<double>(g_bdRadius.load(std::memory_order_relaxed)));
         queueToast(next == cc::kParallaxNone ? "Windows: distance off" : next == cc::kParallaxSphere ? "Windows: distance by sphere" : "Windows: distance by depth");
+    }
+    if (g_keyLightTest && g_keyLightTest->pressed()) {
+        const unsigned long long hits = static_cast<unsigned long long>(g_lightTestHits.exchange(0, std::memory_order_relaxed));
+        g_lightTestStep = cc::lightTestNext(g_lightTestStep);
+        const uint32_t ps = cc::lightTestPsAt(g_lightTestStep);
+        g_lightTestPs.store(ps, std::memory_order_relaxed);
+        char text[64];
+        if (ps != 0) std::snprintf(text, sizeof(text), "Light test %u of %u: %08X off", g_lightTestStep, cc::kLightTestSteps - 1, ps);
+        else std::snprintf(text, sizeof(text), "Light test: all on");
+        Log::get().note("concourse light test: %s (the step before left out %llu draws; 0 says it matched nothing)", text, hits);
+        queueToast(text);
     }
     if (g_keyCapture && g_keyCapture->pressed()) {
         g_surveyRequested.store(true, std::memory_order_relaxed);

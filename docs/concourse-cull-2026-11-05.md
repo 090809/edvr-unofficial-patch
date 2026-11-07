@@ -45,7 +45,7 @@
 - **Hangar to concourse and back (Sean, 2026-11-06):** steps 1 to 3 built, not flown; the seal on foot waits on the survey's numbers. See the section of that name at the end.
 - **Ruled out:** see the section of that name. **Issues:** none yet.
 - **Answered by Flight 20:** H47 yes: the game writes this camera every frame before `0x1EA9C0` (284 of 284 held writes overwritten), so a write need not be put back.
-- **Next flight:** not a build yet: two screenshots and F3 at each spot on 0448d071, in "Flight 31 results". The names `Root` and `Perturbator` go on the allow-list in the next build. `fix.station_window_distance` is meant to stay. `diag.concourse_cull` now defaults to `auto`, and the keys below are temporary overrides, to be proposed for removal, quoted, when the arc closes. Keys: `hotkey.concourse_camera_test` Insert in both Steam inis (F10 is Elite's screenshot key, and F11 is the photo camera in Sean's bindings); `diag.concourse_glass` in `edvr-flat.ini`; `hotkey.concourse_backdrop_parallax` F9 in both Steam inis; `diag.concourse_backdrop_radius`; `hotkey.concourse_view_test` F6 in both Steam inis; `hotkey.concourse_cull` F2, `hotkey.concourse_pane_capture` F3, `hotkey.concourse_pane_mode` F4 in both Steam inis, `diag.concourse_glow` in `edvr-flat.ini`, and `log.max_mb = 200` there for these flights only (two censuses filled the default). Keys in both Steam inis: `hotkey.concourse_cull` F2 (the cull and the mirrors), `hotkey.concourse_pane_capture` F3 (logs a ranking by screen coverage and the kept names, changes nothing), `hotkey.concourse_pane_mode` F4.
+- **Next flight:** Flight 32, `hotkey.concourse_light_test` at the lift bank; the list is in its section. `Root` and `Perturbator` are on the allow-list in that build. New temporary key: `hotkey.concourse_light_test`. `fix.station_window_distance` is meant to stay. `diag.concourse_cull` now defaults to `auto`, and the keys below are temporary overrides, to be proposed for removal, quoted, when the arc closes. Keys: `hotkey.concourse_camera_test` Insert in both Steam inis (F10 is Elite's screenshot key, and F11 is the photo camera in Sean's bindings); `diag.concourse_glass` in `edvr-flat.ini`; `hotkey.concourse_backdrop_parallax` F9 in both Steam inis; `diag.concourse_backdrop_radius`; `hotkey.concourse_view_test` F6 in both Steam inis; `hotkey.concourse_cull` F2, `hotkey.concourse_pane_capture` F3, `hotkey.concourse_pane_mode` F4 in both Steam inis, `diag.concourse_glow` in `edvr-flat.ini`, and `log.max_mb = 200` there for these flights only (two censuses filled the default). Keys in both Steam inis: `hotkey.concourse_cull` F2 (the cull and the mirrors), `hotkey.concourse_pane_capture` F3 (logs a ranking by screen coverage and the kept names, changes nothing), `hotkey.concourse_pane_mode` F4.
 
 ## What the earlier attempt learned
 
@@ -572,6 +572,27 @@ Build 0448d071, flat, Steam, 3840x2160, log `edvr_gfx_20261107_105506`, NumLocks
 - ruled out: `Perturbator`, because the key now keeps it everywhere and the light still goes a few metres in.
 - **Not known yet:** whether it is a draw, shading that depends on where the camera stands, or exposure. The camera moved only about 3 m between the censuses, so a line that sharp is unlikely to be exposure settling, but the censuses were only 4 s apart.
 - **Next, no build:** at the lift bank and a few metres in, the same way round: a screenshot and F3 at each. F3 ranks the blended draws by screen coverage, and a screenshot pair says whether the room's lit surfaces or a haze over everything changed.
+
+**The screenshots and F3, log `edvr_gfx_20261107_110953`,** at cam_local 6.0 21.7 -17.5 (11:12:41) and 4.7 22.2 -14.5 (11:12:55):
+
+- **It is light on the room's surfaces.** At the lift bank the walls are pale and flat, with the shadows under the balconies filled in; a few metres in they are deep and warm. The windows keep their deep blue in both. An exposure change or a veil over the finished frame would lift the windows too, and the glass is drawn after the deferred lights. INFERRED from the pictures.
+- ruled out: exposure and any fullscreen draw after the glass, because the windows do not change (by eye).
+- **F3 does not name it.** The same draws lead at both spots, with their coverage moving as the view does: `A1B7CFCD/2DB678B6` about 600 percent (108 instances), `A7339D1F/37649F54` 78 to 93, `0357BBB2/70E6FCA6` 78 to 70, `24DE25E4/3D8442D2` 75 to 58. The volumes are instanced (the census's `i=`), up to 3194 lights in one family, so one light's constants cannot be seen from outside.
+- The kept records are the same on both sides of the line, so the cull's judgement does not move it: the light is there or not by where the camera stands, and with the cull off it is there everywhere. Why is not known.
+
+**Next, Flight 32:** a key that leaves out one light family a press while the cull is on, the families being the ones a census of the room lists.
+
+## Flight 32, the list as written
+
+Flat, Steam, no other keys. `hotkey.concourse_light_test` is `HOME` in both Steam inis.
+
+1. Stand at the lift bank where it is blown out, and look at the same wall. Press HOME, wait a second, and watch the wall. A toast says `Light test N of 15: XXXXXXXX off`.
+2. Go through all 15. Which step takes the pale look away, leaving the room lit as it is further in? Note the eight digits. Others will darken things in their own ways: that is fine, and it is useful to know which.
+3. Do the same a few metres in, for that step only: does it change anything there?
+
+Then: `python tools\edvr_log.py --target steam --grep "concourse light test"`. Each line says how many draws the step before left out; 0 says a step matched nothing, and that it proves nothing.
+
+What it would say if no step takes it away: the light is in a family's constants before its draw, or in a draw not on the list, and the next step is to dump one family's instance data.
 
 ## Flight 31, the list as written
 
