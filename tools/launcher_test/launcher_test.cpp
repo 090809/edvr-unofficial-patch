@@ -1103,22 +1103,32 @@ void testUpdater() {
         gone.replies[std::string(kDownloads) + "relA/ed-up-manifest.json.sig"] = failing(503);
         check(up3.check().outcome == UpdateOutcome::Skipped, "a .sig that fails with a server error is skipped");
 
+        // The manifest of A with the signature of B, and no digest to tell them apart, so the
+        // signature alone has to catch it.
         ScriptedHttp badSig;
-        badSig.replies[latestUrl()] = ok(releaseJson(a));
+        badSig.replies[latestUrl()] = ok(releaseJson(a, [] { ApiOptions o; o.digests = false; return o; }()));
         serveRelease(&badSig, a);
-        // The manifest of A with the signature of B.
         badSig.replies[std::string(kDownloads) + "relA/ed-up-manifest.json.sig"] = ok(b.sigText);
         Updater up4(badSig, settingsFor(fresh("up5d")));
         const UpdateCheck c4 = up4.check();
         check(c4.outcome == UpdateOutcome::Refused, "a signature of another manifest is refused: " + c4.message);
-        // GitHub's digest catches a swapped manifest before the signature does.
+        // A download that differs from GitHub's own listing is its cache serving an older copy after
+        // a re-cut: seen on the first test release. Nothing is offered, and it is no verdict on the
+        // release, so the next check looks again.
+        ScriptedHttp staleSig;
+        staleSig.replies[latestUrl()] = ok(releaseJson(a));
+        serveRelease(&staleSig, a);
+        staleSig.replies[std::string(kDownloads) + "relA/ed-up-manifest.json.sig"] = ok(b.sigText);
+        Updater upStaleSig(staleSig, settingsFor(fresh("up5s")));
+        const UpdateCheck cStaleSig = upStaleSig.check();
+        check(cStaleSig.outcome == UpdateOutcome::Skipped && contains(cStaleSig.message, "older copy of the signature"), "a stale signature skips the check: " + cStaleSig.message);
         ScriptedHttp swapped;
         swapped.replies[latestUrl()] = ok(releaseJson(a));
         serveRelease(&swapped, a);
         swapped.replies[std::string(kDownloads) + "relA/ed-up-manifest.json"] = ok(b.manifestBytes);
         Updater up5(swapped, settingsFor(fresh("up5e")));
         const UpdateCheck c5 = up5.check();
-        check(c5.outcome == UpdateOutcome::Refused && contains(c5.message, "digest"), "a manifest that is not the one GitHub lists is refused: " + c5.message);
+        check(c5.outcome == UpdateOutcome::Skipped && contains(c5.message, "older copy of the manifest"), "a manifest that is not the one GitHub lists skips the check: " + c5.message);
         // Without a digest the signature alone refuses a flipped byte.
         std::string flipped = a.manifestBytes;
         flipped[flipped.find("1794000000") + 9] = '1';

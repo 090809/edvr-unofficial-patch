@@ -210,7 +210,6 @@ UpdateCheck Updater::check() {
     auto fetchSmall = [&](const ReleaseAsset& asset, std::string* bytes, UpdateCheck* failure) {
         HttpRequest req;
         req.url = asset.url;
-        req.headers = {{"Accept", "application/octet-stream"}};
         req.maxBytes = kMaxSmallAssetBytes;
         const HttpResponse r = http_.get(req);
         if (!r.transportOk) {
@@ -230,10 +229,14 @@ UpdateCheck Updater::check() {
     std::string manifestBytes, signatureText;
     if (!fetchSmall(manifestAsset, &manifestBytes, &result)) return result;
     if (!fetchSmall(signatureAsset, &signatureText, &result)) return result;
+    // A file that differs from GitHub's own listing is not a verdict on the release. After an asset
+    // is replaced, as a re-cut does, GitHub's download cache serves the old bytes for some minutes
+    // while the API already lists the new ones (seen on the 2026-11-07 test release). Nothing is
+    // offered, and the next check looks again; only the signature can refuse a release.
     if (!manifestAsset.digest.empty() && sha256Bytes(manifestBytes.data(), manifestBytes.size()) != manifestAsset.digest)
-        return outcomeOnly(UpdateOutcome::Refused, "the manifest does not match the digest GitHub lists for it");
+        return outcomeOnly(UpdateOutcome::Skipped, "GitHub is still serving an older copy of the manifest, so the update check was skipped");
     if (!signatureAsset.digest.empty() && sha256Bytes(signatureText.data(), signatureText.size()) != signatureAsset.digest)
-        return outcomeOnly(UpdateOutcome::Refused, "the signature does not match the digest GitHub lists for it");
+        return outcomeOnly(UpdateOutcome::Skipped, "GitHub is still serving an older copy of the signature, so the update check was skipped");
 
     Manifest manifest;
     std::string why;
@@ -285,7 +288,6 @@ bool Updater::downloadUpdate(const UpdateCheck& check, const std::atomic<bool>* 
         }
         HttpRequest request;
         request.url = listed->url;
-        request.headers = {{"Accept", "application/octet-stream"}};
         request.toFile = destination;
         request.maxBytes = asset.size;
         request.cancel = cancel;
