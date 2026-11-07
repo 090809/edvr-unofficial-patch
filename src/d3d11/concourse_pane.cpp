@@ -230,7 +230,7 @@ std::string g_keyParallaxText;
 Hotkey* g_keyLightTest = nullptr;                // TEMPORARY: hotkey.concourse_light_test
 std::string g_keyLightTestText;
 uint32_t g_lightTestStep = 0;
-std::atomic<uint32_t> g_lightTestPs{0};          // the pixel shader left out, its first 32 bits; 0 is none
+std::atomic<uint64_t> g_lightTestPs{0};          // the pixel shader left out; 0 is none
 std::atomic<uint64_t> g_lightTestHits{0};        // draws left out since the last press: 0 says the step matched nothing
 std::string g_radiusAppliedText;
 bool g_radiusTextSeen = false;// The toast, one slot: the newest text wins (hotkey changes of the mode, the capture's result). The tick's thread writes it and menuTick takes it.
@@ -2187,8 +2187,8 @@ void ConcoursePaneScope::begin(ID3D11DeviceContext* ctx, UINT indexCount, UINT s
     const bool washOff = g_washOffNow.load(std::memory_order_relaxed);
     if (cullOn || sealedOn || washOff) {
         // TEMPORARY (hotkey.concourse_light_test): one of the room's lights left out, to name what blows out the lift bank.
-        const uint32_t lightTest = g_lightTestPs.load(std::memory_order_relaxed);
-        if (lightTest != 0 && static_cast<uint32_t>(ps >> 32) == lightTest) {
+        const uint64_t lightTest = g_lightTestPs.load(std::memory_order_relaxed);
+        if (lightTest != 0 && cc::lightTestLeavesOut(lightTest, ps)) {
             withheld_ = true;
             g_lightTestHits.fetch_add(1, std::memory_order_relaxed);
             return;
@@ -3606,10 +3606,11 @@ void concoursePaneTick(ID3D11Device* device, uint32_t frame, uint64_t nowMs) noe
     if (g_keyLightTest && g_keyLightTest->pressed()) {
         const unsigned long long hits = static_cast<unsigned long long>(g_lightTestHits.exchange(0, std::memory_order_relaxed));
         g_lightTestStep = cc::lightTestNext(g_lightTestStep);
-        const uint32_t ps = cc::lightTestPsAt(g_lightTestStep);
+        const uint64_t ps = cc::lightTestShaderAt(g_lightTestStep);
         g_lightTestPs.store(ps, std::memory_order_relaxed);
         char text[64];
-        if (ps != 0) std::snprintf(text, sizeof(text), "Light test %u of %u: %08X off", g_lightTestStep, cc::kLightTestSteps - 1, ps);
+        if (ps == cc::kLightTestAllLights) std::snprintf(text, sizeof(text), "Light test %u of %u: every light off", g_lightTestStep, cc::kLightTestSteps - 1);
+        else if (ps != 0) std::snprintf(text, sizeof(text), "Light test %u of %u: %08X off", g_lightTestStep, cc::kLightTestSteps - 1, static_cast<unsigned>(ps >> 32));
         else std::snprintf(text, sizeof(text), "Light test: all on");
         Log::get().note("concourse light test: %s (the step before left out %llu draws; 0 says it matched nothing)", text, hits);
         queueToast(text);

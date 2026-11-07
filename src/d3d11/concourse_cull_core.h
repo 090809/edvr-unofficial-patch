@@ -612,13 +612,26 @@ inline const char* camTestModeName(uint32_t m) noexcept {
         default: return "off";
     }
 }
-// TEMPORARY (hotkey.concourse_light_test, docs\concourse-cull-2026-11-05.md "Flight 31 results"): what lights the room, by pixel shader, the first 32 bits. Each press leaves one out while
-// the cull is on: the sun's quad, the light volumes, the half-size chain's composite and the additive quads after it, as a census of the room lists them. Step 0 leaves nothing out.
-constexpr uint32_t kLightTestPs[] = {0x7CECABDEu, 0xC6E6E419u, 0x50364C9Du, 0x3D8442D2u, 0xAC3CE66Fu, 0x81812EF9u, 0x70E6FCA6u, 0x2DB678B6u,
-                                     0xB98B140Fu, 0x1F64463Bu, 0x37649F54u, 0xDFCBA0ECu, 0x5BCB6B95u, 0x97DBC87Fu, 0xD56F859Bu};
-constexpr uint32_t kLightTestSteps = static_cast<uint32_t>(sizeof(kLightTestPs) / sizeof(kLightTestPs[0])) + 1;
+// TEMPORARY (hotkey.concourse_light_test, docs\concourse-cull-2026-11-05.md "Flight 32 results"): what lays light on the room, by pixel shader. Each press leaves one out while the cull is
+// on. Flight 32 left out the sun's quad and each light volume in turn and none was it; these are the rest of a census of the room from the sun on, what is drawn before the glass first. The
+// last step, kLightTestAllLights, leaves out all the lights together, to say whether the look is in them at all. Step 0 leaves nothing out.
+constexpr uint64_t kLightTestAllLights = ~0ull;
+constexpr uint64_t kLightTestLights[] = {0x7CECABDE34FFBE9Eull, 0xC6E6E419DA9F6FADull, 0x50364C9D994141D5ull, 0x3D8442D2FC1DCADDull, 0xAC3CE66FBAF0FA9Aull, 0x81812EF97FB4A361ull,
+                                         0x70E6FCA6CF692D2Aull, 0x2DB678B6B558B604ull, 0xB98B140FC83B4448ull, 0x1F64463B15189104ull, 0x37649F54AD53319Cull};
+constexpr uint64_t kLightTestShaders[] = {0x2519C9050946D545ull, 0x92FF8499ED345759ull, 0x095030F27D2C362Aull, 0xC5A5C7E8216CB9AFull, 0x8DEF46452FA459F5ull, 0x98337732C955AD01ull,
+                                          0x098C0764D28FC42Cull, 0x84965D3C050FB01Bull, 0x06332CA168B6DA63ull, 0x87EF79B19297B8C4ull, 0xFCFAD73924BF45B9ull, 0x057F8E2778A5AAEDull,
+                                          0x7AA0441EE0E88667ull, 0x1AE6AB9A94C0456Eull, 0x66B08F89E4926C01ull, 0xAFED1D4B087E18A9ull, 0xB2DE0A41A4C2B4F5ull, 0x067CBE05E7EF7F32ull,
+                                          0xAD050E528C0E8B17ull, 0x0A80DFD89B15A05Bull, 0xCC4E0188DB8E7300ull, 0xCCDB2A91490F8755ull, 0x68ABCB9FEF6CA66Cull, 0x2C3CB8F06C1CA6BCull,
+                                          0xDB899F4BD577F2E5ull, 0x0146ABCC53240479ull, 0x25D5F73A4616093Bull, kLightTestAllLights};
+constexpr uint32_t kLightTestSteps = static_cast<uint32_t>(sizeof(kLightTestShaders) / sizeof(kLightTestShaders[0])) + 1;
 inline uint32_t lightTestNext(uint32_t step) noexcept { return (step + 1) % kLightTestSteps; }
-inline uint32_t lightTestPsAt(uint32_t step) noexcept { return step == 0 || step >= kLightTestSteps ? 0u : kLightTestPs[step - 1]; }
+inline uint64_t lightTestShaderAt(uint32_t step) noexcept { return step == 0 || step >= kLightTestSteps ? 0ull : kLightTestShaders[step - 1]; }
+inline bool lightTestLeavesOut(uint64_t test, uint64_t ps) noexcept {
+    if (test != kLightTestAllLights) return test != 0 && test == ps;
+    for (uint64_t light : kLightTestLights)
+        if (light == ps) return true;
+    return false;
+}
 
 // The bake's plan (TEMPORARY): one tick a frame, each aiming at the next direction not yet captured, going round until every one has reached the resolve. A write takes about 4 frames to
 // reach it (Flight 25: the first capture 51 ms after the first write), by which time the room's rigs have gone, so no frame waits for them. It is the captures that end the bake, not the

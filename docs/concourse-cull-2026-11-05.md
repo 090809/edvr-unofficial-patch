@@ -45,7 +45,7 @@
 - **Hangar to concourse and back (Sean, 2026-11-06):** steps 1 to 3 built, not flown; the seal on foot waits on the survey's numbers. See the section of that name at the end.
 - **Ruled out:** see the section of that name. **Issues:** none yet.
 - **Answered by Flight 20:** H47 yes: the game writes this camera every frame before `0x1EA9C0` (284 of 284 held writes overwritten), so a write need not be put back.
-- **Next flight:** Flight 32, on c32cd19b, `hotkey.concourse_light_test` at the lift bank; the list is in its section. `Root` and `Perturbator` are on the allow-list in that build. New temporary key: `hotkey.concourse_light_test`. `fix.station_window_distance` is meant to stay. `diag.concourse_cull` now defaults to `auto`, and the keys below are temporary overrides, to be proposed for removal, quoted, when the arc closes. Keys: `hotkey.concourse_camera_test` Insert in both Steam inis (F10 is Elite's screenshot key, and F11 is the photo camera in Sean's bindings); `diag.concourse_glass` in `edvr-flat.ini`; `hotkey.concourse_backdrop_parallax` F9 in both Steam inis; `diag.concourse_backdrop_radius`; `hotkey.concourse_view_test` F6 in both Steam inis; `hotkey.concourse_cull` F2, `hotkey.concourse_pane_capture` F3, `hotkey.concourse_pane_mode` F4 in both Steam inis, `diag.concourse_glow` in `edvr-flat.ini`, and `log.max_mb = 200` there for these flights only (two censuses filled the default). Keys in both Steam inis: `hotkey.concourse_cull` F2 (the cull and the mirrors), `hotkey.concourse_pane_capture` F3 (logs a ranking by screen coverage and the kept names, changes nothing), `hotkey.concourse_pane_mode` F4.
+- **Next flight:** Flight 33, `hotkey.concourse_light_test` at the lift bank with its wider list; the list is in its section. Flight 32 flown on c32cd19b, log `edvr_gfx_20261107_113241`: no one light family is it. `Root` and `Perturbator` are on the allow-list in that build. New temporary key: `hotkey.concourse_light_test`. `fix.station_window_distance` is meant to stay. `diag.concourse_cull` now defaults to `auto`, and the keys below are temporary overrides, to be proposed for removal, quoted, when the arc closes. Keys: `hotkey.concourse_camera_test` Insert in both Steam inis (F10 is Elite's screenshot key, and F11 is the photo camera in Sean's bindings); `diag.concourse_glass` in `edvr-flat.ini`; `hotkey.concourse_backdrop_parallax` F9 in both Steam inis; `diag.concourse_backdrop_radius`; `hotkey.concourse_view_test` F6 in both Steam inis; `hotkey.concourse_cull` F2, `hotkey.concourse_pane_capture` F3, `hotkey.concourse_pane_mode` F4 in both Steam inis, `diag.concourse_glow` in `edvr-flat.ini`, and `log.max_mb = 200` there for these flights only (two censuses filled the default). Keys in both Steam inis: `hotkey.concourse_cull` F2 (the cull and the mirrors), `hotkey.concourse_pane_capture` F3 (logs a ranking by screen coverage and the kept names, changes nothing), `hotkey.concourse_pane_mode` F4.
 
 ## What the earlier attempt learned
 
@@ -581,6 +581,29 @@ Build 0448d071, flat, Steam, 3840x2160, log `edvr_gfx_20261107_105506`, NumLocks
 - The kept records are the same on both sides of the line, so the cull's judgement does not move it: the light is there or not by where the camera stands, and with the cull off it is there everywhere. Why is not known.
 
 **Next, Flight 32:** a key that leaves out one light family a press while the cull is on, the families being the ones a census of the room lists.
+
+## Flight 33, the list as written
+
+Flat, Steam, HOME as before, now 28 steps. The order puts first what is drawn before the glass.
+
+1. At the lift bank, the same wall: press HOME and wait a second each time. Which step takes the pale look away? `2519C905` and `92FF8499`, the first two, are the room's glow cones and their sprites, the leading suspects. Some later steps will wreck the picture, such as the tone-side draws; that is fine, and HOME moves on.
+2. The last step turns every light off together. Is the pale look still there on an unlit room?
+3. A few metres in, the step that did it: what does it change there?
+
+Then: `python tools\edvr_log.py --target steam --grep "concourse light test"`, with the build's hash.
+
+What each answer means: a glow step means the veil is additive sprites over the room, and the next question is which instance, since the room's own lamps share the family. Still pale with every light off means it is laid down in the material pass or the sky before the lights, which this key cannot reach, and the next step reads the material pass's constants.
+
+## Flight 32 results
+
+Build c32cd19b, flat, Steam, log `edvr_gfx_20261107_113241`. Sean: "Tested it, none of those turned the light off". He stepped all 15 at the lift bank (cam_local 6.0 21.7 -17.5) and 9 of them further in.
+
+- **Each step acted.** The log counts 54 to 402 draws left out per step while he held it.
+- ruled out: any one light family alone (the sun's quad, the eleven volumes), and the half-size chain's composite `DFCBA0EC`. `5BCB6B95`, `97DBC87F` and `D56F859B` turned out to be on the withheld list already (the atmosphere quads and the flares), so those three steps said nothing.
+- **A correction to the windows.** Measured on the screenshots, the darks are lifted strongly: luma percentiles 1, 10, 50, 90, 99 go 35, 64, 116, 196, 236 inside and 60, 97, 153, 207, 247 at the lift bank, so the highs barely move. That is the shape of something added, not a gain. The windows' deep blue stays about the same, and the black reveal around them does not: it goes grey-green. So what is added comes before the windows' own draws, which is what the `ruled out: exposure` above rests on.
+- **Where the list stops.** The frame's order from the sun on is: lights, the half-size chain, sky, stars, the first-person draws, `DFCBA0EC`, dust, particles, then about 100 draws of the room's own glows, `1C506222/2519C905` (384 indices, additive, depth-tested) and `359BF8FF/92FF8499`, then the glass from `#18276`. F3 never measured the glows: it stops at 1024 draws, and the frame has about 4300.
+- **The clip (8.6 s, panning at the lift bank).** The near walls and pipes keep their full contrast, and what is further off goes pale in the same frame, more with distance. So it grows with depth, like fog, and is not a lamp on a nearby surface. Sean's Flight 6 note says the same: "the far ceiling is paler than the near beams". The scatter, the one known depth wash, was withheld on every frame at these spots.
+- **Why the glows lead.** They are additive and come before the glass. They are on the far-limited list, so with the cull on their far pixels are dropped, and with the cull off they are not, which fits "everywhere" with the cull off. A cone the camera is inside covers the whole screen, which would fit a sharp line a few metres wide. INFERRED, and what Flight 33's first step tests.
 
 ## Flight 32, the list as written
 

@@ -4047,7 +4047,10 @@ int main(int argc, char** argv) {
                 }
                 {
                     check(cc::concourseAllowName("Root", nullptr) && cc::concourseAllowName("Perturbator", nullptr) && !cc::concourseAllowName("Floor07", nullptr), "the keep list: the bar's tables are on it, and the station's floors are not");
-                    check(cc::lightTestPsAt(0) == 0 && cc::lightTestPsAt(1) == 0x7CECABDEu && cc::lightTestPsAt(cc::kLightTestSteps - 1) == 0xD56F859Bu && cc::lightTestPsAt(cc::kLightTestSteps) == 0, "the light test: step 0 leaves nothing out, and each step after it one");
+                    const uint64_t cone = 0x2519C9050946D545ull, sun = 0x7CECABDE34FFBE9Eull, lastLight = 0x37649F54AD53319Cull;
+                    check(cc::lightTestShaderAt(0) == 0 && cc::lightTestShaderAt(1) == cone && cc::lightTestShaderAt(cc::kLightTestSteps - 1) == cc::kLightTestAllLights && cc::lightTestShaderAt(cc::kLightTestSteps) == 0, "the light test: step 0 leaves nothing out, and each step after it one");
+                    check(cc::lightTestLeavesOut(cone, cone) && !cc::lightTestLeavesOut(cone, sun) && !cc::lightTestLeavesOut(0, 0), "the light test: one step leaves out its own shader and nothing else, and step 0 nothing");
+                    check(cc::lightTestLeavesOut(cc::kLightTestAllLights, sun) && cc::lightTestLeavesOut(cc::kLightTestAllLights, lastLight) && !cc::lightTestLeavesOut(cc::kLightTestAllLights, cone), "the light test: the last step leaves out every light and only those");
                     check(cc::lightTestNext(cc::kLightTestSteps - 1) == 0 && cc::lightTestNext(0) == 1, "the light test: it goes round, back to all on");
                 }
                 {
