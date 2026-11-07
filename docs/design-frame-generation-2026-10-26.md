@@ -53,7 +53,9 @@
   `frame generation lock: replayed B:` names each replay). Lock 2:1 flown once.
   Built, not flown: S's edges in a ship turn (sentinel vectors, dilated vectors);
   S resampled Catmull-Rom (`FG_SHARP`, 0.82 -> 0.94); hole fill along the motion (`FG_FILL_REPROJ`);
-  `fgSynSrc`'s tie deterministic (2026-11-08: second time pass, the passes near their bounds).
+  `fgSynSrc`'s tie deterministic (2026-11-08: second time pass, the passes near their bounds);
+  the resample in 8 fetches instead of 16 (2026-11-08 third time pass: it was fetch-bound, not
+  memory-bound; 0.57 -> 0.54 ms per eye, replays unchanged).
   H1, H8, H9 and the surface classifier are still unbuilt; on foot unflown.
 - **Temporary keys (hidden):** `fix.frame_generation_shadow` (off | on), and
   `fix.frame_generation` (off | on; built 2.3: `on` forces Lock, for A/B
@@ -1523,6 +1525,80 @@ median 0.000-0.005 (holes), of the total up to 0.011.
 - **Not attempted:** RCAS and the UI composite in one pass on S (the
   finishing, 0.16-0.20 ms in game): it needs B's sharpener's HLSL inside the
   synth's text and has no bench; it is measurable only in a flight.
+
+### 2026-11-08: Phase 2.3, third time pass, an independent review (bench and replays, no flight)
+
+A reviewer's roofline of the shown f = 0.5 S on the RTX 5080 (960 GB/s, 64 MB
+L2; render 6.90 Mpx, output 12.26 Mpx: a render-size grid is 27.6 MB, an
+output-size one 49.0 MB), 230157175005:2, against the bytes each pass must
+move. The bound a pass sits at was tested by turning its work off with the
+shader's own switches, not inferred from the byte count.
+
+| pass | ms | bytes it must move (MB) | what bounds it |
+|---|---|---|---|
+| clear | 0.016 | key 27.6 (API fast clear) | the API; an all-ones clear of the read grid costs 0.019, so it has no fast path |
+| splat | 0.109 | depth + mv 55 read, read grid 27.6 write, key 27.6 read-modify-write | at the bound: 110-138 MB is more than DRAM gives in 0.109 ms, so the key grid's 27.6M InterlockedMax run in L2; FG_SENTINEL=0 saves 0.004 |
+| src | 0.132 | depth + mv 55 read, key 27.6 read, read grid about 7M InterlockedMin | not DRAM-bound (83 MB, 630 GB/s): 0.016 is the guard's nine metres (FG_GUARD=0), 0.017 the sentinel ring (FG_SENTINEL=0), 0.005 the dilation; the rest the key reads and the atomics |
+| resolve | 0.055 | key 27.6 + read 27.6 read | two dependent loads a pixel at DRAM speed (1.0 TB/s equivalent) though both grids should sit in L2 |
+| holes | 0.100 (f = 1 0.168) | about 100k holes, 289 key loads + 16 candidates each | latency and divergence; FG_FILL_REPROJ=0 saves 0.008 |
+| resample | 0.161 | B 49 read + S 49 write, read grid 27.6 | **fetch-bound, not memory-bound**: FG_SHARP=0 (4 fetches, the same 98 MB) runs in 0.089; 8 fetches 0.126, 12 0.143, 16 0.161 |
+
+- **What the second pass missed:** the resample's "bound by DRAM traffic" was
+  inferred from 125 MB in 0.16 ms; the bilinear switch refutes it (0.089 ms
+  for the same bytes). The pass pays per fetch, so the same Catmull-Rom in
+  fewer fetches is the saving: the centre 2x2 as point loads (exact, and the
+  clamp's bounds), each edge pair's two centre taps as one bilinear fetch
+  through a clamped sampler (s0, new in the pass table) at the ratio of their
+  weights, the corners as point loads: 12 fetches. The sampler's weights are
+  8-bit; against the 16-load form 0.053% of the S pixels of the 22 replays
+  differ, all by one 8-bit linear step (the PNGs are sRGB, so the dark ones
+  show as 1-13 steps); every class mean and p95, the hole error and the
+  sharpness are unchanged to the printed digit.
+- **Accepted, the resample in 12 fetches:** resample 0.161 / 0.169 / 0.168 ->
+  0.142 / 0.153 / 0.159 ms on 230157175005:2 / 225515258002:4 /
+  222433569001:4; total 0.576 / 0.549 / 0.581 -> 0.559 / 0.535 / 0.572
+  (three runs of 300 each, run-to-run spread of a pass median at most 0.004,
+  of the total 0.007). Rig 137 of 137. The 16-load form stays as the bench's
+  comparison `FG_SHARP=5`.
+- **Accepted, the corners dropped (8 fetches, `FG_SHARP` 1):** the four
+  corner taps weigh at most a sixteenth squared each (under 1.6% in all) and
+  are dropped, the rest renormalised: resample -> 0.126 / 0.133 / 0.139,
+  total 0.539 / 0.514 / 0.551 (6.4% / 6.4% / 5.2% under the second pass). On
+  the 22 replays every turned p95 is the same bin, every mean the same
+  milli-luma but one (cockpit 10 -> 9 on 202815590002), the hole error +0.00
+  to +0.04 milli-luma (at most +0.1%), S/B sharpness outside the holes +0.003
+  to +0.006 (the kernel is a shade more peaked: S nearer B). 2.1% of the S
+  pixels differ from the 12-fetch form, by up to three 8-bit linear steps.
+  Its own commit, so it can go back alone; the 12-fetch form is the bench's
+  comparison `FG_SHARP=6`.
+- ruled out: the read grid's all-ones by `ClearUnorderedAccessViewUint`
+  instead of the splat's store, because the clear costs 0.019 (no fast path
+  for a non-zero clear on this card) and the splat saves 0.006.
+- ruled out: `[unroll]` on the fill's 17 search rows or on the winner's 16
+  candidates, because the hole pass went 0.099 -> 0.098 / 0.103 at f = 0.5
+  (0.167 -> 0.150 at f = 1 for the rows) and the rows' unroll takes fxc 145
+  seconds a compile.
+- Not pursued, with the reason: a one-pass splat (key and offset in one
+  atomic) needs 64-bit atomics, which cs_5_0 has not; the landing stored by
+  the splat for the source pass to read moves 55 MB more than the recompute
+  it saves; a coarser splat where the motion is smooth, or S = B over the
+  static cockpit, still needs every pixel's landing to know it is static;
+  the resample "only where S differs from B" still reads B and writes S for
+  the copy (the same 98 MB). The f = 1 build is not an extra per-frame cost:
+  the shadow alternates it with the f = 0.5 build frame by frame and Lock
+  builds f = 0.5 only.
+- **Checked, not a bug:** the source pass recomputes the splat's landing in a
+  second shader; a landing that rounded differently would leave a key with
+  no offer, which the resolve would count as guarded and the resample would
+  read 2047 px away. The bench now counts those pixels (`orphan` on the
+  sharpness line): 0 on every frame of the 22 replays. The design still
+  rests on two shaders agreeing bit for bit; the resolve could treat the
+  splat's all-ones under a key as a hole for a load and a compare.
+- **Review, the rest of the synth path:** nothing else found that fails an
+  input. Two small things in the bench, not the synth: `--png-dir` makes one
+  directory level only (a missing parent writes nothing and says so per
+  PNG), and without `--png-dir` it writes `bench_out` into the capture.
+
 ### 2026-11-07: Phase 2.3, flight 11, the first Lock flight (same build)
 
 `fix.frame_generation = on`, about 12 minutes. Pilot: "a slight flicker",
