@@ -684,6 +684,7 @@ class NativeRuntimeHost : public SystemSource, public FrameSink, public Composit
   // begun again. Provider tables deliberately retain their sequence floors,
   // so the host adds this offset to every published frame sequence.
   uint64_t frameSequenceOffset=0,lastPublishedFrameSequence=0;
+  FrameGenGameSequence framegenSequence;   // frame generation 2.3: the session sequences Lock's S slots took, left out of the game's numbering (framegen_lock.h); none: today's
   uint64_t activeFrameSequence=0;
   mutable std::atomic<unsigned> geometryQueryNotes[6][2]{};
   // Reads that handed the game a recommended size (GetRecommendedRenderTarget-
@@ -2633,7 +2634,7 @@ class NativeRuntimeHost : public SystemSource, public FrameSink, public Composit
     // phases native_submit_phases prints, so the copy is these two and not their sum with the parts.
     const double copy=scene?transferWall.producerDispatch+submitSample.receiveMs:0.0;
     EndFrameCall call;
-    call.sequence=scene&&submitSample.sequence?submitSample.sequence:info.sequence+frameSequenceOffset;
+    call.sequence=scene&&submitSample.sequence?submitSample.sequence:framegenSequence.game(info.sequence)+frameSequenceOffset;
     call.ms=info.ms;call.periodMs=periodMs;call.nowMs=nowMs;call.shouldRender=info.shouldRender;call.layers=info.layers;
     call.background=info.background;call.turbo=info.turbo;call.overlapped=finishingOverlapped&&!info.background;
     call.result=int(info.result);
@@ -3126,6 +3127,7 @@ class NativeRuntimeHost : public SystemSource, public FrameSink, public Composit
       nativeTracePuts(formatFrameGenLockEdge(false,FrameGenLockReason::KeyOff,double(boundary.lastPeriodNs())/1.0e6).c_str());
     }
     nativeTracePuts(formatFrameGenLockReport(fl.window,FrameGenLockReason::KeyOff).c_str());
+    if(fl.window.fromB)nativeTracePuts(formatFrameGenLockReplay(fl.window).c_str());
     fl.gate.reset();fl.delivery=FrameGenSDelivery{};fl.window.reset();
     fl.was=false;fl.windowUs=fl.lastStepUs=0;fl.lastPairSequence=fl.deliveryNotedFor=0;fl.slotRan=false;fl.headFor=0;fl.headValid=false;
     fl.menuFor=0;fl.unfinishedSaid=~0u;
@@ -3178,6 +3180,7 @@ class NativeRuntimeHost : public SystemSource, public FrameSink, public Composit
     fl.lastStepUs=nowUs;
     fl.slotRan=false;
     const FrameGenLockPair p=frameGenLockBeforeWait(boundary,fl.gate,c,nowUs);
+    framegenSequence.noteSlot(p.slot);   // a slot that began took a session sequence: the game's next frame is still numbered one on from B
     if(p.step.edge) {
       if(!p.step.engaged)++fl.window.disengages;
       nativeTracePuts(formatFrameGenLockEdge(p.step.engaged,p.step.reason,double(period)/1.0e6).c_str());
@@ -3196,6 +3199,7 @@ class NativeRuntimeHost : public SystemSource, public FrameSink, public Composit
     if(nowUs-fl.windowUs>=1000000) {
       fl.windowUs=nowUs;
       nativeTracePuts(formatFrameGenLockReport(fl.window,fl.gate.reason()).c_str());
+      if(fl.window.fromB)nativeTracePuts(formatFrameGenLockReplay(fl.window).c_str());
       fl.lastValid=true;fl.lastSSlots=fl.window.sSlots;fl.lastFromS=fl.window.fromS;fl.lastLateS=fl.window.lateS;fl.lastLateReal=fl.window.lateReal;
       fl.window.reset();
     }
@@ -3217,7 +3221,7 @@ class NativeRuntimeHost : public SystemSource, public FrameSink, public Composit
     framegenSlotConsume();   // an S not yet taken at the pair's finish: the slot's wait gave it more time (a zero timeout still)
     const uint64_t pair=fl.lastPairSequence;
     const uint64_t consumed[2]={fs.eyes[0].consumedSequence(),fs.eyes[1].consumedSequence()};
-    bool shown=true;
+    bool shown=true,formatOk=true;
     // Phase 2.3b: only an S finished as B is (B's sharpening, B's UI layer) is shown; an older d3d11.dll's S, never finished, is not.
     for(unsigned e=0;e<2;++e)if(fs.finishFor[e]!=pair||fs.finish[e]!=kFrameGenFinishDone)shown=false;
     for(auto& e:fs.eyes) {
@@ -3225,7 +3229,7 @@ class NativeRuntimeHost : public SystemSource, public FrameSink, public Composit
       D3D11_TEXTURE2D_DESC d{};if(s)s->GetDesc(&d);
       if(!s||(d.Format!=DXGI_FORMAT_R8G8B8A8_TYPELESS&&d.Format!=DXGI_FORMAT_B8G8R8A8_TYPELESS)) {
         if(s&&!fl.formatSaid){fl.formatSaid=true;char line[200];std::snprintf(line,sizeof(line),kFrameGenLockFormatFmt,unsigned(d.Format));nativeTracePuts(line);}
-        shown=false;
+        shown=false;formatOk=false;
       }
     }
     const bool ready=frameGenSReady(pair,consumed,fl.headFor,fl.headValid,previousHeadValid,shown);
@@ -3255,6 +3259,12 @@ class NativeRuntimeHost : public SystemSource, public FrameSink, public Composit
       }
     }
     ++fl.window.fromB;++fl.window.lateS;
+    {   // the flight 11 instrument: why this slot replays B (Count: everything was ready, so adopting or rendering S failed)
+      FrameGenSEyeFacts facts[2];
+      for(unsigned e=0;e<2;++e){facts[e].answerFor=fs.finishFor[e];facts[e].state=fs.finishState[e];facts[e].finish=fs.finish[e];facts[e].pending=fs.eyes[e].pendingSequence();facts[e].consumed=consumed[e];}
+      uint64_t had=0;
+      fl.window.noteReplay(frameGenReplayWhy(pair,facts,fl.headFor,fl.headValid,previousHeadValid,formatOk,had),pair,had);
+    }
     return stereo.renderCaptured(previousViews,previousSpace,previousPair,layer,nullptr,nullptr,previousPlacement,fade,previousHeadValid?&previousHeadPose:nullptr,leftShare,&hidden,
                                  zoomStripNow,previousZoomed,&previousOrigin,&circleArg);
   }  // B3, the scope zoom's window (scope_zoom_state.h; the request is the provider's version 11 answer, scope_zoom_window.h): whether eye 0's told frustum is narrowed this frame. Set in
@@ -4482,8 +4492,9 @@ class NativeRuntimeHost : public SystemSource, public FrameSink, public Composit
     tracedLifecycle=lifecycle;
   }
   bool applyFrameSequence(Frame& frame) {
-    if(!frame.sequence||frameSequenceOffset>(std::numeric_limits<uint64_t>::max)()-frame.sequence)return false;
-    frame.sequence+=frameSequenceOffset;activeFrameSequence=frame.sequence;
+    const uint64_t game=framegenSequence.game(frame.sequence);   // no S slot has run: the session's own sequence, as always
+    if(!frame.sequence||frameSequenceOffset>(std::numeric_limits<uint64_t>::max)()-game)return false;
+    frame.sequence=game+frameSequenceOffset;activeFrameSequence=frame.sequence;
     if(frame.sequence>lastPublishedFrameSequence)lastPublishedFrameSequence=frame.sequence;
     return true;
   }
@@ -4500,7 +4511,7 @@ class NativeRuntimeHost : public SystemSource, public FrameSink, public Composit
     clearOverlapHandoff();
     if(GetCurrentThreadId()!=ownerThread||state.running()||state.terminal()||!session)return false;
     if(lastPublishedFrameSequence==(std::numeric_limits<uint64_t>::max)())return false;
-    frameSequenceOffset=lastPublishedFrameSequence;
+    frameSequenceOffset=lastPublishedFrameSequence;framegenSequence.reset();   // the session's count starts over, and with it the S slots' share of it
     if(!invalidateOrigin("session_restart"))return false;
     frameGeometryAvailable=false;frameGeometry={};previousPairValid=false;
     activeFrameSequence=0;

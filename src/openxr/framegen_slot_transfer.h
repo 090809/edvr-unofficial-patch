@@ -115,6 +115,7 @@ class FrameGenSlotTransfer final {
   uint64_t serial() const noexcept { return shared_ ? serial_ : 0; }
   bool pending() const noexcept { return pending_; }
   int64_t pendingSlotTime() const noexcept { return slotTime_; }
+  uint64_t pendingSequence() const noexcept { return pending_ ? pendingSequence_ : 0; }   // the pair whose S waits to be taken (0: none)
   // The d3d11 half said this eye's S was produced (key 1) for the slot at slotTime.
   // Phase 2.3: sequence is the pair it was built for, which consumedSequence() says once it is taken.
   void markProduced(int64_t slotTime, uint64_t sequence = 0) noexcept {

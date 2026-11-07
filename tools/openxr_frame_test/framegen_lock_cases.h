@@ -452,8 +452,169 @@ void mutations() {
   }
 }
 
+// Flight 11 (docs/design-frame-generation-2026-10-26.md, "Phase 2.3, flight 11"): every engaged burst showed S in its first S slot, replayed B in the rest, and let go no_s after
+// four pairs. The S chain end to end as far as frame sequences decide it, the host's bookkeeping (native_runtime_host.h) and the d3d11 half's continuity cut to that:
+//   the boundary: S's delivery for the pair just composed (consumed on both eyes for lastPair), the gate, and engaged the S slot, which shows S when frameGenSReady holds;
+//   the game's wait: its frame sequence through FrameGenGameSequence (the fix) or the session's own (flight 11's build: fixed = false);
+//   the treat: the d3d11 half builds S for the pair only when the eye's history carries (native_temporal.cpp: continuity + 1 == seq; a reset leaves the temporal pass no head
+//     delta, so it writes no depth, and framegen_synth.cpp skips the build: the graphics log's synth skipped= was exactly two per engaged pair in flight 11); a built S is
+//     handed over, finished, and consumed at the pair's finish with the pair's sequence;
+//   the finish: lastPair is the pair just composed.
+struct DeliveryRun {
+  unsigned engagedSlots = 0, fromS = 0, fromB = 0, disengagesNoS = 0, engages = 0;
+  unsigned why[int(FrameGenReplayWhy::Count) + 1] = {};
+  std::vector<int> slotShows;                       // per S slot: 1 S, 0 B, in order
+  std::vector<uint64_t> gameSequences;              // as handed to the game
+  uint64_t firstAsked = 0, firstHad = 0;            // the first replayed slot's pair and what the private copy held
+};
+DeliveryRun deliveryModel(bool fixed, int frames) {
+  const XrDuration P = 11;
+  Fake fake; fake.step = fake.period = P; SessionState session; start(session, fake);
+  SlotSink sink(fake); FrameBoundary boundary(session, sink);
+  DeliveryRun out;
+  FrameGenLockGate gate;
+  FrameGenSDelivery delivery;
+  FrameGenGameSequence sequence;
+  uint64_t nowUs = 0, continuity = 0, lastPair = 0, noted = 0, poseFor = 0;
+  FrameGenSEyeFacts eyes[2];
+  vr::Texture_t texture{};
+  for (int i = 0; i < frames; ++i) {
+    nowUs += 22222;
+    if (lastPair && noted != lastPair) { noted = lastPair; delivery.notePair(eyes[0].consumed == lastPair && eyes[1].consumed == lastPair); }
+    FrameGenLockConditions c = allHold();
+    c.sDelivering = delivery.delivering();
+    const uint64_t consumed[2] = {eyes[0].consumed, eyes[1].consumed};
+    sink.sReady = frameGenSReady(lastPair, consumed, poseFor, true, true, true) && eyes[0].finish == kFrameGenFinishDone && eyes[1].finish == kFrameGenFinishDone;
+    const FrameGenLockPair p = frameGenLockBeforeWait(boundary, gate, c, nowUs);
+    if (fixed) sequence.noteSlot(p.slot);
+    if (p.step.edge && p.step.engaged) ++out.engages;
+    if (p.step.edge && !p.step.engaged && p.step.reason == FrameGenLockReason::NoS) ++out.disengagesNoS;
+    if (p.slotRan) {
+      ++out.engagedSlots;
+      out.slotShows.push_back(sink.sReady ? 1 : 0);
+      if (!sink.sReady) {
+        uint64_t had = 0;
+        const FrameGenReplayWhy w = frameGenReplayWhy(lastPair, eyes, poseFor, true, true, true, had);
+        ++out.why[int(w)];
+        if (!out.firstAsked) { out.firstAsked = lastPair; out.firstHad = eyes[0].consumed; }
+      }
+    }
+    if (boundary.waitAndBegin() != XR_SUCCESS) break;
+    const uint64_t game = sequence.game(boundary.frame().sequence);
+    out.gameSequences.push_back(game);
+    // The treat, both eyes: the slot is handed for this pair (its head located: poseFor), and S is built only on a carried history.
+    poseFor = game;
+    const bool carried = continuity != 0 && continuity + 1 == game;
+    continuity = game;
+    for (auto& e : eyes) {
+      e.answerFor = game;
+      e.state = carried ? 1u : 0u;                       // PRODUCED, or NONE (no inputs: skipped)
+      e.finish = carried ? kFrameGenFinishDone : 0u;
+      if (carried) e.pending = game;
+    }
+    boundary.setGeometryReady(true);
+    boundary.submit(vr::Eye_Left, &texture);
+    boundary.submit(vr::Eye_Right, &texture);
+    // The pair's finish: the pending S is taken, and this is the pair an S slot follows.
+    for (auto& e : eyes) if (e.pending) { e.consumed = e.pending; e.pending = 0; }
+    lastPair = game;
+  }
+  out.fromS = sink.fromS; out.fromB = sink.fromB;
+  session.abandonAfterOwnerDestruction();
+  return out;
+}
+
+void delivery() {
+  // The fix: the game's frames stay one apart through the S slots, so every engaged pair's S is built and every S slot shows S; Lock stays engaged.
+  {
+    const DeliveryRun r = deliveryModel(true, 120);
+    bool oneApart = true;
+    for (size_t i = 1; i < r.gameSequences.size(); ++i) oneApart = oneApart && r.gameSequences[i] == r.gameSequences[i - 1] + 1;
+    check(oneApart, "lock delivery: the game's frame sequences are one apart across the S slots (the d3d11 half's history carries)");
+    check(r.engages == 1 && r.disengagesNoS == 0 && r.engagedSlots >= 60 && r.fromS == r.engagedSlots && r.fromB == 0,
+          "lock delivery: 60 and more consecutive engaged pairs, S delivered every pair: every S slot shows S, no disengage");
+    std::printf("lock delivery fixed: %u slots, s_from=%u/%u\n", r.engagedSlots, r.fromS, r.fromB);
+  }
+  // Flight 11's build (the mutant: the session's own sequence handed to the game): the slot after the pair built before engaging shows S, the next three replay B because
+  // the game's next frames are numbered two apart and the d3d11 half builds no S for them, and the fourth miss lets go no_s. The flight's s_from=1/3 and its cycle.
+  {
+    const DeliveryRun r = deliveryModel(false, 120);
+    bool twoApartEngaged = false;
+    for (size_t i = 1; i < r.gameSequences.size(); ++i) twoApartEngaged = twoApartEngaged || r.gameSequences[i] == r.gameSequences[i - 1] + 2;
+    const bool firstBurst = r.slotShows.size() >= 4 && r.slotShows[0] == 1 && r.slotShows[1] == 0 && r.slotShows[2] == 0 && r.slotShows[3] == 0;
+    check(twoApartEngaged && firstBurst && r.disengagesNoS >= 1 && r.fromB > 0 && r.why[int(FrameGenReplayWhy::NotBuilt)] == r.fromB,
+          "lock delivery mutant (S slots' sequences left in the game's numbering): S, then B, B, B, then disengage no_s (flight 11), and every replay is not_built");
+    check(r.firstAsked != 0 && r.firstHad + 2 == r.firstAsked,
+          "lock delivery mutant: the first replayed slot asks for the pair two on from the S it holds (the pair the d3d11 half never built), not a seq_mismatch");
+    std::printf("lock delivery mutant: %u slots, s_from=%u/%u, no_s disengages=%u, first replay asked %llu had %llu\n", r.engagedSlots, r.fromS, r.fromB, r.disengagesNoS,
+                (unsigned long long)r.firstAsked, (unsigned long long)r.firstHad);
+  }
+  // FrameGenGameSequence alone: no S slot: the session's numbering exactly (the key off); a slot that never began takes nothing; reset starts over.
+  {
+    FrameGenGameSequence s;
+    SyntheticSlotInfo refused, begun;
+    begun.begun = true;
+    bool identity = true;
+    for (uint64_t raw = 1; raw < 50; ++raw) identity = identity && s.game(raw) == raw;
+    s.noteSlot(refused);
+    const bool refusedNothing = s.game(7) == 7;
+    s.noteSlot(begun); s.noteSlot(begun);
+    const bool skips = s.game(9) == 7;
+    s.reset();
+    check(identity && refusedNothing && skips && s.game(9) == 9, "lock game sequence: identity with no slot, a refused slot takes nothing, each begun slot one, reset starts over");
+  }
+}
+
+// The replay classifier: each reason in its order.
+void replayWhy() {
+  const auto eye = [](uint64_t answerFor, uint32_t state, uint32_t finish, uint64_t pending, uint64_t consumed) {
+    FrameGenSEyeFacts f; f.answerFor = answerFor; f.state = state; f.finish = finish; f.pending = pending; f.consumed = consumed; return f;
+  };
+  const FrameGenSEyeFacts good = eye(9, 1, kFrameGenFinishDone, 0, 9);
+  uint64_t had = 0;
+  struct Row { FrameGenSEyeFacts e0; FrameGenReplayWhy want; const char* text; };
+  const Row rows[] = {
+      {eye(8, 1, kFrameGenFinishDone, 0, 8), FrameGenReplayWhy::NotBuilt, "no answer for this pair: not_built"},
+      {eye(9, 0, 0, 0, 7), FrameGenReplayWhy::NotBuilt, "answered NONE (skipped): not_built"},
+      {eye(9, 3, 0, 0, 7), FrameGenReplayWhy::Kept, "built, kept (the f = 1 S): kept"},
+      {eye(9, 2, 0, 0, 7), FrameGenReplayWhy::Busy, "busy"},
+      {eye(9, 3, kFrameGenFinishNoDoor, 0, 7), FrameGenReplayWhy::Unfinished, "held back no_door: unfinished"},
+      {eye(9, 1, kFrameGenFinishOld, 0, 9), FrameGenReplayWhy::Unfinished, "produced by an older d3d11.dll: unfinished"},
+      {eye(9, 1, kFrameGenFinishDone, 9, 7), FrameGenReplayWhy::NotConsumed, "produced, still pending: not_consumed"},
+      {eye(9, 1, kFrameGenFinishDone, 0, 8), FrameGenReplayWhy::SeqMismatch, "produced, the copy holds pair 8: seq_mismatch"},
+  };
+  for (const Row& r : rows) {
+    const FrameGenSEyeFacts e[2] = {r.e0, good};
+    char text[200];
+    std::snprintf(text, sizeof(text), "lock replay why: %s", r.text);
+    check(frameGenReplayWhy(9, e, 9, true, true, true, had) == r.want, text);
+  }
+  const FrameGenSEyeFacts mism[2] = {eye(9, 1, kFrameGenFinishDone, 0, 8), good};
+  frameGenReplayWhy(9, mism, 9, true, true, true, had);
+  const FrameGenSEyeFacts both[2] = {good, good};
+  check(had == 8 && frameGenReplayWhy(9, both, 8, true, true, true, had) == FrameGenReplayWhy::NoPose && frameGenReplayWhy(9, both, 9, true, false, true, had) == FrameGenReplayWhy::NoPose &&
+            frameGenReplayWhy(9, both, 9, true, true, false, had) == FrameGenReplayWhy::Format && frameGenReplayWhy(9, both, 9, true, true, true, had) == FrameGenReplayWhy::Count,
+        "lock replay why: a seq_mismatch says the pair held; then no_pose, format, and Count when S could be shown");
+  const FrameGenSEyeFacts rightOnly[2] = {good, eye(9, 2, 0, 0, 7)};
+  check(frameGenReplayWhy(9, rightOnly, 9, true, true, true, had) == FrameGenReplayWhy::Busy, "lock replay why: eye 1's reason when eye 0 is ready");
+  // Agrees with frameGenSReady and the host's finish test wherever S is shown.
+  const uint64_t c9[2] = {9, 9};
+  check(frameGenSReady(9, c9, 9, true, true, true) && frameGenReplayWhy(9, both, 9, true, true, true, had) == FrameGenReplayWhy::Count, "lock replay why: ready means no reason");
+}
+
 // The lines.
 void lines() {
+  {
+    FrameGenLockWindow w;
+    w.noteReplay(FrameGenReplayWhy::NotBuilt, 12, 0); w.noteReplay(FrameGenReplayWhy::NotBuilt, 13, 0); w.noteReplay(FrameGenReplayWhy::SeqMismatch, 15, 14);
+    w.noteReplay(FrameGenReplayWhy::Count, 16, 0);
+    check(formatFrameGenLockReplay(w) ==
+              "frame generation lock: replayed B: not_built=2 kept=0 busy=0 unfinished=0 not_consumed=0 seq_mismatch=1 (asked 15 had 14) no_pose=0 format=0 adopt=1",
+          "lock line: the replay reasons (a reason-less replay counts as adopt)");
+    bool names = true;
+    for (int r = 0; r < int(FrameGenReplayWhy::Count); ++r) names = names && std::strcmp(frameGenReplayWhyName(FrameGenReplayWhy(r)), "unknown") != 0;
+    check(names, "lock line: every replay reason has a name");
+  }
   FrameGenLockWindow w;
   w.engagedSeconds = 0.98; w.realSlots = 44; w.sSlots = 44; w.lateReal = 1; w.lateS = 2; w.fromS = 42; w.fromB = 2; w.disengages = 0;
   w.waitMs = {9.1f, 9.4f, 10.2f}; w.periodMs = {11.11f, 11.11f, 11.12f};
@@ -475,6 +636,6 @@ void lines() {
   check(names, "lock line: every reason has a name");
 }
 
-void run() { gateTable(); slotMath(); schedule(); keyOffIdentity(); mutations(); lines(); }
+void run() { gateTable(); slotMath(); schedule(); keyOffIdentity(); mutations(); delivery(); replayWhy(); lines(); }
 
 }  // namespace lockcases

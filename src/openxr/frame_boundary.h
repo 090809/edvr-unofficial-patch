@@ -59,6 +59,7 @@ struct SyntheticSlotInfo {
   double waitMs = 0, endMs = 0;      // the slot's own xrWaitFrame (with its xrBeginFrame) and xrEndFrame
   bool layers = false;               // a layer went with its end
   uint64_t lateBefore = 0;           // lateFrames() as the slot began, so a caller can count the misses its wait and the next one saw
+  bool begun = false;                // its wait and begin succeeded: the slot took one of the session's frame sequences (the game's next frame skips it)
 };
 
 // Runtime = today's blocking wait, in WaitGetPoses. Deferred is OpenXR
@@ -207,6 +208,7 @@ class FrameBoundary final {
     XrResult r;
     { SubmissionWallScope measured(&info.waitMs); r = session_.waitAndBegin(slot); }
     if (XR_FAILED(r)) { failed_ = true; lastResult_ = r; return r; }
+    info.begun = true;
     noteReal(XR_SUCCESS, slot.predictedDisplayTime, slot.predictedDisplayPeriod);
     info.predictedDisplayTime = slot.predictedDisplayTime;
     info.period = slot.predictedDisplayPeriod;

@@ -183,6 +183,61 @@ inline bool frameGenSUnfinished(uint32_t state, uint32_t finish, uint32_t& why) 
     return false;
 }
 
+// Why an S slot replayed B instead of showing S (the flight 11 instrument): the first of these that holds, eye 0 before eye 1.
+enum class FrameGenReplayWhy : uint8_t {
+    NotBuilt = 0,   // the d3d11 half answered nothing for this pair, or answered that it built no S (no inputs: e.g. the temporal pass wrote no depth)
+    Kept,           // S was built and not handed over (the f = 1 variant of the shadow key's alternation, or no consumer)
+    Busy,           // the previous S was still the runtime's: this one was not handed over
+    Unfinished,     // S was not finished as B is (2.3b) and is not shown
+    NotConsumed,    // S was handed over for this pair and is still pending (its key not yet released at the slot)
+    SeqMismatch,    // S was handed over for this pair, but the private copy holds another pair's S
+    NoPose,         // S's head (T_S) was not located for this pair, or B's head is not known
+    Format,         // S's private texture is missing or in a format the stereo renderer cannot show
+    Adopt,          // everything was ready but adopting S's textures or rendering them failed
+    Count
+};
+inline const char* frameGenReplayWhyName(FrameGenReplayWhy w) {
+    switch (w) {
+        case FrameGenReplayWhy::NotBuilt: return "not_built";
+        case FrameGenReplayWhy::Kept: return "kept";
+        case FrameGenReplayWhy::Busy: return "busy";
+        case FrameGenReplayWhy::Unfinished: return "unfinished";
+        case FrameGenReplayWhy::NotConsumed: return "not_consumed";
+        case FrameGenReplayWhy::SeqMismatch: return "seq_mismatch";
+        case FrameGenReplayWhy::NoPose: return "no_pose";
+        case FrameGenReplayWhy::Format: return "format";
+        case FrameGenReplayWhy::Adopt: return "adopt";
+        default: return "unknown";
+    }
+}
+// What the runtime knows about one eye's S at the S slot: the pair its last answer was for and that answer (state: EDVR_NATIVE_FRAMEGEN_S_*; finish: kFrameGenFinish*), the pair
+// whose S is pending (handed over, not yet taken; 0: none), and the pair whose S the private copy holds (0: none).
+struct FrameGenSEyeFacts {
+    uint64_t answerFor = 0;
+    uint32_t state = 0, finish = 0;
+    uint64_t pending = 0, consumed = 0;
+};
+// The reason the slot after pair `pair` cannot show S, or Count when it can (frameGenSReady and the finish test both hold: then only Adopt remains). `had` is the pair the
+// private copy holds on a SeqMismatch.
+inline FrameGenReplayWhy frameGenReplayWhy(uint64_t pair, const FrameGenSEyeFacts eyes[2], uint64_t poseFor, bool poseValid, bool headBValid, bool formatOk, uint64_t& had) {
+    had = 0;
+    for (int e = 0; e < 2; ++e) {
+        const FrameGenSEyeFacts& f = eyes[e];
+        uint32_t why = 0;
+        if (pair != 0 && f.consumed == pair && f.answerFor == pair && f.finish == kFrameGenFinishDone) continue;
+        if (pair == 0 || f.answerFor != pair || f.state == 0u) return FrameGenReplayWhy::NotBuilt;
+        if (f.state == 2u) return FrameGenReplayWhy::Busy;
+        if (frameGenSUnfinished(f.state, f.finish, why)) return FrameGenReplayWhy::Unfinished;
+        if (f.state != 1u) return FrameGenReplayWhy::Kept;
+        if (f.pending == pair) return FrameGenReplayWhy::NotConsumed;
+        had = f.consumed;
+        return FrameGenReplayWhy::SeqMismatch;
+    }
+    if (poseFor != pair || !poseValid || !headBValid) return FrameGenReplayWhy::NoPose;
+    if (!formatOk) return FrameGenReplayWhy::Format;
+    return FrameGenReplayWhy::Count;
+}
+
 // ---- the lines ----
 // Said once when the runtime first reads the key on (and again after it was off).
 constexpr const char* kFrameGenLockArmedFmt =
@@ -203,12 +258,32 @@ constexpr const char* kFrameGenLockUnfinishedFmt = "frame generation lock: S is 
 constexpr const char* kFrameGenLockReportFmt =
     "frame generation lock: engaged=%.2f slots=%u/%u late_real=%u late_s=%u s_from=%u/%u wait_ms=%s/%s period_ms=%s disengages=%u reason=%s";
 
+// The flight 11 instrument: in a window where an S slot replayed B, why each one did (FrameGenReplayWhy, counted), and on a seq_mismatch the last pair asked for and the pair the
+// private copy held. Said right after the one-second line, only when fromB is not zero.
+constexpr const char* kFrameGenLockReplayFmt =
+    "frame generation lock: replayed B: not_built=%u kept=%u busy=%u unfinished=%u not_consumed=%u seq_mismatch=%u (asked %llu had %llu) no_pose=%u format=%u adopt=%u";
+
 struct FrameGenLockWindow {
     double engagedSeconds = 0.0;
     uint32_t realSlots = 0, sSlots = 0, lateReal = 0, lateS = 0, fromS = 0, fromB = 0, disengages = 0;
     std::vector<float> waitMs, periodMs;
+    uint32_t replayWhy[static_cast<int>(FrameGenReplayWhy::Count) + 1] = {};   // the last entry: Count (no reason found: counted as adopt)
+    uint64_t mismatchAsked = 0, mismatchHad = 0;
+    void noteReplay(FrameGenReplayWhy why, uint64_t asked, uint64_t had) {
+        ++replayWhy[static_cast<int>(why)];
+        if (why == FrameGenReplayWhy::SeqMismatch) { mismatchAsked = asked; mismatchHad = had; }
+    }
     void reset() { *this = FrameGenLockWindow{}; }
 };
+
+inline std::string formatFrameGenLockReplay(const FrameGenLockWindow& w) {
+    char buf[320];
+    const auto n = [&](FrameGenReplayWhy r) { return static_cast<unsigned>(w.replayWhy[static_cast<int>(r)]); };
+    std::snprintf(buf, sizeof(buf), kFrameGenLockReplayFmt, n(FrameGenReplayWhy::NotBuilt), n(FrameGenReplayWhy::Kept), n(FrameGenReplayWhy::Busy), n(FrameGenReplayWhy::Unfinished),
+                  n(FrameGenReplayWhy::NotConsumed), n(FrameGenReplayWhy::SeqMismatch), static_cast<unsigned long long>(w.mismatchAsked), static_cast<unsigned long long>(w.mismatchHad),
+                  n(FrameGenReplayWhy::NoPose), n(FrameGenReplayWhy::Format), n(FrameGenReplayWhy::Adopt) + static_cast<unsigned>(w.replayWhy[static_cast<int>(FrameGenReplayWhy::Count)]));
+    return buf;
+}
 
 inline std::string formatFrameGenLockReport(const FrameGenLockWindow& w, FrameGenLockReason reason) {
     char buf[512];

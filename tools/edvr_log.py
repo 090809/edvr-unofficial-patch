@@ -10697,6 +10697,11 @@ H_FRAMEGEN_LOCK_REPORT = (r"frame generation lock: engaged=(?P<engaged>[\d.]+) s
 H_FRAMEGEN_LOCK_FORMAT = r"frame generation lock: S's format (?P<fmt>\d+) cannot be shown"
 # Phase 2.3b (kFrameGenLockUnfinishedFmt): an S was left unfinished (not finished like B), said when the why changes; Lock lets go with reason s_unfinished.
 H_FRAMEGEN_LOCK_UNFINISHED = r"frame generation lock: S is not finished like B \(why=(?P<why>[a-z_0-9]+)\); the S slot does not show it$"
+# The flight 11 instrument (kFrameGenLockReplayFmt): after a one-second line with B replayed, why each S slot replayed it, counted. Optional: logs before it lack the line.
+H_FRAMEGEN_LOCK_REPLAY_WHY = ("not_built", "kept", "busy", "unfinished", "not_consumed", "seq_mismatch", "no_pose", "format", "adopt")
+H_FRAMEGEN_LOCK_REPLAYED = (r"frame generation lock: replayed B: not_built=(?P<not_built>\d+) kept=(?P<kept>\d+) busy=(?P<busy>\d+) unfinished=(?P<unfinished>\d+) "
+                            r"not_consumed=(?P<not_consumed>\d+) seq_mismatch=(?P<seq_mismatch>\d+) \(asked (?P<asked>\d+) had (?P<had>\d+)\) no_pose=(?P<no_pose>\d+) "
+                            r"format=(?P<format>\d+) adopt=(?P<adopt>\d+)$")
 H_FRAMEGEN_LOCK_LATE_SHARE = 0.05   # late_s or late_real over this share of the S slots is PARTIAL
 # The SRV turret view (issue 140; src\d3d11\srv_turret.cpp, the vehicle latch's line in journal_watch.cpp, and the geometry shader's creation line in shader_swap.cpp, shaderSwapCreateGs,
 # called with who "srv turret hud"): lines of the graphics log with no build tag, read the way the desktop window's are. The settings and vehicle lines are state, so health_scan keeps
@@ -17082,6 +17087,13 @@ def _hj_framegen_lock(rows, ctx=None):
         text += "; S's format %s cannot be shown (every S slot replays B)" % rows["format"][-1]["fmt"]
     if rows.get("unfinished"):
         text += "; S left unfinished (not shown), why: %s" % "/".join(sorted(set(r["why"] for r in rows["unfinished"])))
+    if rows.get("replayed"):
+        # The flight 11 instrument: why the S slots replayed B, summed over the flight (lines from before it carry no such line: nothing is said).
+        sums = [(k, sum(int(r[k]) for r in rows["replayed"])) for k in H_FRAMEGEN_LOCK_REPLAY_WHY]
+        text += "; B replayed because: %s" % (", ".join("%s %d" % kv for kv in sorted((kv for kv in sums if kv[1]), key=lambda kv: -kv[1])) or "none counted")
+        mism = [r for r in rows["replayed"] if int(r["seq_mismatch"])]
+        if mism:
+            text += " (last seq_mismatch asked %s had %s)" % (mism[-1]["asked"], mism[-1]["had"])
     over = []
     if s and late_s > H_FRAMEGEN_LOCK_LATE_SHARE * s:
         over.append("late_s %d of %d S slots (%.1f%%)" % (late_s, s, 100.0 * late_s / s))
@@ -18292,6 +18304,7 @@ HEALTH_RULES = (
         ("report", H_FRAMEGEN_LOCK_REPORT),
         ("format", H_FRAMEGEN_LOCK_FORMAT),
         ("unfinished", H_FRAMEGEN_LOCK_UNFINISHED),
+        ("replayed", H_FRAMEGEN_LOCK_REPLAYED),
     ), _hj_framegen_lock),
     # The SRV turret view (issue 140): lines of the graphics log that carry no build tag (health_scan reads them, as it reads the desktop window's, before it drops the untagged lines).
     _hrule(H_SRV_TURRET, (), H_SRV_TURRET_LABELS, (
@@ -18541,7 +18554,7 @@ def health_scan_runtime(scan, text):
     for order, raw in enumerate(text.splitlines()):
         if H_FRAMEGEN_LOCK_LABEL in raw:
             # Frame generation 2.3: Lock's lines (armed, an edge, the one-second line, the format note; 2.3b: the unfinished S's why).
-            for kind in ("report", "engage", "disengage", "armed", "format", "unfinished"):
+            for kind in ("report", "engage", "disengage", "armed", "format", "unfinished", "replayed"):
                 g = lock_kinds[kind].search(raw)
                 if g:
                     scan["rows"][H_FRAMEGEN_LOCK].setdefault(kind, []).append(dict(g.groupdict(), _order=order, _t=None))
@@ -25585,6 +25598,11 @@ def self_test_health():
               extra=["--runtime-file", runtime([fl_armed(), fl_engage(), fl_report(), RL(flsrc, "frame generation lock: S is not finished like B", "layer_only"), fl_disengage("s_unfinished"),
                                                 fl_report(engaged=0.3, real=13, s=13, from_s=13, disengages=1, reason="s_unfinished"), fl_disengage("menu")])],
               has=["reasons when off: s_unfinished 2, menu 1", "S left unfinished (not shown), why: layer_only"])
+        check("frame generation lock: the replay reasons line is read and summed (flight 11's instrument)", fl_gfx, 0, [("OK", FL)], lacks=["UNPARSED"],
+              extra=["--runtime-file", runtime([fl_armed(), fl_engage(), fl_report(late_s=2, from_s=43, from_b=2),
+                                                RL(flsrc, "frame generation lock: replayed B:", 1, 0, 0, 0, 0, 1, 15, 14, 0, 0, 0),
+                                                fl_report(late_s=1, from_s=44, from_b=1), RL(flsrc, "frame generation lock: replayed B:", 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)])],
+              has=["B replayed because: not_built 2, seq_mismatch 1 (last seq_mismatch asked 15 had 14)"])
         check("frame generation lock: a drifted lock line is counted as unparsed", fl_gfx, 3, [("NEVER APPLIED", FL)],
               extra=["--runtime-file", runtime([fl_armed(), fl_engage(), fl_report().replace("late_s=", "lates=")])], has=["line(s) the rule's patterns do not match"])
         check("frame generation lock: the key off, no lock line, nothing said", fg_off + [fl_key(on=False)], 0, [("OK", F90S)], lacks=["frame generation lock", "NEVER APPLIED"],

@@ -34,6 +34,18 @@ inline FrameGenLockPair frameGenLockBeforeWait(FrameBoundary& boundary, FrameGen
   return p;
 }
 
+// The game's frame sequence while S slots run. Each S slot that begins takes one of the session's frame sequences, so without this the game's frames under Lock would be
+// numbered b, b + 2, b + 4: the d3d11 half reads a gap in the sequence as a dropped frame (native_temporal.cpp: continuity + 1 != seq resets the eye's history), and with its
+// history reset the temporal pass writes no depth, so the synthesizer builds no S for that pair (flight 11: every engaged pair after the first replayed B, then no_s). The game
+// sees only its own frames, numbered one apart as without Lock. Owner thread. Reset only where the session's own count starts over (a session restart); the key going off keeps
+// it, so the game's sequence never runs back. No S slot ever ran: game(raw) == raw, exactly today's numbering.
+struct FrameGenGameSequence {
+  uint64_t skipped = 0;   // the session sequences S slots took since the session's count began
+  void noteSlot(const SyntheticSlotInfo& slot) { if (slot.begun) ++skipped; }
+  uint64_t game(uint64_t raw) const { return raw > skipped ? raw - skipped : raw; }
+  void reset() { skipped = 0; }
+};
+
 // a * b for rigid poses: b's transform first, then a's.
 inline XrPosef frameGenPoseMul(const XrPosef& a, const XrPosef& b) { return seatxf::toNatural(a, b); }
 // a^-1 * b.
