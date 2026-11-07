@@ -767,7 +767,7 @@ void frameGenSynthEyeFrame(ID3D11Device* dev, ID3D11DeviceContext* ctx, uint32_t
     pollReadbacks(ctx, r, r.writes);
     pollTimers(ctx);
 
-    const bool half = f.wantShown || ((r.calls++ & 1u) == 0u);   // the even frames (and the dump's) build the f = 0.5 S
+    const bool half = f.wantShown || f.everyHalf || ((r.calls++ & 1u) == 0u);   // the even frames (and the dump's, and every frame under Lock's key) build the f = 0.5 S
     const bool score = r.havePending && r.bFrame + 1u == frame && !f.cameraJump;
     const bool keep = !half && !f.cameraJump;
 

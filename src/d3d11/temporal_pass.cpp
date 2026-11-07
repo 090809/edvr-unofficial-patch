@@ -1285,6 +1285,7 @@ ID3D11Texture2D* g_eyeRawStaging[kEyeRun] = {};
 ID3D11Texture2D* g_eyeTreatedStaging[kEyeRun] = {};
 ID3D11Texture2D* g_eyeDecisionStaging[kEyeRun] = {};
 ID3D11Texture2D* g_eyePreUiStaging[kEyeRun] = {};
+std::atomic<bool> g_frameGenLockKey{false};   // fix.frame_generation (Phase 2.3, TEMPORARY): Lock 2:1 forced; set where the keys are read, read by the treat
 ID3D11Texture2D* g_eyeSynthStaging[kEyeRun] = {};   // the frame-generation synthesizer's f = 0.5 S of frame k (fix.frame_generation_shadow on; S<k> beside the P<k> pre-interface output and the next frame's P<k+1>)
 int              g_eyeRunLeft = 0;    // captures still to take
 int              g_eyeRunTaken = 0;
@@ -5182,8 +5183,9 @@ void* temporalInner(void* srcTex, int eye, const float* bounds,
                                         w, h, oW, oH, projA, zcWritten);
                         gpuCensusEnd(ctx, GpuCensusSection::DoorSkyRing);
                     }
-                    // Frame generation, Phase 1 (fix.frame_generation_shadow, TEMPORARY): the key off costs the branch.
-                    if (usedDlaa && frameGenShadowOn()) {
+                    // Frame generation, Phase 1 (fix.frame_generation_shadow, TEMPORARY): the key off costs the branch. Phase 2.3: fix.frame_generation (Lock) runs the synthesizer too,
+                    // and the scorer only under its own key.
+                    if (usedDlaa && (frameGenShadowOn() || g_frameGenLockKey.load(std::memory_order_relaxed))) {
                         FrameGenShadowFrame fg;
                         fg.renderW = w; fg.renderH = h; fg.outW = oW; fg.outH = oH;
                         fg.outSrv = e.dlOutSrv;
@@ -5206,9 +5208,11 @@ void* temporalInner(void* srcTex, int eye, const float* bounds,
                         fg.worldValid = worldOn;
                         fg.cameraJump = gateJump || jumpedNow;
                         // Timed by the census as "frame generation shadow", on a line of its own (nested inside the temporal whole, in no total); a window without the key never calls it.
-                        gpuCensusBegin(ctx, GpuCensusSection::DoorFrameGenShadow);
-                        frameGenShadowEyeFrame(dev, ctx, static_cast<uint32_t>(eye), g_rowsFrame, fg);
-                        gpuCensusEnd(ctx, GpuCensusSection::DoorFrameGenShadow);
+                        if (frameGenShadowOn()) {
+                            gpuCensusBegin(ctx, GpuCensusSection::DoorFrameGenShadow);
+                            frameGenShadowEyeFrame(dev, ctx, static_cast<uint32_t>(eye), g_rowsFrame, fg);
+                            gpuCensusEnd(ctx, GpuCensusSection::DoorFrameGenShadow);
+                        }
                         // Phase 2.1, the synthesizer: S one display period after this frame, built beside the scorer and shown nowhere. Its own census section, "frame generation synth".
                         // The eye dump (a run of the left eye, beginEyeRun) asks for the f = 0.5 S on every frame of the run and stages it in the crop the pre-interface output has.
                         {
@@ -5243,6 +5247,9 @@ void* temporalInner(void* srcTex, int eye, const float* bounds,
                             }
                             sy.consumer = slotNow && e.fgSlotConsumer;
                             sy.slotSequence = slotNow ? e.fgSlotSequence : 0;
+                            // Phase 2.3: under fix.frame_generation the f = 0.5 S is built on every frame (S is shown in every other slot); the f = 1 S and its score run only
+                            // under the shadow key while Lock is not engaged (the 2.2 alternation).
+                            sy.everyHalf = g_frameGenLockKey.load(std::memory_order_relaxed) && (!frameGenShadowOn() || (slotNow && nativeTemporalFrameGenLock()));
                             // The dump stages the f = 0.5 S while the module still holds it (on the transfer's path S is the runtime's once it is handed over).
                             if (dumpFrame) {
                                 sy.shownSink = [](void* ctxp, ID3D11DeviceContext* c, ID3D11Texture2D* shown) {
@@ -5802,7 +5809,21 @@ void temporalPassConfigure(Config& cfg) {
         // Frame generation, Phase 1 (TEMPORARY; docs/design-frame-generation-2026-10-26.md): live, VR only (the flat allow-list does not list it, so flat reads off).
         frameGenShadowConfigure(cfg.getString("fix.frame_generation_shadow", "off") == "on");
         nativeFrameSetFrameGenShadow(frameGenShadowOn());
-        frameGenSynthConfigure(frameGenShadowOn());   // the synthesizer rides the same key (no key of its own)
+        // Phase 2.3 (TEMPORARY, hidden; on = Lock 2:1 forced, for A/B flights): live, VR only like the shadow key. Carried to the runtime in a version 12 answer's word 17; it
+        // runs the synthesizer as the shadow key does.
+        {
+            const bool lockKey = cfg.getString("fix.frame_generation", "off") == "on";
+            static bool lockTold = false;
+            if (!runtimeFlatProfile() && (!lockTold || lockKey != g_frameGenLockKey.load(std::memory_order_relaxed))) {
+                lockTold = true;
+                Log::get().note("frame generation: fix.frame_generation=%s (%s).", lockKey ? "on" : "off",
+                                lockKey ? "Lock 2:1 forced: the synthesizer builds S on every frame and the runtime shows it between Elite's frames once Lock engages"
+                                        : "no Lock: the frame loop is today's");
+            }
+            g_frameGenLockKey.store(lockKey, std::memory_order_relaxed);
+            nativeFrameSetFrameGenLock(lockKey);
+        }
+        frameGenSynthConfigure(frameGenShadowOn() || g_frameGenLockKey.load(std::memory_order_relaxed));   // the synthesizer rides either key (no key of its own)
     }
     // The same test native_temporal.cpp's Settings::dlaa makes (flags bit 1
     // at the treat): only an external engine (dlaa, dlss, fsr) touches NGX

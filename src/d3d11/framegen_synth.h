@@ -49,6 +49,8 @@ struct FrameGenSynthFrame {
     float slotT[3] = {};
     bool consumer = false;
     uint64_t slotSequence = 0;                      // the treat's sequence, which the answer to edvrFrameGenTakeS carries (0: no slot this frame)
+    // Phase 2.3 (fix.frame_generation): build the f = 0.5 S on this frame whatever the alternation says, and no f = 1 S (Lock shows S in every other slot).
+    bool everyHalf = false;
     // Called with the f = 0.5 S on a wantShown frame while the module still holds it (on the transfer's path it is the runtime's once handed over): the eye dump stages it here.
     void (*shownSink)(void* context, ID3D11DeviceContext* ctx, ID3D11Texture2D* shown) = nullptr;
     void* shownSinkContext = nullptr;

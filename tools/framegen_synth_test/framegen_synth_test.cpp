@@ -1207,6 +1207,28 @@ void case11Transfer(Gpu& g, Scope& sc) {
     frameGenSynthConfigure(true);
     f.slotPose = true;
     f.consumer = true;
+    // 8: Phase 2.3, Lock's key (everyHalf): the f = 0.5 S on every frame, no f = 1 S between them, each one produced for its own pair and consumed as that pair's.
+    frameGenSynthFrameBoundary();
+    f.everyHalf = true;
+    bool every = true;
+    for (int k = 0; k < 4; ++k) {
+        every = every && build(a) == S_OK && a.state == EDVR_NATIVE_FRAMEGEN_S_PRODUCED && a.poseRuntime == 1;
+        every = every && tr.open(xr.Get(), static_cast<HANDLE>(a.sharedHandle), a.textureSerial) == S_OK;
+        tr.markProduced(200 + k, seq);
+        every = every && tr.consume(0) == S_OK && tr.consumedSequence() == seq;
+    }
+    sc.ok(every, "case 11: Lock's key: four frames in a row each produce an f = 0.5 S (none kept as f = 1), consumed as its own pair's");
+    f.everyHalf = false;
+    EdvrNativeFrameGenS first{};
+    bool built = build(first) == S_OK;
+    if (first.state == EDVR_NATIVE_FRAMEGEN_S_PRODUCED && tr.open(xr.Get(), static_cast<HANDLE>(first.sharedHandle), first.textureSerial) == S_OK) {
+        tr.markProduced(300, seq);
+        tr.consume(0);
+    }
+    built = built && build(a) == S_OK;
+    sc.ok(built && (first.state == EDVR_NATIVE_FRAMEGEN_S_KEPT) != (a.state == EDVR_NATIVE_FRAMEGEN_S_KEPT), "case 11: everyHalf off: the alternation is back (of two builds one f = 1 S is kept)");
+    tr.release();
+    sc.ok(tr.consumedSequence() == 0, "case 11: released, the private texture holds no pair's S");
     frameGenSynthConfigure(false);
     frameGenSynthFrameBoundary();
 }
