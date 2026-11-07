@@ -1193,6 +1193,30 @@ RTX 5080 with `framegen_synth_bench`. p95 (luma x 1024), synth / unwarped:
 - **Next:** 2.2 (the slot's pose from the runtime, S's own transfer); an
   optimization pass against the bench and the replays first if wanted.
 
+### 2026-11-07: Phase 2.1, time and VRAM (bench and replays, no flight)
+
+Measured on the RTX 5080 with `framegen_synth_bench` (`--frame` on a real
+capture, per eye, median) and checked on all ten replays: aggregate scores
+byte-identical, S images within the tie-race floor (0.02% of pixels).
+
+- **Time, shown S:** 0.532 -> 0.414 ms (hardware clears, a hole list with
+  one thread per hole, one packed read offset per S pixel). Rejected by
+  measurement: 16x16 and 32x8 groups, a pre-read before the splat's max.
+  Splat, source and resample move about 100 MB in 0.1 ms each, at the
+  card's bandwidth.
+- **VRAM, two eyes, the pilot's sizes:** 230.1 -> 170.9 MiB. Synth 184.0 ->
+  157.7 (the source grid merged into the packed offset); scorer 46.1 ->
+  13.2 (Phase 1's oracle, bdepth, extrapolation sets and their RGBA32F
+  vector capture removed; the predicted score, the jump count and the mv
+  ceiling kept). Each module logs its bytes by group once per arm.
+- **Found:** this GPU's typed R16G16_FLOAT store rounds toward zero; the
+  packed offsets truncate explicitly, so the result no longer depends on
+  the store's rounding.
+- **Pilot's setting:** `ui_quality` 200 -> 100 (the UI layer was 7512x6528
+  per eye, several times the frame generation's whole budget).
+- **Next in 2.2:** S written straight into its transfer texture, about 94
+  MiB of the remaining 158.
+
 ### 2026-11-07: Phase 2.1, the turned score and the VRAM cut (built, not flown)
 
 - **The compositor's turn, scored (the flight 7 discriminator).** At B the f = 1
