@@ -187,7 +187,7 @@ struct Gpu {
     }
 };
 
-// The production text with one of the four switches turned off, compiled for every entry; `defineName` is "FG_GUARD" and so on.
+// The production text with one or more of its switches turned off, compiled for every entry; `defineName` is "FG_GUARD", or "FG_GUARD,FG_DILATE_MV", and so on.
 bool compileMutated(Gpu& g, const char* defineName, ComPtr<ID3D11ComputeShader> out[kEntries]) {
     HMODULE lib = LoadLibraryA("d3dcompiler_47.dll");
     if (!lib) { std::printf("  d3dcompiler_47.dll did not load\n"); return false; }
@@ -195,10 +195,17 @@ bool compileMutated(Gpu& g, const char* defineName, ComPtr<ID3D11ComputeShader> 
     const CompileFn compile = reinterpret_cast<CompileFn>(GetProcAddress(lib, "D3DCompile"));
     if (!compile) return false;
     std::string text = frameGenSynthShaderSource();
-    const std::string from = std::string("#define ") + defineName + " 1";
-    const size_t at = text.find(from);
-    if (at == std::string::npos) return false;
-    text.replace(at, from.size(), std::string("#define ") + defineName + " 0");
+    std::string names = defineName;   // one switch, or several separated by commas, all turned off
+    for (size_t start = 0; start <= names.size();) {
+        const size_t comma = names.find(',', start);
+        const std::string name = names.substr(start, comma == std::string::npos ? std::string::npos : comma - start);
+        const std::string from = std::string("#define ") + name + " 1";
+        const size_t at = text.find(from);
+        if (at == std::string::npos) return false;
+        text.replace(at, from.size(), std::string("#define ") + name + " 0");
+        if (comma == std::string::npos) break;
+        start = comma + 1;
+    }
     for (int i = 0; i < kEntries; ++i) {
         ComPtr<ID3DBlob> code, err;
         if (FAILED(compile(text.data(), text.size(), "framegen_synth_mutated", nullptr, nullptr, kEntryNames[i], "cs_5_0", 0, 0, &code, &err))) {
@@ -558,9 +565,52 @@ Edge case5Edge(Gpu& g, Scope& sc, bool report) {
     sc.ok(e.skyWorst < 0.01f, label);
     std::snprintf(label, sizeof(label), "case 5: the object keeps its colour past its edge (worst deviation %.4f)", e.objWorst);
     sc.ok(e.objWorst < 0.01f, label);
-    std::snprintf(label, sizeof(label), "case 5: the counters: the strip of 2 px by %d rows was filled from the background (%u), nothing was left (%u), the guard moved one read a row (%u)", RH, e.filled, e.left, e.guard);
-    sc.ok(e.filled >= 2u * (RH - 2) && e.filled <= 2u * RH + 4 && e.left == 0 && e.guard >= static_cast<unsigned>(RH - 2) && e.guard <= static_cast<unsigned>(RH + 4), label);
+    // The sky pixel beside the object takes the object's depth and, since 2026-11-07, its vector (FG_DILATE_MV): it moves with the object and loses its S pixels to the
+    // object's own, so the guard moves no read here (one a row before, when it moved by the sky's vector).
+    std::snprintf(label, sizeof(label), "case 5: the counters: the strip of 2 px by %d rows was filled from the background (%u), nothing was left (%u), the guard moved no read (%u)", RH, e.filled, e.left, e.guard);
+    sc.ok(e.filled >= 2u * (RH - 2) && e.filled <= 2u * RH + 4 && e.left == 0 && e.guard == 0u, label);
     if (g_verbose && report) std::printf("  case 5: sky worst %.4f, object worst %.4f, filled %u, left %u, guard %u\n", e.skyWorst, e.objWorst, e.filled, e.left, e.guard);
+    return e;
+}
+
+// Case 13 (2026-11-07, eye dump 222433569001, the own hull smeared in a ship turn): the hull (right of x = 64, 60 m, still in the eye: vectors 0) over a background at
+// 4000 m that the ship's turn moves away from it (vectors +8 px: at f = 0.5 S reads the background 4 px to the right). Red is the render x read: the background a gradient,
+// the outline the game draws just outside the hull (x = 63, on the background's depth) -100, the hull 1000. The background just uncovered beside the hull (x 56 to 63) carries
+// the temporal pass's rejection sentinel (size * 2), not a vector. Expected: the background moves as the background up to the hole the hull leaves (S reads x + 4 for x <= 58),
+// and the outline stays on the hull (S at 63 reads -100).
+struct HullEdge { bool ran = false; float bgWorst = 0.0f, outline = 0.0f; };
+
+HullEdge case13HullEdge(Gpu& g, Scope& sc, bool report) {
+    HullEdge e;
+    char label[260];
+    Scene S;
+    for (int y = 0; y < RH; ++y)
+        for (int x = 0; x < RW; ++x) {
+            float* p = &S.rgba[(static_cast<size_t>(y) * RW + x) * 4];
+            p[0] = x < 63 ? static_cast<float>(x) : (x == 63 ? -100.0f : 1000.0f);
+            p[1] = static_cast<float>(y); p[2] = 0.5f; p[3] = 1.0f;
+            const size_t i = static_cast<size_t>(y) * RW + x;
+            S.depth[i] = x < 64 ? depthOf(4000.0f) : depthOf(60.0f);
+            const bool sentinel = x >= 56 && x < 64;
+            S.mv[i * 2] = x >= 64 ? 0.0f : (sentinel ? 2.0f * RW : 8.0f);
+            S.mv[i * 2 + 1] = sentinel ? 2.0f * RH : 0.0f;
+        }
+    FrameGenSynthCb cb;
+    frameGenSynthFillCb(cb, RW, RH, RW, RH, kTan, 0.0f, kDepthB, 10.0f, 0.5f, Deltas(0.0f, 0.0f, 0.0f, 0.0f).d);
+    const Run r = runSynth(g, S, cb);
+    sc.ok(r.ok, "case 13: the synthesizer ran");
+    if (!r.ok) return e;
+    e.ran = true;
+    e.outline = -1e9f;
+    for (int y = 4; y < RH - 4; ++y) {
+        for (int x = 8; x <= 58; ++x) e.bgWorst = std::max(e.bgWorst, std::fabs(r.at(x, y, 0, RW) - (x + 4.0f)));
+        e.outline = std::max(e.outline, r.at(63, y, 0, RW));
+    }
+    std::snprintf(label, sizeof(label), "case 13: the background uncovered beside the hull (the rejection sentinel in its vectors) moves as the background (worst %.4f px)", e.bgWorst);
+    sc.ok(e.bgWorst < 0.1f, label);
+    std::snprintf(label, sizeof(label), "case 13: the outline just outside the hull stays on the hull (S at x 63 reads %.2f, the outline -100)", e.outline);
+    sc.ok(e.outline < -99.0f, label);
+    if (g_verbose && report) std::printf("  case 13: background worst %.4f px, outline column %.2f\n", e.bgWorst, e.outline);
     return e;
 }
 
@@ -1560,7 +1610,8 @@ int run() {
     case3Far(g, sc);
     case4Split(g, sc);
     const Edge edge = case5Edge(g, sc, true);
-    if (!alive("cases 1 to 5")) return 1;
+    case13HullEdge(g, sc, true);
+    if (!alive("cases 1 to 5 and 13")) return 1;
     case6Module(g, sc);
     if (!alive("case 6")) return 1;
     case7Check(g, sc);
@@ -1593,13 +1644,17 @@ int run() {
 
     // The mutations: each must break its case.
     struct Mutation { const char* define; const char* what; std::function<void(Scope&)> run; unsigned fails = 0; };
-    Mutation muts[6] = {
+    Mutation muts[8] = {
         {"FG_USE_F", "f ignored (the landing uses f = 1 whatever the block says)", [&](Scope& s) { case2World(g, s); }},
         {"FG_REMOVE_HEAD", "the head turn not taken out of the vector", [&](Scope& s) { case2World(g, s); }},
-        {"FG_GUARD", "the guard off", [&](Scope& s) { case5Edge(g, s, false); }},
+        // Since the edge pixels move by the vector of the pixel whose depth they took (FG_DILATE_MV), the guard has nothing to move in case 5: it is checked on the
+        // edge it was built for, the sky pixel moving by its own vector.
+        {"FG_GUARD,FG_DILATE_MV", "the guard off (an edge pixel on its own vector)", [&](Scope& s) { case5Edge(g, s, false); }},
         {"FG_FILL_FAR", "the fill from the nearer side", [&](Scope& s) { case5Edge(g, s, false); }},
         {"FG_TURN", "the score's turn not applied (the residual ignored)", [&](Scope& s) { case7Check(g, s); }},
         {"FG_TURN_SIGN", "the score's turn applied the wrong way round (the residual transposed)", [&](Scope& s) { case7Check(g, s); }},
+        {"FG_DILATE_MV", "an edge pixel moved by its own vector, not the one whose depth it took", [&](Scope& s) { case13HullEdge(g, s, false); }},
+        {"FG_SENTINEL", "the rejection sentinel taken as a vector", [&](Scope& s) { case13HullEdge(g, s, false); }},
     };
     for (Mutation& m : muts) {
         ComPtr<ID3D11ComputeShader> mutated[kEntries], saved[kEntries];
@@ -1618,8 +1673,8 @@ int run() {
         if (ms.fails == 0) { ++g_failures; std::printf("FAIL: mutation: %s still passes\n", m.what); }
     }
     // Case 3 reads the head's part the same way as case 2: the head-turn mutation must break it too (a second look, not a second count).
-    std::printf("%s: %u checks, %u failures (mutations: f ignored broke %u checks, head turn not removed broke %u, guard off broke %u, fill from the nearer side broke %u, turn not applied broke %u, turn the wrong way round broke %u, slot pose ignored broke %u, slot step inverted broke %u)\n",
-                g_failures ? "FAIL" : "PASS", g_checks, g_failures, muts[0].fails, muts[1].fails, muts[2].fails, muts[3].fails, muts[4].fails, muts[5].fails, poseIgnored, poseInverted);
+    std::printf("%s: %u checks, %u failures (mutations: f ignored broke %u checks, head turn not removed broke %u, guard off broke %u, fill from the nearer side broke %u, turn not applied broke %u, turn the wrong way round broke %u, own vector at an edge broke %u, sentinel as a vector broke %u, slot pose ignored broke %u, slot step inverted broke %u)\n",
+                g_failures ? "FAIL" : "PASS", g_checks, g_failures, muts[0].fails, muts[1].fails, muts[2].fails, muts[3].fails, muts[4].fails, muts[5].fails, muts[6].fails, muts[7].fails, poseIgnored, poseInverted);
     return g_failures ? 1 : 0;
 }
 

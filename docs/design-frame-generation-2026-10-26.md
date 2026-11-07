@@ -51,6 +51,7 @@
   own smoothing off and then on. This is the visual reference to beat.
 - **Next: fly the flight 11 fix** (the game's frame sequences skip the S slots;
   `frame generation lock: replayed B:` names each replay). Lock 2:1 flown once.
+  Built, not flown: S's edges in a ship turn (sentinel vectors, dilated vectors).
   H1, H8, H9 and the surface classifier are still unbuilt; on foot unflown.
 - **Temporary keys (hidden):** `fix.frame_generation_shadow` (off | on), and
   `fix.frame_generation` (off | on; built 2.3: `on` forces Lock, for A/B
@@ -1313,6 +1314,53 @@ With the sequence fix (63a29232), the Monitor block and the menu row.
   every second. The period never halved while Lock was engaged.
 - **Next:** engage from a halved period (disengage only if it stays halved
   while engaged), and the menu drawn on S.
+
+### 2026-11-07: the own hull smeared in a ship turn: S's edges (eye dump and replay 222433569001; built, not flown)
+
+Pilot, Lock on: the own ship's hull outside the canopy smears in turns; a distant
+docking ship a little. Dump frame 4 = replay f4 (frame 11393): ship pitch 0.72° a
+frame (camera rows), head 0.02°. S04 against SB04: the hull's cyan outline torn at
+the top edges, a lattice of hull and outline colour beside the lower-left edges.
+The bench's f = 0.5 S of replay f4 reproduces both, pixel for pixel in place.
+
+| Hypothesis | Signature | Observed (replay f4, render x 1345-1720, y 1026-1176) | Verdict |
+|---|---|---|---|
+| H-b the hull split by the 10 m split, torn at the seam | hull depth both sides of `split.x`; cockpit and world keys meeting on the hull | hull 46-83 m (p10-p90), 98.6% world class; the 418 cockpit-class pixels are canopy frame, no seam on the hull | ruled out |
+| H-b' (lead) ex2dh's m on the hull carries the turn | hull vector minus the head's part non-zero | hull vector (-0.44, -0.22) px, flat over the region; the head's Hd alone moves it 0.41, 0.21 px: m about 0.03 px. The asteroid moves (-1.95, -15.2) | ruled out |
+| H-e (new) the rejection sentinel read as motion | vectors of exactly (2W, 2H) in the hole bands | 3-7% of every frame's pixels carry (5632, 4896) = render size x 2, the temporal pass's history-rejection write (`written`, temporal_shader_source.h) for a background just uncovered, a masked engine record or a fresh screen edit. A band up to 30 px wide beside every edge the background leaves; each such pixel lands off the image, so the band is a hole, filled from 8 px around: the lattice | confirmed |
+| H-d edge vectors not dilated with the depth | a pixel within 1 px of the hull: hull key, background vector | the 1 px ring (where the game draws the cyan outline, on background depth) takes the hull's key and moves 7.6 px at the background's motion, into or off the hull: the torn outline | confirmed |
+| H-a the fill pulls from the wrong side | hole fills reading the near surface | the fill takes the farthest key; with the bands gone the remaining holes are true disocclusions, filled from the background | ruled out as the cause |
+| H-c the outline has its own (holo) motion | decision path 8/10 on the outline | the outline is on background depth with the background's vector (or the sentinel); its motion is H-d's | ruled out as separate |
+
+- ruled out: the hull on the wrong path (H-b), because the hull is 46-83 m and
+  its vector is the head's to 0.03 px: ex2dh moves it with the head only.
+- ruled out: the fill direction (H-a), because the holes it filled wrongly were
+  the sentinel bands; the background fill is right where the hole is real.
+- ruled out: a holo or UI motion of the outline (H-c), because the outline is
+  background depth and vector, which H-d accounts for.
+- **Fix (framegen_synth_shader.h):** a pixel moves by the vector of the 3x3
+  pixel whose depth it took (`FG_DILATE_MV`), and a sentinel vector borrows the
+  vector of the farthest non-sentinel pixel on a ring of 2-32 px in 8
+  directions, else the head's motion alone (`FG_SENTINEL`).
+- **Measured (bench, f = 1 S against the next frame, 8-bit):** f0->f1 (the one
+  pair not under a camera jump) lead's crop 5.02 -> 4.22 mean, over 32
+  2.73% -> 2.04%; the five pairs' crop 12.53 -> 11.85; replay f4 holes filled
+  2.58% -> 1.14%, left 1.59% -> 0.39%. The ten 15:26-15:33 replays: no class
+  field worse but 152830339005's cockpit over-8 share 8.6 -> 8.7% (the sentinel
+  change; world 49.1 -> 48.8, holes left 4.04 -> 1.65%). Cost 0.607 -> 0.628 ms
+  an eye (f = 1, frame 4). Crops before and after are in the session's scratch.
+- **Rig:** case 13 (a still hull at 60 m over a background moving 8 px, its
+  outline at background depth, the uncovered band carrying the sentinel); each
+  of `FG_DILATE_MV` and `FG_SENTINEL` off fails it. Case 5's guard now moves no
+  read (the sky pixel moves with the object), so the guard's mutation runs with
+  the dilated vectors off too.
+- **Open:** with the dilated vectors the guard changes 0.26% of replay f4's S
+  pixels and is neutral to slightly worse (crop 4.22 vs 4.19 without it); a
+  case for removing it, not done here. The f = 1 S on f1-f4 (camera-jump
+  pairs) is worse than no warp in the crop (11.85 against 11.02).
+- **Flight signature:** in a ship turn with the hull in view, no lattice
+  beside the hull's edges and the outline whole in S; the synth line's
+  `holes=` filled and left both lower than in flight 12.
 
 ### 2026-11-07: Phase 2.3, flight 11, the first Lock flight (same build)
 

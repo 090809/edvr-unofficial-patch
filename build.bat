@@ -2148,8 +2148,8 @@ REM The frame-generation synthesizer (fix.frame_generation_shadow, TEMPORARY): t
 REM against the CPU reference of src\common\framegen_synth_math.h -- a cockpit plane under a head translation and turn, a world plane at a constant ship screen velocity under a
 REM changing head turn, the far plane, the on-foot 1 mm split, 2:1 output -- then the guard (a near object's edge over the sky takes no near colour into a sky pixel), the
 REM background fill (a hole behind a moving near object is filled from the far side), and the module itself (framegen_synth.cpp) driven on the same device: the key off creates
-REM nothing, the key on builds the two variants in turn and scores the f = 1 one against the next frame. Four mutations (f ignored, the head turn not taken out, the guard off,
-REM the fill from the nearer side) must each fail their case. Phase 2.2: the head step from the runtime's slot pose against a reference from the poses alone (the pose
+REM nothing, the key on builds the two variants in turn and scores the f = 1 one against the next frame. Mutations (f ignored, the head turn not taken out, the guard off,
+REM the fill from the nearer side, an edge pixel on its own vector, the rejection sentinel taken as a vector) must each fail their case. Phase 2.2: the head step from the runtime's slot pose against a reference from the poses alone (the pose
 REM ignored, or the step inverted, must fail), and S's transfer on a second WARP device (src\openxr\framegen_slot_transfer.h: produce, consume, busy, a 0 ms timeout, the
 REM producer texture made again, no consumer, the key off). Needs no real GPU.
 if not exist "%OBJ%\framegensynth" mkdir "%OBJ%\framegensynth"

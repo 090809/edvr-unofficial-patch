@@ -33,7 +33,7 @@
 //
 // The key: 0 a hole, 4 the far plane, else (max(asuint(1 / metres), 8) & ~7) | 4 when the pixel is its own nearest | class (1 cockpit, 2 world). A larger key is a nearer surface.
 //
-// The six #defines at the top of kFrameGenSynthCs are the rig's mutation points (tools\framegen_synth_test replaces one with 0 and the case it guards must fail); production
+// The eight #defines at the top of kFrameGenSynthCs are the rig's mutation points (tools\framegen_synth_test replaces one with 0 and the case it guards must fail); production
 // compiles them all 1.
 #include <cstring>
 #include <string>
@@ -47,6 +47,8 @@ inline constexpr char kFrameGenSynthCs[] = R"HLSL(
 #define FG_REMOVE_HEAD 1
 #define FG_GUARD 1
 #define FG_FILL_FAR 1
+#define FG_DILATE_MV 1   // a pixel moves by the vector of the 3x3 pixel whose depth it took (0: its own)
+#define FG_SENTINEL 1   // a rejected-history vector (the size * 2 sentinel) borrows its background's (0: taken as motion)
 #define FG_TURN 1        // the score turns S by the residual head rotation (0: it scores it unturned)
 #define FG_TURN_SIGN 1   // the residual is applied the right way round (0: its transpose)
 cbuffer P : register(b0) {
@@ -158,6 +160,19 @@ float synDepth9(int2 q, out float z9[9]) {
     return z;
 }
 
+// The pixel whose depth synDepth9 took (the pixel's own when it ties): its DLSS vector is the one the pixel moves by, so an edge pixel the near object's depth reached
+// moves with the near object and does not carry its colour (the outline the game draws just outside a hull) away at the background's motion (2026-11-07).
+int2 synNearest9(int2 q, float z9[9], float zr) {
+#if FG_DILATE_MV
+    if (z9[4] == zr) return q;
+    int k = 4;
+    [unroll] for (int i = 8; i >= 0; --i) if (z9[i] == zr) k = i;
+    return clamp(q + int2(k % 3 - 1, k / 3 - 1), int2(0, 0), int2(sz.x, sz.y) - 1);
+#else
+    return q;
+#endif
+}
+
 // A written depth's metres, 1e9 for the far plane (the guard's comparisons).
 float synMetresOrFar(float zr) {
     bool far;
@@ -165,10 +180,36 @@ float synMetresOrFar(float zr) {
     return far ? 1.0e9 : z;
 }
 
+// B's DLSS vector at q, for the ex2dh rule. Where the temporal pass rejected the history (a background just uncovered beside a nearer edge, a masked engine record, a fresh
+// screen edit) it writes the size * 2 sentinel instead of the motion (temporal_shader_source.h, `written`): not a vector, and taken as one it throws the pixel off the image
+// and leaves a hole band beside every moving edge, filled as a lattice (2026-11-07, the eye dump 222433569001). Such a pixel borrows the vector of the farthest pixel
+// without the sentinel on a sparse ring (2 to 32 px, 8 directions): the uncovered background moves as the background beside it. None found: the head's motion alone.
+bool synRejected(float2 mv) { return any(abs(mv) >= float2(sz.x, sz.y)); }
+float2 synVector(int2 q, float2 headPrevMinusB) {
+    float2 mv = Mv.Load(int3(q.x, q.y, 0));
+#if FG_SENTINEL
+    if (!synRejected(mv)) return mv;
+    float bestZ = 2.0;
+    float2 best = headPrevMinusB;
+    [loop] for (int r = 2; r <= 32; r *= 2) {
+        [unroll] for (int j = 0; j < 8; ++j) {
+            int2 d = int2(j < 3 ? -1 : (j > 4 ? 1 : 0), (j == 0 || j == 3 || j == 5) ? -1 : ((j == 2 || j == 4 || j == 7) ? 1 : 0));
+            int2 n = clamp(q + d * r, int2(0, 0), int2(sz.x, sz.y) - 1);
+            float2 v = Mv.Load(int3(n.x, n.y, 0));
+            float zn = Depth.Load(int3(n.x, n.y, 0));
+            if (!synRejected(v) && zn < bestZ) { bestZ = zn; best = v; }
+        }
+    }
+    return best;
+#else
+    return mv;
+#endif
+}
+
 // Where B's pixel id lands in S, and its key, from its dilated depth zr (synDepth9's nearest) and `own` (4 when the pixel's own depth is zr, else 0). The class and depth are
 // the dilated depth's. false: behind the eye. The motion is src\common\framegen_synth_math.h frameGenSynthTarget's: cockpit the head's rigid step with the depth; far and world
 // the ex2dh rule on B's vector, rotation only.
-bool fgSynTargetZ(uint2 id, float zr, uint own, out float2 pp, out uint key) {
+bool fgSynTargetZ(uint2 id, float zr, uint own, int2 vq, out float2 pp, out uint key) {
     pp = float2(0.0, 0.0);
     key = 0u;
     float z;
@@ -183,7 +224,6 @@ bool fgSynTargetZ(uint2 id, float zr, uint own, out float2 pp, out uint key) {
         if (!temporalProjectPixel(dp, tanB, int2(sz.x, sz.y), pp)) return false;
         zKey = -dp.z;
     } else {
-        float2 mv = Mv.Load(int3(id.x, id.y, 0));
 #if FG_REMOVE_HEAD
         float3 dH = float3(dot(hp[0].xyz, dB), dot(hp[1].xyz, dB), dot(hp[2].xyz, dB));
         float2 pHeadPrev;
@@ -191,6 +231,7 @@ bool fgSynTargetZ(uint2 id, float zr, uint own, out float2 pp, out uint key) {
 #else
         float2 pHeadPrev = pB;
 #endif
+        float2 mv = synVector(vq, pHeadPrev - pB);
         float2 m = (pB + mv) - pHeadPrev;
         float3 dS = temporalPixelDir(pB - f * m, tanB, int2(sz.x, sz.y));
         float3 dR = float3(dot(rs[0].xyz, dS), dot(rs[1].xyz, dS), dot(rs[2].xyz, dS));
@@ -205,7 +246,7 @@ bool fgSynTargetZ(uint2 id, float zr, uint own, out float2 pp, out uint key) {
 bool fgSynTarget(uint2 id, out float2 pp, out uint key) {
     float z9[9];
     float zr = synDepth9(int2(id), z9);
-    return fgSynTargetZ(id, zr, (z9[4] == zr) ? 4u : 0u, pp, key);
+    return fgSynTargetZ(id, zr, (z9[4] == zr) ? 4u : 0u, synNearest9(int2(id), z9, zr), pp, key);
 }
 
 // The 3x3 depths' metres (synMetresOrFar of each), once per source pixel: the guard's comparisons.
@@ -261,7 +302,7 @@ void fgSynSrc(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
         float zr = synDepth9(int2(id.xy), z9);
         float2 pp;
         uint key;
-        if (fgSynTargetZ(id.xy, zr, (z9[4] == zr) ? 4u : 0u, pp, key)) {
+        if (fgSynTargetZ(id.xy, zr, (z9[4] == zr) ? 4u : 0u, synNearest9(int2(id.xy), z9, zr), pp, key)) {
             float m9[9];
             synMetres9(z9, m9);
             int2 base = int2(floor(pp));
@@ -306,7 +347,7 @@ bool synWinnerRead(int2 n, out float2 rd) {
         float zr = synDepth9(w, z9);
         float2 pp;
         uint kw;
-        if (!fgSynTargetZ(uint2(w), zr, (z9[4] == zr) ? 4u : 0u, pp, kw) || kw != key) continue;
+        if (!fgSynTargetZ(uint2(w), zr, (z9[4] == zr) ? 4u : 0u, synNearest9(w, z9, zr), pp, kw) || kw != key) continue;
         int2 dd = n - int2(floor(pp));
         if (dd.x < 0 || dd.x > 1 || dd.y < 0 || dd.y > 1) continue;
         float2 off = float2(n) - pp;
