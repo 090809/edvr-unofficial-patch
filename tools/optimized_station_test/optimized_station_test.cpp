@@ -3900,6 +3900,16 @@ int main(int argc, char** argv) {
                 check(c.stop() == false, "camera test: stop when closed is a no-op");
                 check(cc::camTestNextMode(0) == 1 && cc::camTestNextMode(1) == 2 && cc::camTestNextMode(2) == 3 && cc::camTestNextMode(3) == 0, "camera test: the key steps off, log only, look, bake, off");
                 {
+                    int wash = 0;
+                    bool scatter = false;
+                    for (size_t i = 0; i < cc::kWithheldPsCount; ++i)
+                        if (cc::kWithheldPs[i].washToo) {
+                            ++wash;
+                            scatter = std::strcmp(cc::kWithheldPs[i].name, "scatter") == 0;
+                        }
+                    check(wash == 1 && scatter, "the bake: the scatter alone stays off while the windows show the bake");
+                }
+                {
                     CamTestTimer b;
                     b.step(cc::kCamTestModeBake, true, false, 70000, &e);
                     check(b.armed() && b.step(cc::kCamTestModeBake, false, true, 70100, &e) && b.active(), "the bake: a ride up arms it and the first sighting opens it, like the look");
@@ -3909,7 +3919,19 @@ int main(int argc, char** argv) {
                     bool order = true;
                     for (uint32_t t = 0; t < cc::kBakeSettleTicks; ++t) order = order && cc::bakeDirAt(t, cc::kBakeDirsAll) == 0;
                     for (uint32_t d = 1; d < cc::kBakeDirs; ++d) order = order && cc::bakeDirAt(cc::kBakeSettleTicks + d, cc::kBakeDirsAll) == d;
-                    check(order, "the bake: the first direction waits for the room to go, then each has one tick");
+                    check(order, "the bake: each direction has one tick");
+                    bool round = true;
+                    for (uint32_t f = 0; f < 6; ++f)
+                        for (int a = 0; a < 5; ++a)
+                            for (int b2 = 0; b2 < 5; ++b2) {
+                                const float u = 0.1f + 0.2f * static_cast<float>(a), v = 0.1f + 0.2f * static_cast<float>(b2);
+                                float dir[3] = {};
+                                cc::cubeDirOf(f, u, v, dir);
+                                cc::CubeTexel tx;
+                                round = round && cc::cubeFaceOf(dir[0], dir[1], dir[2], &tx) && tx.face == f && std::fabs(tx.u - u) < 1e-5f && std::fabs(tx.v - v) < 1e-5f;
+                            }
+                    check(round, "the bake: a place on a face, to its direction and back");
+                    check(std::strstr(cc::cubeDirHlsl(), "float3 cubeDir(uint face, float2 uv)") != nullptr, "the bake: the direction's HLSL twin is there");
                     check(cc::bakeDirAt(cc::kBakeSettleTicks + 4 + cc::kBakeTailTicks, cc::kBakeDirsAll) == 4, "the bake: the last direction stays through the tail");
                     check(cc::bakeDirAt(0, 0x14u) == 2 && cc::bakeDirAt(cc::kBakeSettleTicks, 0x14u) == 2 && cc::bakeDirAt(cc::kBakeSettleTicks + 1, 0x14u) == 4, "the bake: directions left out are skipped");
                     check(cc::bakeParseDirs("11111") == cc::kBakeDirsAll && cc::bakeParseDirs("00001") == 0x10u && cc::bakeParseDirs("10100") == 0x5u, "the bake: the directions' key reads left to right");
@@ -3946,7 +3968,11 @@ int main(int argc, char** argv) {
                     check(cc::concourseJudge(true, true, true, 5.0f, 2.0f, false, false, true) == Judge::kCull, "the look: an allowed name close by is culled");
                     check(cc::concourseJudge(true, true, true, 5.0f, 130.0f, true, false, true) == Judge::kCull, "the look: the anchor and the hub are culled too");
                     check(cc::concourseJudge(true, false, true, 400.0f, 300.0f, false, false, true) == Judge::kKeepName, "the look: a name outside the list is kept");
-                    check(cc::concourseJudge(true, false, true, 5.0f, 2.0f, false, false, true) == Judge::kKeepName, "the look: and kept close by");
+                    check(cc::concourseJudge(true, false, true, 5.0f, 2.0f, false, false, true) == Judge::kCull, "the look: a small one close by is in the way, and culled");
+                    check(cc::concourseJudge(true, false, true, 100.0f, 50.0f, false, false, true) == Judge::kCull, "the look: and one that reaches within the limit");
+                    check(cc::concourseJudge(true, false, true, 200.0f, 50.0f, false, false, true) == Judge::kKeepName, "the look: past the limit it is kept");
+                    check(cc::concourseJudge(true, false, true, 5.0f, 300.0f, false, false, true) == Judge::kKeepName, "the look: a large one around the camera is kept, it may be the station");
+                    check(cc::concourseJudge(true, false, false, 0.0f, 0.0f, false, false, true) == Judge::kKeepName, "the look: a name with no sphere is kept");
                     check(cc::concourseJudge(false, false, true, 50.0f, 10.0f, false, false, true) == Judge::kCull, "the look: a small unnamed record in the room is culled");
                     check(cc::concourseJudge(false, false, true, 900.0f, 10.0f, false, false, true) == Judge::kKeepUnreadableName, "the look: a small unnamed record past the room is kept");
                     check(cc::concourseJudge(false, false, true, 50.0f, 400.0f, false, false, true) == Judge::kKeepUnreadableName, "the look: a large unnamed record is kept, it may be the station");

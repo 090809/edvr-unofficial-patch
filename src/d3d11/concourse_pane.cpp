@@ -92,6 +92,7 @@ std::atomic<float> g_bayOpacity{1.0f};
 std::atomic<bool> g_treatNow{false};      // treat fed, a mode other than off, and the replacement states made
 std::atomic<bool> g_withholdNow{false};   // withhold fed (the cull is on, the plain mirror phase): the mirror is marked; the mirror itself needs a mode other than off
 std::atomic<bool> g_effectsNow{false};    // the outside draws (smoke, trails, lasers, the planet) are not issued, whatever the mode: the plain phase, or the backdrop capture's lift (feed.effects)
+std::atomic<bool> g_washOffNow{false};    // TEMPORARY: the windows show the bake: the families marked washToo are not issued, the cull lifted or not
 std::atomic<bool> g_shareOn{false};       // measure fed and the query pool made
 std::atomic<ID3D11DeviceContext*> g_immediate{nullptr};   // not held: the device's immediate context, the one the binding shadow follows
 std::atomic<bool> g_capturing{false};     // a capture frame is open
@@ -1609,9 +1610,12 @@ bool makeBackdropShaders(ID3D11Device* device) noexcept {
         "    float3 dir;\n"
         "    float3 s = backdropS(i, dir);\n"
         "    float4 acc = lookup(s, glassB.x, 7.0);\n"
-        "    float3 base = acc.rgb * glassA.rgb + (1.0 - acc.a) * fb;\n"
+        // Flight 25: a hole took the window's level, and that is 4 on a skylight: white shapes where the bake left the room's things out. Colour over coverage takes the neighbours'
+        // colour instead, and only a direction with nothing near it falls back. The sheen is the level's colour at no more than 1, so a bright window is not a washed-out one.
+        "    float3 base = (acc.a > 0.02 ? acc.rgb / acc.a : fb) * glassA.rgb;\n"
+        "    float3 sheen = fb / max(max(fb.r, max(fb.g, fb.b)), 1.0);\n"
         "    float f = glassB.y * pow(saturate(1.0 - abs(dot(i.n * rsqrt(max(dot(i.n, i.n), 1e-12)), dir))), 5.0);\n"
-        "    return float4(lerp(base, fb, saturate(glassA.w + f)), 1.0);\n"
+        "    return float4(lerp(base, sheen, saturate(glassA.w + f)), 1.0);\n"
         "}\n";
     // Probe: the same direction and the same blur; a pixel whose composite coverage through lod 3 is under one half survives, and the occlusion count is those pixels.
     const std::string probe = head +
@@ -2152,26 +2156,29 @@ void ConcoursePaneScope::begin(ID3D11DeviceContext* ctx, UINT indexCount, UINT s
     const uint64_t ps = followed ? bindingShaderHash(BindSlot::Ps) : pixelShaderHash(ctx);
     const bool cullOn = g_effectsNow.load(std::memory_order_relaxed);   // the outside is not issued: the plain phase, or the backdrop capture's lift
     const bool sealedOn = g_withholdSealedNow.load(std::memory_order_relaxed);
-    if (cullOn || sealedOn) {
+    const bool washOff = g_washOffNow.load(std::memory_order_relaxed);
+    if (cullOn || sealedOn || washOff) {
         // The outside (smoke, trails, ship lasers, the planet) is not issued while the cull is on. By pixel shader on any context; by vertex shader too on the
         // immediate one, because a terrain patch has no pixel shader. Checked before `if (!ps) return`.
         int fam = cc::withheldPsIndex(ps);
         bool sealedToo = fam >= 0 && cc::kWithheldPs[fam].sealedToo;
+        bool washToo = fam >= 0 && cc::kWithheldPs[fam].washToo;
         if (fam < 0 && followed) {
             const int v = cc::withheldVsIndex(bindingShaderHash(BindSlot::Vs));
             if (v >= 0) {
                 fam = static_cast<int>(cc::kWithheldPsCount) + v;
                 sealedToo = cc::kWithheldVs[v].sealedToo;
+                washToo = cc::kWithheldVs[v].washToo;
             }
         }
-        if (fam >= 0 && (cullOn || sealedToo)) {
+        if (fam >= 0 && (cullOn || (sealedOn && sealedToo) || (washOff && washToo))) {
             withheld_ = true;
             g_withheld.fetch_add(1, std::memory_order_relaxed);
             g_withheldFam[fam].fetch_add(1, std::memory_order_relaxed);
             return;
         }
         // The glows that may also be the room's: their far pixels are dropped by the mark (concourse_cull_core.h, farLimitedPs). Immediate context only, as the mark is.
-        if (!cullOn) return;   // sealed: nothing below is for a sealed hangar
+        if (!cullOn && !washOff) return;   // sealed: nothing below is for a sealed hangar
         if (followed && g_withholdNow.load(std::memory_order_relaxed) && cc::farLimitedPs(ps)) {   // the plain phase only: the capture's lift draws the room's far glows
             if (ensureMarked(ctx, calls)) {
                 UINT ref = 0;
@@ -2944,6 +2951,7 @@ void updateArmed() noexcept {
     const bool sealed = g_feedSealed.load(std::memory_order_relaxed);
     g_withholdNow.store(withhold, std::memory_order_release);
     g_effectsNow.store(effects, std::memory_order_release);
+    g_washOffNow.store(treat && mode == kModeBackdrop && g_bakeBaked.load(std::memory_order_acquire), std::memory_order_release);
     g_withholdSealedNow.store(sealed, std::memory_order_release);
     detail::g_concoursePaneArmed.store(treat || effects || sealed || shares || g_capturing.load(std::memory_order_relaxed) || g_bdArmed.load(std::memory_order_relaxed), std::memory_order_release);
 }
@@ -3142,8 +3150,10 @@ std::atomic<bool> g_bakeCapturing{false};
 std::atomic<bool> g_bakeWantPrepare{false};
 std::atomic<bool> g_bakeHoldSave{false};       // each Present keeps the back buffer
 std::atomic<bool> g_bakeHoldShow{false};       // each Present puts the kept image back
-bool g_bakeArmedNow = false, g_bakeReady = false, g_bakeReleasing = false, g_bakeHeldValid = false, g_bakeAtCentre = false, g_bakeSaidRefused = false;
+bool g_bakeArmedNow = false, g_bakeReady = false, g_bakeReleasing = false, g_bakeHeldValid = false, g_bakeAtCentre = false, g_bakeSaidRefused = false, g_bakeLastSeen = false;
 float g_bakeCentre[3] = {};
+float g_bakeLastFwd[3] = {};                   // where the last direction looks: its arrival ends the bake
+float g_bakeCapFwd[3] = {};                    // the last frame captured: a frame looking the same way adds nothing
 float g_bakeNearM = cc::kBakeNearDefaultM;
 uint32_t g_bakeCaps = 0, g_bakeSeenAtCentre = 0, g_bakeSeenAway = 0, g_bakeHoldPresents = 0, g_bakeReleaseTicks = 0, g_bakeHeldW = 0, g_bakeHeldH = 0;
 uint64_t g_bakeHoldStartMs = 0;
@@ -3153,12 +3163,15 @@ ID3D11ComputeShader* g_csBake = nullptr;
 ID3D11Buffer* g_cbBake = nullptr;
 ID3D11Texture2D* g_bakeHeld = nullptr;
 struct BakeConstants {
-    float inv[16];     // clip over w to the position relative to the camera
+    float m[16];       // the position relative to the camera to clip: the frame's own camera rows
+    float inv[16];     // clip over w back to that position
     float rel[4];      // the camera less the origin
     float size[4];     // width, height, the near limit, the far limit
 };
 
-// One pixel a thread: its ray and its hit from the inverse of the frame's own camera rows, whatever the camera is, into the texel of the cube that direction from the origin names.
+// One cube texel a thread, not one pixel: where its direction falls in this frame, from the frame's own camera rows, and what is there. Every texel the frame covers gets a colour, so no
+// holes are left for the mips to fill (Flight 25: a forward splat of 1080p across 90 degrees filled about one in four). The camera is at the origin in these frames, so a texel's direction
+// from the camera is its direction from the origin. A point nearer than the near limit is the room's, and the texel keeps whatever another frame gave it.
 bool bakeMakeCompute(ID3D11Device* device) noexcept {
     if (g_bakeDevice != device) {
         if (g_csBake) g_csBake->Release();
@@ -3178,30 +3191,28 @@ bool bakeMakeCompute(ID3D11Device* device) noexcept {
             if (mod) compile = reinterpret_cast<PfnCompile>(GetProcAddress(mod, "D3DCompile"));
         }
         if (!compile) return bdRefuse("the bake: d3dcompiler_47.dll was not found");
-        const std::string hlsl = std::string(cc::cubeTexelHlsl()) +
-            "cbuffer C : register(b0) { row_major float4x4 inv; float4 rel; float4 size; };\n"
+        const std::string hlsl = std::string(cc::cubeDirHlsl()) +
+            "cbuffer C : register(b0) { row_major float4x4 m; row_major float4x4 inv; float4 rel; float4 size; };\n"
             "Texture2D<float4> scene : register(t0);\n"
             "Texture2D<float> sceneDepth : register(t1);\n"
+            "SamplerState smp : register(s0);\n"
             "RWTexture2DArray<float> distCube : register(u0);\n"
             "RWTexture2DArray<float4> cube : register(u1);\n"
-            "[numthreads(16, 16, 1)]\n"
+            "[numthreads(32, 32, 1)]\n"
             "void main(uint3 id : SV_DispatchThreadID) {\n"
-            "    if (id.x >= (uint)size.x || id.y >= (uint)size.y) return;\n"
-            "    float2 ndc = float2((id.x + 0.5) / size.x * 2.0 - 1.0, 1.0 - (id.y + 0.5) / size.y * 2.0);\n"
-            "    float4 a = mul(inv, float4(ndc, 1.0, 1.0));\n"
-            "    float3 p = a.xyz / a.w;\n"
-            "    float dl = dot(p, p);\n"
-            "    if (dl < 1e-12) return;\n"
-            "    float3 dir = p * rsqrt(dl);\n"
-            "    float z = sceneDepth.Load(int3(id.xy, 0));\n"
+            "    float3 d = normalize(cubeDir(id.z, (float2(id.xy) + 0.5) / " + std::to_string(cc::kBackdropCubeSize) + ".0));\n"
+            "    float4 c = mul(m, float4(d, 0.0));\n"
+            "    if (c.w <= 1e-4) return;\n"
+            "    float2 ndc = c.xy / c.w;\n"
+            "    if (abs(ndc.x) >= 1.0 || abs(ndc.y) >= 1.0) return;\n"
+            "    float2 uv = float2(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);\n"
+            "    float z = sceneDepth.Load(int3(uv * size.xy, 0));\n"
             "    float t = size.w;\n"
             "    if (z > 0.0) { float4 b = mul(inv, float4(ndc, z, 1.0)); t = min(length(b.xyz / b.w), size.w); }\n"
-            "    float3 r = rel.xyz + dir * t;\n"
-            "    float rl = length(r);\n"
+            "    float rl = length(rel.xyz + d * t);\n"
             "    if (!(rl > size.z)) return;\n"
-            "    uint3 tx = cubeTexel(r, " + std::to_string(cc::kBackdropCubeSize) + "u);\n"
-            "    cube[tx] = float4(clamp(scene.Load(int3(id.xy, 0)).rgb, 0.0, 60000.0), 1.0);\n"
-            "    distCube[tx] = clamp(rl, 1.0, size.w);\n"
+            "    cube[id] = float4(clamp(scene.SampleLevel(smp, uv, 0.0).rgb, 0.0, 60000.0), 1.0);\n"
+            "    distCube[id] = clamp(rl, 1.0, size.w);\n"
             "}\n";
         ID3DBlob* code = nullptr;
         ID3DBlob* errors = nullptr;
@@ -3288,6 +3299,8 @@ bool concoursePaneBakeBegin(const float centre[3], float nearM) noexcept {
     for (int k = 0; k < 3; ++k) g_bakeCentre[k] = centre[k];
     g_bakeNearM = nearM;
     g_bakeCaps = g_bakeSeenAtCentre = g_bakeSeenAway = g_bakeHoldPresents = g_bakeReleaseTicks = 0;
+    g_bakeLastSeen = false;
+    for (float& v : g_bakeCapFwd) v = 0.0f;
     g_bakeAtCentre = false;
     g_bakeReleasing = false;
     g_bakeSaidRefused = false;
@@ -3308,6 +3321,12 @@ bool concoursePaneBakeBegin(const float centre[3], float nearM) noexcept {
                     static_cast<double>(nearM), g_bakeHeldValid ? "is held" : "IS NOT THERE: no hold");
     return true;
 }
+
+void concoursePaneBakeExpectLast(const float forward[3]) noexcept {
+    for (int k = 0; k < 3; ++k) g_bakeLastFwd[k] = forward[k];
+}
+
+bool concoursePaneBakeLastSeen() noexcept { return g_bakeLastSeen; }
 
 void concoursePaneBakeFinish() noexcept {
     g_bakeCapturing.store(false, std::memory_order_release);
@@ -3356,11 +3375,15 @@ void concoursePaneBakeFrame(ID3D11DeviceContext* ctx, ID3D11ShaderResourceView* 
     }
     ++g_bakeSeenAtCentre;
     if (!g_bakeCapturing.load(std::memory_order_acquire)) return;
+    // Clip w is the position along the view's forward axis, so these are where this frame looks.
+    const float fw[3] = {camera[0][3], camera[1][3], camera[2][3]};
+    if (fw[0] * g_bakeCapFwd[0] + fw[1] * g_bakeCapFwd[1] + fw[2] * g_bakeCapFwd[2] > 0.9999f) return;   // the same direction as the last one captured
     ID3D11UnorderedAccessView* uav[2] = {g_bdDistBackUav.load(std::memory_order_acquire), g_bdBackUav.load(std::memory_order_acquire)};
-    if (!ctx || !color || !depth || !g_csBake || !g_cbBake || !uav[0] || !uav[1] || width == 0 || height == 0) {
+    ID3D11SamplerState* smp = g_bdSampler.load(std::memory_order_acquire);
+    if (!ctx || !color || !depth || !g_csBake || !g_cbBake || !uav[0] || !uav[1] || !smp || width == 0 || height == 0) {
         if (!g_bakeSaidRefused) {
             g_bakeSaidRefused = true;
-            Log::get().note("concourse bake: a frame refused: colour %d depth %d shader %d cubes %d, %ux%u", color ? 1 : 0, depth ? 1 : 0, g_csBake ? 1 : 0, uav[0] && uav[1] ? 1 : 0, width, height);
+            Log::get().note("concourse bake: a frame refused: colour %d depth %d shader %d cubes %d sampler %d, %ux%u", color ? 1 : 0, depth ? 1 : 0, g_csBake ? 1 : 0, uav[0] && uav[1] ? 1 : 0, smp ? 1 : 0, width, height);
         }
         return;
     }
@@ -3376,7 +3399,10 @@ void concoursePaneBakeFrame(ID3D11DeviceContext* ctx, ID3D11ShaderResourceView* 
         return;
     }
     BakeConstants k{};
-    for (int i = 0; i < 16; ++i) k.inv[i] = static_cast<float>(inv[i]);
+    for (int i = 0; i < 16; ++i) {
+        k.m[i] = static_cast<float>(m[i]);
+        k.inv[i] = static_cast<float>(inv[i]);
+    }
     k.rel[0] = dx;
     k.rel[1] = dy;
     k.rel[2] = dz;
@@ -3390,26 +3416,33 @@ void concoursePaneBakeFrame(ID3D11DeviceContext* ctx, ID3D11ShaderResourceView* 
         ID3D11ShaderResourceView* oldSrv[2] = {};
         ID3D11UnorderedAccessView* oldUav[2] = {};
         ID3D11Buffer* oldCb = nullptr;
+        ID3D11SamplerState* oldSmp = nullptr;
         ctx->CSGetShader(&oldCs, nullptr, nullptr);
         ctx->CSGetShaderResources(0, 2, oldSrv);
         ctx->CSGetUnorderedAccessViews(0, 2, oldUav);
         ctx->CSGetConstantBuffers(0, 1, &oldCb);
+        ctx->CSGetSamplers(0, 1, &oldSmp);
         ctx->UpdateSubresource(g_cbBake, 0, nullptr, &k, 0, 0);
         ID3D11ShaderResourceView* srv[2] = {color, depth};
         ctx->CSSetShader(g_csBake, nullptr, 0);
         ctx->CSSetConstantBuffers(0, 1, &g_cbBake);
+        ctx->CSSetSamplers(0, 1, &smp);
         ctx->CSSetShaderResources(0, 2, srv);
         ctx->CSSetUnorderedAccessViews(0, 2, uav, nullptr);
-        ctx->Dispatch((width + 15u) / 16u, (height + 15u) / 16u, 1);
+        ctx->Dispatch(cc::kBackdropCubeSize / 32u, cc::kBackdropCubeSize / 32u, 6);
         ctx->CSSetShader(oldCs, nullptr, 0);
         ctx->CSSetConstantBuffers(0, 1, &oldCb);
+        ctx->CSSetSamplers(0, 1, &oldSmp);
         ctx->CSSetShaderResources(0, 2, oldSrv);
         ctx->CSSetUnorderedAccessViews(0, 2, oldUav, nullptr);
         if (oldCs) oldCs->Release();
         if (oldCb) oldCb->Release();
+        if (oldSmp) oldSmp->Release();
         for (auto* p : oldSrv) if (p) p->Release();
         for (auto* p : oldUav) if (p) p->Release();
     }
+    for (int i = 0; i < 3; ++i) g_bakeCapFwd[i] = fw[i];
+    if (fw[0] * g_bakeLastFwd[0] + fw[1] * g_bakeLastFwd[1] + fw[2] * g_bakeLastFwd[2] > 0.999f) g_bakeLastSeen = true;
     ++g_bakeCaps;
     if (g_bakeCaps <= 16) {
         const float sy = std::sqrt(camera[0][1] * camera[0][1] + camera[1][1] * camera[1][1] + camera[2][1] * camera[2][1]);

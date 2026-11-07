@@ -216,6 +216,8 @@ void concoursePaneQueueToast(const char* text) noexcept;   // TEMPORARY: the cam
 // mode becomes the captured view; the hold ends when the resolve sees the camera back. Cancel ends it with nothing published.
 void concoursePaneBakeArm(bool on) noexcept;
 bool concoursePaneBakeBegin(const float centre[3], float nearM) noexcept;   // false when the cube was not ready: the frames still move, nothing is captured or held
+void concoursePaneBakeExpectLast(const float forward[3]) noexcept;          // where the last direction looks: its arrival at the resolve is the end of the bake
+bool concoursePaneBakeLastSeen() noexcept;
 void concoursePaneBakeFinish() noexcept;
 void concoursePaneBakeCancel() noexcept;
 // From the flat runtime, with what the resolve is about to read: the scene's colour and depth before the visor and the HUD, and b1[270..275]. One relaxed load when no bake runs.

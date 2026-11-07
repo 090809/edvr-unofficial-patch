@@ -274,6 +274,7 @@ std::atomic<bool> g_concWanted{false};        // armed, on foot in social space 
 std::atomic<bool> g_concActive{false};        // the cull runs: wanted, the key or its override on, and the anchor seen within kConcAnchorFreshMs
 std::atomic<bool> g_camLookOn{false};         // TEMPORARY (the camera test): the look is on: the judgement is the keep list inside out (cc::concourseJudge); published in the snapshot as `look`, part of g_concActive
 int g_camLookGraceTicks = 0;                  // TEMPORARY: ticks after the look in which a big camera step is its own way back, not another room
+bool g_camLookSurvey = false;                 // TEMPORARY: the names survey was taken in the look: its report lists what is near the room's centre and still kept
 std::atomic<bool> g_liftGateOn{false};       // the tick's: the lift gate is on, the player is in a shut lift cabin (published in the snapshot as `lift`; part of g_concActive)
 std::atomic<bool> g_concSurveyArmed{false};   // the one-shot names are being gathered: the rig and producer vetoes forward so the store judges and names every record
 bool g_roomCutPending = false;   // the camera stepped over kRoomCutM this tick (resolveTickView); the concourse tick takes it, under the state lock
@@ -3502,6 +3503,16 @@ void concourseSurveyReport(bool listCulled) {
     Log::get().note("concourse names: survey over 2 frames: %u kept names, %u culled names, %u small-close names, %u unreadable-sphere names, %u culled records within %.0f m",
                     static_cast<unsigned>(kept.size()), static_cast<unsigned>(culled.size()), static_cast<unsigned>(smallClose.size()),
                     static_cast<unsigned>(unreadSphere.size()), static_cast<unsigned>(close.size()), static_cast<double>(kSurveyCloseM));
+    if (g_camLookSurvey) {   // TEMPORARY: what could still stand in the bake's way: every name kept within 200 m of the room's centre, with the centre as the distance
+        Log::get().note("concourse names: the survey above was taken in the look or the bake: the camera is at the room's centre");
+        uint32_t listed = 0;
+        for (size_t i = 0; i < kept.size() && listed < 200; ++i) {
+            if (kept[i].nearest - kept[i].r > 200.0f) continue;
+            Log::get().note("concourse names: kept near the centre %s x%u r=%.1f nearest=%.1f", kept[i].name.c_str(), kept[i].n, static_cast<double>(kept[i].r), static_cast<double>(kept[i].nearest));
+            ++listed;
+        }
+        g_camLookSurvey = false;
+    }
     for (size_t i = 0; i < kept.size() && i < 80; ++i)
         Log::get().note("concourse names: kept %s x%u r=%.1f nearest=%.1f", kept[i].name.c_str(), kept[i].n, static_cast<double>(kept[i].r),
                         static_cast<double>(kept[i].nearest));
@@ -4057,6 +4068,13 @@ void walkSurveyTick(uint64_t now, bool camIn) {
     }
 }
 
+// TEMPORARY (the bake): where direction d looks, along the room's axes (cc::bakeDirAt): 0 +a2, 1 -a2, 2 +a0, 3 -a0, 4 up.
+void bakeForward(const float axes[3][3], uint32_t d, float out[3]) noexcept {
+    const float* a = axes[d < 2 ? 2 : d < 4 ? 0 : 1];
+    const float sign = d == 1 || d == 3 ? -1.0f : 1.0f;
+    for (int k = 0; k < 3; ++k) out[k] = a[k] * sign;
+}
+
 // The tick, under the state lock, before the store gate is set (storeHookGate reads g_concWanted).
 void concourseTick(uint64_t now, uint32_t frame) {
     g_concSettingOffLogged = false;
@@ -4126,8 +4144,8 @@ void concourseTick(uint64_t now, uint32_t frame) {
             g_camMode = 0;
         }
         const bool baking = g_camMode == cc::kCamTestModeBake;
-        // The bake ends by its frame count, not the clock: one tick a frame.
-        if (g_camTimer.active() && baking && camWasActive && g_camBakeTick >= cc::bakeTicks(g_camBakeMask)) {
+        // The bake ends when its last direction reaches the resolve, or by its frame count if that never comes; not by the clock.
+        if (g_camTimer.active() && baking && camWasActive && (concoursePaneBakeLastSeen() || g_camBakeTick >= cc::bakeTicks(g_camBakeMask))) {
             g_camTimer.stop();
             camEnd = cc::CamTestEnd::kDone;
         }
@@ -4144,15 +4162,19 @@ void concourseTick(uint64_t now, uint32_t frame) {
         else if (!camWasActive) {
             g_camLookValid = anchor && concourseAnchorFrame(g_camLookCentre, g_camLookAxes);
             g_camBakeTick = 0;
-            if (baking && g_camLookValid) concoursePaneBakeBegin(g_camLookCentre, g_camBakeNear);
+            if (baking && g_camLookValid) {
+                concoursePaneBakeBegin(g_camLookCentre, g_camBakeNear);
+                float last[3] = {};
+                bakeForward(g_camLookAxes, cc::bakeDirAt(cc::bakeTicks(g_camBakeMask), g_camBakeMask), last);
+                concoursePaneBakeExpectLast(last);
+            }
         }
         lookOn = acting && g_camLookValid;
         if (lookOn && baking) {
             // The room's own axes, in the order cc::bakeDirAt names them. A view along the room's up takes the room's axes[2] as its own up.
             const uint32_t d = cc::bakeDirAt(g_camBakeTick++, g_camBakeMask);
-            const float* a = g_camLookAxes[d < 2 ? 2 : d < 4 ? 0 : 1];
-            const float sign = d == 1 || d == 3 ? -1.0f : 1.0f;
-            const float forward[3] = {a[0] * sign, a[1] * sign, a[2] * sign};
+            float forward[3] = {};
+            bakeForward(g_camLookAxes, d, forward);
             concourseCameraTestAim(g_camLookCentre, forward, g_camLookAxes[d == 4 ? 2 : 1], cc::kBakeFovRad);
         } else if (lookOn) {
             concourseCameraTestLook(g_camLookCentre, g_camLookAxes[1], cc::camTestLookDir(now - g_camTimer.startMs()));
@@ -4205,6 +4227,11 @@ void concourseTick(uint64_t now, uint32_t frame) {
     if (lookOn != g_camLookWasOn) {
         bumpRigEpoch();
         if (!lookOn) g_camLookGraceTicks = 12;
+        else {
+            // The names, once the camera is at the centre: the first frame there comes about 50 ms after the first write (Flight 25).
+            g_concSurveyDueMs = now + 60;
+            g_camLookSurvey = true;
+        }
         g_camLookWasOn = lookOn;
     }
     g_camLookOn.store(lookOn, std::memory_order_release);

@@ -85,15 +85,16 @@ constexpr float kLiftKeepM = 8.0f;
 // anchor and the hub (`farExempt`, computed from the name by the caller) are kept however far. Then: keep an unreadable sphere (not finite, or no radius); keep a
 // small, close record; cull. `lift` (the player is in a shut lift cabin) replaces all of that by the rule above kLiftKeepM; `farExempt` does not apply to it.
 // `look` (TEMPORARY, the camera test) is the keep list turned inside out, what a bake would want: the room off and the rest on. An allowed name is culled however far, the anchor and
-// the hub included. An unreadable name is the room's when it is small and reaches within kAllowedFarM of the camera, which is at the room's centre then (INFERRED); it is kept otherwise.
-constexpr float kLookRoomRadiusM = 60.0f;
+// the hub included. An unreadable name is the room's when it is small and reaches within kAllowedFarM of the camera, which is at the room's centre then (INFERRED). Any other name is the
+// room's when it is small and reaches within kLookReachM: Flight 25's gaps were walkways, doors, panels and people hanging in the bake's way, which a depth filter can only leave out, with
+// nothing behind them, since the bake sees from one place. Not drawn, what is behind them is captured. A large record is kept: it may be the station.
+constexpr float kLookRoomRadiusM = 60.0f, kLookReachM = 60.0f;
 inline Judge concourseJudge(bool nameReadable, bool allowed, bool sphereReadable, float distance, float radius, bool farExempt, bool lift = false, bool look = false) noexcept {
     const bool sphereOk = sphereReadable && std::isfinite(distance) && std::isfinite(radius) && radius > 0.0f;
     if (look) {
         if (allowed) return Judge::kCull;
-        if (nameReadable) return Judge::kKeepName;
-        if (sphereOk && radius <= kLookRoomRadiusM && distance - radius <= kAllowedFarM) return Judge::kCull;
-        return Judge::kKeepUnreadableName;
+        if (sphereOk && radius <= kLookRoomRadiusM && distance - radius <= (nameReadable ? kLookReachM : kAllowedFarM)) return Judge::kCull;
+        return nameReadable ? Judge::kKeepName : Judge::kKeepUnreadableName;
     }
     if (lift) {
         if (!sphereOk) return Judge::kKeepUnreadableSphere;
@@ -149,10 +150,13 @@ constexpr uint64_t kTwinPs = 0x34A1475B2C790DFAull;
 // the stars (68DDDEF0, F7A6E916), the dust (E904D334). Beams, flares and the scatter are non-indexed draws, so the plain draw thunks carry the scope too.
 // sealedToo: also withheld while the hangar is sealed (fix.optimized_stations): it can only be outside. Not so for what a hangar may draw itself: flares, the scatter,
 // the particle batches and an engine glow (its own ship's on the pad); no census has been taken in a sealed hangar yet to say otherwise.
+// washToo: also withheld while the windows show the bake, the cull lifted or not. The scatter is a wash over the whole screen, room included. When the cull lifted at the bay it came back in
+// one frame (Flight 25's second clip, Sean: "anything we can do to make this blend better?"), and the bake has none in it, so the room and the windows jumped together.
 struct WithheldFamily {
     uint64_t hash;
     const char* name;
     bool sealedToo = false;
+    bool washToo = false;
 };
 constexpr WithheldFamily kWithheldPs[] = {
     {0x3B0B38CD96F53BC1ull, "plume", true},
@@ -169,7 +173,7 @@ constexpr WithheldFamily kWithheldPs[] = {
     {0x97DBC87FCAA429C4ull, "atmosphere quad B", true},
     {0xD56F859BE4781431ull, "flares"},
     {0x43E5E6EB67AC751Bull, "planet surface", true},
-    {0x41152F82C6E8BE1Full, "scatter"},               // VS AFFEF018: fullscreen, additive, no depth test, reads only the depth
+    {0x41152F82C6E8BE1Full, "scatter", false, true},  // VS AFFEF018: fullscreen, additive, no depth test, reads only the depth
     {0x2BAE3742FEB916D9ull, "particles A"},           // VS AFBCD3AD, 9F4BBCFC (docs\billboard-root-cause-2026-10-16.md)
     {0x3789CA2062E196FBull, "particles B"},           // VS 9AEC596A
     {0xE54F2A902E5631F6ull, "particles C"},           // VS BBAD1CA8
@@ -605,11 +609,12 @@ inline const char* camTestModeName(uint32_t m) noexcept {
         default: return "off";
     }
 }
-// The bake's plan (TEMPORARY): one tick a frame. The first direction is repeated while the room's rigs go (a later frame overwrites an earlier one, so a frame that still held them
-// does no harm), each other direction has one tick, and the last is held while the frames already asked for arrive: a write takes about 3 frames to reach the resolve (Flight 24).
+// The bake's plan (TEMPORARY): one tick a frame, one tick a direction, and the last is held while the frames already asked for arrive. A write takes about 4 frames to reach the
+// resolve (Flight 25: the first capture 51 ms after the first write), by which time the room's rigs have gone, so no frame waits for them. The bake ends when the last direction is
+// seen to arrive; kBakeTailTicks is only the limit on that.
 // The directions are the room's own axes (the anchor's: 0 is axes[2], 2 is axes[0], 4 is axes[1], up), so the same ones serve every visit to this room: 0 +a2, 1 -a2, 2 +a0, 3 -a0, 4 up.
 // Straight down is not one of them: Flight 24's look that way was stars through the floor, and no window faces it.
-constexpr uint32_t kBakeDirs = 5, kBakeSettleTicks = 3, kBakeTailTicks = 4, kBakeDirsAll = 0x1Fu;
+constexpr uint32_t kBakeDirs = 5, kBakeSettleTicks = 0, kBakeTailTicks = 8, kBakeDirsAll = 0x1Fu;
 constexpr float kBakeFovRad = 1.5707963f;      // camera+0x260, the vertical field of view in radians (READ, 0x4F30F0): 90 degrees, so about 121 across at 16:9, and these directions overlap
 constexpr float kBakeNearDefaultM = 50.0f, kBakeNearMinM = 5.0f, kBakeNearMaxM = 400.0f;   // diag.concourse_bake_near: a captured point nearer the centre than this is the room's
 inline uint32_t bakeDirCount(uint32_t mask) noexcept {
@@ -801,6 +806,29 @@ inline const char* cubeTexelHlsl() noexcept {
            "    float2 uv = 0.5 * (float2(sc, tc) / max(ma, 1e-20) + 1.0);\n"
            "    uint2 xy = min((uint2)(uv * (float)size), uint2(size - 1, size - 1));\n"
            "    return uint3(xy, face);\n"
+           "}\n";
+}
+// The reverse (TEMPORARY, the bake): the direction of a place on a face, with u and v from 0 to 1, not normalised. cubeFaceOf of it gives the same face, u and v back. And its HLSL twin.
+inline void cubeDirOf(uint32_t face, float u, float v, float out[3]) noexcept {
+    const float sc = 2.0f * u - 1.0f, tc = 2.0f * v - 1.0f;
+    switch (face) {
+        case 0: out[0] = 1.0f; out[1] = -tc; out[2] = -sc; break;
+        case 1: out[0] = -1.0f; out[1] = -tc; out[2] = sc; break;
+        case 2: out[0] = sc; out[1] = 1.0f; out[2] = tc; break;
+        case 3: out[0] = sc; out[1] = -1.0f; out[2] = -tc; break;
+        case 4: out[0] = sc; out[1] = -tc; out[2] = 1.0f; break;
+        default: out[0] = -sc; out[1] = -tc; out[2] = -1.0f; break;
+    }
+}
+inline const char* cubeDirHlsl() noexcept {
+    return "float3 cubeDir(uint face, float2 uv) {\n"
+           "    float sc = 2.0 * uv.x - 1.0, tc = 2.0 * uv.y - 1.0;\n"
+           "    if (face == 0) return float3(1.0, -tc, -sc);\n"
+           "    if (face == 1) return float3(-1.0, -tc, sc);\n"
+           "    if (face == 2) return float3(sc, 1.0, tc);\n"
+           "    if (face == 3) return float3(sc, -1.0, -tc);\n"
+           "    if (face == 4) return float3(sc, -tc, 1.0);\n"
+           "    return float3(-sc, -tc, -1.0);\n"
            "}\n";
 }
 // ---- The backdrop's distance (PROTOTYPE, docs\concourse-cull-2026-11-05.md): where the captured view is taken to be --------------------------------------
