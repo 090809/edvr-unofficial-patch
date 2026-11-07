@@ -3912,8 +3912,15 @@ void testFlatWrapperNoteWiring() {
     struct Pin { const std::string* text; const char* needle; unsigned times; const char* what; };
     const Pin pins[] = {
         {&proxyCpp, "#include \"flat_wrapper_note.h\"", 1, "the probe takes the decision from its header"},
-        {&proxyCpp, "edvr::vtableDominantOtherModule(vt, kSample, g_systemModule, owner, sizeof(owner))", 1,
+        {&proxyCpp, "edvr::vtableDominantOtherModule(vt, kSample, systemModule, owner, sizeof(owner))", 1,
          "the probe asks which module backs the methods, excluding Windows' d3d11.dll"},
+        // The module those two calls and the count read is the one probeSystemModule checked by path (src\common\system_d3d11.h),
+        // never the handle LoadLibrary returned in DllMain: a hook on LoadLibraryExW can answer that with another module, and the
+        // probe then read 0 of 96 for a context whose methods were all Windows' own (docs\windows-d3d11-system-module-2026-11-07.md).
+        {&proxyCpp, "HMODULE const systemModule = probeSystemModule();", 1,
+         "the probe takes Windows' d3d11.dll from probeSystemModule, which checks it by path, not from the DllMain handle"},
+        {&proxyCpp, "edvr::vtableEntriesInModule(vt, kSample, systemModule)", 1,
+         "and counts the context's entries against that module"},
         {&proxyCpp, "flatWrapperFile(mode, probed, owner)", 1, "and lets the header decide from the mode it used and what it alone chose"},
         {&proxyCpp, "g_wrapperFileSet.store(true, std::memory_order_release);", 1, "the name is published once, after it is written"},
         {&proxyCpp, "const char* contextWrapperFile() {", 1, "and read back through one accessor"},

@@ -1146,6 +1146,21 @@ if errorlevel 1 ( echo [edvr] ERROR: format_support_test build failed & exit /b 
 "%OBJ%\formatsupport\format_support_test.exe" --self-test || exit /b 1
 exit /b 0
 
+:rig_system_module_test
+REM The system d3d11.dll check (src\common\system_d3d11.h chooseSystemD3D11 and its walk of the module list,
+REM which src\d3d11\d3d11_proxy.cpp's probeSystemModule hands to the context probe and slot reclaim): a decoy
+REM d3d11.dll mapped first, as a hook on LoadLibraryExW would leave it, and the chooser asked for Windows' own.
+REM Built outside %BUILD%, where it can only ever load System32's d3d11.dll, never the proxy beside the game DLLs.
+if not exist "%OBJ%\system_module" mkdir "%OBJ%\system_module"
+%CC% /nologo /O2 /MT /std:c++17 /EHsc /W4 /DWIN32_LEAN_AND_MEAN /DNOMINMAX ^
+    /D_CRT_SECURE_NO_WARNINGS /Isrc\common /Fo"%OBJ%\system_module\\" ^
+    /Fe"%OBJ%\system_module\system_module_test.exe" ^
+    "tools\system_module_test\system_module_test.cpp" ^
+    /link /INCREMENTAL:NO kernel32.lib
+if errorlevel 1 ( echo [edvr] ERROR: system_module_test build failed & exit /b 1 )
+"%OBJ%\system_module\system_module_test.exe" --dry-run || exit /b 1
+"%OBJ%\system_module\system_module_test.exe" --self-test || exit /b 1
+exit /b 0
 :rig_native_temporal_test
 echo [edvr] === native_temporal_test.exe ===
 if not exist "%OBJ%\native_temporal" mkdir "%OBJ%\native_temporal"
