@@ -2,9 +2,9 @@
 
 ## Status
 
-- **State (2026-11-07): Phase 1 slice FLOWN ONCE, world class failing** (fork
-  `framegen-phase1`; "flight 1" entry). In flight the world warp scores worse
-  than no warp; an instrumented build is next. Design from OFXR-Bridge
+- **State (2026-11-07): Phase 1 slice FLOWN TWICE, world class failing** (fork
+  `framegen-phase1`; "flight 2" entry). In flight the world warp scores worse
+  than no warp, with the true transform too; W1, W2 ruled out. Design from OFXR-Bridge
   `d7fcca72` and EDVR `6b8ef374`. No issue yet.
 - **Recommendation:** take OFXR-Bridge's frame loop, not its synthesizer. Elite
   renders at half the headset rate and EDVR's runtime presents every display
@@ -49,9 +49,9 @@
 - **Phase 0 (no EDVR code):** fly stock OFXR-Bridge and VectorXR (colour-only
   routes) over EDVR at a bright settlement and in space, with each runtime's
   own smoothing off and then on. This is the visual reference to beat.
-- **Next flight: Phase 1, measure only:** the world class's W1-W3 (oracle,
-  frame intervals; "flight 1" entry). H1, H8, H9 and the surface classifier
-  are still unbuilt.
+- **Next flight: Phase 1, measure only:** the world class's W3 (scored with
+  the DLSS vectors and at B's own depth; "flight 2" entry). H1, H8, H9 and
+  the surface classifier are still unbuilt.
 - **Temporary key (built 2026-11-07, hidden):** `fix.frame_generation_shadow`
   (off | on), Phase 1 only. The user key `fix.frame_generation` (off | auto)
   comes with Phase 2. Its `on` value (forced, ignoring the gate's performance
@@ -982,3 +982,26 @@ luma x 1024, p95 warped / p95 unwarped (`id:`).
     the shader against a CPU reference with the same convention, so it
     cannot catch this). Signature: scoring with B's true world delta (an
     oracle) is still worse than no warp.
+
+### 2026-11-07: Phase 1, flight 2 (v0.22.0-rc.7-30-g9870da64)
+
+Same site, low flight about 1-2 m a frame (`motion_mm` median to 2000),
+45 fps; celestial motion gated off (not supercruise), so the DLSS vectors'
+world path is the camera rows' `[W | tvCam]`, the oracle's own transform.
+
+- **The oracle is as bad as the prediction:** world p95 459-545 both ways
+  (no warp 136-324), mean 78-87 against 29-55, 30-36% of world cells over
+  0.02; median 4. Far and cockpit stay clean.
+- ruled out: W1 (per-frame vs per-second), because `rig_dt_mm` is larger
+  than `rig_mm` in every flying second (e.g. 103 against 57 mm): Elite's
+  step is per frame, and `dt_ratio` 0.8-1.2 is CPU jitter, not sim time.
+- ruled out: W2 (A two frames back), because `mag_ratio` p5/p50/p95 stays
+  about 0.85/1.00/1.15 in flight.
+- ruled out: the prediction as the world class's cause, because the oracle
+  (B's measured transform) scores the same as the prediction.
+- **Open:** W3 narrowed: either the scorer's pipeline (capture, pairing,
+  forward splat) is wrong under translation, or the rows' world transform
+  is not the terrain's image motion and the DLSS vectors carry the same
+  error. Discriminator: score B backward with the DLSS motion vectors and
+  with the true transform at B's own depth (no splat), and log how far the
+  two land apart.
