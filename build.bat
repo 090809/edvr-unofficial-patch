@@ -2161,6 +2161,22 @@ if errorlevel 1 ( echo [edvr] ERROR: framegen_synth_test build failed & exit /b 
 "%OBJ%\framegensynth\framegen_synth_test.exe" --self-test || exit /b 1
 exit /b 0
 
+:rig_framegen_synth_bench
+echo [edvr] === framegen_synth_bench.exe ===
+REM The offline tool that runs the frame-generation synthesizer (fix.frame_generation_shadow, TEMPORARY) on the hardware GPU: --bench times every pass, --replay scores a captured
+REM fgreplay folder like the in-game f = 1 score. It compiles the production shader text (frameGenSynthShaderSource) and fills the constant block with the production helpers, so
+REM it needs no generated header. The gate runs only --self-test: the format reader and writer, the constant block against the production fill, and a synthetic capture replayed
+REM and a tiny bench on WARP (the GPU parts are skipped with a note when WARP is missing).
+if not exist "%OBJ%\framegensynthbench" mkdir "%OBJ%\framegensynthbench"
+%CC% /nologo /O2 /MT /std:c++17 /EHsc /W4 /DWIN32_LEAN_AND_MEAN /DNOMINMAX ^
+    /D_CRT_SECURE_NO_WARNINGS /I"src\d3d11" ^
+    /Fo"%OBJ%\framegensynthbench"\ /Fe"%OBJ%\framegensynthbench\framegen_synth_bench.exe" ^
+    "tools\framegen_synth_bench\framegen_synth_bench.cpp" ^
+    /link /INCREMENTAL:NO d3d11.lib dxgi.lib dxguid.lib windowscodecs.lib ole32.lib uuid.lib
+if errorlevel 1 ( echo [edvr] ERROR: framegen_synth_bench build failed & exit /b 1 )
+"%OBJ%\framegensynthbench\framegen_synth_bench.exe" --self-test || exit /b 1
+exit /b 0
+
 :rig_ui_depth
 echo [edvr] === private UI depth regression ===
 REM Keep the executable away from build\d3d11.dll: these tests use system
