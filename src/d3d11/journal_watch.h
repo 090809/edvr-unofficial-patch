@@ -46,6 +46,8 @@
 #include <cstdint>
 #include <cstring>
 
+#include "journal_station.h"
+
 namespace edvr {
 
 // Reads d3d11.journal_watch and d3d11.journal_dir, resolves the folder, and
@@ -135,6 +137,9 @@ struct JournalRawStatus {
     uint32_t gui = 0;
 };
 JournalRawStatus journalRawStatus();
+
+// The type of station the commander is at (journal_station.h), under either profile. kUnknown until the journal has named one, and away from any station.
+journal_station::Kind journalStationKind();
 
 // The ADS fields from the publication last taken by journalWatchTick. Like the accessors above, callers read this on the Present thread,
 // between its publication boundaries. Profile/active gating matches journalAdsKnown/journalAds; poll-count semantics are unchanged.

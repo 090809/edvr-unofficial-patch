@@ -3202,10 +3202,16 @@ uint64_t g_concShareLogMs = 0;
 uint32_t g_concShareSeq = 0;
 ConcoursePaneShares g_concShareLast;
 
+// diag.concourse_cull = auto runs only at a type of station whose layout has been flown (cc::bakePlanFor). The key at on, or the hotkey's override, is a test and goes anywhere.
+bool g_concAuto = false;
+journal_station::Kind g_concKind = journal_station::Kind::kUnknown;
+bool g_concKindSeen = false;
+bool concourseStationOk() noexcept { return !g_concAuto || g_concOverride != ConcOverride::kNone || cc::bakePlanFor(g_concKind).run; }
 bool concourseEffective() noexcept {
+    if (!concourseStationOk()) return false;
     return g_concOverride == ConcOverride::kNone ? g_concKeyOn : g_concOverride == ConcOverride::kOn;
 }
-bool concourseArmed() noexcept { return g_concKeyOn || g_concOverride != ConcOverride::kNone; }
+bool concourseArmed() noexcept { return concourseStationOk() && (g_concKeyOn || g_concOverride != ConcOverride::kNone); }
 const char* concourseKeyText() noexcept {
     switch (g_concOverride) {
         case ConcOverride::kOn: return "override-on";
@@ -3294,7 +3300,8 @@ void concoursePoll(uint64_t now) {
     g_concNextPollMs = now + 1000;
     Config& cfg = Config::get();
     const std::string cullText = cfg.getString("diag.concourse_cull", "auto");
-    const bool on = cullText == "auto" ? concourseAutoOn() : cullText == "on";
+    g_concAuto = cullText == "auto";
+    const bool on = g_concAuto ? concourseAutoOn() : cullText == "on";
     if (!g_concKeySeen || on != g_concKeyOn) {
         if (g_concKeySeen) {
             g_concOverride = ConcOverride::kNone;
@@ -4111,6 +4118,14 @@ void bakeForward(const float axes[3][3], uint32_t d, float out[3]) noexcept {
 void concourseTick(uint64_t now, uint32_t frame) {
     g_concSettingOffLogged = false;
     concoursePoll(now);
+    const journal_station::Kind stationKind = journalStationKind();
+    if (!g_concKindSeen || stationKind != g_concKind) {
+        g_concKindSeen = true;
+        g_concKind = stationKind;
+        if (g_concAuto && g_concKeyOn && stationKind != journal_station::Kind::kUnknown)
+            Log::get().note("concourse cull: a station of type %s: %s", journal_station::kindName(stationKind),
+                            cc::bakePlanFor(stationKind).run ? "the cull and its bake run" : "its layout has not been flown, so it stays the game's own");
+    }
     bool toggledOn = false;
     if (g_concHotkey && g_concHotkey->pressed()) {
         const bool was = concourseEffective();
@@ -4211,7 +4226,7 @@ void concourseTick(uint64_t now, uint32_t frame) {
         const bool acting = g_camTimer.active();
         if (g_camTimer.armed() && !camWasArmed && baking) {
             const std::string dirsT = Config::get().getString("diag.concourse_bake_dirs", "");
-            g_camBakeMask = cc::bakeParseDirs(dirsT.c_str());
+            g_camBakeMask = dirsT.empty() ? cc::bakePlanFor(g_concKind).dirs : cc::bakeParseDirs(dirsT.c_str());
             const std::string nearT = Config::get().getString("diag.concourse_bake_near", "");
             const float nearM = nearT.empty() ? cc::kBakeNearDefaultM : static_cast<float>(std::atof(nearT.c_str()));
             g_camBakeNear = nearM >= cc::kBakeNearMinM && nearM <= cc::kBakeNearMaxM ? nearM : cc::kBakeNearDefaultM;

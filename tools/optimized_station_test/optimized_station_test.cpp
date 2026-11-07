@@ -4021,6 +4021,90 @@ int main(int argc, char** argv) {
                     check(cc::windowClearPercent(20.0f, 0) == 0.0f, "window distance: 0 never clears");
                     check(cc::windowClearPercent(20.0f, 10) == 100.0f, "window distance: the share stops at the whole view");
                 }
+                {
+                    // The station's type from the journal (journal_station.h), in the shape of real lines.
+                    namespace js = edvr::journal_station;
+                    using K = js::Kind;
+                    js::Latch l;
+                    K last = K::kUnknown;
+                    int changes = 0;
+                    const auto feed = [&](js::Latch& to, const char* text) {
+                        to.feed(text, static_cast<uint32_t>(std::strlen(text)), [&](K k) {
+                            last = k;
+                            ++changes;
+                        });
+                    };
+                    const char* dockedLoad = "{ \"timestamp\":\"2026-11-07T15:14:57Z\", \"event\":\"Location\", \"DistFromStarLS\":3797.2, \"Docked\":true, \"StationName\":\"Test Market\", \"StationType\":\"Orbis\", \"MarketID\":1, \"BodyType\":\"Station\" }\r\n";
+                    const char* disembark = "{ \"timestamp\":\"t\", \"event\":\"Disembark\", \"SRV\":false, \"Taxi\":false, \"Multicrew\":false, \"ID\":1, \"StarSystem\":\"S\", \"Body\":\"Test Market\", \"BodyID\":4, \"OnStation\":true, \"OnPlanet\":false, \"StationName\":\"Test Market\", \"StationType\":\"Orbis\", \"MarketID\":1 }\r\n";
+                    const char* onFootLoad = "{ \"timestamp\":\"t\", \"event\":\"Location\", \"DistFromStarLS\":3797.2, \"Docked\":false, \"OnFoot\":true, \"StarSystem\":\"S\", \"Body\":\"Test Market\", \"BodyID\":4, \"BodyType\":\"Station\" }\r\n";
+                    const char* onFootElsewhere = "{ \"timestamp\":\"t\", \"event\":\"Location\", \"Docked\":false, \"OnFoot\":true, \"StarSystem\":\"S\", \"Body\":\"Another Market\", \"BodyID\":4, \"BodyType\":\"Station\" }\r\n";
+                    check(l.kind() == K::kUnknown, "station type: unknown before the journal names one");
+                    feed(l, dockedLoad);
+                    check(l.kind() == K::kOrbis && last == K::kOrbis && changes == 1 && l.takeSavedChanged() && !l.takeSavedChanged(), "station type: a docked load names it and asks once to be saved");
+                    feed(l, disembark);
+                    check(l.kind() == K::kOrbis && changes == 1 && !l.takeSavedChanged(), "station type: the same station again changes nothing");
+                    feed(l, "{ \"timestamp\":\"t\", \"event\":\"Music\", \"MusicTrack\":\"MainMenu\" }\r\n");
+                    check(l.kind() == K::kOrbis, "station type: other events leave it");
+                    feed(l, "{ \"timestamp\":\"t\", \"event\":\"Undocked\", \"StationName\":\"Test Market\", \"StationType\":\"Orbis\" }\r\n");
+                    check(l.kind() == K::kUnknown && !l.takeSavedChanged(), "station type: an undock forgets where we are and keeps what was saved");
+                    feed(l, onFootLoad);
+                    check(l.kind() == K::kOrbis, "station type: a load on foot matches its Body against the saved station");
+                    feed(l, onFootElsewhere);
+                    check(l.kind() == K::kUnknown, "station type: a load on foot somewhere else is unknown");
+                    feed(l, "{ \"timestamp\":\"t\", \"event\":\"Location\", \"Docked\":false, \"OnFoot\":true, \"Body\":\"LP 1 a\", \"BodyID\":4, \"BodyType\":\"Planet\" }\r\n");
+                    check(l.kind() == K::kUnknown, "station type: on foot on a planet is unknown");
+
+                    js::Latch fresh;
+                    feed(fresh, onFootLoad);
+                    check(fresh.kind() == K::kUnknown, "station type: a load on foot with nothing saved is unknown");
+                    js::Latch restored;
+                    restored.restore(l.saved());
+                    feed(restored, onFootLoad);
+                    check(restored.kind() == K::kOrbis, "station type: what was saved works in the next session");
+
+                    js::Latch split;
+                    const char* whole = disembark;
+                    for (size_t i = 0, n = std::strlen(whole); i < n; ++i) split.feed(whole + i, 1, [](K) {});
+                    check(split.kind() == K::kOrbis, "station type: a line read a byte at a time is the same");
+                    js::Latch part;
+                    feed(part, disembark);
+                    part.feed("{ \"event\":\"Undo", 15, [](K) {});
+                    part.newFile();
+                    check(part.kind() == K::kOrbis, "station type: another file of the session changes nothing");
+                    part.feed("cked\" }\n", 8, [](K) {});
+                    check(part.kind() == K::kOrbis, "station type: and a line cut by it is not read as a whole line");
+
+                    js::Latch type;
+                    feed(type, "{ \"event\":\"Docked\", \"StationName\":\"A\", \"StationType\":\"Bernal\" }\n");
+                    check(type.kind() == K::kOcellus, "station type: Bernal is an Ocellus");
+                    feed(type, "{ \"event\":\"Docked\", \"StationName\":\"Stronghold Carrier\", \"StationType\":\"SurfaceStation\" }\n");
+                    check(type.kind() == K::kSurfaceStation, "station type: a Stronghold Carrier is a SurfaceStation");
+                    feed(type, "{ \"event\":\"Docked\", \"StationName\":\"Q1H-2DZ\", \"StationType\":\"FleetCarrier\" }\n");
+                    check(type.kind() == K::kFleetCarrier, "station type: a fleet carrier has its own");
+                    feed(type, "{ \"event\":\"Docked\", \"StationName\":\"B\", \"StationType\":\"SomethingNew\" }\n");
+                    check(type.kind() == K::kOther, "station type: a type not on the list is another type");
+
+                    using T = K;
+                    check(cc::bakePlanFor(T::kOrbis).run && cc::bakePlanFor(T::kCoriolis).run && cc::bakePlanFor(T::kOcellus).run && cc::bakePlanFor(T::kOrbis).dirs == cc::kBakeDirsAll,
+                          "bake plan: the large stations run, with every direction");
+                    check(!cc::bakePlanFor(T::kUnknown).run && !cc::bakePlanFor(T::kOutpost).run && !cc::bakePlanFor(T::kCraterPort).run && !cc::bakePlanFor(T::kCraterOutpost).run &&
+                              !cc::bakePlanFor(T::kSurfaceStation).run && !cc::bakePlanFor(T::kAsteroidBase).run && !cc::bakePlanFor(T::kFleetCarrier).run && !cc::bakePlanFor(T::kMegaShip).run &&
+                              !cc::bakePlanFor(T::kOnFootSettlement).run && !cc::bakePlanFor(T::kOther).run,
+                          "bake plan: everything else, and not knowing, stays the game's own");
+
+                    char text[128] = {};
+                    js::Saved s;
+                    s.nameHash = js::hashName("Test Market", 11);
+                    s.kind = K::kCoriolis;
+                    js::formatSaved(s, text, sizeof(text));
+                    js::Saved back;
+                    check(js::parseSaved(text, &back) && back.nameHash == s.nameHash && back.kind == K::kCoriolis, "saved station: the line reads back");
+                    check(std::strstr(text, "Test Market") == nullptr, "saved station: the name is not in it");
+                    js::Saved none;
+                    check(!js::parseSaved("", &none) && !js::parseSaved("edvr-station 1 zz Orbis\n", &none) && !js::parseSaved("edvr-station 1 0123456789abcdef Nonsense\n", &none) &&
+                              !js::parseSaved("edvr-station 2 0123456789abcdef Orbis\n", &none) && !js::parseSaved(nullptr, &none) && none.nameHash == 0,
+                          "saved station: anything else reads as nothing saved");
+                }
             }
         }
 

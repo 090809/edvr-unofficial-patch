@@ -18,6 +18,8 @@
 #include <cstdlib>
 #include <cstring>
 
+#include "journal_station.h"
+
 namespace edvr::concourse {
 
 // The Flags2 bits (journal documentation): 0 OnFoot, 14 OnFootSocialSpace. Bit 3 (in station) rides with them in 0x00014009.
@@ -617,6 +619,18 @@ inline const char* camTestModeName(uint32_t m) noexcept {
 constexpr uint32_t kBakeDirs = 5, kBakeSettleTicks = 0, kBakeTailTicks = 8, kBakeDirsAll = 0x1Fu;
 constexpr float kBakeFovRad = 1.5707963f;      // camera+0x260, the vertical field of view in radians (READ, 0x4F30F0): 90 degrees, so about 121 across at 16:9, of which the capture keeps the middle 90
 constexpr float kBakeNearDefaultM = 50.0f, kBakeNearMinM = 5.0f, kBakeNearMaxM = 400.0f;   // diag.concourse_bake_near: the bake frames' near plane, and a captured point nearer the centre than this is the room's
+// What the bake does at each type of station, from the journal (journal_station.h). A row is added when its layout has been flown: the keep list's names and the anchor were read at one
+// Orbis, and another room could lose its own objects or have no anchor. Everything else, and a type not known, stays the game's own; diag.concourse_cull = on, or the hotkey, forces it
+// for a test. Once a type's windows are known, its row can name only the directions they need.
+struct BakePlan {
+    bool run = false;
+    uint32_t dirs = kBakeDirsAll;
+};
+inline BakePlan bakePlanFor(journal_station::Kind k) noexcept {
+    BakePlan p;
+    p.run = k == journal_station::Kind::kOrbis || k == journal_station::Kind::kCoriolis || k == journal_station::Kind::kOcellus;
+    return p;
+}
 inline uint32_t bakeDirCount(uint32_t mask) noexcept {
     uint32_t n = 0;
     for (uint32_t d = 0; d < kBakeDirs; ++d)
