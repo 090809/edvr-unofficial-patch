@@ -18,8 +18,8 @@
 //
 // Shared with production, not copied: the shader TEXT (frameGenSynthShaderSource, compiled with the arguments tools\temporal_shader_build uses: cs_5_0, no macros, flags 0, the entry
 // names fgSyn*, so the DXBC is the production DXBC), the constant block and its fill (frameGenSynthFillCb, frameGenSynthResidual), the stats decode and the log line
-// (frameGenSynthDecodeStats, formatFrameGenSynthReport). The only mirrored piece is the per-pass binding table (src\d3d11\framegen_synth.cpp frameGenSynthEyeFrame), which that
-// module keeps private.
+// (frameGenSynthDecodeStats, formatFrameGenSynthReport), and the dispatch sequence with its binding table (src\d3d11\framegen_synth_pass.h frameGenSynthRunPasses). Nothing is
+// mirrored.
 //
 // f<k>.json keys (names compare case- and punctuation-insensitively; nested objects and the aliases in the readers below are accepted): render_w render_h out_w out_h out_format
 // (DXGI enum) depth_format mv_format tan_now[4] (left right bottom top) tan_prev[4] depth_a depth_b split_metres hd[9] th[3] world_w[9] tv_cam[3] world_valid camera_jump frame qpc
@@ -46,6 +46,7 @@
 #include <vector>
 
 #include "framegen_synth_shader.h"
+#include "framegen_synth_pass.h"
 #include "../../src/common/framegen_synth_math.h"
 
 using Microsoft::WRL::ComPtr;
@@ -414,10 +415,9 @@ int captureFrameCount(const std::string& dir, std::string& note) {
 
 // ---- the GPU harness --------------------------------------------------------------------------------------------------------------------------------------
 
-enum Entry : int { kClear = 0, kSplat, kSrc, kResolve, kResample, kLuma, kScore, kEntries };
-constexpr int kSrvSlots = 10, kUavSlots = 8;
-const char* const kEntryNames[kEntries] = {"fgSynClear", "fgSynSplat", "fgSynSrc", "fgSynResolve", "fgSynResample", "fgSynLuma", "fgSynScore"};
-const char* const kPassLabels[kEntries] = {"clear", "splat", "src", "resolve", "resample", "luma", "score"};
+constexpr int kEntries = kFrameGenSynthEntries;   // the entries, their names and the dispatch sequence: framegen_synth_pass.h
+const char* const* const kEntryNames = kFrameGenSynthEntryNames;
+const char* const* const kPassLabels = kFrameGenSynthPassLabels;
 
 struct Tex {
     ComPtr<ID3D11Texture2D> t;
@@ -597,69 +597,22 @@ struct Inputs {
     ID3D11ShaderResourceView* mv = nullptr;
 };
 
-// One dispatch with nothing left bound from the last (framegen_synth.cpp bindAndDispatch).
-void dispatchPass(Gpu& g, int entry, ID3D11ShaderResourceView* const srv[kSrvSlots], ID3D11UnorderedAccessView* const uav[kUavSlots], uint32_t gx, uint32_t gy) {
-    g.ctx->CSSetShader(g.cs[entry].Get(), nullptr, 0);
-    ID3D11UnorderedAccessView* const noUav[kUavSlots] = {};
-    g.ctx->CSSetUnorderedAccessViews(0, kUavSlots, noUav, nullptr);
-    g.ctx->CSSetShaderResources(0, kSrvSlots, srv);
-    g.ctx->CSSetUnorderedAccessViews(0, kUavSlots, uav, nullptr);
-    g.ctx->Dispatch(gx, gy, 1);
-}
-
-// The synth's per-frame sequence (framegen_synth.cpp frameGenSynthEyeFrame, the binding table mirrored): clear, [score], splat, src, resolve, resample, [luma].
+// The synth's per-frame sequence (framegen_synth_pass.h, the module's own table): clear, [score], splat, src, resolve, resample, [luma].
 // scoreOnly: clear and score alone (a scored frame's own build is not needed for its score). `after(entry)` is called after each dispatch (the bench's timestamps).
 void runCall(Gpu& g, Synth& sy, const Inputs& in, bool score, bool keep, bool scoreOnly, const std::function<void(int)>& after) {
-    const uint32_t rgx = (sy.rw + 7) / 8, rgy = (sy.rh + 7) / 8, ogx = (sy.ow + 7) / 8, ogy = (sy.oh + 7) / 8, qgx = (sy.qw + 7) / 8, qgy = (sy.qh + 7) / 8;
-    ID3D11ShaderResourceView* const noSrv[kSrvSlots] = {};
-    ID3D11UnorderedAccessView* const noUav[kUavSlots] = {};
-    ID3D11UnorderedAccessView* statsUav = sy.statsUav.Get();
-    const auto done = [&](int e) { if (after) after(e); };
-    {
-        ID3D11UnorderedAccessView* uav[kUavSlots] = {nullptr, sy.key.uav.Get(), sy.src.uav.Get(), nullptr, nullptr, statsUav};
-        dispatchPass(g, kClear, noSrv, uav, rgx, rgy);
-        done(kClear);
-    }
-    if (score) {
-        ID3D11ShaderResourceView* srv[kSrvSlots] = {in.out, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, sy.sLuma.srv.Get(), sy.bInfo.srv.Get()};
-        ID3D11UnorderedAccessView* uav[kUavSlots] = {nullptr, nullptr, nullptr, nullptr, nullptr, statsUav};
-        dispatchPass(g, kScore, srv, uav, qgx, qgy);
-        done(kScore);
-    }
-    if (!scoreOnly) {
-        {
-            ID3D11ShaderResourceView* srv[kSrvSlots] = {nullptr, in.depth, in.mv};
-            ID3D11UnorderedAccessView* uav[kUavSlots] = {nullptr, sy.key.uav.Get()};
-            dispatchPass(g, kSplat, srv, uav, rgx, rgy);
-            done(kSplat);
-        }
-        {
-            ID3D11ShaderResourceView* srv[kSrvSlots] = {nullptr, in.depth, in.mv, nullptr, sy.key.srv.Get()};
-            ID3D11UnorderedAccessView* uav[kUavSlots] = {nullptr, nullptr, sy.src.uav.Get()};
-            dispatchPass(g, kSrc, srv, uav, rgx, rgy);
-            done(kSrc);
-        }
-        {
-            ID3D11ShaderResourceView* srv[kSrvSlots] = {nullptr, in.depth, in.mv, nullptr, sy.key.srv.Get(), sy.src.srv.Get()};
-            ID3D11UnorderedAccessView* uav[kUavSlots] = {nullptr, nullptr, nullptr, sy.read.uav.Get(), nullptr, statsUav};
-            dispatchPass(g, kResolve, srv, uav, rgx, rgy);
-            done(kResolve);
-        }
-        {
-            ID3D11ShaderResourceView* srv[kSrvSlots] = {in.out, nullptr, nullptr, nullptr, nullptr, nullptr, sy.read.srv.Get()};
-            ID3D11UnorderedAccessView* uav[kUavSlots] = {nullptr, nullptr, nullptr, nullptr, sy.s.uav.Get()};
-            dispatchPass(g, kResample, srv, uav, ogx, ogy);
-            done(kResample);
-        }
-        if (keep) {
-            ID3D11ShaderResourceView* srv[kSrvSlots] = {in.out, in.depth, nullptr, nullptr, nullptr, nullptr, nullptr, sy.s.srv.Get()};
-            ID3D11UnorderedAccessView* uav[kUavSlots] = {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, sy.sLuma.uav.Get(), sy.bInfo.uav.Get()};
-            dispatchPass(g, kLuma, srv, uav, qgx, qgy);
-            done(kLuma);
-        }
-    }
-    g.ctx->CSSetShaderResources(0, kSrvSlots, noSrv);
-    g.ctx->CSSetUnorderedAccessViews(0, kUavSlots, noUav, nullptr);
+    FrameGenSynthPassViews v;
+    v.out = in.out; v.depth = in.depth; v.mv = in.mv;
+    v.keySrv = sy.key.srv.Get(); v.keyUav = sy.key.uav.Get();
+    v.srcSrv = sy.src.srv.Get(); v.srcUav = sy.src.uav.Get();
+    v.readSrv = sy.read.srv.Get(); v.readUav = sy.read.uav.Get();
+    v.sSrv = sy.s.srv.Get(); v.sUav = sy.s.uav.Get();
+    v.sLumaSrv = sy.sLuma.srv.Get(); v.sLumaUav = sy.sLuma.uav.Get();
+    v.bInfoSrv = sy.bInfo.srv.Get(); v.bInfoUav = sy.bInfo.uav.Get();
+    v.statsUav = sy.statsUav.Get();
+    v.rw = sy.rw; v.rh = sy.rh; v.ow = sy.ow; v.oh = sy.oh; v.qw = sy.qw; v.qh = sy.qh;
+    ID3D11ComputeShader* cs[kEntries];
+    for (int i = 0; i < kEntries; ++i) cs[i] = g.cs[i].Get();
+    frameGenSynthRunPasses(g.ctx.Get(), cs, v, score, !scoreOnly, keep, [&](int e) { if (after) after(e); });
 }
 
 // ---- pictures -----------------------------------------------------------------------------------------------------------------------------------------------
@@ -1276,7 +1229,7 @@ int selfTest() {
         bo.rw = 128; bo.rh = 96; bo.ow = 256; bo.oh = 192; bo.iters = 4; bo.warm = 2;
         BenchOutput out;
         if (runBench(g, bo, out, err)) {
-            check(out.variants.size() == 2 && out.variants[0].st.total.size() == 4 && out.variants[1].st.ms[kScore].size() == 4 && out.variants[0].st.ms[kScore].empty() &&
+            check(out.variants.size() == 2 && out.variants[0].st.total.size() == 4 && out.variants[1].st.ms[kFgSynScore].size() == 4 && out.variants[0].st.ms[kFgSynScore].empty() &&
                       out.eyeBytes > 0 && !benchJson(bo, out, g).empty(),
                   "the bench times both variants pass by pass (f = 0.5 has no score pass, f = 1 does) and reports the VRAM");
         } else {

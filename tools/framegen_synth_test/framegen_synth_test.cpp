@@ -39,6 +39,7 @@
 
 #include <d3dcompiler.h>
 #include "framegen_synth_shader.h"
+#include "framegen_synth_pass.h"
 
 #include "../../src/common/framegen_synth_math.h"
 #include "framegen_synth.h"
@@ -104,9 +105,8 @@ struct Tex {
     ComPtr<ID3D11UnorderedAccessView> uav;
 };
 
-constexpr int kEntries = 7, kSrvSlots = 10, kUavSlots = 8;
-enum { kEClear = 0, kESplat, kESrc, kEResolve, kEResample, kELuma, kEScore };
-const char* const kEntryNames[kEntries] = {"fgSynClear", "fgSynSplat", "fgSynSrc", "fgSynResolve", "fgSynResample", "fgSynLuma", "fgSynScore"};
+constexpr int kEntries = kFrameGenSynthEntries;   // the entries, their names and the dispatch sequence: framegen_synth_pass.h
+const char* const* const kEntryNames = kFrameGenSynthEntryNames;
 
 struct Gpu {
     ComPtr<ID3D11Device> dev;
@@ -169,16 +169,11 @@ struct Gpu {
         ctx->CSSetConstantBuffers(0, 1, &b);
     }
 
-    void run(int entry, ID3D11ShaderResourceView* const srv[kSrvSlots], ID3D11UnorderedAccessView* const uav[kUavSlots], int gx, int gy) {
-        ctx->CSSetShader(cs[entry].Get(), nullptr, 0);
-        // Nothing stays bound from the last dispatch: a resource still bound as a UAV would silently null its SRV here.
-        ID3D11ShaderResourceView* const noSrv[kSrvSlots] = {};
-        ID3D11UnorderedAccessView* const noUav[kUavSlots] = {};
-        ctx->CSSetShaderResources(0, kSrvSlots, noSrv);
-        ctx->CSSetUnorderedAccessViews(0, kUavSlots, noUav, nullptr);
-        ctx->CSSetShaderResources(0, kSrvSlots, srv);
-        ctx->CSSetUnorderedAccessViews(0, kUavSlots, uav, nullptr);
-        ctx->Dispatch(static_cast<UINT>(gx), static_cast<UINT>(gy), 1);
+    // The module's dispatch sequence (framegen_synth_pass.h) on this device's shaders (the production bytecode, or a mutated build swapped into cs).
+    void run(const FrameGenSynthPassViews& v, bool score, bool build, bool keep) {
+        ID3D11ComputeShader* raw[kEntries];
+        for (int i = 0; i < kEntries; ++i) raw[i] = cs[i].Get();
+        frameGenSynthRunPasses(ctx.Get(), raw, v, score, build, keep);
     }
 };
 
@@ -285,41 +280,17 @@ Run runSynth(Gpu& g, const Scene& sc, const FrameGenSynthCb& cb, Keep* keep = nu
     if (FAILED(g.dev->CreateBuffer(&bd, nullptr, &staging))) return r;
 
     g.setCb(cb);
-    const int rgx = (sc.w + 7) / 8, rgy = (sc.h + 7) / 8, ogx = (sc.ow + 7) / 8, ogy = (sc.oh + 7) / 8;
-    const int qgx = ((sc.w + 3) / 4 + 7) / 8, qgy = ((sc.h + 3) / 4 + 7) / 8;
-    ID3D11ShaderResourceView* const none[kSrvSlots] = {};
-    {
-        ID3D11UnorderedAccessView* uav[kUavSlots] = {nullptr, key.uav.Get(), src.uav.Get(), nullptr, nullptr, statsUav.Get()};
-        g.run(kEClear, none, uav, rgx, rgy);
-    }
-    {
-        ID3D11ShaderResourceView* srv[kSrvSlots] = {nullptr, depth.srv.Get(), mv.srv.Get()};
-        ID3D11UnorderedAccessView* uav[kUavSlots] = {nullptr, key.uav.Get()};
-        g.run(kESplat, srv, uav, rgx, rgy);
-    }
-    {
-        ID3D11ShaderResourceView* srv[kSrvSlots] = {nullptr, depth.srv.Get(), mv.srv.Get(), nullptr, key.srv.Get()};
-        ID3D11UnorderedAccessView* uav[kUavSlots] = {nullptr, nullptr, src.uav.Get()};
-        g.run(kESrc, srv, uav, rgx, rgy);
-    }
-    {
-        ID3D11ShaderResourceView* srv[kSrvSlots] = {nullptr, depth.srv.Get(), mv.srv.Get(), nullptr, key.srv.Get(), src.srv.Get()};
-        ID3D11UnorderedAccessView* uav[kUavSlots] = {nullptr, nullptr, nullptr, read.uav.Get(), nullptr, statsUav.Get()};
-        g.run(kEResolve, srv, uav, rgx, rgy);
-    }
-    {
-        ID3D11ShaderResourceView* srv[kSrvSlots] = {out.srv.Get(), nullptr, nullptr, nullptr, nullptr, nullptr, read.srv.Get()};
-        ID3D11UnorderedAccessView* uav[kUavSlots] = {nullptr, nullptr, nullptr, nullptr, s.uav.Get()};
-        g.run(kEResample, srv, uav, ogx, ogy);
-    }
-    if (keep) {
-        ID3D11ShaderResourceView* srv[kSrvSlots] = {out.srv.Get(), depth.srv.Get(), nullptr, nullptr, nullptr, nullptr, nullptr, s.srv.Get()};
-        ID3D11UnorderedAccessView* uav[kUavSlots] = {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, keep->sLuma.uav.Get(), keep->bInfo.uav.Get()};
-        g.run(kELuma, srv, uav, qgx, qgy);
-    }
-    ID3D11UnorderedAccessView* noUav[kUavSlots] = {};
-    g.ctx->CSSetShaderResources(0, kSrvSlots, none);
-    g.ctx->CSSetUnorderedAccessViews(0, kUavSlots, noUav, nullptr);
+    FrameGenSynthPassViews v;
+    v.out = out.srv.Get(); v.depth = depth.srv.Get(); v.mv = mv.srv.Get();
+    v.keySrv = key.srv.Get(); v.keyUav = key.uav.Get();
+    v.srcSrv = src.srv.Get(); v.srcUav = src.uav.Get();
+    v.readSrv = read.srv.Get(); v.readUav = read.uav.Get();
+    v.sSrv = s.srv.Get(); v.sUav = s.uav.Get();
+    if (keep) { v.sLumaUav = keep->sLuma.uav.Get(); v.bInfoUav = keep->bInfo.uav.Get(); }
+    v.statsUav = statsUav.Get();
+    v.rw = static_cast<uint32_t>(sc.w); v.rh = static_cast<uint32_t>(sc.h); v.ow = static_cast<uint32_t>(sc.ow); v.oh = static_cast<uint32_t>(sc.oh);
+    v.qw = static_cast<uint32_t>((sc.w + 3) / 4); v.qh = static_cast<uint32_t>((sc.h + 3) / 4);
+    g.run(v, false, true, keep != nullptr);
     g.ctx->CopyResource(staging.Get(), stats.Get());
     D3D11_MAPPED_SUBRESOURCE m{};
     if (FAILED(g.ctx->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &m))) return r;
@@ -347,21 +318,14 @@ bool runScore(Gpu& g, const Scene& scC, const FrameGenSynthCb& cbC, const Keep& 
     bd.Usage = D3D11_USAGE_STAGING; bd.BindFlags = 0; bd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
     if (FAILED(g.dev->CreateBuffer(&bd, nullptr, &staging))) return false;
     g.setCb(cbC);
-    const int rgx = (scC.w + 7) / 8, rgy = (scC.h + 7) / 8;
-    const int qgx = ((scC.w + 3) / 4 + 7) / 8, qgy = ((scC.h + 3) / 4 + 7) / 8;
-    ID3D11ShaderResourceView* const none[kSrvSlots] = {};
-    {
-        ID3D11UnorderedAccessView* uav[kUavSlots] = {nullptr, key.uav.Get(), src.uav.Get(), nullptr, nullptr, statsUav.Get()};
-        g.run(kEClear, none, uav, rgx, rgy);
-    }
-    {
-        ID3D11ShaderResourceView* srv[kSrvSlots] = {out.srv.Get(), nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, keep.sLuma.srv.Get(), keep.bInfo.srv.Get()};
-        ID3D11UnorderedAccessView* uav[kUavSlots] = {nullptr, nullptr, nullptr, nullptr, nullptr, statsUav.Get()};
-        g.run(kEScore, srv, uav, qgx, qgy);
-    }
-    ID3D11UnorderedAccessView* noUav[kUavSlots] = {};
-    g.ctx->CSSetShaderResources(0, kSrvSlots, none);
-    g.ctx->CSSetUnorderedAccessViews(0, kUavSlots, noUav, nullptr);
+    FrameGenSynthPassViews v;
+    v.out = out.srv.Get(); v.depth = depth.srv.Get(); v.mv = mv.srv.Get();
+    v.keyUav = key.uav.Get(); v.srcUav = src.uav.Get();
+    v.sLumaSrv = keep.sLuma.srv.Get(); v.bInfoSrv = keep.bInfo.srv.Get();
+    v.statsUav = statsUav.Get();
+    v.rw = static_cast<uint32_t>(scC.w); v.rh = static_cast<uint32_t>(scC.h);
+    v.qw = static_cast<uint32_t>((scC.w + 3) / 4); v.qh = static_cast<uint32_t>((scC.h + 3) / 4);
+    g.run(v, true, false, false);
     g.ctx->CopyResource(staging.Get(), stats.Get());
     D3D11_MAPPED_SUBRESOURCE m{};
     if (FAILED(g.ctx->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &m))) return false;

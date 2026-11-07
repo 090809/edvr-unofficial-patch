@@ -1,6 +1,7 @@
 // The frame-generation synthesizer: see framegen_synth.h.
 #include "temporal_shader_bytecode.h"
 #include "framegen_synth.h"
+#include "framegen_synth_pass.h"
 #include "cs_stage_save.h"
 #include "gpu_frame_timing.h"
 #include "gpu_timing.h"
@@ -25,11 +26,7 @@ namespace {
 
 constexpr int kStagingDepth = 4;
 constexpr int kTimerRing = 8;
-constexpr int kEntries = 7;      // clear, splat, source, resolve, resample, luma, score
-constexpr int kSrvSlots = 10;    // t0..t9
-constexpr int kUavSlots = 8;     // u0..u7
-
-enum Entry : int { kClear = 0, kSplat, kSrc, kResolve, kResample, kLuma, kScore };
+constexpr int kEntries = kFrameGenSynthEntries;   // clear, splat, source, resolve, resample, luma, score (framegen_synth_pass.h)
 
 std::atomic<bool> g_on{false};
 std::atomic<bool> g_told{false};   // the armed line has been said since the key last went on
@@ -331,19 +328,19 @@ bool uavStoreOk(ID3D11Device* dev, DXGI_FORMAT fmt) {
 }
 
 bool createCommon(ID3D11Device* dev, ID3D11DeviceContext* ctx) {
-    struct Item { const unsigned char* code; size_t size; const char* name; };
-    const Item entries[kEntries] = {
-        {kFrameGenSynthClearBytecode, sizeof(kFrameGenSynthClearBytecode), "framegen_synth_clear"},
-        {kFrameGenSynthSplatBytecode, sizeof(kFrameGenSynthSplatBytecode), "framegen_synth_splat"},
-        {kFrameGenSynthSrcBytecode, sizeof(kFrameGenSynthSrcBytecode), "framegen_synth_src"},
-        {kFrameGenSynthResolveBytecode, sizeof(kFrameGenSynthResolveBytecode), "framegen_synth_resolve"},
-        {kFrameGenSynthResampleBytecode, sizeof(kFrameGenSynthResampleBytecode), "framegen_synth_resample"},
-        {kFrameGenSynthLumaBytecode, sizeof(kFrameGenSynthLumaBytecode), "framegen_synth_luma"},
-        {kFrameGenSynthScoreBytecode, sizeof(kFrameGenSynthScoreBytecode), "framegen_synth_score"},
+    struct Item { int entry; const unsigned char* code; size_t size; const char* name; };
+    const Item entries[kEntries] = {   // in framegen_synth_pass.h's entry order
+        {kFgSynClear, kFrameGenSynthClearBytecode, sizeof(kFrameGenSynthClearBytecode), "framegen_synth_clear"},
+        {kFgSynSplat, kFrameGenSynthSplatBytecode, sizeof(kFrameGenSynthSplatBytecode), "framegen_synth_splat"},
+        {kFgSynSrc, kFrameGenSynthSrcBytecode, sizeof(kFrameGenSynthSrcBytecode), "framegen_synth_src"},
+        {kFgSynResolve, kFrameGenSynthResolveBytecode, sizeof(kFrameGenSynthResolveBytecode), "framegen_synth_resolve"},
+        {kFgSynResample, kFrameGenSynthResampleBytecode, sizeof(kFrameGenSynthResampleBytecode), "framegen_synth_resample"},
+        {kFgSynLuma, kFrameGenSynthLumaBytecode, sizeof(kFrameGenSynthLumaBytecode), "framegen_synth_luma"},
+        {kFgSynScore, kFrameGenSynthScoreBytecode, sizeof(kFrameGenSynthScoreBytecode), "framegen_synth_score"},
     };
-    for (int i = 0; i < kEntries; ++i) {
-        g.cs[i] = shaderSwapCreateCs(ctx, entries[i].code, entries[i].size, entries[i].name, "frame generation (synth)");
-        if (!g.cs[i]) return false;
+    for (const Item& e : entries) {
+        g.cs[e.entry] = shaderSwapCreateCs(ctx, e.code, e.size, e.name, "frame generation (synth)");
+        if (!g.cs[e.entry]) return false;
     }
     D3D11_BUFFER_DESC bd{};
     bd.ByteWidth = sizeof(FrameGenSynthCb);
@@ -486,16 +483,6 @@ TimerSlot* beginTimer(ID3D11Device* dev, ID3D11DeviceContext* ctx, int kind) {
     return nullptr;
 }
 
-void bindAndDispatch(ID3D11DeviceContext* ctx, int entry, ID3D11ShaderResourceView* const srv[kSrvSlots], ID3D11UnorderedAccessView* const uav[kUavSlots], uint32_t gx, uint32_t gy) {
-    ctx->CSSetShader(g.cs[entry], nullptr, 0);
-    // The last dispatch's UAVs come off first: a resource still bound as a UAV would silently null the SRV set for it here (the key grid, the read offsets...).
-    ID3D11UnorderedAccessView* const noUav[kUavSlots] = {};
-    ctx->CSSetUnorderedAccessViews(0, kUavSlots, noUav, nullptr);
-    ctx->CSSetShaderResources(0, kSrvSlots, srv);
-    ctx->CSSetUnorderedAccessViews(0, kUavSlots, uav, nullptr);
-    ctx->Dispatch(gx, gy, 1);
-}
-
 }  // namespace
 
 void frameGenSynthConfigure(bool on) {
@@ -595,50 +582,19 @@ void frameGenSynthEyeFrame(ID3D11Device* dev, ID3D11DeviceContext* ctx, uint32_t
     CsStageSave save;
     save.save(ctx);
     ctx->CSSetConstantBuffers(0, 1, &g.cb);
-    const uint32_t rgx = (r.rw + 7u) / 8u, rgy = (r.rh + 7u) / 8u;
-    const uint32_t ogx = (r.ow + 7u) / 8u, ogy = (r.oh + 7u) / 8u;
-    const uint32_t qgx = (r.qw + 7u) / 8u, qgy = (r.qh + 7u) / 8u;
-    ID3D11ShaderResourceView* const noSrv[kSrvSlots] = {};
-    ID3D11UnorderedAccessView* const noUav[kUavSlots] = {};
-    ID3D11ShaderResourceView* const out = f.outSrv;
-    ID3D11ShaderResourceView* const depth = f.depthSrv;
-    ID3D11ShaderResourceView* const mv = f.mvSrv;
-    {   // clear: the key and source grids and the stats words
-        ID3D11UnorderedAccessView* uav[kUavSlots] = {nullptr, sc.key.uav, sc.src.uav, nullptr, nullptr, r.statsUav};
-        bindAndDispatch(ctx, kClear, noSrv, uav, rgx, rgy);
-    }
-    if (score) {   // the f = 1 S kept from the frame before against this frame, which is C: its luma, S's and B's, by B's class
-        ID3D11ShaderResourceView* srv[kSrvSlots] = {out, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, r.sLuma.srv, r.bInfo.srv};
-        ID3D11UnorderedAccessView* uav[kUavSlots] = {nullptr, nullptr, nullptr, nullptr, nullptr, r.statsUav};
-        bindAndDispatch(ctx, kScore, srv, uav, qgx, qgy);
-    }
-    {   // splat: B's pixels carried to S, the nearer surface's key kept
-        ID3D11ShaderResourceView* srv[kSrvSlots] = {nullptr, depth, mv};
-        ID3D11UnorderedAccessView* uav[kUavSlots] = {nullptr, sc.key.uav};
-        bindAndDispatch(ctx, kSplat, srv, uav, rgx, rgy);
-    }
-    {   // source: each footprint pixel whose final key is the pixel's own takes the pixel's index
-        ID3D11ShaderResourceView* srv[kSrvSlots] = {nullptr, depth, mv, nullptr, sc.key.srv};
-        ID3D11UnorderedAccessView* uav[kUavSlots] = {nullptr, nullptr, sc.src.uav};
-        bindAndDispatch(ctx, kSrc, srv, uav, rgx, rgy);
-    }
-    {   // resolve: the offset every S pixel reads at, the guard and the background pull
-        ID3D11ShaderResourceView* srv[kSrvSlots] = {nullptr, depth, mv, nullptr, sc.key.srv, sc.src.srv};
-        ID3D11UnorderedAccessView* uav[kUavSlots] = {nullptr, nullptr, nullptr, sc.read.uav, nullptr, r.statsUav};
-        bindAndDispatch(ctx, kResolve, srv, uav, rgx, rgy);
-    }
-    {   // resample B's output into S at the output size
-        ID3D11ShaderResourceView* srv[kSrvSlots] = {out, nullptr, nullptr, nullptr, nullptr, nullptr, sc.read.srv};
-        ID3D11UnorderedAccessView* uav[kUavSlots] = {nullptr, nullptr, nullptr, nullptr, r.s.uav};
-        bindAndDispatch(ctx, kResample, srv, uav, ogx, ogy);
-    }
-    if (keep) {   // the f = 1 S's luma, B's luma and B's class, for the next real frame to score
-        ID3D11ShaderResourceView* srv[kSrvSlots] = {out, depth, nullptr, nullptr, nullptr, nullptr, nullptr, r.s.srv};
-        ID3D11UnorderedAccessView* uav[kUavSlots] = {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, r.sLuma.uav, r.bInfo.uav};
-        bindAndDispatch(ctx, kLuma, srv, uav, qgx, qgy);
-    }
-    ctx->CSSetShaderResources(0, kSrvSlots, noSrv);
-    ctx->CSSetUnorderedAccessViews(0, kUavSlots, noUav, nullptr);
+    FrameGenSynthPassViews v;
+    v.out = f.outSrv;
+    v.depth = f.depthSrv;
+    v.mv = f.mvSrv;
+    v.keySrv = sc.key.srv; v.keyUav = sc.key.uav;
+    v.srcSrv = sc.src.srv; v.srcUav = sc.src.uav;
+    v.readSrv = sc.read.srv; v.readUav = sc.read.uav;
+    v.sSrv = r.s.srv; v.sUav = r.s.uav;
+    v.sLumaSrv = r.sLuma.srv; v.sLumaUav = r.sLuma.uav;
+    v.bInfoSrv = r.bInfo.srv; v.bInfoUav = r.bInfo.uav;
+    v.statsUav = r.statsUav;
+    v.rw = r.rw; v.rh = r.rh; v.ow = r.ow; v.oh = r.oh; v.qw = r.qw; v.qh = r.qh;
+    frameGenSynthRunPasses(ctx, g.cs, v, score, true, keep);
     ctx->CopyResource(r.staging[slot], r.stats);
     r.pending[slot] = true;
     r.slotKind[slot] = half ? 0 : 1;
