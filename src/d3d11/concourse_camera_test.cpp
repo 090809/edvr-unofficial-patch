@@ -187,6 +187,39 @@ void ctTurn90(float* v,const float* a) noexcept {
 }
 
 // 0x2874290 after it returns: the read, and in the window the write. The camera is read in log only too: the RenderView's camera against it says, with no write at all, that this is view 0's.
+// The value every main camera's near plane comes from: a float in .data holding 0.025, read at 15 places and written by none (a rip-relative scan of build 334925). 0x287AAE0 stores it over
+// the four view owners' cameras right after the views take their slots (0x287AEC4 and on, camera object +0x254, dirty bits 0xD), which is why Flight 27's write to the camera's own near
+// never reached cb1. Raised at the producer, so it goes with the camera it was written for; each tick while the bake is not acting puts it back.
+constexpr uintptr_t kCtNearValueRva=0x5E85B8Cu;
+constexpr float kCtNearValue=0.025f;
+std::atomic<float*> g_ctNearAt{nullptr};
+std::atomic<bool> g_ctNearRaised{false};
+
+void ctNearRaise(float nearM) noexcept {
+    float* at=g_ctNearAt.load(std::memory_order_relaxed);
+    if(!at)return;
+    __try {
+        *static_cast<volatile float*>(at)=nearM;
+        g_ctNearRaised.store(true,std::memory_order_relaxed);
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        g_ctFaults.fetch_add(1,std::memory_order_relaxed);
+    }
+}
+void ctNearRestore() noexcept {
+    if(!g_ctNearRaised.exchange(false,std::memory_order_relaxed))return;
+    float* at=g_ctNearAt.load(std::memory_order_relaxed);
+    if(!at)return;
+    __try {
+        *static_cast<volatile float*>(at)=kCtNearValue;
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        g_ctFaults.fetch_add(1,std::memory_order_relaxed);
+    }
+}
+bool ctNearValueOk(uintptr_t at) noexcept {
+    __try {return *reinterpret_cast<const float*>(at)==kCtNearValue;}
+    __except(EXCEPTION_EXECUTE_HANDLER) {return false;}
+}
+
 void ctCameraEdit(uintptr_t cam,uint32_t mode) noexcept {
     __try {
         float* pos=reinterpret_cast<float*>(cam+kCtPosOff);
@@ -217,11 +250,15 @@ void ctCameraEdit(uintptr_t cam,uint32_t mode) noexcept {
                 }
                 const float fov=g_ctAimFov.load(std::memory_order_relaxed);
                 if(fov>0.0f)*reinterpret_cast<float*>(cam+0x260u)=fov;   // the vertical field of view (READ, 0x4F30F0); the producer leaves the camera dirty, so the projection is built from it
-                // The near plane, the same way (+0x234, READ in 0x4F30F0 and written by the producer from the pose record). Whatever is nearer is clipped by the hardware, whatever its name
+                // The near plane: this camera's own (+0x234, READ in 0x4F30F0) and the value the game stores over it (above). Whatever is nearer is clipped by the hardware, whatever its name
                 // and however large its record, so what is behind it is drawn and captured: Flight 26's Floor07, r 1018 m, with a surface 44 m from the centre, cannot be culled by record.
                 const float nearM=g_ctAimNear.load(std::memory_order_relaxed);
-                if(nearM>0.0f)*reinterpret_cast<float*>(cam+0x234u)=nearM;
+                if(nearM>0.0f) {
+                    *reinterpret_cast<float*>(cam+0x234u)=nearM;
+                    ctNearRaise(nearM);
+                }
             } else {
+                ctNearRestore();
                 // The look: the player's own axes turned: directions 0 to 3 a quarter turn at a time about the room's up, 4 and 5 straight up and down, about the camera's right row.
                 float up[3];
                 for(int i=0;i<3;++i)up[i]=g_ctLookUp[i].load(std::memory_order_relaxed);
@@ -236,6 +273,8 @@ void ctCameraEdit(uintptr_t cam,uint32_t mode) noexcept {
             }
             for(int i=0;i<3;++i)pos[i]=g_ctLookCentre[i].load(std::memory_order_relaxed);
             g_ctWritten.fetch_add(1,std::memory_order_relaxed);
+        } else {
+            ctNearRestore();
         }
         for(int i=0;i<3;++i) {
             g_ctCamAfter[i].store(pos[i],std::memory_order_relaxed);
@@ -291,6 +330,8 @@ bool concourseCameraTestInstall(const char** why) noexcept {
         const uintptr_t base=reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
         if(!base){*why="the module base could not be read";return false;}
         g_ctBase=base;
+        if(ctNearValueOk(base+kCtNearValueRva))g_ctNearAt.store(reinterpret_cast<float*>(base+kCtNearValueRva),std::memory_order_relaxed);
+        else Log::get().note("concourse camera test: the near value at 0x%llX is not the 0.025 that was read: the bake frames keep the game's near plane",static_cast<unsigned long long>(kCtNearValueRva));
         uint32_t mask=0;
         for(int i=0;i<kIdxCount;++i) {
             const uintptr_t at=base+g_ctEntries[i].rva;
@@ -318,6 +359,7 @@ bool concourseCameraTestInstall(const char** why) noexcept {
 void concourseCameraTestControl(uint32_t mode,bool acting) noexcept {
     g_ctMode.store(mode,std::memory_order_relaxed);
     g_ctActing.store(acting&&(mode==2||mode==3),std::memory_order_relaxed);
+    if(!acting)ctNearRestore();   // after the store: a producer that still saw acting can raise it once more, and the next tick's call puts that back too
     camTestGate.store(mode!=0?uintptr_t(1):uintptr_t(0),std::memory_order_release);
 }
 

@@ -3205,6 +3205,9 @@ bool bakeMakeCompute(ID3D11Device* device) noexcept {
             "    if (c.w <= 1e-4) return;\n"
             "    float2 ndc = c.xy / c.w;\n"
             "    if (abs(ndc.x) >= 1.0 || abs(ndc.y) >= 1.0) return;\n"
+            // Only this frame's own 90 degrees across, not all of its 121. The near plane clips a box around the centre only if each direction is taken from the frame looking along it: an
+            // overlap would let a frame that clips a point overwrite the one that kept it, and draw a seam along the frame's edge.
+            "    if (abs(ndc.x) * size.x / size.y > 1.002) return;\n"
             "    float2 uv = float2(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);\n"
             "    float z = sceneDepth.Load(int3(uv * size.xy, 0));\n"
             "    float t = size.w;\n"
@@ -3368,9 +3371,11 @@ void concoursePaneBakeCancel() noexcept {
 void concoursePaneBakeFrame(ID3D11DeviceContext* ctx, ID3D11ShaderResourceView* color, ID3D11ShaderResourceView* depth, const float camera[6][4], uint32_t width, uint32_t height) noexcept {
     if (!g_bakeWatch.load(std::memory_order_acquire)) return;
     const float dx = camera[5][0] - g_bakeCentre[0], dy = camera[5][1] - g_bakeCentre[1], dz = camera[5][2] - g_bakeCentre[2];
-    g_bakeAtCentre = dx * dx + dy * dy + dz * dz < 4.0f;
-    if (!g_bakeAtCentre) {
-        ++g_bakeSeenAway;
+    const bool atCentre = dx * dx + dy * dy + dz * dz < 4.0f;
+    // A frame back at the player with the near plane still raised would show the room clipped away, so the hold does not end on one (the game's own is 0.025 m).
+    g_bakeAtCentre = atCentre || camera[3][2] > 1.0f;
+    if (!atCentre) {
+        if (!g_bakeAtCentre) ++g_bakeSeenAway;
         return;
     }
     ++g_bakeSeenAtCentre;
