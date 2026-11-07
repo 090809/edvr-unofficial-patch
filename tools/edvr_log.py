@@ -10646,15 +10646,19 @@ H_FRAMEGEN_EXTRAP = (r"frame generation \(shadow\) extrapolation: ex2d=(?P<x2_n>
                      r" rowsoff_world=(?P<rows_world>[\d.]+%|-) rowsoff_cockpit=(?P<rows_cockpit>[\d.]+%|-)$")
 # Frame generation, Phase 2.1 (the synthesizer, the same key; src\common\framegen_synth_report.h): its armed line (once per key-on, said when the first eye's textures are made) and its
 # one-second line, graphics-log lines with no build tag, read the way the scorer's are. The report is frames=<f=0.5 built>/<f=1 built> scored=<f=1 frames scored against the next real
-# frame> skipped=<calls that built nothing> gpu_ms=<f=0.5 median/max(n=)>/<f=1 ...> holes=<filled>%/<left>% guard=<%>, then the scorer's three class fields (the f = 1 S against the next frame).
+# frame> skipped=<calls that built nothing> gpu_ms=<f=0.5 median/max(n=)>/<f=1 ...> holes=<filled>%/<left>% guard=<%> clamp=<%>, then the scorer's three class fields (the f = 1 S against the
+# next frame), then ` turned:` and the same three fields with S turned by the residual head rotation (the compositor's step) before it is scored, rot_res_deg=<median>/<max> of that residual
+# and out=<%> of the cells outside S. clamp and the turned part are optional: a log from before them still parses.
 H_FRAMEGEN_SYNTH = "frame generation synth"
 H_FRAMEGEN_SYNTH_LABEL = "frame generation (synth):"
 H_FRAMEGEN_SYNTH_ARMED = (r"frame generation \(synth\): armed, render (?P<rw>\d+)x(?P<rh>\d+) output (?P<ow>\d+)x(?P<oh>\d+) per eye, S format (?P<fmt>\d+), "
                           r"f=0.5 built on the even frames and f=1 scored against the next real frame \(nothing is shown\)$")
 _HFGS_GPU = r"(?:(?P<{p}_med>[\d.]+)/(?P<{p}_max>[\d.]+)\(n=(?P<{p}_n>[1-9]\d*)\)|-\(n=0\))"
 H_FRAMEGEN_SYNTH_REPORT = (r"frame generation \(synth\): frames=(?P<f05>\d+)/(?P<f1>\d+) scored=(?P<scored>\d+) skipped=(?P<skipped>\d+) gpu_ms=" + _HFGS_GPU.format(p="g05") + "/" +
-                           _HFGS_GPU.format(p="g1") + r" holes=(?P<filled>[\d.]+)%/(?P<left>[\d.]+)% guard=(?P<guard>[\d.]+)%" +
-                           "".join(_HFG_CLASS.format(n=n) for n in ("far", "cockpit", "world")) + "$")
+                           _HFGS_GPU.format(p="g1") + r" holes=(?P<filled>[\d.]+)%/(?P<left>[\d.]+)% guard=(?P<guard>[\d.]+)%(?: clamp=(?P<clamp>[\d.]+)%)?" +
+                           "".join(_HFG_CLASS.format(n=n) for n in ("far", "cockpit", "world")) +
+                           r"(?: turned:" + "".join(_HFG_SET_CLASS.format(n=n, p="t_") for n in ("far", "cockpit", "world")) +
+                           r" rot_res_deg=(?P<rot_med>[\d.]+|-)/(?P<rot_max>[\d.]+|-) out=(?P<t_out>[\d.]+)%)?$")
 # The SRV turret view (issue 140; src\d3d11\srv_turret.cpp, the vehicle latch's line in journal_watch.cpp, and the geometry shader's creation line in shader_swap.cpp, shaderSwapCreateGs,
 # called with who "srv turret hud"): lines of the graphics log with no build tag, read the way the desktop window's are. The settings and vehicle lines are state, so health_scan keeps
 # every one whatever --since says; the rest are events and are cut by the window. Every kind of line the DLL writes has a pattern of its own, so a labelled line that none matches is
@@ -16955,6 +16959,15 @@ def _hj_framegen_synth(rows, ctx=None):
         text += "; f=1 S against the next frame: p95 error far %s / cockpit %s / world %s milli-luma, no warp %s / %s / %s (mean of %d line(s))" % (
             tuple(sum(int(r[c + "_p95"]) for r in withScore) // len(withScore) for c in ("far", "cockpit", "world")) +
             tuple(sum(int(r[c + "_idp95"]) for r in withScore) // len(withScore) for c in ("far", "cockpit", "world")) + (len(withScore),))
+        turned = [r for r in withScore if r.get("t_far_p95") is not None]
+        if turned:
+            # The compositor's step: S turned by what remains of the head's rotation (true against the one S was built for) before it is scored; raw is the unturned score above.
+            rots = [(float(r["rot_med"]), float(r["rot_max"])) for r in turned if r.get("rot_med") not in (None, "-")]
+            text += "; turned by the residual head rotation: world p95 %d (raw %d) / cockpit %d (raw %d) / far %d (raw %d) milli-luma" % tuple(
+                v for c in ("world", "cockpit", "far")
+                for v in (sum(int(r["t_" + c + "_p95"]) for r in turned) // len(turned), sum(int(r[c + "_p95"]) for r in turned) // len(turned)))
+            if rots:
+                text += ", residual %.3f deg median (max %.3f)" % (sum(m for m, _ in rots) / len(rots), max(x for _, x in rots))
     return ("OK", text)
 
 
@@ -25194,10 +25207,14 @@ def self_test_health():
         def fg_synth_armed(rw=612, rh=699, ow=1224, oh=1398, fmt=10):
             return RS("frame generation (synth): armed, render %ux%u", rw, rh, ow, oh, fmt)
 
-        def fg_synth_report(f05=40, f1=39, scored=38, skipped=2, timed=True, p95=20, filled=0.25, left=0.01, guard=1.5):
+        def fg_synth_report(f05=40, f1=39, scored=38, skipped=2, timed=True, p95=20, filled=0.25, left=0.01, guard=1.5, turned=True, tp95=7, rot=(0.4, 1.2), clamp=0.0):
             cls = "".join(RF(" %s=%.1f%%,%u", n, 10.0, 12, 8, p95, 5.5, 1.5, 9, 30) for n in ("far", "cockpit", "world"))
             gpu = RF("%.2f/%.2f(n=%u)", 0.31, 0.8, 40) if timed else health_c_format(fgsrc, "-(n=0)")
-            return RS("frame generation (synth): frames=%u/%u scored=%u skipped=%u", f05, f1, scored, skipped) + RS(" gpu_ms=%s/%s holes=%.2f%%/%.2f%% guard=%.2f%%", gpu, gpu, filled, left, guard) + cls
+            line = RS("frame generation (synth): frames=%u/%u scored=%u skipped=%u", f05, f1, scored, skipped) + RS(" gpu_ms=%s/%s holes=%.2f%%/%.2f%% guard=%.2f%% clamp=%.3f%%", gpu, gpu, filled, left, guard, clamp) + cls
+            if turned:
+                tcls = "".join(RF(" %s=%.1f%%,%u", n, 10.0, 12, 8, tp95, 5.5, 1.5, 9, 30) for n in ("far", "cockpit", "world"))
+                line += RS(" turned:") + tcls + RS(" rot_res_deg=%s/%s out=%.2f%%", "%.3f" % rot[0], "%.3f" % rot[1], 3.5)
+            return line
 
         # fg_off is a log with the key off; fg_ok is one with the key on, whose scorer lines the synthesizer's lines must accompany (its rule judges against them).
         FG, FGS, fg_off = H_FRAMEGEN, H_FRAMEGEN_SYNTH, [f90_part()]
@@ -25263,6 +25280,11 @@ def self_test_health():
                    "holes filled 0.25% / left 0.01% of the render pixels (mean), guard 1.50%", "p95 error far 22 / cockpit 22 / world 22 milli-luma, no warp 30 / 30 / 30 (mean of 2 line(s))"], lacks=["UNPARSED"])
         check("frame generation synth: a report line with no gpu timing (\"-(n=0)\") and no scored frame is OK", fg_off + [fg_armed(), fg_report(), fg_synth_armed(), fg_synth_report(timed=False, scored=0)], 0, [("OK", FGS)],
               has=["1 report line(s)", "0 scored"], lacks=["UNPARSED", "f=1 S against the next frame"])
+        check("frame generation synth: the turned score is read and the OK summary sets the world p95 raw against turned",
+              fg_off + [fg_armed(), fg_report(), fg_synth_armed(), fg_synth_report(p95=96, tp95=7, rot=(0.4, 1.2)), fg_synth_report(p95=100, tp95=9, rot=(0.6, 2.0))], 0, [("OK", FGS)],
+              has=["turned by the residual head rotation: world p95 8 (raw 98) / cockpit 8 (raw 98) / far 8 (raw 98) milli-luma, residual 0.500 deg median (max 2.000)"], lacks=["UNPARSED"])
+        check("frame generation synth: a report line from before the turned fields (and the clamp) is read as it was and says nothing of a turn",
+              fg_off + [fg_armed(), fg_report(), fg_synth_armed(), fg_synth_report(turned=False)], 0, [("OK", FGS)], lacks=["UNPARSED", "turned by the residual"])
         check("frame generation synth: the scorer armed and reporting and no synth line at all is NEVER APPLIED", fg_off + [fg_armed(), fg_report()], 3, [("NEVER APPLIED", FGS)],
               has=["the shadow scorer is armed or reporting (fix.frame_generation_shadow on) but there is no 'frame generation (synth):' line at all", "exit 3"])
         check("frame generation synth: armed and no report line is NEVER APPLIED", fg_off + [fg_armed(), fg_report(), fg_synth_armed()], 3, [("NEVER APPLIED", FGS)],
