@@ -10662,7 +10662,18 @@ H_FRAMEGEN_SYNTH_REPORT = (r"frame generation \(synth\): frames=(?P<f05>\d+)/(?P
                            _HFGS_GPU.format(p="g1") + r" holes=(?P<filled>[\d.]+)%/(?P<left>[\d.]+)% guard=(?P<guard>[\d.]+)%(?: clamp=(?P<clamp>[\d.]+)%)?" +
                            "".join(_HFG_CLASS.format(n=n) for n in ("far", "cockpit", "world")) +
                            r"(?: turned:" + "".join(_HFG_SET_CLASS.format(n=n, p="t_") for n in ("far", "cockpit", "world")) +
-                           r" rot_res_deg=(?P<rot_med>[\d.]+|-)/(?P<rot_max>[\d.]+|-) out=(?P<t_out>[\d.]+)%)?$")
+                           r" rot_res_deg=(?P<rot_med>[\d.]+|-)/(?P<rot_max>[\d.]+|-) out=(?P<t_out>[\d.]+)%)?"
+                           r"(?: pose=(?P<pose_rt>\d+)/(?P<pose_fb>\d+) s=(?P<spath>[a-z]+) busy=(?P<sbusy>\d+))?$")
+# Frame generation, Phase 2.2 (src\common\framegen_slot_report.h, written by the OpenXR runtime): S's transfer once a second, produced=<S handed over> consumed=<copied to the runtime's
+# private texture> s_busy=<held back, the last one unconsumed> s_late=<consumed after T_S> ready_ms=<consume time less T_S, median/max> consume_ms=<median/max> pose=<pairs handed a
+# located slot pose>/<handed none> path=<uav|copy|none|mixed> vram_game_mib= vram_xr_mib=; and a line said once when the d3d11 half has no slot channel (an older d3d11.dll). Lines
+# of the runtime log, read the way the pose line is (health_scan_runtime), into the synth rule's rows. The synth report's own Phase 2.2 tail (pose=<on the slot pose>/<on the
+# extrapolation> s=<private|uav|copy|mixed|none> busy=) is optional above: a log from before it still parses, and is not held to a transfer line.
+H_FRAMEGEN_SLOT_LABEL = "frame generation (synth) transfer:"
+H_FRAMEGEN_SLOT = (r"frame generation \(synth\) transfer: produced=(?P<produced>\d+) consumed=(?P<consumed>\d+) s_busy=(?P<busy>\d+) s_late=(?P<late>\d+) "
+                   r"ready_ms=(?P<ready_med>-?[\d.]+|-)/(?P<ready_max>-?[\d.]+|-) consume_ms=(?P<cons_med>[\d.]+|-)/(?P<cons_max>[\d.]+|-) "
+                   r"pose=(?P<pose_rt>\d+)/(?P<pose_none>\d+) path=(?P<path>uav|copy|none|mixed) vram_game_mib=(?P<vgame>[\d.]+) vram_xr_mib=(?P<vxr>[\d.]+)$")
+H_FRAMEGEN_SLOT_NOCHANNEL = r"frame generation \(synth\) transfer: the d3d11 half has no slot channel \(edvrFrameGenNoteSlot missing: an older d3d11\.dll\)"
 # The SRV turret view (issue 140; src\d3d11\srv_turret.cpp, the vehicle latch's line in journal_watch.cpp, and the geometry shader's creation line in shader_swap.cpp, shaderSwapCreateGs,
 # called with who "srv turret hud"): lines of the graphics log with no build tag, read the way the desktop window's are. The settings and vehicle lines are state, so health_scan keeps
 # every one whatever --since says; the rest are events and are cut by the window. Every kind of line the DLL writes has a pattern of its own, so a labelled line that none matches is
@@ -16965,6 +16976,32 @@ def _hj_framegen_synth(rows, ctx=None):
                 for v in (sum(int(r["t_" + c + "_p95"]) for r in turned) // len(turned), sum(int(r[c + "_p95"]) for r in turned) // len(turned)))
             if rots:
                 text += ", residual %.3f deg median (max %.3f)" % (sum(m for m, _ in rots) / len(rots), max(x for _, x in rots))
+    # Phase 2.2: a report with the slot tail is a d3d11.dll that takes the runtime's slot and hands S over, so the runtime's transfer line must be there (when its log was read). A
+    # report without the tail is an older d3d11.dll, and is not held to it.
+    slotted = [r for r in reports if r.get("pose_rt") is not None]
+    if slotted:
+        paths = sorted(set(r["spath"] for r in slotted))
+        text += "; f=0.5 S head: %d on the runtime's slot pose, %d on the extrapolation; S written %s; %d busy" % (
+            sum(int(r["pose_rt"]) for r in slotted), sum(int(r["pose_fb"]) for r in slotted), "/".join(paths), sum(int(r["sbusy"]) for r in slotted))
+    transfers = rows.get("transfer", [])
+    if transfers:
+        produced, consumed = sum(int(r["produced"]) for r in transfers), sum(int(r["consumed"]) for r in transfers)
+        if produced > 0 and consumed == 0:
+            return ("NEVER APPLIED", "the runtime's transfer lines say %d S produced and none consumed (%d line(s)): the consume after the pair's finish never took one (the keyed mutex "
+                                     "never reached key 1 on its side, or the consume is dead)" % (produced, len(transfers)))
+        last = transfers[-1]
+        text += ("; transfer: %d line(s), %d produced / %d consumed, %d busy, %d late, ready %s ms against T_S (median, last line), consume %s ms, path %s, slot pose %d located / %d none, "
+                 "VRAM game %s / XR %s MiB (last line)" % (len(transfers), produced, consumed, sum(int(r["busy"]) for r in transfers), sum(int(r["late"]) for r in transfers),
+                                                          last["ready_med"], last["cons_med"], "/".join(sorted(set(r["path"] for r in transfers))),
+                                                          sum(int(r["pose_rt"]) for r in transfers), sum(int(r["pose_none"]) for r in transfers), last["vgame"], last["vxr"]))
+    elif slotted and _hrows(ctx or {}, H_FRAMEGEN_RUNTIME_READ, "read"):
+        if rows.get("nochannel"):
+            return ("NEVER APPLIED", "the synthesizer reported with the slot fields (%d line(s)) but the runtime says the d3d11 half has no slot channel: the runtime log is from "
+                                     "another d3d11.dll than this graphics log's" % len(slotted))
+        return ("NEVER APPLIED", "the synthesizer reported with the slot fields (%d line(s)) but the runtime log has no 'frame generation (synth) transfer:' line: no slot was handed "
+                                 "and nothing crossed (an older openvr_api.dll, or the transfer's line is dead)" % len(slotted))
+    elif slotted:
+        text += "; the runtime log was not read, so the transfer is not judged"
     return ("OK", text)
 
 
@@ -18157,6 +18194,8 @@ HEALTH_RULES = (
         ("armed", H_FRAMEGEN_SYNTH_ARMED),
         ("vram", H_FRAMEGEN_SYNTH_VRAM),
         ("report", H_FRAMEGEN_SYNTH_REPORT),
+        ("transfer", H_FRAMEGEN_SLOT),
+        ("nochannel", H_FRAMEGEN_SLOT_NOCHANNEL),
     ), _hj_framegen_synth),
     # The SRV turret view (issue 140): lines of the graphics log that carry no build tag (health_scan reads them, as it reads the desktop window's, before it drops the untagged lines).
     _hrule(H_SRV_TURRET, (), H_SRV_TURRET_LABELS, (
@@ -18389,8 +18428,21 @@ def health_scan_runtime(scan, text):
     rule = next(r for r in HEALTH_RULES if r.name == H_WORLD)
     rows = scan["rows"][H_WORLD]
     pose_rx = dict(next(r for r in HEALTH_RULES if r.name == H_FRAMEGEN).kinds)["pose"]
+    synth_kinds = dict(next(r for r in HEALTH_RULES if r.name == H_FRAMEGEN_SYNTH).kinds)
     scan["rows"][H_FRAMEGEN_RUNTIME_READ] = {"read": [{}]}
     for order, raw in enumerate(text.splitlines()):
+        if H_FRAMEGEN_SLOT_LABEL in raw:
+            # Frame generation 2.2: S's transfer line, or the line that says the d3d11 half has no slot channel.
+            for kind in ("transfer", "nochannel"):
+                g = synth_kinds[kind].search(raw)
+                if g:
+                    scan["rows"][H_FRAMEGEN_SYNTH].setdefault(kind, []).append(dict(g.groupdict(), _order=order, _t=None))
+                    break
+            else:
+                u = scan["unparsed"][H_FRAMEGEN_SYNTH]
+                u[0] += 1
+                u[1] = u[1] or raw.strip()[:160]
+            continue
         if H_FRAMEGEN_POSE_LABEL in raw:
             g = pose_rx.search(raw)
             if g:
@@ -25216,13 +25268,15 @@ def self_test_health():
             return RS("frame generation (synth): eye %u VRAM %llu B", eye, 53364996, 50.9, "s=49038336 luma=862920 class=3451680 stats=12060", 58616136, 55.9,
                       "key=27584064 read=27584064 holes=3448008", 165346128, 157.7)
 
-        def fg_synth_report(f05=40, f1=39, scored=38, skipped=2, timed=True, p95=20, filled=0.25, left=0.01, guard=1.5, turned=True, tp95=7, rot=(0.4, 1.2), clamp=0.0):
+        def fg_synth_report(f05=40, f1=39, scored=38, skipped=2, timed=True, p95=20, filled=0.25, left=0.01, guard=1.5, turned=True, tp95=7, rot=(0.4, 1.2), clamp=0.0, slot=None):
             cls = "".join(RF(" %s=%.1f%%,%u", n, 10.0, 12, 8, p95, 5.5, 1.5, 9, 30) for n in ("far", "cockpit", "world"))
             gpu = RF("%.2f/%.2f(n=%u)", 0.31, 0.8, 40) if timed else health_c_format(fgsrc, "-(n=0)")
             line = RS("frame generation (synth): frames=%u/%u scored=%u skipped=%u", f05, f1, scored, skipped) + RS(" gpu_ms=%s/%s holes=%.2f%%/%.2f%% guard=%.2f%% clamp=%.3f%%", gpu, gpu, filled, left, guard, clamp) + cls
             if turned:
                 tcls = "".join(RF(" %s=%.1f%%,%u", n, 10.0, 12, 8, tp95, 5.5, 1.5, 9, 30) for n in ("far", "cockpit", "world"))
                 line += RS(" turned:") + tcls + RS(" rot_res_deg=%s/%s out=%.2f%%", "%.3f" % rot[0], "%.3f" % rot[1], 3.5)
+            if slot is not None:   # Phase 2.2: (on the slot pose, on the extrapolation, where S was written, busy)
+                line += RS(" pose=%u/%u s=%s busy=%u", *slot)
             return line
 
         # fg_off is a log with the key off; fg_ok is one with the key on, whose scorer lines the synthesizer's lines must accompany (its rule judges against them).
@@ -25316,6 +25370,39 @@ def self_test_health():
               has=["1 report line(s)", "armed at render 612x699"], extra=["--since", "10:01:00"])
         check("frame generation synth: a synth line with no scorer line is OK (the scorer's rule says nothing)", fg_off + [fg_synth_armed(), fg_synth_report()], 0, [("OK", FGS)], lacks=["UNPARSED"])
         check("frame generation synth: no synth line and no scorer line, nothing said (the key off)", fg_off, 0, [("OK", F90S)], lacks=["frame generation synth", "NEVER APPLIED"])
+        # Phase 2.2: S's transfer, the runtime log's line (src\common\framegen_slot_report.h), judged beside a synth report that carries the slot fields.
+        fgtsrc = read_text(os.path.join(repo_root(), "src", "common", "framegen_slot_report.h"))
+
+        def RT(needle, *vals):
+            key = "fgt:" + needle
+            if key not in fmts:
+                fmts[key] = health_c_format(fgtsrc, needle)
+            if fmts[key] is None:
+                raise AssertionError("frame generation synth: no transfer log format holds %r: the --health rule that reads it is out of date" % needle)
+            return health_render(fmts[key], vals)
+
+        def fg_transfer(produced=45, consumed=45, busy=0, late=0, ready=("-9.12", "-7.50"), path="uav"):
+            return RT("frame generation (synth) transfer: produced=%u", produced, consumed, busy, late, ready[0], ready[1], "0.04", "0.09", 45, 0, path, 93.5, 93.5)
+
+        fg_slotted = fg_off + [fg_armed(), fg_report(), fg_synth_armed(), fg_synth_report(slot=(45, 0, "uav", 0))]
+        check("frame generation synth: a slotted report with the runtime's transfer line is OK and says both halves",
+              fg_slotted, 0, [("OK", FGS)], lacks=["UNPARSED"], extra=["--runtime-file", runtime([fg_pose(), fg_transfer(), fg_transfer(late=1, ready=("-9.00", "0.50"))])],
+              has=["f=0.5 S head: 45 on the runtime's slot pose, 0 on the extrapolation; S written uav; 0 busy",
+                   "transfer: 2 line(s), 90 produced / 90 consumed, 0 busy, 1 late, ready -9.00 ms against T_S (median, last line), consume 0.04 ms, path uav, slot pose 90 located / 0 none, "
+                   "VRAM game 93.5 / XR 93.5 MiB (last line)"])
+        check("frame generation synth: S produced and never consumed is NEVER APPLIED", fg_slotted, 3, [("NEVER APPLIED", FGS)],
+              extra=["--runtime-file", runtime([fg_pose(), fg_transfer(consumed=0, ready=("-", "-"))])], has=["the runtime's transfer lines say 45 S produced and none consumed (1 line(s))", "exit 3"])
+        check("frame generation synth: a slotted report and no transfer line in the runtime log is NEVER APPLIED", fg_slotted, 3, [("NEVER APPLIED", FGS)],
+              extra=["--runtime-file", runtime([fg_pose(), "native_frame: unrelated runtime line"])], has=["but the runtime log has no 'frame generation (synth) transfer:' line", "exit 3"])
+        check("frame generation synth: a runtime that says the d3d11 half has no slot channel, beside a slotted report, is NEVER APPLIED (two builds)", fg_slotted, 3, [("NEVER APPLIED", FGS)],
+              extra=["--runtime-file", runtime([fg_pose(), RT("frame generation (synth) transfer: the d3d11 half has no slot channel")])], has=["the runtime says the d3d11 half has no slot channel"])
+        check("frame generation synth: no runtime log read leaves the transfer unjudged, and says so", fg_slotted, 0, [("OK", FGS)], has=["the runtime log was not read, so the transfer is not judged"])
+        check("frame generation synth: a report from before the slot fields is not held to a transfer line", fg_off + [fg_armed(), fg_report(), fg_synth_armed(), fg_synth_report()], 0, [("OK", FGS)],
+              extra=["--runtime-file", runtime([fg_pose(), "native_frame: unrelated runtime line"])], lacks=["transfer", "UNPARSED", "slot pose"])
+        check("frame generation synth: a drifted transfer line is counted as unparsed and is no transfer line", fg_slotted, 3, [("NEVER APPLIED", FGS)],
+              extra=["--runtime-file", runtime([fg_pose(), fg_transfer().replace("s_late=", "late=")])], has=["line(s) the rule's patterns do not match"])
+        check("frame generation synth: an extrapolated window (no slot pose: an older runtime) on the private path reads as such", fg_off + [fg_armed(), fg_report(), fg_synth_armed(), fg_synth_report(slot=(0, 45, "private", 0))], 0,
+              [("OK", FGS)], has=["f=0.5 S head: 0 on the runtime's slot pose, 45 on the extrapolation; S written private"], lacks=["UNPARSED"])
 
         # ---- the SRV turret view: the graphics log's untagged lines, rendered from the C format strings in src\d3d11\srv_turret.cpp and (the geometry shader's creation line) shader_swap.cpp ----
         stsrc = read_text(os.path.join(repo_root(), "src", "d3d11", "srv_turret.cpp"))
