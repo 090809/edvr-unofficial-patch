@@ -106,6 +106,7 @@ struct State {
     ID3D11ComputeShader* csFinish = nullptr;   // Phase 2.3b: fgSynFinish, outside the pass sequence
     TimerSlot* finTimer[2] = {};               // the finish's timer per eye, from frameGenSynthFinishSource to frameGenSynthFinish
     ID3D11Buffer* cb = nullptr;
+    ID3D11SamplerState* linear = nullptr;      // the resample's paired taps (framegen_synth_pass.h frameGenSynthCreateSampler)
     DXGI_FORMAT lumaFormat = DXGI_FORMAT_R16_FLOAT;
     EyeRes eye[2];
     Scratch scratch;
@@ -366,6 +367,7 @@ void releaseAll() {
     releaseCom(g.csFinish);
     g.finTimer[0] = g.finTimer[1] = nullptr;   // a timer slot in flight is polled on as before (pollTimers); only the eye's claim on it goes
     releaseCom(g.cb);
+    releaseCom(g.linear);
     g.dev = nullptr;
     g.failed = false;
     g.slotSeen = g.slotAbsenceSaid = g.sharedRefused = g.remakeSaid = false;
@@ -403,6 +405,7 @@ bool createCommon(ID3D11Device* dev, ID3D11DeviceContext* ctx) {
     bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
     bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
     if (FAILED(dev->CreateBuffer(&bd, nullptr, &g.cb))) return false;
+    if (!frameGenSynthCreateSampler(dev, &g.linear)) return false;
     // The formats the textures are written in: R32_FLOAT and R32_UINT (the keys, the packed read offsets) are in every D3D11 part's typed set, stores and loads; the two-float
     // class map needs the adapter to store it (every D3D11 part that matters does); the luma is R16_FLOAT where the adapter stores it, else R32_FLOAT, as the scorer's.
     if (!uavStoreOk(dev, DXGI_FORMAT_R32G32_FLOAT) || !uavStoreOk(dev, DXGI_FORMAT_R32_UINT) || !uavStoreOk(dev, DXGI_FORMAT_R32_FLOAT)) return false;
@@ -914,6 +917,7 @@ void frameGenSynthEyeFrame(ID3D11Device* dev, ID3D11DeviceContext* ctx, uint32_t
     v.sLumaSrv = r.sLuma.srv; v.sLumaUav = r.sLuma.uav;
     v.bInfoSrv = r.bInfo.srv; v.bInfoUav = r.bInfo.uav;
     v.statsUav = r.statsUav;
+    v.linear = g.linear;
     v.rw = r.rw; v.rh = r.rh; v.ow = r.ow; v.oh = r.oh; v.qw = r.qw; v.qh = r.qh;
     frameGenSynthRunPasses(ctx, g.cs, v, score, true, keep);
     ctx->CopyResource(r.staging[slot], r.stats);

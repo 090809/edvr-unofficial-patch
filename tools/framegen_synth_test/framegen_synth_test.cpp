@@ -127,6 +127,7 @@ struct Gpu {
     ComPtr<ID3D11Device> dev;
     ComPtr<ID3D11DeviceContext> ctx;
     ComPtr<ID3D11ComputeShader> cs[kEntries];
+    ComPtr<ID3D11SamplerState> linear;
     ComPtr<ID3D11Buffer> cb;
 
     bool init() {
@@ -139,6 +140,7 @@ struct Gpu {
             {kFrameGenSynthLumaBytecode, sizeof(kFrameGenSynthLumaBytecode)}, {kFrameGenSynthScoreBytecode, sizeof(kFrameGenSynthScoreBytecode)}};
         for (int i = 0; i < kEntries; ++i)
             if (FAILED(dev->CreateComputeShader(codes[i].code, codes[i].size, nullptr, &cs[i]))) return false;
+        if (!frameGenSynthCreateSampler(dev.Get(), &linear)) return false;
         D3D11_BUFFER_DESC bd{};
         bd.ByteWidth = sizeof(FrameGenSynthCb);
         bd.Usage = D3D11_USAGE_DYNAMIC;
@@ -319,6 +321,7 @@ Run runSynth(Gpu& g, const Scene& sc, const FrameGenSynthCb& cb, Keep* keep = nu
     v.sSrv = s.srv.Get(); v.sUav = s.uav.Get();
     if (keep) { v.sLumaUav = keep->sLuma.uav.Get(); v.bInfoUav = keep->bInfo.uav.Get(); }
     v.statsUav = statsUav.Get();
+    v.linear = g.linear.Get();
     v.rw = static_cast<uint32_t>(sc.w); v.rh = static_cast<uint32_t>(sc.h); v.ow = static_cast<uint32_t>(sc.ow); v.oh = static_cast<uint32_t>(sc.oh);
     v.qw = static_cast<uint32_t>((sc.w + 3) / 4); v.qh = static_cast<uint32_t>((sc.h + 3) / 4);
     g.run(v, false, true, keep != nullptr);

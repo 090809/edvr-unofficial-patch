@@ -20,8 +20,8 @@
 //                  2026-11-07). That read becomes its offset, counted as filled and no longer left. The neighbour's read is taken in full precision, as fgSynSrc computed it before the store rounded it
 //                  (synWinnerRead finds the neighbour's source pixel again from the stored offset and recomputes its read), so the fill is the same as when every read was computed
 //                  in one pass; the counters (filled, left, guard, clamped) of the three passes add up in the stats words;
-//   fgSynResample  output size: each output pixel to its S pixel, its read offset, B's output there, Catmull-Rom with its ringing clamped (synSharp, FG_SHARP), into the S
-//                  texture (dlOut's format);
+//   fgSynResample  output size: each output pixel to its S pixel, its read offset, B's output there, Catmull-Rom in 12 fetches with its ringing clamped (synSharp, FG_SHARP),
+//                  into the S texture (dlOut's format);
 //   fgSynLuma      quarter grid: S's luma the way the scorer's capture takes it, B's luma and B's class (the f = 1 S is kept for the next real frame);
 //   fgSynScore     quarter grid, on the next real frame C: C's luma against the kept S luma and against B's (the no-warp comparison), binned per class of B as the scorer bins; and again
 //                  against the kept S luma TURNED by the residual head rotation (the compositor's step: C's cell direction rotated into the eye S was built for, projected with the
@@ -33,7 +33,7 @@
 // this frame to the previous, jitter-free), t3 and t5 fgSynFinish's frame and UI layer (t10 its multiply, u2 its output: Phase 2.3b, at the end of the text), t4 the key grid, t6 the read offsets, t7 the S texture, t8 the kept S luma, t9 the kept B luma (x) and class (y);
 // u0 the hole list (a structured buffer of uints), u1 the key grid (R32_UINT), u2 fgSynFinish's output, u3 the read offsets (R32_UINT: two packed half floats, or a guarded read's integer
 // pair with the mark; the resolve and the hole pass read other pixels' through this view, a typed uint load every D3D11 part does), u4 the S texture, u5 the stats words, u6 the
-// S luma, u7 B's luma and class; b0 P.
+// S luma, u7 B's luma and class; b0 P; s0 a linear clamped sampler (framegen_synth_pass.h frameGenSynthCreateSampler), the resample's paired taps.
 //
 // The key: 0 a hole, 4 the far plane, else (max(asuint(1 / metres), 8) & ~7) | 4 when the pixel is its own nearest | class (1 cockpit, 2 world). A larger key is a nearer surface.
 //
@@ -56,7 +56,7 @@ inline constexpr char kFrameGenSynthCs[] = R"HLSL(
 #define FG_SENTINEL 1   // a rejected-history vector (the size * 2 sentinel) borrows its background's (0: taken as motion)
 #define FG_TURN 1        // the score turns S by the residual head rotation (0: it scores it unturned)
 #define FG_TURN_SIGN 1   // the residual is applied the right way round (0: its transpose)
-#define FG_SHARP 1       // S's resample is Catmull-Rom, its ringing clamped to the 2x2 around the read (0: bilinear; the bench's comparisons: 2 Lanczos-2 clamped, 3 Catmull-Rom unclamped, 4 clamped to the 4x4)
+#define FG_SHARP 1       // S's resample is Catmull-Rom in 12 fetches, its ringing clamped to the 2x2 around the read (0: bilinear; the bench's comparisons: 2 Lanczos-2 clamped, 3 Catmull-Rom unclamped, 4 clamped to the 4x4, 5 the same Catmull-Rom as 16 loads, 6 the corners dropped: 8 fetches)
 cbuffer P : register(b0) {
     int4   sz;       // render width, height, output width, height
     int4   qz;       // quarter grid width, height
@@ -82,6 +82,7 @@ RWTexture2D<float4> SOut      : register(u4);
 RWStructuredBuffer<uint> Stats : register(u5);
 RWTexture2D<float>  SLumaOut  : register(u6);
 RWTexture2D<float2> BInfoOut  : register(u7);
+SamplerState LinClamp : register(s0);   // linear, clamp (framegen_synth_pass.h frameGenSynthCreateSampler): the resample's paired taps
 
 static const uint  kBins = 48;
 static const uint  kPerClass = 99;        // 2 * kBins + 3
@@ -148,6 +149,10 @@ float4 synBilinear(Texture2D<float4> t, float2 u, int2 size) {
 // S's resample (fgSynResample): a 4x4 read of B's output at a continuous position, Catmull-Rom (FG_SHARP), the result clamped per channel to the 2x2 texels around the
 // position so an edge does not ring. A bilinear read of an 8-bit source at a sub-pixel position kept about 80% of B's high-frequency energy (the eye dumps of 2026-11-07); the
 // cubic keeps it. A position on a texel centre returns that texel exactly (weights 0, 1, 0, 0). Edges clamped.
+// The pass is bound by its fetches, not by memory (2026-11-08: 4 fetches 0.089 ms, 16 loads 0.161 at the pilot's sizes, the same 98 MB either way), so the production form
+// (synSharpPaired) takes the same 4x4 in 12: the centre 2x2 as point loads (exact, and the clamp's bounds), each edge pair's two centre taps as one bilinear fetch through
+// LinClamp at the ratio of their weights (an edge tap is at most a sixteenth of the sum and the sampler's weights are 8-bit, so a result can differ from the 16-load sum by one
+// step of an 8-bit channel: 0.05% of the S pixels of the 22 replays), the corners as point loads. 5 is the 16-load form it replaced, for the bench's comparison.
 float4 synCatmullW(float t) {
     return float4(t * (-0.5 + t * (1.0 - 0.5 * t)), 1.0 + t * t * (-2.5 + 1.5 * t), t * (0.5 + t * (2.0 - 1.5 * t)), t * t * (-0.5 + 0.5 * t));
 }
@@ -163,9 +168,36 @@ float4 synLanczosW(float t) {
     float4 w = float4(synLanczos2(t + 1.0), synLanczos2(t), synLanczos2(1.0 - t), synLanczos2(2.0 - t));
     return w / dot(w, float4(1.0, 1.0, 1.0, 1.0));
 }
+// The Catmull-Rom 4x4 in 12 fetches (above; FG_SHARP 1), or in 8 with the corners dropped and the rest renormalised (6, the bench's comparison).
+float4 synSharpPaired(Texture2D<float4> t, float2 u, int2 size) {
+    float2 f = u - 0.5;
+    int2 i0 = int2(floor(f));
+    float2 w = f - float2(i0);
+    float4 wx = synCatmullW(w.x), wy = synCatmullW(w.y);
+    int2 hi = size - 1;
+    int2 a = clamp(i0, int2(0, 0), hi), b = clamp(i0 + 1, int2(0, 0), hi);
+    float4 c00 = t.Load(int3(a.x, a.y, 0)), c10 = t.Load(int3(b.x, a.y, 0)), c01 = t.Load(int3(a.x, b.y, 0)), c11 = t.Load(int3(b.x, b.y, 0));
+    float4 lo = min(min(c00, c10), min(c01, c11)), up = max(max(c00, c10), max(c01, c11));
+    float4 acc = wy[1] * (wx[1] * c00 + wx[2] * c10) + wy[2] * (wx[1] * c01 + wx[2] * c11);
+    float wxc = wx[1] + wx[2], wyc = wy[1] + wy[2];   // at least 1: the outer weights are never positive
+    float2 inv = 1.0 / float2(size);
+    float2 pc = float2(i0) + 0.5 + float2(wx[2] / wxc, wy[2] / wyc);   // the paired position between texels 1 and 2, texel centres at +0.5
+    acc += wx[0] * wyc * t.SampleLevel(LinClamp, float2(float(i0.x) - 0.5, pc.y) * inv, 0) + wx[3] * wyc * t.SampleLevel(LinClamp, float2(float(i0.x) + 2.5, pc.y) * inv, 0) +
+           wy[0] * wxc * t.SampleLevel(LinClamp, float2(pc.x, float(i0.y) - 0.5) * inv, 0) + wy[3] * wxc * t.SampleLevel(LinClamp, float2(pc.x, float(i0.y) + 2.5) * inv, 0);
+#if FG_SHARP != 6
+    int2 m = clamp(i0 - 1, int2(0, 0), hi), p = clamp(i0 + 2, int2(0, 0), hi);
+    acc += wx[0] * wy[0] * t.Load(int3(m.x, m.y, 0)) + wx[3] * wy[0] * t.Load(int3(p.x, m.y, 0)) + wx[0] * wy[3] * t.Load(int3(m.x, p.y, 0)) + wx[3] * wy[3] * t.Load(int3(p.x, p.y, 0));
+#else
+    acc /= 1.0 - (wx[0] + wx[3]) * (wy[0] + wy[3]);
+#endif
+    return clamp(acc, lo, up);
+}
+
 float4 synSharp(Texture2D<float4> t, float2 u, int2 size) {
 #if FG_SHARP == 0
     return synBilinear(t, u, size);
+#elif FG_SHARP == 1 || FG_SHARP == 6
+    return synSharpPaired(t, u, size);
 #else
     float2 f = u - 0.5;
     int2 i0 = int2(floor(f));
@@ -196,6 +228,7 @@ float4 synSharp(Texture2D<float4> t, float2 u, int2 size) {
 #endif
 }
 
+)HLSL" R"HLSL(
 uint synBin(float e) {
     if (!(e >= 1.0 / 1024.0)) return 0u;
     float l = 4.0 * log2(e * 1024.0);

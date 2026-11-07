@@ -41,10 +41,21 @@ struct FrameGenSynthPassViews {
     ID3D11UnorderedAccessView* statsUav = nullptr;
     ID3D11UnorderedAccessView* sLumaUav = nullptr;
     ID3D11UnorderedAccessView* bInfoUav = nullptr;
+    ID3D11SamplerState* linear = nullptr;   // frameGenSynthCreateSampler's: the resample's paired taps (s0)
     uint32_t rw = 0, rh = 0;   // render size
     uint32_t ow = 0, oh = 0;   // output size
     uint32_t qw = 0, qh = 0;   // the quarter grid
 };
+
+// The one sampler the passes use (s0, the resample): linear, clamped at the edges, no mips. The callers own it (made once with their shaders).
+inline bool frameGenSynthCreateSampler(ID3D11Device* dev, ID3D11SamplerState** out) {
+    D3D11_SAMPLER_DESC sd{};
+    sd.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+    sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+    sd.ComparisonFunc = D3D11_COMPARISON_NEVER;
+    sd.MaxLOD = D3D11_FLOAT32_MAX;
+    return SUCCEEDED(dev->CreateSamplerState(&sd, out)) && *out;
+}
 
 // The sequence of one call: the clear (the key grid and the stats words to 0 by the API; the read offsets are set by the splat, framegen_synth_shader.h); the score of the kept f = 1 S
 // against this frame when `score`; then, when `build`, splat, source (the winners' read offsets), resolve (the holes listed), holes, resample and, when `keep`, the luma pass
@@ -103,7 +114,11 @@ inline void frameGenSynthRunPasses(ID3D11DeviceContext* ctx, ID3D11ComputeShader
         {   // resample B's output into S at the output size
             ID3D11ShaderResourceView* srv[kFrameGenSynthSrvSlots] = {v.out, nullptr, nullptr, nullptr, nullptr, nullptr, v.readSrv};
             ID3D11UnorderedAccessView* uav[kFrameGenSynthUavSlots] = {nullptr, nullptr, nullptr, nullptr, v.sUav};
+            ID3D11SamplerState* const smp[1] = {v.linear};
+            ctx->CSSetSamplers(0, 1, smp);
             dispatch(kFgSynResample, srv, uav, ogx, ogy);
+            ID3D11SamplerState* const noSmp[1] = {};
+            ctx->CSSetSamplers(0, 1, noSmp);
         }
         if (keep) {   // the f = 1 S's luma, B's luma and B's class, for the next real frame to score
             ID3D11ShaderResourceView* srv[kFrameGenSynthSrvSlots] = {v.out, v.depth, nullptr, nullptr, nullptr, nullptr, nullptr, v.sSrv};

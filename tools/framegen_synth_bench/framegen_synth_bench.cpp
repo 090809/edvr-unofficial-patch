@@ -11,9 +11,11 @@
 //       FOLDER is an fgreplay_<stamp> capture (.agents/framegen-replay-format.md). For each consecutive pair (B = k, C = k + 1): the f = 1 S is built from B, kept, and scored against C's
 //       output exactly as the DLL scores it (raw, and turned by the residual head rotation, per class; the |id: fields of the line are the no-warp baseline); the f = 0.5 S is built
 //       from B too. B, S(f = 0.5) and S(f = 1) are written as PNGs (8-bit, clamped to 0..1, sRGB encoded) into DIR (default FOLDER\bench_out); --dry-run writes nothing.
-//       Each pair also prints S's sharpness against B's (Sharpness: the mean |Laplacian| of luma per class, S over B) for both S, and the hole region's error (HoleError: the
-//       mean |luma| of the f = 1 S against C over the output pixels whose render pixel was a hole, the fill's, with B against C beside it).
-//   --define NAME=V (with --bench or --replay): the shader's `#define NAME 1` compiled as V instead, for a comparison (FG_SHARP 0 bilinear, 2 Lanczos-2, 3 unclamped).
+//       Each pair also prints S's sharpness against B's (Sharpness: the mean |Laplacian| of luma per class, S over B) for both S, with the count of render pixels that got a key
+//       but no read offer (orphan: fgSynSrc's recompute of a landing disagreeing with fgSynSplat's; 0 so far), and the hole region's error (HoleError: the mean |luma| of the
+//       f = 1 S against C over the output pixels whose render pixel was a hole, the fill's, with B against C beside it).
+//   --define NAME=V (with --bench or --replay): the shader's `#define NAME 1` compiled as V instead, for a comparison (FG_SHARP 0 bilinear, 2 Lanczos-2, 3 unclamped, 5 the
+//       Catmull-Rom as 16 loads, 6 with its corners dropped).
 //   --self-test
 //       The format reader and writer round trip, the constant block rebuilt from a frame's JSON against the production fill (memcmp), a synthetic capture written, read back and
 //       replayed on WARP (a scene scrolling at the vectors' rate is predicted by the f = 1 S), and a tiny bench on WARP. Needs no real GPU; WARP missing: the GPU parts are skipped.
@@ -434,6 +436,7 @@ struct Gpu {
     ComPtr<ID3D11Device> dev;
     ComPtr<ID3D11DeviceContext> ctx;
     ComPtr<ID3D11ComputeShader> cs[kEntries];
+    ComPtr<ID3D11SamplerState> linear;
     ComPtr<ID3D11Buffer> cb;
     std::string adapterName;
     uint64_t dedicatedVram = 0;
@@ -493,6 +496,7 @@ struct Gpu {
         bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
         bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
         if (FAILED(dev->CreateBuffer(&bd, nullptr, &cb))) { err = "constant buffer"; return false; }
+        if (!frameGenSynthCreateSampler(dev.Get(), &linear)) { err = "sampler"; return false; }
         // framegen_synth.cpp createCommon: the formats the synth stores in, and the luma format.
         const auto uavStoreOk = [&](DXGI_FORMAT fmt) {
             UINT support = 0;
@@ -629,6 +633,7 @@ void runCall(Gpu& g, Synth& sy, const Inputs& in, bool score, bool keep, bool sc
     v.sLumaSrv = sy.sLuma.srv.Get(); v.sLumaUav = sy.sLuma.uav.Get();
     v.bInfoSrv = sy.bInfo.srv.Get(); v.bInfoUav = sy.bInfo.uav.Get();
     v.statsUav = sy.statsUav.Get();
+    v.linear = g.linear.Get();
     v.rw = sy.rw; v.rh = sy.rh; v.ow = sy.ow; v.oh = sy.oh; v.qw = sy.qw; v.qh = sy.qh;
     ID3D11ComputeShader* cs[kEntries];
     for (int i = 0; i < kEntries; ++i) cs[i] = g.cs[i].Get();
@@ -716,13 +721,15 @@ bool uploadFrame(Gpu& g, const FrameData& fd, GpuFrame& gf) {
 // in all: a torn fill's false edges read as sharpness there, so the fill is judged by the hole region's error and the resample by the rest.
 struct Sharpness {
     double s[5] = {}, b[5] = {};   // far, cockpit, world, all, holes
-    void add(const Sharpness& o) { for (int i = 0; i < 5; ++i) { s[i] += o.s[i]; b[i] += o.b[i]; } }
+    uint64_t orphan = 0;           // render pixels with a key but no read offer (the splat's all-ones still there): fgSynSrc's recompute of the splat's landing disagreeing with it; 0 on every replay of 2026-11-08
+    void add(const Sharpness& o) { for (int i = 0; i < 5; ++i) { s[i] += o.s[i]; b[i] += o.b[i]; } orphan += o.orphan; }
     double ratio(int i) const { return b[i] > 0.0 ? s[i] / b[i] : -1.0; }
     double restRatio() const { return b[3] - b[4] > 0.0 ? (s[3] - s[4]) / (b[3] - b[4]) : -1.0; }   // all but the holes
     std::string text() const {
         static const char* const kNames[5] = {"far", "cockpit", "world", "all", "holes"};
         std::string t;
         for (int i = 0; i < 5; ++i) t += fmtStr("%s%s %s", i ? " " : "", kNames[i], ratio(i) < 0.0 ? "-" : fmtStr("%.3f", ratio(i)).c_str());
+        t += fmtStr(" orphan %llu", static_cast<unsigned long long>(orphan));
         return t;
     }
 };
@@ -763,6 +770,7 @@ bool measureSharpness(const std::vector<uint8_t>& sRaw, const std::vector<uint8_
     const uint32_t* rd = reinterpret_cast<const uint32_t*>(reads.data());
     const uint32_t* key = keys && keys->size() >= static_cast<size_t>(sy.rw) * sy.rh * 4 ? reinterpret_cast<const uint32_t*>(keys->data()) : nullptr;
     const auto lap = [&](const std::vector<float>& l, size_t i) { return std::fabs(4.0f * l[i] - l[i - 1] - l[i + 1] - l[i - sy.ow] - l[i + sy.ow]); };
+    if (key) for (size_t i = 0; i < static_cast<size_t>(sy.rw) * sy.rh; ++i) if (key[i] != 0u && rd[i] == 0xFFFFFFFFu) ++out.orphan;
     for (uint32_t y = 1; y + 1 < sy.oh; ++y) {
         const double ry = (y + 0.5) * sy.rh / sy.oh - 0.5;
         const uint32_t py = std::min(static_cast<uint32_t>(ry + 0.5), sy.rh - 1);
