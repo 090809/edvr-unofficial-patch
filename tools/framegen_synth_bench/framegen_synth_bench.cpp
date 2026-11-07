@@ -742,9 +742,9 @@ bool lumaPlane(const std::vector<uint8_t>& raw, uint32_t w, uint32_t h, DXGI_FOR
 
 // A packed read offset (the shader's synUnpackOffset), in render pixels; false: kNoRead (the pixel reads itself).
 bool unpackReadOffset(uint32_t p, float& ox, float& oy) {
-    if ((p & 0x7C00u) == 0x7C00u) {   // a guarded read: an integer pair
-        ox = static_cast<float>(static_cast<int>((p & 0x3FFu) | (((p >> 15) & 3u) << 10)) - 2048);
-        oy = static_cast<float>(static_cast<int>((p >> 17) & 0xFFFu) - 2048);
+    if ((p & 0x7C000000u) == 0x7C000000u) {   // a guarded read: an integer pair
+        ox = static_cast<float>(static_cast<int>(p & 0xFFFu) - 2048);
+        oy = static_cast<float>(static_cast<int>((p >> 12) & 0xFFFu) - 2048);
         return true;
     }
     ox = halfToFloat(static_cast<uint16_t>(p & 0xFFFFu));

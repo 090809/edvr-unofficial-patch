@@ -1482,7 +1482,7 @@ static void selfTest() {
         struct Binding { const char* name; D3D_SHADER_INPUT_TYPE type; UINT slot; };
         struct SynthContract { const char* symbol; const char* entry; std::vector<Binding> bindings; };
         const std::vector<SynthContract> contracts = {
-            {"kFrameGenSynthSplatBytecode", "fgSynSplat", {{"Depth", D3D_SIT_TEXTURE, 1}, {"Mv", D3D_SIT_TEXTURE, 2}, {"Key", D3D_SIT_UAV_RWTYPED, 1}, {"P", D3D_SIT_CBUFFER, 0}}},
+            {"kFrameGenSynthSplatBytecode", "fgSynSplat", {{"Depth", D3D_SIT_TEXTURE, 1}, {"Mv", D3D_SIT_TEXTURE, 2}, {"Key", D3D_SIT_UAV_RWTYPED, 1}, {"ReadOut", D3D_SIT_UAV_RWTYPED, 3}, {"P", D3D_SIT_CBUFFER, 0}}},
             {"kFrameGenSynthSrcBytecode", "fgSynSrc", {{"Depth", D3D_SIT_TEXTURE, 1}, {"Mv", D3D_SIT_TEXTURE, 2}, {"KeyT", D3D_SIT_TEXTURE, 4}, {"ReadOut", D3D_SIT_UAV_RWTYPED, 3}, {"Stats", D3D_SIT_UAV_RWSTRUCTURED, 5}, {"P", D3D_SIT_CBUFFER, 0}}},
             {"kFrameGenSynthResolveBytecode", "fgSynResolve", {{"KeyT", D3D_SIT_TEXTURE, 4}, {"Holes", D3D_SIT_UAV_RWSTRUCTURED, 0}, {"ReadOut", D3D_SIT_UAV_RWTYPED, 3}, {"Stats", D3D_SIT_UAV_RWSTRUCTURED, 5}, {"P", D3D_SIT_CBUFFER, 0}}},
             {"kFrameGenSynthHolesBytecode", "fgSynHoles", {{"Depth", D3D_SIT_TEXTURE, 1}, {"Mv", D3D_SIT_TEXTURE, 2}, {"KeyT", D3D_SIT_TEXTURE, 4}, {"Holes", D3D_SIT_UAV_RWSTRUCTURED, 0}, {"ReadOut", D3D_SIT_UAV_RWTYPED, 3}, {"Stats", D3D_SIT_UAV_RWSTRUCTURED, 5}, {"P", D3D_SIT_CBUFFER, 0}}},

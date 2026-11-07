@@ -1,8 +1,9 @@
 #pragma once
 // The frame-generation synthesizer's compute shaders (fix.frame_generation_shadow, TEMPORARY; docs/design-frame-generation-2026-10-26.md, Phase 2.1, "The synthesis pass").
 // One source, seven entry points (and Phase 2.3b's eighth, fgSynFinish, outside the pass sequence), one constant block (src\common\framegen_synth_math.h FrameGenSynthCb). Nothing they write is shown in the headset. Before them the key grid and the
-// stats words are cleared to 0 by the API (ClearUnorderedAccessViewUint, framegen_synth_pass.h); the read offsets are not cleared: a pixel whose key is 0 has kNoRead written by
-// fgSynResolve, and a pixel whose key is not 0 has its offset written by fgSynSrc (the pixel that set the key finds it there again and writes).
+// stats words are cleared to 0 by the API (ClearUnorderedAccessViewUint, framegen_synth_pass.h); the read offsets are set to all ones by fgSynSplat (each thread its own
+// pixel; the S grid is the render grid): a pixel whose key is 0 has kNoRead written by fgSynResolve, and a pixel whose key is not 0 has its offset written by fgSynSrc (the
+// pixel that set the key finds it there again and offers it; of tied offers the smallest packed value stands, InterlockedMin, so S does not depend on the order they run in).
 //   fgSynSplat     each B pixel carried to S by its class's motion (fgSynTarget; its class and depth are the nearest of the 3x3 around it, synDepth9, taken where they are read) and
 //                  scattered as a key into the four pixels of its bilinear footprint (InterlockedMax: the nearer surface wins; a pixel that is its own nearest beats one that borrowed
 //                  the dilated depth);
@@ -10,7 +11,7 @@
 //                  as an offset from the S pixel's own centre, two half floats packed in a uint (kMaxOffset, kNoRead; synPackOffset rounds to nearest even as a typed half store
 //                  does). The read is the pixel's own position moved by the landing offset (the S pixel minus where the pixel landed), or the pixel's own position itself when the
 //                  guard says so (a nearer 3x3 neighbour on the side the offset points to would be read across the edge), then an integer pair stored exactly with the guard's
-//                  mark (synPackGuarded); a read past kMaxOffset is clamped and counted;
+//                  mark (synPackGuarded, larger than any unguarded value, so a tie keeps the unguarded read); a read past kMaxOffset is clamped and counted;
 //   fgSynResolve   every S pixel no key reached is a hole: kNoRead written, counted as left, its index listed in the hole list (u0, an eighth of the render pixels; the count in the
 //                  stats words); the S pixels whose stored offset carries the guard's mark are counted as guarded, one each;
 //   fgSynHoles     one thread per listed hole, in full 64-thread groups: the farthest key found within 8 px of it is the background, and the hole is carried back into B by that
@@ -99,7 +100,7 @@ static const float kFillBackFar = 4.0 / 3.0;   // the read is no farther than th
 static const float kFillBackMargin = 0.75;   // B is the background's surface at a read when no texel of its 2x2 is nearer than this share of the background neighbour's distance
 static const float kNoRead = -4096.0;       // framegen_synth_math.h kFrameGenSynthNoRead
 static const float kMaxOffset = 2000.0;    // kFrameGenSynthMaxOffset
-static const uint  kGuardMark = 0x7C00u;      // a packed offset whose x half has this exponent field (a NaN's, never a clamped offset's) is a guarded read's: an integer pair, stored as such
+static const uint  kGuardMark = 0x7C000000u;  // a packed offset whose y half has this exponent field (a NaN's, never a clamped offset's) is a guarded read's: an integer pair, stored as such
 
 float synLuma(float3 c) { return clamp(dot(c, float3(0.2126, 0.7152, 0.0722)), 0.0, 1.0); }
 
@@ -116,15 +117,16 @@ uint synHalfBits(float v) {
 }
 uint synPackOffset(float2 o) { return synHalfBits(o.x) | (synHalfBits(o.y) << 16); }
 
-// A guarded read's offset (the source pixel minus the S pixel: integers, within the clamp) with the mark, in the bits the mark leaves: x + 2048 in bits 0-9 and 15-16, y + 2048
-// in bits 17-28. The mark is how fgSynResolve counts the guarded pixels, once each, from the one store fgSynSrc makes.
+// A guarded read's offset (the source pixel minus the S pixel: integers, within the clamp) with the mark and the sign bit above it, x + 2048 in bits 0-11, y + 2048 in bits
+// 12-23: every guarded value is larger than every unguarded one, so of two sources that tie for a pixel fgSynSrc's InterlockedMin keeps an unguarded read. The mark is how
+// fgSynResolve counts the guarded pixels, once each.
 uint synPackGuarded(float2 o) {
     uint x = uint(int(o.x) + 2048), y = uint(int(o.y) + 2048);
-    return kGuardMark | (x & 0x3FFu) | (((x >> 10) & 3u) << 15) | (y << 17);
+    return 0x80000000u | kGuardMark | (x & 0xFFFu) | ((y & 0xFFFu) << 12);
 }
 bool synIsGuarded(uint p) { return (p & kGuardMark) == kGuardMark; }
 float2 synUnpackOffset(uint p) {
-    if (synIsGuarded(p)) return float2(int((p & 0x3FFu) | (((p >> 15) & 3u) << 10)) - 2048, int((p >> 17) & 0xFFFu) - 2048);
+    if (synIsGuarded(p)) return float2(int(p & 0xFFFu) - 2048, int((p >> 12) & 0xFFFu) - 2048);
     return float2(f16tof32(p & 0xFFFFu), f16tof32(p >> 16));
 }
 
@@ -335,6 +337,7 @@ bool synGuarded(float m9[9], float2 off) {
 [numthreads(8, 8, 1)]
 void fgSynSplat(uint3 id : SV_DispatchThreadID) {
     if (id.x >= uint(sz.x) || id.y >= uint(sz.y)) return;
+    ReadOut[id.xy] = 0xFFFFFFFFu;   // the read offsets cleared for fgSynSrc's InterlockedMin (the S grid is the render grid)
     float2 pp;
     uint key;
     if (!fgSynTarget(id.xy, pp, key)) return;
@@ -350,9 +353,10 @@ void fgSynSplat(uint3 id : SV_DispatchThreadID) {
 )HLSL" R"HLSL(
 groupshared uint gSrc;   // clamped
 
-// The winner's read offset for every S pixel its key won: its own position moved by the landing offset (c minus where it landed), guarded, as an offset from c. A pixel two
-// sources tie for is written by both (the splat's tie: the last write stands). A guarded read is stored with the mark, for the resolve to count once per S pixel; a clamped
-// read is counted here, per write.
+// The winner's read offset for every S pixel its key won: its own position moved by the landing offset (c minus where it landed), guarded, as an offset from c. Two sources
+// that tie for a pixel (the splat's tie: the same key) both offer theirs and the smaller packed value stands (InterlockedMin over fgSynSplat's all-ones), whatever order they
+// run in: an unguarded read before a guarded one, then by the y half's bits (until 2026-11-08 the last write stood, and the S pixels and the guard count of a tie varied from
+// run to run). A guarded read is stored with the mark, for the resolve to count once per S pixel; a clamped read is counted here, per offer.
 [numthreads(8, 8, 1)]
 void fgSynSrc(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
     if (gi == 0) gSrc = 0u;
@@ -377,7 +381,7 @@ void fgSynSrc(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
                         float2 o = rd - float2(c);
                         if (any(abs(o) > kMaxOffset)) InterlockedAdd(gSrc, 1u);
                         o = clamp(o, -kMaxOffset, kMaxOffset);
-                        ReadOut[uint2(c)] = guarded ? synPackGuarded(o) : synPackOffset(o);
+                        InterlockedMin(ReadOut[uint2(c)], guarded ? synPackGuarded(o) : synPackOffset(o));
                     }
                 }
             }

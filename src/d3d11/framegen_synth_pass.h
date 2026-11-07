@@ -46,7 +46,7 @@ struct FrameGenSynthPassViews {
     uint32_t qw = 0, qh = 0;   // the quarter grid
 };
 
-// The sequence of one call: the clear (the key grid and the stats words to 0 by the API; the read offsets need none, framegen_synth_shader.h); the score of the kept f = 1 S
+// The sequence of one call: the clear (the key grid and the stats words to 0 by the API; the read offsets are set by the splat, framegen_synth_shader.h); the score of the kept f = 1 S
 // against this frame when `score`; then, when `build`, splat, source (the winners' read offsets), resolve (the holes listed), holes, resample and, when `keep`, the luma pass
 // that keeps this f = 1 S for the next frame.
 // `after(int step)` runs after the clear and after each dispatch (the bench's timestamps). Every dispatch starts with nothing bound from the last (a resource still bound as a
@@ -80,9 +80,9 @@ inline void frameGenSynthRunPasses(ID3D11DeviceContext* ctx, ID3D11ComputeShader
         dispatch(kFgSynScore, srv, uav, qgx, qgy);
     }
     if (build) {
-        {   // splat: B's pixels carried to S, the nearer surface's key kept
+        {   // splat: B's pixels carried to S, the nearer surface's key kept (and the read offsets set to all ones for the source pass's InterlockedMin)
             ID3D11ShaderResourceView* srv[kFrameGenSynthSrvSlots] = {nullptr, v.depth, v.mv};
-            ID3D11UnorderedAccessView* uav[kFrameGenSynthUavSlots] = {nullptr, v.keyUav};
+            ID3D11UnorderedAccessView* uav[kFrameGenSynthUavSlots] = {nullptr, v.keyUav, nullptr, v.readUav};
             dispatch(kFgSynSplat, srv, uav, rgx, rgy);
         }
         {   // source: each footprint pixel whose final key is the pixel's own takes the pixel's read offset, guarded (a guarded one marked); the clamp count
