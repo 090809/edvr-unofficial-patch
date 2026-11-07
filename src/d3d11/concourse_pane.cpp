@@ -1393,7 +1393,7 @@ void pollTests(ID3D11Device* device, uint32_t frame) noexcept {
                 }
                 if (plainNow && enterShare > 0.0f && pixels > 0.0 && g_sides.side(key) == cc::PaneSide::kExterior) {
                     const float share = static_cast<float>(static_cast<double>(drawn) / pixels);
-                    if (share >= enterShare * cc::clearEntryScale(key.n) && share > candShare && key.n != g_clearN.load(std::memory_order_relaxed)) {
+                    if (share >= enterShare * cc::clearEntryScale(key.n, g_bayN.load(std::memory_order_relaxed)) && share > candShare && key.n != g_clearN.load(std::memory_order_relaxed)) {
                         candN = key.n;
                         candShare = share;
                     }

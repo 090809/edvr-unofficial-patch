@@ -3365,6 +3365,19 @@ int main(int argc, char** argv) {
         check(&cc::roomLayoutOf("SA_PlanetPortHub_Compact") == &cc::kRoomPort && cc::kRoomPort.bayN == 12u && cc::kRoomPort.backdropRadiusM >= cc::kBackdropRadiusMinM && cc::kRoomPort.backdropRadiusM <= cc::kBackdropRadiusMaxM,
               "concourse layouts: a surface port's bay is n=12, on a sphere the key's range allows");
         check(&cc::roomLayoutOf(nullptr) == &cc::kRoomStation && &cc::roomLayoutOf("") == &cc::kRoomStation, "concourse layouts: no name is a station's");
+        // An orbital outpost's room, from two surveys: its own hub, the bay n=30, the station's list parting room from outside with nothing culled within 165 m.
+        check(cc::concourseAnchorName("SA_OutpostHub_Compact") && &cc::roomLayoutOf("SA_OutpostHub_Compact") == &cc::kRoomOutpost && cc::kRoomOutpost.bayN == 30u,
+              "concourse layouts: an orbital outpost's anchor and its bay");
+        check(cc::kRoomOutpost.roomReachM > 33.3f && !cc::anchorMeansRoomHere(cc::kRoomOutpost, true, true, 431.0f) && cc::anchorMeansRoomHere(cc::kRoomOutpost, true, true, 15.6f),
+              "concourse layouts: an outpost's reach takes the bay and not the hangar lobby");
+        check(!cc::concourseAnchorName("SA_Outpost_Exterior") && !cc::concourseAnchorName("SA_Outpost_01_Bar") && !cc::concourseAnchorName("Outpost"), "concourse anchors: an outpost's other big names are not");
+        for (const char* n : {"SA_OutpostHub_Compact", "SA_Outpost_01_Bar", "SA_Outpost_01_Store", "SA_Outpost_Exterior", "SA_Outpost_Compact_Hitcheck", "SA_PP_All_EdmundMahon_Logo_01",
+                              "PS_STAT_HoloScreen_BarScreen_1", "PS_Sittable_BarStool_01", "PS_FanBroken1", "TP_Crate"})
+            check(cc::concourseAllowName(n, nullptr), "concourse outpost: the room's own name is on the list");
+        for (const char* n : {"Outpost", "BlastShieldBase", "BlastShield_A", "LandingPadSmallA", "HangerSmall", "HangerMedium", "SmallHangerSkirt", "WeaponsPlatform", "AdvertDroneA_Advert04", "Spheres", "Tube"})
+            check(!cc::concourseAllowName(n, nullptr), "concourse outpost: what stands outside is not on the list");
+        check(cc::clearEntryScale(30, 30) == 1.0f && cc::clearEntryScale(30, 36) == 0.3f && cc::clearEntryScale(30, 12) == 0.3f && cc::clearEntryScale(36, 30) == 1.0f,
+              "concourse clear: n=30 is the Orbis shop window, entering early, except where it is the bay");
         // The anchor means the room: a station's is gone from the store once the lift cuts away, a port's is seen from the hangar too (503 m, Flight 36).
         check(cc::anchorMeansRoomHere(cc::kRoomStation, false, false, 0.0f) && cc::anchorMeansRoomHere(cc::kRoomStation, true, true, 1090.0f), "concourse layouts: at a station the sighting is enough, as it was");
         check(cc::anchorMeansRoomHere(cc::kRoomPort, true, true, 3.5f) && cc::anchorMeansRoomHere(cc::kRoomPort, true, true, 22.9f), "concourse layouts: at a port, in the middle of the room and at the bay");

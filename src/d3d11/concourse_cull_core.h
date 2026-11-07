@@ -31,7 +31,11 @@ constexpr const char* kAnchorName = "Standard_SocialArea";
 constexpr const char* kHubName = "SA_StationHub_Compact";
 // A surface port's room has no Standard_SocialArea. Its own hub anchors it: r=42.1, centred 3.5 m from where Sean stood in the middle of the room (Flight 35, a CraterOutpost).
 constexpr const char* kPortAnchorName = "SA_PlanetPortHub_Compact";
-inline bool concourseAnchorName(const char* name) noexcept { return name && (std::strcmp(name, kAnchorName) == 0 || std::strcmp(name, kPortAnchorName) == 0); }
+// An orbital outpost's room, the same way: r=33.3, 9.6 m from where Sean stood at the bar (two surveys, after Flight 37).
+constexpr const char* kOutpostAnchorName = "SA_OutpostHub_Compact";
+inline bool concourseAnchorName(const char* name) noexcept {
+    return name && (std::strcmp(name, kAnchorName) == 0 || std::strcmp(name, kPortAnchorName) == 0 || std::strcmp(name, kOutpostAnchorName) == 0);
+}
 
 // The name prefixes that are the room. Exact case.
 // Root and Perturbator are the room's too: off this list they stayed only while within kCloseDistanceM, so the bar's tables popped in and flickered at that distance (Flight 31).
@@ -927,7 +931,15 @@ struct RoomLayout {
 };
 inline constexpr RoomLayout kRoomStation{kBayIndexCount, kBackdropRadiusDefaultM, "a large station's", 0.0f};
 inline constexpr RoomLayout kRoomPort{12u, 300.0f, "a surface port's", 100.0f};
-inline const RoomLayout& roomLayoutOf(const char* anchorName) noexcept { return anchorName && std::strcmp(anchorName, kPortAnchorName) == 0 ? kRoomPort : kRoomStation; }
+// An orbital outpost: the bay is n=30 (79.7% of the view standing at it), 15.6 m from the hub, the hub's radius 33.3 m, the hangar lobby 431 m off. Outside it, the outpost's own hull
+// (one record, r=570, centred 165 m off), then the medium hangar 223 m, pads 330 m, blast shields 380 m: the same first sphere as a port.
+inline constexpr RoomLayout kRoomOutpost{30u, 300.0f, "an orbital outpost's", 100.0f};
+inline const RoomLayout& roomLayoutOf(const char* anchorName) noexcept {
+    if (!anchorName) return kRoomStation;
+    if (std::strcmp(anchorName, kPortAnchorName) == 0) return kRoomPort;
+    if (std::strcmp(anchorName, kOutpostAnchorName) == 0) return kRoomOutpost;
+    return kRoomStation;
+}
 // Whether a fresh sighting of the anchor means the commander is in that room. With no reading of where either is, a room with a reach says no: the game's own.
 inline bool anchorMeansRoomHere(const RoomLayout& room, bool cameraKnown, bool anchorRead, float cameraDistM) noexcept {
     if (room.roomReachM <= 0.0f) return true;
@@ -1111,7 +1123,8 @@ inline const char* clearPhaseName(ClearPhase p) noexcept {
 // The shop window (the ship services counter) is the mesh n=30, start 7301760. It reads exterior, and at the counter it fills 7.3 to 8.3% of the view (Flight 11, cam_local
 // 9.2 26.17 30.8), its maximum 9.8%; elsewhere, in three flights, n=30 stayed under 3%. The 20% entry share never reached it, so it enters at 0.3 of the share.
 // The exit follows at kClearExitRatio of that. Any other pane enters at the share itself.
-inline float clearEntryScale(uint32_t n) noexcept { return n == 30 ? 0.3f : 1.0f; }
+// In a room whose bay is itself n=30 (an orbital outpost's) that is the bay, and it enters at the share.
+inline float clearEntryScale(uint32_t n, uint32_t bayN = kBayIndexCount) noexcept { return n == 30 && bayN != 30 ? 0.3f : 1.0f; }
 
 constexpr float kClearExitRatio = 0.4f;     // the exit share is enterShare * this (20% in, 8% out)
 constexpr uint64_t kClearReleaseMs = 250;   // the share must stay below the exit share this long

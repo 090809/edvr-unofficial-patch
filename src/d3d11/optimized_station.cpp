@@ -3785,7 +3785,7 @@ cc::ClearOutput concourseClearStep(uint64_t now, bool wantCull, bool gateWanted,
     in.gate = wantCull;
     in.bayShare = sh.valid ? sh.bay : -1.0f;
     in.shareSeq = sh.seq;
-    in.enterShare = g_concEnterShare * cc::clearEntryScale(concoursePaneClearingN());   // the shop window enters at 0.3 of the share; the exit follows at 0.4 of that
+    in.enterShare = g_concEnterShare * cc::clearEntryScale(concoursePaneClearingN(), g_concLayout->bayN);   // the shop window enters at 0.3 of the share; the exit follows at 0.4 of that
     const cc::ClearPhase before = g_concClear.phase();
     const cc::ClearOutput out = g_concClear.step(in);
     if (out.phase != before) {
