@@ -41,7 +41,12 @@ constexpr uint32_t kFrameGenSynthStatsLeft = kFrameGenSynthStatsFilled + 1;
 constexpr uint32_t kFrameGenSynthStatsGuard = kFrameGenSynthStatsFilled + 2;
 constexpr uint32_t kFrameGenSynthStatsClamp = kFrameGenSynthStatsFilled + 3;
 constexpr uint32_t kFrameGenSynthStatsTurned = kFrameGenSynthStatsFilled + 4;   // 303
-constexpr uint32_t kFrameGenSynthStatsUints = kFrameGenSynthStatsTurned + kFrameGenShadowStatsBlockUints;   // 602
+constexpr uint32_t kFrameGenSynthStatsHoles = kFrameGenSynthStatsTurned + kFrameGenShadowStatsBlockUints;   // 602: the holes listed for the fill pass (GPU-side only)
+constexpr uint32_t kFrameGenSynthStatsUints = kFrameGenSynthStatsHoles + 1;   // 603
+
+// The hole list the resolve pass writes and the fill pass reads (one render pixel index per hole): an eighth of the render pixels; holes past it stay unfilled (counted as left).
+// The shader computes the same (fgSynHoleCapacity).
+inline uint32_t frameGenSynthHoleCapacity(uint32_t rw, uint32_t rh) { return (rw * rh) / 8u; }
 
 // The read offsets (the source B position minus the S pixel centre, render pixels) are stored as two half floats: exact to 1/16 px up to 256 px, to 1/8 px up to 512 px, to 1/2 px up
 // to 2048 px. An offset past kFrameGenSynthMaxOffset on either axis is clamped to it (a wrong read, counted in the clamp stat); kFrameGenSynthNoRead on x marks a pixel with nothing to read.

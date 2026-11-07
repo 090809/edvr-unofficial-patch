@@ -119,7 +119,8 @@ struct Gpu {
         if (FAILED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, 0, nullptr, 0, D3D11_SDK_VERSION, &dev, &level, &ctx))) return false;
         const struct { const unsigned char* code; size_t size; } codes[kEntries] = {
             {kFrameGenSynthSplatBytecode, sizeof(kFrameGenSynthSplatBytecode)}, {kFrameGenSynthSrcBytecode, sizeof(kFrameGenSynthSrcBytecode)},
-            {kFrameGenSynthResolveBytecode, sizeof(kFrameGenSynthResolveBytecode)}, {kFrameGenSynthResampleBytecode, sizeof(kFrameGenSynthResampleBytecode)},
+            {kFrameGenSynthResolveBytecode, sizeof(kFrameGenSynthResolveBytecode)}, {kFrameGenSynthHolesBytecode, sizeof(kFrameGenSynthHolesBytecode)},
+            {kFrameGenSynthResampleBytecode, sizeof(kFrameGenSynthResampleBytecode)},
             {kFrameGenSynthLumaBytecode, sizeof(kFrameGenSynthLumaBytecode)}, {kFrameGenSynthScoreBytecode, sizeof(kFrameGenSynthScoreBytecode)}};
         for (int i = 0; i < kEntries; ++i)
             if (FAILED(dev->CreateComputeShader(codes[i].code, codes[i].size, nullptr, &cs[i]))) return false;
@@ -277,6 +278,13 @@ Run runSynth(Gpu& g, const Scene& sc, const FrameGenSynthCb& cb, Keep* keep = nu
     if (FAILED(g.dev->CreateUnorderedAccessView(stats.Get(), &ud, &statsUav))) return r;
     bd.Usage = D3D11_USAGE_STAGING; bd.BindFlags = 0; bd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
     if (FAILED(g.dev->CreateBuffer(&bd, nullptr, &staging))) return r;
+    ComPtr<ID3D11Buffer> holes;   // the hole list (the module's ensureScratch)
+    ComPtr<ID3D11UnorderedAccessView> holesUav;
+    bd = D3D11_BUFFER_DESC{};
+    bd.ByteWidth = frameGenSynthHoleCapacity(static_cast<uint32_t>(sc.w), static_cast<uint32_t>(sc.h)) * 4; bd.Usage = D3D11_USAGE_DEFAULT; bd.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
+    bd.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED; bd.StructureByteStride = 4;
+    ud.Buffer.NumElements = frameGenSynthHoleCapacity(static_cast<uint32_t>(sc.w), static_cast<uint32_t>(sc.h));
+    if (FAILED(g.dev->CreateBuffer(&bd, nullptr, &holes)) || FAILED(g.dev->CreateUnorderedAccessView(holes.Get(), &ud, &holesUav))) return r;
 
     g.setCb(cb);
     FrameGenSynthPassViews v;
@@ -284,6 +292,7 @@ Run runSynth(Gpu& g, const Scene& sc, const FrameGenSynthCb& cb, Keep* keep = nu
     v.keySrv = key.srv.Get(); v.keyUav = key.uav.Get();
     v.srcSrv = src.srv.Get(); v.srcUav = src.uav.Get();
     v.readSrv = read.srv.Get(); v.readUav = read.uav.Get();
+    v.holesUav = holesUav.Get();
     v.sSrv = s.srv.Get(); v.sUav = s.uav.Get();
     if (keep) { v.sLumaUav = keep->sLuma.uav.Get(); v.bInfoUav = keep->bInfo.uav.Get(); }
     v.statsUav = statsUav.Get();

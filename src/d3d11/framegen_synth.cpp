@@ -26,7 +26,7 @@ namespace {
 
 constexpr int kStagingDepth = 4;
 constexpr int kTimerRing = 8;
-constexpr int kEntries = kFrameGenSynthEntries;   // splat, source, resolve, resample, luma, score (framegen_synth_pass.h)
+constexpr int kEntries = kFrameGenSynthEntries;   // splat, source, resolve, holes, resample, luma, score (framegen_synth_pass.h)
 
 std::atomic<bool> g_on{false};
 std::atomic<bool> g_told{false};   // the armed line has been said since the key last went on
@@ -60,11 +60,13 @@ struct EyeRes {
     uint32_t shownFrame = 0;
 };
 
-// The render-size scratch of one call (the key and source grids and the read offsets): rebuilt from nothing by every call, so both eyes share one set (they run one after the other
-// on the same context). 12 bytes per render pixel in all; recreated when a call's render size differs from the last's.
+// The render-size scratch of one call (the key and source grids, the read offsets and the hole list): rebuilt from nothing by every call, so both eyes share one set (they run one
+// after the other on the same context). 12.5 bytes per render pixel in all; recreated when a call's render size differs from the last's.
 struct Scratch {
     uint32_t rw = 0, rh = 0;
     Tex key, src, read;
+    ID3D11Buffer* holes = nullptr;              // frameGenSynthHoleCapacity uints
+    ID3D11UnorderedAccessView* holesUav = nullptr;
 };
 
 struct TimerSlot {
@@ -116,6 +118,8 @@ void releaseScratch() {
     releaseTex(g.scratch.key);
     releaseTex(g.scratch.src);
     releaseTex(g.scratch.read);
+    releaseCom(g.scratch.holesUav);
+    releaseCom(g.scratch.holes);
     g.scratch = Scratch{};
 }
 
@@ -333,6 +337,7 @@ bool createCommon(ID3D11Device* dev, ID3D11DeviceContext* ctx) {
         {kFgSynSplat, kFrameGenSynthSplatBytecode, sizeof(kFrameGenSynthSplatBytecode), "framegen_synth_splat"},
         {kFgSynSrc, kFrameGenSynthSrcBytecode, sizeof(kFrameGenSynthSrcBytecode), "framegen_synth_src"},
         {kFgSynResolve, kFrameGenSynthResolveBytecode, sizeof(kFrameGenSynthResolveBytecode), "framegen_synth_resolve"},
+        {kFgSynHoles, kFrameGenSynthHolesBytecode, sizeof(kFrameGenSynthHolesBytecode), "framegen_synth_holes"},
         {kFgSynResample, kFrameGenSynthResampleBytecode, sizeof(kFrameGenSynthResampleBytecode), "framegen_synth_resample"},
         {kFgSynLuma, kFrameGenSynthLumaBytecode, sizeof(kFrameGenSynthLumaBytecode), "framegen_synth_luma"},
         {kFgSynScore, kFrameGenSynthScoreBytecode, sizeof(kFrameGenSynthScoreBytecode), "framegen_synth_score"},
@@ -431,9 +436,21 @@ bool ensureScratch(ID3D11Device* dev, uint32_t rw, uint32_t rh) {
     releaseScratch();
     if (makeTex(dev, rw, rh, DXGI_FORMAT_R32_UINT, g.scratch.key) && makeTex(dev, rw, rh, DXGI_FORMAT_R32_UINT, g.scratch.src) &&
         makeTex(dev, rw, rh, DXGI_FORMAT_R16G16_FLOAT, g.scratch.read)) {
-        g.scratch.rw = rw;
-        g.scratch.rh = rh;
-        return true;
+        D3D11_BUFFER_DESC bd{};
+        bd.ByteWidth = frameGenSynthHoleCapacity(rw, rh) * 4u;
+        bd.Usage = D3D11_USAGE_DEFAULT;
+        bd.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
+        bd.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
+        bd.StructureByteStride = 4;
+        D3D11_UNORDERED_ACCESS_VIEW_DESC ud{};
+        ud.Format = DXGI_FORMAT_UNKNOWN;
+        ud.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
+        ud.Buffer.NumElements = frameGenSynthHoleCapacity(rw, rh);
+        if (bd.ByteWidth && SUCCEEDED(dev->CreateBuffer(&bd, nullptr, &g.scratch.holes)) && SUCCEEDED(dev->CreateUnorderedAccessView(g.scratch.holes, &ud, &g.scratch.holesUav))) {
+            g.scratch.rw = rw;
+            g.scratch.rh = rh;
+            return true;
+        }
     }
     releaseScratch();
     return false;
@@ -588,6 +605,7 @@ void frameGenSynthEyeFrame(ID3D11Device* dev, ID3D11DeviceContext* ctx, uint32_t
     v.keySrv = sc.key.srv; v.keyUav = sc.key.uav;
     v.srcSrv = sc.src.srv; v.srcUav = sc.src.uav;
     v.readSrv = sc.read.srv; v.readUav = sc.read.uav;
+    v.holesUav = sc.holesUav;
     v.sSrv = r.s.srv; v.sUav = r.s.uav;
     v.sLumaSrv = r.sLuma.srv; v.sLumaUav = r.sLuma.uav;
     v.bInfoSrv = r.bInfo.srv; v.bInfoUav = r.bInfo.uav;

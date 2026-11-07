@@ -164,8 +164,9 @@ void caseDecode() {
     check(r.cells == 12 && r.cls[0].pixels == 3 && r.cls[0].hist[0] == 3 && r.cls[2].pixels == 9 && r.filled == 40 && r.left == 5 && r.guard == 77,
           "the stats words decode: the score block as the scorer's, then filled, left and guard");
     check(r.clamped == 4 && r.tcls[0].pixels == 6 && r.tout == 2 && r.tcells == 6 && r.tcls[2].pixels == 0, "and the clamp count and the turned block (its holes word is the cells outside S)");
-    check(kFrameGenSynthStatsUints == 602 && kFrameGenSynthStatsFilled == 299 && kFrameGenSynthStatsClamp == 302 && kFrameGenSynthStatsTurned == 303,
-          "the stats layout is 299 score words, four counters, then the turned block of 299");
+    check(kFrameGenSynthStatsUints == 603 && kFrameGenSynthStatsFilled == 299 && kFrameGenSynthStatsClamp == 302 && kFrameGenSynthStatsTurned == 303 && kFrameGenSynthStatsHoles == 602,
+          "the stats layout is 299 score words, four counters, the turned block of 299, then the hole list's count");
+    check(frameGenSynthHoleCapacity(2817, 2448) == 862002 && frameGenSynthHoleCapacity(8, 8) == 8, "the hole list holds an eighth of the render pixels");
 }
 
 void caseRotation() {

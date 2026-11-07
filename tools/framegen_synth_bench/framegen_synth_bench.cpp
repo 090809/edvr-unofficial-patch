@@ -550,8 +550,8 @@ struct Synth {
     uint32_t rw = 0, rh = 0, ow = 0, oh = 0, qw = 0, qh = 0;
     DXGI_FORMAT sFormat = DXGI_FORMAT_UNKNOWN;
     Tex s, sLuma, bInfo, key, src, read;
-    ComPtr<ID3D11Buffer> stats, staging[4];
-    ComPtr<ID3D11UnorderedAccessView> statsUav;
+    ComPtr<ID3D11Buffer> stats, staging[4], holes;
+    ComPtr<ID3D11UnorderedAccessView> statsUav, holesUav;
     uint64_t eyeBytes = 0, scratchBytes = 0;
 
     bool create(Gpu& g, uint32_t rw_, uint32_t rh_, uint32_t ow_, uint32_t oh_, DXGI_FORMAT sFmt) {
@@ -578,7 +578,16 @@ struct Synth {
         bd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
         for (auto& st : staging) if (FAILED(g.dev->CreateBuffer(&bd, nullptr, &st))) return false;
         eyeBytes = s.bytes + sLuma.bytes + bInfo.bytes + bd.ByteWidth * 5ull;   // the stats buffer and its four staging slots
-        scratchBytes = key.bytes + src.bytes + read.bytes;
+        const uint32_t cap = frameGenSynthHoleCapacity(rw, rh);   // the hole list (framegen_synth.cpp ensureScratch)
+        bd = D3D11_BUFFER_DESC{};
+        bd.ByteWidth = cap * 4u;
+        bd.Usage = D3D11_USAGE_DEFAULT;
+        bd.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
+        bd.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
+        bd.StructureByteStride = 4;
+        ud.Buffer.NumElements = cap;
+        if (FAILED(g.dev->CreateBuffer(&bd, nullptr, &holes)) || FAILED(g.dev->CreateUnorderedAccessView(holes.Get(), &ud, &holesUav))) return false;
+        scratchBytes = key.bytes + src.bytes + read.bytes + bd.ByteWidth;
         return true;
     }
 
@@ -606,6 +615,7 @@ void runCall(Gpu& g, Synth& sy, const Inputs& in, bool score, bool keep, bool sc
     v.keySrv = sy.key.srv.Get(); v.keyUav = sy.key.uav.Get();
     v.srcSrv = sy.src.srv.Get(); v.srcUav = sy.src.uav.Get();
     v.readSrv = sy.read.srv.Get(); v.readUav = sy.read.uav.Get();
+    v.holesUav = sy.holesUav.Get();
     v.sSrv = sy.s.srv.Get(); v.sUav = sy.s.uav.Get();
     v.sLumaSrv = sy.sLuma.srv.Get(); v.sLumaUav = sy.sLuma.uav.Get();
     v.bInfoSrv = sy.bInfo.srv.Get(); v.bInfoUav = sy.bInfo.uav.Get();
@@ -1029,11 +1039,12 @@ void printBench(const BenchOptions& o, const BenchOutput& bo, const Gpu& g) {
             sumMed += med;
             std::printf("  %-10s %10.3f %10.3f\n", kPassLabels[e], med, percentile(v.st.ms[e], 0.95));
         }
-        std::printf("  %-10s %10.3f %10.3f   (sum of pass medians %.3f)\n", "TOTAL", percentile(v.st.total, 0.5), percentile(v.st.total, 0.95), sumMed);
+        std::printf("  %-10s %10.3f %10.3f   (sum of pass medians %.3f; p90 %.3f p99 %.3f max %.3f: a total past the sum is a gap between passes)\n", "TOTAL",
+                    percentile(v.st.total, 0.5), percentile(v.st.total, 0.95), sumMed, percentile(v.st.total, 0.9), percentile(v.st.total, 0.99), percentile(v.st.total, 1.0));
     }
     const double mib = 1048576.0;
     std::printf("\n%s\n", bo.sanity.c_str());
-    std::printf("VRAM the synth allocates: %.1f MiB per eye (S + luma + class + stats + 4 staging) + %.1f MiB shared scratch (key, source, read offsets) = %.1f MiB for two eyes\n",
+    std::printf("VRAM the synth allocates: %.1f MiB per eye (S + luma + class + stats + 4 staging) + %.1f MiB shared scratch (key, source, read offsets, hole list) = %.1f MiB for two eyes\n",
                 static_cast<double>(bo.eyeBytes) / mib, static_cast<double>(bo.scratchBytes) / mib, (2.0 * static_cast<double>(bo.eyeBytes) + static_cast<double>(bo.scratchBytes)) / mib);
 }
 
@@ -1046,7 +1057,8 @@ std::string benchJson(const BenchOptions& o, const BenchOutput& bo, const Gpu& g
     s += "  \"variants\": [\n";
     for (size_t i = 0; i < bo.variants.size(); ++i) {
         const VariantResult& v = bo.variants[i];
-        s += fmtStr("    {\"name\": \"%s\", \"total_ms\": {\"median\": %.4f, \"p95\": %.4f}, \"passes\": {", v.name.substr(0, v.name.find(' ')).c_str(), percentile(v.st.total, 0.5), percentile(v.st.total, 0.95));
+        s += fmtStr("    {\"name\": \"%s\", \"total_ms\": {\"median\": %.4f, \"p90\": %.4f, \"p95\": %.4f, \"p99\": %.4f, \"max\": %.4f}, \"passes\": {", v.name.substr(0, v.name.find(' ')).c_str(),
+                    percentile(v.st.total, 0.5), percentile(v.st.total, 0.9), percentile(v.st.total, 0.95), percentile(v.st.total, 0.99), percentile(v.st.total, 1.0));
         bool first = true;
         for (int e = 0; e < kSteps; ++e) {
             if (v.st.ms[e].empty()) continue;

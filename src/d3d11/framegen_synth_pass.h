@@ -7,21 +7,23 @@
 
 #include <cstdint>
 
+#include "../common/framegen_synth_math.h"   // frameGenSynthHoleCapacity
+
 namespace edvr {
 
-constexpr int kFrameGenSynthEntries = 6;
+constexpr int kFrameGenSynthEntries = 7;
 constexpr int kFrameGenSynthSteps = kFrameGenSynthEntries + 1;   // the entries and the API clear before them, for timing
 constexpr int kFrameGenSynthSrvSlots = 10;   // t0..t9
 constexpr int kFrameGenSynthUavSlots = 8;    // u0..u7
 
-enum FrameGenSynthEntry : int { kFgSynSplat = 0, kFgSynSrc, kFgSynResolve, kFgSynResample, kFgSynLuma, kFgSynScore, kFgSynClear /* a step, not a shader */ };
+enum FrameGenSynthEntry : int { kFgSynSplat = 0, kFgSynSrc, kFgSynResolve, kFgSynHoles, kFgSynResample, kFgSynLuma, kFgSynScore, kFgSynClear /* a step, not a shader */ };
 
 // The HLSL entry points, in entry order (tools\temporal_shader_build compiles them to kFrameGenSynth*Bytecode in the same order).
-constexpr const char* const kFrameGenSynthEntryNames[kFrameGenSynthEntries] = {"fgSynSplat", "fgSynSrc", "fgSynResolve", "fgSynResample", "fgSynLuma", "fgSynScore"};
-constexpr const char* const kFrameGenSynthStepLabels[kFrameGenSynthSteps] = {"splat", "src", "resolve", "resample", "luma", "score", "clear"};
+constexpr const char* const kFrameGenSynthEntryNames[kFrameGenSynthEntries] = {"fgSynSplat", "fgSynSrc", "fgSynResolve", "fgSynHoles", "fgSynResample", "fgSynLuma", "fgSynScore"};
+constexpr const char* const kFrameGenSynthStepLabels[kFrameGenSynthSteps] = {"splat", "src", "resolve", "holes", "resample", "luma", "score", "clear"};
 
 // One eye's views for a call. The inputs: B's output (the upscaler's, before the interface; C's on a score), B's depth copy, the DLSS vectors. The synth's own: the key and source
-// grids and the read offsets (render size, scratch), S (output size), the kept S luma and B's luma and class (quarter grid), the stats words.
+// grids, the read offsets and the hole list (render size, scratch), S (output size), the kept S luma and B's luma and class (quarter grid), the stats words.
 struct FrameGenSynthPassViews {
     ID3D11ShaderResourceView* out = nullptr;
     ID3D11ShaderResourceView* depth = nullptr;
@@ -35,6 +37,7 @@ struct FrameGenSynthPassViews {
     ID3D11UnorderedAccessView* keyUav = nullptr;
     ID3D11UnorderedAccessView* srcUav = nullptr;
     ID3D11UnorderedAccessView* readUav = nullptr;
+    ID3D11UnorderedAccessView* holesUav = nullptr;   // frameGenSynthHoleCapacity(rw, rh) uints
     ID3D11UnorderedAccessView* sUav = nullptr;
     ID3D11UnorderedAccessView* statsUav = nullptr;
     ID3D11UnorderedAccessView* sLumaUav = nullptr;
@@ -45,7 +48,7 @@ struct FrameGenSynthPassViews {
 };
 
 // The sequence of one call: the clear (the key grid and the stats words to 0 by the API; the source grid needs none, framegen_synth_shader.h); the score of the kept f = 1 S
-// against this frame when `score`; then, when `build`, splat, source, resolve, resample and, when `keep`, the luma pass that keeps this f = 1 S for the next frame.
+// against this frame when `score`; then, when `build`, splat, source, resolve, holes, resample and, when `keep`, the luma pass that keeps this f = 1 S for the next frame.
 // `after(int step)` runs after the clear and after each dispatch (the bench's timestamps). Every dispatch starts with nothing bound from the last (a resource still bound as a
 // UAV would silently null the SRV set for it), and nothing stays bound at the end.
 template <class After>
@@ -87,10 +90,15 @@ inline void frameGenSynthRunPasses(ID3D11DeviceContext* ctx, ID3D11ComputeShader
             ID3D11UnorderedAccessView* uav[kFrameGenSynthUavSlots] = {nullptr, nullptr, v.srcUav};
             dispatch(kFgSynSrc, srv, uav, rgx, rgy);
         }
-        {   // resolve: the offset every S pixel reads at, the guard and the background pull
+        {   // resolve: the offset every S pixel reads at and the guard; the holes listed
             ID3D11ShaderResourceView* srv[kFrameGenSynthSrvSlots] = {nullptr, v.depth, v.mv, nullptr, v.keySrv, v.srcSrv};
-            ID3D11UnorderedAccessView* uav[kFrameGenSynthUavSlots] = {nullptr, nullptr, nullptr, v.readUav, nullptr, v.statsUav};
+            ID3D11UnorderedAccessView* uav[kFrameGenSynthUavSlots] = {v.holesUav, nullptr, nullptr, v.readUav, nullptr, v.statsUav};
             dispatch(kFgSynResolve, srv, uav, rgx, rgy);
+        }
+        {   // holes: the background pull for the listed holes, one thread each; the groups past the count return at once
+            ID3D11ShaderResourceView* srv[kFrameGenSynthSrvSlots] = {nullptr, v.depth, v.mv, nullptr, v.keySrv, v.srcSrv};
+            ID3D11UnorderedAccessView* uav[kFrameGenSynthUavSlots] = {v.holesUav, nullptr, nullptr, v.readUav, nullptr, v.statsUav};
+            dispatch(kFgSynHoles, srv, uav, (frameGenSynthHoleCapacity(v.rw, v.rh) + 63u) / 64u, 1u);
         }
         {   // resample B's output into S at the output size
             ID3D11ShaderResourceView* srv[kFrameGenSynthSrvSlots] = {v.out, nullptr, nullptr, nullptr, nullptr, nullptr, v.readSrv};
