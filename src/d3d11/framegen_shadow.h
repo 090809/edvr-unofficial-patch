@@ -6,7 +6,7 @@
 //
 // temporal_pass.cpp calls frameGenShadowEyeFrame once per treated eye-frame beside the sky ring, with the numbers the pass already computed for that frame.
 // Per eye the module keeps the previous frame's capture (a quarter-size luma and depth, ping-ponged) and deltas; a frame with both and no skip reason is
-// scored on the GPU and the 993 stats words read back without waiting, a few frames later. Key off: nothing is created and nothing is dispatched.
+// scored on the GPU and the 1595 stats words read back without waiting, a few frames later. Key off: nothing is created and nothing is dispatched.
 // frameGenShadowFrameBoundary (once a frame, from temporalPassFrameBoundary) prints the one-second report.
 #include <d3d11.h>
 

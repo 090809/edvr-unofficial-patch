@@ -647,7 +647,7 @@ static void selfTest() {
     coreLegacy.insert(coreLegacy.end(), originalCore.begin(), originalCore.end());
     coreLegacy.insert(coreLegacy.end(), originalExtra.begin(), originalExtra.end());
     auto coreFixed = fixedVariants(extractCore(edvr::kTemporalCsHlsl));
-    check(originalCore.size() == 28 && originalExtra.size() == 12 && coreFixed.size() == 112 && coreLegacy.size() + 65 == coreFixed.size(),
+    check(originalCore.size() == 28 && originalExtra.size() == 12 && coreFixed.size() == 116 && coreLegacy.size() + 69 == coreFixed.size(),
           "all original fixed shader contracts, three bounded diagnostics, six flat foreground shaders, the supercruise bars' geometry shader, the foreground map's four sibling-pass compute shaders (donor, fit and the shadow's two), the sky ring's compute shader, the UI layer's in-place composite, the explosion billboards' five facing transcriptions the sharp weapons' two source-pass shaders, the shield ripple's door pass, the HUD bloom feed pass, the star light pass, the visor's axis-centred vertex shader, the desktop window's two draw shaders, the scope lens's three compute passes, the SRV turret HUD's eleven geometry shaders, the VR maps' twelve (five transcribed vertex shaders, the probe's vertex and pixel shader, the sprites' depth issue's two pixel shaders, the System Map's marker vertex shader and the cut-out's vertex and pixel shader) the legacy cockpit glass's three pixel shaders (intact, ice overlay, condensation overlay) and the frame-generation shadow scorer's four compute entries (capture, clear, splat, score) are registered");
     for(size_t i=0;i<coreFixed.size();++i)for(size_t j=0;j<i;++j)
         check(std::strcmp(coreFixed[i].symbol,coreFixed[j].symbol)!=0,"generated shader symbols do not collide");
@@ -1422,18 +1422,22 @@ static void selfTest() {
         }
     }
 
-    // The frame-generation shadow scorer (src/d3d11/framegen_shadow_shader.h): five entries of one text, the carry functions cut from kTemporalCsHlsl and the scorer's own.
+    // The frame-generation shadow scorer (src/d3d11/framegen_shadow_shader.h): nine entries of one text, the carry functions cut from kTemporalCsHlsl and the scorer's own.
     // Held to the symbols, the source name, the entries, the profile, the text (the carry region is in it, once, and is the pass's text byte for byte), the 8x8 group each
     // is dispatched with, and the bindings each reads at the slots src/d3d11/framegen_shadow.cpp sets them at.
     {
         struct Binding { const char* name; D3D_SHADER_INPUT_TYPE type; UINT slot; };
         struct ShadowContract { const char* symbol; const char* entry; std::vector<Binding> bindings; };
         const std::vector<ShadowContract> contracts = {
-            {"kFrameGenShadowCaptureBytecode", "fgShadowCapture", {{"Out", D3D_SIT_TEXTURE, 0}, {"Depth", D3D_SIT_TEXTURE, 1}, {"LumaOut", D3D_SIT_UAV_RWTYPED, 0}, {"DepthOut", D3D_SIT_UAV_RWTYPED, 1}, {"P", D3D_SIT_CBUFFER, 0}}},
+            {"kFrameGenShadowCaptureBytecode", "fgShadowCapture", {{"Out", D3D_SIT_TEXTURE, 0}, {"Depth", D3D_SIT_TEXTURE, 1}, {"DepthA", D3D_SIT_TEXTURE, 3}, {"Mv", D3D_SIT_TEXTURE, 5}, {"LumaOut", D3D_SIT_UAV_RWTYPED, 0}, {"DepthOut", D3D_SIT_UAV_RWTYPED, 1}, {"MvOut", D3D_SIT_UAV_RWTYPED, 4}, {"P", D3D_SIT_CBUFFER, 0}}},
             {"kFrameGenShadowClearBytecode", "fgShadowClear", {{"Key", D3D_SIT_UAV_RWTYPED, 2}, {"Stats", D3D_SIT_UAV_RWSTRUCTURED, 3}, {"P", D3D_SIT_CBUFFER, 0}}},
             {"kFrameGenShadowSplatBytecode", "fgShadowSplat", {{"DepthA", D3D_SIT_TEXTURE, 3}, {"Key", D3D_SIT_UAV_RWTYPED, 2}, {"P", D3D_SIT_CBUFFER, 0}}},
             {"kFrameGenShadowScoreBytecode", "fgShadowScore", {{"LumaA", D3D_SIT_TEXTURE, 2}, {"LumaB", D3D_SIT_TEXTURE, 4}, {"Key", D3D_SIT_UAV_RWTYPED, 2}, {"Stats", D3D_SIT_UAV_RWSTRUCTURED, 3}, {"P", D3D_SIT_CBUFFER, 0}}},
             {"kFrameGenShadowScoreBBytecode", "fgShadowScoreB", {{"LumaA", D3D_SIT_TEXTURE, 2}, {"LumaB", D3D_SIT_TEXTURE, 4}, {"Mv", D3D_SIT_TEXTURE, 5}, {"DepthB", D3D_SIT_TEXTURE, 6}, {"Stats", D3D_SIT_UAV_RWSTRUCTURED, 3}, {"P", D3D_SIT_CBUFFER, 0}}},
+            {"kFrameGenShadowExClearBytecode", "fgShadowExClear", {{"KeyE", D3D_SIT_UAV_RWTYPED, 5}, {"SrcE", D3D_SIT_UAV_RWTYPED, 6}, {"P", D3D_SIT_CBUFFER, 0}}},
+            {"kFrameGenShadowExSplatBytecode", "fgShadowExSplat", {{"DepthA", D3D_SIT_TEXTURE, 3}, {"MvA", D3D_SIT_TEXTURE, 7}, {"KeyE", D3D_SIT_UAV_RWTYPED, 5}, {"P", D3D_SIT_CBUFFER, 0}}},
+            {"kFrameGenShadowExSrcBytecode", "fgShadowExSrc", {{"DepthA", D3D_SIT_TEXTURE, 3}, {"MvA", D3D_SIT_TEXTURE, 7}, {"KeyE", D3D_SIT_UAV_RWTYPED, 5}, {"SrcE", D3D_SIT_UAV_RWTYPED, 6}, {"P", D3D_SIT_CBUFFER, 0}}},
+            {"kFrameGenShadowExScoreBytecode", "fgShadowExScore", {{"DepthA", D3D_SIT_TEXTURE, 3}, {"MvA", D3D_SIT_TEXTURE, 7}, {"LumaA", D3D_SIT_TEXTURE, 2}, {"LumaB", D3D_SIT_TEXTURE, 4}, {"KeyE", D3D_SIT_UAV_RWTYPED, 5}, {"SrcE", D3D_SIT_UAV_RWTYPED, 6}, {"Stats", D3D_SIT_UAV_RWSTRUCTURED, 3}, {"P", D3D_SIT_CBUFFER, 0}}},
         };
         const std::string& text = edvr::frameGenShadowShaderSource();
         const std::string carry = edvr::frameGenCarryText();

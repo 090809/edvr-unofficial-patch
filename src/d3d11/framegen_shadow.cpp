@@ -21,8 +21,9 @@ namespace {
 
 constexpr int kStagingDepth = 4;
 constexpr int kTimerRing = 8;
-constexpr int kEntries = 5;      // capture, clear, splat, score, score B
-constexpr int kSrvSlots = 7;     // t0..t6
+constexpr int kEntries = 9;      // capture, clear, splat, score, score B, extrapolation clear, splat, source, score
+constexpr int kSrvSlots = 8;     // t0..t7
+constexpr int kUavSlots = 7;     // u0..u6
 
 std::atomic<bool> g_on{false};
 std::atomic<bool> g_told{false};   // the armed line has been said since the key last went on
@@ -38,6 +39,9 @@ struct EyeRes {
     bool created = false;
     uint32_t rw = 0, rh = 0, ow = 0, oh = 0, qw = 0, qh = 0;
     Tex luma[2], depth[2], key;
+    Tex mvq[2];                   // the DLSS vectors at the cells (xy) and the frame before's depth where they point (z), ping-ponged with the luma
+    Tex keyE, srcE;               // the extrapolation's key grid and the winner's cell
+    bool mvValid[2] = {};         // the slot's vectors were captured from a bound vector texture, a frame after the slot before it
     ID3D11Buffer* stats = nullptr;
     ID3D11UnorderedAccessView* statsUav = nullptr;
     ID3D11Buffer* staging[kStagingDepth] = {};
@@ -62,7 +66,7 @@ struct TimerSlot {
 struct State {
     ID3D11Device* dev = nullptr;   // identity only
     bool failed = false;           // creation failed on this device: stand down until it changes or the key is toggled
-    ID3D11ComputeShader* cs[kEntries] = {};   // capture, clear, splat, score, score B
+    ID3D11ComputeShader* cs[kEntries] = {};   // capture, clear, splat, score, score B, extrapolation clear, splat, source, score
     ID3D11Buffer* cb = nullptr;
     DXGI_FORMAT lumaFormat = DXGI_FORMAT_R16_FLOAT;
     EyeRes eye[2];
@@ -91,7 +95,10 @@ void releaseTex(Tex& t) {
 void releaseEye(EyeRes& r) {
     for (Tex& t : r.luma) releaseTex(t);
     for (Tex& t : r.depth) releaseTex(t);
+    for (Tex& t : r.mvq) releaseTex(t);
     releaseTex(r.key);
+    releaseTex(r.keyE);
+    releaseTex(r.srcE);
     releaseCom(r.statsUav);
     releaseCom(r.stats);
     for (auto& s : r.staging) releaseCom(s);
@@ -136,6 +143,10 @@ bool createCommon(ID3D11Device* dev, ID3D11DeviceContext* ctx) {
         {kFrameGenShadowSplatBytecode, sizeof(kFrameGenShadowSplatBytecode), "framegen_shadow_splat"},
         {kFrameGenShadowScoreBytecode, sizeof(kFrameGenShadowScoreBytecode), "framegen_shadow_score"},
         {kFrameGenShadowScoreBBytecode, sizeof(kFrameGenShadowScoreBBytecode), "framegen_shadow_score_b"},
+        {kFrameGenShadowExClearBytecode, sizeof(kFrameGenShadowExClearBytecode), "framegen_shadow_ex_clear"},
+        {kFrameGenShadowExSplatBytecode, sizeof(kFrameGenShadowExSplatBytecode), "framegen_shadow_ex_splat"},
+        {kFrameGenShadowExSrcBytecode, sizeof(kFrameGenShadowExSrcBytecode), "framegen_shadow_ex_src"},
+        {kFrameGenShadowExScoreBytecode, sizeof(kFrameGenShadowExScoreBytecode), "framegen_shadow_ex_score"},
     };
     for (int i = 0; i < kEntries; ++i) {
         g.cs[i] = shaderSwapCreateCs(ctx, entries[i].code, entries[i].size, entries[i].name, "frame generation (shadow)");
@@ -177,9 +188,11 @@ bool createEye(ID3D11Device* dev, EyeRes& r, uint32_t rw, uint32_t rh, uint32_t 
     if (r.qw == 0 || r.qh == 0) return false;
     bool ok = true;
     for (int i = 0; i < 2 && ok; ++i) {
-        ok = makeTex(dev, r.qw, r.qh, g.lumaFormat, true, r.luma[i]) && makeTex(dev, r.qw, r.qh, DXGI_FORMAT_R32_FLOAT, true, r.depth[i]);
+        ok = makeTex(dev, r.qw, r.qh, g.lumaFormat, true, r.luma[i]) && makeTex(dev, r.qw, r.qh, DXGI_FORMAT_R32_FLOAT, true, r.depth[i]) &&
+             makeTex(dev, r.qw, r.qh, DXGI_FORMAT_R32G32B32A32_FLOAT, true, r.mvq[i]);
     }
-    ok = ok && makeTex(dev, r.qw, r.qh, DXGI_FORMAT_R32_UINT, false, r.key);
+    ok = ok && makeTex(dev, r.qw, r.qh, DXGI_FORMAT_R32_UINT, false, r.key) && makeTex(dev, r.qw, r.qh, DXGI_FORMAT_R32_UINT, false, r.keyE) &&
+         makeTex(dev, r.qw, r.qh, DXGI_FORMAT_R32_UINT, false, r.srcE);
     if (ok) {
         D3D11_BUFFER_DESC bd{};
         bd.ByteWidth = kFrameGenShadowStatsUints * 4u;
@@ -259,10 +272,10 @@ TimerSlot* beginTimer(ID3D11Device* dev, ID3D11DeviceContext* ctx) {
     return nullptr;
 }
 
-void bindAndDispatch(ID3D11DeviceContext* ctx, int entry, ID3D11ShaderResourceView* const srv[kSrvSlots], ID3D11UnorderedAccessView* const uav[4], uint32_t gx, uint32_t gy) {
+void bindAndDispatch(ID3D11DeviceContext* ctx, int entry, ID3D11ShaderResourceView* const srv[kSrvSlots], ID3D11UnorderedAccessView* const uav[kUavSlots], uint32_t gx, uint32_t gy) {
     ctx->CSSetShader(g.cs[entry], nullptr, 0);
     ctx->CSSetShaderResources(0, kSrvSlots, srv);
-    ctx->CSSetUnorderedAccessViews(0, 4, uav, nullptr);
+    ctx->CSSetUnorderedAccessViews(0, kUavSlots, uav, nullptr);
     ctx->Dispatch(gx, gy, 1);
 }
 
@@ -386,35 +399,53 @@ void frameGenShadowEyeFrame(ID3D11Device* dev, ID3D11DeviceContext* ctx, uint32_
         ctx->CSSetConstantBuffers(0, 1, &g.cb);
         const uint32_t gx = (r.qw + 7u) / 8u, gy = (r.qh + 7u) / 8u;
         ID3D11ShaderResourceView* noSrv[kSrvSlots] = {};
-        ID3D11UnorderedAccessView* noUav[4] = {};
-        {   // capture this frame into the slot the next frame will read as its previous
-            ID3D11ShaderResourceView* srv[kSrvSlots] = {f.outSrv, f.depthSrv};
-            ID3D11UnorderedAccessView* uav[4] = {r.luma[next].uav, r.depth[next].uav, nullptr, nullptr};
+        ID3D11UnorderedAccessView* noUav[kUavSlots] = {};
+        {   // capture this frame into the slot the next frame will read as its previous: luma, depth, and the vectors (with the previous frame's depth where they point)
+            ID3D11ShaderResourceView* srv[kSrvSlots] = {f.outSrv, f.depthSrv, nullptr, r.haveCapture ? r.depth[r.cur].srv : nullptr, nullptr, f.mvSrv};
+            ID3D11UnorderedAccessView* uav[kUavSlots] = {r.luma[next].uav, r.depth[next].uav, nullptr, nullptr, r.mvq[next].uav, nullptr, nullptr};
             bindAndDispatch(ctx, 0, srv, uav, gx, gy);
+            r.mvValid[next] = f.mvSrv && r.haveCapture && r.captureFrame + 1u == frame;
         }
         if (scored) {
             const int prevSlot = r.cur;
             {   // clear
-                ID3D11UnorderedAccessView* uav[4] = {nullptr, nullptr, r.key.uav, r.statsUav};
+                ID3D11UnorderedAccessView* uav[kUavSlots] = {nullptr, nullptr, r.key.uav, r.statsUav};
                 bindAndDispatch(ctx, 1, noSrv, uav, gx, gy);
             }
             {   // splat: the previous depth, forward
                 ID3D11ShaderResourceView* srv[kSrvSlots] = {nullptr, nullptr, nullptr, r.depth[prevSlot].srv};
-                ID3D11UnorderedAccessView* uav[4] = {nullptr, nullptr, r.key.uav, nullptr};
+                ID3D11UnorderedAccessView* uav[kUavSlots] = {nullptr, nullptr, r.key.uav, nullptr};
                 bindAndDispatch(ctx, 2, srv, uav, gx, gy);
             }
             {   // score: the previous and this frame's luma against the keys, backward
                 ID3D11ShaderResourceView* srv[kSrvSlots] = {nullptr, nullptr, r.luma[prevSlot].srv, nullptr, r.luma[next].srv};
-                ID3D11UnorderedAccessView* uav[4] = {nullptr, nullptr, r.key.uav, r.statsUav};
+                ID3D11UnorderedAccessView* uav[kUavSlots] = {nullptr, nullptr, r.key.uav, r.statsUav};
                 bindAndDispatch(ctx, 3, srv, uav, gx, gy);
             }
             if (f.mvSrv) {   // score B: this frame's cells by its own depth, carried back by the DLSS vector and by the true rows (the stats words add to the score's)
                 ID3D11ShaderResourceView* srv[kSrvSlots] = {nullptr, nullptr, r.luma[prevSlot].srv, nullptr, r.luma[next].srv, f.mvSrv, r.depth[next].srv};
-                ID3D11UnorderedAccessView* uav[4] = {nullptr, nullptr, nullptr, r.statsUav};
+                ID3D11UnorderedAccessView* uav[kUavSlots] = {nullptr, nullptr, nullptr, r.statsUav};
                 bindAndDispatch(ctx, 4, srv, uav, gx, gy);
             }
+            if (r.mvValid[prevSlot]) {   // the extrapolation sets: the previous frame's cells carried forward by their own vectors, once per variant (0 ex2d, 1 ex3d)
+                for (int variant = 0; variant < 2; ++variant) {
+                    cb.qz[2] = variant;
+                    if (SUCCEEDED(ctx->Map(g.cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {
+                        std::memcpy(m.pData, &cb, sizeof(cb));
+                        ctx->Unmap(g.cb, 0);
+                    }
+                    ID3D11ShaderResourceView* sA[kSrvSlots] = {nullptr, nullptr, nullptr, r.depth[prevSlot].srv, nullptr, nullptr, nullptr, r.mvq[prevSlot].srv};
+                    ID3D11ShaderResourceView* sS[kSrvSlots] = {nullptr, nullptr, r.luma[prevSlot].srv, r.depth[prevSlot].srv, r.luma[next].srv, nullptr, nullptr, r.mvq[prevSlot].srv};
+                    ID3D11UnorderedAccessView* uClear[kUavSlots] = {nullptr, nullptr, nullptr, nullptr, nullptr, r.keyE.uav, r.srcE.uav};
+                    ID3D11UnorderedAccessView* uScore[kUavSlots] = {nullptr, nullptr, nullptr, r.statsUav, nullptr, r.keyE.uav, r.srcE.uav};
+                    bindAndDispatch(ctx, 5, noSrv, uClear, gx, gy);
+                    bindAndDispatch(ctx, 6, sA, uClear, gx, gy);
+                    bindAndDispatch(ctx, 7, sA, uClear, gx, gy);
+                    bindAndDispatch(ctx, 8, sS, uScore, gx, gy);
+                }
+            }
             ctx->CSSetShaderResources(0, kSrvSlots, noSrv);
-            ctx->CSSetUnorderedAccessViews(0, 4, noUav, nullptr);
+            ctx->CSSetUnorderedAccessViews(0, kUavSlots, noUav, nullptr);
             ctx->CopyResource(r.staging[slot], r.stats);
             r.pending[slot] = true;
             r.slotSet[slot] = static_cast<uint8_t>(set);
@@ -422,7 +453,7 @@ void frameGenShadowEyeFrame(ID3D11Device* dev, ID3D11DeviceContext* ctx, uint32_
             ++r.writes;
         } else {
             ctx->CSSetShaderResources(0, kSrvSlots, noSrv);
-            ctx->CSSetUnorderedAccessViews(0, 4, noUav, nullptr);
+            ctx->CSSetUnorderedAccessViews(0, kUavSlots, noUav, nullptr);
         }
         if (timer) timer->timer.end(ctx);
         save.restore(ctx);
@@ -489,6 +520,8 @@ void frameGenShadowFrameBoundary() {
     m.rigDtMedian = frameGenMedian(g.rigDtMm.data(), g.rigDtMm.size());
     const std::string line = formatFrameGenShadowReport(g.win);
     Log::get().note("%s", line.c_str());
+    const std::string extrap = formatFrameGenShadowExtrapolation(g.win);   // its own line: the report is at the widest a line takes
+    if (!extrap.empty()) Log::get().note("%s", extrap.c_str());
     windowReset();
 }
 

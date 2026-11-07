@@ -74,7 +74,7 @@ inline void frameGenBackward(const FrameGenDeltas& b, const float Wp[9], const f
 // The scorer's constant buffer (b0 of every entry), laid out for the HLSL cbuffer P in src\d3d11\framegen_shadow_shader.h: 23 rows of 16 bytes.
 struct FrameGenShadowCb {
     int32_t sz[4];        // render width, render height, output width, output height
-    int32_t qz[4];        // quarter grid width, height, 0, 0
+    int32_t qz[4];        // quarter grid width, height, the extrapolation variant (0 ex2d, 1 ex3d; set by the host before each fgShadowEx* dispatch), 0
     float tanA[4];        // the previous frame's tangents (left, right, bottom, top), jitter excluded
     float tanB[4];        // this frame's
     float dk[4];          // the depth encoding's A and B (depth = A + B / z), the ship's split in metres, 0
@@ -87,6 +87,7 @@ static_assert(sizeof(FrameGenShadowCb) == 512, "the scorer's cbuffer is 32 16-by
 // The stats buffer: three blocks of one layout (per class hist, histId, pixels, sum, sumId; then holes and cells), then the two disagreement histograms.
 //   [0, 299)    the main score (fgShadowScore)        [299, 598)  the mv set (fgShadowScoreB)       [598, 897)  the bdepth set (fgShadowScoreB)
 //   [897, 945)  the world disagreement histogram      [945, 993)  the cockpit disagreement histogram
+//   [993, 1292) the ex2d set (fgShadowExScore)        [1292, 1591) the ex3d set                       [1591, 1595) rows off: world cells, world off, cockpit cells, cockpit off
 constexpr uint32_t kFrameGenShadowStatsPerClass = 2 * kFrameGenShadowBins + 3;   // hist, histId, pixels, sum, sumId
 constexpr uint32_t kFrameGenShadowStatsHoles = kFrameGenShadowClasses * kFrameGenShadowStatsPerClass;
 constexpr uint32_t kFrameGenShadowStatsCells = kFrameGenShadowStatsHoles + 1;
@@ -95,7 +96,10 @@ constexpr uint32_t kFrameGenShadowStatsMvBase = kFrameGenShadowStatsBlockUints;
 constexpr uint32_t kFrameGenShadowStatsBdepthBase = 2 * kFrameGenShadowStatsBlockUints;
 constexpr uint32_t kFrameGenShadowStatsDisWorld = 3 * kFrameGenShadowStatsBlockUints;
 constexpr uint32_t kFrameGenShadowStatsDisCockpit = kFrameGenShadowStatsDisWorld + kFrameGenShadowBins;
-constexpr uint32_t kFrameGenShadowStatsUints = kFrameGenShadowStatsDisCockpit + kFrameGenShadowBins;   // 993
+constexpr uint32_t kFrameGenShadowStatsEx2dBase = kFrameGenShadowStatsDisCockpit + kFrameGenShadowBins;   // 993
+constexpr uint32_t kFrameGenShadowStatsEx3dBase = kFrameGenShadowStatsEx2dBase + kFrameGenShadowStatsBlockUints;
+constexpr uint32_t kFrameGenShadowStatsRowsOff = kFrameGenShadowStatsEx3dBase + kFrameGenShadowStatsBlockUints;   // 1591
+constexpr uint32_t kFrameGenShadowStatsUints = kFrameGenShadowStatsRowsOff + 4;   // 1595
 
 // `truth` is B's true backward rows (frameGenBackward of B's measured W and tvCam), null for identity rows.
 inline void frameGenFillCb(FrameGenShadowCb& cb, uint32_t renderW, uint32_t renderH, uint32_t outW, uint32_t outH, const float tanA[4], const float tanB[4],
@@ -161,6 +165,12 @@ inline void frameGenDecodeStats(const uint32_t* s, FrameGenShadowEyeResult& out)
         out.disWorld[i] = s[kFrameGenShadowStatsDisWorld + i];
         out.disCockpit[i] = s[kFrameGenShadowStatsDisCockpit + i];
     }
+    frameGenDecodeBlock(s + kFrameGenShadowStatsEx2dBase, out.ex2d.cls, out.ex2d.holes, out.ex2d.cells);
+    frameGenDecodeBlock(s + kFrameGenShadowStatsEx3dBase, out.ex3d.cls, out.ex3d.holes, out.ex3d.cells);
+    out.rowsWorld = s[kFrameGenShadowStatsRowsOff];
+    out.rowsWorldOff = s[kFrameGenShadowStatsRowsOff + 1];
+    out.rowsCockpit = s[kFrameGenShadowStatsRowsOff + 2];
+    out.rowsCockpitOff = s[kFrameGenShadowStatsRowsOff + 3];
 }
 
 // The median of a small sample set (the middle element, the upper one for an even count); 0 for none. The vector is reordered.
