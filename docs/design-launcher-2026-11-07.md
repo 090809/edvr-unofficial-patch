@@ -3,8 +3,8 @@
 ## Status
 
 - **State:** build order steps 2 and 3 are built on branch
-  `claude/hungry-heyrovsky-000d7b` (2026-11-07), full build green at `5033812c`. No
-  release carries the launcher yet. Step 4 has not started.
+  `claude/hungry-heyrovsky-000d7b` (2026-11-07), and the full build passes. No release
+  carries the launcher yet. Step 4 has not started.
 - **Proven, 2026-11-07 (see Test results):** CI builds the split assets, the signing
   tool's signature verifies through BCrypt, and a test release on GitHub was refused
   or accepted correctly over real HTTPS. The launcher downloaded it, verified every
