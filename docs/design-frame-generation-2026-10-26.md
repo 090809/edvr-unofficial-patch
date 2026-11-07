@@ -1139,6 +1139,33 @@ p95 (luma x 1024), warped / unwarped:
   sets 324-459 against 545 unwarped). The drop itself (one frame of 23 km)
   reads as a camera jump.
 
+### 2026-11-07: Phase 2.1, flight 7 (v0.22.0-rc.7-49-g9e71db96, compile-only)
+
+The synthesizer built, nothing shown. Landed with head turns, then low
+flight. Every other real frame per eye builds S at f = 0.5 (the shown
+variant), the others at f = 1, scored against C's real luma.
+
+- **Cost:** 0.58-0.73 ms per eye per variant (median), max 1.2-1.6 ms with
+  a few 2-10 ms outliers: 1.2-1.4 ms a pair for the shown variant, inside
+  H5's 1.5 ms. Guard 0.2-0.3%; holes 1.3-1.8% under head turns, 1-4% of
+  them left unfilled (the view's entering edge, not read).
+- **f = 1 against C, head turns, p95 synth / unwarped:** far 4-20 / 4-20,
+  cockpit 57-162 / 136-229, world 68-229 / 115-386. Phase 1's scorer on the
+  same seconds (one step, B's TRUE head): far 0-1, cockpit 17-34, world
+  17-34. In flight the synth's world is at or a little under no warp
+  (e.g. 96 / 273, 459 / 545 in a turn) where ex2dh (true head) scores
+  41-81.
+- **Hypothesis (not tested): the gap is the head's extrapolation,** not
+  the pipeline. S at f = 1 carries the head 44 ms at A -> B's velocity;
+  the far class (rotation only) going from 0-1 to 4-20 is that miss. On
+  display the compositor turns S by what remains of the head's rotation,
+  so this score overstates what is seen. Discriminator: turn S by the
+  rotation between the predicted and C's true head before scoring (the
+  compositor's step); if the far class falls back to 0-1 and the world
+  near ex2dh's, the pipeline is sound.
+- **VRAM:** 98% of the budget with pressure lines (11.36 of 11.57 GB);
+  the synth adds about 20 B per render pixel per eye.
+
 ### 2026-11-07: Phase 1, extrapolation sets built (not flown)
 
 - **Built:** the scorer keeps A's own DLSS vectors (a quarter-grid copy, with
