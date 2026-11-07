@@ -18,16 +18,7 @@
     `advanced.ui_replay` (retired 48ad7689), the Foveation centre row
     (`experimental.foveation_centre`) and the three `Trim view` rows (ini-only
     since 2026-09-29). Its `Settlement detail` row: removed 2026-10-08 (claude/remove-settlement-detail).
-  - Monitor page: no rows the compositor's frame timing filled (frame_flag v34).
-    2026-11-07: a FRAME GENERATION block, only while `fix.frame_generation` or
-    `fix.frame_generation_shadow` is on (item 3 below); BUILT, NOT FLOWN.
-  - Performance page, 2026-11-07: `Frame generation (experimental, Lock 2:1)`
-    (`fix.frame_generation`, off / on, live) right after Turbo mode, the
-    page that already carries the experimental [fix] switch; the developer
-    tier's Experimental page lists only `[experimental]` keys, and moving
-    the key there would rename it. `fix.frame_generation_shadow` stays
-    hidden. Live: the d3d11 half re-reads the key on the menu's write and
-    the runtime reads it from the frame answer every frame. BUILT, NOT FLOWN.
+  - Monitor page: no rows the compositor's frame timing filled (frame_flag v34). 2026-11-07: a FRAME GENERATION block with either frame-generation key on (item 3); and Performance's `Frame generation (experimental, Lock 2:1)` row (`fix.frame_generation`, live, after Turbo mode; "Frame generation row" below). BUILT, NOT FLOWN.
   - Single-line overlay: fits its text, keeps its font size across OpenXR
     resolutions, shows application GPU/CPU timings. Full desktop gates
     passed; headset checks: [combined test guide](native-render-benchmark-2026-09-15.md).
@@ -1007,7 +998,15 @@ they were there (flown 2026-09-07).
        scorer's VRAM lines' groups on the game device, and the S transfers'
        private copies on the XR device.
      The runtime's half rides the slot it already hands once a pair
-     (`EdvrNativeFrameGenSlot` size 3, appended fields; no new lock or call);
+     (`EdvrNativeFrameGenSlot` size 3, appended fields; no new lock or call).
+     **Frame generation row** (2026-11-07): `Frame generation (experimental,
+     Lock 2:1)` (`fix.frame_generation`, off / on, live) is a Performance
+     page row right after Turbo mode, the page that carries the other
+     experimental [fix] switch; the developer tier's Experimental page lists
+     only `[experimental]` keys, and moving the key there would rename it.
+     `fix.frame_generation_shadow` stays hidden. Live: the d3d11 half
+     re-reads the key on the menu's write, and the runtime reads it from the
+     frame answer every frame;
    - **two frame-time strips**, fpsVR's pair: the GPU frame and the
      render thread's busy time, each the last 120 frames against its own
      budget line, green within it, amber over it, red at twice it. A
