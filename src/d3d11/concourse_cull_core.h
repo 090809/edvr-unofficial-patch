@@ -33,14 +33,20 @@ constexpr const char* kHubName = "SA_StationHub_Compact";
 constexpr const char* kPortAnchorName = "SA_PlanetPortHub_Compact";
 // An orbital outpost's room, the same way: r=33.3, 9.6 m from where Sean stood at the bar (two surveys, after Flight 37).
 constexpr const char* kOutpostAnchorName = "SA_OutpostHub_Compact";
+// A fleet carrier's concourse: r=32.5, 4.0 m from where Sean stood in it (five surveys, after Flight 39). The bar is 25 m from it and the bridge 45 m, the bridge's own record
+// (SA_Carrier_01_Bridge) 55 m from the bar's: one room for the cull, one bake from this centre for both.
+constexpr const char* kCarrierAnchorName = "SA_Carrier_01";
 inline bool concourseAnchorName(const char* name) noexcept {
-    return name && (std::strcmp(name, kAnchorName) == 0 || std::strcmp(name, kPortAnchorName) == 0 || std::strcmp(name, kOutpostAnchorName) == 0);
+    return name && (std::strcmp(name, kAnchorName) == 0 || std::strcmp(name, kPortAnchorName) == 0 || std::strcmp(name, kOutpostAnchorName) == 0 ||
+                    std::strcmp(name, kCarrierAnchorName) == 0);
 }
 
 // The name prefixes that are the room. Exact case.
 // Root and Perturbator are the room's too: off this list they stayed only while within kCloseDistanceM, so the bar's tables popped in and flickered at that distance (Flight 31).
-constexpr const char* kAllowPrefixes[] = {"Standard_SocialArea", "SA_",         "PS_",        "STAT_", "FUI_",        "PROP_",
-                                          "GUI_Interactive",     "Interactive_", "TP_",         "HangarLobby", "TurboLift", "Root", "Perturbator"};
+// RandomDirt, Narrow_Door_ and Arm_ are a fleet carrier's: dirt on its concourse floor 8 m from its anchor, its doors 35 to 42 m off, arms 10 m from the bridge; seen nowhere else surveyed,
+// and off this list they would pop at kCloseDistanceM too.
+constexpr const char* kAllowPrefixes[] = {"Standard_SocialArea", "SA_",         "PS_",        "STAT_", "FUI_",        "PROP_", "GUI_Interactive", "Interactive_", "TP_",
+                                          "HangarLobby",         "TurboLift",    "Root",        "Perturbator", "RandomDirt", "Narrow_Door_", "Arm_"};
 constexpr size_t kAllowPrefixCount = sizeof(kAllowPrefixes) / sizeof(kAllowPrefixes[0]);
 
 inline bool hasPrefixExact(const char* name, const char* prefix, size_t n) noexcept { return n > 0 && std::strncmp(name, prefix, n) == 0; }
@@ -936,10 +942,14 @@ inline constexpr RoomLayout kRoomPort{12u, 300.0f, "a surface port's", 100.0f};
 // An orbital outpost: the bay is n=30 (79.7% of the view standing at it), 15.6 m from the hub, the hub's radius 33.3 m, the hangar lobby 431 m off. Outside it, the outpost's own hull
 // (one record, r=570, centred 165 m off), then the medium hangar 223 m, pads 330 m, blast shields 380 m: the same first sphere as a port.
 inline constexpr RoomLayout kRoomOutpost{30u, 300.0f, "an orbital outpost's", 100.0f};
+// A fleet carrier: the bar's windows are n=30 (99.7% of the view at them), the bridge's n=54 (99.9%), 39 m and 54 m from the anchor. Outside, the carrier's own hull, `MS_` records culled by the
+// list: the core 116 m past the bridge window, the command tower around the rooms, the engines 255 m off. The bridge is inside the 100 m reach; the lift to the hangar cuts 1331 m.
+inline constexpr RoomLayout kRoomCarrier{30u, 300.0f, "a fleet carrier's", 100.0f};
 inline const RoomLayout& roomLayoutOf(const char* anchorName) noexcept {
     if (!anchorName) return kRoomStation;
     if (std::strcmp(anchorName, kPortAnchorName) == 0) return kRoomPort;
     if (std::strcmp(anchorName, kOutpostAnchorName) == 0) return kRoomOutpost;
+    if (std::strcmp(anchorName, kCarrierAnchorName) == 0) return kRoomCarrier;
     return kRoomStation;
 }
 // Whether a fresh sighting of the anchor means the commander is in that room. With no reading of where either is, a room with a reach says no: the game's own.

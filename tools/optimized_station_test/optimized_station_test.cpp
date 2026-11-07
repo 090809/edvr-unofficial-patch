@@ -3378,6 +3378,16 @@ int main(int argc, char** argv) {
             check(!cc::concourseAllowName(n, nullptr), "concourse outpost: what stands outside is not on the list");
         check(cc::clearEntryScale(30, 30) == 1.0f && cc::clearEntryScale(30, 36) == 0.3f && cc::clearEntryScale(30, 12) == 0.3f && cc::clearEntryScale(36, 30) == 1.0f,
               "concourse clear: n=30 is the Orbis shop window, entering early, except where it is the bay");
+        // A fleet carrier's concourse, from five surveys: its anchor, the bar's n=30, the bridge inside the reach, and the carrier's own names kept.
+        check(cc::concourseAnchorName("SA_Carrier_01") && &cc::roomLayoutOf("SA_Carrier_01") == &cc::kRoomCarrier && cc::kRoomCarrier.bayN == 30u,
+              "concourse layouts: a fleet carrier's anchor and its bar window");
+        check(!cc::concourseAnchorName("SA_Carrier_01_Bridge") && !cc::concourseAnchorName("SA_Carrier_01_Bar"), "concourse anchors: the carrier's bridge and bar are not");
+        check(cc::anchorMeansRoomHere(cc::kRoomCarrier, true, true, 53.7f) && !cc::anchorMeansRoomHere(cc::kRoomCarrier, true, true, 1331.0f), "concourse layouts: a carrier's reach takes the bridge");
+        for (const char* n : {"SA_Carrier_01", "SA_Carrier_01_Bar", "SA_Carrier_01_Bridge", "SA_Carrier_01_Bar_WindowShutters0", "SA_Carrier_DoorA0", "PS_FUI_STAT_BigScreen_Carrier_01",
+                              "FUI_Panel_4x2_Carrier_010", "RandomDirt_NarrowRightA0", "Narrow_Door_Left_Tech", "Arm_Base0"})
+            check(cc::concourseAllowName(n, nullptr), "concourse carrier: the room's own name is on the list");
+        for (const char* n : {"MS_EngineBlock07", "MS_Command_Tower4", "MS_CoreHub1", "MS_CarrierDockB_Shell", "HangerLarge", "LandingPadLargeA", "CargoLayout08_03", "POI_Wreck_Independant_Fighter"})
+            check(!cc::concourseAllowName(n, nullptr), "concourse carrier: what stands outside is not on the list");
         // The anchor means the room: a station's is gone from the store once the lift cuts away, a port's is seen from the hangar too (503 m, Flight 36).
         check(cc::anchorMeansRoomHere(cc::kRoomStation, false, false, 0.0f) && cc::anchorMeansRoomHere(cc::kRoomStation, true, true, 1090.0f), "concourse layouts: at a station the sighting is enough, as it was");
         check(cc::anchorMeansRoomHere(cc::kRoomPort, true, true, 3.5f) && cc::anchorMeansRoomHere(cc::kRoomPort, true, true, 22.9f), "concourse layouts: at a port, in the middle of the room and at the bay");
@@ -4198,6 +4208,19 @@ int main(int argc, char** argv) {
                         feed(settlement, "{ \"event\":\"Docked\", \"StationName\":\"X\", \"StationType\":\"OnFootSettlement\" }\n");
                         feed(settlement, portDisembark);
                         check(settlement.kind() == K::kOnFootSettlement, "station type: any port on a planet holds");
+                        // A fleet carrier: its Disembark names neither it nor a planet.
+                        const char* carrierDisembark = "{ \"timestamp\":\"t\", \"event\":\"Disembark\", \"SRV\":false, \"Taxi\":false, \"Multicrew\":false, \"ID\":1, \"StarSystem\":\"S\", \"Body\":\"S\", \"BodyID\":0, \"OnStation\":false, \"OnPlanet\":false }\r\n";
+                        js::Latch carrier;
+                        feed(carrier, "{ \"event\":\"Docked\", \"StationName\":\"Q1H-2DZ\", \"StationType\":\"FleetCarrier\" }\n");
+                        feed(carrier, carrierDisembark);
+                        check(carrier.kind() == K::kFleetCarrier, "station type: a carrier's Disembark holds its type");
+                        feed(carrier, "{ \"event\":\"Undocked\", \"StationName\":\"Q1H-2DZ\", \"StationType\":\"FleetCarrier\" }\n");
+                        feed(carrier, carrierDisembark);
+                        check(carrier.kind() == K::kUnknown, "station type: and after Undocked such a Disembark is nowhere");
+                        js::Latch orbis;
+                        feed(orbis, dockedLoad);
+                        feed(orbis, carrierDisembark);
+                        check(orbis.kind() == K::kUnknown, "station type: it holds only a carrier's");
                     }
 
                     js::Latch fresh;

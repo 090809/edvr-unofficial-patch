@@ -231,6 +231,8 @@ private:
         }
         // At a port on a planet: see the head of this file.
         if (!location && surfaceKind(kind_) && has("\"OnPlanet\":true")) return;
+        // On a fleet carrier, likewise: Disembark and Embark there name neither it nor a planet ("OnStation":false, "OnPlanet":false; Flight 39's journal).
+        if (!location && kind_ == Kind::kFleetCarrier && has("\"OnStation\":false") && has("\"OnPlanet\":false")) return;
         if (location && has("\"OnFoot\":true") && has("\"BodyType\":\"Planet\"")) {
             set(surfaceKind(saved_.kind) ? saved_.kind : Kind::kUnknown, onChange);
             return;
