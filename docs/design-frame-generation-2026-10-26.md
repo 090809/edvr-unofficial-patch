@@ -1037,3 +1037,32 @@ warped / unwarped (luma x 1024), per set:
   vectors (constant screen velocity, and constant 3D velocity from A's
   vector and depth), and log the share of world pixels by the vector
   pass's decision path.
+
+### 2026-11-07: Phase 1, extrapolation sets built (not flown)
+
+- **Built:** the scorer keeps A's own DLSS vectors (a quarter-grid copy, with
+  the frame before's depth where each vector points) and forward-splats A's
+  cells by them into a key grid, a second pass writing each winner's cell
+  index. Two variants, scored per class against A's luma at the B cell's
+  centre carried back by its winner's own motion (bilinear, not the
+  winner's exact cell: the 4-cell footprint puts the winner up to a cell
+  away, which alone costs 0.04 luma on a zooming plane):
+  - `ex2d`: constant screen velocity, `pB = pA - mvA`.
+  - `ex3d`: constant view-space velocity, `P_B = 2 P_A - P_prev`, `P_prev`
+    the point at A's vector target at the frame before's depth (both seen
+    through A's tangents), projected through B's. No head or ship rotation
+    is applied; far cells take the screen rule.
+- **Also:** `rowsoff_world` / `rowsoff_cockpit`, the share of cells, of those
+  where either landing is inside the image, where B's true rows and the
+  DLSS vector land more than 4 px apart (one inside and one outside counts).
+  The vector pass's `decisionPath` is not readable without the trace buffer,
+  so it is not logged.
+- **Log:** a second line, `frame generation (shadow) extrapolation:
+  ex2d=n far/cockpit/world ex3d=n far/cockpit/world rowsoff_world=%
+  rowsoff_cockpit=%`, right after the report (which is at the widest a line
+  takes). `edvr_log.py --health` reads it as optional.
+- **WARP rig:** a plane scrolling at 8 px a frame with exact vectors: ex2d
+  and ex3d mean error 0.0000, holes 48 (the leading two columns); an
+  approaching plane (60, 50, 40 m): ex3d 0.0054, ex2d 0.0445, no-warp 0.1477.
+  A flipped vector sign in the extrapolation fails the scrolling case.
+- **Next:** fly it; compare ex2d, ex3d and mv (B's own vector) per class.
