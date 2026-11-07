@@ -31,8 +31,11 @@
 //      resample's rounding) through the exact identity; under a head turn and step the layer's block lands where a direction reference puts it (within 0.5 px) and the image
 //      is the homography's composite; an unfinished S (a named reason, a door that never came, a door that did not sharpen an S built to be) is not handed over and gives the
 //      producer texture's key back; a sharpening door's frame is the one finished over; the eye dump's sink sees the finished S
-// Mutations (each replaces one of the shader's six #define switches, or the host's f, and the case it guards must fail): f ignored, the head turn not taken out of the
-// vector, the guard off, the fill from the nearer side, the score's turn not applied, the score's turn applied the wrong way round.
+//   14 S's resample (FG_SHARP): a still scene and an integer read return B's texels exactly; a 5 px period read a quarter pixel off keeps 0.95 of its high-frequency energy;
+//      a step read off a texel rings nowhere outside its two levels
+// Mutations (each replaces one of the shader's #define switches, or the host's f, and the case it guards must fail): f ignored, the head turn not taken out of the
+// vector, the guard off, the fill from the nearer side, the score's turn not applied, the score's turn applied the wrong way round, an edge pixel on its own vector, the
+// sentinel as a vector, S resampled bilinear, the cubic without its clamp (FG_SHARP=3).
 #include <windows.h>
 #include <d3d11.h>
 #include <wrl/client.h>
@@ -198,11 +201,13 @@ bool compileMutated(Gpu& g, const char* defineName, ComPtr<ID3D11ComputeShader> 
     std::string names = defineName;   // one switch, or several separated by commas, all turned off
     for (size_t start = 0; start <= names.size();) {
         const size_t comma = names.find(',', start);
-        const std::string name = names.substr(start, comma == std::string::npos ? std::string::npos : comma - start);
+        std::string name = names.substr(start, comma == std::string::npos ? std::string::npos : comma - start), value = "0";
+        const size_t eq = name.find('=');   // NAME=V: the switch set to V instead of 0
+        if (eq != std::string::npos) { value = name.substr(eq + 1); name.resize(eq); }
         const std::string from = std::string("#define ") + name + " 1";
         const size_t at = text.find(from);
         if (at == std::string::npos) return false;
-        text.replace(at, from.size(), std::string("#define ") + name + " 0");
+        text.replace(at, from.size(), std::string("#define ") + name + " " + value);
         if (comma == std::string::npos) break;
         start = comma + 1;
     }
@@ -611,6 +616,84 @@ HullEdge case13HullEdge(Gpu& g, Scope& sc, bool report) {
     std::snprintf(label, sizeof(label), "case 13: the outline just outside the hull stays on the hull (S at x 63 reads %.2f, the outline -100)", e.outline);
     sc.ok(e.outline < -99.0f, label);
     if (g_verbose && report) std::printf("  case 13: background worst %.4f px, outline column %.2f\n", e.bgWorst, e.outline);
+    return e;
+}
+
+// ---- case 14: S's resample keeps B's sharpness ------------------------------------------------------------------------------------------------------------
+//
+// A world plane at 50 m, the head still, every pixel's vector (m, 0), f = 0.5: S reads B m / 2 px along x. B is grey on the 8-bit grid. A still scene (m = 0) and an
+// integer read (m = 4: 2 px) give B's texels exactly; a sinusoid of period 5 px read a quarter pixel off keeps its high-frequency energy (the RMS of the 1-D Laplacian, S
+// over B: 0.965 Catmull-Rom with the clamp, 0.861 bilinear, computed offline on the same 8-bit pattern); a step read 0.3 px off rings nowhere outside the step's two levels.
+struct SharpRead { bool ran = false; float still = 0.0f, shifted = 0.0f, energy = 0.0f, lo = 0.0f, hi = 0.0f; };
+
+Run sharpRun(Gpu& g, const std::function<float(int)>& grey, float m, int outScale = 1) {
+    Scene S(RW * outScale, RH * outScale);
+    S.grey([&](int x, int) { return std::round(grey(x / outScale) * 255.0f) / 255.0f; });
+    std::fill(S.depth.begin(), S.depth.end(), depthOf(50.0f));
+    for (size_t i = 0; i < static_cast<size_t>(RW) * RH; ++i) { S.mv[i * 2] = m; S.mv[i * 2 + 1] = 0.0f; }
+    FrameGenSynthCb cb;
+    frameGenSynthFillCb(cb, RW, RH, S.ow, S.oh, kTan, 0.0f, kDepthB, 10.0f, 0.5f, Deltas(0.0f, 0.0f, 0.0f, 0.0f).d);
+    return runSynth(g, S, cb);
+}
+
+SharpRead case14Sharp(Gpu& g, Scope& sc, bool report) {
+    SharpRead e;
+    char label[260];
+    const auto sine = [](int x) { return 0.5f + 0.4f * std::sin(2.0f * kPi * static_cast<float>(x) / 5.0f); };
+    const auto step = [](int x) { return x < 64 ? 0.1f : 0.9f; };
+    const auto b8 = [](float v) { return std::round(v * 255.0f) / 255.0f; };
+    // Identity: a still scene, at 1:1 and 2:1, and an integer read, return B's texels bit for bit.
+    for (int scale = 1; scale <= 2; ++scale) {
+        const Run r = sharpRun(g, sine, 0.0f, scale);
+        sc.ok(r.ok, "case 14: the synthesizer ran (still)");
+        if (!r.ok) return e;
+        for (int y = 0; y < RH * scale; ++y)
+            for (int x = 0; x < RW * scale; ++x) e.still = std::max(e.still, std::fabs(r.at(x, y, 0, RW * scale) - b8(sine(x / scale))));
+    }
+    std::snprintf(label, sizeof(label), "case 14: a still scene's S is B exactly, at 1:1 and 2:1 output (worst %.3g)", e.still);
+    sc.ok(e.still == 0.0f, label);
+    {
+        const Run r = sharpRun(g, sine, 4.0f);
+        sc.ok(r.ok, "case 14: the synthesizer ran (integer read)");
+        if (!r.ok) return e;
+        float fwd = 0.0f, back = 0.0f;   // S(x) against B(x - 2) and B(x + 2)
+        for (int y = 0; y < RH; ++y)
+            for (int x = 8; x < RW - 8; ++x) {
+                fwd = std::max(fwd, std::fabs(r.at(x, y, 0, RW) - b8(sine(x - 2))));
+                back = std::max(back, std::fabs(r.at(x, y, 0, RW) - b8(sine(x + 2))));
+            }
+        e.shifted = std::min(fwd, back);
+        std::snprintf(label, sizeof(label), "case 14: a read 2 px off returns B's texels exactly (worst %.3g)", e.shifted);
+        sc.ok(e.shifted == 0.0f, label);
+    }
+    {
+        const Run r = sharpRun(g, sine, 0.5f);
+        sc.ok(r.ok, "case 14: the synthesizer ran (quarter-pixel read)");
+        if (!r.ok) return e;
+        double es = 0.0, eb = 0.0;
+        for (int y = 0; y < RH; ++y)
+            for (int x = 8; x < RW - 8; ++x) {
+                const double ls = 2.0 * r.at(x, y, 0, RW) - r.at(x - 1, y, 0, RW) - r.at(x + 1, y, 0, RW);
+                const double lb = 2.0 * b8(sine(x)) - b8(sine(x - 1)) - b8(sine(x + 1));
+                es += ls * ls;
+                eb += lb * lb;
+            }
+        e.energy = static_cast<float>(std::sqrt(es / eb));
+        std::snprintf(label, sizeof(label), "case 14: a 5 px period read a quarter pixel off keeps its high-frequency energy (%.3f of B's; Catmull-Rom 0.965, bilinear 0.861)", e.energy);
+        sc.ok(e.energy >= 0.95f && e.energy <= 1.05f, label);
+    }
+    {
+        const Run r = sharpRun(g, step, 0.6f);
+        sc.ok(r.ok, "case 14: the synthesizer ran (step)");
+        if (!r.ok) return e;
+        e.lo = 1e9f; e.hi = -1e9f;
+        for (int y = 0; y < RH; ++y)
+            for (int x = 0; x < RW; ++x) { e.lo = std::min(e.lo, r.at(x, y, 0, RW)); e.hi = std::max(e.hi, r.at(x, y, 0, RW)); }
+        std::snprintf(label, sizeof(label), "case 14: a step read 0.3 px off rings nowhere outside its two levels (S %.4f to %.4f, B %.4f to %.4f)", e.lo, e.hi, b8(0.1f), b8(0.9f));
+        sc.ok(e.lo >= b8(0.1f) && e.hi <= b8(0.9f), label);
+    }
+    e.ran = true;
+    if (g_verbose && report) std::printf("  case 14: still %.3g, integer read %.3g, energy %.4f, step %.4f..%.4f\n", e.still, e.shifted, e.energy, e.lo, e.hi);
     return e;
 }
 
@@ -1611,7 +1694,8 @@ int run() {
     case4Split(g, sc);
     const Edge edge = case5Edge(g, sc, true);
     case13HullEdge(g, sc, true);
-    if (!alive("cases 1 to 5 and 13")) return 1;
+    case14Sharp(g, sc, true);
+    if (!alive("cases 1 to 5, 13 and 14")) return 1;
     case6Module(g, sc);
     if (!alive("case 6")) return 1;
     case7Check(g, sc);
@@ -1644,7 +1728,7 @@ int run() {
 
     // The mutations: each must break its case.
     struct Mutation { const char* define; const char* what; std::function<void(Scope&)> run; unsigned fails = 0; };
-    Mutation muts[8] = {
+    Mutation muts[10] = {
         {"FG_USE_F", "f ignored (the landing uses f = 1 whatever the block says)", [&](Scope& s) { case2World(g, s); }},
         {"FG_REMOVE_HEAD", "the head turn not taken out of the vector", [&](Scope& s) { case2World(g, s); }},
         // Since the edge pixels move by the vector of the pixel whose depth they took (FG_DILATE_MV), the guard has nothing to move in case 5: it is checked on the
@@ -1655,6 +1739,8 @@ int run() {
         {"FG_TURN_SIGN", "the score's turn applied the wrong way round (the residual transposed)", [&](Scope& s) { case7Check(g, s); }},
         {"FG_DILATE_MV", "an edge pixel moved by its own vector, not the one whose depth it took", [&](Scope& s) { case13HullEdge(g, s, false); }},
         {"FG_SENTINEL", "the rejection sentinel taken as a vector", [&](Scope& s) { case13HullEdge(g, s, false); }},
+        {"FG_SHARP", "S resampled bilinear", [&](Scope& s) { case14Sharp(g, s, false); }},
+        {"FG_SHARP=3", "S's cubic resample without its ringing clamp", [&](Scope& s) { case14Sharp(g, s, false); }},
     };
     for (Mutation& m : muts) {
         ComPtr<ID3D11ComputeShader> mutated[kEntries], saved[kEntries];
@@ -1673,8 +1759,9 @@ int run() {
         if (ms.fails == 0) { ++g_failures; std::printf("FAIL: mutation: %s still passes\n", m.what); }
     }
     // Case 3 reads the head's part the same way as case 2: the head-turn mutation must break it too (a second look, not a second count).
-    std::printf("%s: %u checks, %u failures (mutations: f ignored broke %u checks, head turn not removed broke %u, guard off broke %u, fill from the nearer side broke %u, turn not applied broke %u, turn the wrong way round broke %u, own vector at an edge broke %u, sentinel as a vector broke %u, slot pose ignored broke %u, slot step inverted broke %u)\n",
-                g_failures ? "FAIL" : "PASS", g_checks, g_failures, muts[0].fails, muts[1].fails, muts[2].fails, muts[3].fails, muts[4].fails, muts[5].fails, muts[6].fails, muts[7].fails, poseIgnored, poseInverted);
+    std::printf("%s: %u checks, %u failures (mutations: f ignored broke %u checks, head turn not removed broke %u, guard off broke %u, fill from the nearer side broke %u, turn not applied broke %u, turn the wrong way round broke %u, own vector at an edge broke %u, sentinel as a vector broke %u, bilinear resample broke %u, unclamped cubic broke %u, slot pose ignored broke %u, slot step inverted broke %u)\n",
+                g_failures ? "FAIL" : "PASS", g_checks, g_failures, muts[0].fails, muts[1].fails, muts[2].fails, muts[3].fails, muts[4].fails, muts[5].fails, muts[6].fails, muts[7].fails,
+                muts[8].fails, muts[9].fails, poseIgnored, poseInverted);
     return g_failures ? 1 : 0;
 }
 

@@ -17,7 +17,8 @@
 //                  its read offset, counted as filled and no longer left. The neighbour's read is taken in full precision, as fgSynSrc computed it before the store rounded it
 //                  (synWinnerRead finds the neighbour's source pixel again from the stored offset and recomputes its read), so the fill is the same as when every read was computed
 //                  in one pass; the counters (filled, left, guard, clamped) of the three passes add up in the stats words;
-//   fgSynResample  output size: each output pixel to its S pixel, its read offset, B's output there, bilinear, into the S texture (dlOut's format);
+//   fgSynResample  output size: each output pixel to its S pixel, its read offset, B's output there, Catmull-Rom with its ringing clamped (synSharp, FG_SHARP), into the S
+//                  texture (dlOut's format);
 //   fgSynLuma      quarter grid: S's luma the way the scorer's capture takes it, B's luma and B's class (the f = 1 S is kept for the next real frame);
 //   fgSynScore     quarter grid, on the next real frame C: C's luma against the kept S luma and against B's (the no-warp comparison), binned per class of B as the scorer bins; and again
 //                  against the kept S luma TURNED by the residual head rotation (the compositor's step: C's cell direction rotated into the eye S was built for, projected with the
@@ -33,7 +34,7 @@
 //
 // The key: 0 a hole, 4 the far plane, else (max(asuint(1 / metres), 8) & ~7) | 4 when the pixel is its own nearest | class (1 cockpit, 2 world). A larger key is a nearer surface.
 //
-// The eight #defines at the top of kFrameGenSynthCs are the rig's mutation points (tools\framegen_synth_test replaces one with 0 and the case it guards must fail); production
+// The nine #defines at the top of kFrameGenSynthCs are the rig's mutation points (tools\framegen_synth_test replaces one with 0 and the case it guards must fail); production
 // compiles them all 1.
 #include <cstring>
 #include <string>
@@ -51,6 +52,7 @@ inline constexpr char kFrameGenSynthCs[] = R"HLSL(
 #define FG_SENTINEL 1   // a rejected-history vector (the size * 2 sentinel) borrows its background's (0: taken as motion)
 #define FG_TURN 1        // the score turns S by the residual head rotation (0: it scores it unturned)
 #define FG_TURN_SIGN 1   // the residual is applied the right way round (0: its transpose)
+#define FG_SHARP 1       // S's resample is Catmull-Rom, its ringing clamped to the 2x2 around the read (0: bilinear; the bench's comparisons: 2 Lanczos-2 clamped, 3 Catmull-Rom unclamped, 4 clamped to the 4x4)
 cbuffer P : register(b0) {
     int4   sz;       // render width, height, output width, height
     int4   qz;       // quarter grid width, height
@@ -132,6 +134,57 @@ float4 synBilinear(Texture2D<float4> t, float2 u, int2 size) {
     float4 c01 = t.Load(int3(a.x, b.y, 0));
     float4 c11 = t.Load(int3(b.x, b.y, 0));
     return lerp(lerp(c00, c10, w.x), lerp(c01, c11, w.x), w.y);
+}
+
+// S's resample (fgSynResample): a 4x4 read of B's output at a continuous position, Catmull-Rom (FG_SHARP), the result clamped per channel to the 2x2 texels around the
+// position so an edge does not ring. A bilinear read of an 8-bit source at a sub-pixel position kept about 80% of B's high-frequency energy (the eye dumps of 2026-11-07); the
+// cubic keeps it. A position on a texel centre returns that texel exactly (weights 0, 1, 0, 0). Edges clamped.
+float4 synCatmullW(float t) {
+    return float4(t * (-0.5 + t * (1.0 - 0.5 * t)), 1.0 + t * t * (-2.5 + 1.5 * t), t * (0.5 + t * (2.0 - 1.5 * t)), t * t * (-0.5 + 0.5 * t));
+}
+float synLanczos2(float x) {
+    x = abs(x);
+    if (x < 1e-5) return 1.0;
+    if (x >= 2.0) return 0.0;
+    float px = 3.14159265 * x;
+    return 2.0 * sin(px) * sin(px * 0.5) / (px * px);
+}
+float4 synLanczosW(float t) {
+    if (t == 0.0) return float4(0.0, 1.0, 0.0, 0.0);
+    float4 w = float4(synLanczos2(t + 1.0), synLanczos2(t), synLanczos2(1.0 - t), synLanczos2(2.0 - t));
+    return w / dot(w, float4(1.0, 1.0, 1.0, 1.0));
+}
+float4 synSharp(Texture2D<float4> t, float2 u, int2 size) {
+#if FG_SHARP == 0
+    return synBilinear(t, u, size);
+#else
+    float2 f = u - 0.5;
+    int2 i0 = int2(floor(f));
+    float2 w = f - float2(i0);
+#if FG_SHARP == 2
+    float4 wx = synLanczosW(w.x), wy = synLanczosW(w.y);
+#else
+    float4 wx = synCatmullW(w.x), wy = synCatmullW(w.y);
+#endif
+    int2 hi = size - 1;
+    float4 acc = float4(0.0, 0.0, 0.0, 0.0);
+    float4 lo = float4(1e30, 1e30, 1e30, 1e30), up = -lo;
+    [unroll] for (int y = 0; y < 4; ++y) {
+        int ry = clamp(i0.y - 1 + y, 0, hi.y);
+        float4 row = float4(0.0, 0.0, 0.0, 0.0);
+        [unroll] for (int x = 0; x < 4; ++x) {
+            float4 c = t.Load(int3(clamp(i0.x - 1 + x, 0, hi.x), ry, 0));
+            row += wx[x] * c;
+            if (FG_SHARP == 4 || ((x == 1 || x == 2) && (y == 1 || y == 2))) { lo = min(lo, c); up = max(up, c); }
+        }
+        acc += wy[y] * row;
+    }
+#if FG_SHARP == 3
+    return acc;
+#else
+    return clamp(acc, lo, up);
+#endif
+#endif
 }
 
 uint synBin(float e) {
@@ -464,8 +517,9 @@ void fgSynResample(uint3 id : SV_DispatchThreadID) {
     float2 ci = (float2(id.xy) + 0.5) / scale - 0.5;       // this output pixel's centre in render pixels
     int2 c = clamp(int2(floor(ci + 0.5)), int2(0, 0), int2(sz.x, sz.y) - 1);
     float2 off = synUnpackOffset(ReadT.Load(int3(c.x, c.y, 0)));
-    float2 r = (off.x < kNoRead * 0.5) ? ci : ci + off;       // the read position is the pixel's own plus its offset
-    SOut[id.xy] = synBilinear(Out, (r + 0.5) * scale, int2(sz.z, sz.w));
+    if (off.x < kNoRead * 0.5) off = float2(0.0, 0.0);
+    // The read position is the pixel's own plus its offset, in output pixels: (ci + off + 0.5) * scale, taken from the pixel's own centre so a zero offset lands on it exactly.
+    SOut[id.xy] = synSharp(Out, float2(id.xy) + 0.5 + off * scale, int2(sz.z, sz.w));
 }
 
 )HLSL" R"HLSL(

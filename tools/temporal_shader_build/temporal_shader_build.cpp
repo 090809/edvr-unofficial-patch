@@ -1497,8 +1497,9 @@ static void selfTest() {
               std::string(edvr::kTemporalCsHlsl).find(carry) != std::string::npos &&
               text.find("#define FG_USE_F 1") != std::string::npos && text.find("#define FG_REMOVE_HEAD 1") != std::string::npos &&
               text.find("#define FG_GUARD 1") != std::string::npos && text.find("#define FG_FILL_FAR 1") != std::string::npos &&
-              text.find("#define FG_TURN 1") != std::string::npos && text.find("#define FG_TURN_SIGN 1") != std::string::npos,
-              "the synthesizer's text is the pass's carry region byte for byte, then its own entries, with the rig's six mutation points all on");
+              text.find("#define FG_TURN 1") != std::string::npos && text.find("#define FG_TURN_SIGN 1") != std::string::npos &&
+              text.find("#define FG_SHARP 1") != std::string::npos,
+              "the synthesizer's text is the pass's carry region byte for byte, then its own entries, with the rig's seven checked mutation points all on");
         for (size_t v = 0; v < contracts.size(); ++v) {
             auto& shader = coreFixed[coreLegacy.size() + 65 + v];
             const SynthContract& want = contracts[v];
