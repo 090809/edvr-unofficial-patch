@@ -3139,8 +3139,12 @@ bool g_camHotkeyBound = false;
 uint32_t g_camMode = 0;
 bool g_camHooked = false;
 cc::CamTestTimer g_camTimer;
-bool g_camLookValid = false;           // the room's centre and up were read when the window opened: a ride that starts in the concourse
+bool g_camLookValid = false;           // the room's centre and up were read when the window opened
 bool g_camLookWasOn = false;
+constexpr int kCamLookTickCount = 16;
+int g_camLookTicks = 0;
+uint64_t g_camLookTickMs = 0;
+uint16_t g_camLookTickDt[kCamLookTickCount] = {};
 float g_camLookCentre[3] = {};
 float g_camLookUp[3] = {};
 uint64_t g_camLogMs = 0;               // the last status line (mode 1: once a second; acting: every cc::kCamTestLogMs)
@@ -3329,7 +3333,7 @@ void concoursePoll(uint64_t now) {
         g_camHotkeyText = camKey;
         g_camHotkey->setBinding(camKey.c_str());
         if (g_camHotkey->bound()) {
-            Log::get().note("concourse camera test: hotkey.concourse_camera_test = \"%s\" bound (TEMPORARY, flat only: each press steps off, log only, look; the look acts for %llu ms from the lift gate going on, once per ride, on a ride that starts in the concourse)",
+            Log::get().note("concourse camera test: hotkey.concourse_camera_test = \"%s\" bound (TEMPORARY, flat only: each press steps off, log only, look; the look acts for %llu ms from the anchor's first sighting on a ride up)",
                             camKey.c_str(), static_cast<unsigned long long>(cc::kCamTestMs));
             camTestInstall("bind");
         } else {
@@ -4081,18 +4085,22 @@ void concourseTick(uint64_t now, uint32_t frame) {
     cc::LiftReading liftRead;
     bool liftOn = false;
     // TEMPORARY (the camera test): while its window is open the gate is held (not stepped: the moved camera would drop it, it reads the camera distance to the cabin) and
-    // the lift cull rule is not applied. The window opens on the tick the gate first goes on in a ride, and closes by time, doors, a cut or the conditions ending.
+    // the lift cull rule is not applied. A ride up arms the window, the anchor's first sighting opens it, and it closes by time or the conditions ending.
     if (g_camHotkey && g_camHotkey->pressed()) camTestPress();
     cc::CamTestEnd camEnd = cc::CamTestEnd::kNone;
     const bool camWasActive = g_camTimer.active();
+    const bool camWasArmed = g_camTimer.armed();
     if (armed && effective && onFoot && !sealedNow && g_frameCamValid) {
         liftRead = liftReadNow();
         if (camWasActive) {
-            g_camTimer.step(g_camMode, false, liftRead, cutNow, now, &camEnd);
+            g_camTimer.step(g_camMode, false, anchor, now, &camEnd);
             liftOn = g_camTimer.active() ? false : g_liftGate.step(liftRead, cutNow, now);
         } else {
             liftOn = g_liftGate.step(liftRead, cutNow, now);
-            if (g_camTimer.step(g_camMode, liftOn, liftRead, cutNow, now, &camEnd)) liftOn = false;
+            if (g_camTimer.step(g_camMode, liftOn, anchor, now, &camEnd)) {
+                liftOn = false;
+                g_liftGate.stop();
+            }
         }
     } else {
         g_liftGate.stop();
@@ -4110,10 +4118,19 @@ void concourseTick(uint64_t now, uint32_t frame) {
         lookOn = acting && g_camMode == cc::kCamTestModeLook && g_camLookValid;
         if (lookOn) concourseCameraTestLook(g_camLookCentre, g_camLookUp, cc::camTestLookDir(now - g_camTimer.startMs()));
         concourseCameraTestControl(g_camMode, lookOn);
+        if (g_camTimer.armed() && !camWasArmed)
+            Log::get().note("concourse camera test: armed: a ride up, the lift gate on with no room seen (cabin %.2f m, gaps %.2f %.2f, camera %.2f %.2f %.2f); waiting for the anchor",
+                            static_cast<double>(liftRead.cabinDistM), static_cast<double>(liftRead.gap1), static_cast<double>(liftRead.gap2), static_cast<double>(g_frameCam[0]),
+                            static_cast<double>(g_frameCam[1]), static_cast<double>(g_frameCam[2]));
+        if (camWasArmed && !g_camTimer.armed() && !acting && g_camMode == cc::kCamTestModeLook)
+            Log::get().note("concourse camera test: armed for %llu ms and the anchor was not seen: it lets go", static_cast<unsigned long long>(now - g_camTimer.armedMs()));
         if (acting && !camWasActive) {
-            Log::get().note("concourse camera test: mode %u: the window opens with the lift gate (cabin %.2f m, gaps %.2f %.2f): %llu ms, the gate is held and the lift cull rule is off; %s, centre %.2f %.2f %.2f, up %.3f %.3f %.3f",
-                            g_camMode, static_cast<double>(liftRead.cabinDistM), static_cast<double>(liftRead.gap1), static_cast<double>(liftRead.gap2),
-                            static_cast<unsigned long long>(cc::kCamTestMs), g_camLookValid ? "the look is on" : "NO ANCHOR HERE, nothing is written (a ride that starts in the hangar)",
+            g_camLookTicks = 0;
+            g_camLookTickMs = now;
+            // The doors' reading here is this tick's, with the room's rigs not yet vetoed: it says whether they are still shut at the sighting. The cut's own line gives the time to it.
+            Log::get().note("concourse camera test: mode %u: the window opens %llu ms after arming, at the anchor's first sighting (cabin %.2f m, gaps %.2f %.2f): %llu ms, the gate is held and the lift cull rule is off; %s, centre %.2f %.2f %.2f, up %.3f %.3f %.3f",
+                            g_camMode, static_cast<unsigned long long>(now - g_camTimer.armedMs()), static_cast<double>(liftRead.cabinDistM), static_cast<double>(liftRead.gap1),
+                            static_cast<double>(liftRead.gap2), static_cast<unsigned long long>(cc::kCamTestMs), g_camLookValid ? "the look is on" : "THE ANCHOR COULD NOT BE READ, nothing is written",
                             static_cast<double>(g_camLookCentre[0]), static_cast<double>(g_camLookCentre[1]), static_cast<double>(g_camLookCentre[2]),
                             static_cast<double>(g_camLookUp[0]), static_cast<double>(g_camLookUp[1]), static_cast<double>(g_camLookUp[2]));
             camTestLine("start", g_camMode);
@@ -4129,6 +4146,17 @@ void concourseTick(uint64_t now, uint32_t frame) {
         } else if (!acting && g_camMode == cc::kCamTestModeLog && armed && onFoot && now - g_camLogMs >= 1000) {
             camTestLine("log only", g_camMode);
             g_camLogMs = now;
+        }
+    }
+    // The look's first ticks, ms apart: what a bake of that many frames would have cost here. A stall in them is the game's arrival, or the jump.
+    if (lookOn && g_camLookTicks < kCamLookTickCount) {
+        g_camLookTickDt[g_camLookTicks++] = static_cast<uint16_t>(now - g_camLookTickMs > 60000 ? 60000 : now - g_camLookTickMs);
+        g_camLookTickMs = now;
+        if (g_camLookTicks == kCamLookTickCount) {
+            char dts[kCamLookTickCount * 7] = {};
+            size_t dat = 0;
+            for (int k = 0; k < kCamLookTickCount; ++k) dat += static_cast<size_t>(std::snprintf(dts + dat, sizeof(dts) - dat, "%u ", static_cast<unsigned>(g_camLookTickDt[k])));
+            Log::get().note("concourse camera test: the look's first %d ticks, ms apart: %s", kCamLookTickCount, dts);
         }
     }
     // The rigs are judged afresh both ways: a verdict from the other rule would hold them back up to kRigRefreshN calls, as at the lift's end.

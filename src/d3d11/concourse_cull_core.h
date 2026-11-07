@@ -587,11 +587,13 @@ private:
 };
 
 // ---- The camera test (TEMPORARY, docs\concourse-cull-2026-11-05.md): the look test: what would a bake see from the room's centre, with the room off and the rest on? ---------
-// The look acts for kCamTestMs from the tick the lift gate first goes on in a ride, once per ride, and needs the room's anchor, so only a ride that starts in the concourse has it. The
-// window has its own timer and the gate is not stepped meanwhile (a moved camera would drop it at once: it reads the camera's distance to the cabin). The decision is here so a table can pin it.
+// The flow it has to serve (Sean, 2026-11-07): dock, disembark, ride up, and the stand-in is ready when the doors open. So the look runs on the ride up, from the tick the room's anchor is
+// first seen, which logs put 156 to 188 ms before the cut. The window has its own timer and the gate is not stepped meanwhile (a moved camera would drop it at once: it reads the camera's
+// distance to the cabin). The decision is here so a table can pin it.
 constexpr uint64_t kCamTestDirMs = 800;    // each of the six directions
 constexpr uint32_t kCamTestDirs = 6;       // the heading, a quarter turn three times, straight up, straight down
-constexpr uint64_t kCamTestMs = kCamTestDirMs * kCamTestDirs;   // inside the 6 s from the doors shutting to the cut (Flight 20: 6.02 s both rides)
+constexpr uint64_t kCamTestMs = kCamTestDirMs * kCamTestDirs;   // long enough to see; a bake would need a few frames of it
+constexpr uint64_t kCamTestArmMs = 15000;  // armed this long with no sighting, and it lets go: the doors shut about 6 s before the cut
 constexpr uint64_t kCamTestLogMs = 250;    // the acting lines' spacing
 constexpr uint32_t kCamTestModeOff = 0, kCamTestModeLog = 1, kCamTestModeLook = 2, kCamTestModes = 3;
 inline uint32_t camTestNextMode(uint32_t m) noexcept { return (m + 1) % kCamTestModes; }
@@ -606,29 +608,25 @@ inline uint32_t camTestLookDir(uint64_t elapsedMs) noexcept {
     const uint64_t d = elapsedMs / kCamTestDirMs;
     return d >= kCamTestDirs ? kCamTestDirs - 1 : static_cast<uint32_t>(d);
 }
-enum class CamTestEnd : uint8_t { kNone, kTime, kDoors, kCut, kModeOff };
+enum class CamTestEnd : uint8_t { kNone, kTime, kModeOff };
 inline const char* camTestEndName(CamTestEnd e) noexcept {
     switch (e) {
         case CamTestEnd::kTime: return "time ran out";
-        case CamTestEnd::kDoors: return "the doors moved";
-        case CamTestEnd::kCut: return "a camera cut";
         case CamTestEnd::kModeOff: return "the mode or the cull's conditions ended";
         default: return "none";
     }
 }
 class CamTestTimer {
 public:
-    // One tick. `gateOn`: the lift gate's own answer this tick (read only while the window is not open). `r`: the lift reading this tick. `cut`: the camera cut to
-    // another room. Returns whether the window is open after this tick; `*ended` is set only on the tick it closes.
-    bool step(uint32_t mode, bool gateOn, const LiftReading& r, bool cut, uint64_t nowMs, CamTestEnd* ended) noexcept {
+    // One tick. `gateOn`: the lift gate's own answer this tick (read only while the window is not open). `anchorFresh`: the store has just seen the room's anchor. Returns whether
+    // the window is open after this tick; `*ended` is set only on the tick it closes. A ride up arms it: the gate on with no room seen. The anchor's first sighting then fires it, and
+    // it ends by time or the mode alone: the doors and the cut go on behind it. A ride down never arms it, since the room is already seen when its gate comes on.
+    bool step(uint32_t mode, bool gateOn, bool anchorFresh, uint64_t nowMs, CamTestEnd* ended) noexcept {
         if (ended) *ended = CamTestEnd::kNone;
         const bool acts = mode == kCamTestModeLook;
         if (active_) {
             CamTestEnd why = CamTestEnd::kNone;
             if (!acts) why = CamTestEnd::kModeOff;
-            else if (cut) why = CamTestEnd::kCut;
-            // The camera's own distance to the cabin is not read while the window is open: the test moves the camera, and that distance is what would drop the gate.
-            else if (r.doors && (!(r.gap1 <= kLiftGap1ShutM) || !(r.gap2 <= kLiftGap2ShutM))) why = CamTestEnd::kDoors;
             else if (nowMs - startMs_ >= kCamTestMs) why = CamTestEnd::kTime;
             if (why != CamTestEnd::kNone) {
                 active_ = false;
@@ -636,12 +634,19 @@ public:
             }
             return active_;
         }
-        if (!gateOn) {
-            usedThisRide_ = false;   // the ride is over: the next one may be tested
-        } else if (acts && !usedThisRide_) {
-            active_ = true;
-            usedThisRide_ = true;
-            startMs_ = nowMs;
+        if (!acts) {
+            armed_ = false;
+        } else if (armed_) {
+            if (anchorFresh) {
+                armed_ = false;
+                active_ = true;
+                startMs_ = nowMs;
+            } else if (nowMs - armedMs_ > kCamTestArmMs) {
+                armed_ = false;
+            }
+        } else if (gateOn && !anchorFresh) {
+            armed_ = true;
+            armedMs_ = nowMs;
         }
         return active_;
     }
@@ -649,16 +654,17 @@ public:
     bool stop() noexcept {
         const bool was = active_;
         active_ = false;
-        usedThisRide_ = false;
+        armed_ = false;
         return was;
     }
     bool active() const noexcept { return active_; }
+    bool armed() const noexcept { return armed_; }
     uint64_t startMs() const noexcept { return startMs_; }
-    bool usedThisRide() const noexcept { return usedThisRide_; }
+    uint64_t armedMs() const noexcept { return armedMs_; }
 
 private:
-    bool active_ = false, usedThisRide_ = false;
-    uint64_t startMs_ = 0;
+    bool active_ = false, armed_ = false;
+    uint64_t startMs_ = 0, armedMs_ = 0;
 };
 
 // ---- The backdrop cube (PROTOTYPE on the concourse arc, docs\concourse-cull-2026-11-05.md "The window plan") -----------------------------------------------

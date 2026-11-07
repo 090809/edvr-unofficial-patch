@@ -3871,37 +3871,34 @@ int main(int argc, char** argv) {
             to.stop();
             check(!to.on(), "lift gate: stop is off");
 
-            // The camera test's timer (TEMPORARY): starts with the gate, once per ride, ends by time, doors, cut, leaving the cabin or the mode.
+            // The camera test's timer (TEMPORARY): a ride up arms it, the anchor's first sighting fires it, and it ends by time or the mode, whatever the doors and the cut do.
             {
                 using cc::CamTestEnd;
                 using cc::CamTestTimer;
-                const LiftReading shut = rd(0.9f, 1.49f, 1.37f);
-                const LiftReading open = rd(0.9f, 2.9f, 2.65f);
+                const uint32_t look = cc::kCamTestModeLook;
                 CamTestEnd e = CamTestEnd::kNone;
                 CamTestTimer c;
-                check(!c.step(cc::kCamTestModeOff, true, shut, false, 1000, &e) && !c.step(cc::kCamTestModeLog, true, shut, false, 1033, &e), "camera test: modes off and log only never open the window");
-                check(!c.step(cc::kCamTestModeLook, false, shut, false, 1066, &e) && !c.active(), "camera test: the gate off does not open it");
-                check(c.step(cc::kCamTestModeLook, true, shut, false, 2000, &e) && c.active() && c.startMs() == 2000 && e == CamTestEnd::kNone, "camera test: the gate on in the look opens it, once");
-                check(c.step(cc::kCamTestModeLook, false, shut, false, 2000 + cc::kCamTestMs - 1, &e) && e == CamTestEnd::kNone, "camera test: open just under the limit (the gate's answer is not read)");
-                check(!c.step(cc::kCamTestModeLook, false, shut, false, 2000 + cc::kCamTestMs, &e) && e == CamTestEnd::kTime, "camera test: closes at exactly the limit, for the time");
-                check(!c.step(cc::kCamTestModeLook, true, shut, false, 2000 + cc::kCamTestMs + 100, &e) && e == CamTestEnd::kNone && c.usedThisRide(), "camera test: the gate still on after it: not again in the same ride");
-                check(!c.step(cc::kCamTestModeLook, false, shut, false, 2000 + cc::kCamTestMs + 200, &e) && !c.usedThisRide(), "camera test: the gate off ends the ride");
-                check(c.step(cc::kCamTestModeLook, true, shut, false, 9000, &e) && c.active(), "camera test: the next ride opens it again");
-                check(!c.step(cc::kCamTestModeLook, false, open, false, 9100, &e) && e == CamTestEnd::kDoors, "camera test: the doors moving close it at once");
-                c.stop();
-                c.step(cc::kCamTestModeLook, true, shut, false, 10000, &e);
-                check(!c.step(cc::kCamTestModeLook, false, shut, true, 10100, &e) && e == CamTestEnd::kCut, "camera test: a cut closes it at once");
-                c.stop();
-                c.step(cc::kCamTestModeLook, true, shut, false, 11000, &e);
-                check(c.step(cc::kCamTestModeLook, false, rd(30.0f, 1.49f, 1.37f), false, 11100, &e) && e == CamTestEnd::kNone, "camera test: the camera 30 m from the cabin (it was moved) does not close it");
-                check(c.step(cc::kCamTestModeLook, false, none, false, 11200, &e) && e == CamTestEnd::kNone, "camera test: no cabin reading does not close it");
-                c.stop();
-                c.step(cc::kCamTestModeLook, true, shut, false, 13000, &e);
-                check(c.step(cc::kCamTestModeLook, false, LiftReading{true, 0.9f, false, 9.0f, 9.0f}, false, 13100, &e) && e == CamTestEnd::kNone, "camera test: unknown doors do not close it");
-                check(!c.step(cc::kCamTestModeOff, false, shut, false, 13200, &e) && e == CamTestEnd::kModeOff, "camera test: the mode turned off closes it");
-                check(c.stop() == false && !c.usedThisRide(), "camera test: stop when closed is a no-op and forgets the ride");
+                check(!c.step(cc::kCamTestModeOff, true, false, 1000, &e) && !c.step(cc::kCamTestModeLog, true, false, 1033, &e) && !c.armed(), "camera test: modes off and log only never arm it");
+                check(!c.step(look, false, false, 1066, &e) && !c.armed(), "camera test: no gate: not armed");
+                check(!c.step(look, true, true, 1100, &e) && !c.armed(), "camera test: the gate on with the room already seen is a ride down: not armed");
+                check(!c.step(look, true, false, 2000, &e) && c.armed() && !c.active() && c.armedMs() == 2000, "camera test: the gate on with no room seen is a ride up: armed");
+                check(!c.step(look, false, false, 7000, &e) && c.armed(), "camera test: the gate letting go before arrival keeps it armed");
+                check(c.step(look, false, true, 7800, &e) && c.active() && c.startMs() == 7800 && !c.armed() && e == CamTestEnd::kNone, "camera test: the anchor's first sighting fires it");
+                check(c.step(look, false, false, 7800 + cc::kCamTestMs - 1, &e) && e == CamTestEnd::kNone, "camera test: open just under the limit, with the anchor gone (the look culls it, and the cut forgets it)");
+                check(!c.step(look, false, true, 7800 + cc::kCamTestMs, &e) && e == CamTestEnd::kTime, "camera test: closes at exactly the limit, for the time");
+                check(!c.step(look, true, true, 7800 + cc::kCamTestMs + 100, &e) && !c.armed(), "camera test: a ride down after it does not arm it");
+                check(!c.step(look, true, false, 20000, &e) && c.armed(), "camera test: the next ride up arms it again");
+                check(!c.step(look, false, false, 20000 + cc::kCamTestArmMs + 1, &e) && !c.armed() && !c.active(), "camera test: no sighting in time: it lets go");
+                c.step(look, true, false, 40000, &e);
+                c.step(look, false, true, 41000, &e);
+                check(c.active() && !c.step(cc::kCamTestModeOff, false, true, 41100, &e) && e == CamTestEnd::kModeOff, "camera test: the mode turned off closes it");
+                c.step(look, true, false, 50000, &e);
+                check(c.armed() && !c.step(cc::kCamTestModeLog, false, false, 50100, &e) && !c.armed(), "camera test: the mode moved on: disarmed");
+                c.step(look, true, false, 60000, &e);
+                c.step(look, false, true, 60100, &e);
+                check(c.stop() && !c.active() && !c.armed(), "camera test: stop closes an open window and says so");
+                check(c.stop() == false, "camera test: stop when closed is a no-op");
                 check(cc::camTestNextMode(0) == 1 && cc::camTestNextMode(1) == 2 && cc::camTestNextMode(2) == 0, "camera test: the key steps off, log only, look, off");
-                check(cc::kCamTestMs < 6000, "camera test: the look ends inside the 6 s between the doors shutting and the cut");
                 check(cc::camTestLookDir(0) == 0 && cc::camTestLookDir(cc::kCamTestDirMs - 1) == 0 && cc::camTestLookDir(cc::kCamTestDirMs) == 1 && cc::camTestLookDir(cc::kCamTestMs - 1) == cc::kCamTestDirs - 1 &&
                           cc::camTestLookDir(cc::kCamTestMs * 10) == cc::kCamTestDirs - 1, "camera test: the direction steps, and stays on the last past the end");
                 {
@@ -3919,7 +3916,7 @@ int main(int argc, char** argv) {
                 }
                 {
                     CamTestTimer past;
-                    check(!past.step(cc::kCamTestModes, true, shut, false, 20000, &e) && !past.active(), "camera test: a mode past the last does not open the window");
+                    check(!past.step(cc::kCamTestModes, true, false, 20000, &e) && !past.active() && !past.armed(), "camera test: a mode past the last does not arm it");
                     check(std::strcmp(cc::camTestModeName(2), "look from the room's centre") == 0 &&
                               std::strcmp(cc::camTestModeName(1), "log only") == 0 && std::strcmp(cc::camTestModeName(0), "off") == 0,
                           "camera test: the toast names the mode");
