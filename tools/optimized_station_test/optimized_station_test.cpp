@@ -127,6 +127,46 @@ int main(int argc, char** argv) {
         check(!se::sunStep(si, &sun, &why) && !sun.off, "v14.23 surface: the sun stays on at the outpost surface (r0 0)");
     }
     {
+        // A port on a planet: its pad descends like a station's (r0 3, then r0 1 and r1 1 at a CraterOutpost, Flight 34), and the sun stays on for all of it, the concourse's bay window included.
+        namespace js = edvr::journal_station;
+        se::SunInputs si;
+        si.setting = true;
+        si.docked = true;
+        si.ownKnown = true;
+        si.r0Fresh = true;
+        si.r0 = 3;
+        si.r1Fresh = true;
+        si.inHangar = true;
+        si.relOk = true;
+        si.rel = -6.0f;
+        const char* why = "";
+        se::SunState orbital;
+        check(se::sunStep(si, &orbital, &why) && orbital.off, "surface port: the same pad at an orbital station turns the sun off");
+        si.surfacePort = true;
+        se::SunState surface;
+        check(!se::sunStep(si, &surface, &why) && !surface.off, "surface port: the pad descending does not turn the sun off");
+        si.r0 = 1;
+        check(!se::sunStep(si, &surface, &why) && !surface.off, "surface port: nor the pad locked in");
+        // What the journal says may arrive after the pad has moved: then it comes back on, once, with a reason.
+        se::SunState late;
+        late.off = true;
+        check(se::sunStep(si, &late, &why) && !late.off && why[0] != '\0', "surface port: a sun already off comes back on and says why");
+        check(!se::sunStep(si, &late, &why) && !late.off, "surface port: and says it once");
+
+        const uint32_t kOrbitalFlags = 0x00000005u, kOrbitalFlags2 = 0x00014009u;   // on foot, an Orbis, Flight 34
+        const uint32_t kSurfaceFlags = 0x00200005u, kSurfaceFlags2 = 0x00014011u;   // on foot, a CraterOutpost, Flight 34
+        for (js::Kind k : {js::Kind::kCraterPort, js::Kind::kCraterOutpost, js::Kind::kSurfaceStation, js::Kind::kOnFootSettlement})
+            check(js::atSurfacePort(k, 0, 0), "surface port: the type alone says so");
+        for (js::Kind k : {js::Kind::kCoriolis, js::Kind::kOrbis, js::Kind::kOcellus, js::Kind::kOutpost, js::Kind::kAsteroidBase, js::Kind::kFleetCarrier, js::Kind::kMegaShip})
+            check(!js::atSurfacePort(k, kSurfaceFlags, kSurfaceFlags2), "surface port: a type in space wins over a latitude");
+        check(js::atSurfacePort(js::Kind::kUnknown, kSurfaceFlags, kSurfaceFlags2), "surface port: a Disembark on a planet names no station, and Status says it");
+        check(js::atSurfacePort(js::Kind::kUnknown, 0x0121000Du, 0), "surface port: docked in the ship, a latitude says it");
+        check(js::atSurfacePort(js::Kind::kUnknown, 0, kSurfaceFlags2), "surface port: on foot on a planet says it");
+        check(!js::atSurfacePort(js::Kind::kUnknown, kOrbitalFlags, kOrbitalFlags2), "surface port: an orbital station with no type is not one");
+        check(!js::atSurfacePort(js::Kind::kUnknown, 0, 0), "surface port: nothing known is not one");
+        check(!js::atSurfacePort(js::Kind::kOther, kOrbitalFlags, kOrbitalFlags2) && js::atSurfacePort(js::Kind::kOther, kSurfaceFlags, kSurfaceFlags2), "surface port: a type not listed goes by Status");
+    }
+    {
         // A descent: r0 3 (the descent has started) turns the sun off; the pad is not yet in the bay, so no seal.
         se::SunState sun;
         se::SunInputs si;

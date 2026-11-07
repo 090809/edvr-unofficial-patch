@@ -63,6 +63,29 @@ inline uint64_t hashName(const char* p, size_t n) noexcept {
     return h != 0 ? h : 1;
 }
 
+// Whether the commander is at a port on a planet's surface. The type says it where the journal has given one. A Disembark on a planet names no station, and neither does a load on foot, so
+// with no type Status.json says: Flags bit 21 (a latitude and longitude: near a body) and Flags2 bit 4 (on foot on a planet), as a docked, on-foot commander at a CraterOutpost shows
+// (0x00200005, 0x00014011; at an Orbis 0x00000005, 0x00014009). A type comes first because a station in a low orbit may have a latitude too.
+inline bool atSurfacePort(Kind k, uint32_t flags, uint32_t flags2) noexcept {
+    switch (k) {
+        case Kind::kCraterPort:
+        case Kind::kCraterOutpost:
+        case Kind::kSurfaceStation:
+        case Kind::kOnFootSettlement:
+            return true;
+        case Kind::kCoriolis:
+        case Kind::kOrbis:
+        case Kind::kOcellus:
+        case Kind::kOutpost:
+        case Kind::kAsteroidBase:
+        case Kind::kFleetCarrier:
+        case Kind::kMegaShip:
+            return false;
+        default:
+            return (flags & (1u << 21)) != 0 || (flags2 & (1u << 4)) != 0;
+    }
+}
+
 struct Saved {
     uint64_t nameHash = 0;
     Kind kind = Kind::kUnknown;

@@ -1740,9 +1740,11 @@ inline size_t selectMechanism(const LatchCand* cands, size_t n, uintptr_t ownAdd
 
 // Built v14.23: the sun inside the hangar, from the game's pad state. The skip is off while the own pad's latest r0 is 1 (moving in) or 3 (the descent),
 // read fresh. It comes back on when the pad is out (not r1 1 fresh), r0 is neither 1 nor 3 (or stale), and the pad is raised (the geometric test),
-// or on undock, setting off, or a hangar change. An outpost surface (r0 0) never turns it off.
+// or on undock, setting off, or a hangar change. An outpost surface (r0 0) never turns it off, and nor does any port on a planet (`surfacePort`), whatever its pad does: a surface
+// installation's pad descends too (r0 3, r1 1 at a CraterOutpost), and then the skip held the sun off through the concourse and its bay window (Flight 34).
 struct SunInputs {
     bool setting = false;
+    bool surfacePort = false;    // journal_station::atSurfacePort
     bool docked = false;
     bool ownKnown = false;       // the game has named the own pad this dock
     bool r0Fresh = false;        // the own pad's r0 was called within kPadStateFreshMs
@@ -1761,6 +1763,12 @@ struct SunState {
 // Returns true when the skip changed. *why names the change for the state line.
 inline bool sunStep(const SunInputs& in, SunState* st, const char** why) noexcept {
     *why = "";
+    if (in.surfacePort) {
+        if (!st->off) return false;
+        st->off = false;
+        *why = "a port on a planet's surface";
+        return true;
+    }
     const bool moving = in.ownKnown && in.r0Fresh && (in.r0 == kReaderMoving || in.r0 == kReaderDescent);
     if (!st->off) {
         if (in.setting && in.docked && moving) {

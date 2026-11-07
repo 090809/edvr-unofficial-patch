@@ -277,6 +277,7 @@ int g_camLookGraceTicks = 0;                  // TEMPORARY: ticks after the look
 bool g_camLookSurvey = false;                 // TEMPORARY: the names survey was taken in the look: its report lists what is near the room's centre and still kept
 std::atomic<bool> g_liftGateOn{false};       // the tick's: the lift gate is on, the player is in a shut lift cabin (published in the snapshot as `lift`; part of g_concActive)
 std::atomic<bool> g_concSurveyArmed{false};   // the one-shot names are being gathered: the rig and producer vetoes forward so the store judges and names every record
+std::atomic<bool> g_concNamesOnly{false};     // TEMPORARY: an F3 with the cull off is gathering names: the store only reads each record (concourseNamesOnlyRecord)
 bool g_roomCutPending = false;   // the camera stepped over kRoomCutM this tick (resolveTickView); the concourse tick takes it, under the state lock
 float g_roomCutM = 0.0f;
 // TEMPORARY (the walk survey, below): the tick's. g_walkPassArmed is published to the callbacks in the snapshot (walkOn) with a copy of the pick cell.
@@ -2835,6 +2836,7 @@ struct SurveyAgg {
     uint32_t kept = 0, culled = 0, smallClose = 0, unreadSphere = 0;
     float radiusMax = 0.0f;
     float nearest = -1.0f;   // the smallest distance of a record with a readable sphere; negative when none
+    float nearestAt[3] = {};   // that record from the camera, in world axes (the survey with the cull off asks for it)
     float cRadiusMax = 0.0f;   // the largest radius, and the smallest distance, among the culled records of the name
     float cNearest = -1.0f;
 };
@@ -2870,13 +2872,16 @@ void concourseSurveyUnnamed(cc::Judge j, float dist, float radius) noexcept {
     }
 }
 
-void concourseSurveyNote(const char* name, cc::Judge j, float dist, float radius) noexcept {
+void concourseSurveyNote(const char* name, cc::Judge j, float dist, float radius, const float* at = nullptr) noexcept {
     try {
         Survey& sv = survey();
         std::lock_guard<std::mutex> lock(sv.m);
         SurveyAgg& a = sv.names[name];
         if (radius > a.radiusMax) a.radiusMax = radius;
-        if (radius > 0.0f && std::isfinite(dist) && (a.nearest < 0.0f || dist < a.nearest)) a.nearest = dist;
+        if (radius > 0.0f && std::isfinite(dist) && (a.nearest < 0.0f || dist < a.nearest)) {
+            a.nearest = dist;
+            if (at) std::memcpy(a.nearestAt, at, sizeof(a.nearestAt));
+        }
         switch (j) {
             case cc::Judge::kKeepName: ++a.kept; break;
             case cc::Judge::kKeepSmallClose: ++a.smallClose; break;
@@ -2953,6 +2958,29 @@ void afterStoreConcourse(uintptr_t bucket, uintptr_t record) noexcept {
     }
 }
 
+// TEMPORARY: one record of the survey an F3 asks for with the cull off. It reads and notes, and changes nothing: no gather, no rig note, no clear. The judge says what the keep list would do.
+void concourseNamesOnlyRecord(uintptr_t record) noexcept {
+    if (!record) return;
+    SnapshotPin pin;
+    const PadSnapshot& s = pin.get();
+    uintptr_t node = 0;
+    const NodeInfo ni = nodeInfoOf(record, &node);
+    const WorldRead wr = worldOfRecord(record);
+    const bool sphere = s.camValid && wr.source != 4 && std::isfinite(wr.radius) && wr.radius > 0.0f && std::isfinite(wr.world[0]) && std::isfinite(wr.world[1]) &&
+                        std::isfinite(wr.world[2]);
+    const bool nameReadable = ni.cls != sealed::NameClass::kUnnamed && ni.cls != sealed::NameClass::kNone;
+    const float d = sphere ? sealed::distance(wr.world, s.cam) : 0.0f;
+    const cc::Judge j = cc::concourseJudge(nameReadable, (ni.flags & sealed::kNodeConcourseAllow) != 0, sphere, d, sphere ? wr.radius : 0.0f,
+                                           (ni.flags & sealed::kNodeConcourseFarExempt) != 0, false, false);
+    if (nameReadable) {
+        char nm[64] = {};
+        const float at[3] = {wr.world[0] - s.cam[0], wr.world[1] - s.cam[1], wr.world[2] - s.cam[2]};
+        if (cachedNameOfNode(node, nm, sizeof(nm), &ni.validator)) concourseSurveyNote(nm, j, d, sphere ? wr.radius : 0.0f, at);
+    } else if (sphere) {
+        concourseSurveyUnnamed(j, d, wr.radius);
+    }
+}
+
 }  // namespace
 
 // ---- The engine's entry points (declared in optimized_station.h) -------------------------------------------------------------------------
@@ -2972,7 +3000,8 @@ void optimizedStationInstall(bool flatProfile) {
 bool optimizedStationOn() noexcept { return g_setting.load(std::memory_order_acquire); }
 bool optimizedStationGathers() noexcept {
     // Built 2026-11-05: also while the concourse cull is wanted (on foot in social space, the key on): the store gate opens so the anchor can be seen.
-    return g_setting.load(std::memory_order_acquire) && (g_dockedNow.load(std::memory_order_acquire) || g_concWanted.load(std::memory_order_acquire));
+    return g_setting.load(std::memory_order_acquire) &&
+           (g_dockedNow.load(std::memory_order_acquire) || g_concWanted.load(std::memory_order_acquire) || g_concNamesOnly.load(std::memory_order_relaxed));
 }
 bool optimizedStationSealed() noexcept { return g_sealedFlag.load(std::memory_order_acquire); }
 
@@ -2990,6 +3019,7 @@ void optimizedStationNoteSunDraw(SunDrawPath path) noexcept {
 // The store calls this after it has written a record (bucket = the collection, record = its record). While sealed it judges the record; while
 // docked and unsealed it only gathers the frame's pads, explicit parts and camera for the seal trigger (built v14.1).
 void afterStoreDispatch(uintptr_t bucket, uintptr_t record) noexcept {
+    if (g_concNamesOnly.load(std::memory_order_relaxed)) concourseNamesOnlyRecord(record);
     // Built 2026-11-06: docked with the cull wanted but not active (on foot in the hangar) takes the seal's gather path (the pad's gathers; afterStoreJudge also
     // sights the anchor); the concourse path is for the cull active, or not docked (a taxi arrival).
     const bool docked = g_dockedNow.load(std::memory_order_acquire);
@@ -3184,6 +3214,8 @@ uint64_t g_concSurveyDueMs = 0;    // 0: none due
 bool g_concSurveyOn = false;
 bool g_concSurveyList = false;     // the running survey lists the culled names
 uint32_t g_concSurveyStamp = 0;
+bool g_concNamesOnlyOn = false;    // TEMPORARY: the tick's side of g_concNamesOnly
+uint32_t g_concNamesOnlyStamp = 0;
 uint64_t g_concTraceMs = 0;
 uint32_t g_concTraceReason = 0;
 uint64_t g_concTraceReasonMs = 0;
@@ -3491,6 +3523,8 @@ void concourseSettingOffTick(uint64_t now) {
     g_concActive.store(false, std::memory_order_release);
     g_concSurveyArmed.store(false, std::memory_order_release);
     g_concSurveyOn = false;
+    g_concNamesOnly.store(false, std::memory_order_release);
+    g_concNamesOnlyOn = false;
     g_concWasActive = false;
     g_concWaitSet = false;
     g_concWasWant = false;
@@ -3505,14 +3539,19 @@ void concourseSettingOffTick(uint64_t now) {
 }
 
 // The names survey's report (the tick, once, after its two frames).
-void concourseSurveyReport(bool listCulled) {
+void concourseSurveyReport(bool listCulled, bool everything = false) {
     struct Row {
         std::string name;
         uint32_t n = 0;
         float r = 0.0f;
         float nearest = -1.0f;
     };
+    struct WholeRow {
+        std::string name;
+        SurveyAgg a;
+    };
     std::vector<Row> kept, culled, smallClose, unreadSphere;
+    std::vector<WholeRow> whole;
     std::vector<SurveyClose> close, unnamed;
     try {
         Survey& sv = survey();
@@ -3521,6 +3560,7 @@ void concourseSurveyReport(bool listCulled) {
         sv.unnamed.clear();
         for (const auto& kv : sv.names) {
             const SurveyAgg& a = kv.second;
+            if (everything) whole.push_back({kv.first, a});
             if (a.kept) kept.push_back({kv.first, a.kept, a.radiusMax, a.nearest});
             if (a.culled) culled.push_back({kv.first, a.culled, a.cRadiusMax, a.cNearest});
             if (a.smallClose) smallClose.push_back({kv.first, a.smallClose, a.radiusMax});
@@ -3551,6 +3591,31 @@ void concourseSurveyReport(bool listCulled) {
             ++listed;
         }
         g_camLookSurvey = false;
+    }
+    if (everything) {
+        // TEMPORARY: F3 with the cull off, at a layout the cull has not run at: every name, the nearest first, and where its nearest record is. The positions are world axes from the camera,
+        // so two presses in different places give the room's shape, the camera's own move between them, and which way each thing lies.
+        Log::get().note("concourse names: that was F3 with the cull off, so nothing was culled: name, close and culled say what the keep list would do. Type %s, camera %.1f %.1f %.1f (known %d), %u names",
+                        journal_station::kindName(journalStationKind()), static_cast<double>(g_frameCam[0]), static_cast<double>(g_frameCam[1]), static_cast<double>(g_frameCam[2]),
+                        g_frameCamValid ? 1 : 0, static_cast<unsigned>(whole.size()));
+        std::sort(whole.begin(), whole.end(), [](const WholeRow& a, const WholeRow& b) {
+            const bool ar = a.a.nearest >= 0.0f, br = b.a.nearest >= 0.0f;
+            if (ar != br) return ar;
+            if (a.a.nearest != b.a.nearest) return a.a.nearest < b.a.nearest;
+            return a.name < b.name;
+        });
+        for (size_t i = 0; i < whole.size() && i < 600; ++i) {
+            const SurveyAgg& a = whole[i].a;
+            Log::get().note("concourse names: all %s name=%u close=%u culled=%u r=%.1f nearest=%.1f at %.1f %.1f %.1f", whole[i].name.c_str(), a.kept, a.smallClose + a.unreadSphere, a.culled,
+                            static_cast<double>(a.radiusMax), static_cast<double>(a.nearest), static_cast<double>(a.nearestAt[0]), static_cast<double>(a.nearestAt[1]),
+                            static_cast<double>(a.nearestAt[2]));
+        }
+        if (whole.size() > 600) Log::get().note("concourse names: %u more names not listed", static_cast<unsigned>(whole.size() - 600));
+        std::sort(unnamed.begin(), unnamed.end(), [](const SurveyClose& a, const SurveyClose& b) { return a.radius > b.radius; });
+        Log::get().note("concourse names: %u records with no readable name and a readable sphere", static_cast<unsigned>(unnamed.size()));
+        for (size_t i = 0; i < unnamed.size() && i < 24; ++i)
+            Log::get().note("concourse names: unnamed %s r=%.1f dist=%.1f", unnamed[i].name, static_cast<double>(unnamed[i].radius), static_cast<double>(unnamed[i].dist));
+        return;
     }
     for (size_t i = 0; i < kept.size() && i < 80; ++i)
         Log::get().note("concourse names: kept %s x%u r=%.1f nearest=%.1f", kept[i].name.c_str(), kept[i].n, static_cast<double>(kept[i].r),
@@ -4478,9 +4543,30 @@ void concourseTick(uint64_t now, uint32_t frame) {
     g_concWasArmed = armed;
     // The one-shot names: due at an engage (or 2 s after a toggle-on that did not re-engage), gathered over 2 frames.
     const uint32_t stamp = g_frameStamp.load(std::memory_order_relaxed);
-    if (concoursePaneTakeSurveyRequest() && active && !g_concSurveyOn) {   // an F3 press: name what is left in view, and list what is culled
+    const bool surveyPress = concoursePaneTakeSurveyRequest();
+    if (surveyPress && active && !g_concSurveyOn) {   // an F3 press: name what is left in view, and list what is culled
         g_concSurveyDueMs = now;
         g_concSurveyListPending = true;
+    }
+    // TEMPORARY: an F3 press with the cull off, on foot in social space: every record's name over 2 frames. The survey above needs the cull active, and that needs the anchor's name, so a layout
+    // the cull has never run at (a surface port) would otherwise say nothing about what its records are called. No veto is running, so the store sees every record as it is.
+    if (surveyPress && !active && social && !g_concNamesOnlyOn) {
+        try {
+            Survey& sv = survey();
+            std::lock_guard<std::mutex> lock(sv.m);
+            sv.names.clear();
+            sv.close.clear();
+            sv.unnamed.clear();
+        } catch (...) {
+        }
+        g_concNamesOnlyOn = true;
+        g_concNamesOnlyStamp = stamp;
+        g_concNamesOnly.store(true, std::memory_order_release);
+        Log::get().note("concourse names: F3 with the cull off: reading every record's name for 2 frames; nothing is culled");
+    } else if (g_concNamesOnlyOn && static_cast<uint32_t>(stamp - g_concNamesOnlyStamp) >= 2) {
+        g_concNamesOnly.store(false, std::memory_order_release);
+        g_concNamesOnlyOn = false;
+        concourseSurveyReport(true, true);
     }
     if (!active) {
         if (g_concSurveyOn) {
@@ -4789,7 +4875,16 @@ void optimizedStationFrameBody(uint32_t frame) {
     {
         sealed::SunInputs su;
         su.setting = g_setting.load(std::memory_order_acquire);
+        su.surfacePort = journal_station::atSurfacePort(journalStationKind(), g_statusFlagsNow, g_statusFlags2Now);
         su.docked = g_dockedNow.load(std::memory_order_acquire);
+        {   // One line a dock, so a flight says which rule a port was under: no such line at a surface port means the sun was still on the pad's rule.
+            static bool saidSurface = false;
+            if (!su.docked) saidSurface = false;
+            else if (su.surfacePort && !saidSurface) {
+                saidSurface = true;
+                Log::get().note("optimized station: a port on a planet's surface (type %s, Status flags 0x%08X 0x%08X): the sun stays on", journal_station::kindName(journalStationKind()), g_statusFlagsNow, g_statusFlags2Now);
+            }
+        }
         su.ownKnown = g_game.ownKnown;
         su.r0Fresh = g_game.r0Fresh;
         su.r0 = static_cast<uint8_t>(g_game.r0 < 0 ? 0 : g_game.r0);
