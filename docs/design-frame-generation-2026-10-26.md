@@ -52,7 +52,8 @@
 - **Next: fly the flight 11 fix** (the game's frame sequences skip the S slots;
   `frame generation lock: replayed B:` names each replay). Lock 2:1 flown once.
   Built, not flown: S's edges in a ship turn (sentinel vectors, dilated vectors);
-  S resampled Catmull-Rom (`FG_SHARP`, 0.82 -> 0.94); hole fill along the motion (`FG_FILL_REPROJ`).
+  S resampled Catmull-Rom (`FG_SHARP`, 0.82 -> 0.94); hole fill along the motion (`FG_FILL_REPROJ`);
+  `fgSynSrc`'s tie deterministic (2026-11-08: second time pass, the passes near their bounds).
   H1, H8, H9 and the surface classifier are still unbuilt; on foot unflown.
 - **Temporary keys (hidden):** `fix.frame_generation_shadow` (off | on), and
   `fix.frame_generation` (off | on; built 2.3: `on` forces Lock, for A/B
@@ -1470,6 +1471,58 @@ further into its source; each row picked a different neighbour.
   ship turn continues the terrain, the same in every S; the synth line's
   `fill_stretch` 40-60% of the filled.
 
+### 2026-11-08: Phase 2.3, second time and VRAM pass (bench and replays, no flight)
+
+RTX 5080, `framegen_synth_bench --bench --frame` on 230157175005:2 (hull turn),
+225515258002:4 and 222433569001:4, three runs of 300 each; ms per eye, the
+shown f = 0.5 S, median (p95 within 0.006 of it), in that order of captures. Run-to-run spread of a pass
+median 0.000-0.005 (holes), of the total up to 0.011.
+
+| Pass | before (87014896^) | after (87014896) |
+|---|---|---|
+| clear | 0.016 | 0.016 |
+| splat | 0.103 / 0.107 / 0.106 | 0.108 / 0.111 / 0.109 |
+| src | 0.135 / 0.151 / 0.152 | 0.132 / 0.136 / 0.144 |
+| resolve | 0.053 / 0.054 / 0.053 | 0.055 / 0.055 / 0.055 |
+| holes | 0.098 / 0.066 / 0.086 | 0.104 / 0.067 / 0.087 |
+| resample | 0.162 / 0.169 / 0.169 | 0.161 / 0.169 / 0.168 |
+| total | 0.568 / 0.566 / 0.584 | 0.577 / 0.552 / 0.580 |
+
+- **Accepted, `fgSynSrc`'s tie (87014896):** two sources tying for an S pixel
+  both wrote and the last stood, so S at ties (0.022% of S pixels between two
+  runs of a replay) and the guard counter varied (rig case 5 failed about 1
+  run in 8). The splat now sets the read offsets to all ones and `fgSynSrc`
+  offers with InterlockedMin; the guard mark moved to the y half's exponent
+  with the sign bit, so a tie keeps the unguarded read. Cost-neutral (above).
+  Two replay runs now give byte-identical S and scores; rig 30 of 30. Against
+  the racy build 0.14% of the f = 0.5 S pixels differ; class means and p95
+  unchanged in median (one turned world p95 4 lower), hole error unchanged
+  (median 32.62 milli-luma), guard 0.30 -> 0.27%, S/B sharpness outside the
+  holes median -0.0005 (worst 222433569001, 0.9154 -> 0.9103): a guarded read
+  copies a whole texel, and the race kept more of them. Preferring the guarded
+  read instead fails rig case 6 (a still scene's edges move a pixel).
+- ruled out: a 16x16 groupshared tile for the resample's 4x4 reads (resample
+  0.169 -> 0.277), because the pass is bound by DRAM traffic (about 125 MB in
+  0.16 ms: B's output, S, the read offsets), not by texture loads; two output
+  pixels a thread sharing a 4x5 window gained 0.000-0.010 (within the spread);
+  16x4, 32x2 and 4x16 groups lost 0.002-0.016.
+- ruled out: a 10x10 groupshared depth tile for the splat's and the source's
+  3x3 (splat +0.001-0.005, src 0.135 -> 0.143 on 230157175005), because the
+  3x3 reads hit the cache.
+- ruled out: the resolve folded into the source pass (the holes listed there,
+  the guard counted in the resample or from InterlockedMin's returned value),
+  because the source pass grew 0.03-0.04 and the resample 0.02 (it reads the
+  offsets the resolve left in L2): totals -0.011 at best, +0.05 with the
+  returning atomics.
+- ruled out: eight threads a hole in `fgSynHoles` (the 17x17 search, the ring,
+  the winner's 16 candidates and the stretch's steps split and reduced in
+  order), because the pass went 0.104 -> 0.125: it is bound by its loads, not
+  by one thread's chain.
+- **VRAM:** unchanged, 157.7 MiB for two eyes and the scratch (per eye s 46.8,
+  luma 0.8, class 3.3 MiB; shared key 26.3, read 26.3, holes 3.3 MiB).
+- **Not attempted:** RCAS and the UI composite in one pass on S (the
+  finishing, 0.16-0.20 ms in game): it needs B's sharpener's HLSL inside the
+  synth's text and has no bench; it is measurable only in a flight.
 ### 2026-11-07: Phase 2.3, flight 11, the first Lock flight (same build)
 
 `fix.frame_generation = on`, about 12 minutes. Pilot: "a slight flicker",
