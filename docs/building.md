@@ -211,24 +211,61 @@ Write and review release notes before creating the draft. Generate the Thanks
 section from the previous tag, then write each contributor's sentence by hand.
 Only merged PR authors are named, plus anyone the maintainer approved by name
 in `tools/release_credits_approved.json` for a commit in the release. Issue and
-log reporters get the tool's general line. Review the final notes file, then
-attach the three verified ZIPs and `SHA256SUMS` to a draft release:
+log reporters get the tool's general line. Review the final notes file.
+
+Besides the three ZIPs, the package artifact carries the split assets the
+launcher updates from: `ed-up-core-<version>.zip`, an `ed-up-dlss-<hash>.zip`
+and an `ed-up-xess-<hash>.zip` when the build has those runtimes,
+`ed-up-launcher.exe` when the build has one, and `ed-up-manifest.json`, which
+names them all with their hashes. `SHA256SUMS` lists every one of them. The
+workflow never signs. Sign the manifest in your own terminal, because
+`sign_manifest.py` refuses to run anywhere else, and it reads the private key
+from a hidden prompt or, with `--key-stdin`, from one line on stdin so your
+password manager's command line can supply it. The key is never kept in a
+repository or in a session. The signing tool only signs with a key whose public
+half is listed in `src/installer/update_keys.h`. Check the folder before
+attaching anything; the check exits 0 only when the signature, the schema and
+the size and hash of every asset and every file inside the zips all pass:
+
+```powershell
+python tools/sign_manifest.py sign "edvr-artifacts/$runId/ed-up-manifest.json"
+if ($LASTEXITCODE -ne 0) { throw 'Signing the manifest failed' }
+python tools/sign_manifest.py verify "edvr-artifacts/$runId"
+if ($LASTEXITCODE -ne 0) { throw 'The signed release folder did not verify' }
+```
+
+Then attach the three verified ZIPs, the split assets, the manifest with its
+`.sig`, and `SHA256SUMS` to a draft release. A release with no `.sig` is simply
+not offered to the launcher as an update:
 
 ```powershell
 python tools/release_credits.py --from vPREVIOUS --to "v$version" --thanks --out thanks.md
 if ($LASTEXITCODE -ne 0) { throw 'Review release credits before continuing' }
 # Edit release-notes.md and include the reviewed ## Thanks section from thanks.md.
+$folder = "edvr-artifacts/$runId"
 $assets = @(
-    "edvr-artifacts/$runId/ed-up-$version.zip"
-    "edvr-artifacts/$runId/ed-up-installer-$version.zip"
-    "edvr-artifacts/$runId/ed-up-installer-linux-$version.zip"
-    "edvr-artifacts/$runId/SHA256SUMS"
+    "$folder/ed-up-$version.zip"
+    "$folder/ed-up-installer-$version.zip"
+    "$folder/ed-up-installer-linux-$version.zip"
+    "$folder/ed-up-manifest.json"
+    "$folder/ed-up-manifest.json.sig"
+    "$folder/SHA256SUMS"
 )
+$assets += Get-ChildItem "$folder/ed-up-core-$version.zip", "$folder/ed-up-dlss-*.zip", "$folder/ed-up-xess-*.zip", "$folder/ed-up-launcher.exe" -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName }
 gh release create "v$version" @assets --draft --verify-tag --title "ED Unofficial Patch $version" --notes-file release-notes.md
 if ($LASTEXITCODE -ne 0) { throw 'Draft release creation failed' }
 ```
 
 For a prerelease tag, add `--prerelease` to `gh release create` as well.
+
+On native Windows, where `package.bat <version>` packages the release without
+Actions, the same assets land in `dist\`. `package.bat` prints the signing
+command when it finishes. Run `python tools\sign_manifest.py sign
+dist\ed-up-manifest.json` and then `python tools\sign_manifest.py verify dist`,
+and attach the files from `dist\` the same way. `package_native.py` writes the
+split zips with fixed timestamps and file order, so packaging twice gives the
+same bytes, and it removes older `ed-up-dlss-*.zip` and `ed-up-xess-*.zip` from
+`dist\` when a runtime's contents change.
 
 The draft is the review point before publication. A failed build has no package
 artifact and should never be used for a release.

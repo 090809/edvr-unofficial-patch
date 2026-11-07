@@ -89,13 +89,72 @@ New assets, added beside today's:
 
 | Asset | Holds | Fetched |
 |---|---|---|
-| `edvr-launcher.exe` | The launcher, no embedded payload | When its digest changes |
-| `edvr-manifest.json`, `.sig` | Per-file hashes, asset names, minimum launcher version | Every check |
-| `edvr-core-<ver>.zip` | `d3d11.dll`, `openvr_api.dll`, loader, inis, descriptor | Every update |
-| `edvr-dlss-<hash>.zip`, `edvr-xess-<hash>.zip` | The DLSS and XeSS files | Only when their hash changes |
+| `ed-up-launcher.exe` | The launcher, no embedded payload | When its digest changes |
+| `ed-up-manifest.json`, `ed-up-manifest.json.sig` | Per-file hashes, asset names, minimum launcher version | Every check |
+| `ed-up-core-<ver>.zip` | `d3d11.dll`, `openvr_api.dll`, loader, inis, descriptor | Every update |
+| `ed-up-dlss-<hash>.zip`, `ed-up-xess-<hash>.zip` | The DLSS and XeSS files | Only when their hash changes |
 
 Today no asset is a DLL zip. The installer ZIP is 97 MB and the full ZIP 194 MB,
 and DLSS and XeSS are 130 MB of the 164 MB installer exe.
+
+The maintainer chose these names on 2026-11-07. `%LOCALAPPDATA%\EDVR` keeps its name
+under the rename rule above.
+
+### The manifest
+
+The manifest is ASCII JSON, signed as exact bytes. The launcher checks the signature
+before it parses anything.
+
+```json
+{
+  "schema": 1,
+  "version": "0.22.0",
+  "build": "v0.22.0",
+  "tag": "v0.22.0",
+  "issued": 1794000000,
+  "min_launcher": "0.1.0",
+  "launcher": {"version": "0.1.0", "asset": "ed-up-launcher.exe", "sha256": "...", "size": 1},
+  "assets": [{"name": "ed-up-core-0.22.0.zip", "sha256": "...", "size": 1}],
+  "files": [{"item": "native_graphics", "path": "d3d11.dll",
+             "asset": "ed-up-core-0.22.0.zip", "sha256": "...", "size": 1}]
+}
+```
+
+- `build` is the stamp in the DLLs, which the install record stores. `item` is a name
+  `payloadItem()` already knows. `path` is the file's path in the zip and in the
+  unpacked `ed-up-<ver>.zip`, so `--payload <dir>` uses the same table.
+- `tag` must match the release it was fetched from, so a signed manifest cannot be
+  moved onto another release.
+- `issued` only goes up. The launcher records the highest it has accepted and ignores
+  a lower one on an automatic check, so a compromised account cannot roll users back
+  to an older signed build. Rolling back by hand reads the local copy of a manifest it
+  already accepted.
+- Cache file names come from `sha256` after a hex check, and zip entries are found by
+  the manifest's `path`. Nothing is ever written to a path named inside a zip.
+- The hash in `ed-up-dlss-<hash>.zip` is taken over the file names and file hashes, and
+  the zips are built with fixed timestamps and order. The same DLSS files therefore
+  keep the same asset name from release to release.
+
+### Signing and the key
+
+The signature is P-256 ECDSA over the SHA-256 of the manifest's bytes, written as 128
+hex characters (`r` then `s`). `tools\sign_manifest.py` signs with a deterministic
+nonce (RFC 6979) in the Python standard library, and the launcher verifies through
+BCrypt, so a build test proves the two agree.
+
+The maintainer decided on 2026-11-07 that the private key lives in their password
+manager. It is never on GitHub or in a repository, and never in a session: `generate`
+and `sign` refuse to run without a real terminal, and `sign` reads the key from a
+hidden prompt or from a password manager's command line on stdin.
+
+Actions cannot sign, so a release gains one local step. CI or `package.bat` writes the
+unsigned manifest, the maintainer signs it, and the `.sig` goes up with the other
+assets. A release with no `.sig` is simply not offered as an update. Today's assets do
+not depend on any of this.
+
+The exe embeds two public keys, the main one and a recovery one, and accepts a
+signature from either. Losing the main key therefore does not strand installed
+launchers. Replacing a leaked key needs a launcher update signed by the other key.
 
 - **Compare digests, not tags.** rc.7 was re-cut and its tag moved after 24
   downloads. A version comparison would have told those users they were current.
@@ -115,7 +174,7 @@ and DLSS and XeSS are 130 MB of the 164 MB installer exe.
   `src\installer\payload.cpp` is the only reader of the embedded files, so the
   planner does not need to know where the bytes came from.
 - **Offline install.** `--payload <dir>` reads the same files from an unpacked
-  `edvr-<ver>.zip`. The Linux wrapper uses this too once the embedded payload goes.
+  `ed-up-<ver>.zip`. The Linux wrapper uses this too once the embedded payload goes.
 
 The README has to disclose the network access. The launcher contacts
 `api.github.com`, GitHub's release downloads, and `api.zaonce.net` for sign-in.

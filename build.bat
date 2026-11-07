@@ -242,6 +242,7 @@ python tools\run_jobs.py ^
     --gate "tools\fetch_xess.py --self-test" ^
     --gate "tools\gen_installer_rc.py --self-test" ^
     --gate "tools\package_native.py --self-test" ^
+    --gate "tools\sign_manifest.py --self-test" ^
     --gate "tools\install_proton.py --self-test" ^
     --gate "tools\build_diff.py --self-test" ^
     --gate "tools\effects_arc.py --self-test" ^
