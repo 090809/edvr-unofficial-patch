@@ -60,11 +60,11 @@ struct EyeRes {
     uint32_t shownFrame = 0;
 };
 
-// The render-size scratch of one call (the key and source grids, the read offsets and the hole list): rebuilt from nothing by every call, so both eyes share one set (they run one
-// after the other on the same context). 12.5 bytes per render pixel in all; recreated when a call's render size differs from the last's.
+// The render-size scratch of one call (the key grid, the read offsets and the hole list): rebuilt from nothing by every call, so both eyes share one set (they run one after the
+// other on the same context). 8.5 bytes per render pixel in all; recreated when a call's render size differs from the last's.
 struct Scratch {
     uint32_t rw = 0, rh = 0;
-    Tex key, src, read;
+    Tex key, read;                              // R32_UINT both: the keys; the read offsets as two packed half floats
     ID3D11Buffer* holes = nullptr;              // frameGenSynthHoleCapacity uints
     ID3D11UnorderedAccessView* holesUav = nullptr;
 };
@@ -116,7 +116,6 @@ void releaseEye(EyeRes& r) {
 
 void releaseScratch() {
     releaseTex(g.scratch.key);
-    releaseTex(g.scratch.src);
     releaseTex(g.scratch.read);
     releaseCom(g.scratch.holesUav);
     releaseCom(g.scratch.holes);
@@ -352,9 +351,9 @@ bool createCommon(ID3D11Device* dev, ID3D11DeviceContext* ctx) {
     bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
     bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
     if (FAILED(dev->CreateBuffer(&bd, nullptr, &g.cb))) return false;
-    // The formats the textures are written in: R32_FLOAT and R32_UINT are in every D3D11 part's typed set; the two-half read offset and the two-float class map need the adapter to
-    // store them (every D3D11 part that matters does); the luma is R16_FLOAT where the adapter stores it, else R32_FLOAT, as the scorer's.
-    if (!uavStoreOk(dev, DXGI_FORMAT_R16G16_FLOAT) || !uavStoreOk(dev, DXGI_FORMAT_R32G32_FLOAT) || !uavStoreOk(dev, DXGI_FORMAT_R32_UINT) || !uavStoreOk(dev, DXGI_FORMAT_R32_FLOAT)) return false;
+    // The formats the textures are written in: R32_FLOAT and R32_UINT (the keys, the packed read offsets) are in every D3D11 part's typed set, stores and loads; the two-float
+    // class map needs the adapter to store it (every D3D11 part that matters does); the luma is R16_FLOAT where the adapter stores it, else R32_FLOAT, as the scorer's.
+    if (!uavStoreOk(dev, DXGI_FORMAT_R32G32_FLOAT) || !uavStoreOk(dev, DXGI_FORMAT_R32_UINT) || !uavStoreOk(dev, DXGI_FORMAT_R32_FLOAT)) return false;
     g.lumaFormat = uavStoreOk(dev, DXGI_FORMAT_R16_FLOAT) ? DXGI_FORMAT_R16_FLOAT : DXGI_FORMAT_R32_FLOAT;
     return true;
 }
@@ -434,8 +433,7 @@ bool ensureScratch(ID3D11Device* dev, uint32_t rw, uint32_t rh) {
     Scratch& sc = g.scratch;
     if (sc.key.tex && sc.rw == rw && sc.rh == rh) return true;
     releaseScratch();
-    if (makeTex(dev, rw, rh, DXGI_FORMAT_R32_UINT, g.scratch.key) && makeTex(dev, rw, rh, DXGI_FORMAT_R32_UINT, g.scratch.src) &&
-        makeTex(dev, rw, rh, DXGI_FORMAT_R16G16_FLOAT, g.scratch.read)) {
+    if (makeTex(dev, rw, rh, DXGI_FORMAT_R32_UINT, g.scratch.key) && makeTex(dev, rw, rh, DXGI_FORMAT_R32_UINT, g.scratch.read)) {
         D3D11_BUFFER_DESC bd{};
         bd.ByteWidth = frameGenSynthHoleCapacity(rw, rh) * 4u;
         bd.Usage = D3D11_USAGE_DEFAULT;
@@ -479,7 +477,6 @@ FrameGenSynthVram vramOf(const EyeRes& r, const Scratch& sc) {
     v.stats = bufBytes(r.stats);
     for (ID3D11Buffer* s : r.staging) v.stats += bufBytes(s);
     v.key = texBytes(sc.key);
-    v.src = texBytes(sc.src);
     v.read = texBytes(sc.read);
     v.holes = bufBytes(sc.holes);
     return v;
@@ -638,7 +635,6 @@ void frameGenSynthEyeFrame(ID3D11Device* dev, ID3D11DeviceContext* ctx, uint32_t
     v.depth = f.depthSrv;
     v.mv = f.mvSrv;
     v.keySrv = sc.key.srv; v.keyUav = sc.key.uav;
-    v.srcSrv = sc.src.srv; v.srcUav = sc.src.uav;
     v.readSrv = sc.read.srv; v.readUav = sc.read.uav;
     v.holesUav = sc.holesUav;
     v.sSrv = r.s.srv; v.sUav = r.s.uav;

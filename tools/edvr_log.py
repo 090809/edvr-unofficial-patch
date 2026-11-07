@@ -25229,8 +25229,8 @@ def self_test_health():
             return RS("frame generation (synth): armed, render %ux%u", rw, rh, ow, oh, fmt)
 
         def fg_synth_vram(eye=0):
-            return RS("frame generation (synth): eye %u VRAM %llu B", eye, 53364996, 50.9, "s=49038336 luma=862920 class=3451680 stats=12060", 86200200, 82.2,
-                      "key=27584064 src=27584064 read=27584064 holes=3448008", 192930192, 184.0)
+            return RS("frame generation (synth): eye %u VRAM %llu B", eye, 53364996, 50.9, "s=49038336 luma=862920 class=3451680 stats=12060", 58616136, 55.9,
+                      "key=27584064 read=27584064 holes=3448008", 165346128, 157.7)
 
         def fg_synth_report(f05=40, f1=39, scored=38, skipped=2, timed=True, p95=20, filled=0.25, left=0.01, guard=1.5, turned=True, tp95=7, rot=(0.4, 1.2), clamp=0.0):
             cls = "".join(RF(" %s=%.1f%%,%u", n, 10.0, 12, 8, p95, 5.5, 1.5, 9, 30) for n in ("far", "cockpit", "world"))
@@ -25311,7 +25311,7 @@ def self_test_health():
                    "holes filled 0.25% / left 0.01% of the render pixels (mean), guard 1.50%", "p95 error far 22 / cockpit 22 / world 22 milli-luma, no warp 30 / 30 / 30 (mean of 2 line(s))"], lacks=["UNPARSED"])
         check("frame generation synth: the VRAM line is read as state and the OK summary says the figure for two eyes and the scratch",
               fg_off + [(1, fg_armed()), (1, fg_synth_armed()), (1, fg_synth_vram()), (70, fg_report()), (70, fg_synth_report())], 0, [("OK", FGS)],
-              has=["VRAM 184.0 MiB for two eyes and the scratch (eye s=49038336 luma=862920 class=3451680 stats=12060; scratch key=27584064 src=27584064 read=27584064 holes=3448008; the last VRAM line)"],
+              has=["VRAM 157.7 MiB for two eyes and the scratch (eye s=49038336 luma=862920 class=3451680 stats=12060; scratch key=27584064 read=27584064 holes=3448008; the last VRAM line)"],
               lacks=["UNPARSED"], extra=["--since", "10:01:00"])
         check("frame generation synth: a report line with no gpu timing (\"-(n=0)\") and no scored frame is OK", fg_off + [fg_armed(), fg_report(), fg_synth_armed(), fg_synth_report(timed=False, scored=0)], 0, [("OK", FGS)],
               has=["1 report line(s)", "0 scored"], lacks=["UNPARSED", "f=1 S against the next frame"])

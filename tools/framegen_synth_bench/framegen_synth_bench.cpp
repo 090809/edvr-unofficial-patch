@@ -489,7 +489,7 @@ struct Gpu {
             const UINT want = D3D11_FORMAT_SUPPORT_TEXTURE2D | D3D11_FORMAT_SUPPORT_SHADER_LOAD | D3D11_FORMAT_SUPPORT_TYPED_UNORDERED_ACCESS_VIEW;
             return SUCCEEDED(dev->CheckFormatSupport(fmt, &support)) && (support & want) == want;
         };
-        if (!uavStoreOk(DXGI_FORMAT_R16G16_FLOAT) || !uavStoreOk(DXGI_FORMAT_R32G32_FLOAT) || !uavStoreOk(DXGI_FORMAT_R32_UINT) || !uavStoreOk(DXGI_FORMAT_R32_FLOAT)) {
+        if (!uavStoreOk(DXGI_FORMAT_R32G32_FLOAT) || !uavStoreOk(DXGI_FORMAT_R32_UINT) || !uavStoreOk(DXGI_FORMAT_R32_FLOAT)) {
             err = "the adapter does not store the synth's texture formats";
             return false;
         }
@@ -549,7 +549,7 @@ struct Gpu {
 struct Synth {
     uint32_t rw = 0, rh = 0, ow = 0, oh = 0, qw = 0, qh = 0;
     DXGI_FORMAT sFormat = DXGI_FORMAT_UNKNOWN;
-    Tex s, sLuma, bInfo, key, src, read;
+    Tex s, sLuma, bInfo, key, read;
     ComPtr<ID3D11Buffer> stats, staging[4], holes;
     ComPtr<ID3D11UnorderedAccessView> statsUav, holesUav;
     FrameGenSynthVram vram;   // measured from what was made, as the module's VRAM line is
@@ -558,8 +558,7 @@ struct Synth {
         rw = rw_; rh = rh_; ow = ow_; oh = oh_; qw = (rw + 3) / 4; qh = (rh + 3) / 4; sFormat = sFmt;
         if (!g.uavOk(sFmt)) return false;
         if (!g.makeTex(ow, oh, sFmt, nullptr, true, s) || !g.makeTex(qw, qh, g.lumaFormat, nullptr, true, sLuma) || !g.makeTex(qw, qh, DXGI_FORMAT_R32G32_FLOAT, nullptr, true, bInfo)) return false;
-        if (!g.makeTex(rw, rh, DXGI_FORMAT_R32_UINT, nullptr, true, key) || !g.makeTex(rw, rh, DXGI_FORMAT_R32_UINT, nullptr, true, src) ||
-            !g.makeTex(rw, rh, DXGI_FORMAT_R16G16_FLOAT, nullptr, true, read)) return false;
+        if (!g.makeTex(rw, rh, DXGI_FORMAT_R32_UINT, nullptr, true, key) || !g.makeTex(rw, rh, DXGI_FORMAT_R32_UINT, nullptr, true, read)) return false;
         D3D11_BUFFER_DESC bd{};
         bd.ByteWidth = kFrameGenSynthStatsUints * 4u;
         bd.Usage = D3D11_USAGE_DEFAULT;
@@ -588,7 +587,7 @@ struct Synth {
         bd.StructureByteStride = 4;
         ud.Buffer.NumElements = cap;
         if (FAILED(g.dev->CreateBuffer(&bd, nullptr, &holes)) || FAILED(g.dev->CreateUnorderedAccessView(holes.Get(), &ud, &holesUav))) return false;
-        vram.key = key.bytes; vram.src = src.bytes; vram.read = read.bytes; vram.holes = bd.ByteWidth;
+        vram.key = key.bytes; vram.read = read.bytes; vram.holes = bd.ByteWidth;
         return true;
     }
 
@@ -614,7 +613,6 @@ void runCall(Gpu& g, Synth& sy, const Inputs& in, bool score, bool keep, bool sc
     FrameGenSynthPassViews v;
     v.out = in.out; v.depth = in.depth; v.mv = in.mv;
     v.keySrv = sy.key.srv.Get(); v.keyUav = sy.key.uav.Get();
-    v.srcSrv = sy.src.srv.Get(); v.srcUav = sy.src.uav.Get();
     v.readSrv = sy.read.srv.Get(); v.readUav = sy.read.uav.Get();
     v.holesUav = sy.holesUav.Get();
     v.sSrv = sy.s.srv.Get(); v.sUav = sy.s.uav.Get();
@@ -1053,10 +1051,10 @@ std::string benchJson(const BenchOptions& o, const BenchOutput& bo, const Gpu& g
                 g.warp ? "true" : "false", o.rw, o.rh, o.ow, o.oh, o.iters, o.warm, o.frameDir.empty() ? "synthetic" : fmtStr("frame %d of a capture", o.frameIndex).c_str());
     const FrameGenSynthVram& v = bo.vram;
     s += fmtStr("  \"vram_bytes\": {\"per_eye\": %llu, \"scratch\": %llu, \"two_eyes\": %llu, \"eye\": {\"s\": %llu, \"luma\": %llu, \"class\": %llu, \"stats\": %llu}, "
-                "\"shared\": {\"key\": %llu, \"src\": %llu, \"read\": %llu, \"holes\": %llu}},\n",
+                "\"shared\": {\"key\": %llu, \"read\": %llu, \"holes\": %llu}},\n",
                 static_cast<unsigned long long>(v.eye()), static_cast<unsigned long long>(v.scratch()), static_cast<unsigned long long>(v.total()),
                 static_cast<unsigned long long>(v.s), static_cast<unsigned long long>(v.luma), static_cast<unsigned long long>(v.cls), static_cast<unsigned long long>(v.stats),
-                static_cast<unsigned long long>(v.key), static_cast<unsigned long long>(v.src), static_cast<unsigned long long>(v.read), static_cast<unsigned long long>(v.holes));
+                static_cast<unsigned long long>(v.key), static_cast<unsigned long long>(v.read), static_cast<unsigned long long>(v.holes));
     s += "  \"variants\": [\n";
     for (size_t i = 0; i < bo.variants.size(); ++i) {
         const VariantResult& v = bo.variants[i];

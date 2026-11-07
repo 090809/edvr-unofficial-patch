@@ -21,7 +21,7 @@
 //   7  the f = 1 S scored the way it would be seen (the compositor's turn): a far scene seen from a head turning at a changing rate, the S built for the extrapolated turn,
 //      scored against the next frame raw and turned by the residual rotation (the true head against the predicted): the turned score is near zero where the raw one is
 //      clearly not, and the residual's angle is the sequence's own
-//   8  the read offsets' half-float storage: exact to 1/8 px up to 512 px, and the clamp's bounds
+//   8  the read offsets' storage (two halves in a uint, rounded toward zero): exact to 1/4 px up to 512 px, and the clamp's bounds
 // Mutations (each replaces one of the shader's six #define switches, or the host's f, and the case it guards must fail): f ignored, the head turn not taken out of the
 // vector, the guard off, the fill from the nearer side, the score's turn not applied, the score's turn applied the wrong way round.
 #include <windows.h>
@@ -255,14 +255,14 @@ struct Keep {
     Tex sLuma, bInfo;
 };
 
-// The module's order of dispatches for one eye-frame, up to and including the resample (and, with `keep`, the luma that is kept for the score). The read offsets are the
-// module's: R16G16_FLOAT.
+// The module's order of dispatches for one eye-frame, up to and including the resample (and, with `keep`, the luma that is kept for the score). The key grid and the read
+// offsets are the module's: R32_UINT both (the offsets two packed half floats).
 Run runSynth(Gpu& g, const Scene& sc, const FrameGenSynthCb& cb, Keep* keep = nullptr) {
     Run r;
-    Tex out, depth, mv, key, src, read, s;
+    Tex out, depth, mv, key, read, s;
     if (!makeInputs(g, sc, out, depth, mv)) return r;
-    if (!g.makeTex(sc.w, sc.h, DXGI_FORMAT_R32_UINT, nullptr, 0, key, true) || !g.makeTex(sc.w, sc.h, DXGI_FORMAT_R32_UINT, nullptr, 0, src, true) ||
-        !g.makeTex(sc.w, sc.h, DXGI_FORMAT_R16G16_FLOAT, nullptr, 0, read, true) || !g.makeTex(sc.ow, sc.oh, DXGI_FORMAT_R32G32B32A32_FLOAT, nullptr, 0, s, true))
+    if (!g.makeTex(sc.w, sc.h, DXGI_FORMAT_R32_UINT, nullptr, 0, key, true) || !g.makeTex(sc.w, sc.h, DXGI_FORMAT_R32_UINT, nullptr, 0, read, true) ||
+        !g.makeTex(sc.ow, sc.oh, DXGI_FORMAT_R32G32B32A32_FLOAT, nullptr, 0, s, true))
         return r;
     if (keep && (!g.makeTex((sc.w + 3) / 4, (sc.h + 3) / 4, DXGI_FORMAT_R32_FLOAT, nullptr, 0, keep->sLuma, true) ||
                  !g.makeTex((sc.w + 3) / 4, (sc.h + 3) / 4, DXGI_FORMAT_R32G32_FLOAT, nullptr, 0, keep->bInfo, true)))
@@ -290,7 +290,6 @@ Run runSynth(Gpu& g, const Scene& sc, const FrameGenSynthCb& cb, Keep* keep = nu
     FrameGenSynthPassViews v;
     v.out = out.srv.Get(); v.depth = depth.srv.Get(); v.mv = mv.srv.Get();
     v.keySrv = key.srv.Get(); v.keyUav = key.uav.Get();
-    v.srcSrv = src.srv.Get(); v.srcUav = src.uav.Get();
     v.readSrv = read.srv.Get(); v.readUav = read.uav.Get();
     v.holesUav = holesUav.Get();
     v.sSrv = s.srv.Get(); v.sUav = s.uav.Get();
@@ -311,9 +310,9 @@ Run runSynth(Gpu& g, const Scene& sc, const FrameGenSynthCb& cb, Keep* keep = nu
 
 // The score of frame C against the S kept from B (the module's order: clear the stats, then the score entry on C's output), decoded.
 bool runScore(Gpu& g, const Scene& scC, const FrameGenSynthCb& cbC, const Keep& keep, FrameGenSynthEyeResult& res) {
-    Tex out, depth, mv, key, src;
+    Tex out, depth, mv, key;
     if (!makeInputs(g, scC, out, depth, mv)) return false;
-    if (!g.makeTex(scC.w, scC.h, DXGI_FORMAT_R32_UINT, nullptr, 0, key, true) || !g.makeTex(scC.w, scC.h, DXGI_FORMAT_R32_UINT, nullptr, 0, src, true)) return false;
+    if (!g.makeTex(scC.w, scC.h, DXGI_FORMAT_R32_UINT, nullptr, 0, key, true)) return false;
     ComPtr<ID3D11Buffer> stats, staging;
     ComPtr<ID3D11UnorderedAccessView> statsUav;
     D3D11_BUFFER_DESC bd{};
@@ -328,7 +327,7 @@ bool runScore(Gpu& g, const Scene& scC, const FrameGenSynthCb& cbC, const Keep& 
     g.setCb(cbC);
     FrameGenSynthPassViews v;
     v.out = out.srv.Get(); v.depth = depth.srv.Get(); v.mv = mv.srv.Get();
-    v.keyUav = key.uav.Get(); v.srcUav = src.uav.Get();
+    v.keyUav = key.uav.Get();
     v.sLumaSrv = keep.sLuma.srv.Get(); v.bInfoSrv = keep.bInfo.srv.Get();
     v.statsUav = statsUav.Get();
     v.rw = static_cast<uint32_t>(scC.w); v.rh = static_cast<uint32_t>(scC.h);
@@ -816,21 +815,36 @@ float halfToFloat(uint16_t h) {
     return (h & 0x8000u) ? -v : v;
 }
 
-// Case 8: the offsets' storage. floatToHalf rounds to nearest, as the GPU's store does.
+// The module's packing of an offset component (framegen_synth_shader.h synHalfBits): the half's bits, rounded toward zero. Finite inputs.
+uint16_t truncToHalf(float f) {
+    uint32_t u;
+    std::memcpy(&u, &f, 4);
+    const uint32_t sign = (u >> 16) & 0x8000u, a = u & 0x7FFFFFFFu;
+    if (a >= 0x47800000u) return static_cast<uint16_t>(sign | 0x7C00u);
+    if (a < 0x38800000u) { float d; std::memcpy(&d, &a, 4); return static_cast<uint16_t>(sign | static_cast<uint32_t>(d * 16777216.0f)); }
+    return static_cast<uint16_t>(sign | (((a >> 23) - 112u) << 10) | ((a >> 13) & 0x3FFu));
+}
+
+// Case 8: the offsets' storage, two halves packed in a uint and rounded toward zero as the module packs them (truncToHalf is synHalfBits's arithmetic).
 void case8Offsets(Scope& sc) {
     char label[260];
     float worst512 = 0.0f, worst256 = 0.0f, worst2000 = 0.0f;
+    bool towardZero = true;
     for (int i = -20000; i <= 20000; ++i) {
         const float v = static_cast<float>(i) * 0.1f * (1.0f + 0.000137f * static_cast<float>(i % 7));   // up to +-2000, off the grid of halves
-        const float e = std::fabs(halfToFloat(floatToHalf(v)) - v);
+        const float back = halfToFloat(truncToHalf(v));
+        const float e = std::fabs(back - v);
+        if (std::fabs(back) > std::fabs(v)) towardZero = false;
         if (std::fabs(v) <= 256.0f) worst256 = std::max(worst256, e);
         if (std::fabs(v) <= 512.0f) worst512 = std::max(worst512, e);
         if (std::fabs(v) <= kFrameGenSynthMaxOffset) worst2000 = std::max(worst2000, e);
     }
-    std::snprintf(label, sizeof(label), "case 8: a read offset stored in half floats is exact to %.4f px up to 256 px, %.4f px up to 512 px and %.4f px up to the clamp (%.0f px)", worst256, worst512, worst2000,
-                  static_cast<double>(kFrameGenSynthMaxOffset));
-    sc.ok(worst256 <= 0.0625f && worst512 <= 0.125f && worst2000 <= 0.5f && std::fabs(halfToFloat(floatToHalf(kFrameGenSynthNoRead)) - kFrameGenSynthNoRead) == 0.0f &&
-          kFrameGenSynthNoRead < -kFrameGenSynthMaxOffset * 1.5f, label);
+    std::snprintf(label, sizeof(label), "case 8: a read offset packed as a half, rounded toward zero, is exact to %.4f px up to 256 px, %.4f px up to 512 px and %.4f px up to the clamp (%.0f px)", worst256,
+                  worst512, worst2000, static_cast<double>(kFrameGenSynthMaxOffset));
+    sc.ok(towardZero && worst256 < 0.125f && worst512 < 0.25f && worst2000 < 1.0f && std::fabs(halfToFloat(truncToHalf(kFrameGenSynthNoRead)) - kFrameGenSynthNoRead) == 0.0f &&
+              halfToFloat(truncToHalf(kFrameGenSynthMaxOffset)) == kFrameGenSynthMaxOffset && halfToFloat(truncToHalf(0.5f)) == 0.5f && halfToFloat(truncToHalf(1.0e-6f)) < 1.0e-6f &&
+              kFrameGenSynthNoRead < -kFrameGenSynthMaxOffset * 1.5f,
+          label);
 }
 
 // ---- case 9: the replay capture's writer (.agents/framegen-replay-format.md) ----------------------------------------------------------------------------------

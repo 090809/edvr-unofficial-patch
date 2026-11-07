@@ -1,17 +1,22 @@
 #pragma once
 // The frame-generation synthesizer's compute shaders (fix.frame_generation_shadow, TEMPORARY; docs/design-frame-generation-2026-10-26.md, Phase 2.1, "The synthesis pass").
 // One source, seven entry points, one constant block (src\common\framegen_synth_math.h FrameGenSynthCb). Nothing they write is shown in the headset. Before them the key grid and the
-// stats words are cleared to 0 by the API (ClearUnorderedAccessViewUint, framegen_synth_pass.h); the source grid is not cleared: a pixel whose key is 0 never has its source
-// read, and a pixel whose key is not 0 has it written by fgSynSrc (the pixel that set the key finds it there again and writes).
-//   fgSynSplat     each B pixel carried to S by its class's motion (fgSynTarget; its class and depth are the nearest of the 3x3 around it, synDilated, taken where they are read) and
+// stats words are cleared to 0 by the API (ClearUnorderedAccessViewUint, framegen_synth_pass.h); the read offsets are not cleared: a pixel whose key is 0 has kNoRead written by
+// fgSynResolve, and a pixel whose key is not 0 has its offset written by fgSynSrc (the pixel that set the key finds it there again and writes).
+//   fgSynSplat     each B pixel carried to S by its class's motion (fgSynTarget; its class and depth are the nearest of the 3x3 around it, synDepth9, taken where they are read) and
 //                  scattered as a key into the four pixels of its bilinear footprint (InterlockedMax: the nearer surface wins; a pixel that is its own nearest beats one that borrowed
 //                  the dilated depth);
-//   fgSynSrc       the second pass over the same keys: each pixel writes its index (plus one) to every footprint pixel whose final key is its own;
-//   fgSynResolve   for every S pixel the B position to read, stored as an OFFSET from the S pixel's own centre in two half floats (kMaxOffset, kNoRead): the winner's own position moved
-//                  by the landing offset (the guard reads the winner's pixel itself when it has a nearer 3x3 neighbour on the side the offset points to); a pixel with no winner is
-//                  a hole: kNoRead, counted as left, and listed in the hole list (u0, an eighth of the render pixels; the count in the stats words);
+//   fgSynSrc       the second pass over the same keys: each pixel writes, to every footprint pixel whose final key is its own, that S pixel's READ OFFSET: the B position to read,
+//                  as an offset from the S pixel's own centre, two half floats packed in a uint (kMaxOffset, kNoRead; synPackOffset rounds to nearest even as a typed half store
+//                  does). The read is the pixel's own position moved by the landing offset (the S pixel minus where the pixel landed), or the pixel's own position itself when the
+//                  guard says so (a nearer 3x3 neighbour on the side the offset points to would be read across the edge), then an integer pair stored exactly with the guard's
+//                  mark (synPackGuarded); a read past kMaxOffset is clamped and counted;
+//   fgSynResolve   every S pixel no key reached is a hole: kNoRead written, counted as left, its index listed in the hole list (u0, an eighth of the render pixels; the count in the
+//                  stats words); the S pixels whose stored offset carries the guard's mark are counted as guarded, one each;
 //   fgSynHoles     one thread per listed hole, in full 64-thread groups: the farthest key found within 8 px of it read 2 px further into its own surface (the background pull) becomes
-//                  its read offset, counted as filled and no longer left; the counters (filled, left, guard, clamped) of both passes are added to the stats words;
+//                  its read offset, counted as filled and no longer left. The neighbour's read is taken in full precision, as fgSynSrc computed it before the store rounded it
+//                  (synWinnerRead finds the neighbour's source pixel again from the stored offset and recomputes its read), so the fill is the same as when every read was computed
+//                  in one pass; the counters (filled, left, guard, clamped) of the three passes add up in the stats words;
 //   fgSynResample  output size: each output pixel to its S pixel, its read offset, B's output there, bilinear, into the S texture (dlOut's format);
 //   fgSynLuma      quarter grid: S's luma the way the scorer's capture takes it, B's luma and B's class (the f = 1 S is kept for the next real frame);
 //   fgSynScore     quarter grid, on the next real frame C: C's luma against the kept S luma and against B's (the no-warp comparison), binned per class of B as the scorer bins; and again
@@ -21,9 +26,10 @@
 // kFrameGenSynthCs (frameGenSynthShaderSource); the markers are read out of kTemporalCsHlsl by frameGenCarryText (framegen_shadow_shader.h).
 //
 // Bindings: t0 B's output (the upscaler's, before the interface; on C's frame the score reads C's there), t1 B's depth copy, t2 the DLSS vectors (R16G16_FLOAT, render size, pixels,
-// this frame to the previous, jitter-free), t3 unused, t4 the key grid, t5 the source grid, t6 the read offsets, t7 the S texture, t8 the kept S luma, t9 the kept B luma (x) and class
-// (y); u0 the hole list (a structured buffer of uints), u1 the key grid (R32_UINT), u2 the source grid (R32_UINT), u3 the read offsets (R16G16_FLOAT), u4 the S texture, u5 the
-// stats words, u6 the S luma, u7 B's luma and class; b0 P.
+// this frame to the previous, jitter-free), t3 and t5 unused, t4 the key grid, t6 the read offsets, t7 the S texture, t8 the kept S luma, t9 the kept B luma (x) and class (y);
+// u0 the hole list (a structured buffer of uints), u1 the key grid (R32_UINT), u2 unused, u3 the read offsets (R32_UINT: two packed half floats, or a guarded read's integer
+// pair with the mark; the resolve and the hole pass read other pixels' through this view, a typed uint load every D3D11 part does), u4 the S texture, u5 the stats words, u6 the
+// S luma, u7 B's luma and class; b0 P.
 //
 // The key: 0 a hole, 4 the far plane, else (max(asuint(1 / metres), 8) & ~7) | 4 when the pixel is its own nearest | class (1 cockpit, 2 world). A larger key is a nearer surface.
 //
@@ -57,15 +63,13 @@ Texture2D<float4> Out     : register(t0);
 Texture2D<float>  Depth   : register(t1);
 Texture2D<float2> Mv      : register(t2);
 Texture2D<uint>   KeyT    : register(t4);
-Texture2D<uint>   SrcT    : register(t5);
-Texture2D<float2> ReadT   : register(t6);   // the read offsets
+Texture2D<uint>   ReadT   : register(t6);   // the read offsets, packed
 Texture2D<float4> SIn     : register(t7);
 Texture2D<float>  SLumaIn : register(t8);
 Texture2D<float2> BInfoIn : register(t9);
 RWStructuredBuffer<uint> Holes : register(u0);   // the render pixel index of every hole the resolve found, for fgSynHoles; the count is Stats[kHoleCount]
 RWTexture2D<uint>   Key       : register(u1);
-RWTexture2D<uint>   Src       : register(u2);
-RWTexture2D<float2> ReadOut   : register(u3);   // R16G16_FLOAT
+RWTexture2D<uint>   ReadOut   : register(u3);   // R32_UINT: two half floats (synPackOffset)
 RWTexture2D<float4> SOut      : register(u4);
 RWStructuredBuffer<uint> Stats : register(u5);
 RWTexture2D<float>  SLumaOut  : register(u6);
@@ -84,8 +88,34 @@ static const int   kFillRadius = 8;
 static const float kFillShift = 2.0;
 static const float kNoRead = -4096.0;       // framegen_synth_math.h kFrameGenSynthNoRead
 static const float kMaxOffset = 2000.0;    // kFrameGenSynthMaxOffset
+static const uint  kGuardMark = 0x7C00u;      // a packed offset whose x half has this exponent field (a NaN's, never a clamped offset's) is a guarded read's: an integer pair, stored as such
 
 float synLuma(float3 c) { return clamp(dot(c, float3(0.2126, 0.7152, 0.0722)), 0.0, 1.0); }
+
+// A float's half-float bits, rounded toward zero: what the typed R16G16_FLOAT store the offsets went through before they shared a uint with the source grid's slot did on the
+// pilot's NVIDIA card (D3D leaves a store's float16 rounding to the implementation; the replays of 2026-11-07 match that store byte for byte with truncation and not with
+// round-to-nearest-even), so the offsets packed here are the ones that store kept. Finite inputs (the offsets are clamped). synUnpackOffset is exact (f16tof32).
+uint synHalfBits(float v) {
+    uint b = asuint(v);
+    uint sign = (b >> 16) & 0x8000u;
+    uint a = b & 0x7FFFFFFFu;
+    if (a >= 0x47800000u) return sign | 0x7C00u;                             // 65536 and up: infinity
+    if (a < 0x38800000u) return sign | uint(asfloat(a) * 16777216.0);       // under 2^-14: a half denormal or zero, in units of 2^-24, truncated
+    return sign | (((a >> 23) - 112u) << 10) | ((a >> 13) & 0x3FFu);
+}
+uint synPackOffset(float2 o) { return synHalfBits(o.x) | (synHalfBits(o.y) << 16); }
+
+// A guarded read's offset (the source pixel minus the S pixel: integers, within the clamp) with the mark, in the bits the mark leaves: x + 2048 in bits 0-9 and 15-16, y + 2048
+// in bits 17-28. The mark is how fgSynResolve counts the guarded pixels, once each, from the one store fgSynSrc makes.
+uint synPackGuarded(float2 o) {
+    uint x = uint(int(o.x) + 2048), y = uint(int(o.y) + 2048);
+    return kGuardMark | (x & 0x3FFu) | (((x >> 10) & 3u) << 15) | (y << 17);
+}
+bool synIsGuarded(uint p) { return (p & kGuardMark) == kGuardMark; }
+float2 synUnpackOffset(uint p) {
+    if (synIsGuarded(p)) return float2(int((p & 0x3FFu) | (((p >> 15) & 3u) << 10)) - 2048, int((p >> 17) & 0xFFFu) - 2048);
+    return float2(f16tof32(p & 0xFFFFu), f16tof32(p >> 16));
+}
 
 // A bilinear read of a render-or-output size float4 texture at a continuous position (texel centres at +0.5), edges clamped.
 float4 synBilinear(Texture2D<float4> t, float2 u, int2 size) {
@@ -116,14 +146,14 @@ uint synClass(float zr, out float z) {
     return far ? 0u : (temporalWorldPath(true, far, z, dk.z, false) ? 2u : 1u);
 }
 
-// The nearest of the 3x3 around a pixel (the larger reversed-Z value): the class and depth an edge pixel takes are the near object's.
-float synDilated(int2 q) {
+// The 3x3 depths around a pixel (z9, row by row, the pixel's own at 4) and their nearest (the larger reversed-Z value): the class and depth an edge pixel takes are the near
+// object's, and the guard compares the neighbours with the centre.
+float synDepth9(int2 q, out float z9[9]) {
     float z = 0.0;
-    [unroll] for (int dy = -1; dy <= 1; ++dy) {
-        [unroll] for (int dx = -1; dx <= 1; ++dx) {
-            int2 n = clamp(q + int2(dx, dy), int2(0, 0), int2(sz.x, sz.y) - 1);
-            z = max(z, Depth.Load(int3(n.x, n.y, 0)));
-        }
+    [unroll] for (int i = 0; i < 9; ++i) {
+        int2 n = clamp(q + int2(i % 3 - 1, i / 3 - 1), int2(0, 0), int2(sz.x, sz.y) - 1);
+        z9[i] = Depth.Load(int3(n.x, n.y, 0));
+        z = max(z, z9[i]);
     }
     return z;
 }
@@ -135,9 +165,9 @@ float synMetresOrFar(float zr) {
     return far ? 1.0e9 : z;
 }
 
-// Where B's pixel id lands in S, and its key, from its dilated depth zr (synDilated) and `own` (4 when the pixel's own depth is zr, else 0). The class and depth are the dilated
-// depth's. false: behind the eye. The motion is src\common\framegen_synth_math.h frameGenSynthTarget's: cockpit the head's rigid step with the depth; far and world the ex2dh
-// rule on B's vector, rotation only.
+// Where B's pixel id lands in S, and its key, from its dilated depth zr (synDepth9's nearest) and `own` (4 when the pixel's own depth is zr, else 0). The class and depth are
+// the dilated depth's. false: behind the eye. The motion is src\common\framegen_synth_math.h frameGenSynthTarget's: cockpit the head's rigid step with the depth; far and world
+// the ex2dh rule on B's vector, rotation only.
 bool fgSynTargetZ(uint2 id, float zr, uint own, out float2 pp, out uint key) {
     pp = float2(0.0, 0.0);
     key = 0u;
@@ -171,11 +201,34 @@ bool fgSynTargetZ(uint2 id, float zr, uint own, out float2 pp, out uint key) {
     return true;
 }
 
-// fgSynTargetZ with the pixel's 3x3 read here (the splat and the source pass).
+// fgSynTargetZ with the pixel's 3x3 read here (the splat).
 bool fgSynTarget(uint2 id, out float2 pp, out uint key) {
-    float zr = synDilated(int2(id));
-    uint own = (Depth.Load(int3(id.x, id.y, 0)) == zr) ? 4u : 0u;
-    return fgSynTargetZ(id, zr, own, pp, key);
+    float z9[9];
+    float zr = synDepth9(int2(id), z9);
+    return fgSynTargetZ(id, zr, (z9[4] == zr) ? 4u : 0u, pp, key);
+}
+
+// The 3x3 depths' metres (synMetresOrFar of each), once per source pixel: the guard's comparisons.
+void synMetres9(float z9[9], out float m9[9]) {
+    [unroll] for (int j = 0; j < 9; ++j) m9[j] = synMetresOrFar(z9[j]);
+}
+
+// The guard: a source pixel (its 3x3 metres m9) with a nearer neighbour (by more than kGuardMargin) on the side its landing offset `off` points to would read across the
+// edge, so it reads itself.
+bool synGuarded(float m9[9], float2 off) {
+#if FG_GUARD
+    float zw = m9[4] * kGuardMargin;
+    bool g = false;
+    [unroll] for (int j = 0; j < 9; ++j) {
+        if (j != 4) {
+            float2 d = float2(j % 3 - 1, j / 3 - 1);
+            if (m9[j] < zw && dot(off, d) > 0.0) g = true;
+        }
+    }
+    return g;
+#else
+    return false;
+#endif
 }
 
 [numthreads(8, 8, 1)]
@@ -193,56 +246,78 @@ void fgSynSplat(uint3 id : SV_DispatchThreadID) {
     }
 }
 
+)HLSL" R"HLSL(
+groupshared uint gSrc;   // clamped
+
+// The winner's read offset for every S pixel its key won: its own position moved by the landing offset (c minus where it landed), guarded, as an offset from c. A pixel two
+// sources tie for is written by both (the splat's tie: the last write stands). A guarded read is stored with the mark, for the resolve to count once per S pixel; a clamped
+// read is counted here, per write.
 [numthreads(8, 8, 1)]
-void fgSynSrc(uint3 id : SV_DispatchThreadID) {
-    if (id.x >= uint(sz.x) || id.y >= uint(sz.y)) return;
-    float2 pp;
-    uint key;
-    if (!fgSynTarget(id.xy, pp, key)) return;
-    int2 base = int2(floor(pp));
-    [unroll] for (int dy = 0; dy < 2; ++dy) {
-        [unroll] for (int dx = 0; dx < 2; ++dx) {
-            int2 c = base + int2(dx, dy);
-            if (c.x >= 0 && c.y >= 0 && c.x < sz.x && c.y < sz.y && KeyT.Load(int3(c.x, c.y, 0)) == key) Src[uint2(c)] = id.y * uint(sz.x) + id.x + 1u;
+void fgSynSrc(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
+    if (gi == 0) gSrc = 0u;
+    GroupMemoryBarrierWithGroupSync();
+    if (id.x < uint(sz.x) && id.y < uint(sz.y)) {
+        float z9[9];
+        float zr = synDepth9(int2(id.xy), z9);
+        float2 pp;
+        uint key;
+        if (fgSynTargetZ(id.xy, zr, (z9[4] == zr) ? 4u : 0u, pp, key)) {
+            float m9[9];
+            synMetres9(z9, m9);
+            int2 base = int2(floor(pp));
+            [unroll] for (int dy = 0; dy < 2; ++dy) {
+                [unroll] for (int dx = 0; dx < 2; ++dx) {
+                    int2 c = base + int2(dx, dy);
+                    if (c.x >= 0 && c.y >= 0 && c.x < sz.x && c.y < sz.y && KeyT.Load(int3(c.x, c.y, 0)) == key) {
+                        float2 off = float2(c) - pp;
+                        float2 rd = float2(id.xy) + off;
+                        bool guarded = synGuarded(m9, off);
+                        if (guarded) rd = float2(id.xy);
+                        float2 o = rd - float2(c);
+                        if (any(abs(o) > kMaxOffset)) InterlockedAdd(gSrc, 1u);
+                        o = clamp(o, -kMaxOffset, kMaxOffset);
+                        ReadOut[uint2(c)] = guarded ? synPackGuarded(o) : synPackOffset(o);
+                    }
+                }
+            }
         }
     }
+    GroupMemoryBarrierWithGroupSync();
+    if (gi == 0 && gSrc != 0u) InterlockedAdd(Stats[kCountBase + 3], gSrc);
 }
 
-)HLSL" R"HLSL(
-// The winner's read for S pixel c: its source pixel moved by the landing offset (c minus where the source landed). false: no winner, a hole. `guarded` says the guard
-// moved the read: a source pixel with a nearer 3x3 neighbour (by more than kGuardMargin) on the side the offset points to would read across the edge, so it reads itself.
-bool fgSynWinner(int2 c, out float2 rd, out bool guarded) {
+// The read of a pixel n that has a winner, in full precision (what fgSynSrc computed before the store rounded it to halves): the winner's source pixel is found again as the B
+// pixel whose key is n's and whose footprint holds n, within the window the stored offset leaves (the source is the offset's end moved by the landing, under a pixel, and the
+// rounding, under half a pixel at the clamp), and its read is recomputed. Of tied sources (the same key, n in both footprints) the one whose read rounds to the stored offset is
+// taken; the stored offset itself stands in when none is found (a clamped read).
+bool synWinnerRead(int2 n, out float2 rd) {
     rd = float2(0.0, 0.0);
-    guarded = false;
-    uint key = KeyT.Load(int3(c.x, c.y, 0));
-    uint s = SrcT.Load(int3(c.x, c.y, 0));
-    if (key == 0u || s == 0u) return false;
-    uint si = s - 1u;
-    int2 w = int2(int(si % uint(sz.x)), int(si / uint(sz.x)));
-    // The 3x3 around the winner, read once: its nearest is the dilated depth (synDilated's), its centre says whether the winner is its own nearest, and the guard compares the
-    // neighbours' metres with the centre's.
-    float z9[9];
-    float zr = 0.0;
-    [unroll] for (int i = 0; i < 9; ++i) {
-        int2 n = clamp(w + int2(i % 3 - 1, i / 3 - 1), int2(0, 0), int2(sz.x, sz.y) - 1);
-        z9[i] = Depth.Load(int3(n.x, n.y, 0));
-        zr = max(zr, z9[i]);
+    uint key = KeyT.Load(int3(n.x, n.y, 0));
+    float2 o = synUnpackOffset(ReadOut[uint2(n)]);
+    if (key == 0u || o.x < kNoRead * 0.5) return false;
+    float2 approx = float2(n) + o;
+    rd = approx;
+    int2 lo = int2(floor(approx - 1.5));
+    float bestD = 1.0e9;
+    [loop] for (int j = 0; j < 16; ++j) {
+        int2 w = lo + int2(j & 3, j >> 2);
+        if (w.x < 0 || w.y < 0 || w.x >= sz.x || w.y >= sz.y) continue;
+        float z9[9];
+        float zr = synDepth9(w, z9);
+        float2 pp;
+        uint kw;
+        if (!fgSynTargetZ(uint2(w), zr, (z9[4] == zr) ? 4u : 0u, pp, kw) || kw != key) continue;
+        int2 dd = n - int2(floor(pp));
+        if (dd.x < 0 || dd.x > 1 || dd.y < 0 || dd.y > 1) continue;
+        float2 off = float2(n) - pp;
+        float2 r = float2(w) + off;
+        float m9[9];
+        synMetres9(z9, m9);
+        if (synGuarded(m9, off)) r = float2(w);
+        float2 oc = clamp(r - float2(n), -kMaxOffset, kMaxOffset);
+        float d = abs(oc.x - o.x) + abs(oc.y - o.y);
+        if (d < bestD) { bestD = d; rd = r; }
     }
-    float2 pp;
-    uint k2;
-    if (!fgSynTargetZ(uint2(w), zr, (z9[4] == zr) ? 4u : 0u, pp, k2)) return false;
-    float2 off = float2(c) - pp;
-    rd = float2(w) + off;
-#if FG_GUARD
-    float zw = synMetresOrFar(z9[4]);
-    [unroll] for (int j = 0; j < 9; ++j) {
-        if (j != 4) {
-            float2 d = float2(j % 3 - 1, j / 3 - 1);
-            if (synMetresOrFar(z9[j]) < zw * kGuardMargin && dot(off, d) > 0.0) guarded = true;
-        }
-    }
-    if (guarded) rd = float2(w);
-#endif
     return true;
 }
 
@@ -259,7 +334,7 @@ bool fgSynFill(int2 c, out float2 rd) {
             if (dx == 0 && dy == 0) continue;
             int2 n = c + int2(dx, dy);
             if (n.x < 0 || n.y < 0 || n.x >= sz.x || n.y >= sz.y) continue;
-            uint kn = KeyT.Load(int3(n.x, n.y, 0));   // a key that is not 0 has its source written (the source pass, the header)
+            uint kn = KeyT.Load(int3(n.x, n.y, 0));   // a key that is not 0 has its read offset written (fgSynSrc, the header)
             if (kn == 0u) continue;
             float d = float(dx * dx + dy * dy);
             bool better = FG_FILL_FAR ? (kn < bestKey) : (kn > bestKey);
@@ -273,45 +348,38 @@ bool fgSynFill(int2 c, out float2 rd) {
     }
     if (!found) return false;
     float2 rn;
-    bool gn;
-    if (!fgSynWinner(bestN, rn, gn)) return false;
+    if (!synWinnerRead(bestN, rn)) return false;
     rd = rn + kFillShift * normalize(float2(bestN - c));
     return true;
 }
 
 uint fgSynHoleCapacity() { return uint(sz.x) * uint(sz.y) / 8u; }   // src\common\framegen_synth_math.h frameGenSynthHoleCapacity
 
-groupshared uint gCount[5];   // filled (fgSynHoles's), left, guard, clamped; the holes of this group
+groupshared uint gCount[3];   // left, guard; the holes of this group
 groupshared uint gHoleBase;   // where this group's holes start in Holes
 
-// The winner's read offset for every S pixel, the guard counted. A pixel with no winner is a hole: kNoRead for now, counted as left, and its index listed in Holes for fgSynHoles
-// (the group reserves one run of the list; a hole past the list's capacity stays left).
+// Every S pixel no key reached is a hole: kNoRead for now, counted as left, and its index listed in Holes for fgSynHoles (the group reserves one run of the list; a hole past
+// the list's capacity stays left). A pixel whose stored offset carries the guard's mark is counted as guarded.
 [numthreads(8, 8, 1)]
 void fgSynResolve(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
-    if (gi < 5) gCount[gi] = 0u;
+    if (gi < 3) gCount[gi] = 0u;
     GroupMemoryBarrierWithGroupSync();
     bool hole = false;
     uint rank = 0u;
     if (id.x < uint(sz.x) && id.y < uint(sz.y)) {
-        int2 c = int2(id.xy);
-        float2 rd, off;
-        bool guarded;
-        if (fgSynWinner(c, rd, guarded)) {
-            if (guarded) InterlockedAdd(gCount[2], 1u);
-            off = rd - float2(c);
-            if (any(abs(off) > kMaxOffset)) InterlockedAdd(gCount[3], 1u);
-            off = clamp(off, -kMaxOffset, kMaxOffset);
-        } else {
+        if (KeyT.Load(int3(id.x, id.y, 0)) == 0u) {
             hole = true;
-            off = float2(kNoRead, 0.0);
+            ReadOut[id.xy] = synPackOffset(float2(kNoRead, 0.0));
+            InterlockedAdd(gCount[0], 1u);
+            InterlockedAdd(gCount[2], 1u, rank);
+        } else if (synIsGuarded(ReadOut[id.xy])) {
             InterlockedAdd(gCount[1], 1u);
-            InterlockedAdd(gCount[4], 1u, rank);
         }
-        ReadOut[id.xy] = off;
     }
     GroupMemoryBarrierWithGroupSync();
-    if (gi == 0 && gCount[4] != 0u) InterlockedAdd(Stats[kHoleCount], gCount[4], gHoleBase);
-    if (gi < 4 && gCount[gi] != 0u) InterlockedAdd(Stats[kCountBase + gi], gCount[gi]);
+    if (gi == 0 && gCount[2] != 0u) InterlockedAdd(Stats[kHoleCount], gCount[2], gHoleBase);
+    if (gi == 1 && gCount[0] != 0u) InterlockedAdd(Stats[kCountBase + 1], gCount[0]);
+    if (gi == 2 && gCount[1] != 0u) InterlockedAdd(Stats[kCountBase + 2], gCount[1]);
     GroupMemoryBarrierWithGroupSync();
     if (hole) {
         uint slot = gHoleBase + rank;
@@ -336,7 +404,7 @@ void fgSynHoles(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
         if (fgSynFill(c, rd)) {
             float2 off = rd - float2(c);
             if (any(abs(off) > kMaxOffset)) InterlockedAdd(gFill[1], 1u);
-            ReadOut[uint2(c)] = clamp(off, -kMaxOffset, kMaxOffset);
+            ReadOut[uint2(c)] = synPackOffset(clamp(off, -kMaxOffset, kMaxOffset));
             InterlockedAdd(gFill[0], 1u);
         }
     }
@@ -354,7 +422,7 @@ void fgSynResample(uint3 id : SV_DispatchThreadID) {
     float2 scale = float2(sz.z, sz.w) / float2(sz.x, sz.y);
     float2 ci = (float2(id.xy) + 0.5) / scale - 0.5;       // this output pixel's centre in render pixels
     int2 c = clamp(int2(floor(ci + 0.5)), int2(0, 0), int2(sz.x, sz.y) - 1);
-    float2 off = ReadT.Load(int3(c.x, c.y, 0));
+    float2 off = synUnpackOffset(ReadT.Load(int3(c.x, c.y, 0)));
     float2 r = (off.x < kNoRead * 0.5) ? ci : ci + off;       // the read position is the pixel's own plus its offset
     SOut[id.xy] = synBilinear(Out, (r + 0.5) * scale, int2(sz.z, sz.w));
 }

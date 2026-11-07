@@ -48,8 +48,9 @@ constexpr uint32_t kFrameGenSynthStatsUints = kFrameGenSynthStatsHoles + 1;   //
 // The shader computes the same (fgSynHoleCapacity).
 inline uint32_t frameGenSynthHoleCapacity(uint32_t rw, uint32_t rh) { return (rw * rh) / 8u; }
 
-// The read offsets (the source B position minus the S pixel centre, render pixels) are stored as two half floats: exact to 1/16 px up to 256 px, to 1/8 px up to 512 px, to 1/2 px up
-// to 2048 px. An offset past kFrameGenSynthMaxOffset on either axis is clamped to it (a wrong read, counted in the clamp stat); kFrameGenSynthNoRead on x marks a pixel with nothing to read.
+// The read offsets (the source B position minus the S pixel centre, render pixels) are stored as two half floats packed in a uint, rounded toward zero (framegen_synth_shader.h
+// synHalfBits): exact to 1/8 px up to 256 px, to 1/4 px up to 512 px, to 1 px up to 2048 px. An offset past kFrameGenSynthMaxOffset on either axis is clamped to it (a wrong read,
+// counted in the clamp stat); kFrameGenSynthNoRead on x marks a pixel with nothing to read.
 constexpr float kFrameGenSynthMaxOffset = 2000.0f;
 constexpr float kFrameGenSynthNoRead = -4096.0f;
 

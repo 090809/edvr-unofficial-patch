@@ -22,20 +22,19 @@ enum FrameGenSynthEntry : int { kFgSynSplat = 0, kFgSynSrc, kFgSynResolve, kFgSy
 constexpr const char* const kFrameGenSynthEntryNames[kFrameGenSynthEntries] = {"fgSynSplat", "fgSynSrc", "fgSynResolve", "fgSynHoles", "fgSynResample", "fgSynLuma", "fgSynScore"};
 constexpr const char* const kFrameGenSynthStepLabels[kFrameGenSynthSteps] = {"splat", "src", "resolve", "holes", "resample", "luma", "score", "clear"};
 
-// One eye's views for a call. The inputs: B's output (the upscaler's, before the interface; C's on a score), B's depth copy, the DLSS vectors. The synth's own: the key and source
-// grids, the read offsets and the hole list (render size, scratch), S (output size), the kept S luma and B's luma and class (quarter grid), the stats words.
+// One eye's views for a call. The inputs: B's output (the upscaler's, before the interface; C's on a score), B's depth copy, the DLSS vectors. The synth's own: the key grid
+// (R32_UINT), the read offsets (R32_UINT, two packed half floats) and the hole list (render size, scratch), S (output size), the kept S luma and B's luma and class (quarter
+// grid), the stats words.
 struct FrameGenSynthPassViews {
     ID3D11ShaderResourceView* out = nullptr;
     ID3D11ShaderResourceView* depth = nullptr;
     ID3D11ShaderResourceView* mv = nullptr;
     ID3D11ShaderResourceView* keySrv = nullptr;
-    ID3D11ShaderResourceView* srcSrv = nullptr;
     ID3D11ShaderResourceView* readSrv = nullptr;
     ID3D11ShaderResourceView* sSrv = nullptr;
     ID3D11ShaderResourceView* sLumaSrv = nullptr;
     ID3D11ShaderResourceView* bInfoSrv = nullptr;
     ID3D11UnorderedAccessView* keyUav = nullptr;
-    ID3D11UnorderedAccessView* srcUav = nullptr;
     ID3D11UnorderedAccessView* readUav = nullptr;
     ID3D11UnorderedAccessView* holesUav = nullptr;   // frameGenSynthHoleCapacity(rw, rh) uints
     ID3D11UnorderedAccessView* sUav = nullptr;
@@ -47,8 +46,9 @@ struct FrameGenSynthPassViews {
     uint32_t qw = 0, qh = 0;   // the quarter grid
 };
 
-// The sequence of one call: the clear (the key grid and the stats words to 0 by the API; the source grid needs none, framegen_synth_shader.h); the score of the kept f = 1 S
-// against this frame when `score`; then, when `build`, splat, source, resolve, holes, resample and, when `keep`, the luma pass that keeps this f = 1 S for the next frame.
+// The sequence of one call: the clear (the key grid and the stats words to 0 by the API; the read offsets need none, framegen_synth_shader.h); the score of the kept f = 1 S
+// against this frame when `score`; then, when `build`, splat, source (the winners' read offsets), resolve (the holes listed), holes, resample and, when `keep`, the luma pass
+// that keeps this f = 1 S for the next frame.
 // `after(int step)` runs after the clear and after each dispatch (the bench's timestamps). Every dispatch starts with nothing bound from the last (a resource still bound as a
 // UAV would silently null the SRV set for it), and nothing stays bound at the end.
 template <class After>
@@ -85,18 +85,18 @@ inline void frameGenSynthRunPasses(ID3D11DeviceContext* ctx, ID3D11ComputeShader
             ID3D11UnorderedAccessView* uav[kFrameGenSynthUavSlots] = {nullptr, v.keyUav};
             dispatch(kFgSynSplat, srv, uav, rgx, rgy);
         }
-        {   // source: each footprint pixel whose final key is the pixel's own takes the pixel's index
+        {   // source: each footprint pixel whose final key is the pixel's own takes the pixel's read offset, guarded (a guarded one marked); the clamp count
             ID3D11ShaderResourceView* srv[kFrameGenSynthSrvSlots] = {nullptr, v.depth, v.mv, nullptr, v.keySrv};
-            ID3D11UnorderedAccessView* uav[kFrameGenSynthUavSlots] = {nullptr, nullptr, v.srcUav};
+            ID3D11UnorderedAccessView* uav[kFrameGenSynthUavSlots] = {nullptr, nullptr, nullptr, v.readUav, nullptr, v.statsUav};
             dispatch(kFgSynSrc, srv, uav, rgx, rgy);
         }
-        {   // resolve: the offset every S pixel reads at and the guard; the holes listed
-            ID3D11ShaderResourceView* srv[kFrameGenSynthSrvSlots] = {nullptr, v.depth, v.mv, nullptr, v.keySrv, v.srcSrv};
+        {   // resolve: the holes (no key) marked, counted and listed; the guarded pixels counted
+            ID3D11ShaderResourceView* srv[kFrameGenSynthSrvSlots] = {nullptr, nullptr, nullptr, nullptr, v.keySrv};
             ID3D11UnorderedAccessView* uav[kFrameGenSynthUavSlots] = {v.holesUav, nullptr, nullptr, v.readUav, nullptr, v.statsUav};
             dispatch(kFgSynResolve, srv, uav, rgx, rgy);
         }
-        {   // holes: the background pull for the listed holes, one thread each; the groups past the count return at once
-            ID3D11ShaderResourceView* srv[kFrameGenSynthSrvSlots] = {nullptr, v.depth, v.mv, nullptr, v.keySrv, v.srcSrv};
+        {   // holes: the background pull for the listed holes, one thread each (the neighbours' offsets read through the UAV); the groups past the count return at once
+            ID3D11ShaderResourceView* srv[kFrameGenSynthSrvSlots] = {nullptr, v.depth, v.mv, nullptr, v.keySrv};
             ID3D11UnorderedAccessView* uav[kFrameGenSynthUavSlots] = {v.holesUav, nullptr, nullptr, v.readUav, nullptr, v.statsUav};
             dispatch(kFgSynHoles, srv, uav, (frameGenSynthHoleCapacity(v.rw, v.rh) + 63u) / 64u, 1u);
         }

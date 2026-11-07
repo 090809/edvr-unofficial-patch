@@ -85,13 +85,13 @@ inline std::string formatFrameGenSynthArmed(uint32_t rw, uint32_t rh, uint32_t o
 // ---- the VRAM line ----
 // Said once per eye when the eye's textures are made (framegen_synth.cpp createEye, then ensureScratch), from the descriptors of what was made, as the scorer's line is
 // (framegen_shadow_report.h FrameGenShadowVram); tools\framegen_synth_bench prints the same line from its own textures. The eye's groups: S (output size, the upscaler's format),
-// the kept S luma, B's luma and class (both the quarter grid), the stats words with their staging copies. The scratch, shared by the eyes: the key grid, the source grid, the
-// read offsets (render size) and the hole list.
+// the kept S luma, B's luma and class (both the quarter grid), the stats words with their staging copies. The scratch, shared by the eyes: the key grid, the read offsets (render
+// size, both R32_UINT) and the hole list.
 struct FrameGenSynthVram {
     uint64_t s = 0, luma = 0, cls = 0, stats = 0;
-    uint64_t key = 0, src = 0, read = 0, holes = 0;
+    uint64_t key = 0, read = 0, holes = 0;
     uint64_t eye() const { return s + luma + cls + stats; }
-    uint64_t scratch() const { return key + src + read + holes; }
+    uint64_t scratch() const { return key + read + holes; }
     uint64_t total() const { return 2u * eye() + scratch(); }
 };
 
@@ -100,8 +100,8 @@ constexpr const char* kFrameGenSynthVramFmt =
 
 inline std::string formatFrameGenSynthVram(uint32_t eye, const FrameGenSynthVram& v) {
     const FrameGenVramGroup eg[] = {{"s", v.s}, {"luma", v.luma}, {"class", v.cls}, {"stats", v.stats}};
-    const FrameGenVramGroup sg[] = {{"key", v.key}, {"src", v.src}, {"read", v.read}, {"holes", v.holes}};
-    const std::string e = formatFrameGenVramGroups(eg, 4), s = formatFrameGenVramGroups(sg, 4);
+    const FrameGenVramGroup sg[] = {{"key", v.key}, {"read", v.read}, {"holes", v.holes}};
+    const std::string e = formatFrameGenVramGroups(eg, 4), s = formatFrameGenVramGroups(sg, 3);
     char buf[400];
     std::snprintf(buf, sizeof(buf), kFrameGenSynthVramFmt, static_cast<unsigned>(eye), static_cast<unsigned long long>(v.eye()), frameGenMiB(v.eye()), e.c_str(),
                   static_cast<unsigned long long>(v.scratch()), frameGenMiB(v.scratch()), s.c_str(), static_cast<unsigned long long>(v.total()), frameGenMiB(v.total()));

@@ -121,10 +121,10 @@ void caseLines() {
     // The VRAM line: the eye's groups and the shared scratch's in order, each with its total, then two eyes and the scratch, bytes and MiB.
     FrameGenSynthVram v;
     v.s = 49038336; v.luma = 862920; v.cls = 3451680; v.stats = 12060;
-    v.key = 27584064; v.src = 27584064; v.read = 27584064; v.holes = 3448008;
+    v.key = 27584064; v.read = 27584064; v.holes = 3448008;
     checkText(formatFrameGenSynthVram(0, v),
-              "frame generation (synth): eye 0 VRAM 53364996 B (50.9 MiB): s=49038336 luma=862920 class=3451680 stats=12060; shared scratch 86200200 B (82.2 MiB): "
-              "key=27584064 src=27584064 read=27584064 holes=3448008; two eyes and the scratch 192930192 B (184.0 MiB)",
+              "frame generation (synth): eye 0 VRAM 53364996 B (50.9 MiB): s=49038336 luma=862920 class=3451680 stats=12060; shared scratch 58616136 B (55.9 MiB): "
+              "key=27584064 read=27584064 holes=3448008; two eyes and the scratch 165346128 B (157.7 MiB)",
               "the VRAM line");
 }
 
