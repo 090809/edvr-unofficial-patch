@@ -293,6 +293,9 @@ the setting is game or absent.
 The frame generation shadow (fix.frame_generation_shadow, TEMPORARY, Phase 1 of the frame-generation design) is another: the graphics log's "frame generation (shadow):" lines, an
 armed line once and a report line every second. It says OK when a report line is in the window, NEVER APPLIED when the armed line is there and no report line is, and nothing
 at all in a log with neither (the key off).
+The frame generation synthesizer (Phase 2.1, the same key) is the next rule, "frame generation synth": the graphics log's "frame generation (synth):" lines, an armed line once and
+a report line every second. It says OK when a report line shows frames built, NEVER APPLIED when the shadow scorer is armed (or reporting) and no synth line follows, when the synth
+armed and never reported, or when it reported only calls that built nothing (frames=0/0), and nothing at all in a log with neither it nor the scorer (the key off).
 The SRV turret view (experimental.srv_turret_camera_back, experimental.srv_turret_hud_forward, experimental.srv_turret_radar_forward, experimental.srv_turret_panels_back, experimental.srv_turret_radar_back, experimental.srv_turret_hud_gap, experimental.srv_turret_hud_depth, experimental.srv_turret_hud_scissor) is the third: the graphics log's "srv turret ..." lines. The settings lines and the vehicle latch's lines
 ("srv turret: the vehicle is the Scorpion|not the Scorpion (event X)", written by the journal watcher) are kept whatever --since says; the last vehicle line is said in the detail, and
 vehicle lines alone are not the rule's lines (nothing is said for them). The pass acts in the Scorpion only: when the turret view bit is on in an SRV the journal does not call the Scorpion
@@ -10641,6 +10644,17 @@ H_FRAMEGEN_REPORT = (r"frame generation \(shadow\): frames=(?P<frames>\d+) skipp
 H_FRAMEGEN_EXTRAP = (r"frame generation \(shadow\) extrapolation: ex2d=(?P<x2_n>\d+)" + "".join(_HFG_SET_CLASS.format(n=n, p="x2_") for n in ("far", "cockpit", "world")) +
                      r" ex2dh=(?P<xh_n>\d+)" + "".join(_HFG_SET_CLASS.format(n=n, p="xh_") for n in ("far", "cockpit", "world")) +
                      r" rowsoff_world=(?P<rows_world>[\d.]+%|-) rowsoff_cockpit=(?P<rows_cockpit>[\d.]+%|-)$")
+# Frame generation, Phase 2.1 (the synthesizer, the same key; src\common\framegen_synth_report.h): its armed line (once per key-on, said when the first eye's textures are made) and its
+# one-second line, graphics-log lines with no build tag, read the way the scorer's are. The report is frames=<f=0.5 built>/<f=1 built> scored=<f=1 frames scored against the next real
+# frame> skipped=<calls that built nothing> gpu_ms=<f=0.5 median/max(n=)>/<f=1 ...> holes=<filled>%/<left>% guard=<%>, then the scorer's three class fields (the f = 1 S against the next frame).
+H_FRAMEGEN_SYNTH = "frame generation synth"
+H_FRAMEGEN_SYNTH_LABEL = "frame generation (synth):"
+H_FRAMEGEN_SYNTH_ARMED = (r"frame generation \(synth\): armed, render (?P<rw>\d+)x(?P<rh>\d+) output (?P<ow>\d+)x(?P<oh>\d+) per eye, S format (?P<fmt>\d+), "
+                          r"f=0.5 built on the even frames and f=1 scored against the next real frame \(nothing is shown\)$")
+_HFGS_GPU = r"(?:(?P<{p}_med>[\d.]+)/(?P<{p}_max>[\d.]+)\(n=(?P<{p}_n>[1-9]\d*)\)|-\(n=0\))"
+H_FRAMEGEN_SYNTH_REPORT = (r"frame generation \(synth\): frames=(?P<f05>\d+)/(?P<f1>\d+) scored=(?P<scored>\d+) skipped=(?P<skipped>\d+) gpu_ms=" + _HFGS_GPU.format(p="g05") + "/" +
+                           _HFGS_GPU.format(p="g1") + r" holes=(?P<filled>[\d.]+)%/(?P<left>[\d.]+)% guard=(?P<guard>[\d.]+)%" +
+                           "".join(_HFG_CLASS.format(n=n) for n in ("far", "cockpit", "world")) + "$")
 # The SRV turret view (issue 140; src\d3d11\srv_turret.cpp, the vehicle latch's line in journal_watch.cpp, and the geometry shader's creation line in shader_swap.cpp, shaderSwapCreateGs,
 # called with who "srv turret hud"): lines of the graphics log with no build tag, read the way the desktop window's are. The settings and vehicle lines are state, so health_scan keeps
 # every one whatever --since says; the rest are events and are cut by the window. Every kind of line the DLL writes has a pattern of its own, so a labelled line that none matches is
@@ -10709,7 +10723,7 @@ H_F125_LABEL = "native on foot log (F125)"
 H_F125_RE = re.compile(r"native on foot log \(F125\): detail (?P<detail>on|off), summary window (?P<wl>\d+) s")
 # Rules whose absence says nothing about a feature, so a log without their lines does not list them as not present: every log written before F125 has no F125
 # line, and its report stays as it was.
-HEALTH_QUIET_WHEN_ABSENT = frozenset((H_F125, H_WORLD, H_DESKTOP, H_SRV_TURRET, H_FRAMEGEN))   # the frame generation shadow is off by default and says nothing then; world scale writes nothing while the value stays 100; the desktop window nothing while the setting is game; the SRV turret view nothing in a log with no VR profile
+HEALTH_QUIET_WHEN_ABSENT = frozenset((H_F125, H_WORLD, H_DESKTOP, H_SRV_TURRET, H_FRAMEGEN, H_FRAMEGEN_SYNTH))   # the frame generation shadow is off by default and says nothing then; world scale writes nothing while the value stays 100; the desktop window nothing while the setting is game; the SRV turret view nothing in a log with no VR profile
 
 # ---- F125: summary windows (the on-foot log diet) ----
 # By default an on-foot summary line covers a window of 10 s, 1 s with log.on_foot_detail = on, and 1 to 10 s when a window is flushed early (a held-item change,
@@ -16909,6 +16923,41 @@ def _hj_framegen_shadow(rows, ctx=None):
     return ("OK", text)
 
 
+def _hj_framegen_synth(rows, ctx=None):
+    """Frame generation, Phase 2.1 (the synthesizer, riding fix.frame_generation_shadow): ran is the shadow scorer's armed (or report) line, applied is a synth report line with
+    frames built. NEVER APPLIED when the scorer is armed and no synth line follows, when the synth armed and never reported, or when it reported only calls that built nothing
+    (frames=0/0: it was called and no depth copy or vectors reached it); None (nothing said) when neither the scorer nor the synth left a line, which is the key off."""
+    armed = rows.get("armed", [])
+    reports = rows.get("report", [])
+    shadow = (ctx or {}).get(H_FRAMEGEN, {})
+    shadow_on = bool(shadow.get("armed")) or bool(shadow.get("report"))
+    if not armed and not reports:
+        if not shadow_on:
+            return None
+        return ("NEVER APPLIED", "the shadow scorer is armed or reporting (fix.frame_generation_shadow on) but there is no 'frame generation (synth):' line at all: the synthesizer never ran "
+                                 "(the d3d11.dll is older than Phase 2.1, it stood down before its first line, or its report path is dead)")
+    if not reports:
+        return ("NEVER APPLIED", "the synthesizer armed (render %sx%s, output %sx%s per eye) but no 'frame generation (synth): frames=' report line follows in the window: it built nothing "
+                                 "that reached a report" % (armed[-1]["rw"], armed[-1]["rh"], armed[-1]["ow"], armed[-1]["oh"]))
+    built = [(int(r["f05"]), int(r["f1"])) for r in reports]
+    n05, n1 = sum(b[0] for b in built), sum(b[1] for b in built)
+    scored, skipped = sum(int(r["scored"]) for r in reports), sum(int(r["skipped"]) for r in reports)
+    if n05 + n1 == 0:
+        return ("NEVER APPLIED", "the synthesizer was called (%d call(s) in %d report line(s)) and built no frame: no depth copy or DLSS vectors reached it" % (skipped, len(reports)))
+    text = "%d report line(s), %d frame(s) built at f=0.5 and %d at f=1, %d scored against the next real frame, %d call(s) built nothing" % (len(reports), n05, n1, scored, skipped)
+    if armed:
+        text += "; armed at render %sx%s, output %sx%s per eye" % (armed[-1]["rw"], armed[-1]["rh"], armed[-1]["ow"], armed[-1]["oh"])
+    else:
+        text += "; the armed line is before the window"
+    text += "; holes filled %.2f%% / left %.2f%% of the render pixels (mean), guard %.2f%%" % tuple(sum(float(r[k]) for r in reports) / len(reports) for k in ("filled", "left", "guard"))
+    withScore = [r for r in reports if int(r["scored"]) > 0]
+    if withScore:
+        text += "; f=1 S against the next frame: p95 error far %s / cockpit %s / world %s milli-luma, no warp %s / %s / %s (mean of %d line(s))" % (
+            tuple(sum(int(r[c + "_p95"]) for r in withScore) // len(withScore) for c in ("far", "cockpit", "world")) +
+            tuple(sum(int(r[c + "_idp95"]) for r in withScore) // len(withScore) for c in ("far", "cockpit", "world")) + (len(withScore),))
+    return ("OK", text)
+
+
 SRV_TURRET_REFUSE_NAMES = ("no-eye", "game-gs", "topology", "not-ready", "no-geometry")   # the order of the 10 s line's refused[...] counts (srv_turret_math.h refuseName)
 SRV_TURRET_HUD_MIN_SECS = 12.0   # the turret view this long with no 10 s line and no first draw: the HUD half never ran (a 10 s line is due within 10 s of the view going on, and the first draw within a frame)
 SRV_TURRET_BOUND_MIN = 0.9       # the share of the 10 s lines' HUD draws that must go through the shader
@@ -18093,6 +18142,11 @@ HEALTH_RULES = (
         ("extrap", H_FRAMEGEN_EXTRAP),
         ("pose", H_FRAMEGEN_POSE),
     ), _hj_framegen_shadow),
+    # Frame generation, Phase 2.1 (TEMPORARY): the synthesizer's armed line and one-second report, read the scorer's way; it judges against the scorer's rows (the key is the same).
+    _hrule(H_FRAMEGEN_SYNTH, (), (H_FRAMEGEN_SYNTH_LABEL,), (
+        ("armed", H_FRAMEGEN_SYNTH_ARMED),
+        ("report", H_FRAMEGEN_SYNTH_REPORT),
+    ), _hj_framegen_synth),
     # The SRV turret view (issue 140): lines of the graphics log that carry no build tag (health_scan reads them, as it reads the desktop window's, before it drops the untagged lines).
     _hrule(H_SRV_TURRET, (), H_SRV_TURRET_LABELS, (
         ("setting", H_SRV_TURRET_SETTING),
@@ -18165,6 +18219,7 @@ def health_scan(text, since=None, until=None):
     )
     desktop = next(r for r in HEALTH_RULES if r.name == H_DESKTOP)
     framegen = next(r for r in HEALTH_RULES if r.name == H_FRAMEGEN)
+    synth = next(r for r in HEALTH_RULES if r.name == H_FRAMEGEN_SYNTH)
     turret =next(r for r in HEALTH_RULES if r.name == H_SRV_TURRET)
     for raw in text.splitlines():
         if "srv turret" in raw and any(label in raw for label in H_SRV_TURRET_LABELS):
@@ -18180,6 +18235,22 @@ def health_scan(text, since=None, until=None):
                     break
             else:
                 u = unparsed[H_SRV_TURRET]
+                u[0] += 1
+                u[1] = u[1] or raw.strip()[:160]
+            continue
+        if H_FRAMEGEN_SYNTH_LABEL in raw:
+            # The synthesizer's lines carry no build tag either. The armed line is state, kept whatever --since says; the report lines are events and are cut by the window.
+            sm = HEALTH_STAMP_RE.match(raw)
+            tod = int(sm.group(1)) * 3600 + int(sm.group(2)) * 60 + int(sm.group(3)) + int(sm.group(4)) / 1000.0 if sm else None
+            body = raw[sm.end():] if sm else raw
+            for kind, rx in synth.kinds:
+                g = rx.search(body)
+                if g:
+                    if kind == "armed" or _health_in_window(tod, since, until):
+                        rows[H_FRAMEGEN_SYNTH].setdefault(kind, []).append(dict(g.groupdict(), _t=tod))
+                    break
+            else:
+                u = unparsed[H_FRAMEGEN_SYNTH]
                 u[0] += 1
                 u[1] = u[1] or raw.strip()[:160]
             continue
@@ -25109,8 +25180,29 @@ def self_test_health():
             xh = "".join(RF(" %s=%.1f%%,%u", n, 10.0, 12, 8, xh_p95, 5.5, 1.5, 9, 30) for n in ("far", "cockpit", "world"))
             return RF("frame generation (shadow) extrapolation: ex2d=%u", 29) + x2 + RF(" ex2dh=%u", 29) + xh + RF(" rowsoff_world=%s rowsoff_cockpit=%s", *rows)
 
-        FG, fg_ok = H_FRAMEGEN, [f90_part()]
-        check("frame generation shadow: no line at all, nothing said (the key off)", fg_ok, 0, [("OK", F90S)], lacks=["frame generation", "NEVER APPLIED"])
+        # The synthesizer's armed and one-second lines (Phase 2.1), rendered from the C format strings in src\common\framegen_synth_report.h.
+        fgssrc = read_text(os.path.join(repo_root(), "src", "common", "framegen_synth_report.h"))
+
+        def RS(needle, *vals):
+            key = "fgs:" + needle
+            if key not in fmts:
+                fmts[key] = health_c_format(fgssrc, needle)
+            if fmts[key] is None:
+                raise AssertionError("frame generation synth: no log format holds %r: the --health rule that reads it is out of date" % needle)
+            return health_render(fmts[key], vals)
+
+        def fg_synth_armed(rw=612, rh=699, ow=1224, oh=1398, fmt=10):
+            return RS("frame generation (synth): armed, render %ux%u", rw, rh, ow, oh, fmt)
+
+        def fg_synth_report(f05=40, f1=39, scored=38, skipped=2, timed=True, p95=20, filled=0.25, left=0.01, guard=1.5):
+            cls = "".join(RF(" %s=%.1f%%,%u", n, 10.0, 12, 8, p95, 5.5, 1.5, 9, 30) for n in ("far", "cockpit", "world"))
+            gpu = RF("%.2f/%.2f(n=%u)", 0.31, 0.8, 40) if timed else health_c_format(fgsrc, "-(n=0)")
+            return RS("frame generation (synth): frames=%u/%u scored=%u skipped=%u", f05, f1, scored, skipped) + RS(" gpu_ms=%s/%s holes=%.2f%%/%.2f%% guard=%.2f%%", gpu, gpu, filled, left, guard) + cls
+
+        # fg_off is a log with the key off; fg_ok is one with the key on, whose scorer lines the synthesizer's lines must accompany (its rule judges against them).
+        FG, FGS, fg_off = H_FRAMEGEN, H_FRAMEGEN_SYNTH, [f90_part()]
+        fg_ok = fg_off + [fg_synth_armed(), fg_synth_report()]
+        check("frame generation shadow: no line at all, nothing said (the key off)", fg_off, 0, [("OK", F90S)], lacks=["frame generation", "NEVER APPLIED"])
         check("frame generation shadow: armed and reporting is OK", fg_ok + [fg_armed(), fg_report(), fg_report(frames=58)], 0, [("OK", FG)],
               has=["2 report line(s), 118 frame(s) scored, 30 skipped; armed at quarter 612x699 per eye"], lacks=["UNPARSED"])
         check("frame generation shadow: a line with the oracle and jump sets and the motion facts is OK and says oracle world p95 against the prediction's",
@@ -25136,7 +25228,7 @@ def self_test_health():
               has=["line(s) the rule's patterns do not match"])
         check("frame generation shadow: armed and no report line is NEVER APPLIED", fg_ok + [fg_armed()], 3, [("NEVER APPLIED", FG)],
               has=["the key was on (armed, quarter 612x699 per eye) but no 'frame generation (shadow): frames=' report line follows", "exit 3"])
-        check("frame generation shadow: the armed line before --since still counts as armed", fg_ok + [(1, fg_armed()), (70, fg_report())], 0, [("OK", FG)],
+        check("frame generation shadow: the armed line before --since still counts as armed", fg_ok + [(1, fg_armed()), (70, fg_report()), (70, fg_synth_report())], 0, [("OK", FG)],
               has=["1 report line(s), 60 frame(s) scored"], extra=["--since", "10:01:00"])
         check("frame generation shadow: a report line without the armed line is OK, and says so", fg_ok + [fg_report()], 0, [("OK", FG)], has=["the armed line is before the window"])
         check("frame generation shadow: a drifted report line is UNPARSED, not a report", fg_ok + [fg_armed(), fg_report().replace("holes=", "gaps=")], 3, [("NEVER APPLIED", FG)],
@@ -25161,8 +25253,30 @@ def self_test_health():
         check("frame generation shadow: no runtime log read leaves the pose part unjudged, and says so", fg_all, 0, [("OK", FG)], has=["the runtime log was not read, so the pose measure is not judged"])
         check("frame generation shadow: a drifted pose line is not a pose line", fg_all, 3, [("NEVER APPLIED", FG)],
               has=["line(s) the rule's patterns do not match"], extra=["--runtime-file", runtime([fg_pose().replace("refused=", "denied=")])])
-        check("frame generation shadow: no scorer line and no pose line, nothing said (the key off)", fg_ok, 0, [("OK", F90S)], lacks=["frame generation", "NEVER APPLIED"],
+        check("frame generation shadow: no scorer line and no pose line, nothing said (the key off)", fg_off, 0, [("OK", F90S)], lacks=["frame generation", "NEVER APPLIED"],
               extra=["--runtime-file", runtime(["native_frame: unrelated runtime line"])])
+
+        # The synthesizer's own rule: the scorer armed or reporting and a synth line beside it is OK; the scorer without one, or a synth that never built a frame, is NEVER APPLIED.
+        check("frame generation synth: armed and reporting beside the scorer is OK and says the frames, the scores and the shares",
+              fg_off + [fg_armed(), fg_report(), fg_synth_armed(), fg_synth_report(), fg_synth_report(f05=41, f1=40, scored=39, p95=24)], 0, [("OK", FGS)],
+              has=["2 report line(s), 81 frame(s) built at f=0.5 and 79 at f=1, 77 scored against the next real frame, 4 call(s) built nothing; armed at render 612x699, output 1224x1398 per eye",
+                   "holes filled 0.25% / left 0.01% of the render pixels (mean), guard 1.50%", "p95 error far 22 / cockpit 22 / world 22 milli-luma, no warp 30 / 30 / 30 (mean of 2 line(s))"], lacks=["UNPARSED"])
+        check("frame generation synth: a report line with no gpu timing (\"-(n=0)\") and no scored frame is OK", fg_off + [fg_armed(), fg_report(), fg_synth_armed(), fg_synth_report(timed=False, scored=0)], 0, [("OK", FGS)],
+              has=["1 report line(s)", "0 scored"], lacks=["UNPARSED", "f=1 S against the next frame"])
+        check("frame generation synth: the scorer armed and reporting and no synth line at all is NEVER APPLIED", fg_off + [fg_armed(), fg_report()], 3, [("NEVER APPLIED", FGS)],
+              has=["the shadow scorer is armed or reporting (fix.frame_generation_shadow on) but there is no 'frame generation (synth):' line at all", "exit 3"])
+        check("frame generation synth: armed and no report line is NEVER APPLIED", fg_off + [fg_armed(), fg_report(), fg_synth_armed()], 3, [("NEVER APPLIED", FGS)],
+              has=["the synthesizer armed (render 612x699, output 1224x1398 per eye) but no 'frame generation (synth): frames=' report line follows"])
+        check("frame generation synth: a report of calls that built nothing (frames=0/0) is NEVER APPLIED", fg_off + [fg_armed(), fg_report(), fg_synth_armed(), fg_synth_report(f05=0, f1=0, scored=0, skipped=7, timed=False)], 3,
+              [("NEVER APPLIED", FGS)], has=["the synthesizer was called (7 call(s) in 1 report line(s)) and built no frame"])
+        check("frame generation synth: a drifted report line is counted as unparsed, not read as a report", fg_off + [fg_armed(), fg_report(), fg_synth_armed(), fg_synth_report().replace("guard=", "grd=")], 3,
+              [("NEVER APPLIED", FGS)], has=["+1 line(s) the rule's patterns do not match"])
+        check("frame generation synth: a drifted armed line is counted as unparsed beside the report it precedes", fg_off + [fg_armed(), fg_report(), fg_synth_armed().replace("per eye", "a eye"), fg_synth_report()], 0,
+              [("OK", FGS)], has=["1 report line(s)", "the armed line is before the window", "+1 line(s) the rule's patterns do not match"])
+        check("frame generation synth: the armed line before --since still counts as armed", fg_off + [(1, fg_armed()), (1, fg_synth_armed()), (70, fg_report()), (70, fg_synth_report())], 0, [("OK", FGS)],
+              has=["1 report line(s)", "armed at render 612x699"], extra=["--since", "10:01:00"])
+        check("frame generation synth: a synth line with no scorer line is OK (the scorer's rule says nothing)", fg_off + [fg_synth_armed(), fg_synth_report()], 0, [("OK", FGS)], lacks=["UNPARSED"])
+        check("frame generation synth: no synth line and no scorer line, nothing said (the key off)", fg_off, 0, [("OK", F90S)], lacks=["frame generation synth", "NEVER APPLIED"])
 
         # ---- the SRV turret view: the graphics log's untagged lines, rendered from the C format strings in src\d3d11\srv_turret.cpp and (the geometry shader's creation line) shader_swap.cpp ----
         stsrc = read_text(os.path.join(repo_root(), "src", "d3d11", "srv_turret.cpp"))
