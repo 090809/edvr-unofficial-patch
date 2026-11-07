@@ -51,8 +51,8 @@
   own smoothing off and then on. This is the visual reference to beat.
 - **Next: fly the flight 11 fix** (the game's frame sequences skip the S slots;
   `frame generation lock: replayed B:` names each replay). Lock 2:1 flown once.
-  Built, not flown: S's edges in a ship turn (sentinel vectors, dilated vectors).
-  H1, H8, H9 and the surface classifier are still unbuilt; on foot unflown.
+  Built, not flown: S's edges in a ship turn (sentinel vectors, dilated vectors);
+  S resampled Catmull-Rom (`FG_SHARP`; S/B sharpness 0.82 -> 0.94). H1, H8, H9 and the surface classifier are still unbuilt; on foot unflown.
 - **Temporary keys (hidden):** `fix.frame_generation_shadow` (off | on), and
   `fix.frame_generation` (off | on; built 2.3: `on` forces Lock, for A/B
   flights; `auto` replaces it in 2.4).
@@ -1361,6 +1361,56 @@ The bench's f = 0.5 S of replay f4 reproduces both, pixel for pixel in place.
 - **Flight signature:** in a ship turn with the hull in view, no lattice
   beside the hull's edges and the outline whole in S; the synth line's
   `holes=` filled and left both lower than in flight 12.
+
+### 2026-11-07: S softer than B under Lock: the resample (built, not flown)
+
+The lead measured three eye dumps of this build (225459033001, 225515258002,
+225627723003): the finished S has 64-98% (typically ~80%) of the finished B's
+mean |Laplacian| of luma, the cockpit worst (0.64-0.92) though it moves with
+the head only. Under Lock the pilot sees sharp and soft alternate. Lock itself
+held (251 of 263 s engaged).
+
+- **Measure (bench):** `framegen_synth_bench --replay` now prints S's
+  sharpness against B (mean |Laplacian| of luma, S over B, per class of the B
+  pixel each S pixel reads; f = 0.5 and f = 1) and `--define NAME=V` compiles
+  a shader switch as V. 22 replays (all of 15:26-23:03, 8-bit `dlOut`, no
+  RCAS). Medians over replays, the shown f = 0.5 S:
+
+  | Resample | far | cockpit | world | all | resample ms/eye |
+  |---|---|---|---|---|---|
+  | bilinear (before) | 0.815 | 0.833 | 0.791 | 0.819 | 0.091 |
+  | Catmull-Rom, 2x2 clamp (chosen) | 0.921 | 0.944 | 0.913 | 0.937 | 0.171 |
+  | Catmull-Rom, 4x4 clamp | 0.922 | 0.946 | 0.915 | 0.939 | - |
+  | Catmull-Rom, unclamped | 0.923 | 0.952 | 0.917 | 0.942 | 0.156 |
+  | Lanczos-2, 2x2 clamp | 0.921 | 0.945 | 0.914 | 0.937 | 0.212 |
+
+  Cockpit per replay 0.806-0.898 before, 0.927 and up after; the highest replay
+  1.011 (target ~1.0, not over 1.1). Time: `--bench --frame
+  fgreplay_225515258002:4`, the whole f = 0.5 build 0.481 -> 0.570 ms an eye.
+- **Scores:** the raw and turned scores against the next frame are unchanged
+  to the milli-luma (median per-replay change of every class mean 0; the sum of
+  raw world p95 over 22 replays 1960 -> 1986, turned world 1146 -> 1135);
+  holes and guard identical. Bilinear through the new read position equals the
+  old code's scores exactly.
+- **Chosen:** Catmull-Rom with the result clamped per channel to the 2x2
+  texels around the read (`synSharp`, `FG_SHARP 1`). Lanczos-2 is no sharper
+  and costs a quarter more; the unclamped cubic gains under 1% and can ring at
+  a step; the 2x2 clamp is the tighter halo bound at the same sharpness as the
+  4x4. The read position is now the output pixel's own centre plus the offset
+  in output pixels, so a zero or whole offset returns B's texel exactly.
+- ruled out: RCAS at B's strength over-softening S, because AMD RCAS (strength
+  0.4, the pilot's `render_sharpness`) applied to both S and B in numpy leaves
+  the S/B ratio within 0.01 of the unsharpened one (225515258002 f2 0.981 ->
+  0.981, 225627723003 f4 0.932 -> 0.919), and S is already resampled from the
+  pre-sharpen `dlOut`. Raising S's strength would be compensation; not done.
+- **What remains:** about 6% of the energy; an interpolator half a pixel off
+  passes nothing at Nyquist, so this is the floor of any resample.
+- **Rig:** case 14 (still scene and a whole-pixel read return B bit for bit, at
+  1:1 and 2:1; a 5 px period read 0.25 px off keeps 0.966, bilinear 0.861; a
+  step read 0.3 px off stays within its two levels). `FG_SHARP` 0 (bilinear)
+  and 3 (unclamped) each fail it.
+- **Flight signature:** with Lock engaged, the eye dumps' S/SB Laplacian
+  ratio about 0.9-1.0 in the cockpit, and no sharp/soft alternation felt.
 
 ### 2026-11-07: Phase 2.3, flight 11, the first Lock flight (same build)
 
