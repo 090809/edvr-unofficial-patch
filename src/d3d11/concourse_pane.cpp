@@ -186,7 +186,7 @@ std::atomic<bool> g_bdOriginSetNow{false};          // the origin was set during
 std::atomic<uint32_t> g_bdCaptures{0};              // captures that went into this cube
 std::atomic<bool> g_bdResetPending{false};          // a new visit (treat rose): the tick empties the cube and forgets the origin
 std::atomic<bool> g_bakeBaked{false};               // TEMPORARY: the cube is the bake's: a new visit does not empty it (treat rises just after the bake, on arrival)
-std::atomic<uint32_t> g_bdParallax{cc::kParallaxDepth};   // the distance mode (hotkey.concourse_backdrop_parallax)
+std::atomic<uint32_t> g_bdParallax{cc::kParallaxSphere};   // the distance mode (hotkey.concourse_backdrop_parallax); the sphere by Sean's eye on Flight 30, against the march and none
 std::atomic<float> g_bdRadius{cc::kBackdropRadiusDefaultM};   // diag.concourse_backdrop_radius
 std::atomic<ID3D11PixelShader*> g_psBdShow{nullptr}, g_psBdCapture{nullptr};
 std::atomic<ID3D11SamplerState*> g_bdSampler{nullptr};
@@ -526,7 +526,7 @@ void makeSkyPs(ID3D11Device* device) noexcept {
 }
 
 bool makeGlowCb(ID3D11Device* device) noexcept {
-    float init[24] = {0, 0, 0, 0, 1, 1, 1, 0, kSteadyColour[0], kSteadyColour[1], kSteadyColour[2], 0, static_cast<float>(cc::kParallaxDepth), cc::kBackdropRadiusDefaultM, 0, 0,
+    float init[24] = {0, 0, 0, 0, 1, 1, 1, 0, kSteadyColour[0], kSteadyColour[1], kSteadyColour[2], 0, static_cast<float>(cc::kParallaxSphere), cc::kBackdropRadiusDefaultM, 0, 0,
                       cc::kGlassDefault[0], cc::kGlassDefault[1], cc::kGlassDefault[2], cc::kGlassDefault[3], cc::kGlassDefault[4], cc::kGlassDefault[5], 0, 0};
     ID3D11Buffer* made[2] = {};
     for (int i = 0; i < 2; ++i) {
