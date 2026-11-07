@@ -51,6 +51,10 @@
 // steps the runtime down to 11, and a runtime that never asks 12 never reads the word: either way the runtime reads "off". Same hand-copied-DLLs rule.
 #define EDVR_NATIVE_FRAME_VERSION_12 12u
 #define EDVR_NATIVE_FRAME_FRAMEGEN_SHADOW_WORD 18u
+// Frame generation, Phase 2.3 (fix.frame_generation = on, TEMPORARY): a version 12 answer from a d3d11.dll that knows the key carries 1 in reservedTerrainGuard[17] while it is on,
+// 0 otherwise. No ladder step: a version 12 provider from before 2.3 leaves the word zero (the retired guard's words are written zero), and a runtime from before it never reads
+// it; either way the runtime reads off. An answer older than 12 has the word zeroed by the runtime's ladder (native_frame_client.h).
+#define EDVR_NATIVE_FRAME_FRAMEGEN_LOCK_WORD 17u
 #define EDVR_NATIVE_FRAME_INPUT_VERSION_1 1u
 #define EDVR_NATIVE_FRAME_INPUT_VERSION_2 2u
 #define EDVR_NATIVE_FRAME_INPUT_VERSION_3 3u
@@ -164,6 +168,7 @@ struct EdvrNativeFrameOutput {
     // the narrowing M, the window's centre in the left eye's tangent plane (x, y), and how black the left eye's uncovered strip is (floats' bits). All zero when there is none; offset, size and
     // type unchanged, and the other 14 words are the retired guard's.
     // Frame generation, Phase 1: in a version 12 answer only, word 18 (EDVR_NATIVE_FRAME_FRAMEGEN_SHADOW_WORD) is 1 while fix.frame_generation_shadow is on.
+    // Frame generation, Phase 2.3: in a version 12 answer only, word 17 (EDVR_NATIVE_FRAME_FRAMEGEN_LOCK_WORD) is 1 while fix.frame_generation is on.
     uint32_t reservedTerrainGuard[19];
     // World scale (visual.world_scale, docs\world-scale.md), in a version 11 answer only: the percent the runtime moves the two eye origins Elite is told about by,
     // about their midpoint (50 to 200; 100 is Elite's own scale). Taken from the last of the retired guard's 21 words; offset, size and type unchanged. A provider
@@ -293,6 +298,7 @@ void nativeFrameSetLookYaw(float total, uint32_t gameFrame, uint32_t resetSerial
 // frame thread takes a new value. Set by the d3d11 frame thread; read under the provider's lock by beginFrame.
 void nativeFrameSetEyeAlign(const float offsetSeated[3], uint32_t serial);
 void nativeFrameSetFrameGenShadow(bool on);   // fix.frame_generation_shadow, carried in a version 12 answer's reservedTerrainGuard[EDVR_NATIVE_FRAME_FRAMEGEN_SHADOW_WORD]
+void nativeFrameSetFrameGenLock(bool on);     // fix.frame_generation (Phase 2.3), carried in a version 12 answer's reservedTerrainGuard[EDVR_NATIVE_FRAME_FRAMEGEN_LOCK_WORD]
 void nativeFrameSetNowPose(uint32_t mode);   // F40/F42: the live now-pose mode (0 next, 1 render, 2 render_locked), carried in version 9 output
 // F61 (TEMPORARY): the rotation calibration's seated yaw and pitch (radians, about the head), carried in version 9 output's reservedOffset[0..1].
 // Zero when fix.native_on_foot_rot_calibrate is off. Set by the d3d11 frame thread; read under the provider's lock by beginFrame.

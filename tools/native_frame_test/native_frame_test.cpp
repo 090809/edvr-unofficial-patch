@@ -6477,6 +6477,28 @@ int wmain(int argc, wchar_t** argv) {
         v12Old.size = EDVR_NATIVE_FRAME_INPUT_SIZE_2;
         check(table.beginFrame(table.context, &v12Old, &v12Short) == E_INVALIDARG,
               "frame generation shadow: a version 12 ask rides input version 3 like 10 and 11: with a version 2 input it is refused, and the runtime steps down");
+        // Phase 2.3: fix.frame_generation (Lock) rides word 17 of the same version 12 answer, with no ladder step; the shadow's word 18 beside it is its own; a version 11 or
+        // older answer leaves word 17 zero whatever the key says (an old runtime never reads it; one that asks 11 reads off).
+        edvr::nativeFrameSetFrameGenLock(false);
+        const auto lockOff = ask(EDVR_NATIVE_FRAME_VERSION_12, 100006);
+        edvr::nativeFrameSetFrameGenLock(true);
+        const auto lockOn = ask(EDVR_NATIVE_FRAME_VERSION_12, 100007);
+        const auto lockOn11 = ask(EDVR_NATIVE_FRAME_VERSION_11, 100008);
+        edvr::nativeFrameSetFrameGenShadow(true);
+        const auto both = ask(EDVR_NATIVE_FRAME_VERSION_12, 100009);
+        edvr::nativeFrameSetFrameGenShadow(false);
+        edvr::nativeFrameSetFrameGenLock(false);
+        const uint32_t lw = EDVR_NATIVE_FRAME_FRAMEGEN_LOCK_WORD;
+        check(lockOff.first && lockOff.second.reservedTerrainGuard[lw] == 0u && lockOn.first && lockOn.second.version == EDVR_NATIVE_FRAME_VERSION_12 &&
+                  lockOn.second.reservedTerrainGuard[lw] == 1u && lockOn.second.reservedTerrainGuard[w] == 0u && lw == 17u,
+              "frame generation lock: a version 12 answer carries fix.frame_generation in word 17 (1 on, 0 off), the shadow's word 18 untouched by it");
+        check(both.first && both.second.reservedTerrainGuard[lw] == 1u && both.second.reservedTerrainGuard[w] == 1u,
+              "frame generation lock: both keys on: words 17 and 18 both 1");
+        check(lockOn11.first && lockOn11.second.version == EDVR_NATIVE_FRAME_VERSION_11 && lockOn11.second.reservedTerrainGuard[lw] == 0u,
+              "frame generation lock: a version 11 answer leaves word 17 zero whatever the key says (an older runtime reads off)");
+        bool rest = true;
+        for (uint32_t i = 10; i < 17; ++i) rest = rest && lockOn.second.reservedTerrainGuard[i] == 0u;
+        check(rest && sizeof(EdvrNativeFrameOutput) == 184, "frame generation lock: the retired words 10..16 stay zero and the struct is still 184 bytes");
     }
 
     check(table.close(table.context) == S_OK && !edvr::glitchConsumerPresent(),

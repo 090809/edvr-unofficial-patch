@@ -478,7 +478,7 @@ void run(){
     fs=frame(11,22);fs.head[3]=.1f;
     float headS[12]={std::cos(a),0,std::sin(a),.11f, 0,1,0,0, -std::sin(a),0,std::cos(a),0};
     const auto slot=FrameGenSlotChannel::slot(22,1000000000,1011111111,headS,true);
-    check(slot.size==EDVR_NATIVE_FRAMEGEN_SLOT_SIZE_1&&slot.version==1&&slot.poseValid==1&&slot.consumer==1&&slot.slotTime==1011111111,"frame generation slot: the runtime's slot carries the pose, T_S and the consumer");
+    check(slot.size==EDVR_NATIVE_FRAMEGEN_SLOT_SIZE_2&&slot.version==1&&slot.poseValid==1&&slot.consumer==1&&slot.slotTime==1011111111&&slot.lockEngaged==0,"frame generation slot: the runtime's slot carries the pose, T_S and the consumer (size 2 since 2.3, Lock not engaged)");
     check(edvrFrameGenNoteSlot(&slot)==S_OK,"frame generation slot: the provider takes a version 1 slot");
     begin(t,fs);treat(t,22,0,source.Get());
     float rot[9],tr[3];edvr::frameGenSlotStep(headS,fs.head,fs.eyeToHead[0],rot,tr);
@@ -494,7 +494,7 @@ void run(){
     fs=frame(11,23);begin(t,fs);treat(t,23,0,source.Get());
     check(slotNotes==2,"frame generation slot: a slot handed for another pair is not noted for this one");
     // The struct's versioning: a smaller one, version 0, sequence 0 and null are refused; a larger one (a newer runtime appended fields) is taken as version 1.
-    EdvrNativeFrameGenSlot shortSlot=slot;shortSlot.size-=4;
+    EdvrNativeFrameGenSlot shortSlot=slot;shortSlot.size=EDVR_NATIVE_FRAMEGEN_SLOT_SIZE_1-4;
     EdvrNativeFrameGenSlot v0=slot;v0.version=0;
     EdvrNativeFrameGenSlot s0=slot;s0.sequence=0;
     check(edvrFrameGenNoteSlot(&shortSlot)==E_INVALIDARG&&edvrFrameGenNoteSlot(&v0)==E_INVALIDARG&&edvrFrameGenNoteSlot(&s0)==E_INVALIDARG&&edvrFrameGenNoteSlot(nullptr)==E_INVALIDARG,
@@ -512,6 +512,20 @@ void run(){
     // No previous pair or a lead out of range: the runtime hands no pose (FrameGenSlotChannel::slot with no head).
     const auto none=FrameGenSlotChannel::slot(26,1000000000,0,headS,true);
     check(none.poseValid==0&&none.slotTime==0,"frame generation slot: no T_S means no pose, whatever head is passed");
+    // Phase 2.3: Lock's bit rides a size 2 slot. Engaged: the treat of that very pair reads it; a size 1 slot (a 2.2 runtime) is read as not engaged whatever its bytes past
+    // size 1 say; a slot for another pair is not this treat's; the next treat without a slot reads not engaged.
+    check(EDVR_NATIVE_FRAMEGEN_SLOT_SIZE_1==88u&&EDVR_NATIVE_FRAMEGEN_SLOT_SIZE_2==96u,"frame generation lock: the slot's size 1 is 2.2's 88 bytes and size 2 adds the lock word (96)");
+    auto locked=FrameGenSlotChannel::slot(27,1000000000,1011111111,headS,true,true);
+    check(locked.lockEngaged==1&&edvrFrameGenNoteSlot(&locked)==S_OK,"frame generation lock: an engaged slot is handed and taken");
+    fs=frame(11,27);begin(t,fs);treat(t,27,0,source.Get());
+    check(edvr::nativeTemporalFrameGenLock(),"frame generation lock: ...and the treat of that pair reads Lock engaged");
+    auto oldRuntime=FrameGenSlotChannel::slot(28,1000000000,1011111111,headS,true,true);oldRuntime.size=EDVR_NATIVE_FRAMEGEN_SLOT_SIZE_1;
+    check(edvrFrameGenNoteSlot(&oldRuntime)==S_OK,"frame generation lock: a size 1 slot (a 2.2 runtime) is taken");
+    fs=frame(11,28);begin(t,fs);treat(t,28,0,source.Get());
+    check(!edvr::nativeTemporalFrameGenLock()&&slotLast.sequence==28,"frame generation lock: ...and read as Lock not engaged, whatever lies past its size");
+    auto lockedOther=FrameGenSlotChannel::slot(77,1000000000,1011111111,headS,true,true);edvrFrameGenNoteSlot(&lockedOther);
+    fs=frame(11,29);begin(t,fs);treat(t,29,0,source.Get());
+    check(!edvr::nativeTemporalFrameGenLock(),"frame generation lock: an engaged slot for another pair is not this treat's");
     // The runtime's end. An older d3d11.dll (a module without the exports, here kernel32) has no channel: nothing is handed and nothing is read.
     FrameGenSlotChannel oldD3d;
     check(!oldD3d.resolve(GetModuleHandleW(L"kernel32.dll"))&&!oldD3d.present()&&oldD3d.hand(slot)==S_FALSE,"frame generation slot: an older d3d11.dll (no exports) gives the runtime no channel, and nothing is handed");

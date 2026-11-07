@@ -13,7 +13,7 @@ namespace comfort_fixture {
 // A provider of a given age: it knows the shapes up to maxVersion, refuses any other with E_INVALIDARG and consumes nothing when it does, and writes the fade
 // level only into a struct that has the slot. `scribble` makes it write the slot anyway (a provider that claims less than it writes).
 struct Provider {
-  uint32_t maxVersion=8;float fade=1.0f;unsigned calls=0;bool scribble=false;HRESULT fail=S_OK;uint32_t worldScale=130;
+  uint32_t maxVersion=8;float fade=1.0f;unsigned calls=0;bool scribble=false,lockKey=false;HRESULT fail=S_OK;uint32_t worldScale=130;
   HRESULT answer(EdvrNativeFrameOutput& o) {
     ++calls;
     if(fail!=S_OK)return fail;
@@ -29,6 +29,7 @@ struct Provider {
     if(o.version>=10||scribble)o.leftEyeShare=0x3F19999Au;   // F106: the left eye's share (0.6f's bits; F89's darkening before) rides a version 10 answer only
     if(o.version>=11||scribble)o.worldScalePercent=worldScale;   // world scale: rides a version 11 answer only
     if(o.version>=12||scribble)o.reservedTerrainGuard[EDVR_NATIVE_FRAME_FRAMEGEN_SHADOW_WORD]=1u;   // frame generation shadow: rides a version 12 answer only
+    if((o.version>=12&&lockKey)||scribble)o.reservedTerrainGuard[EDVR_NATIVE_FRAME_FRAMEGEN_LOCK_WORD]=1u;   // frame generation 2.3: Lock's key, a version 12 answer from a 2.3 d3d11.dll
     return S_OK;
   }
 };
@@ -137,6 +138,20 @@ template<class Check> void runComfortFadeCases(Check&& check) {
     Provider failing;failing.fail=E_FAIL;uint32_t vf=12;EdvrNativeFrameOutput outf{};outf.reservedTerrainGuard[w]=1u;
     check(ladder(failing,vf,outf)==E_FAIL&&outf.reservedTerrainGuard[w]==0u&&vf==12,"frame generation shadow: a provider that fails the frame leaves no flag behind");
     check(Client::ask(12).reservedTerrainGuard[w]==0u,"frame generation shadow: a fresh ask carries no flag");
+  }
+  {   // Frame generation, Phase 2.3: Lock's key rides word 17 of a version 12 answer with no ladder step: a 2.3 d3d11.dll says it, a 2.2 one (version 12, the word zero) and
+      // every older answer read off, and a word an old provider scribbles is not believed.
+    const uint32_t w=EDVR_NATIVE_FRAME_FRAMEGEN_LOCK_WORD;
+    Provider p;p.maxVersion=12;p.lockKey=true;uint32_t v=12;EdvrNativeFrameOutput out{};
+    check(ladder(p,v,out)==S_OK&&out.version==12&&v==12&&p.calls==1&&out.reservedTerrainGuard[w]==1u&&out.reservedTerrainGuard[EDVR_NATIVE_FRAME_FRAMEGEN_SHADOW_WORD]==1u,
+          "frame generation lock: a 2.3 d3d11.dll: one call (no ladder step), the key arrives in word 17 beside the shadow's word 18");
+    Provider p22;p22.maxVersion=12;uint32_t v22=12;EdvrNativeFrameOutput out22{};
+    check(ladder(p22,v22,out22)==S_OK&&out22.version==12&&p22.calls==1&&out22.reservedTerrainGuard[w]==0u,"frame generation lock: a 2.2 d3d11.dll (version 12, word 17 zero): off, one call");
+    Provider old;old.maxVersion=11;old.scribble=true;uint32_t v11=12;EdvrNativeFrameOutput out11{};
+    check(ladder(old,v11,out11)==S_OK&&out11.version==11&&out11.reservedTerrainGuard[w]==0u,"frame generation lock: an old d3d11.dll answered at 11 that scribbles word 17 is not believed: off");
+    Provider failing;failing.fail=E_FAIL;uint32_t vf=12;EdvrNativeFrameOutput outf{};outf.reservedTerrainGuard[w]=1u;
+    check(ladder(failing,vf,outf)==E_FAIL&&outf.reservedTerrainGuard[w]==0u,"frame generation lock: a provider that fails the frame leaves no key behind");
+    check(Client::ask(12).reservedTerrainGuard[w]==0u&&w==17u&&w!=EDVR_NATIVE_FRAME_FRAMEGEN_SHADOW_WORD,"frame generation lock: a fresh ask carries no key; the word is 17, not the shadow's");
   }
 }
 } // namespace edvr::openxr::test

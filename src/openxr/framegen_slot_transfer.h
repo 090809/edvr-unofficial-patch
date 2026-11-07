@@ -33,10 +33,12 @@ struct FrameGenSlotChannel {
     return present();
   }
   bool present() const noexcept { return note != nullptr; }
-  // The slot for pair `sequence` at T (displayTime), S's time T_S (0: none) and the head located there (null: none), with whether this runtime consumes S.
-  static EdvrNativeFrameGenSlot slot(uint64_t sequence, int64_t displayTime, int64_t slotTime, const float* head, bool consumer) noexcept {
+  // The slot for pair `sequence` at T (displayTime), S's time T_S (0: none) and the head located there (null: none), with whether this runtime consumes S, and (size 2, Phase 2.3)
+  // whether Lock is engaged as the pair begins.
+  static EdvrNativeFrameGenSlot slot(uint64_t sequence, int64_t displayTime, int64_t slotTime, const float* head, bool consumer, bool lockEngaged = false) noexcept {
     EdvrNativeFrameGenSlot s{};
-    s.size = EDVR_NATIVE_FRAMEGEN_SLOT_SIZE_1;
+    s.size = EDVR_NATIVE_FRAMEGEN_SLOT_SIZE_2;
+    s.lockEngaged = lockEngaged ? 1u : 0u;
     s.version = EDVR_NATIVE_FRAMEGEN_VERSION_1;
     s.sequence = sequence;
     s.displayTime = displayTime;
@@ -61,6 +63,15 @@ struct FrameGenSlotChannel {
   }
 };
 
+// The private copy's format: the typeless family of an 8-bit RGBA/BGRA format, any other format as it is (an S in it cannot be shown; the S slot replays B).
+inline DXGI_FORMAT frameGenSlotPrivateFormat(DXGI_FORMAT f) noexcept {
+  switch (f) {
+    case DXGI_FORMAT_R8G8B8A8_UNORM: case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB: case DXGI_FORMAT_R8G8B8A8_TYPELESS: return DXGI_FORMAT_R8G8B8A8_TYPELESS;
+    case DXGI_FORMAT_B8G8R8A8_UNORM: case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB: case DXGI_FORMAT_B8G8R8A8_TYPELESS: return DXGI_FORMAT_B8G8R8A8_TYPELESS;
+    default: return f;
+  }
+}
+
 class FrameGenSlotTransfer final {
  public:
   // Opens the producer texture `handle` names on `consumer` (borrowed; the d3d11 half keeps it open while `serial` stands) and makes the private copy. A transfer already open
@@ -78,6 +89,8 @@ class FrameGenSlotTransfer final {
     D3D11_TEXTURE2D_DESC d{};
     if (hr == S_OK) {
       shared->GetDesc(&d);
+      // Phase 2.3: an 8-bit RGBA/BGRA S is kept typeless (the copy is within its family), so the stereo renderer views it as it views a captured eye (EyeCapture::adopt).
+      d.Format = frameGenSlotPrivateFormat(d.Format);
       d.BindFlags = D3D11_BIND_SHADER_RESOURCE;
       d.MiscFlags = 0;
       d.CPUAccessFlags = 0;
@@ -100,9 +113,11 @@ class FrameGenSlotTransfer final {
   bool pending() const noexcept { return pending_; }
   int64_t pendingSlotTime() const noexcept { return slotTime_; }
   // The d3d11 half said this eye's S was produced (key 1) for the slot at slotTime.
-  void markProduced(int64_t slotTime) noexcept {
+  // Phase 2.3: sequence is the pair it was built for, which consumedSequence() says once it is taken.
+  void markProduced(int64_t slotTime, uint64_t sequence = 0) noexcept {
     pending_ = shared_ != nullptr;
     slotTime_ = slotTime;
+    pendingSequence_ = sequence;
   }
 
   // AcquireSync(1, timeoutMs), the copy to the private texture, ReleaseSync(0). S_OK: consumed. WAIT_TIMEOUT (as an HRESULT): not released yet, still pending. Anything else: the
@@ -119,6 +134,7 @@ class FrameGenSlotTransfer final {
     context_->Flush();
     const HRESULT r = mutex_->ReleaseSync(0);
     pending_ = false;
+    consumedSequence_ = pendingSequence_;
     if (r != S_OK) {
       release();
       return FAILED(r) ? r : E_FAIL;
@@ -130,12 +146,15 @@ class FrameGenSlotTransfer final {
   ID3D11Texture2D* privateTexture() const noexcept { return copy_.Get(); }
   uint64_t xrBytes() const noexcept { return copy_ ? bytes_ : 0; }
   uint64_t consumedCount() const noexcept { return consumed_; }
+  // The pair whose S the private texture holds (0: none, or released).
+  uint64_t consumedSequence() const noexcept { return copy_ ? consumedSequence_ : 0; }
 
   // Drops everything (the key went off, the runtime closes, or a fault). A handoff still pending is tried once at 0 ms first, so the key goes back to the game device when it can.
   void release() noexcept {
     if (pending_ && mutex_ && mutex_->AcquireSync(1, 0) == S_OK) mutex_->ReleaseSync(0);
     pending_ = false;
     slotTime_ = 0;
+    pendingSequence_ = consumedSequence_ = 0;
     copy_.Reset();
     mutex_.Reset();
     shared_.Reset();
@@ -153,6 +172,7 @@ class FrameGenSlotTransfer final {
   uint64_t serial_ = 0, bytes_ = 0, consumed_ = 0;
   bool pending_ = false;
   int64_t slotTime_ = 0;
+  uint64_t pendingSequence_ = 0, consumedSequence_ = 0;
 };
 
 }  // namespace edvr::openxr

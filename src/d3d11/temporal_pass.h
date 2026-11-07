@@ -295,6 +295,9 @@ void temporalPassNoteEyes(int eye, const float (*prevEyes)[12],
 // S (framegen_synth_math.h frameGenSlotStep; rot row-major 3x3, t metres, B's eye space to S's), null when the runtime handed none; and whether the runtime consumes this frame's S
 // (edvrFrameGenNoteSlot's consumer), with the treat's sequence the module stamps its answer with. Good for the treat that follows on the same frame only. Internal to d3d11.dll.
 void temporalPassNoteFrameGenSlot(int eye, const float* rot, const float* t, bool consumer, uint64_t sequence);
+// Frame generation, Phase 2.3 (fix.frame_generation): whether the runtime's slot for the treat being made said Lock 2:1 is engaged (native_temporal.cpp; false with a 2.2
+// runtime, which hands a size 1 slot, or with no slot). Read by the pass right after the treat's note, on the same thread.
+bool nativeTemporalFrameGenLock();
 
 // probe.w bits 64 and 256 of the temporal shader: t6 (the smoke's depth) / t7
 // (the private UI depth) NOT bound, so zSceneAt skips the fetch and uses the

@@ -82,8 +82,13 @@ struct EdvrNativeFrameGenSlot {
   uint32_t poseValid;           // 1: head is the head located at slotTime
   uint32_t consumer;            // 1: the runtime takes this pair's S through edvrFrameGenTakeS and consumes it
   float head[12];               // the head at T_S: EdvrNativeTemporalFrame::head's space and convention (rigid row-major 3x4)
+  // Size 2 (Phase 2.3, fix.frame_generation): the fields below. A size 1 slot (a runtime from 2.2) has none, which reads as Lock not engaged; a d3d11.dll from 2.2 reads no
+  // field past size 1. The version stays 1: the size alone says which fields are there.
+  uint32_t lockEngaged;         // 1: Lock 2:1 is engaged as this pair begins (the d3d11 half builds the f = 0.5 S on every frame and no f = 1 S)
+  uint32_t reserved;
 };
-#define EDVR_NATIVE_FRAMEGEN_SLOT_SIZE_1 ((uint32_t)sizeof(EdvrNativeFrameGenSlot))
+#define EDVR_NATIVE_FRAMEGEN_SLOT_SIZE_1 ((uint32_t)offsetof(EdvrNativeFrameGenSlot, lockEngaged))
+#define EDVR_NATIVE_FRAMEGEN_SLOT_SIZE_2 ((uint32_t)sizeof(EdvrNativeFrameGenSlot))
 // The state of one eye's S after its treat.
 #define EDVR_NATIVE_FRAMEGEN_S_NONE 0u       // no S built for this sequence
 #define EDVR_NATIVE_FRAMEGEN_S_PRODUCED 1u   // S written and published (the producer texture's key released to 1): the runtime consumes it

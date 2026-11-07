@@ -112,7 +112,8 @@ class NativeFrameClient final {
     if(r!=S_OK||out.version<EDVR_NATIVE_FRAME_VERSION_11)for(unsigned i=0;i<12;++i)out.reservedTerrainGuard[i]=0;
     // World scale: Elite's own scale (100) unless a version 11 answer carried a percent; a zero or an out-of-range word is held to the range (common/world_scale.h).
     // Frame generation, Phase 1: the shadow's flag (word 18) is off unless a version 12 answer carried it.
-    if(r!=S_OK||out.version<EDVR_NATIVE_FRAME_VERSION_12)out.reservedTerrainGuard[EDVR_NATIVE_FRAME_FRAMEGEN_SHADOW_WORD]=0;
+    // Frame generation, Phase 2.3: and Lock's key (word 17), off unless a version 12 answer carried it.
+    if(r!=S_OK||out.version<EDVR_NATIVE_FRAME_VERSION_12){out.reservedTerrainGuard[EDVR_NATIVE_FRAME_FRAMEGEN_SHADOW_WORD]=0;out.reservedTerrainGuard[EDVR_NATIVE_FRAME_FRAMEGEN_LOCK_WORD]=0;}
     out.worldScalePercent=(r==S_OK&&out.version>=EDVR_NATIVE_FRAME_VERSION_11)?edvr::worldScaleClamp(out.worldScalePercent):edvr::kWorldScaleDefault;
     return r;
   }
