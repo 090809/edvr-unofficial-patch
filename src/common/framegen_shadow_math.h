@@ -80,16 +80,27 @@ struct FrameGenShadowCb {
     float dk[4];          // the depth encoding's A and B (depth = A + B / z), the ship's split in metres, 0
     float fw[9][4];       // forward (A to B) rows of each class: [class * 3 + row], xyz the row, w the translation component
     float bw[9][4];       // backward (B to A)
+    float tb[9][4];       // B's TRUE backward rows whatever the frame's set (far [W_B | 0], cockpit [Hd_B | th_B], world [W_B | tvCam_B]): what the second score kernel uses
 };
-static_assert(sizeof(FrameGenShadowCb) == 368, "the scorer's cbuffer is 23 16-byte rows");
+static_assert(sizeof(FrameGenShadowCb) == 512, "the scorer's cbuffer is 32 16-byte rows");
 
+// The stats buffer: three blocks of one layout (per class hist, histId, pixels, sum, sumId; then holes and cells), then the two disagreement histograms.
+//   [0, 299)    the main score (fgShadowScore)        [299, 598)  the mv set (fgShadowScoreB)       [598, 897)  the bdepth set (fgShadowScoreB)
+//   [897, 945)  the world disagreement histogram      [945, 993)  the cockpit disagreement histogram
 constexpr uint32_t kFrameGenShadowStatsPerClass = 2 * kFrameGenShadowBins + 3;   // hist, histId, pixels, sum, sumId
 constexpr uint32_t kFrameGenShadowStatsHoles = kFrameGenShadowClasses * kFrameGenShadowStatsPerClass;
 constexpr uint32_t kFrameGenShadowStatsCells = kFrameGenShadowStatsHoles + 1;
-constexpr uint32_t kFrameGenShadowStatsUints = kFrameGenShadowStatsCells + 1;   // 299
+constexpr uint32_t kFrameGenShadowStatsBlockUints = kFrameGenShadowStatsCells + 1;   // 299
+constexpr uint32_t kFrameGenShadowStatsMvBase = kFrameGenShadowStatsBlockUints;
+constexpr uint32_t kFrameGenShadowStatsBdepthBase = 2 * kFrameGenShadowStatsBlockUints;
+constexpr uint32_t kFrameGenShadowStatsDisWorld = 3 * kFrameGenShadowStatsBlockUints;
+constexpr uint32_t kFrameGenShadowStatsDisCockpit = kFrameGenShadowStatsDisWorld + kFrameGenShadowBins;
+constexpr uint32_t kFrameGenShadowStatsUints = kFrameGenShadowStatsDisCockpit + kFrameGenShadowBins;   // 993
 
+// `truth` is B's true backward rows (frameGenBackward of B's measured W and tvCam), null for identity rows.
 inline void frameGenFillCb(FrameGenShadowCb& cb, uint32_t renderW, uint32_t renderH, uint32_t outW, uint32_t outH, const float tanA[4], const float tanB[4],
-                           float depthA, float depthB, float splitMetres, const FrameGenAffine bwd[kFrameGenShadowClasses]) {
+                           float depthA, float depthB, float splitMetres, const FrameGenAffine bwd[kFrameGenShadowClasses],
+                           const FrameGenAffine* truth = nullptr) {
     cb = FrameGenShadowCb{};
     cb.sz[0] = static_cast<int32_t>(renderW);
     cb.sz[1] = static_cast<int32_t>(renderH);
@@ -114,15 +125,20 @@ inline void frameGenFillCb(FrameGenShadowCb& cb, uint32_t renderW, uint32_t rend
             cb.bw[c * 3 + r][3] = bwd[c].t[r];
             cb.fw[c * 3 + r][3] = fwd.t[r];
         }
+        const FrameGenAffine t = truth ? truth[c] : FrameGenAffine{};
+        for (int r = 0; r < 3; ++r) {
+            for (int k = 0; k < 3; ++k) cb.tb[c * 3 + r][k] = t.R[r * 3 + k];
+            cb.tb[c * 3 + r][3] = t.t[r];
+        }
     }
 }
 
-// Decodes one eye's stats buffer (kFrameGenShadowStatsUints words) into the result the window merges.
-inline void frameGenDecodeStats(const uint32_t* s, FrameGenShadowEyeResult& out) {
-    out = FrameGenShadowEyeResult{};
+// Decodes one block of the stats buffer (kFrameGenShadowStatsBlockUints words) into per-class stats, holes and cells.
+inline void frameGenDecodeBlock(const uint32_t* s, FrameGenShadowClassStats cls[kFrameGenShadowClasses], uint64_t& holes, uint64_t& cells) {
     for (int c = 0; c < kFrameGenShadowClasses; ++c) {
         const uint32_t* b = s + static_cast<uint32_t>(c) * kFrameGenShadowStatsPerClass;
-        FrameGenShadowClassStats& st = out.cls[c];
+        FrameGenShadowClassStats& st = cls[c];
+        st = FrameGenShadowClassStats{};
         for (int i = 0; i < kFrameGenShadowBins; ++i) {
             st.hist[i] = b[i];
             st.histId[i] = b[kFrameGenShadowBins + i];
@@ -131,8 +147,20 @@ inline void frameGenDecodeStats(const uint32_t* s, FrameGenShadowEyeResult& out)
         st.sumErr1024 = b[2 * kFrameGenShadowBins + 1];
         st.sumErrId1024 = b[2 * kFrameGenShadowBins + 2];
     }
-    out.holes = s[kFrameGenShadowStatsHoles];
-    out.cells = s[kFrameGenShadowStatsCells];
+    holes = s[kFrameGenShadowStatsHoles];
+    cells = s[kFrameGenShadowStatsCells];
+}
+
+// Decodes one eye's stats buffer (kFrameGenShadowStatsUints words) into the result the window merges.
+inline void frameGenDecodeStats(const uint32_t* s, FrameGenShadowEyeResult& out) {
+    out = FrameGenShadowEyeResult{};
+    frameGenDecodeBlock(s, out.cls, out.holes, out.cells);
+    frameGenDecodeBlock(s + kFrameGenShadowStatsMvBase, out.mv.cls, out.mv.holes, out.mv.cells);
+    frameGenDecodeBlock(s + kFrameGenShadowStatsBdepthBase, out.bdepth.cls, out.bdepth.holes, out.bdepth.cells);
+    for (int i = 0; i < kFrameGenShadowBins; ++i) {
+        out.disWorld[i] = s[kFrameGenShadowStatsDisWorld + i];
+        out.disCockpit[i] = s[kFrameGenShadowStatsDisCockpit + i];
+    }
 }
 
 // The median of a small sample set (the middle element, the upper one for an even count); 0 for none. The vector is reordered.

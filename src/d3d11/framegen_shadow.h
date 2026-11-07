@@ -6,7 +6,7 @@
 //
 // temporal_pass.cpp calls frameGenShadowEyeFrame once per treated eye-frame beside the sky ring, with the numbers the pass already computed for that frame.
 // Per eye the module keeps the previous frame's capture (a quarter-size luma and depth, ping-ponged) and deltas; a frame with both and no skip reason is
-// scored on the GPU and the 299 stats words read back without waiting, a few frames later. Key off: nothing is created and nothing is dispatched.
+// scored on the GPU and the 993 stats words read back without waiting, a few frames later. Key off: nothing is created and nothing is dispatched.
 // frameGenShadowFrameBoundary (once a frame, from temporalPassFrameBoundary) prints the one-second report.
 #include <d3d11.h>
 
@@ -24,6 +24,7 @@ bool frameGenShadowOn();
 struct FrameGenShadowFrame {
     uint32_t renderW = 0, renderH = 0, outW = 0, outH = 0;
     ID3D11ShaderResourceView* outSrv = nullptr;     // the upscaler's output, before the interface (dlOutSrv)
+    ID3D11ShaderResourceView* mvSrv = nullptr;      // the DLSS motion vectors (dlMvSrv): R16G16_FLOAT, render size, pixels, this frame -> previous, jitter-free
     ID3D11ShaderResourceView* depthSrv = nullptr;   // this frame's depth copy (dlDepthSrv): Elite's reversed-Z, depth = A + B / metres
     const float* tanNow = nullptr;                  // this frame's tangents, jitter excluded (left, right, bottom, top)
     const float* tanPrev = nullptr;                 // the previous frame's (what p.tanPrev holds), null when the pass has none

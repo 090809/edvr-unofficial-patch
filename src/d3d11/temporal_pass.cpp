@@ -5170,6 +5170,7 @@ void* temporalInner(void* srcTex, int eye, const float* bounds,
                         fg.renderW = w; fg.renderH = h; fg.outW = oW; fg.outH = oH;
                         fg.outSrv = e.dlOutSrv;
                         fg.depthSrv = e.dlDepthSrv;
+                        fg.mvSrv = e.dlMvSrv;
                         fg.tanNow = tanNow;
                         fg.tanPrev = useTanPrev ? tanPrev : nullptr;
                         fg.depthA = p.knobs[0];

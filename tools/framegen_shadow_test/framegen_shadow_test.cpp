@@ -17,6 +17,10 @@
 //      rig miss is the figure worked out by hand and the score is worse
 //   5  reversed-Z far (the written depth at or under A) and the on-foot 1 mm split: 0.5 mm is the cockpit, 2 mm the world; the ship's 10 m split puts both in the cockpit
 //   6  the module itself (framegen_shadow.cpp) on WARP: the key off creates nothing; on, a static scene scores with every error in bin 0, and each skip reason counts
+//   7  the second score kernel (fgShadowScoreB): a world plane at constant ship motion with the DLSS vectors filled in exactly (the mv set and the bdepth set both
+//      score near 0 and the two landings agree to under 1/16 px), then every vector offset by +2 px (the mv set is worse, the disagreement reads 2 px), then a cockpit
+//      plane under a head translation (the cockpit disagreement histogram). Mutations: vectors of the wrong sign (the same as a kernel that reads the sign wrong) and
+//      the shader itself recompiled with the sign flipped must each fail the exact case
 #include <windows.h>
 #include <d3d11.h>
 #include <wrl/client.h>
@@ -28,6 +32,9 @@
 #include <cstring>
 #include <string>
 #include <vector>
+
+#include <d3dcompiler.h>
+#include "framegen_shadow_shader.h"
 
 #include "../../src/common/framegen_shadow_math.h"
 #include "../../src/common/framegen_shadow_report.h"
@@ -113,16 +120,17 @@ struct Tex {
 struct Gpu {
     ComPtr<ID3D11Device> dev;
     ComPtr<ID3D11DeviceContext> ctx;
-    ComPtr<ID3D11ComputeShader> cs[4];
+    ComPtr<ID3D11ComputeShader> cs[5];
     ComPtr<ID3D11Buffer> cb;
 
     bool init() {
         D3D_FEATURE_LEVEL level{};
         if (FAILED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, 0, nullptr, 0, D3D11_SDK_VERSION, &dev, &level, &ctx))) return false;
-        const struct { const unsigned char* code; size_t size; } codes[4] = {
+        const struct { const unsigned char* code; size_t size; } codes[5] = {
             {kFrameGenShadowCaptureBytecode, sizeof(kFrameGenShadowCaptureBytecode)}, {kFrameGenShadowClearBytecode, sizeof(kFrameGenShadowClearBytecode)},
-            {kFrameGenShadowSplatBytecode, sizeof(kFrameGenShadowSplatBytecode)}, {kFrameGenShadowScoreBytecode, sizeof(kFrameGenShadowScoreBytecode)}};
-        for (int i = 0; i < 4; ++i)
+            {kFrameGenShadowSplatBytecode, sizeof(kFrameGenShadowSplatBytecode)}, {kFrameGenShadowScoreBytecode, sizeof(kFrameGenShadowScoreBytecode)},
+            {kFrameGenShadowScoreBBytecode, sizeof(kFrameGenShadowScoreBBytecode)}};
+        for (int i = 0; i < 5; ++i)
             if (FAILED(dev->CreateComputeShader(codes[i].code, codes[i].size, nullptr, &cs[i]))) return false;
         D3D11_BUFFER_DESC bd{};
         bd.ByteWidth = sizeof(FrameGenShadowCb);
@@ -169,13 +177,28 @@ struct Gpu {
         ctx->CSSetConstantBuffers(0, 1, &b);
     }
 
-    void run(int entry, ID3D11ShaderResourceView* const srv[5], ID3D11UnorderedAccessView* const uav[4]) {
+    void run(int entry, ID3D11ShaderResourceView* const srv[5], ID3D11UnorderedAccessView* const uav[4], ID3D11ShaderResourceView* mv = nullptr, ID3D11ShaderResourceView* depthB = nullptr) {
         ctx->CSSetShader(cs[entry].Get(), nullptr, 0);
         ctx->CSSetShaderResources(0, 5, srv);
+        ID3D11ShaderResourceView* extra[2] = {mv, depthB};
+        ctx->CSSetShaderResources(5, 2, extra);
         ctx->CSSetUnorderedAccessViews(0, 4, uav, nullptr);
         ctx->Dispatch((QW + 7) / 8, (QH + 7) / 8, 1);
     }
 };
+
+uint16_t floatToHalf(float f) {
+    uint32_t u;
+    std::memcpy(&u, &f, 4);
+    const uint32_t sign = (u >> 16) & 0x8000u;
+    int e = static_cast<int>((u >> 23) & 0xFF) - 127 + 15;
+    uint32_t m = u & 0x7FFFFFu;
+    if (e <= 0) return static_cast<uint16_t>(sign);   // the rig's vectors are never denormal-small and a flushed one reads 0
+    if (e >= 31) return static_cast<uint16_t>(sign | 0x7BFFu);
+    uint32_t h = (static_cast<uint32_t>(e) << 10) | (m >> 13);
+    if (m & 0x1000u) ++h;   // round to nearest
+    return static_cast<uint16_t>(sign | h);
+}
 
 struct GpuResult {
     std::vector<float> lumaA, lumaB, depthA, depthB;
@@ -193,7 +216,8 @@ bool makeInputs(Gpu& g, const Scene& s, Tex& out, Tex& depth) {
 }
 
 // Frame A is captured, then frame B is captured and scored against it with `cb`, in the module's order of dispatches.
-GpuResult runGpu(Gpu& g, const Scene& A, const Scene& B, const FrameGenShadowCb& cb) {
+// `mv`, when given, is the DLSS vector field (2 floats a render pixel, pixels, B -> A) and the second kernel runs after the score.
+GpuResult runGpu(Gpu& g, const Scene& A, const Scene& B, const FrameGenShadowCb& cb, const std::vector<float>* mv = nullptr) {
     GpuResult r;
     Tex outA, depA, outB, depB;
     if (!makeInputs(g, A, outA, depA) || !makeInputs(g, B, outB, depB)) return r;
@@ -215,6 +239,12 @@ GpuResult runGpu(Gpu& g, const Scene& A, const Scene& B, const FrameGenShadowCb&
     bd.Usage = D3D11_USAGE_STAGING; bd.BindFlags = 0; bd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
     if (FAILED(g.dev->CreateBuffer(&bd, nullptr, &staging))) return r;
 
+    Tex mvTex;
+    if (mv) {
+        std::vector<uint16_t> half(mv->size());
+        for (size_t i = 0; i < mv->size(); ++i) half[i] = floatToHalf((*mv)[i]);
+        if (!g.makeTex(RW, RH, DXGI_FORMAT_R16G16_FLOAT, D3D11_BIND_SHADER_RESOURCE, half.data(), RW * 4, mvTex, true, false)) return r;
+    }
     g.setCb(cb);
     ID3D11ShaderResourceView* none[5] = {};
     for (int f = 0; f < 2; ++f) {
@@ -236,8 +266,15 @@ GpuResult runGpu(Gpu& g, const Scene& A, const Scene& B, const FrameGenShadowCb&
         ID3D11UnorderedAccessView* uav[4] = {nullptr, nullptr, key.uav.Get(), statsUav.Get()};
         g.run(3, srv, uav);
     }
+    if (mv) {
+        ID3D11ShaderResourceView* srv[5] = {nullptr, nullptr, luma[0].srv.Get(), nullptr, luma[1].srv.Get()};
+        ID3D11UnorderedAccessView* uav[4] = {nullptr, nullptr, nullptr, statsUav.Get()};
+        g.run(4, srv, uav, mvTex.srv.Get(), dq[1].srv.Get());
+    }
     ID3D11UnorderedAccessView* noUav[4] = {};
     g.ctx->CSSetShaderResources(0, 5, none);
+    ID3D11ShaderResourceView* none2[2] = {};
+    g.ctx->CSSetShaderResources(5, 2, none2);
     g.ctx->CSSetUnorderedAccessViews(0, 4, noUav, nullptr);
     g.ctx->CopyResource(staging.Get(), stats.Get());
     D3D11_MAPPED_SUBRESOURCE m{};
@@ -401,7 +438,9 @@ FrameGenShadowCb makeCb(const Scene& a, const FrameGenDeltas& dA, const FrameGen
     else frameGenBackward(dB, Wp, tp, bwd);
     if (identityBackward) for (auto& b : bwd) b = FrameGenAffine{};
     FrameGenShadowCb cb;
-    frameGenFillCb(cb, RW, RH, RW, RH, kTan, kTan, depthA, kDepthB, split, bwd);
+    FrameGenAffine truth[kFrameGenShadowClasses];
+    frameGenBackward(dB, dB.W, dB.tv, truth);
+    frameGenFillCb(cb, RW, RH, RW, RH, kTan, kTan, depthA, kDepthB, split, bwd, truth);
     if (mutateForward) std::memcpy(cb.fw, cb.bw, sizeof(cb.fw));
     return cb;
 }
@@ -755,6 +794,12 @@ void case6Module(Gpu& g, Scope& sc) {
     f.renderW = RW; f.renderH = RH; f.outW = RW; f.outH = RH;
     f.outSrv = ms.out.srv.Get();
     f.depthSrv = ms.depth.srv.Get();
+    Tex zeroMv;
+    {
+        std::vector<uint16_t> zero(static_cast<size_t>(RW) * RH * 2, 0);
+        sc.ok(g.makeTex(RW, RH, DXGI_FORMAT_R16G16_FLOAT, D3D11_BIND_SHADER_RESOURCE, zero.data(), RW * 4, zeroMv, true, false), "case 6: the zero vector field was made");
+    }
+    f.mvSrv = zeroMv.srv.Get();   // a static scene: the vectors are 0
     f.tanNow = kTan;
     f.tanPrev = kTan;
     f.depthA = 0.0f; f.depthB = kDepthB; f.splitMetres = 10.0f;
@@ -794,6 +839,18 @@ void case6Module(Gpu& g, Scope& sc) {
     sc.ok(w.oracle.frames >= 3 && w.framesScored >= 3 && (w.framesScored > w.oracle.frames ? w.framesScored - w.oracle.frames : w.oracle.frames - w.framesScored) <= 4 &&
               oScored == static_cast<uint64_t>(w.oracle.frames) * QW * QH && oBin0 == oScored,
           label);
+
+    // The second kernel runs on every scored frame, whatever its set: a static scene with zero vectors lands every cell on itself both ways.
+    {
+        uint64_t mvPx = 0, mvBin0 = 0, bdPx = 0, bdBin0 = 0, dis = 0;
+        for (int c = 0; c < kFrameGenShadowClasses; ++c) { mvPx += w.mv.cls[c].pixels; mvBin0 += w.mv.cls[c].hist[0]; bdPx += w.bdepth.cls[c].pixels; bdBin0 += w.bdepth.cls[c].hist[0]; }
+        for (int i = 0; i < kFrameGenShadowBins; ++i) dis += w.disWorld[i] + w.disCockpit[i];
+        std::snprintf(label, sizeof(label), "case 6: the mv and bdepth sets cover every scored eye-frame (mv %u, bdepth %u of %u + %u + %u) with every error in bin 0 (%llu of %llu, %llu of %llu)", w.mv.frames,
+                      w.bdepth.frames, w.framesScored, w.oracle.frames, w.jump.frames, static_cast<unsigned long long>(mvBin0), static_cast<unsigned long long>(mvPx),
+                      static_cast<unsigned long long>(bdBin0), static_cast<unsigned long long>(bdPx));
+        sc.ok(w.mv.frames == w.framesScored + w.oracle.frames + w.jump.frames && w.bdepth.frames == w.mv.frames && mvPx == bdPx && mvPx > 0 && mvBin0 == mvPx && bdBin0 == bdPx, label);
+        sc.ok(dis > 0 && w.disWorld[0] + w.disCockpit[0] == dis, "case 6: with zero vectors and identity rows the two landings coincide (every disagreement is in bin 0)");
+    }
 
     // The skip reasons, each counted once on its own frame.
     FrameGenShadowWindow before = frameGenShadowOpenWindow();
@@ -836,6 +893,132 @@ void case6Module(Gpu& g, Scope& sc) {
     sc.ok(!frameGenShadowResident(), "case 6: turning the key off releases every resource at the next frame boundary");
 }
 
+// ---- case 7: the second kernel -----------------------------------------------------------------------------------------------------------------------------
+
+// The exact vector field of a plane under `cb`'s TRUE rows: for each render pixel of B at depth z metres (class row `cls`), where it is in A minus where it is.
+std::vector<float> exactMv(const FrameGenShadowCb& cb, float z, int cls) {
+    std::vector<float> mv(static_cast<size_t>(RW) * RH * 2);
+    for (int y = 0; y < RH; ++y)
+        for (int x = 0; x < RW; ++x) {
+            float d[3], dp[3], px = 0.0f, py = 0.0f;
+            pixelDir(x, y, d);
+            carryCpu(d, z, false, cb.tb + cls * 3, dp);
+            if (!temporalDirToPixel(dp, cb.tanA, RW, RH, &px, &py)) { px = static_cast<float>(x) + 1000.0f; py = static_cast<float>(y); }
+            mv[(static_cast<size_t>(y) * RW + x) * 2] = px - static_cast<float>(x);
+            mv[(static_cast<size_t>(y) * RW + x) * 2 + 1] = py - static_cast<float>(y);
+        }
+    return mv;
+}
+
+struct Case7Out {
+    double mvErr = 0.0, bdErr = 0.0, dis50 = 0.0;
+    bool ran = false;
+};
+
+// mode 0 exact vectors, 1 every vector offset by +2 px in x, 2 every vector negated (what a kernel reading the sign wrong sees)
+Case7Out case7World(Gpu& g, Scope& sc, int mode) {
+    Case7Out out;
+    float W[9];
+    rotY(2.0f, W);
+    const float tv[3] = {-2.0f, 0.0f, 0.5f};
+    FrameGenDeltas dA, dB;
+    std::memcpy(dA.W, W, sizeof(W)); std::memcpy(dB.W, W, sizeof(W));
+    std::memcpy(dA.tv, tv, sizeof(tv)); std::memcpy(dB.tv, tv, sizeof(tv));
+    Scene A, B;
+    worldPlane(A, B, W, tv);
+    const FrameGenShadowCb cb = makeCb(A, dA, dB, 10.0f);
+    std::vector<float> mv = exactMv(cb, 50.0f, 2);
+    for (size_t i = 0; i < mv.size(); i += 2) {
+        if (mode == 1) mv[i] += 2.0f;
+        if (mode == 2) { mv[i] = -mv[i]; mv[i + 1] = -mv[i + 1]; }
+    }
+    const GpuResult r = runGpu(g, A, B, cb, &mv);
+    sc.ok(r.ok, "case 7: the scorer ran");
+    if (!r.ok) return out;
+    out.ran = true;
+    FrameGenShadowEyeResult res;
+    frameGenDecodeStats(r.stats.data(), res);
+    const double mvErr = res.mv.cls[2].pixels ? static_cast<double>(res.mv.cls[2].sumErr1024) / 1024.0 / res.mv.cls[2].pixels : 1.0;
+    const double bdErr = res.bdepth.cls[2].pixels ? static_cast<double>(res.bdepth.cls[2].sumErr1024) / 1024.0 / res.bdepth.cls[2].pixels : 1.0;
+    out.mvErr = mvErr;
+    out.bdErr = bdErr;
+    uint64_t disN = 0;
+    for (int i = 0; i < kFrameGenShadowBins; ++i) disN += res.disWorld[i];
+    out.dis50 = frameGenShadowDisPercentile(res.disWorld, 0.5f);
+    char label[240];
+    const char* tag = mode == 0 ? "case 7 (exact vectors)" : (mode == 1 ? "case 7 (+2 px)" : "case 7 (negated vectors)");
+    std::snprintf(label, sizeof(label), "%s: the plane is the world class in both sets (mv %u, bdepth %u of %d cells, all %llu cells looked at)", tag, res.mv.cls[2].pixels, res.bdepth.cls[2].pixels, QW * QH,
+                  static_cast<unsigned long long>(res.mv.cells));
+    sc.ok(res.mv.cls[2].pixels > static_cast<uint32_t>(QW * QH) * 8 / 10 && res.bdepth.cls[2].pixels > static_cast<uint32_t>(QW * QH) * 9 / 10 && res.mv.cls[1].pixels == 0 &&
+              res.bdepth.cls[1].pixels == 0 && res.bdepth.cells == static_cast<uint64_t>(QW * QH) && res.mv.cells == res.bdepth.cells,
+          label);
+    // bdepth does not use the vectors: its figure is the same whatever the field.
+    std::snprintf(label, sizeof(label), "%s: the bdepth landing reproduces B (mean error %.4f)", tag, bdErr);
+    sc.ok(bdErr < 0.008, label);
+    if (mode != 1) {
+        std::snprintf(label, sizeof(label), "%s: the mv landing reproduces B as well as bdepth (mean error %.4f against %.4f)", tag, mvErr, bdErr);
+        sc.ok(mvErr < 0.008, label);
+        std::snprintf(label, sizeof(label), "%s: the two landings agree to under 1/16 px (%llu of %llu world cells in bin 0)", tag, static_cast<unsigned long long>(res.disWorld[0]),
+                      static_cast<unsigned long long>(disN));
+        sc.ok(disN > static_cast<uint64_t>(QW * QH) * 8 / 10 && res.disWorld[0] * 100 >= disN * 98, label);
+    } else if (mode == 1) {
+        std::snprintf(label, sizeof(label), "%s: the mv landing is worse than bdepth (%.4f against %.4f)", tag, mvErr, bdErr);
+        sc.ok(mvErr > 3.0 * bdErr && mvErr > 0.012, label);
+        std::snprintf(label, sizeof(label), "%s: the median disagreement reads about 2 px (%.2f)", tag, out.dis50);
+        sc.ok(disN > static_cast<uint64_t>(QW * QH) * 8 / 10 && out.dis50 > 1.8 && out.dis50 < 2.5, label);
+    }
+    return out;
+}
+
+// A cockpit plane 1 m ahead under an 8 cm head translation, exact vectors: the cockpit disagreement histogram is filled and reads 0.
+void case7Cockpit(Gpu& g, Scope& sc) {
+    FrameGenDeltas dA, dB;
+    dB.th[0] = 0.08f;
+    dB.tv[0] = 0.08f;
+    Scene A, B;
+    for (int y = 0; y < RH; ++y)
+        for (int x = 0; x < RW; ++x) {
+            float dir[3];
+            pixelDir(x, y, dir);
+            A.out[static_cast<size_t>(y) * RW + x] = contentF(dir[0], dir[1]);
+            B.out[static_cast<size_t>(y) * RW + x] = contentF(dir[0] + dB.th[0], dir[1]);
+            A.depth[static_cast<size_t>(y) * RW + x] = B.depth[static_cast<size_t>(y) * RW + x] = kDepthB / 1.0f;
+        }
+    const FrameGenShadowCb cb = makeCb(A, dA, dB, 10.0f);
+    const std::vector<float> mv = exactMv(cb, 1.0f, 1);
+    const GpuResult r = runGpu(g, A, B, cb, &mv);
+    sc.ok(r.ok, "case 7 (cockpit): the scorer ran");
+    if (!r.ok) return;
+    FrameGenShadowEyeResult res;
+    frameGenDecodeStats(r.stats.data(), res);
+    uint64_t world = 0, cockpit = 0;
+    for (int i = 0; i < kFrameGenShadowBins; ++i) { world += res.disWorld[i]; cockpit += res.disCockpit[i]; }
+    char label[240];
+    std::snprintf(label, sizeof(label), "case 7 (cockpit): the cockpit disagreement histogram holds the cells (%llu, the world one %llu) and they agree to under 1/16 px (%u in bin 0)",
+                  static_cast<unsigned long long>(cockpit), static_cast<unsigned long long>(world), res.disCockpit[0]);
+    sc.ok(world == 0 && cockpit > static_cast<uint64_t>(QW * QH) * 8 / 10 && res.disCockpit[0] * 100 >= cockpit * 98, label);
+    const double mvErr = res.mv.cls[1].pixels ? static_cast<double>(res.mv.cls[1].sumErr1024) / 1024.0 / res.mv.cls[1].pixels : 1.0;
+    std::snprintf(label, sizeof(label), "case 7 (cockpit): the cockpit's mv set reproduces B (mean error %.4f, %u cells)", mvErr, res.mv.cls[1].pixels);
+    sc.ok(mvErr < 0.008 && res.mv.cls[0].pixels == 0 && res.mv.cls[2].pixels == 0, label);
+}
+
+// The shader itself with the sign flipped: fgShadowScoreB recompiled from the production text with `c + Mv.Load` made `c - Mv.Load`.
+bool compileFlippedScoreB(Gpu& g, ComPtr<ID3D11ComputeShader>& out) {
+    HMODULE lib = LoadLibraryA("d3dcompiler_47.dll");
+    if (!lib) return false;
+    using CompileFn = HRESULT(WINAPI*)(LPCVOID, SIZE_T, LPCSTR, const D3D_SHADER_MACRO*, ID3DInclude*, LPCSTR, LPCSTR, UINT, UINT, ID3DBlob**, ID3DBlob**);
+    const CompileFn compile = reinterpret_cast<CompileFn>(GetProcAddress(lib, "D3DCompile"));
+    if (!compile) return false;
+    std::string text = frameGenShadowShaderSource();
+    const std::string from = "float2 pm = c + Mv.Load", to = "float2 pm = c - Mv.Load";
+    const size_t at = text.find(from);
+    if (at == std::string::npos) return false;
+    text.replace(at, from.size(), to);
+    ComPtr<ID3DBlob> code, err;
+    if (FAILED(compile(text.data(), text.size(), "framegen_flipped", nullptr, nullptr, "fgShadowScoreB", "cs_5_0", 0, 0, &code, &err))) return false;
+    return SUCCEEDED(g.dev->CreateComputeShader(code->GetBufferPointer(), code->GetBufferSize(), nullptr, &out));
+}
+
 // ---- the run ---------------------------------------------------------------------------------------------------------------------------------------------
 
 int run() {
@@ -852,6 +1035,14 @@ int run() {
     const World4 w4 = case4World(g, sc, false);
     case5ReversedZAndSplit(g, sc);
     case6Module(g, sc);
+    const Case7Out c7exact = case7World(g, sc, 0);
+    const Case7Out c7off = case7World(g, sc, 1);
+    case7Cockpit(g, sc);
+    {
+        char label[200];
+        std::snprintf(label, sizeof(label), "case 7: the vectors' error moves with the vectors, the bdepth one does not (exact mv %.4f, +2 px mv %.4f; bdepth %.4f, %.4f)", c7exact.mvErr, c7off.mvErr, c7exact.bdErr, c7off.bdErr);
+        sc.ok(c7exact.ran && c7off.ran && c7off.mvErr > 3.0 * c7exact.mvErr && std::fabs(c7off.bdErr - c7exact.bdErr) < 1e-4, label);
+    }
 
     // The mutations: each must break its case.
     Scope m1;
@@ -864,8 +1055,30 @@ int run() {
     case4World(g, m2, true);
     ++g_checks;
     if (m2.fails == 0) { ++g_failures; std::printf("FAIL: mutation: an identity backward transform still passes case 4\n"); }
+    Scope m3;
+    m3.quiet = true;
+    case7World(g, m3, 2);   // the vectors' sign wrong, which is what a kernel reading the sign wrong would see
+    ++g_checks;
+    if (m3.fails == 0) { ++g_failures; std::printf("FAIL: mutation: vectors of the wrong sign still pass case 7\n"); }
+    Scope m4;
+    m4.quiet = true;
+    {
+        ComPtr<ID3D11ComputeShader> flipped;
+        ComPtr<ID3D11ComputeShader> saved = g.cs[4];
+        ++g_checks;
+        if (!compileFlippedScoreB(g, flipped)) {
+            ++g_failures;
+            std::printf("FAIL: mutation: the sign-flipped shader could not be built (is `float2 pm = c + Mv.Load` still in the kernel?)\n");
+        } else {
+            g.cs[4] = flipped;
+            case7World(g, m4, 0);
+            g.cs[4] = saved;
+            if (m4.fails == 0) { ++g_failures; std::printf("FAIL: mutation: the shader reading the vector with the wrong sign still passes case 7\n"); }
+        }
+    }
     (void)w4;
-    std::printf("%s: %u checks, %u failures (mutations: forward-not-inverted broke %u checks, identity-backward broke %u)\n", g_failures ? "FAIL" : "PASS", g_checks, g_failures, m1.fails, m2.fails);
+    std::printf("%s: %u checks, %u failures (mutations: forward-not-inverted broke %u checks, identity-backward broke %u, wrong-sign vectors broke %u, wrong-sign shader broke %u)\n", g_failures ? "FAIL" : "PASS", g_checks,
+                g_failures, m1.fails, m2.fails, m3.fails, m4.fails);
     return g_failures ? 1 : 0;
 }
 

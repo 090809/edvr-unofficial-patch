@@ -21,7 +21,8 @@ namespace {
 
 constexpr int kStagingDepth = 4;
 constexpr int kTimerRing = 8;
-constexpr uint32_t kMinCells = kFrameGenShadowStatsUints;   // the clear entry zeroes the stats words from the first cells of the grid
+constexpr int kEntries = 5;      // capture, clear, splat, score, score B
+constexpr int kSrvSlots = 7;     // t0..t6
 
 std::atomic<bool> g_on{false};
 std::atomic<bool> g_told{false};   // the armed line has been said since the key last went on
@@ -61,7 +62,7 @@ struct TimerSlot {
 struct State {
     ID3D11Device* dev = nullptr;   // identity only
     bool failed = false;           // creation failed on this device: stand down until it changes or the key is toggled
-    ID3D11ComputeShader* cs[4] = {};   // capture, clear, splat, score
+    ID3D11ComputeShader* cs[kEntries] = {};   // capture, clear, splat, score, score B
     ID3D11Buffer* cb = nullptr;
     DXGI_FORMAT lumaFormat = DXGI_FORMAT_R16_FLOAT;
     EyeRes eye[2];
@@ -129,13 +130,14 @@ void releaseAll() {
 
 bool createCommon(ID3D11Device* dev, ID3D11DeviceContext* ctx) {
     struct Entry { const unsigned char* code; size_t size; const char* name; };
-    const Entry entries[4] = {
+    const Entry entries[kEntries] = {
         {kFrameGenShadowCaptureBytecode, sizeof(kFrameGenShadowCaptureBytecode), "framegen_shadow_capture"},
         {kFrameGenShadowClearBytecode, sizeof(kFrameGenShadowClearBytecode), "framegen_shadow_clear"},
         {kFrameGenShadowSplatBytecode, sizeof(kFrameGenShadowSplatBytecode), "framegen_shadow_splat"},
         {kFrameGenShadowScoreBytecode, sizeof(kFrameGenShadowScoreBytecode), "framegen_shadow_score"},
+        {kFrameGenShadowScoreBBytecode, sizeof(kFrameGenShadowScoreBBytecode), "framegen_shadow_score_b"},
     };
-    for (int i = 0; i < 4; ++i) {
+    for (int i = 0; i < kEntries; ++i) {
         g.cs[i] = shaderSwapCreateCs(ctx, entries[i].code, entries[i].size, entries[i].name, "frame generation (shadow)");
         if (!g.cs[i]) return false;
     }
@@ -172,7 +174,7 @@ bool createEye(ID3D11Device* dev, EyeRes& r, uint32_t rw, uint32_t rh, uint32_t 
     r.rw = rw; r.rh = rh; r.ow = ow; r.oh = oh;
     r.qw = (rw + 3u) / 4u;
     r.qh = (rh + 3u) / 4u;
-    if (r.qw * r.qh < kMinCells) return false;
+    if (r.qw == 0 || r.qh == 0) return false;
     bool ok = true;
     for (int i = 0; i < 2 && ok; ++i) {
         ok = makeTex(dev, r.qw, r.qh, g.lumaFormat, true, r.luma[i]) && makeTex(dev, r.qw, r.qh, DXGI_FORMAT_R32_FLOAT, true, r.depth[i]);
@@ -220,6 +222,7 @@ void pollReadbacks(ID3D11DeviceContext* ctx, EyeRes& r, uint32_t nextSlot) {
         frameGenDecodeStats(static_cast<const uint32_t*>(m.pData), res);
         ctx->Unmap(r.staging[slot], 0);
         const int set = r.slotSet[slot];
+        frameGenShadowMergeProbe(g.win, res);   // the second kernel's sets, on every scored frame whatever its set
         if (set == kSetOracle) {
             frameGenShadowMergeSet(g.win.oracle, res);
         } else if (set == kSetJump) {
@@ -256,9 +259,9 @@ TimerSlot* beginTimer(ID3D11Device* dev, ID3D11DeviceContext* ctx) {
     return nullptr;
 }
 
-void bindAndDispatch(ID3D11DeviceContext* ctx, int entry, ID3D11ShaderResourceView* const srv[5], ID3D11UnorderedAccessView* const uav[4], uint32_t gx, uint32_t gy) {
+void bindAndDispatch(ID3D11DeviceContext* ctx, int entry, ID3D11ShaderResourceView* const srv[kSrvSlots], ID3D11UnorderedAccessView* const uav[4], uint32_t gx, uint32_t gy) {
     ctx->CSSetShader(g.cs[entry], nullptr, 0);
-    ctx->CSSetShaderResources(0, 5, srv);
+    ctx->CSSetShaderResources(0, kSrvSlots, srv);
     ctx->CSSetUnorderedAccessViews(0, 4, uav, nullptr);
     ctx->Dispatch(gx, gy, 1);
 }
@@ -339,7 +342,9 @@ void frameGenShadowEyeFrame(ID3D11Device* dev, ID3D11DeviceContext* ctx, uint32_
         FrameGenShadowCb cb;
         float Wp[9], tp[3];
         FrameGenAffine bwd[kFrameGenShadowClasses];
+        FrameGenAffine truth[kFrameGenShadowClasses];   // B's true backward rows, whatever the set: the second kernel's bdepth landing
         if (scored) {
+            frameGenBackward(f.deltas, f.deltas.W, f.deltas.tv, truth);
             frameGenPredictWorld(r.prev, f.deltas, Wp, tp);
             // An oracle frame scores far and world with frame B's own measured transform instead of the prediction.
             if (set == kSetOracle) frameGenBackward(f.deltas, f.deltas.W, f.deltas.tv, bwd);
@@ -366,7 +371,7 @@ void frameGenShadowEyeFrame(ID3D11Device* dev, ID3D11DeviceContext* ctx, uint32_
             if (scale > 0.0f) g.dtRatio.push_back(scale);
             if (dtB > 0.0) g.dtMs.push_back(static_cast<float>(dtB));
         }
-        frameGenFillCb(cb, f.renderW, f.renderH, f.outW, f.outH, scored ? f.tanPrev : f.tanNow, f.tanNow, f.depthA, f.depthB, f.splitMetres, bwd);
+        frameGenFillCb(cb, f.renderW, f.renderH, f.outW, f.outH, scored ? f.tanPrev : f.tanNow, f.tanNow, f.depthA, f.depthB, f.splitMetres, bwd, scored ? truth : nullptr);
         D3D11_MAPPED_SUBRESOURCE m{};
         if (SUCCEEDED(ctx->Map(g.cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {
             std::memcpy(m.pData, &cb, sizeof(cb));
@@ -380,10 +385,10 @@ void frameGenShadowEyeFrame(ID3D11Device* dev, ID3D11DeviceContext* ctx, uint32_
         save.save(ctx);
         ctx->CSSetConstantBuffers(0, 1, &g.cb);
         const uint32_t gx = (r.qw + 7u) / 8u, gy = (r.qh + 7u) / 8u;
-        ID3D11ShaderResourceView* noSrv[5] = {};
+        ID3D11ShaderResourceView* noSrv[kSrvSlots] = {};
         ID3D11UnorderedAccessView* noUav[4] = {};
         {   // capture this frame into the slot the next frame will read as its previous
-            ID3D11ShaderResourceView* srv[5] = {f.outSrv, f.depthSrv, nullptr, nullptr, nullptr};
+            ID3D11ShaderResourceView* srv[kSrvSlots] = {f.outSrv, f.depthSrv};
             ID3D11UnorderedAccessView* uav[4] = {r.luma[next].uav, r.depth[next].uav, nullptr, nullptr};
             bindAndDispatch(ctx, 0, srv, uav, gx, gy);
         }
@@ -394,16 +399,21 @@ void frameGenShadowEyeFrame(ID3D11Device* dev, ID3D11DeviceContext* ctx, uint32_
                 bindAndDispatch(ctx, 1, noSrv, uav, gx, gy);
             }
             {   // splat: the previous depth, forward
-                ID3D11ShaderResourceView* srv[5] = {nullptr, nullptr, nullptr, r.depth[prevSlot].srv, nullptr};
+                ID3D11ShaderResourceView* srv[kSrvSlots] = {nullptr, nullptr, nullptr, r.depth[prevSlot].srv};
                 ID3D11UnorderedAccessView* uav[4] = {nullptr, nullptr, r.key.uav, nullptr};
                 bindAndDispatch(ctx, 2, srv, uav, gx, gy);
             }
             {   // score: the previous and this frame's luma against the keys, backward
-                ID3D11ShaderResourceView* srv[5] = {nullptr, nullptr, r.luma[prevSlot].srv, nullptr, r.luma[next].srv};
+                ID3D11ShaderResourceView* srv[kSrvSlots] = {nullptr, nullptr, r.luma[prevSlot].srv, nullptr, r.luma[next].srv};
                 ID3D11UnorderedAccessView* uav[4] = {nullptr, nullptr, r.key.uav, r.statsUav};
                 bindAndDispatch(ctx, 3, srv, uav, gx, gy);
             }
-            ctx->CSSetShaderResources(0, 5, noSrv);
+            if (f.mvSrv) {   // score B: this frame's cells by its own depth, carried back by the DLSS vector and by the true rows (the stats words add to the score's)
+                ID3D11ShaderResourceView* srv[kSrvSlots] = {nullptr, nullptr, r.luma[prevSlot].srv, nullptr, r.luma[next].srv, f.mvSrv, r.depth[next].srv};
+                ID3D11UnorderedAccessView* uav[4] = {nullptr, nullptr, nullptr, r.statsUav};
+                bindAndDispatch(ctx, 4, srv, uav, gx, gy);
+            }
+            ctx->CSSetShaderResources(0, kSrvSlots, noSrv);
             ctx->CSSetUnorderedAccessViews(0, 4, noUav, nullptr);
             ctx->CopyResource(r.staging[slot], r.stats);
             r.pending[slot] = true;
@@ -411,7 +421,7 @@ void frameGenShadowEyeFrame(ID3D11Device* dev, ID3D11DeviceContext* ctx, uint32_
             if (set == kSetJump) ++g.win.skipped[kSkipCameraJump];
             ++r.writes;
         } else {
-            ctx->CSSetShaderResources(0, 5, noSrv);
+            ctx->CSSetShaderResources(0, kSrvSlots, noSrv);
             ctx->CSSetUnorderedAccessViews(0, 4, noUav, nullptr);
         }
         if (timer) timer->timer.end(ctx);
