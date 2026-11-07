@@ -1,7 +1,7 @@
-// TEMPORARY (docs\concourse-cull-2026-11-05.md): the concourse camera test, version 3. Flight 20 refuted a write to RenderView+0x310 (only the cull context's copy), and Flight 21 showed
-// the VR eye path does not run in flat. This version moves flat's main camera where it is made: after 0x2874290, on 0x281D190's stack, before any copy is taken (concourse_camera_test.cpp
-// labels each offset, build 334925). 0x1EA9C0 is read only, for view 0. Flat only (the caller refuses the VR profile), installed only when hotkey.concourse_camera_test is bound; the relay
-// gate is shut while the mode is 0, so unbound costs nothing.
+// TEMPORARY (docs\concourse-cull-2026-11-05.md): the concourse camera test, the look test. Flight 22 showed that moving flat's main camera where it is made (after 0x2874290, on 0x281D190's
+// stack, before any copy is taken) moves the whole picture. This puts it at the room's centre, turning through six directions (concourse_camera_test.cpp labels each offset, build 334925).
+// 0x1EA9C0 is read only, for view 0. Flat only (the caller refuses the VR profile), installed only when hotkey.concourse_camera_test is bound; the relay gate is shut while the mode is 0,
+// so unbound costs nothing.
 // Remove with the concourse arc.
 #pragma once
 
@@ -20,7 +20,8 @@ struct ConcourseCameraTestSnap {
 };
 
 bool concourseCameraTestInstall(const char** why) noexcept;             // true when at least one hook is in; else false, and why (one sentence)
-void concourseCameraTestControl(uint32_t mode, bool acting) noexcept;   // mode 0 off, 1 log only, 2 lift, 3 turn; acting: the camera may be written now
+void concourseCameraTestControl(uint32_t mode, bool acting) noexcept;   // mode 0 off, 1 log only, 2 the look; acting: the camera may be written now
+void concourseCameraTestLook(const float centre[3], const float up[3], uint32_t dir) noexcept;   // the room's centre and up axis, and the direction 0 to 5
 bool concourseCameraTestHooked() noexcept;
 void concourseCameraTestSnapshot(ConcourseCameraTestSnap* out) noexcept;
 

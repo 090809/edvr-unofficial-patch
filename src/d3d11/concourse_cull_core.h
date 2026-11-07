@@ -84,8 +84,17 @@ constexpr float kLiftKeepM = 8.0f;
 // One record. A record whose name is unreadable, or an allowed name, is kept unless its sphere is readable and wholly past kAllowedFarM (distance - radius); the
 // anchor and the hub (`farExempt`, computed from the name by the caller) are kept however far. Then: keep an unreadable sphere (not finite, or no radius); keep a
 // small, close record; cull. `lift` (the player is in a shut lift cabin) replaces all of that by the rule above kLiftKeepM; `farExempt` does not apply to it.
-inline Judge concourseJudge(bool nameReadable, bool allowed, bool sphereReadable, float distance, float radius, bool farExempt, bool lift = false) noexcept {
+// `look` (TEMPORARY, the camera test) is the keep list turned inside out, what a bake would want: the room off and the rest on. An allowed name is culled however far, the anchor and
+// the hub included. An unreadable name is the room's when it is small and reaches within kAllowedFarM of the camera, which is at the room's centre then (INFERRED); it is kept otherwise.
+constexpr float kLookRoomRadiusM = 60.0f;
+inline Judge concourseJudge(bool nameReadable, bool allowed, bool sphereReadable, float distance, float radius, bool farExempt, bool lift = false, bool look = false) noexcept {
     const bool sphereOk = sphereReadable && std::isfinite(distance) && std::isfinite(radius) && radius > 0.0f;
+    if (look) {
+        if (allowed) return Judge::kCull;
+        if (nameReadable) return Judge::kKeepName;
+        if (sphereOk && radius <= kLookRoomRadiusM && distance - radius <= kAllowedFarM) return Judge::kCull;
+        return Judge::kKeepUnreadableName;
+    }
     if (lift) {
         if (!sphereOk) return Judge::kKeepUnreadableSphere;
         const float surface = distance - radius > 0.0f ? distance - radius : 0.0f;
@@ -577,20 +586,25 @@ private:
     LiftEnd end_ = LiftEnd::kNone;
 };
 
-// ---- The camera test (TEMPORARY, docs\concourse-cull-2026-11-05.md): does moving flat's camera where it is made (after 0x2874290) move the picture? ------------
-// Modes 2 and 3 act for kCamTestMs from the tick the lift gate first goes on in a ride, once per ride. The window has its own timer and the gate is not stepped
-// meanwhile (a moved camera would drop it at once: it reads the camera's distance to the cabin). The decision is here so a table can pin it.
-constexpr uint64_t kCamTestMs = 3000;      // how long modes 2 and 3 act
+// ---- The camera test (TEMPORARY, docs\concourse-cull-2026-11-05.md): the look test: what would a bake see from the room's centre, with the room off and the rest on? ---------
+// The look acts for kCamTestMs from the tick the lift gate first goes on in a ride, once per ride, and needs the room's anchor, so only a ride that starts in the concourse has it. The
+// window has its own timer and the gate is not stepped meanwhile (a moved camera would drop it at once: it reads the camera's distance to the cabin). The decision is here so a table can pin it.
+constexpr uint64_t kCamTestDirMs = 800;    // each of the six directions
+constexpr uint32_t kCamTestDirs = 6;       // the heading, a quarter turn three times, straight up, straight down
+constexpr uint64_t kCamTestMs = kCamTestDirMs * kCamTestDirs;   // inside the 6 s from the doors shutting to the cut (Flight 20: 6.02 s both rides)
 constexpr uint64_t kCamTestLogMs = 250;    // the acting lines' spacing
-constexpr uint32_t kCamTestModeOff = 0, kCamTestModeLog = 1, kCamTestModeLift = 2, kCamTestModeTurn = 3, kCamTestModes = 4;
+constexpr uint32_t kCamTestModeOff = 0, kCamTestModeLog = 1, kCamTestModeLook = 2, kCamTestModes = 3;
 inline uint32_t camTestNextMode(uint32_t m) noexcept { return (m + 1) % kCamTestModes; }
 inline const char* camTestModeName(uint32_t m) noexcept {
     switch (m) {
         case kCamTestModeLog: return "log only";
-        case kCamTestModeLift: return "lift 30 m";
-        case kCamTestModeTurn: return "turn 90 degrees";
+        case kCamTestModeLook: return "look from the room's centre";
         default: return "off";
     }
+}
+inline uint32_t camTestLookDir(uint64_t elapsedMs) noexcept {
+    const uint64_t d = elapsedMs / kCamTestDirMs;
+    return d >= kCamTestDirs ? kCamTestDirs - 1 : static_cast<uint32_t>(d);
 }
 enum class CamTestEnd : uint8_t { kNone, kTime, kDoors, kCut, kModeOff };
 inline const char* camTestEndName(CamTestEnd e) noexcept {
@@ -608,7 +622,7 @@ public:
     // another room. Returns whether the window is open after this tick; `*ended` is set only on the tick it closes.
     bool step(uint32_t mode, bool gateOn, const LiftReading& r, bool cut, uint64_t nowMs, CamTestEnd* ended) noexcept {
         if (ended) *ended = CamTestEnd::kNone;
-        const bool acts = mode == kCamTestModeLift || mode == kCamTestModeTurn;
+        const bool acts = mode == kCamTestModeLook;
         if (active_) {
             CamTestEnd why = CamTestEnd::kNone;
             if (!acts) why = CamTestEnd::kModeOff;

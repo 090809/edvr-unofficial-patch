@@ -272,7 +272,9 @@ struct ConcourseExtra {
 ConcourseExtra g_concExtra;
 std::atomic<bool> g_concWanted{false};        // armed, on foot in social space and not sealed: the store gate is open (it sights the anchor, and judges while active)
 std::atomic<bool> g_concActive{false};        // the cull runs: wanted, the key or its override on, and the anchor seen within kConcAnchorFreshMs
-std::atomic<bool> g_liftGateOn{false};        // the tick's: the lift gate is on, the player is in a shut lift cabin (published in the snapshot as `lift`; part of g_concActive)
+std::atomic<bool> g_camLookOn{false};         // TEMPORARY (the camera test): the look is on: the judgement is the keep list inside out (cc::concourseJudge); published in the snapshot as `look`, part of g_concActive
+int g_camLookGraceTicks = 0;                  // TEMPORARY: ticks after the look in which a big camera step is its own way back, not another room
+std::atomic<bool> g_liftGateOn{false};       // the tick's: the lift gate is on, the player is in a shut lift cabin (published in the snapshot as `lift`; part of g_concActive)
 std::atomic<bool> g_concSurveyArmed{false};   // the one-shot names are being gathered: the rig and producer vetoes forward so the store judges and names every record
 bool g_roomCutPending = false;   // the camera stepped over kRoomCutM this tick (resolveTickView); the concourse tick takes it, under the state lock
 float g_roomCutM = 0.0f;
@@ -506,6 +508,7 @@ struct PadSnapshot {
     bool lost = false;            // gathered entries were lost before this publication: the callbacks keep every record
     bool engagePending = false;   // built v14.31: an engage is pending: every pass gathers the near list, the own candidate and the tally
     bool concourse = false;       // built 2026-11-05: the concourse cull is active (the producer veto judges by name)
+    bool look = false;            // TEMPORARY (the camera test): the room off and the rest on (cc::concourseJudge)
     bool lift = false;            // built 2026-11-06: the player is in a shut lift cabin: the judgement keeps only what is near (cc::concourseJudge)
     bool walkOn = false;          // TEMPORARY (the walk survey): this publication's passes report what the seal would cull against walkCell; nothing else reads either
     sealed::OwnCell walkCell;
@@ -1950,7 +1953,7 @@ bool concourseProducerVeto(uintptr_t rec) noexcept {
     if (sphere) prodPutGen(rec, centre, radius, s.prodGen);
     const bool nameReadable = ni.cls != sealed::NameClass::kUnnamed && ni.cls != sealed::NameClass::kNone;
     const float d = sphere ? sealed::distance(centre, s.cam) : 0.0f;
-    const cc::Judge j = cc::concourseJudge(nameReadable, (ni.flags & sealed::kNodeConcourseAllow) != 0, sphere, d, radius, (ni.flags & sealed::kNodeConcourseFarExempt) != 0, s.lift);
+    const cc::Judge j = cc::concourseJudge(nameReadable, (ni.flags & sealed::kNodeConcourseAllow) != 0, sphere, d, radius, (ni.flags & sealed::kNodeConcourseFarExempt) != 0, s.lift, s.look);
     if (cc::judgeKeeps(j)) {
         ++tc.concProdKept;
         concourseCountKept(tc, j);
@@ -2476,6 +2479,7 @@ void publishSnapshot() noexcept {
     s.engagePending = g_engagePending;
     s.concourse = g_concActive.load(std::memory_order_acquire);
     s.lift = g_liftGateOn.load(std::memory_order_acquire);
+    s.look = g_camLookOn.load(std::memory_order_acquire);
     s.walkOn = g_walkPassArmed;
     if (s.walkOn) s.walkCell = g_walkCellCopy;
     g_engagePublished = g_engagePending;
@@ -2499,7 +2503,9 @@ void resolveTickView() noexcept {
         if (g_frameCamValid && sealed::distance(cam, g_frameCam) > kCamJumpM) ++g_winCamJump;
         if (g_frameCamValid) {
             const float step = sealed::distance(cam, g_frameCam);
-            if (cc::roomCut(step)) {   // built 2026-11-06: another room (the lift): the concourse tick forgets the anchor
+            const bool lookStep = g_camLookOn.load(std::memory_order_relaxed) || g_camLookGraceTicks > 0;   // TEMPORARY: the look's own jumps, there and back
+            if (g_camLookGraceTicks > 0) --g_camLookGraceTicks;
+            if (cc::roomCut(step) && !lookStep) {   // built 2026-11-06: another room (the lift): the concourse tick forgets the anchor
                 g_roomCutPending = true;
                 g_roomCutM = step;
             }
@@ -2927,7 +2933,7 @@ void afterStoreConcourse(uintptr_t bucket, uintptr_t record) noexcept {
     const bool nameReadable = ni.cls != sealed::NameClass::kUnnamed && ni.cls != sealed::NameClass::kNone;
     const float d = sphere ? sealed::distance(wr.world, s.cam) : 0.0f;
     const cc::Judge j = cc::concourseJudge(nameReadable, (ni.flags & sealed::kNodeConcourseAllow) != 0, sphere, d, sphere ? wr.radius : 0.0f,
-                                      (ni.flags & sealed::kNodeConcourseFarExempt) != 0, s.lift);
+                                      (ni.flags & sealed::kNodeConcourseFarExempt) != 0, s.lift, s.look);
     const bool keep = cc::judgeKeeps(j);
     const float zero[3] = {0.0f, 0.0f, 0.0f};
     gatherRigNote(w, bucket, record, sphere ? wr.world : zero, sphere ? wr.radius : 0.0f, stamp,
@@ -3126,13 +3132,17 @@ Hotkey* g_viewHotkey = nullptr;
 std::string g_viewHotkeyText;
 bool g_viewHotkeyBound = false;
 // TEMPORARY (docs\concourse-cull-2026-11-05.md): the camera test. hotkey.concourse_camera_test steps g_camMode (cc::kCamTestMode*); the hooks are in
-// concourse_camera_test.cpp (the write point is after 0x2874290) and install only when the key is bound, in the flat profile, on build 334925. Modes 2 and 3 act in a window the tick opens (g_camTimer).
+// concourse_camera_test.cpp (the write point is after 0x2874290) and install only when the key is bound, in the flat profile, on build 334925. The look acts in a window the tick opens (g_camTimer).
 Hotkey* g_camHotkey = nullptr;
 std::string g_camHotkeyText;
 bool g_camHotkeyBound = false;
 uint32_t g_camMode = 0;
 bool g_camHooked = false;
 cc::CamTestTimer g_camTimer;
+bool g_camLookValid = false;           // the room's centre and up were read when the window opened: a ride that starts in the concourse
+bool g_camLookWasOn = false;
+float g_camLookCentre[3] = {};
+float g_camLookUp[3] = {};
 uint64_t g_camLogMs = 0;               // the last status line (mode 1: once a second; acting: every cc::kCamTestLogMs)
 ConcourseCameraTestSnap g_camLast;     // the snapshot at that line, for the counts since
 // PROTOTYPE (the backdrop capture, hotkey.concourse_view_test = F6; docs\concourse-cull-2026-11-05.md "The window plan"): Lifting (the cull is off for cc::kBackdropLiftMs, the
@@ -3319,7 +3329,7 @@ void concoursePoll(uint64_t now) {
         g_camHotkeyText = camKey;
         g_camHotkey->setBinding(camKey.c_str());
         if (g_camHotkey->bound()) {
-            Log::get().note("concourse camera test: hotkey.concourse_camera_test = \"%s\" bound (TEMPORARY, flat only: each press steps off, log only, lift 30 m, turn 90 degrees; the last two act for %llu ms from the lift gate going on, once per ride)",
+            Log::get().note("concourse camera test: hotkey.concourse_camera_test = \"%s\" bound (TEMPORARY, flat only: each press steps off, log only, look; the look acts for %llu ms from the lift gate going on, once per ride, on a ride that starts in the concourse)",
                             camKey.c_str(), static_cast<unsigned long long>(cc::kCamTestMs));
             camTestInstall("bind");
         } else {
@@ -3421,6 +3431,9 @@ void concourseSettingOffTick(uint64_t now) {
     g_backdropGate.reset();
     g_liftGate.reset();
     g_camTimer.stop();
+    g_camLookOn.store(false, std::memory_order_release);
+    g_camLookWasOn = false;
+    g_camLookValid = false;
     if (g_camHooked && g_camMode != 0) {
         g_camMode = 0;
         concourseCameraTestControl(0, false);
@@ -3616,6 +3629,18 @@ bool concourseAnchorUp(float out[3]) {
     const float len = std::sqrt(out[0] * out[0] + out[1] * out[1] + out[2] * out[2]);
     if (!std::isfinite(len) || len < 0.5f) return false;
     for (int k = 0; k < 3; ++k) out[k] /= len;
+    return true;
+}
+
+// TEMPORARY (the camera test): the anchor's centre (the frame the camera's position is in: `concourse frame` lines, checked by hand against its cam_local) and its up axis. False when
+// either cannot be read now.
+bool concourseAnchorCentreUp(float centre[3], float up[3]) {
+    if (!concourseAnchorUp(up)) return false;
+    const uintptr_t anchor = g_concAnchorAddr.load(std::memory_order_relaxed);
+    if (!anchor) return false;
+    const WorldRead aw = worldOfRecord(anchor);
+    if (aw.source == 4 || !std::isfinite(aw.world[0]) || !std::isfinite(aw.world[1]) || !std::isfinite(aw.world[2])) return false;
+    for (int k = 0; k < 3; ++k) centre[k] = aw.world[k];
     return true;
 }
 
@@ -4073,17 +4098,24 @@ void concourseTick(uint64_t now, uint32_t frame) {
         g_liftGate.stop();
         if (g_camTimer.stop()) camEnd = cc::CamTestEnd::kModeOff;
     }
+    bool lookOn = false;
     if (g_camHooked) {
         if (g_camMode != 0 && !runtimeFlatProfile()) {
             Log::get().note("concourse camera test: the profile is not flat any more: the mode is off");
             g_camMode = 0;
         }
         const bool acting = g_camTimer.active();
-        concourseCameraTestControl(g_camMode, acting);   // every tick: it also closes the gate once a held write has gone back
+        if (!acting) g_camLookValid = false;
+        else if (!camWasActive) g_camLookValid = anchor && concourseAnchorCentreUp(g_camLookCentre, g_camLookUp);
+        lookOn = acting && g_camMode == cc::kCamTestModeLook && g_camLookValid;
+        if (lookOn) concourseCameraTestLook(g_camLookCentre, g_camLookUp, cc::camTestLookDir(now - g_camTimer.startMs()));
+        concourseCameraTestControl(g_camMode, lookOn);
         if (acting && !camWasActive) {
-            Log::get().note("concourse camera test: mode %u: the window opens with the lift gate (cabin %.2f m, gaps %.2f %.2f): %llu ms, the gate is held and the lift cull rule is off",
+            Log::get().note("concourse camera test: mode %u: the window opens with the lift gate (cabin %.2f m, gaps %.2f %.2f): %llu ms, the gate is held and the lift cull rule is off; %s, centre %.2f %.2f %.2f, up %.3f %.3f %.3f",
                             g_camMode, static_cast<double>(liftRead.cabinDistM), static_cast<double>(liftRead.gap1), static_cast<double>(liftRead.gap2),
-                            static_cast<unsigned long long>(cc::kCamTestMs));
+                            static_cast<unsigned long long>(cc::kCamTestMs), g_camLookValid ? "the look is on" : "NO ANCHOR HERE, nothing is written (a ride that starts in the hangar)",
+                            static_cast<double>(g_camLookCentre[0]), static_cast<double>(g_camLookCentre[1]), static_cast<double>(g_camLookCentre[2]),
+                            static_cast<double>(g_camLookUp[0]), static_cast<double>(g_camLookUp[1]), static_cast<double>(g_camLookUp[2]));
             camTestLine("start", g_camMode);
             g_camLogMs = now;
         } else if (acting && now - g_camLogMs >= cc::kCamTestLogMs) {
@@ -4099,6 +4131,13 @@ void concourseTick(uint64_t now, uint32_t frame) {
             g_camLogMs = now;
         }
     }
+    // The rigs are judged afresh both ways: a verdict from the other rule would hold them back up to kRigRefreshN calls, as at the lift's end.
+    if (lookOn != g_camLookWasOn) {
+        bumpRigEpoch();
+        if (!lookOn) g_camLookGraceTicks = 12;
+        g_camLookWasOn = lookOn;
+    }
+    g_camLookOn.store(lookOn, std::memory_order_release);
     if (liftOn && !g_liftWasOn) {
         g_liftStartMs = now;
         g_liftTicks = 0;
@@ -4139,7 +4178,7 @@ void concourseTick(uint64_t now, uint32_t frame) {
         g_backdropLiftedMs = 0;
     }
     if (g_viewHotkey && g_viewHotkey->pressed()) {
-        concourseBackdropPress(cullPartRaw && !liftOn, now);
+        concourseBackdropPress(cullPartRaw && !liftOn && !lookOn, now);
     } else if (g_backdropPhase == BackdropPhase::kIdle) {
         // Automatic capture: the same capture F6 starts, when what the panes in view show of nothing is meaningful (concourse_cull_core.h, BackdropAutoGate).
         const ConcourseBackdropMissing miss = concoursePaneBackdropMissing();
@@ -4150,7 +4189,7 @@ void concourseTick(uint64_t now, uint32_t frame) {
         in.modeBackdrop = concoursePaneIsBackdropMode();
         in.cullPartOn = cullPartRaw;
         in.plainMirror = clr.phase == cc::ClearPhase::kMirror;
-        in.liftOn = liftOn;
+        in.liftOn = liftOn || lookOn;
         in.captureRunning = false;
         const cc::BackdropAutoDecision d = g_backdropGate.step(in);
         if (d.escalated)
@@ -4181,12 +4220,12 @@ void concourseTick(uint64_t now, uint32_t frame) {
     }
     const bool backdropLift = concourseBackdropStep(now, wantCull);
     const bool cullPart = cullPartRaw && !backdropLift;
-    const bool active = cullPart || liftOn;
-    ConcoursePaneFeed feed;
-    feed.measure = gateWanted;
-    feed.treat = wantCull;
-    feed.withhold = active;
-    feed.effects = active || backdropLift;
+    const bool active = cullPart || liftOn || lookOn;
+    ConcoursePaneFeed feed;   // the look wants the game's own picture: no pane treatment, nothing withheld
+    feed.measure = gateWanted && !lookOn;
+    feed.treat = wantCull && !lookOn;
+    feed.withhold = active && !lookOn;
+    feed.effects = (active || backdropLift) && !lookOn;
     feed.bayOpacity = clr.bayOpacity;
     feed.sealed = g_sealedFlag.load(std::memory_order_acquire);   // the hangar is sealed: what can only be outside is not issued, with no diag key
     feed.enterShare = g_concEnterShare;
@@ -4206,7 +4245,7 @@ void concourseTick(uint64_t now, uint32_t frame) {
         for (int k = 0; k < 3; ++k) feed.up[k] = upValid ? up[k] : 0.0f;
     }
     concoursePaneSetFeed(feed);
-    g_concWanted.store(gateWanted || liftOn, std::memory_order_release);   // the lift opens the store route in the hangar too (it is not social space there)
+    g_concWanted.store(gateWanted || liftOn || lookOn, std::memory_order_release);   // the lift opens the store route in the hangar too (it is not social space there)
     g_concHubWanted.store(gateWanted && g_concHubAddr.load(std::memory_order_relaxed) == 0, std::memory_order_relaxed);
     const bool transitioned = active != g_concWasActive;
     if (transitioned) {

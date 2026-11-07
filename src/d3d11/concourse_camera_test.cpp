@@ -96,8 +96,8 @@ bool installOne(HookEntry& entry,uintptr_t base) noexcept {
     return true;   // process-lifetime storage: an in-flight call may be executing the relay
 }
 
-// ---- TEMPORARY concourse camera test v3 (docs\concourse-cull-2026-11-05.md "Flight 21 results"). Flight 20 refuted a write to RenderView+0x310 (only the cull context's copy). Flight 21
-// showed the VR eye path (0x2845730, 0x283FA20) does not run in flat. This version moves flat's camera where it is made. Offsets READ in analysis\decomp\verify_20261107_flat_camera_build.txt:
+// ---- TEMPORARY concourse camera test (docs\concourse-cull-2026-11-05.md "Flight 22 results"). Flight 22 showed that moving flat's camera where it is made moves the whole picture. This is
+// the look test: the camera goes to the room's centre and steps through six directions. Offsets READ in analysis\decomp\verify_20261107_flat_camera_build.txt:
 //   0x2874290 (H, pose record*, camera*): the single flat producer of the main camera. Integer arguments only (READ in the disassembly, and it reads nothing else on entry). One direct
 //            caller, 0x281D190, call at 0x281D254, return 0x281D259. THE WRITE POINT, after it returns: the camera is a stack local of 0x281D190, which then copies it to the camera set,
 //            and from there to the view node (+0x20) and the RenderView (+0x310). Moved here, every copy moves together, and the pose record, which game logic may read, is not touched.
@@ -109,7 +109,6 @@ constexpr uintptr_t kHkViews = 0x1EA9C0u, kHkProducer = 0x2874290u, kCtProducerR
 constexpr uintptr_t kCtFlagsOff = 0x18, kCtCamOff = 0x310, kCtPosOff = 0x30, kCtCtxOff = 0xF4Bu * 8u, kCtCountOff = 0x1A940, kCtSlotsOff = 0x40, kCtSlotStride = 0x6A0,
                     kCtSlotPosOff = 0x540, kCtSlotFlagsOff = 0x688;
 constexpr uint32_t kCtDropFlags = (1u << 24) | (1u << 18) | (1u << 17) | (1u << 15), kCtBit16 = 1u << 16;   // 0x1068000, 0x10000: RenderView+0x18 bits that leave the first context (READ in 0x1EA9C0)
-constexpr float kCtLiftM = 30.0f;   // mode 2: along the world y
 enum : int { kIdxViews, kIdxProducer, kIdxCount };
 alignas(8) std::atomic<uintptr_t> camTestGate{0};
 std::atomic<uint32_t> g_ctMode{0};
@@ -118,7 +117,8 @@ std::atomic<uint64_t> g_ctCalls[kIdxCount];
 std::atomic<uint64_t> g_ctFaults{0}, g_ctNoView0{0}, g_ctMulti{0}, g_ctWritten{0}, g_ctRefused{0}, g_ctOtherSite{0};
 std::atomic<uint32_t> g_ctRvCount{0}, g_ctMain{0}, g_ctFlags{0}, g_ctSlotIdx{0}, g_ctSlotFlags{0};
 std::atomic<bool> g_ctSlotKnown{false};
-std::atomic<float> g_ctRvPos[3], g_ctSlot[3], g_ctCamBefore[3], g_ctCamAfter[3], g_ctFwdBefore[3], g_ctFwdAfter[3];
+std::atomic<float> g_ctRvPos[3], g_ctSlot[3], g_ctCamBefore[3], g_ctCamAfter[3], g_ctFwdBefore[3], g_ctFwdAfter[3], g_ctLookCentre[3], g_ctLookUp[3];
+std::atomic<uint32_t> g_ctLookDir{0};
 uintptr_t g_ctBase=0;
 
 __declspec(noinline) uintptr_t __fastcall viewsObserved(uintptr_t,uintptr_t,uintptr_t) noexcept;
@@ -177,6 +177,13 @@ void ctReadViews(uintptr_t self,uintptr_t views,uintptr_t count) noexcept {
     }
 }
 
+// A quarter turn of v about the unit axis a (right-handed): a x v + a (a . v). A rotation, so the rows stay orthonormal and keep their handedness.
+void ctTurn90(float* v,const float* a) noexcept {
+    const float d=a[0]*v[0]+a[1]*v[1]+a[2]*v[2];
+    const float x=a[1]*v[2]-a[2]*v[1]+a[0]*d,y=a[2]*v[0]-a[0]*v[2]+a[1]*d,z=a[0]*v[1]-a[1]*v[0]+a[2]*d;
+    v[0]=x;v[1]=y;v[2]=z;
+}
+
 // 0x2874290 after it returns: the read, and in the window the write. The camera is read in log only too: the RenderView's camera against it says, with no write at all, that this is view 0's.
 void ctCameraEdit(uintptr_t cam,uint32_t mode) noexcept {
     __try {
@@ -187,17 +194,20 @@ void ctCameraEdit(uintptr_t cam,uint32_t mode) noexcept {
             g_ctCamBefore[i].store(pos[i],std::memory_order_relaxed);
             g_ctFwdBefore[i].store(fwd[i],std::memory_order_relaxed);
         }
-        if(g_ctActing.load(std::memory_order_relaxed)&&(mode==2||mode==3)) {
-            if(mode==2) {
-                pos[1]+=kCtLiftM;
-            } else {
-                // 90 degrees about the world y: each axis row (x,y,z) -> (z,y,-x).
-                for(int r=0;r<3;++r) {
-                    float* row=reinterpret_cast<float*>(cam+0x10u*r);
-                    const float x=row[0],z=row[2];
-                    row[0]=z;row[2]=-x;
-                }
+        if(g_ctActing.load(std::memory_order_relaxed)&&mode==2) {
+            // The player's own axes turned: directions 0 to 3 a quarter turn at a time about the room's up, 4 and 5 straight up and down, about the camera's right row.
+            float up[3];
+            for(int i=0;i<3;++i)up[i]=g_ctLookUp[i].load(std::memory_order_relaxed);
+            const uint32_t dir=g_ctLookDir.load(std::memory_order_relaxed);
+            float* rows[3]={reinterpret_cast<float*>(cam),reinterpret_cast<float*>(cam+0x10u),reinterpret_cast<float*>(cam+0x20u)};
+            for(uint32_t k=0;k<(dir<4u?dir:0u);++k)for(int r=0;r<3;++r)ctTurn90(rows[r],up);
+            if(dir==4u||dir==5u) {
+                const float sign=dir==4u?1.0f:-1.0f;
+                const float axis[3]={rows[0][0]*sign,rows[0][1]*sign,rows[0][2]*sign};
+                ctTurn90(rows[1],axis);
+                ctTurn90(rows[2],axis);
             }
+            for(int i=0;i<3;++i)pos[i]=g_ctLookCentre[i].load(std::memory_order_relaxed);
             g_ctWritten.fetch_add(1,std::memory_order_relaxed);
         }
         for(int i=0;i<3;++i) {
@@ -277,11 +287,20 @@ bool concourseCameraTestInstall(const char** why) noexcept {
     } catch(...) {*why="an exception during the install";return false;}
 }
 
-// The mode (0 off, 1 log only, 2 lift, 3 turn) and whether the camera may be written now. The relay gate is open while the mode is not 0.
+// The mode (0 off, 1 log only, 2 the look) and whether the camera may be written now. The relay gate is open while the mode is not 0.
 void concourseCameraTestControl(uint32_t mode,bool acting) noexcept {
     g_ctMode.store(mode,std::memory_order_relaxed);
-    g_ctActing.store(acting&&(mode==2||mode==3),std::memory_order_relaxed);
+    g_ctActing.store(acting&&mode==2,std::memory_order_relaxed);
     camTestGate.store(mode!=0?uintptr_t(1):uintptr_t(0),std::memory_order_release);
+}
+
+// Where the look stands and which way it faces: set by the tick before it says acting.
+void concourseCameraTestLook(const float centre[3],const float up[3],uint32_t dir) noexcept {
+    for(int i=0;i<3;++i) {
+        g_ctLookCentre[i].store(centre[i],std::memory_order_relaxed);
+        g_ctLookUp[i].store(up[i],std::memory_order_relaxed);
+    }
+    g_ctLookDir.store(dir,std::memory_order_relaxed);
 }
 
 bool concourseCameraTestHooked() noexcept {return g_ctHooked.load(std::memory_order_acquire)!=0;}
