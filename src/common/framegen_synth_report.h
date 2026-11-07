@@ -7,6 +7,7 @@
 // the shadow scorer scores a warp: the luma error per class of B, with the no-warp comparison (B against C) beside it. The classes, bins and class fields are the scorer's
 // (framegen_shadow_report.h), so the two lines read side by side.
 #include "framegen_shadow_report.h"
+#include "framegen_slot_report.h"   // Phase 2.3b: kFrameGenFinish*, frameGenFinishName
 
 #include <cstdint>
 #include <cstdio>
@@ -36,13 +37,16 @@ struct FrameGenSynthWindow {
     uint64_t tcells = 0, tout = 0;
     float rotMedian = 0.0f, rotMax = 0.0f;                   // the residual rotation's angle (true B -> C head rotation against the one S was built for), degrees
     uint32_t rotSamples = 0;
-    float gpuMedian[2] = {}, gpuMax[2] = {};
-    uint32_t gpuSamples[2] = {};  // the timed frames behind each pair; 0 reads "-(n=0)"
+    float gpuMedian[3] = {}, gpuMax[3] = {};
+    uint32_t gpuSamples[3] = {};  // the timed frames behind each pair; 0 reads "-(n=0)". [2]: Phase 2.3b's finish of one eye's S (S's sharpening and its UI composite)
     // Phase 2.2: the f = 0.5 builds by the head step they took (the runtime's slot pose / the synthesizer's own extrapolation), where S was written (bits: 1 the game-device private
     // texture, 2 the producer texture directly (uav), 4 a private S copied into it), and the f = 0.5 S not built or not handed over because the previous one was still unconsumed.
     uint32_t poseRuntime = 0, poseFallback = 0;
     uint32_t pathBits = 0;
     uint32_t busy = 0;
+    // Phase 2.3b: the f = 0.5 S finished as B is (B's sharpening, B's UI layer by the head's step) / left unfinished (not handed over), and the last reason one was not
+    // (framegen_slot_report.h kFrameGenFinish*).
+    uint32_t finished = 0, unfinished = 0, unfinishedWhy = 0;
 };
 
 inline const char* frameGenSynthPathName(uint32_t bits) {
@@ -90,6 +94,9 @@ constexpr const char* kFrameGenSynthTurnedTailFmt = " rot_res_deg=%s/%s out=%.2f
 // Phase 2.2, last on the line: pose=<f=0.5 builds on the runtime's slot pose>/<on the extrapolation> s=<where S was written: private, uav, copy, mixed, none> busy=<f=0.5 S held
 // back because the previous one was not consumed>. A line from before it ends at out=.
 constexpr const char* kFrameGenSynthSlotTailFmt = " pose=%u/%u s=%s busy=%u";
+// Phase 2.3b, after busy= and only in a window that finished or refused to finish an S: finish=<S finished like B>/<left unfinished, not handed over> finish_ms=<the finish's GPU
+// time per eye, median/max(n=)> why=<the last reason an S was left unfinished, or finished>.
+constexpr const char* kFrameGenSynthFinishTailFmt = " finish=%u/%u finish_ms=%s why=%s";
 constexpr const char* kFrameGenSynthRotNumFmt = "%.3f";
 constexpr const char* kFrameGenSynthRotNoneFmt = "-";
 
@@ -161,8 +168,13 @@ inline std::string formatFrameGenSynthReport(const FrameGenSynthWindow& w) {
         n += std::snprintf(buf + n, sizeof(buf) - n, kFrameGenSynthTurnedTailFmt, lo, hi, 100.0 * static_cast<double>(w.tout) / (all > 0.0 ? all : 1.0));
     }
     if (n > 0 && n < static_cast<int>(sizeof(buf)))
-        std::snprintf(buf + n, sizeof(buf) - n, kFrameGenSynthSlotTailFmt, static_cast<unsigned>(w.poseRuntime), static_cast<unsigned>(w.poseFallback), frameGenSynthPathName(w.pathBits),
-                      static_cast<unsigned>(w.busy));
+        n += std::snprintf(buf + n, sizeof(buf) - n, kFrameGenSynthSlotTailFmt, static_cast<unsigned>(w.poseRuntime), static_cast<unsigned>(w.poseFallback), frameGenSynthPathName(w.pathBits),
+                           static_cast<unsigned>(w.busy));
+    if ((w.finished || w.unfinished) && n > 0 && n < static_cast<int>(sizeof(buf))) {
+        const std::string gf = formatFrameGenSynthGpu(w, 2);
+        std::snprintf(buf + n, sizeof(buf) - n, kFrameGenSynthFinishTailFmt, static_cast<unsigned>(w.finished), static_cast<unsigned>(w.unfinished), gf.c_str(),
+                      frameGenFinishName(w.unfinished ? w.unfinishedWhy : kFrameGenFinishDone));
+    }
     return buf;
 }
 

@@ -37,6 +37,33 @@ inline uint32_t frameGenSlotFormatBytes(uint32_t dxgiFormat) {
     }
 }
 
+// Phase 2.3b: whether an eye's S was finished as B is (EdvrNativeFrameGenS::finish, common/native_temporal.h): B's door (src\d3d11\native_sharpen.cpp) runs B's sharpener on S
+// and composites B's UI layer over it moved by the head's step alone. 0 is what a d3d11.dll from before 2.3b answers (never finished); 1 finished; anything else names why not, and
+// that S is not handed over. The runtime shows only a finished S (otherwise Lock lets go with reason s_unfinished, and says the why once per change).
+constexpr uint32_t kFrameGenFinishOld = 0;        // a d3d11.dll from before 2.3b: its S is not finished
+constexpr uint32_t kFrameGenFinishDone = 1;       // finished like B
+constexpr uint32_t kFrameGenFinishNoDoor = 2;     // B's door did not run for the eye after S was built (no native sharpen table, or the door refused the eye)
+constexpr uint32_t kFrameGenFinishLayerOnly = 3;  // the eye is the UI layer alone (an on-foot map or menu screen, the VR world route): there is no scene to synthesize
+constexpr uint32_t kFrameGenFinishScope = 4;      // the scope lens rewrites B's picture (a press of the sights): S has no lens
+constexpr uint32_t kFrameGenFinishRipple = 5;     // the shield ripple rewrote B's picture this frame: S has no ripple
+constexpr uint32_t kFrameGenFinishCropped = 6;    // B's door works on a region of the frame, not the whole of it (S is the whole)
+constexpr uint32_t kFrameGenFinishSharpen = 7;    // B is sharpened and S could not be (or the reverse)
+constexpr uint32_t kFrameGenFinishFault = 8;      // the finish itself failed (a texture, a view, the parameter block, the producer texture's key)
+inline const char* frameGenFinishName(uint32_t why) {
+    switch (why) {
+        case kFrameGenFinishOld: return "old_d3d11";
+        case kFrameGenFinishDone: return "finished";
+        case kFrameGenFinishNoDoor: return "no_door";
+        case kFrameGenFinishLayerOnly: return "layer_only";
+        case kFrameGenFinishScope: return "scope";
+        case kFrameGenFinishRipple: return "ripple";
+        case kFrameGenFinishCropped: return "cropped";
+        case kFrameGenFinishSharpen: return "sharpen";
+        case kFrameGenFinishFault: return "fault";
+        default: return "unknown";
+    }
+}
+
 // The transfer path the window saw: uav (the resample pass writes S into the producer texture), copy (a private S copied into it), none (nothing produced), mixed (both).
 inline const char* frameGenSlotPathName(bool uav, bool copy) { return uav && copy ? "mixed" : uav ? "uav" : copy ? "copy" : "none"; }
 

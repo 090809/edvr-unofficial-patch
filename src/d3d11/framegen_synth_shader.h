@@ -1,6 +1,6 @@
 #pragma once
 // The frame-generation synthesizer's compute shaders (fix.frame_generation_shadow, TEMPORARY; docs/design-frame-generation-2026-10-26.md, Phase 2.1, "The synthesis pass").
-// One source, seven entry points, one constant block (src\common\framegen_synth_math.h FrameGenSynthCb). Nothing they write is shown in the headset. Before them the key grid and the
+// One source, seven entry points (and Phase 2.3b's eighth, fgSynFinish, outside the pass sequence), one constant block (src\common\framegen_synth_math.h FrameGenSynthCb). Nothing they write is shown in the headset. Before them the key grid and the
 // stats words are cleared to 0 by the API (ClearUnorderedAccessViewUint, framegen_synth_pass.h); the read offsets are not cleared: a pixel whose key is 0 has kNoRead written by
 // fgSynResolve, and a pixel whose key is not 0 has its offset written by fgSynSrc (the pixel that set the key finds it there again and writes).
 //   fgSynSplat     each B pixel carried to S by its class's motion (fgSynTarget; its class and depth are the nearest of the 3x3 around it, synDepth9, taken where they are read) and
@@ -26,8 +26,8 @@
 // kFrameGenSynthCs (frameGenSynthShaderSource); the markers are read out of kTemporalCsHlsl by frameGenCarryText (framegen_shadow_shader.h).
 //
 // Bindings: t0 B's output (the upscaler's, before the interface; on C's frame the score reads C's there), t1 B's depth copy, t2 the DLSS vectors (R16G16_FLOAT, render size, pixels,
-// this frame to the previous, jitter-free), t3 and t5 unused, t4 the key grid, t6 the read offsets, t7 the S texture, t8 the kept S luma, t9 the kept B luma (x) and class (y);
-// u0 the hole list (a structured buffer of uints), u1 the key grid (R32_UINT), u2 unused, u3 the read offsets (R32_UINT: two packed half floats, or a guarded read's integer
+// this frame to the previous, jitter-free), t3 and t5 fgSynFinish's frame and UI layer (t10 its multiply, u2 its output: Phase 2.3b, at the end of the text), t4 the key grid, t6 the read offsets, t7 the S texture, t8 the kept S luma, t9 the kept B luma (x) and class (y);
+// u0 the hole list (a structured buffer of uints), u1 the key grid (R32_UINT), u2 fgSynFinish's output, u3 the read offsets (R32_UINT: two packed half floats, or a guarded read's integer
 // pair with the mark; the resolve and the hole pass read other pixels' through this view, a typed uint load every D3D11 part does), u4 the S texture, u5 the stats words, u6 the
 // S luma, u7 B's luma and class; b0 P.
 //
@@ -546,6 +546,53 @@ void fgSynScore(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
         uint vt = gTurn[j];
         if (vt != 0u) InterlockedAdd(Stats[kTurnBase + j], vt);
     }
+}
+)HLSL" R"HLSL(
+// Phase 2.3b, S finished like B (fgSynFinish): the UI layer B's door composited over B, composited over S the same way (ui_layer's kUiLayerCompositeHlsl, line for line: the
+// layer and the multiply averaged over the output pixel's exact footprint, at most 4 x 4 taps, out = L.rgb + F.rgb * L.a * M.rgb, the frame's alpha kept), except that each S
+// pixel reads the layer where B's eye saw the same cockpit-fixed point: S's pixel centre carried to B's output pixels by the head's step alone (a homography, the layer taken as a
+// plane at a fixed panel distance; exact for the rotation). Its own block in P (framegen_synth_math.h frameGenSynthFinishFillCb): sz.xy the output (the region's) size, sz.zw the
+// region's origin in FinFrame; qz.x 1 when a multiply drew into M this frame; dk.xy the layer's size in texels; tanK the layer's rectangle (u0, v0, u1, v1) for the region; rs[0..2]
+// the homography's rows, S output pixel (centre at integers) to B's. A homography that is the identity reads exactly the texels B's composite read.
+Texture2D<float4>   FinFrame : register(t3);
+Texture2D<float4>   FinLayer : register(t5);
+Texture2D<float4>   FinMult  : register(t10);
+RWTexture2D<float4> FinOut   : register(u2);
+[numthreads(8, 8, 1)]
+void fgSynFinish(uint3 id : SV_DispatchThreadID) {
+    if (id.x >= uint(sz.x) || id.y >= uint(sz.y)) return;
+    float4 f = FinFrame.Load(int3(sz.zw + int2(id.xy), 0));
+    float3 p = float3(float2(id.xy), 1.0);
+    float3 hq = float3(dot(rs[0].xyz, p), dot(rs[1].xyz, p), dot(rs[2].xyz, p));
+    float4 l = float4(0, 0, 0, 1);
+    float3 m = float3(1, 1, 1);
+    if (hq.z > 1e-6) {
+        float2 q = hq.xy / hq.z;
+        float2 layerSize = dk.xy;
+        float2 span = (tanK.zw - tanK.xy) * layerSize / float2(sz.xy);
+        float2 x0 = tanK.xy * layerSize + q * span;
+        float2 x1 = x0 + span;
+        int2 k0 = max(int2(floor(x0)), int2(0, 0));
+        int2 k1 = min(int2(ceil(x1)) - 1, int2(layerSize) - 1);
+        float4 acc = float4(0, 0, 0, 0);
+        float3 accM = float3(0, 0, 0);
+        float wsum = 0;
+        [loop] for (int j = k0.y; j <= min(k1.y, k0.y + 3); ++j) {
+            float wy = min(x1.y, (float)j + 1.0) - max(x0.y, (float)j);
+            if (wy <= 0) continue;
+            [loop] for (int i = k0.x; i <= min(k1.x, k0.x + 3); ++i) {
+                float wx = min(x1.x, (float)i + 1.0) - max(x0.x, (float)i);
+                if (wx <= 0) continue;
+                acc += FinLayer.Load(int3(i, j, 0)) * (wx * wy);
+                if (qz.x != 0) accM += FinMult.Load(int3(i, j, 0)).rgb * (wx * wy);
+                wsum += wx * wy;
+            }
+        }
+        l = wsum > 0 ? acc / wsum : float4(0, 0, 0, 1);
+        m = (qz.x != 0 && wsum > 0) ? accM / wsum : float3(1, 1, 1);
+    }
+    float3 c = l.rgb + f.rgb * l.a * m;
+    FinOut[id.xy] = float4(saturate(c), f.a);
 }
 )HLSL";
 

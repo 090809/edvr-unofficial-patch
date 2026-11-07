@@ -196,4 +196,69 @@ inline bool frameGenSynthTarget(const FrameGenSynthCb& cb, float px, float py, f
     return temporalDirToPixel(dr, cb.tanB, w, h, &pp[0], &pp[1]);
 }
 
+// ---- Phase 2.3b: S finished like B (fgSynFinish) ----
+// B's UI layer (the HUD, the holo panels: drawn by the ship, fixed to it) moves in the eye from B to S by the head's step alone, x_S = rot x_B + t (B's eye space to S's, the step the
+// f = 0.5 S was built with). The layer has no depth of its own, so it is taken as a plane at kFrameGenFinishPanelMetres in front of S's eye: an S output pixel (centre at
+// integers, w x h, tangents tan: left, right, bottom, top) shows the point of that plane a B pixel showed, d_B ~ rot^T (d_S - t / D). The rotation is exact at any distance; the
+// translation's part is exact at D only (a panel at d instead lands off by |t| (1/d - 1/D) radians).
+constexpr float kFrameGenFinishPanelMetres = 1.5f;
+// H (row-major 3x3): (x_B, y_B, 1) ~ H (x_S, y_S, 1). Built in double; entries within 1e-9 of 0 or 1 are snapped, so the identity step gives the identity exactly and S's composite
+// reads the very texels B's did.
+inline void frameGenSynthFinishHomography(const float rot[9], const float t[3], const float tan[4], uint32_t w, uint32_t h, float panelMetres, float H[9]) {
+    const double L = tan[0], R = tan[1], Bt = tan[2], T = tan[3], W = static_cast<double>(w), Hh = static_cast<double>(h);
+    const double sx = (R - L) / W, sy = (T - Bt) / Hh, u = W / (R - L), v = Hh / (T - Bt);
+    const double kinv[9] = {sx, 0.0, L + 0.5 * sx, 0.0, -sy, T - 0.5 * sy, 0.0, 0.0, -1.0};   // S pixel -> direction (z = -1)
+    const double k[9] = {u, 0.0, u * L + 0.5, 0.0, -v, 0.5 - v * T, 0.0, 0.0, -1.0};          // direction -> B pixel, homogeneous
+    double m[9];                                                                                // rot^T (I + (t / D) e_z^T)
+    for (int r = 0; r < 3; ++r)
+        for (int c = 0; c < 3; ++c) {
+            double s = 0.0;
+            for (int i = 0; i < 3; ++i) s += static_cast<double>(rot[i * 3 + r]) * ((i == c ? 1.0 : 0.0) + (c == 2 ? static_cast<double>(t[i]) / panelMetres : 0.0));
+            m[r * 3 + c] = s;
+        }
+    double km[9], out[9];
+    for (int r = 0; r < 3; ++r)
+        for (int c = 0; c < 3; ++c) {
+            double a = 0.0;
+            for (int i = 0; i < 3; ++i) a += k[r * 3 + i] * m[i * 3 + c];
+            km[r * 3 + c] = a;
+        }
+    for (int r = 0; r < 3; ++r)
+        for (int c = 0; c < 3; ++c) {
+            double a = 0.0;
+            for (int i = 0; i < 3; ++i) a += km[r * 3 + i] * kinv[i * 3 + c];
+            out[r * 3 + c] = a;
+        }
+    for (int i = 0; i < 9; ++i) {
+        double x = out[i];
+        if (std::fabs(x) < 1e-9) x = 0.0;
+        else if (std::fabs(x - 1.0) < 1e-9) x = 1.0;
+        H[i] = static_cast<float>(x);
+    }
+}
+// Where S's output pixel (sx, sy) reads B's (the layer's footprint starts there, as B's composite starts at its own pixel). False when it is not in front of B's eye.
+inline bool frameGenSynthFinishLanding(const float H[9], float sx, float sy, float out[2]) {
+    const float x = H[0] * sx + H[1] * sy + H[2], y = H[3] * sx + H[4] * sy + H[5], z = H[6] * sx + H[7] * sy + H[8];
+    if (!(z > 1e-6f)) return false;
+    out[0] = x / z;
+    out[1] = y / z;
+    return true;
+}
+// fgSynFinish's block, in P's rows (framegen_synth_shader.h says which field carries what): the output (the region's) size and the region's origin in the frame, whether a multiply
+// drew this frame, the layer's size and its rectangle for the region (ui_layer's composite parameters as B's door used them), and H's rows.
+inline void frameGenSynthFinishFillCb(FrameGenSynthCb& cb, uint32_t outW, uint32_t outH, uint32_t x0, uint32_t y0, const float H[9], const float layerUv[4], uint32_t layerW,
+                                      uint32_t layerH, bool useMult) {
+    cb = FrameGenSynthCb{};
+    cb.sz[0] = static_cast<int32_t>(outW);
+    cb.sz[1] = static_cast<int32_t>(outH);
+    cb.sz[2] = static_cast<int32_t>(x0);
+    cb.sz[3] = static_cast<int32_t>(y0);
+    cb.qz[0] = useMult ? 1 : 0;
+    cb.dk[0] = static_cast<float>(layerW);
+    cb.dk[1] = static_cast<float>(layerH);
+    for (int i = 0; i < 4; ++i) cb.tanK[i] = layerUv[i];
+    for (int r = 0; r < 3; ++r)
+        for (int c = 0; c < 3; ++c) cb.rs[r][c] = H[r * 3 + c];
+}
+
 }  // namespace edvr

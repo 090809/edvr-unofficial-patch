@@ -14,5 +14,6 @@ static std::vector<Variant> frameGenSynthVariants() {
         {"kFrameGenSynthResampleBytecode", "framegen synth", "fgSynResample", nullptr, {}, false, text, "cs_5_0"},
         {"kFrameGenSynthLumaBytecode", "framegen synth", "fgSynLuma", nullptr, {}, false, text, "cs_5_0"},
         {"kFrameGenSynthScoreBytecode", "framegen synth", "fgSynScore", nullptr, {}, false, text, "cs_5_0"},
+        {"kFrameGenSynthFinishBytecode", "framegen synth", "fgSynFinish", nullptr, {}, false, text, "cs_5_0"},   // Phase 2.3b: S finished like B (the UI layer by the head's step)
     };
 }

@@ -107,7 +107,8 @@ struct EdvrNativeFrameGenS {
   void* sharedHandle;           // the producer texture's NT handle (keyed mutex), owned by the d3d11 half: valid while textureSerial stands; never closed by the reader
   uint64_t textureSerial;       // changes whenever the producer texture is made again
   uint32_t width, height, format;
-  uint32_t reserved;
+  uint32_t finish;              // Phase 2.3b (framegen_slot_report.h kFrameGenFinish*): 1 S was finished as B is (B's sharpening, B's UI layer by the head's step); 0 from a d3d11.dll before
+                                // it (the field was reserved and zero); else why not, and S was not handed over. A runtime from before 2.3b does not read it.
   uint64_t gameBytes;           // the game-device bytes this eye's S set holds now (the producer texture, plus the private S on the copy path)
 };
 #define EDVR_NATIVE_FRAMEGEN_S_SIZE_1 ((uint32_t)sizeof(EdvrNativeFrameGenS))

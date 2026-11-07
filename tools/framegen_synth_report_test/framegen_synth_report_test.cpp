@@ -112,9 +112,35 @@ void caseLines() {
         x.rotMedian = x.rotMax = 179.999f;
         x.poseRuntime = x.poseFallback = x.busy = 4000000000u;
         x.pathBits = 7;
+        x.finished = x.unfinished = 4000000000u;
+        x.unfinishedWhy = kFrameGenFinishLayerOnly;
+        x.gpuSamples[2] = 4000000000u;
+        x.gpuMedian[2] = x.gpuMax[2] = 99999.99f;
         const std::string widest = formatFrameGenSynthReport(x);
         std::printf("framegen_synth_report_test: widest report line %zu characters\n", widest.size());
         check(widest.size() < 1100, "the widest report line, every number at its widest, is under Log::note's 1165 characters in one line");
+    }
+
+    {   // Phase 2.3b: the finish's tail, only in a window that finished or refused to finish an S.
+        FrameGenSynthWindow fw = w;
+        fw.finished = 88; fw.unfinished = 2; fw.unfinishedWhy = kFrameGenFinishScope;
+        fw.gpuSamples[2] = 90; fw.gpuMedian[2] = 0.21f; fw.gpuMax[2] = 0.4f;
+        const std::string fl = formatFrameGenSynthReport(fw);
+        checkText(fl.substr(line.size()), " finish=88/2 finish_ms=0.21/0.40(n=90) why=scope",
+                  "the finish's tail (Phase 2.3b): finished / unfinished, the finish's GPU time per eye, the last reason one was left unfinished");
+        fw.unfinished = 0;
+        check(formatFrameGenSynthReport(fw).substr(line.size()) == " finish=88/0 finish_ms=0.21/0.40(n=90) why=finished", "...and why=finished in a window that left none unfinished");
+        // The homography the finish carries the layer by: the identity step is exactly the identity; a turn about y moves the centre by the tangent of the angle in pixels.
+        float H[9], id[9] = {1, 0, 0, 0, 1, 0, 0, 0, 1}, t0[3] = {}, q[2];
+        const float tan4[4] = {-1.0f, 1.0f, -0.75f, 0.75f};
+        frameGenSynthFinishHomography(id, t0, tan4, 3756, 3264, kFrameGenFinishPanelMetres, H);
+        check(std::memcmp(H, id, sizeof(H)) == 0, "the finish's homography for no head step is exactly the identity");
+        const float a = 2.0f * 3.14159265f / 180.0f, ry[9] = {std::cos(a), 0, std::sin(a), 0, 1, 0, -std::sin(a), 0, std::cos(a)};
+        frameGenSynthFinishHomography(ry, t0, tan4, 3756, 3264, kFrameGenFinishPanelMetres, H);
+        // x_S = R x_B: S's centre (0, 0, -1) is R^T (0, 0, -1) = (sin a, 0, -cos a) in B's eye, B's pixel at tan(a).
+        const bool landed = frameGenSynthFinishLanding(H, 1877.5f, 1631.5f, q);
+        const float want = (std::tan(a) - tan4[0]) / (tan4[1] - tan4[0]) * 3756.0f - 0.5f;
+        check(landed && std::fabs(q[0] - want) < 0.01f && std::fabs(q[1] - 1631.5f) < 0.01f, "the finish's homography: a 2 degree turn about y carries S's centre to B's pixel at tan(2 deg)");
     }
 
     FrameGenSynthWindow idle;
