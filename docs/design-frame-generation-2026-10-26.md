@@ -2,9 +2,9 @@
 
 ## Status
 
-- **State (2026-11-07): Phase 1 slice FLOWN 4 TIMES** (fork
-  `framegen-phase1`; "flight 4" entry). The world in flight extrapolates
-  from A's own vectors (ex2d), not from the camera rows; fast turns fail. Design from OFXR-Bridge
+- **State (2026-11-07): Phase 1 slice FLOWN 5 TIMES** (fork
+  `framegen-phase1`; "flight 5" entry). World in flight: A's vectors less
+  A's head turn plus the slot's head turn (ex2dh) scores at the ceiling. Design from OFXR-Bridge
   `d7fcca72` and EDVR `6b8ef374`. No issue yet.
 - **Recommendation:** take OFXR-Bridge's frame loop, not its synthesizer. Elite
   renders at half the headset rate and EDVR's runtime presents every display
@@ -49,9 +49,8 @@
 - **Phase 0 (no EDVR code):** fly stock OFXR-Bridge and VectorXR (colour-only
   routes) over EDVR at a bright settlement and in space, with each runtime's
   own smoothing off and then on. This is the visual reference to beat.
-- **Next flight: Phase 1, measure only:** ex2d with the head's turn taken
-  out and the true head put in ("flight 4" entry). H1, H8, H9 and the
-  surface classifier are still unbuilt.
+- **Next: not decided** ("flight 5" entry, Open). H1, H8, H9 and the
+  surface classifier are still unbuilt; on foot and supercruise unflown.
 - **Temporary key (built 2026-11-07, hidden):** `fix.frame_generation_shadow`
   (off | on), Phase 1 only. The user key `fix.frame_generation` (off | auto)
   comes with Phase 2. Its `on` value (forced, ignoring the gate's performance
@@ -1066,6 +1065,36 @@ world cells; `rowsoff_cockpit` 0.2-5%.
   head's own A-1 -> A turn, plus the head's true A -> B turn (the pose the
   runtime predicts for the slot), to see how much of the turn failures is
   the head's.
+
+### 2026-11-07: Phase 1, flight 5 (v0.22.0-rc.7-41-g1ab498ea, compile-only)
+
+Same site: low and fast with ship turns, then steady flight with the head
+turned hard and often (from about 12:47:56). `ex2dh` = A's vectors less A's
+own head turn, carried at constant screen velocity, plus B's true head
+turn (rotation only). World, p95 / mean (luma x 1024):
+
+| segment | mv (ceiling) | ex2d | ex2dh | no warp |
+|---|---|---|---|---|
+| steady | 7-57 / 2-13 | 9-115 / 3-29 | 7-81 / 2-18 | 12-229 |
+| ship turns | 57-324 / 13-57 | 115-324 / 29-75 | 57-115 / 15-26 | 229-545 |
+| head turns | 81-386 / 20-79 | 229-648 / 46-127 | 81-386 / 20-81 | 229-771 |
+
+Cockpit p95 in the head-turn segment: ex2d 136-229, ex2dh 34-81.
+
+- **ex2dh is at the ceiling:** within one bin of warping B by B's own
+  vectors in every segment, the head-turn one included, where ex2d is two
+  to four bins worse. The turn failures of flight 4 were the head's.
+- **H3 for the world, answered:** the world in flight extrapolates per
+  pixel from A's vectors with the head's turn swapped for the slot's pose,
+  as well as B's own vectors would allow. What remains (p95 81-386 under
+  head turns) is the ceiling's: quarter grid, disocclusion, DLSS noise.
+- ruled out: the ship's own turn as the main cause of flight 4's failures,
+  because ex2dh, which keeps the ship's motion constant, stays at the
+  ceiling through ship turns.
+- **Open:** ex2dh ignores the head's translation (rotation only); the
+  cockpit keeps the rigid true-head path, which scores better; holes are
+  not filled; the slot's head pose comes from the runtime (H6: 0.5-1.8 deg
+  median miss under turns at 50-70 ms lead, flight 1).
 
 ### 2026-11-07: Phase 1, extrapolation sets built (not flown)
 
