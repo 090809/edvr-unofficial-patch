@@ -5,10 +5,10 @@
 //   fgShadowClear    the destination key grid and the stats words to 0;
 //   fgShadowSplat    each previous-frame cell carried FORWARD by its class's transform, scattered as a key into the cells of its bilinear footprint (nearest wins);
 //   fgShadowScore    each cell of this frame carried BACKWARD by the key's class, the previous luma sampled there, the error binned.
-//   fgShadowExClear, fgShadowExSplat, fgShadowExSrc, fgShadowExScore  the extrapolation sets (once per variant, qz.z: 0 ex2d, 1 ex3d): each previous-frame cell carried FORWARD by its
+//   fgShadowExClear, fgShadowExSplat, fgShadowExSrc, fgShadowExScore  the extrapolation sets (once per variant, qz.z: 0 ex2d, 1 ex2dh): each previous-frame cell carried FORWARD by its
 //                    OWN DLSS vector (captured a frame ago, by the capture), splatted like the main splat into KeyE, the winner's cell index written to SrcE by a second pass over
 //                    the same keys, and each cell of this frame scored against the previous luma read (bilinear, as the score does) at its own centre moved back by its winner's
-//                    displacement (ex3d: its winner's view-space velocity at its winner's depth); no winner, or a read outside the image, is a hole.
+//                    screen displacement; no winner, or a read outside the image, is a hole. ex2dh takes the head's rotation out of A's vector first and puts B's true one in.
 //   fgShadowScoreB   dispatched after it on every scored frame (the second kernel): each cell of this frame classed by this frame's OWN depth and carried back to the
 //                    previous frame two ways, by the DLSS motion vector (set mv) and by this frame's TRUE backward rows and own depth (set bdepth), each scored as above,
 //                    and the distance between the two landings binned (the disagreement). It does not use the key grid.
@@ -44,6 +44,7 @@ cbuffer P : register(b0) {
     float4 fw[9];    // forward rows, [class * 3 + row], w the translation
     float4 bw[9];    // backward rows
     float4 tb[9];    // B's TRUE backward rows (far [W_B|0], cockpit [Hd_B|th_B], world [W_B|tvCam_B]) whatever the frame's set: the second kernel's
+    float4 ha[3];    // A's head delta rows (A's eye to the frame before it's), xyz: the ex2dh variant's
 };
 Texture2D<float4> Out    : register(t0);
 Texture2D<float>  Depth  : register(t1);
@@ -240,38 +241,34 @@ void fgShadowScore(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
 R"HLSL(
 // ---- the extrapolation sets ----
 // Where the previous frame's cell (id) lands in this frame, and its key: false when it does not project. qz.z 0 (ex2d): constant screen velocity, the cell centre minus its own
-// vector (vel and zOut are for the score: the winner's view-space velocity and its depth in B). qz.z 1 (ex3d): constant view-space velocity: the cell's point P_A = dir(pA) * z_A and its point a frame earlier P_P = dir(pA + vector) * z_P (z_P the frame before's
-// depth at the pixel the vector points to, both seen through A's tangents; z_A when that depth is the far plane) extrapolate to P_B = 2 P_A - P_P, projected through B's
-// tangents with B's depth z_B = -P_B.z in the key. The far plane has no depth and always takes the screen rule. No head or ship rotation is applied: the track is the one the
-// eye saw.
-bool fgExTarget(uint2 id, out float2 pp, out uint key, out uint cls, out float3 vel, out float zOut) {
+// vector. qz.z 1 (ex2dh): the head's part of A's vector is taken out and B's true head rotation put in. With pA the cell centre, mvA its vector (A to the frame before A):
+// pHeadPrev is where pA lands in the frame before A under A's head rotation alone (ha, a direction through the rows, the far-style carry), m = (pA + mvA) - pHeadPrev is what is
+// left of the vector (the ship's), extrapolated at constant screen velocity to pShip = pA - m, and B's true head rotation A to B (the cockpit class's forward rows, fw[3..5]: the
+// transpose of Hd_B) carries pShip's direction into B. Rotation only, no head translation (small at world depths); the tangents of A stand in for the frame before A's. Every
+// class takes the same path, class by A's own depth. The key is A's depth for both variants (the surface's depth is not moved).
+bool fgExTarget(uint2 id, out float2 pp, out uint key, out uint cls) {
     pp = float2(0.0, 0.0);
     key = 0u;
-    vel = float3(0.0, 0.0, 0.0);
-    zOut = 0.0;
     float zr = DepthA.Load(int3(id.x, id.y, 0));
     bool far;
     float z = temporalDepthMetres(zr, dk.x, dk.y, far);
     cls = far ? 0u : (temporalWorldPath(true, far, z, dk.z, false) ? 2u : 1u);
     float4 m = MvA.Load(int3(id.x, id.y, 0));
     float2 pA = float2(id) * 4.0 + 1.5;
-    float zB = z;
-    if (qz.z == 0 || far) {
+    if (qz.z == 0) {
         pp = pA - m.xy;
     } else {
-        bool farP;
-        float zP = temporalDepthMetres(m.z, dk.x, dk.y, farP);
-        if (farP) zP = z;
-        float3 PA = temporalPixelDir(pA, tanA, int2(sz.x, sz.y)) * z;
-        float3 PP = temporalPixelDir(pA + m.xy, tanA, int2(sz.x, sz.y)) * zP;
-        float3 PB = 2.0 * PA - PP;
-        if (!temporalProjectPixel(PB, tanB, int2(sz.x, sz.y), pp)) return false;
-        zB = -PB.z;
-        vel = PA - PP;
+        float3 dA = temporalPixelDir(pA, tanA, int2(sz.x, sz.y));
+        float3 dH = float3(dot(ha[0].xyz, dA), dot(ha[1].xyz, dA), dot(ha[2].xyz, dA));
+        float2 pHeadPrev;
+        if (!temporalProjectPixel(dH, tanA, int2(sz.x, sz.y), pHeadPrev)) return false;
+        float2 shipM = (pA + m.xy) - pHeadPrev;
+        float3 dS = temporalPixelDir(pA - shipM, tanA, int2(sz.x, sz.y));
+        float3 dB = float3(dot(fw[3].xyz, dS), dot(fw[4].xyz, dS), dot(fw[5].xyz, dS));
+        if (!temporalProjectPixel(dB, tanB, int2(sz.x, sz.y), pp)) return false;
     }
-    zOut = zB;
     key = 4u;
-    if (!far) key = (max(asuint(1.0 / max(zB, 1e-6)), 8u) & ~3u) | cls;
+    if (!far) key = (max(asuint(1.0 / max(z, 1e-6)), 8u) & ~3u) | cls;
     return true;
 }
 
@@ -287,9 +284,7 @@ void fgShadowExSplat(uint3 id : SV_DispatchThreadID) {
     if (id.x >= uint(qz.x) || id.y >= uint(qz.y)) return;
     float2 pp;
     uint key, cls;
-    float3 vel;
-    float zOut;
-    if (!fgExTarget(id.xy, pp, key, cls, vel, zOut)) return;
+    if (!fgExTarget(id.xy, pp, key, cls)) return;
     int2 base = int2(floor((pp - 1.5) * 0.25));
     [unroll] for (int dy = 0; dy < 2; ++dy) {
         [unroll] for (int dx = 0; dx < 2; ++dx) {
@@ -305,9 +300,7 @@ void fgShadowExSrc(uint3 id : SV_DispatchThreadID) {
     if (id.x >= uint(qz.x) || id.y >= uint(qz.y)) return;
     float2 pp;
     uint key, cls;
-    float3 vel;
-    float zOut;
-    if (!fgExTarget(id.xy, pp, key, cls, vel, zOut)) return;
+    if (!fgExTarget(id.xy, pp, key, cls)) return;
     int2 base = int2(floor((pp - 1.5) * 0.25));
     [unroll] for (int dy = 0; dy < 2; ++dy) {
         [unroll] for (int dx = 0; dx < 2; ++dx) {
@@ -335,14 +328,10 @@ void fgShadowExScore(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
             uint2 w = uint2(s % uint(qz.x), s / uint(qz.x));
             float2 ppw;
             uint keyW, clsW;
-            float3 velW;
-            float zW;
-            if (fgExTarget(w, ppw, keyW, clsW, velW, zW)) {
+            if (fgExTarget(w, ppw, keyW, clsW)) {
                 float2 cB = float2(id.xy) * 4.0 + 1.5;
                 float2 back = cB + (float2(w) * 4.0 + 1.5 - ppw);
-                bool landed = true;
-                if (qz.z != 0 && clsW != 0u) landed = temporalProjectPixel(temporalPixelDir(cB, tanB, int2(sz.x, sz.y)) * zW - velW, tanA, int2(sz.x, sz.y), back);
-                if (landed && fgInImage(back)) {
+                if (fgInImage(back)) {
                     float lumaB = LumaB.Load(int3(id.x, id.y, 0));
                     float pred = fgCellBilinear(LumaA, (back - 1.5) * 0.25);
                     float e = abs(lumaB - pred);

@@ -238,33 +238,33 @@ void caseLines() {
     check(pw.mv.frames == 2 && pw.bdepth.frames == 2 && pw.mv.cls[2].pixels == 10 && pw.bdepth.cls[1].pixels == 12 && pw.mv.cells == 16 && pw.bdepth.holes == 4 && pw.mv.holes == 6,
           "a probe merge counts a frame in each of the mv and bdepth sets and adds their stats");
     check(pw.disWorld[21] == 8 && pw.disCockpit[0] == 4 && pw.framesScored == 0 && pw.cls[2].pixels == 0, "a probe merge adds the disagreement histograms and leaves the main set alone");
-    check(pw.ex2d.frames == 0 && pw.ex3d.frames == 0 && formatFrameGenShadowExtrapolation(pw).empty(), "a probe merge of frames without the extrapolation counts none and the extrapolation line is empty");
+    check(pw.ex2d.frames == 0 && pw.ex2dh.frames == 0 && formatFrameGenShadowExtrapolation(pw).empty(), "a probe merge of frames without the extrapolation counts none and the extrapolation line is empty");
 
     // The extrapolation sets: a frame counts only when its block looked at cells; the rows-off counters add.
     FrameGenShadowEyeResult x;
     x.ex2d.cls[2].pixels = 30; x.ex2d.cls[2].hist[0] = 30; x.ex2d.cells = 40; x.ex2d.holes = 10;
-    x.ex3d.cls[2].pixels = 20; x.ex3d.cls[2].sumErr1024 = 20480; x.ex3d.cls[2].hist[23] = 20; x.ex3d.cells = 40; x.ex3d.holes = 20;
+    x.ex2dh.cls[2].pixels = 20; x.ex2dh.cls[2].sumErr1024 = 20480; x.ex2dh.cls[2].hist[23] = 20; x.ex2dh.cells = 40; x.ex2dh.holes = 20;
     x.rowsWorld = 100; x.rowsWorldOff = 25; x.rowsCockpit = 0;
     FrameGenShadowWindow xw;
     frameGenShadowMergeProbe(xw, x);
     frameGenShadowMergeProbe(xw, p);   // no extrapolation on this one
     frameGenShadowMergeProbe(xw, x);
-    check(xw.ex2d.frames == 2 && xw.ex3d.frames == 2 && xw.ex2d.cls[2].pixels == 60 && xw.ex3d.holes == 40 && xw.ex2d.cells == 80, "an extrapolation merge counts only the frames that ran it and adds the stats");
+    check(xw.ex2d.frames == 2 && xw.ex2dh.frames == 2 && xw.ex2d.cls[2].pixels == 60 && xw.ex2dh.holes == 40 && xw.ex2d.cells == 80, "an extrapolation merge counts only the frames that ran it and adds the stats");
     check(xw.rowsWorld == 200 && xw.rowsWorldOff == 50 && xw.rowsCockpit == 0, "the rows-off counters add");
     checkText(formatFrameGenShadowExtrapolation(xw),
               "frame generation (shadow) extrapolation: ex2d=2 far=0.0%,0,0,0,0.0%,0.0%|id:0,0 cockpit=0.0%,0,0,0,0.0%,0.0%|id:0,0 world=75.0%,0,0,0,0.0%,0.0%|id:0,0 "
-              "ex3d=2 far=0.0%,0,0,0,0.0%,0.0%|id:0,0 cockpit=0.0%,0,0,0,0.0%,0.0%|id:0,0 world=50.0%,1000,48,48,100.0%,0.0%|id:0,0 rowsoff_world=25.0% rowsoff_cockpit=-",
+              "ex2dh=2 far=0.0%,0,0,0,0.0%,0.0%|id:0,0 cockpit=0.0%,0,0,0,0.0%,0.0%|id:0,0 world=50.0%,1000,48,48,100.0%,0.0%|id:0,0 rowsoff_world=25.0% rowsoff_cockpit=-",
               "the extrapolation line");
     // The widest extrapolation line, as its own Log::note line.
     FrameGenShadowWindow xb = xw;
     for (int c = 0; c < kFrameGenShadowClasses; ++c) {
-        FrameGenShadowClassStats* cs[2] = {&xb.ex2d.cls[c], &xb.ex3d.cls[c]};
+        FrameGenShadowClassStats* cs[2] = {&xb.ex2d.cls[c], &xb.ex2dh.cls[c]};
         for (FrameGenShadowClassStats* k : cs) {
             *k = FrameGenShadowClassStats{};
             k->pixels = 1000; k->sumErr1024 = 1000ull * 1024ull; k->sumErrId1024 = 1000ull * 1024ull; k->hist[47] = 1000; k->histId[47] = 1000;
         }
     }
-    xb.ex2d.cells = xb.ex3d.cells = 1000;
+    xb.ex2d.cells = xb.ex2dh.cells = 1000;
     xb.rowsWorld = xb.rowsCockpit = 1; xb.rowsWorldOff = xb.rowsCockpitOff = 1;
     const std::string xl = formatFrameGenShadowExtrapolation(xb);
     check(xl.size() < 1165 && xl.find("rowsoff_cockpit=100.0%") != std::string::npos, "the widest extrapolation line fits Log::note's 1200 bytes and ends with its rows-off fields");

@@ -52,8 +52,8 @@ struct FrameGenShadowEyeResult {
     uint32_t disWorld[kFrameGenShadowBins] = {};
     uint32_t disCockpit[kFrameGenShadowBins] = {};
     // The extrapolation sets (fgShadowEx*; zero when the frame had no usable vectors of the previous frame, then cells is 0): A's cells carried FORWARD by A's own DLSS vector,
-    // ex2d at constant screen velocity, ex3d at constant view-space velocity, each scored against the previous frame's luma at the cell that won the B cell.
-    FrameGenShadowEyeBlock ex2d, ex3d;
+    // ex2d at constant screen velocity, ex2dh the same with the head's rotation taken out of A's vector and B's true head rotation put back, each scored against the previous frame's luma at the cell that won the B cell.
+    FrameGenShadowEyeBlock ex2d, ex2dh;
     // How often B's true rows part from the DLSS vector by more than 4 render px: of the cells of the class where either landing was inside the image, those where only one
     // was or the two are more than 4 px apart.
     uint32_t rowsWorld = 0, rowsWorldOff = 0, rowsCockpit = 0, rowsCockpitOff = 0;
@@ -98,7 +98,7 @@ struct FrameGenShadowWindow {
     uint64_t cells = 0;
     FrameGenShadowSetStats oracle, jump;
     FrameGenShadowSetStats mv, bdepth;                  // frames = eye-frames merged, every scored frame of every set
-    FrameGenShadowSetStats ex2d, ex3d;                  // the extrapolation sets: frames = the eye-frames that had the previous frame's vectors
+    FrameGenShadowSetStats ex2d, ex2dh;                  // the extrapolation sets: frames = the eye-frames that had the previous frame's vectors
     uint64_t rowsWorld = 0, rowsWorldOff = 0, rowsCockpit = 0, rowsCockpitOff = 0;   // see FrameGenShadowEyeResult
     uint32_t disWorld[kFrameGenShadowBins] = {};        // |p_mv - p_bdepth| in render px, world cells where both landed inside the image
     uint32_t disCockpit[kFrameGenShadowBins] = {};
@@ -195,8 +195,8 @@ inline void frameGenShadowMergeProbe(FrameGenShadowWindow& w, const FrameGenShad
         w.disWorld[i] += eye.disWorld[i];
         w.disCockpit[i] += eye.disCockpit[i];
     }
-    FrameGenShadowSetStats* const ex[2] = {&w.ex2d, &w.ex3d};
-    const FrameGenShadowEyeBlock* const exFrom[2] = {&eye.ex2d, &eye.ex3d};
+    FrameGenShadowSetStats* const ex[2] = {&w.ex2d, &w.ex2dh};
+    const FrameGenShadowEyeBlock* const exFrom[2] = {&eye.ex2d, &eye.ex2dh};
     for (int i = 0; i < 2; ++i) {
         if (exFrom[i]->cells == 0) continue;   // the extrapolation did not run on this frame
         for (int c = 0; c < kFrameGenShadowClasses; ++c) frameGenShadowAddClass(ex[i]->cls[c], exFrom[i]->cls[c]);
@@ -263,10 +263,10 @@ constexpr const char* kFrameGenShadowMvHeadFmt = " mv=%u";
 constexpr const char* kFrameGenShadowBdepthHeadFmt = " bdepth=%u";
 constexpr const char* kFrameGenShadowDisFmt = " mvdis_world_px=%s/%s mvdis_cockpit_px=%s/%s";
 // The extrapolation line, said right after the report (the report is at the widest a Log::note line takes): ex2d (A's cells carried forward at constant screen velocity by A's own
-// DLSS vector) and ex3d (at constant view-space velocity, A-1's depth at the matched pixel), each a count of eye-frames merged and the three class fields, then the share of
+// DLSS vector) and ex2dh (the same with the head's rotation taken out of A's vector and B's true head rotation put back), each a count of eye-frames merged and the three class fields, then the share of
 // world and of cockpit cells where B's true rows and the DLSS vector land more than 4 px apart ("-" when there were none).
 constexpr const char* kFrameGenShadowExtrapHeadFmt = "frame generation (shadow) extrapolation: ex2d=%u";
-constexpr const char* kFrameGenShadowExtrap3dHeadFmt = " ex3d=%u";
+constexpr const char* kFrameGenShadowExtrap2dhHeadFmt = " ex2dh=%u";
 constexpr const char* kFrameGenShadowRowsOffFmt = " rowsoff_world=%s rowsoff_cockpit=%s";
 constexpr const char* kFrameGenShadowRowsOffNumFmt = "%.1f%%";
 constexpr const char* kFrameGenShadowNumFmtPx = "%.2f";
@@ -343,12 +343,12 @@ inline std::string formatFrameGenShadowDis(const FrameGenShadowWindow& w) {
 
 // The extrapolation line, or "" when no eye-frame had the previous frame's vectors (nothing to say).
 inline std::string formatFrameGenShadowExtrapolation(const FrameGenShadowWindow& w) {
-    if (w.ex2d.frames == 0 && w.ex3d.frames == 0) return std::string();
+    if (w.ex2d.frames == 0 && w.ex2dh.frames == 0) return std::string();
     char buf[640];
     int n = std::snprintf(buf, sizeof(buf), kFrameGenShadowExtrapHeadFmt, static_cast<unsigned>(w.ex2d.frames));
     n = formatFrameGenShadowClasses(buf, sizeof(buf), n, w.ex2d.cls, w.ex2d.cells);
-    if (n > 0 && n < static_cast<int>(sizeof(buf))) n += std::snprintf(buf + n, sizeof(buf) - n, kFrameGenShadowExtrap3dHeadFmt, static_cast<unsigned>(w.ex3d.frames));
-    n = formatFrameGenShadowClasses(buf, sizeof(buf), n, w.ex3d.cls, w.ex3d.cells);
+    if (n > 0 && n < static_cast<int>(sizeof(buf))) n += std::snprintf(buf + n, sizeof(buf) - n, kFrameGenShadowExtrap2dhHeadFmt, static_cast<unsigned>(w.ex2dh.frames));
+    n = formatFrameGenShadowClasses(buf, sizeof(buf), n, w.ex2dh.cls, w.ex2dh.cells);
     std::string rows[2];
     const uint64_t tot[2] = {w.rowsWorld, w.rowsCockpit}, off[2] = {w.rowsWorldOff, w.rowsCockpitOff};
     for (int i = 0; i < 2; ++i) {

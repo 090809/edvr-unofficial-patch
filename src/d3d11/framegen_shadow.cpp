@@ -384,7 +384,7 @@ void frameGenShadowEyeFrame(ID3D11Device* dev, ID3D11DeviceContext* ctx, uint32_
             if (scale > 0.0f) g.dtRatio.push_back(scale);
             if (dtB > 0.0) g.dtMs.push_back(static_cast<float>(dtB));
         }
-        frameGenFillCb(cb, f.renderW, f.renderH, f.outW, f.outH, scored ? f.tanPrev : f.tanNow, f.tanNow, f.depthA, f.depthB, f.splitMetres, bwd, scored ? truth : nullptr);
+        frameGenFillCb(cb, f.renderW, f.renderH, f.outW, f.outH, scored ? f.tanPrev : f.tanNow, f.tanNow, f.depthA, f.depthB, f.splitMetres, bwd, scored ? truth : nullptr, r.prev.Hd);   // r.prev is frame A's deltas here: its head rotation is the ex2dh variant's
         D3D11_MAPPED_SUBRESOURCE m{};
         if (SUCCEEDED(ctx->Map(g.cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {
             std::memcpy(m.pData, &cb, sizeof(cb));
@@ -427,7 +427,7 @@ void frameGenShadowEyeFrame(ID3D11Device* dev, ID3D11DeviceContext* ctx, uint32_
                 ID3D11UnorderedAccessView* uav[kUavSlots] = {nullptr, nullptr, nullptr, r.statsUav};
                 bindAndDispatch(ctx, 4, srv, uav, gx, gy);
             }
-            if (r.mvValid[prevSlot]) {   // the extrapolation sets: the previous frame's cells carried forward by their own vectors, once per variant (0 ex2d, 1 ex3d)
+            if (r.mvValid[prevSlot]) {   // the extrapolation sets: the previous frame's cells carried forward by their own vectors, once per variant (0 ex2d, 1 ex2dh: the head's part of A's vector swapped for B's true head rotation)
                 for (int variant = 0; variant < 2; ++variant) {
                     cb.qz[2] = variant;
                     if (SUCCEEDED(ctx->Map(g.cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {

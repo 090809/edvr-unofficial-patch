@@ -1437,7 +1437,7 @@ static void selfTest() {
             {"kFrameGenShadowExClearBytecode", "fgShadowExClear", {{"KeyE", D3D_SIT_UAV_RWTYPED, 5}, {"SrcE", D3D_SIT_UAV_RWTYPED, 6}, {"P", D3D_SIT_CBUFFER, 0}}},
             {"kFrameGenShadowExSplatBytecode", "fgShadowExSplat", {{"DepthA", D3D_SIT_TEXTURE, 3}, {"MvA", D3D_SIT_TEXTURE, 7}, {"KeyE", D3D_SIT_UAV_RWTYPED, 5}, {"P", D3D_SIT_CBUFFER, 0}}},
             {"kFrameGenShadowExSrcBytecode", "fgShadowExSrc", {{"DepthA", D3D_SIT_TEXTURE, 3}, {"MvA", D3D_SIT_TEXTURE, 7}, {"KeyE", D3D_SIT_UAV_RWTYPED, 5}, {"SrcE", D3D_SIT_UAV_RWTYPED, 6}, {"P", D3D_SIT_CBUFFER, 0}}},
-            {"kFrameGenShadowExScoreBytecode", "fgShadowExScore", {{"DepthA", D3D_SIT_TEXTURE, 3}, {"MvA", D3D_SIT_TEXTURE, 7}, {"LumaA", D3D_SIT_TEXTURE, 2}, {"LumaB", D3D_SIT_TEXTURE, 4}, {"KeyE", D3D_SIT_UAV_RWTYPED, 5}, {"SrcE", D3D_SIT_UAV_RWTYPED, 6}, {"Stats", D3D_SIT_UAV_RWSTRUCTURED, 3}, {"P", D3D_SIT_CBUFFER, 0}}},
+            {"kFrameGenShadowExScoreBytecode", "fgShadowExScore", {{"MvA", D3D_SIT_TEXTURE, 7}, {"LumaA", D3D_SIT_TEXTURE, 2}, {"LumaB", D3D_SIT_TEXTURE, 4}, {"KeyE", D3D_SIT_UAV_RWTYPED, 5}, {"SrcE", D3D_SIT_UAV_RWTYPED, 6}, {"Stats", D3D_SIT_UAV_RWSTRUCTURED, 3}, {"P", D3D_SIT_CBUFFER, 0}}},
         };
         const std::string& text = edvr::frameGenShadowShaderSource();
         const std::string carry = edvr::frameGenCarryText();
@@ -1468,8 +1468,8 @@ static void selfTest() {
                 }
                 D3D11_SHADER_BUFFER_DESC bufferDesc{};
                 ID3D11ShaderReflectionConstantBuffer* cbuffer = reflection ? reflection->GetConstantBufferByName("P") : nullptr;
-                check(bound && cbuffer && SUCCEEDED(cbuffer->GetDesc(&bufferDesc)) && bufferDesc.Size == 512 && desc.BoundResources == want.bindings.size(),
-                      "each frame-generation shadow entry keeps its inputs, outputs and the 512-byte parameter block at the slots the module sets them at, and binds nothing else");
+                check(bound && cbuffer && SUCCEEDED(cbuffer->GetDesc(&bufferDesc)) && bufferDesc.Size == 560 && desc.BoundResources == want.bindings.size(),
+                      "each frame-generation shadow entry keeps its inputs, outputs and the 560-byte parameter block at the slots the module sets them at, and binds nothing else");
             }
         }
     }
