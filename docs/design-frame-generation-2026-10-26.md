@@ -1113,8 +1113,14 @@ p95 (luma x 1024), warped / unwarped:
 - **Cockpit:** rigid 12-68, ex2dh 12-68.
 - **H3, answered for space in this flight:** far and cockpit predict to
   the floor, and the world through ex2dh to the ceiling. Not covered: a
-  near approach with path 12 live, and a fast drop (the drop itself reads
-  as a camera jump and a loading screen).
+  supercruise approach with the body in view and path 12 live (the pilot
+  left under FSD and barely looked at the planet).
+- **After the drop (12:54:48-12:55:50): glide and the approach to the
+  settlement, head on it.** World p95 (1-7 m a frame): ex2dh 81-193, mv
+  68-115, ex2d 193-459, rows 193-771, no warp 229-648. ex2dh is within one
+  bin of the ceiling except in the glide's first seconds (12:54:55: all
+  sets 324-459 against 545 unwarped). The drop itself (one frame of 23 km)
+  reads as a camera jump.
 
 ### 2026-11-07: Phase 1, extrapolation sets built (not flown)
 
