@@ -10609,6 +10609,7 @@ H_DESKTOP_OTHER = r"desktop window: (?!setting |10 s: |stopped \()"
 # window's are. The armed line is said once per change to on (so health_scan keeps it whatever --since says); the report line every second.
 H_FRAMEGEN = "frame generation shadow"
 H_FRAMEGEN_LABEL = "frame generation (shadow):"
+H_FRAMEGEN_EX_LABEL = "frame generation (shadow) extrapolation:"   # the extrapolation sets' own line, said right after the report (the report is at the widest a line takes)
 # The head-pose miss (src\common\framegen_pose_report.h kFrameGenPoseReportFmt, written by the OpenXR runtime): a line of the runtime log, which carries no build tag and a UTC clock, so
 # health_scan_runtime reads it, as it reads the world scale's, and --since/--until do not cut it.
 H_FRAMEGEN_POSE_LABEL = "frame generation (shadow) pose:"
@@ -10635,6 +10636,11 @@ H_FRAMEGEN_REPORT = (r"frame generation \(shadow\): frames=(?P<frames>\d+) skipp
                      r"(?: mv=(?P<mv_n>\d+)" + "".join(_HFG_SET_CLASS.format(n=n, p="m_") for n in ("far", "cockpit", "world")) +
                      r" bdepth=(?P<bd_n>\d+)" + "".join(_HFG_SET_CLASS.format(n=n, p="b_") for n in ("far", "cockpit", "world")) +
                      r" mvdis_world_px=(?P<dw50>{N})/(?P<dw95>{N}) mvdis_cockpit_px=(?P<dc50>{N})/(?P<dc95>{N}))?)?$").replace("{N}", _HFG_NUM)
+# The extrapolation line (optional: a log from before it has none): ex2d (constant screen velocity) and ex3d (constant view-space velocity) as the score sets, then how often B's true rows
+# part from the DLSS vector by more than 4 px (a percentage, or "-" when no cell of the class landed).
+H_FRAMEGEN_EXTRAP = (r"frame generation \(shadow\) extrapolation: ex2d=(?P<x2_n>\d+)" + "".join(_HFG_SET_CLASS.format(n=n, p="x2_") for n in ("far", "cockpit", "world")) +
+                     r" ex3d=(?P<x3_n>\d+)" + "".join(_HFG_SET_CLASS.format(n=n, p="x3_") for n in ("far", "cockpit", "world")) +
+                     r" rowsoff_world=(?P<rows_world>[\d.]+%|-) rowsoff_cockpit=(?P<rows_cockpit>[\d.]+%|-)$")
 # The SRV turret view (issue 140; src\d3d11\srv_turret.cpp, the vehicle latch's line in journal_watch.cpp, and the geometry shader's creation line in shader_swap.cpp, shaderSwapCreateGs,
 # called with who "srv turret hud"): lines of the graphics log with no build tag, read the way the desktop window's are. The settings and vehicle lines are state, so health_scan keeps
 # every one whatever --since says; the rest are events and are cut by the window. Every kind of line the DLL writes has a pattern of its own, so a labelled line that none matches is
@@ -16851,7 +16857,8 @@ def _hj_framegen_shadow(rows, ctx=None):
     armed = rows.get("armed", [])
     reports = rows.get("report", [])
     poses = rows.get("pose", [])
-    if not armed and not reports and not poses:
+    extraps = rows.get("extrap", [])
+    if not armed and not reports and not poses and not extraps:
         return None
     if not reports and not armed:
         return ("PARTIAL", "%d pose line(s) in the runtime log but no scorer line in the graphics log (the graphics log of another flight, or the scorer's lines are cut)" % len(poses))
@@ -16881,6 +16888,13 @@ def _hj_framegen_shadow(rows, ctx=None):
                  (sum(int(r["world_p95"]) for r in withMv) / len(withMv), sum(int(r["o_world_p95"]) for r in withMv) / len(withMv),
                   sum(int(r["m_world_p95"]) for r in withMv) / len(withMv), sum(int(r["b_world_p95"]) for r in withMv) / len(withMv), len(withMv),
                   last["dw50"], last["dw95"], last["dc50"], last["dc95"]))
+    # The extrapolation line (lines from after it only): the world class's p95 error for A's cells carried forward at constant screen velocity and at constant view-space velocity, and
+    # how often B's true rows part from the DLSS vector by more than 4 px.
+    withEx = [r for r in extraps if int(r.get("x2_n") or 0) > 0]
+    if withEx:
+        last = withEx[-1]
+        text += ("; extrapolation world p95 %.0f ex2d vs %.0f ex3d milli-luma (mean of %d line(s)); rows part from the vector by over 4 px on %s of world cells, %s of cockpit cells (last line)" %
+                 (sum(int(r["x2_world_p95"]) for r in withEx) / len(withEx), sum(int(r["x3_world_p95"]) for r in withEx) / len(withEx), len(withEx), last["rows_world"], last["rows_cockpit"]))
     if poses:
         scored = sum(int(r["frames"]) for r in poses)
         text += ("; pose: %d line(s), %d frame(s) scored, runtime miss max %.2f mm / %.3f deg, velocity miss max %.2f mm / %.3f deg, lead median %s ms (last line), %d refused, %d expired, "
@@ -18073,9 +18087,10 @@ HEALTH_RULES = (
         ("_", H_DESKTOP_OTHER),
     ), _hj_desktop_window),
     # Frame generation, Phase 1 (TEMPORARY): the armed line and the one-second report, graphics-log lines with no build tag, read the desktop window's way.
-    _hrule(H_FRAMEGEN, (), (H_FRAMEGEN_LABEL,), (
+    _hrule(H_FRAMEGEN, (), (H_FRAMEGEN_LABEL, H_FRAMEGEN_EX_LABEL), (
         ("armed", H_FRAMEGEN_ARMED),
         ("report", H_FRAMEGEN_REPORT),
+        ("extrap", H_FRAMEGEN_EXTRAP),
         ("pose", H_FRAMEGEN_POSE),
     ), _hj_framegen_shadow),
     # The SRV turret view (issue 140): lines of the graphics log that carry no build tag (health_scan reads them, as it reads the desktop window's, before it drops the untagged lines).
@@ -18168,7 +18183,7 @@ def health_scan(text, since=None, until=None):
                 u[0] += 1
                 u[1] = u[1] or raw.strip()[:160]
             continue
-        if H_FRAMEGEN_LABEL in raw:
+        if H_FRAMEGEN_LABEL in raw or H_FRAMEGEN_EX_LABEL in raw:
             # The frame generation shadow's lines carry no build tag. The armed line is state, so it is kept whatever --since says; the report lines are events and are cut by the window.
             sm = HEALTH_STAMP_RE.match(raw)
             tod = int(sm.group(1)) * 3600 + int(sm.group(2)) * 60 + int(sm.group(3)) + int(sm.group(4)) / 1000.0 if sm else None
@@ -25088,6 +25103,12 @@ def self_test_health():
                     line += RF(" mv=%u", 29) + mcls + RF(" bdepth=%u", 29) + bcls + RF(" mvdis_world_px=%s/%s mvdis_cockpit_px=%s/%s", dis, "4.36", "-", "-")
             return line
 
+        def fg_extrap(x2_p95=33, x3_p95=12, rows=("25.0%", "-")):
+            """The extrapolation sets' own line, rendered from the C format strings."""
+            x2 = "".join(RF(" %s=%.1f%%,%u", n, 10.0, 12, 8, x2_p95, 5.5, 1.5, 9, 30) for n in ("far", "cockpit", "world"))
+            x3 = "".join(RF(" %s=%.1f%%,%u", n, 10.0, 12, 8, x3_p95, 5.5, 1.5, 9, 30) for n in ("far", "cockpit", "world"))
+            return RF("frame generation (shadow) extrapolation: ex2d=%u", 29) + x2 + RF(" ex3d=%u", 29) + x3 + RF(" rowsoff_world=%s rowsoff_cockpit=%s", *rows)
+
         FG, fg_ok = H_FRAMEGEN, [f90_part()]
         check("frame generation shadow: no line at all, nothing said (the key off)", fg_ok, 0, [("OK", F90S)], lacks=["frame generation", "NEVER APPLIED"])
         check("frame generation shadow: armed and reporting is OK", fg_ok + [fg_armed(), fg_report(), fg_report(frames=58)], 0, [("OK", FG)],
@@ -25098,6 +25119,13 @@ def self_test_health():
         check("frame generation shadow: a line with the mv and bdepth sets and the disagreement is OK and says the four world p95s and the disagreement",
               fg_ok + [fg_armed(), fg_report(sets=True, probe=True), fg_report(sets=True, probe=True, oracle_p95=10, mv_p95=31, bd_p95=14, dis="3.00")], 0, [("OK", FG)],
               has=["world p95 40 predicted vs 15 oracle vs 32 mv vs 13 bdepth milli-luma (mean of 2 line(s))", "disagreement p50/p95 3.00/4.36 px world, -/- px cockpit (last line)"], lacks=["UNPARSED"])
+        check("frame generation shadow: the extrapolation line is read and says the two world p95s and the rows-off shares",
+              fg_ok + [fg_armed(), fg_report(), fg_extrap(), fg_report(), fg_extrap(x2_p95=31, x3_p95=14, rows=("30.0%", "0.4%"))], 0, [("OK", FG)],
+              has=["extrapolation world p95 32 ex2d vs 13 ex3d milli-luma (mean of 2 line(s)); rows part from the vector by over 4 px on 30.0% of world cells, 0.4% of cockpit cells (last line)"],
+              lacks=["UNPARSED"])
+        check("frame generation shadow: a log with no extrapolation line has no such part", fg_ok + [fg_armed(), fg_report()], 0, [("OK", FG)], lacks=["extrapolation", "UNPARSED"])
+        check("frame generation shadow: a drifted extrapolation line is counted as unparsed beside the report it follows, not read as one", fg_ok + [fg_armed(), fg_report(), fg_extrap().replace(" ex3d=", " ex3=")], 0, [("OK", FG)],
+              has=["1 report line(s)", "+1 line(s) the rule's patterns do not match"], lacks=["extrapolation world p95"])
         check("frame generation shadow: a line from before the mv and bdepth sets still parses and has no such part", fg_ok + [fg_armed(), fg_report(sets=True)], 0, [("OK", FG)],
               lacks=["vs bdepth", "UNPARSED"])
         check("frame generation shadow: a drifted mv and bdepth part is UNPARSED, not a report", fg_ok + [fg_armed(), fg_report(sets=True, probe=True).replace(" bdepth=", " depth=")], 3, [("NEVER APPLIED", FG)],
