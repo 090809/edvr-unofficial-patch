@@ -1240,6 +1240,24 @@ the pair's finish). Nothing shown. About 7 minutes, landed and low flight,
 - **Next: 2.3**, Lock in the runtime. Vendor smoothing (SteamVR Motion
   Smoothing for Elite) off first.
 
+### 2026-11-07: Phase 2.3 and 2.3b built; flight 10, Lock off, finished S dumped
+
+Lock (2:1 S slot in `waitPoses`, `fix.frame_generation = off | on`, ABI word
+17) built in 2.3; 2.3b finishes S like B: resampled from `dlSubmit`, B's
+RCAS sharpening, B's UI layer composited moved by the head only (a plane at
+1.5 m), shown format (`dlOut` is R8G8B8A8_UNORM, not R11G11B10 as earlier
+entries assumed). The pilot's SteamVR per-app throttling set to fixed:
+predicted period 11.1 ms, Elite at 57-59 fps unthrottled.
+
+- **Flight 10 (v0.22.0-rc.7-81-gf9fdceff), Lock off:** every synth line
+  `why=finished`, `unfinished=0`; finishing 0.16-0.20 ms per eye.
+- **Seven dumps, finished S against finished B (`S<k>` / `SB<k>`):** still
+  head: mean 0.3-0.4 of 255, 0.8% of pixels over 8; head and ship motion:
+  the difference is the motion itself. By eye: the HUD, holo panels and
+  scanner are present in every S, aligned with the cockpit, text as crisp
+  as B's; terrain marginally softer.
+- **Next:** the first Lock flight.
+
 ### 2026-11-07: Phase 2.1, the turned score and the VRAM cut (built, not flown)
 
 - **The compositor's turn, scored (the flight 7 discriminator).** At B the f = 1
