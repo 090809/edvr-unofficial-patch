@@ -63,6 +63,9 @@
 #include "system_publication.h"
 #include "head_locator.h"
 #include "../common/framegen_pose_report.h"
+#include "../common/framegen_slot_report.h"   // frame generation 2.2: T_S and the transfer line
+#include "../common/native_temporal.h"        // frame generation 2.2: the slot channel's structs
+#include "framegen_slot_transfer.h"
 #include "head_track_probe.h"   // F87h: the headset's tracking, one line a second (read only)
 #include "view_fov_note.h"   // F194: the views' field of view, said at the first located views and when it changes
 #include "pose_gap.h"
@@ -577,6 +580,19 @@ class NativeRuntimeHost : public SystemSource, public FrameSink, public Composit
   FrameGenPoseProbe framegenPose;
   uint64_t framegenPoseWindowUs=0;
   bool framegenPoseWas=false;
+  // Frame generation, Phase 2.2 (framegen_slot_report.h, framegen_slot_transfer.h): the slot S is made for (T_S, its head located once a pair before the first treat and handed
+  // to the d3d11 half), and S's own transfer per eye, consumed after the pair's finish. Owner thread only; nothing exists, is located or is said while the key is off.
+  struct FramegenSlot {
+    bool looked=false,noChannelSaid=false,was=false;
+    FrameGenSlotChannel channel;
+    uint64_t sequence=0;          // the pair the slot was handed for
+    int64_t slotTime=0;           // its T_S (0: none)
+    int64_t previousT=0;          // T_A: the previous pair's T
+    FrameGenSlotTransfer eyes[2];
+    FrameGenSlotWindow window;
+    uint64_t windowUs=0;
+    uint64_t gameBytes[2]{};      // as the d3d11 half last said for each eye
+  } framegenSlot;
   // Diagnostic only (docs/linux-native-openxr-launch-centre-2026-09-22.md).
   uint64_t headLocateFailures=0,headLocateConsecutiveFailures=0;
   XrViewConfigurationView sizes[2]{};
@@ -1944,7 +1960,9 @@ class NativeRuntimeHost : public SystemSource, public FrameSink, public Composit
       return vr::VRCompositorError_None;
     }
     dispatchGpuEyeMarker(eye,texture,r==vr::VRCompositorError_None);
-    return finishSubmitTail(eye,r);
+    const auto tail=finishSubmitTail(eye,r);
+    if(pairSync)framegenSlotConsume();   // frame generation 2.2: after the pair's finish (nothing while the key is off)
+    return tail;
   }
   // Queued via service.submit from inside the second Submit's owner body
   // above when frame_end_overlap applies. owner_service.h's FIFO guarantees
@@ -1983,6 +2001,7 @@ class NativeRuntimeHost : public SystemSource, public FrameSink, public Composit
     finishSubmitTail(eye,r);
     if(published&&r==vr::VRCompositorError_None)publishSubmitTimingDevice(sequence);
     lastOverlappedComposeMs=timingFrame.composeMs;
+    framegenSlotConsume();   // frame generation 2.2: after the pair's finish (nothing while the key is off)
   }
   // Needs Elite's own texture pointer and its thread still parked in this
   // rendezvous, so both submitEye (synchronous or about to defer) call this
@@ -2349,6 +2368,7 @@ class NativeRuntimeHost : public SystemSource, public FrameSink, public Composit
         timingInvalidate();
       workClock=workClock&&counterNow(&workEnded);
     };
+    framegenSlotBeforeTreat();   // frame generation 2.2: once a pair, the slot's pose for the synthesizer (the key off: returns at once)
     if(temporal.acquired()||sharpen.acquired()||menu.acquired()) {
       if(!graphicsCalls.invoke(treat)) {
         menu.invalidate();invalidateEyeTreatments();timingInvalidate();
@@ -2360,6 +2380,7 @@ class NativeRuntimeHost : public SystemSource, public FrameSink, public Composit
       submitSample.treatmentMs+=elapsedMs(workBegan,workEnded);
     } else if(!submitStats.full())submitSample.sequence=0; // never publish missing clocks as zero-cost work
     if(r!=vr::VRCompositorError_None)return r;
+    framegenSlotAfterTreat(eye);   // frame generation 2.2: what the synthesizer built for the slot (nothing while the key is off)
     const vr::Texture_t processed{treated.Get(),vr::API_DirectX,texture->eColorSpace};
     D3D11_TEXTURE2D_DESC outputDesc{};treated->GetDesc(&outputDesc);
     submitSample.outputWidth[unsigned(eye)]=outputDesc.Width;
@@ -2940,6 +2961,88 @@ class NativeRuntimeHost : public SystemSource, public FrameSink, public Composit
     framegenPoseWindowUs=nowUs;
     FrameGenPoseWindow window;
     if(framegenPose.takeWindow(window))nativeTracePuts(formatFrameGenPoseReport(window).c_str());
+  }
+  // Frame generation, Phase 2.2 (framegen_slot_report.h): the key went off (or the runtime closes): the transfers let go and nothing more is handed; the d3d11 half, handed no
+  // slot, lets its producer texture go on its next build.
+  void framegenSlotOff() {
+    auto& fs=framegenSlot;
+    for(auto& t:fs.eyes)t.release();
+    fs.was=false;fs.sequence=0;fs.slotTime=0;fs.previousT=0;fs.windowUs=0;fs.window=FrameGenSlotWindow{};
+    fs.gameBytes[0]=fs.gameBytes[1]=0;
+  }
+  // Once a pair, at its first treat (capture(), before the producer callback): T_S from this pair's T and the previous pair's (frameGenSlotTime), the head located at T_S in the
+  // frame's seated space (the space and convention of the head the temporal frame was given, render.pose), handed to the d3d11 half with whether this runtime consumes S (a
+  // separate XR device only: the transfer needs two). The key off: nothing is looked up, located or handed. Owner thread only.
+  void framegenSlotBeforeTreat() {
+    if(GetCurrentThreadId()!=ownerThread)return;
+    auto& fs=framegenSlot;
+    if(!framegenShadowOn()){if(fs.was)framegenSlotOff();return;}
+    fs.was=true;
+    if(!fs.looked){fs.looked=true;fs.channel.resolve(graphicsProxy);}
+    if(!fs.channel.present()){if(!fs.noChannelSaid){fs.noChannelSaid=true;nativeTracePuts(kFrameGenSlotNoChannelFmt);}return;}
+    const auto sequence=activeFrameSequence;
+    if(!sequence||fs.sequence==sequence)return;   // the pair's second eye: one slot a pair
+    fs.sequence=sequence;
+    const Frame frame=boundary.frame();
+    const int64_t displayTime=int64_t(frame.predictedDisplayTime);
+    int64_t slotTime=0;
+    TimedHeadPose head{};bool located=false;
+    if(frameGenSlotTime(displayTime,fs.previousT,fs.previousT!=0,slotTime))
+      located=view&&locateHeadAt(api.locateSpace,view,frameSeat(),XrTime(slotTime),true,head)==XR_SUCCESS&&head.pose.bPoseIsValid;
+    fs.previousT=displayTime>0?displayTime:0;
+    fs.slotTime=slotTime;
+    if(located)++fs.window.poseRuntime;else ++fs.window.poseNone;
+    fs.channel.hand(FrameGenSlotChannel::slot(sequence,displayTime,slotTime,located?&head.pose.mDeviceToAbsoluteTracking.m[0][0]:nullptr,separateGraphics()));
+  }
+  // After an eye's treat returned (capture()): what the d3d11 half built for this pair's slot. A produced S opens (or keeps) the eye's transfer and waits for the pair's finish.
+  void framegenSlotAfterTreat(vr::EVREye eye) {
+    auto& fs=framegenSlot;
+    if(!fs.was||!fs.channel.present()||!fs.sequence||fs.sequence!=activeFrameSequence||GetCurrentThreadId()!=ownerThread)return;
+    const unsigned e=unsigned(eye)&1u;
+    EdvrNativeFrameGenS s{};
+    if(fs.channel.answer(e,fs.sequence,s)!=S_OK)return;
+    fs.gameBytes[e]=s.gameBytes;
+    if(s.path==EDVR_NATIVE_FRAMEGEN_PATH_UAV)fs.window.pathUav=true;
+    else if(s.path==EDVR_NATIVE_FRAMEGEN_PATH_COPY)fs.window.pathCopy=true;
+    if(s.state==EDVR_NATIVE_FRAMEGEN_S_BUSY){++fs.window.busy;return;}
+    if(s.state!=EDVR_NATIVE_FRAMEGEN_S_PRODUCED||!separateGraphics())return;
+    ++fs.window.produced;
+    auto& t=fs.eyes[e];
+    const HRESULT opened=t.open(graphics.device(),static_cast<HANDLE>(s.sharedHandle),s.textureSerial);
+    if(opened!=S_OK){if(framegenSlotOpenFailures++<4)nativeTracePrintf("frame generation (synth) transfer failure, eye %u: the producer texture could not be opened on the XR device (0x%08lx)\n",e,(unsigned long)opened);return;}
+    t.markProduced(fs.slotTime);
+  }
+  uint32_t framegenSlotOpenFailures=0;
+  // After the pair's finish (its compose and xrEndFrame are done): each produced S is taken with a zero timeout (AcquireSync(1, 0), the copy, ReleaseSync(0)); one not yet
+  // released stays pending for the next finish. When it was taken against T_S (the runtime's clock) and the consume's own time go to the window; one line a second.
+  void framegenSlotConsume() {
+    auto& fs=framegenSlot;
+    if(!fs.was||GetCurrentThreadId()!=ownerThread)return;
+    const LocatorDispatch dispatch{api.convertTime,api.locateSpace};
+    for(auto& t:fs.eyes) {
+      if(!t.pending())continue;
+      const int64_t slotTime=t.pendingSlotTime();
+      LARGE_INTEGER began{},ended{};
+      const bool clocked=counterNow(&began);
+      const HRESULT hr=t.consume(0);
+      if(hr!=S_OK)continue;   // a timeout stays pending; a fault let the transfer go (the next produced S opens it again)
+      ++fs.window.consumed;
+      if(clocked&&counterNow(&ended))fs.window.consumeMs.push_back(float(elapsedMs(began,ended)));
+      XrTime now=0;HeadLocatorStage stage=HeadLocatorStage::None;
+      if(slotTime>0&&HeadLocator{}.currentTime(dispatch,instance,headClock,&stage,boundary.estimateNow(),now)==XR_SUCCESS) {
+        const float readyMs=float(double(int64_t(now)-slotTime)/1.0e6);
+        fs.window.readyMs.push_back(readyMs);
+        if(readyMs>0.0f)++fs.window.late;
+      }
+    }
+    fs.window.gameBytes=fs.gameBytes[0]+fs.gameBytes[1];
+    fs.window.xrBytes=fs.eyes[0].xrBytes()+fs.eyes[1].xrBytes();
+    const uint64_t nowUs=frameCycleUs();
+    if(!fs.windowUs){fs.windowUs=nowUs;return;}
+    if(nowUs-fs.windowUs<1000000)return;
+    fs.windowUs=nowUs;
+    if(fs.window.any())nativeTracePuts(formatFrameGenSlotReport(fs.window).c_str());
+    fs.window.reset();
   }
   // B3, the scope zoom's window (scope_zoom_state.h; the request is the provider's version 11 answer, scope_zoom_window.h): whether eye 0's told frustum is narrowed this frame. Set in
   // WaitGetPoses where the trim sets the frame's frusta; the located views the layer lies on, the raw getter's answer, the temporal pass's announcements and the hidden-area mesh stay
@@ -4283,6 +4386,7 @@ class NativeRuntimeHost : public SystemSource, public FrameSink, public Composit
       ShutdownTrace drainStage("host_owned_graphics_drain",tracing);
       const auto drained=stereo.drain();drainStage.end(drained==XR_SUCCESS);
       if(drained!=XR_SUCCESS)return clean=false;
+      framegenSlotOff();   // frame generation 2.2: S's transfers hold only XR-device objects and an opened handle; no producer callback
       const HRESULT eyesRetired=captured.shutdownShared();
       const HRESULT previousRetired=previousPair.shutdownShared();
       const HRESULT skyRetired=skybox.shutdownShared();
