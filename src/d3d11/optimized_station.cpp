@@ -4175,7 +4175,7 @@ void concourseTick(uint64_t now, uint32_t frame) {
             const uint32_t d = cc::bakeDirAt(g_camBakeTick++, g_camBakeMask);
             float forward[3] = {};
             bakeForward(g_camLookAxes, d, forward);
-            concourseCameraTestAim(g_camLookCentre, forward, g_camLookAxes[d == 4 ? 2 : 1], cc::kBakeFovRad);
+            concourseCameraTestAim(g_camLookCentre, forward, g_camLookAxes[d == 4 ? 2 : 1], cc::kBakeFovRad, g_camBakeNear);
         } else if (lookOn) {
             concourseCameraTestLook(g_camLookCentre, g_camLookAxes[1], cc::camTestLookDir(now - g_camTimer.startMs()));
         }

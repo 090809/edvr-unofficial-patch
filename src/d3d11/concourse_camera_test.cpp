@@ -120,7 +120,7 @@ std::atomic<bool> g_ctSlotKnown{false};
 std::atomic<float> g_ctRvPos[3], g_ctSlot[3], g_ctCamBefore[3], g_ctCamAfter[3], g_ctFwdBefore[3], g_ctFwdAfter[3], g_ctLookCentre[3], g_ctLookUp[3];
 std::atomic<uint32_t> g_ctLookDir{0};
 std::atomic<bool> g_ctAimOn{false};          // the bake: the rows are aimed outright, not the player's turned
-std::atomic<float> g_ctAimFwd[3], g_ctAimUp[3], g_ctAimFov{0.0f};
+std::atomic<float> g_ctAimFwd[3], g_ctAimUp[3], g_ctAimFov{0.0f}, g_ctAimNear{0.0f};
 uintptr_t g_ctBase=0;
 
 __declspec(noinline) uintptr_t __fastcall viewsObserved(uintptr_t,uintptr_t,uintptr_t) noexcept;
@@ -217,6 +217,10 @@ void ctCameraEdit(uintptr_t cam,uint32_t mode) noexcept {
                 }
                 const float fov=g_ctAimFov.load(std::memory_order_relaxed);
                 if(fov>0.0f)*reinterpret_cast<float*>(cam+0x260u)=fov;   // the vertical field of view (READ, 0x4F30F0); the producer leaves the camera dirty, so the projection is built from it
+                // The near plane, the same way (+0x234, READ in 0x4F30F0 and written by the producer from the pose record). Whatever is nearer is clipped by the hardware, whatever its name
+                // and however large its record, so what is behind it is drawn and captured: Flight 26's Floor07, r 1018 m, with a surface 44 m from the centre, cannot be culled by record.
+                const float nearM=g_ctAimNear.load(std::memory_order_relaxed);
+                if(nearM>0.0f)*reinterpret_cast<float*>(cam+0x234u)=nearM;
             } else {
                 // The look: the player's own axes turned: directions 0 to 3 a quarter turn at a time about the room's up, 4 and 5 straight up and down, about the camera's right row.
                 float up[3];
@@ -327,14 +331,15 @@ void concourseCameraTestLook(const float centre[3],const float up[3],uint32_t di
     g_ctAimOn.store(false,std::memory_order_relaxed);
 }
 
-// The bake's frame: where it stands, the unit axes it looks along, and its vertical field of view in radians.
-void concourseCameraTestAim(const float centre[3],const float forward[3],const float up[3],float fovRad) noexcept {
+// The bake's frame: where it stands, the unit axes it looks along, its vertical field of view in radians, and its near plane in metres.
+void concourseCameraTestAim(const float centre[3],const float forward[3],const float up[3],float fovRad,float nearM) noexcept {
     for(int i=0;i<3;++i) {
         g_ctLookCentre[i].store(centre[i],std::memory_order_relaxed);
         g_ctAimFwd[i].store(forward[i],std::memory_order_relaxed);
         g_ctAimUp[i].store(up[i],std::memory_order_relaxed);
     }
     g_ctAimFov.store(fovRad,std::memory_order_relaxed);
+    g_ctAimNear.store(nearM,std::memory_order_relaxed);
     g_ctAimOn.store(true,std::memory_order_relaxed);
 }
 

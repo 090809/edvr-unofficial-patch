@@ -616,7 +616,7 @@ inline const char* camTestModeName(uint32_t m) noexcept {
 // Straight down is not one of them: Flight 24's look that way was stars through the floor, and no window faces it.
 constexpr uint32_t kBakeDirs = 5, kBakeSettleTicks = 0, kBakeTailTicks = 8, kBakeDirsAll = 0x1Fu;
 constexpr float kBakeFovRad = 1.5707963f;      // camera+0x260, the vertical field of view in radians (READ, 0x4F30F0): 90 degrees, so about 121 across at 16:9, and these directions overlap
-constexpr float kBakeNearDefaultM = 50.0f, kBakeNearMinM = 5.0f, kBakeNearMaxM = 400.0f;   // diag.concourse_bake_near: a captured point nearer the centre than this is the room's
+constexpr float kBakeNearDefaultM = 50.0f, kBakeNearMinM = 5.0f, kBakeNearMaxM = 400.0f;   // diag.concourse_bake_near: the bake frames' near plane, and a captured point nearer the centre than this is the room's
 inline uint32_t bakeDirCount(uint32_t mask) noexcept {
     uint32_t n = 0;
     for (uint32_t d = 0; d < kBakeDirs; ++d)

@@ -3446,8 +3446,9 @@ void concoursePaneBakeFrame(ID3D11DeviceContext* ctx, ID3D11ShaderResourceView* 
     ++g_bakeCaps;
     if (g_bakeCaps <= 16) {
         const float sy = std::sqrt(camera[0][1] * camera[0][1] + camera[1][1] * camera[1][1] + camera[2][1] * camera[2][1]);
-        Log::get().note("concourse bake: capture %u: %ux%u, forward %.2f %.2f %.2f, vertical field of view %.1f degrees", g_bakeCaps, width, height, static_cast<double>(camera[0][3]), static_cast<double>(camera[1][3]),
-                        static_cast<double>(camera[2][3]), sy > 0.0f ? 2.0 * std::atan(1.0 / static_cast<double>(sy)) * 57.29578 : 0.0);
+        // Clip z is the near plane over a position at 1 m: with reversed infinite depth, the fourth column's z (flat_projection_recipes.h), so this says whether the near write took.
+        Log::get().note("concourse bake: capture %u: %ux%u, forward %.2f %.2f %.2f, vertical field of view %.1f degrees, near plane %.3f m", g_bakeCaps, width, height, static_cast<double>(camera[0][3]), static_cast<double>(camera[1][3]),
+                        static_cast<double>(camera[2][3]), sy > 0.0f ? 2.0 * std::atan(1.0 / static_cast<double>(sy)) * 57.29578 : 0.0, static_cast<double>(camera[3][2]));
     }
 }
 
