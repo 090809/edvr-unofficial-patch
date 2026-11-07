@@ -11,6 +11,8 @@
 //       FOLDER is an fgreplay_<stamp> capture (.agents/framegen-replay-format.md). For each consecutive pair (B = k, C = k + 1): the f = 1 S is built from B, kept, and scored against C's
 //       output exactly as the DLL scores it (raw, and turned by the residual head rotation, per class; the |id: fields of the line are the no-warp baseline); the f = 0.5 S is built
 //       from B too. B, S(f = 0.5) and S(f = 1) are written as PNGs (8-bit, clamped to 0..1, sRGB encoded) into DIR (default FOLDER\bench_out); --dry-run writes nothing.
+//       Each pair also prints S's sharpness against B's (Sharpness: the mean |Laplacian| of luma per class, S over B) for both S.
+//   --define NAME=V (with --bench or --replay): the shader's `#define NAME 1` compiled as V instead, for a comparison (FG_SHARP 0 bilinear, 2 Lanczos-2, 3 unclamped).
 //   --self-test
 //       The format reader and writer round trip, the constant block rebuilt from a frame's JSON against the production fill (memcmp), a synthetic capture written, read back and
 //       replayed on WARP (a scene scrolling at the vectors' rate is predicted by the f = 1 S), and a tiny bench on WARP. Needs no real GPU; WARP missing: the GPU parts are skipped.
@@ -436,6 +438,7 @@ struct Gpu {
     uint64_t dedicatedVram = 0;
     bool warp = false;
     DXGI_FORMAT lumaFormat = DXGI_FORMAT_R16_FLOAT;
+    std::vector<std::pair<std::string, std::string>> defines;   // --define
 
     // adapterIndex < 0: the default hardware adapter. warp: the software one.
     bool init(int adapterIndex, bool useWarp, std::string& err) {
@@ -468,7 +471,13 @@ struct Gpu {
         using CompileFn = HRESULT(WINAPI*)(LPCVOID, SIZE_T, LPCSTR, const D3D_SHADER_MACRO*, ID3DInclude*, LPCSTR, LPCSTR, UINT, UINT, ID3DBlob**, ID3DBlob**);
         const CompileFn compile = reinterpret_cast<CompileFn>(GetProcAddress(lib, "D3DCompile"));
         if (!compile) { err = "D3DCompile missing"; return false; }
-        const std::string& text = frameGenSynthShaderSource();
+        std::string text = frameGenSynthShaderSource();
+        for (const auto& d : defines) {   // --define NAME=V: one of the shader's switches set to V, for a comparison (production compiles them all 1)
+            const std::string from = "#define " + d.first + " 1";
+            const size_t at = text.find(from);
+            if (at == std::string::npos) { err = "the shader has no `" + from + "`"; return false; }
+            text.replace(at, from.size(), "#define " + d.first + " " + d.second);
+        }
         for (int i = 0; i < kEntries; ++i) {
             ComPtr<ID3DBlob> code, e;
             if (FAILED(compile(text.data(), text.size(), "framegen_synth", nullptr, nullptr, kEntryNames[i], "cs_5_0", 0, 0, &code, &e))) {
@@ -700,8 +709,79 @@ bool uploadFrame(Gpu& g, const FrameData& fd, GpuFrame& gf) {
            g.makeTex(fd.meta.rw, fd.meta.rh, fd.meta.mvFmt, fd.mv.data(), false, gf.mv);
 }
 
+// S's sharpness against B's, the eye dumps' measure: the mean |Laplacian| of luma (4-neighbour, output pixels, the interior), summed per class of the B pixel each S pixel reads
+// (the f = 1 call's B info: 0 far, 1 cockpit, 2 world) and over all; the ratio S/B is the share of B's high-frequency energy S kept (1.0: as sharp; a bilinear resample of an 8-bit
+// source reads about 0.8). The far class is the stars'.
+struct Sharpness {
+    double s[4] = {}, b[4] = {};   // far, cockpit, world, all
+    void add(const Sharpness& o) { for (int i = 0; i < 4; ++i) { s[i] += o.s[i]; b[i] += o.b[i]; } }
+    double ratio(int i) const { return b[i] > 0.0 ? s[i] / b[i] : -1.0; }
+    std::string text() const {
+        static const char* const kNames[4] = {"far", "cockpit", "world", "all"};
+        std::string t;
+        for (int i = 0; i < 4; ++i) t += fmtStr("%s%s %s", i ? " " : "", kNames[i], ratio(i) < 0.0 ? "-" : fmtStr("%.3f", ratio(i)).c_str());
+        return t;
+    }
+};
+
+bool lumaPlane(const std::vector<uint8_t>& raw, uint32_t w, uint32_t h, DXGI_FORMAT f, std::vector<float>& out) {
+    const uint32_t bpp = bytesPerTexel(f);
+    if (!bpp || raw.size() < static_cast<size_t>(w) * h * bpp) return false;
+    out.resize(static_cast<size_t>(w) * h);
+    for (size_t i = 0; i < out.size(); ++i) {
+        float c[3];
+        if (!texelRgb(f, &raw[i * bpp], c)) return false;
+        float l = 0.2126f * c[0] + 0.7152f * c[1] + 0.0722f * c[2];
+        out[i] = l < 0.0f ? 0.0f : (l > 1.0f ? 1.0f : l);
+    }
+    return true;
+}
+
+// A packed read offset (the shader's synUnpackOffset), in render pixels; false: kNoRead (the pixel reads itself).
+bool unpackReadOffset(uint32_t p, float& ox, float& oy) {
+    if ((p & 0x7C00u) == 0x7C00u) {   // a guarded read: an integer pair
+        ox = static_cast<float>(static_cast<int>((p & 0x3FFu) | (((p >> 15) & 3u) << 10)) - 2048);
+        oy = static_cast<float>(static_cast<int>((p >> 17) & 0xFFFu) - 2048);
+        return true;
+    }
+    ox = halfToFloat(static_cast<uint16_t>(p & 0xFFFFu));
+    oy = halfToFloat(static_cast<uint16_t>(p >> 16));
+    return !(ox < kFrameGenSynthNoRead * 0.5f);
+}
+
+// info: the synth's B info texture read back (R32G32_FLOAT, quarter grid; y the class); reads: that S's read offsets (render size, R32_UINT). Each S pixel is classed by the
+// B pixel it reads (so content a motion carried over the sky is not counted as the sky's).
+bool measureSharpness(const std::vector<uint8_t>& sRaw, const std::vector<uint8_t>& bRaw, const std::vector<uint8_t>& info, const std::vector<uint8_t>& reads, const Synth& sy,
+                      Sharpness& out) {
+    std::vector<float> ls, lb;
+    if (!lumaPlane(sRaw, sy.ow, sy.oh, sy.sFormat, ls) || !lumaPlane(bRaw, sy.ow, sy.oh, sy.sFormat, lb) || info.size() < static_cast<size_t>(sy.qw) * sy.qh * 8 ||
+        reads.size() < static_cast<size_t>(sy.rw) * sy.rh * 4) return false;
+    const float* cls = reinterpret_cast<const float*>(info.data());
+    const uint32_t* rd = reinterpret_cast<const uint32_t*>(reads.data());
+    const auto lap = [&](const std::vector<float>& l, size_t i) { return std::fabs(4.0f * l[i] - l[i - 1] - l[i + 1] - l[i - sy.ow] - l[i + sy.ow]); };
+    for (uint32_t y = 1; y + 1 < sy.oh; ++y) {
+        const double ry = (y + 0.5) * sy.rh / sy.oh - 0.5;
+        const uint32_t py = std::min(static_cast<uint32_t>(ry + 0.5), sy.rh - 1);
+        for (uint32_t x = 1; x + 1 < sy.ow; ++x) {
+            const double rx = (x + 0.5) * sy.rw / sy.ow - 0.5;
+            const uint32_t px = std::min(static_cast<uint32_t>(rx + 0.5), sy.rw - 1);
+            float ox = 0.0f, oy = 0.0f;
+            if (!unpackReadOffset(rd[static_cast<size_t>(py) * sy.rw + px], ox, oy)) ox = oy = 0.0f;
+            const double sx = std::min(std::max(rx + ox + 0.5, 0.0), sy.rw - 1.0), sy2 = std::min(std::max(ry + oy + 0.5, 0.0), sy.rh - 1.0);
+            const uint32_t cx = std::min(static_cast<uint32_t>(sx) / 4u, sy.qw - 1), cy = std::min(static_cast<uint32_t>(sy2) / 4u, sy.qh - 1);
+            const int c = static_cast<int>(cls[(static_cast<size_t>(cy) * sy.qw + cx) * 2 + 1] + 0.5f);
+            const size_t i = static_cast<size_t>(y) * sy.ow + x;
+            const double a = lap(ls, i), b = lap(lb, i);
+            if (c >= 0 && c < 3) { out.s[c] += a; out.b[c] += b; }
+            out.s[3] += a; out.b[3] += b;
+        }
+    }
+    return true;
+}
+
 struct PairResult {
     int b = 0, c = 0;
+    Sharpness sharp05, sharp1;   // the f = 0.5 S (the one shown) and the f = 1 S against B
     bool scored = false;
     std::string note;
     float rotDeg = 0.0f;
@@ -718,6 +798,7 @@ struct ReplayOptions {
 struct ReplaySummary {
     std::vector<PairResult> pairs;
     FrameGenSynthWindow agg;
+    Sharpness sharp05, sharp1;   // summed over the pairs
     std::string aggLine;
     int frames = 0;
 };
@@ -764,6 +845,7 @@ bool replayFolder(Gpu& g, const std::string& dir, const ReplayOptions& opt, Repl
         g.setCb(fillCb(bm, 0.5f, nullptr, nullptr));
         runCall(g, sy, gb.in(), false, false, false, nullptr);
         png(stem + "_S05.png", sy.s.t.Get(), bm.outFmt);
+        const std::vector<uint8_t> s05 = g.readTex(sy.s.t.Get()), r05 = g.readTex(sy.read.t.Get());
 
         // f = 1 from B, kept for C.
         const FrameGenSynthCb cbB = fillCb(bm, 1.0f, nullptr, nullptr);
@@ -772,6 +854,13 @@ bool replayFolder(Gpu& g, const std::string& dir, const ReplayOptions& opt, Repl
         uint32_t stB[kFrameGenSynthStatsUints] = {};
         sy.readStats(g, stB);
         png(stem + "_S1.png", sy.s.t.Get(), bm.outFmt);
+        {
+            const std::vector<uint8_t> s1 = g.readTex(sy.s.t.Get()), r1 = g.readTex(sy.read.t.Get()), info = g.readTex(sy.bInfo.t.Get());
+            if (measureSharpness(s05, cur.out, info, r05, sy, pr.sharp05) && measureSharpness(s1, cur.out, info, r1, sy, pr.sharp1)) {
+                sum.sharp05.add(pr.sharp05);
+                sum.sharp1.add(pr.sharp1);
+            }
+        }
 
         const bool jump = bm.cameraJump || cm.cameraJump;
         const bool consecutive = bm.frame < 0 || cm.frame < 0 || bm.frame + 1 == cm.frame;
@@ -803,6 +892,7 @@ bool replayFolder(Gpu& g, const std::string& dir, const ReplayOptions& opt, Repl
             pixels += px;
         }
         std::printf("pair B=%d C=%d: %s\n", k, k + 1, pr.line.c_str());
+        std::printf("  sharpness S/B: f=0.5 %s | f=1 %s\n", pr.sharp05.text().c_str(), pr.sharp1.text().c_str());
         sum.pairs.push_back(pr);
         cur = std::move(next);
     }
@@ -813,6 +903,7 @@ bool replayFolder(Gpu& g, const std::string& dir, const ReplayOptions& opt, Repl
     agg.rotMedian = frameGenMedian(tmp.data(), tmp.size());
     sum.aggLine = formatFrameGenSynthReport(agg);
     std::printf("aggregate (%u scored pairs, the |id: fields are the no-warp baseline): %s\n", agg.scored, sum.aggLine.c_str());
+    std::printf("aggregate sharpness S/B (mean |Laplacian| of luma, all pairs): f=0.5 %s | f=1 %s\n", sum.sharp05.text().c_str(), sum.sharp1.text().c_str());
     (void)pixels;
     return true;
 }
@@ -1265,7 +1356,8 @@ bool parseWxH(const char* s, uint32_t& w, uint32_t& h) {
 int usage() {
     std::printf("usage: framegen_synth_bench --bench [--render WxH] [--output WxH] [--frame FOLDER[:k]] [--iters N] [--warmup N] [--adapter N] [--json FILE]\n"
                 "       framegen_synth_bench --replay FOLDER [--png-dir DIR] [--no-png] [--adapter N] [--json FILE] [--dry-run]\n"
-                "       framegen_synth_bench --self-test | --list-adapters\n");
+                "       framegen_synth_bench --self-test | --list-adapters\n"
+                "       --bench and --replay take [--define NAME=V] (a shader switch compiled as V)\n");
     return 2;
 }
 
@@ -1278,6 +1370,7 @@ int main(int argc, char** argv) {
     BenchOptions bopt;
     ReplayOptions ropt;
     std::string json;
+    std::vector<std::pair<std::string, std::string>> defines;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         const auto next = [&]() -> const char* { return i + 1 < argc ? argv[++i] : ""; };
@@ -1300,6 +1393,12 @@ int main(int argc, char** argv) {
         else if (a == "--png-dir") ropt.pngDir = next();
         else if (a == "--no-png") ropt.png = false;
         else if (a == "--dry-run") ropt.dry = true;
+        else if (a == "--define") {   // NAME=V
+            const std::string d = next();
+            const size_t eq = d.find('=');
+            if (eq == std::string::npos || eq == 0 || eq + 1 == d.size()) return usage();
+            defines.emplace_back(d.substr(0, eq), d.substr(eq + 1));
+        }
         else return usage();
     }
     if (test) return selfTest();
@@ -1319,8 +1418,10 @@ int main(int argc, char** argv) {
     if (!bench && replay.empty()) return usage();
     if (bopt.iters < 1 || bopt.warm < 0) return usage();
     Gpu g;
+    g.defines = defines;
     std::string err;
     if (!g.init(adapter, false, err)) { std::printf("FAIL: %s\n", err.c_str()); return 1; }
+    for (const auto& d : defines) std::printf("shader switch: %s %s\n", d.first.c_str(), d.second.c_str());
     if (bench) {
         BenchOutput out;
         if (!runBench(g, bopt, out, err)) { std::printf("FAIL: %s\n", err.c_str()); return 1; }
@@ -1336,10 +1437,10 @@ int main(int argc, char** argv) {
         std::string s = fmtStr("{\n  \"adapter\": \"%s\", \"frames\": %d, \"scored\": %u,\n  \"pairs\": [\n", g.adapterName.c_str(), sum.frames, sum.agg.scored);
         for (size_t i = 0; i < sum.pairs.size(); ++i) {
             const PairResult& p = sum.pairs[i];
-            s += fmtStr("    {\"b\": %d, \"c\": %d, \"scored\": %s, \"rot_res_deg\": %.4f, \"line\": \"%s\"}%s\n", p.b, p.c, p.scored ? "true" : "false", static_cast<double>(p.rotDeg), p.line.c_str(),
-                        i + 1 < sum.pairs.size() ? "," : "");
+            s += fmtStr("    {\"b\": %d, \"c\": %d, \"scored\": %s, \"rot_res_deg\": %.4f, \"line\": \"%s\", \"sharpness_f05\": \"%s\", \"sharpness_f1\": \"%s\"}%s\n", p.b, p.c,
+                        p.scored ? "true" : "false", static_cast<double>(p.rotDeg), p.line.c_str(), p.sharp05.text().c_str(), p.sharp1.text().c_str(), i + 1 < sum.pairs.size() ? "," : "");
         }
-        s += fmtStr("  ],\n  \"aggregate\": \"%s\"\n}\n", sum.aggLine.c_str());
+        s += fmtStr("  ],\n  \"aggregate\": \"%s\",\n  \"sharpness_f05\": \"%s\", \"sharpness_f1\": \"%s\"\n}\n", sum.aggLine.c_str(), sum.sharp05.text().c_str(), sum.sharp1.text().c_str());
         writeText(json, s);
     }
     return 0;
