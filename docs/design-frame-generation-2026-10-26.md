@@ -2,9 +2,10 @@
 
 ## Status
 
-- **State (2026-11-07): Phase 1 first slice BUILT, NOT FLOWN** (fork branch
-  `framegen-phase1`; far, cockpit, world and H6 only; 2026-11-07 entry).
-  Design from OFXR-Bridge `d7fcca72` and EDVR `6b8ef374`. No issue yet.
+- **State (2026-11-07): Phase 1 slice FLOWN ONCE, world class failing** (fork
+  `framegen-phase1`; "flight 1" entry). In flight the world warp scores worse
+  than no warp; an instrumented build is next. Design from OFXR-Bridge
+  `d7fcca72` and EDVR `6b8ef374`. No issue yet.
 - **Recommendation:** take OFXR-Bridge's frame loop, not its synthesizer. Elite
   renders at half the headset rate and EDVR's runtime presents every display
   period. The frame in between is **extrapolated** from Elite's newest frame,
@@ -48,10 +49,9 @@
 - **Phase 0 (no EDVR code):** fly stock OFXR-Bridge and VectorXR (colour-only
   routes) over EDVR at a bright settlement and in space, with each runtime's
   own smoothing off and then on. This is the visual reference to beat.
-- **Next flight: Phase 1, measure only.** It flies the shadow scorer (H2-H4 by
-  pixel class), the stereo score (H8), the surface classifier, the frame GPU
-  span while armed (H1), the per-eye GPU share (H9) and the eye-position miss
-  (H6). Nothing shown in the headset changes.
+- **Next flight: Phase 1, measure only:** the world class's W1-W3 (oracle,
+  frame intervals; "flight 1" entry). H1, H8, H9 and the surface classifier
+  are still unbuilt.
 - **Temporary key (built 2026-11-07, hidden):** `fix.frame_generation_shadow`
   (off | on), Phase 1 only. The user key `fix.frame_generation` (off | auto)
   comes with Phase 2. Its `on` value (forced, ignoring the gate's performance
@@ -944,3 +944,41 @@ Pimax Dream Air on SteamVR's OpenXR runtime (SBoys3 driver), 90 Hz, render
 - **Next flight:** Konovalets Hydroponics Site (Warrapatis 1 b) in a ship,
   low flight, on foot; then docked with the head still (the floor); then
   supercruise near a planet.
+
+### 2026-11-07: Phase 1, flight 1 (v0.22.0-rc.7-27-g1c403828)
+
+Same rig as above; landed at Konovalets, head turns in the cockpit, then
+about two minutes of low flight. No on-foot segment. The game ran at 45 fps
+(SteamVR's half rate) at rest and 30-45 fps under head turns.
+`edvr_log.py --health`: "frame generation shadow" OK. Errors below are
+luma x 1024, p95 warped / p95 unwarped (`id:`).
+
+- **Cost:** scorer median 0.05-0.07 ms per eye; a few single 7-10 ms
+  maxima at loading stalls.
+- **Landed, head still:** every class 0-2 both ways (no signal).
+- **Landed, head turns:** cockpit 17-29 / 96-229, world 0-10 / 24-96, far
+  0-3 / 17-48. Holes 3-13% at fast turns, read as the view edge (not yet
+  split out). The rig miss stays at 0.01 mm with the ship still.
+- **Flying:** world 160-650 / 40-230: **the warp is worse than no warp**;
+  20-60% of world cells over 0.02. Cockpit 10-34 / 10-40, far 0-2 / 0-5.
+  `rig_mm` (predicted world translation against the true one, per frame)
+  median 0.2-0.6 m, max 4.9 m, with the head nearly still, so it is the
+  frame-to-frame change of the world delta itself.
+- **`camera_jump` skips** take up to 54 of 86 frames a second during fast
+  head turns: the temporal pass's camera gate fires on head rotation, and
+  the scorer drops the hardest frames. Score them, report them apart.
+- **H6:** at a 50-70 ms lead (T + P at 45 fps), the runtime's rotation
+  misses 0.5-1.8 deg median, p95 to 8 deg, under turns; position 5-13 mm.
+  `velocity_deg` equals `runtime_deg` by construction (both turn the pose
+  at T by the runtime's angular velocity); only its position differs, and
+  it beats the runtime's there (about 5 against 13 mm).
+- **Open for the world class, one build to separate them:**
+  - W1: frame intervals vary and the prediction is per frame, not per
+    second. Signature: the miss tracks `dt_B/dt_A - 1`, and a dt-scaled
+    prediction misses much less.
+  - W2: A is sometimes two game frames back. Signature: `|tvCam_B| /
+    |tvCam_A|` clusters near 2 and 0.5.
+  - W3: the scorer's translation convention is wrong (the WARP rig checks
+    the shader against a CPU reference with the same convention, so it
+    cannot catch this). Signature: scoring with B's true world delta (an
+    oracle) is still worse than no warp.
