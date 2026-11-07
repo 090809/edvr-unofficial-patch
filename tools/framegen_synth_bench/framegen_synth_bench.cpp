@@ -1,10 +1,12 @@
 // framegen_synth_bench: the frame-generation synthesizer (fix.frame_generation_shadow, TEMPORARY; docs/design-frame-generation-2026-10-26.md, Phase 2.1) run OFFLINE on the
 // hardware GPU, so it can be timed pass by pass and scored against captured real frames without a flight.
 //
-//   --bench [--render WxH] [--output WxH] [--iters N] [--warmup N] [--adapter N] [--json FILE]
-//       Synthetic inputs (a textured scene with a depth step, a cockpit band, the far plane, vectors with a ship screen velocity and a head turn), the synth's per-frame dispatch
-//       sequence for both variants (f = 0.5: clear splat src resolve resample; f = 1: clear score splat src resolve resample luma), every pass timed with D3D11 timestamp queries
-//       inside one disjoint query. Defaults: render 2817x2448, output 3756x3264, RGBA16F output, 300 iterations after 30 warm-up. Median and p95 ms per eye, and the VRAM the synth allocates.
+//   --bench [--render WxH] [--output WxH] [--frame FOLDER[:k]] [--iters N] [--warmup N] [--adapter N] [--json FILE]
+//       Synthetic inputs (a textured scene with a depth step, a cockpit band, the far plane, vectors with a ship screen velocity and a head turn), or with --frame the frame k
+//       (default 0) of an fgreplay capture, the workload the game gives the synth (its holes, guard and vectors; its sizes and S format replace --render/--output). The synth's
+//       per-frame dispatch sequence for both variants (f = 0.5: clear splat src resolve resample; f = 1: clear score splat src resolve resample luma), every pass timed with D3D11
+//       timestamp queries inside one disjoint query. Defaults: render 2817x2448, output 3756x3264, RGBA16F output, 300 iterations after 30 warm-up. Median and p95 ms per eye,
+//       and the VRAM the synth allocates.
 //   --replay FOLDER [--png-dir DIR] [--no-png] [--adapter N] [--json FILE] [--dry-run]
 //       FOLDER is an fgreplay_<stamp> capture (.agents/framegen-replay-format.md). For each consecutive pair (B = k, C = k + 1): the f = 1 S is built from B, kept, and scored against C's
 //       output exactly as the DLL scores it (raw, and turned by the residual head rotation, per class; the |id: fields of the line are the no-warp baseline); the f = 0.5 S is built
@@ -990,6 +992,8 @@ struct BenchOptions {
     uint32_t rw = 2817, rh = 2448, ow = 3756, oh = 3264;
     int iters = 300, warm = 30;
     std::string json;
+    std::string frameDir;   // --frame: a capture folder whose frame `frameIndex` is the bench's input instead of the synthetic scene (its sizes replace --render/--output)
+    int frameIndex = 0;
 };
 
 struct BenchOutput {
@@ -1000,28 +1004,38 @@ struct BenchOutput {
     bool ok = false;
 };
 
-bool runBench(Gpu& g, const BenchOptions& o, BenchOutput& bo, std::string& err) {
-    Scene sc;
-    buildScene(o.rw, o.rh, o.ow, o.oh, sc);
+bool runBench(Gpu& g, BenchOptions& o, BenchOutput& bo, std::string& err) {
     GpuFrame gf;
-    if (!g.makeTex(o.ow, o.oh, DXGI_FORMAT_R16G16B16A16_FLOAT, sc.out.data(), false, gf.out) || !g.makeTex(o.rw, o.rh, DXGI_FORMAT_R32_FLOAT, sc.depth.data(), false, gf.depth) ||
-        !g.makeTex(o.rw, o.rh, DXGI_FORMAT_R16G16_FLOAT, sc.mv.data(), false, gf.mv)) { err = "the input textures could not be created"; return false; }
+    FrameMeta meta;
+    if (o.frameDir.empty()) {
+        Scene sc;
+        buildScene(o.rw, o.rh, o.ow, o.oh, sc);
+        if (!g.makeTex(o.ow, o.oh, DXGI_FORMAT_R16G16B16A16_FLOAT, sc.out.data(), false, gf.out) || !g.makeTex(o.rw, o.rh, DXGI_FORMAT_R32_FLOAT, sc.depth.data(), false, gf.depth) ||
+            !g.makeTex(o.rw, o.rh, DXGI_FORMAT_R16G16_FLOAT, sc.mv.data(), false, gf.mv)) { err = "the input textures could not be created"; return false; }
+        meta = sc.meta;
+    } else {   // a real captured frame: the workload the game gives the synth (holes, the guard, the vectors), its own sizes and S format
+        FrameData fd;
+        if (!loadFrame(o.frameDir, o.frameIndex, fd, err)) return false;
+        if (!uploadFrame(g, fd, gf)) { err = "the capture's input textures could not be created"; return false; }
+        meta = fd.meta;
+        o.rw = meta.rw; o.rh = meta.rh; o.ow = meta.ow; o.oh = meta.oh;
+    }
     Synth sy;
-    if (!sy.create(g, o.rw, o.rh, o.ow, o.oh, DXGI_FORMAT_R16G16B16A16_FLOAT)) { err = "the synth's textures could not be created"; return false; }
+    if (!sy.create(g, o.rw, o.rh, o.ow, o.oh, meta.outFmt)) { err = "the synth's textures could not be created"; return false; }
     bo.adapter = g.adapterName;
     bo.eyeBytes = sy.eyeBytes;
     bo.scratchBytes = sy.scratchBytes;
 
     // A kept f = 1 S to score against: one build with the luma pass; the residual is a small head turn (0.05 degrees) and the tangents the kept S was built with are this frame's.
-    const FrameGenSynthCb cb1 = fillCb(sc.meta, 1.0f, nullptr, nullptr);
+    const FrameGenSynthCb cb1 = fillCb(meta, 1.0f, nullptr, nullptr);
     g.setCb(cb1);
     runCall(g, sy, gf.in(), false, true, false, nullptr);
     float keptRot[9], resid[9], hdC[9];
     for (int r = 0; r < 3; ++r) for (int c = 0; c < 3; ++c) keptRot[r * 3 + c] = cb1.rs[r][c];
     rotY(0.05f, hdC);
     frameGenSynthResidual(keptRot, hdC, resid);
-    const FrameGenSynthCb cbScore = fillCb(sc.meta, 1.0f, resid, sc.meta.tanNow);
-    const FrameGenSynthCb cbHalf = fillCb(sc.meta, 0.5f, nullptr, nullptr);
+    const FrameGenSynthCb cbScore = fillCb(meta, 1.0f, resid, meta.tanNow);
+    const FrameGenSynthCb cbHalf = fillCb(meta, 0.5f, nullptr, nullptr);
 
     {
         uint32_t st[kFrameGenSynthStatsUints] = {};
@@ -1031,8 +1045,8 @@ bool runBench(Gpu& g, const BenchOptions& o, BenchOutput& bo, std::string& err) 
         if (sy.readStats(g, st)) {
             frameGenSynthDecodeStats(st, r);
             const double px = static_cast<double>(o.rw) * o.rh;
-            bo.sanity = fmtStr("synthetic scene, f=1: filled %.2f%% left %.2f%% guard %.2f%% clamp %.3f%% of the render pixels", 100.0 * r.filled / px, 100.0 * r.left / px, 100.0 * r.guard / px,
-                               100.0 * r.clamped / px);
+            bo.sanity = fmtStr("%s, f=1: filled %.2f%% left %.2f%% guard %.2f%% clamp %.3f%% of the render pixels", o.frameDir.empty() ? "synthetic scene" : "captured frame",
+                               100.0 * r.filled / px, 100.0 * r.left / px, 100.0 * r.guard / px, 100.0 * r.clamped / px);
         }
     }
     VariantResult v0, v1;
@@ -1050,7 +1064,8 @@ bool runBench(Gpu& g, const BenchOptions& o, BenchOutput& bo, std::string& err) 
 
 void printBench(const BenchOptions& o, const BenchOutput& bo, const Gpu& g) {
     std::printf("adapter: %s (%.0f MiB dedicated%s)\n", bo.adapter.c_str(), static_cast<double>(g.dedicatedVram) / 1048576.0, g.warp ? ", WARP" : "");
-    std::printf("render %ux%u, output %ux%u RGBA16F, %d iterations after %d warm-up; ms per eye\n", o.rw, o.rh, o.ow, o.oh, o.iters, o.warm);
+    std::printf("render %ux%u, output %ux%u, %s, %d iterations after %d warm-up; ms per eye\n", o.rw, o.rh, o.ow, o.oh,
+                o.frameDir.empty() ? "the synthetic scene (RGBA16F)" : fmtStr("frame %d of %s", o.frameIndex, o.frameDir.c_str()).c_str(), o.iters, o.warm);
     for (const VariantResult& v : bo.variants) {
         std::printf("\n%s\n  %-10s %10s %10s\n", v.name.c_str(), "pass", "median ms", "p95 ms");
         double sumMed = 0.0;
@@ -1070,8 +1085,8 @@ void printBench(const BenchOptions& o, const BenchOutput& bo, const Gpu& g) {
 
 std::string benchJson(const BenchOptions& o, const BenchOutput& bo, const Gpu& g) {
     std::string s = "{\n";
-    s += fmtStr("  \"adapter\": \"%s\", \"warp\": %s, \"render\": [%u, %u], \"output\": [%u, %u], \"iterations\": %d, \"warmup\": %d,\n", bo.adapter.c_str(), g.warp ? "true" : "false", o.rw, o.rh, o.ow,
-                o.oh, o.iters, o.warm);
+    s += fmtStr("  \"adapter\": \"%s\", \"warp\": %s, \"render\": [%u, %u], \"output\": [%u, %u], \"iterations\": %d, \"warmup\": %d, \"source\": \"%s\",\n", bo.adapter.c_str(),
+                g.warp ? "true" : "false", o.rw, o.rh, o.ow, o.oh, o.iters, o.warm, o.frameDir.empty() ? "synthetic" : fmtStr("frame %d of a capture", o.frameIndex).c_str());
     s += fmtStr("  \"vram_bytes\": {\"per_eye\": %llu, \"scratch\": %llu, \"two_eyes\": %llu},\n", static_cast<unsigned long long>(bo.eyeBytes), static_cast<unsigned long long>(bo.scratchBytes),
                 static_cast<unsigned long long>(2 * bo.eyeBytes + bo.scratchBytes));
     s += "  \"variants\": [\n";
@@ -1281,7 +1296,7 @@ bool parseWxH(const char* s, uint32_t& w, uint32_t& h) {
 }
 
 int usage() {
-    std::printf("usage: framegen_synth_bench --bench [--render WxH] [--output WxH] [--iters N] [--warmup N] [--adapter N] [--json FILE]\n"
+    std::printf("usage: framegen_synth_bench --bench [--render WxH] [--output WxH] [--frame FOLDER[:k]] [--iters N] [--warmup N] [--adapter N] [--json FILE]\n"
                 "       framegen_synth_bench --replay FOLDER [--png-dir DIR] [--no-png] [--adapter N] [--json FILE] [--dry-run]\n"
                 "       framegen_synth_bench --self-test | --list-adapters\n");
     return 2;
@@ -1305,6 +1320,12 @@ int main(int argc, char** argv) {
         else if (a == "--replay") replay = next();
         else if (a == "--render") { if (!parseWxH(next(), bopt.rw, bopt.rh)) return usage(); }
         else if (a == "--output") { if (!parseWxH(next(), bopt.ow, bopt.oh)) return usage(); }
+        else if (a == "--frame") {   // FOLDER or FOLDER:k (a drive letter's colon is at index 1, a frame index's past it)
+            bopt.frameDir = next();
+            const size_t colon = bopt.frameDir.rfind(':');
+            if (colon != std::string::npos && colon > 1) { bopt.frameIndex = std::atoi(bopt.frameDir.c_str() + colon + 1); bopt.frameDir.resize(colon); }
+            if (bopt.frameDir.empty() || bopt.frameIndex < 0) return usage();
+        }
         else if (a == "--iters") bopt.iters = std::atoi(next());
         else if (a == "--warmup") bopt.warm = std::atoi(next());
         else if (a == "--adapter") adapter = std::atoi(next());
