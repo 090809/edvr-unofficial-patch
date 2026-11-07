@@ -1,7 +1,8 @@
 #pragma once
 // The frame-generation synthesizer's compute shaders (fix.frame_generation_shadow, TEMPORARY; docs/design-frame-generation-2026-10-26.md, Phase 2.1, "The synthesis pass").
-// One source, seven entry points, one constant block (src\common\framegen_synth_math.h FrameGenSynthCb). Nothing they write is shown in the headset.
-//   fgSynClear     Key and Src to 0 and the stats words to 0 (render size);
+// One source, six entry points, one constant block (src\common\framegen_synth_math.h FrameGenSynthCb). Nothing they write is shown in the headset. Before them the key grid and the
+// stats words are cleared to 0 by the API (ClearUnorderedAccessViewUint, framegen_synth_pass.h); the source grid is not cleared: a pixel whose key is 0 never has its source
+// read, and a pixel whose key is not 0 has it written by fgSynSrc (the pixel that set the key finds it there again and writes).
 //   fgSynSplat     each B pixel carried to S by its class's motion (fgSynTarget; its class and depth are the nearest of the 3x3 around it, synDilated, taken where they are read) and
 //                  scattered as a key into the four pixels of its bilinear footprint (InterlockedMax: the nearer surface wins; a pixel that is its own nearest beats one that borrowed
 //                  the dilated depth);
@@ -167,15 +168,6 @@ bool fgSynTarget(uint2 id, out float2 pp, out uint key) {
         key = (max(asuint(1.0 / max(zKey, 1e-6)), 8u) & ~7u) | own | cls;
     }
     return true;
-}
-
-[numthreads(8, 8, 1)]
-void fgSynClear(uint3 id : SV_DispatchThreadID) {
-    if (id.x >= uint(sz.x) || id.y >= uint(sz.y)) return;
-    Key[id.xy] = 0u;
-    Src[id.xy] = 0u;
-    uint cells = uint(sz.x) * uint(sz.y);
-    for (uint i = id.y * uint(sz.x) + id.x; i < kStatsUints; i += cells) Stats[i] = 0u;
 }
 
 [numthreads(8, 8, 1)]

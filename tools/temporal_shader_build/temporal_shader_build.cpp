@@ -653,7 +653,7 @@ static void selfTest() {
     coreLegacy.insert(coreLegacy.end(), originalExtra.begin(), originalExtra.end());
     auto coreFixed = fixedVariants(extractCore(edvr::kTemporalCsHlsl));
     check(originalCore.size() == 28 && originalExtra.size() == 12 && coreFixed.size() == 123 && coreLegacy.size() + 76 == coreFixed.size(),
-          "all original fixed shader contracts, three bounded diagnostics, six flat foreground shaders, the supercruise bars' geometry shader, the foreground map's four sibling-pass compute shaders (donor, fit and the shadow's two), the sky ring's compute shader, the UI layer's in-place composite, the explosion billboards' five facing transcriptions the sharp weapons' two source-pass shaders, the shield ripple's door pass, the HUD bloom feed pass, the star light pass, the visor's axis-centred vertex shader, the desktop window's two draw shaders, the scope lens's three compute passes, the SRV turret HUD's eleven geometry shaders, the VR maps' twelve (five transcribed vertex shaders, the probe's vertex and pixel shader, the sprites' depth issue's two pixel shaders, the System Map's marker vertex shader and the cut-out's vertex and pixel shader) the legacy cockpit glass's three pixel shaders (intact, ice overlay, condensation overlay) the frame-generation shadow scorer's nine compute entries and the frame-generation synthesizer's seven (clear, splat, source, resolve, resample, luma, score) are registered");
+          "all original fixed shader contracts, three bounded diagnostics, six flat foreground shaders, the supercruise bars' geometry shader, the foreground map's four sibling-pass compute shaders (donor, fit and the shadow's two), the sky ring's compute shader, the UI layer's in-place composite, the explosion billboards' five facing transcriptions the sharp weapons' two source-pass shaders, the shield ripple's door pass, the HUD bloom feed pass, the star light pass, the visor's axis-centred vertex shader, the desktop window's two draw shaders, the scope lens's three compute passes, the SRV turret HUD's eleven geometry shaders, the VR maps' twelve (five transcribed vertex shaders, the probe's vertex and pixel shader, the sprites' depth issue's two pixel shaders, the System Map's marker vertex shader and the cut-out's vertex and pixel shader) the legacy cockpit glass's three pixel shaders (intact, ice overlay, condensation overlay) the frame-generation shadow scorer's nine compute entries and the frame-generation synthesizer's six (splat, source, resolve, resample, luma, score) are registered");
     for(size_t i=0;i<coreFixed.size();++i)for(size_t j=0;j<i;++j)
         check(std::strcmp(coreFixed[i].symbol,coreFixed[j].symbol)!=0,"generated shader symbols do not collide");
     using ReflectFn = HRESULT(WINAPI*)(LPCVOID, SIZE_T, REFIID, void**);
@@ -1479,14 +1479,13 @@ static void selfTest() {
         }
     }
 
-    // The frame-generation synthesizer (src/d3d11/framegen_synth_shader.h): seven entries of one text, the carry functions cut from kTemporalCsHlsl and the synthesizer's own.
+    // The frame-generation synthesizer (src/d3d11/framegen_synth_shader.h): six entries of one text, the carry functions cut from kTemporalCsHlsl and the synthesizer's own.
     // Held as the scorer is: the symbols, the source name, the entries, the profile, the text (the carry region is in it, once, byte for byte), the 8x8 group each is dispatched
     // with, the bindings each reads at the slots src/d3d11/framegen_synth.cpp sets them at, and the 224-byte parameter block.
     {
         struct Binding { const char* name; D3D_SHADER_INPUT_TYPE type; UINT slot; };
         struct SynthContract { const char* symbol; const char* entry; std::vector<Binding> bindings; };
         const std::vector<SynthContract> contracts = {
-            {"kFrameGenSynthClearBytecode", "fgSynClear", {{"Key", D3D_SIT_UAV_RWTYPED, 1}, {"Src", D3D_SIT_UAV_RWTYPED, 2}, {"Stats", D3D_SIT_UAV_RWSTRUCTURED, 5}, {"P", D3D_SIT_CBUFFER, 0}}},
             {"kFrameGenSynthSplatBytecode", "fgSynSplat", {{"Depth", D3D_SIT_TEXTURE, 1}, {"Mv", D3D_SIT_TEXTURE, 2}, {"Key", D3D_SIT_UAV_RWTYPED, 1}, {"P", D3D_SIT_CBUFFER, 0}}},
             {"kFrameGenSynthSrcBytecode", "fgSynSrc", {{"Depth", D3D_SIT_TEXTURE, 1}, {"Mv", D3D_SIT_TEXTURE, 2}, {"KeyT", D3D_SIT_TEXTURE, 4}, {"Src", D3D_SIT_UAV_RWTYPED, 2}, {"P", D3D_SIT_CBUFFER, 0}}},
             {"kFrameGenSynthResolveBytecode", "fgSynResolve", {{"Depth", D3D_SIT_TEXTURE, 1}, {"Mv", D3D_SIT_TEXTURE, 2}, {"KeyT", D3D_SIT_TEXTURE, 4}, {"SrcT", D3D_SIT_TEXTURE, 5}, {"ReadOut", D3D_SIT_UAV_RWTYPED, 3}, {"Stats", D3D_SIT_UAV_RWSTRUCTURED, 5}, {"P", D3D_SIT_CBUFFER, 0}}},

@@ -417,7 +417,8 @@ int captureFrameCount(const std::string& dir, std::string& note) {
 
 constexpr int kEntries = kFrameGenSynthEntries;   // the entries, their names and the dispatch sequence: framegen_synth_pass.h
 const char* const* const kEntryNames = kFrameGenSynthEntryNames;
-const char* const* const kPassLabels = kFrameGenSynthPassLabels;
+constexpr int kSteps = kFrameGenSynthSteps;      // the entries and the clear step, for timing
+const char* const* const kPassLabels = kFrameGenSynthStepLabels;
 
 struct Tex {
     ComPtr<ID3D11Texture2D> t;
@@ -880,9 +881,9 @@ void buildScene(uint32_t rw, uint32_t rh, uint32_t ow, uint32_t oh, Scene& sc) {
 }
 
 struct PassStats {
-    std::vector<double> ms[kEntries];
+    std::vector<double> ms[kSteps];
     std::vector<double> total;
-    int passes[kEntries] = {};
+    int passes[kSteps] = {};
 };
 
 struct VariantResult {
@@ -893,10 +894,10 @@ struct VariantResult {
 
 struct QuerySlot {
     ComPtr<ID3D11Query> disjoint;
-    ComPtr<ID3D11Query> ts[kEntries + 1];
+    ComPtr<ID3D11Query> ts[kSteps + 1];
     bool used = false;
     int n = 0;
-    int entries[kEntries] = {};
+    int entries[kSteps] = {};
     bool measured = false;
 };
 
@@ -905,7 +906,7 @@ bool collectSlot(Gpu& g, QuerySlot& q, PassStats& st) {
     while (g.ctx->GetData(q.disjoint.Get(), &dj, sizeof(dj), 0) == S_FALSE) Sleep(0);
     q.used = false;
     if (dj.Disjoint || !q.measured) return !dj.Disjoint;
-    UINT64 t[kEntries + 1] = {};
+    UINT64 t[kSteps + 1] = {};
     for (int i = 0; i <= q.n; ++i)
         while (g.ctx->GetData(q.ts[i].Get(), &t[i], sizeof(UINT64), 0) == S_FALSE) Sleep(0);
     const double toMs = 1000.0 / static_cast<double>(dj.Frequency);
@@ -1022,7 +1023,7 @@ void printBench(const BenchOptions& o, const BenchOutput& bo, const Gpu& g) {
     for (const VariantResult& v : bo.variants) {
         std::printf("\n%s\n  %-10s %10s %10s\n", v.name.c_str(), "pass", "median ms", "p95 ms");
         double sumMed = 0.0;
-        for (int e = 0; e < kEntries; ++e) {
+        for (int e = 0; e < kSteps; ++e) {
             if (v.st.ms[e].empty()) continue;
             const double med = percentile(v.st.ms[e], 0.5);
             sumMed += med;
@@ -1047,7 +1048,7 @@ std::string benchJson(const BenchOptions& o, const BenchOutput& bo, const Gpu& g
         const VariantResult& v = bo.variants[i];
         s += fmtStr("    {\"name\": \"%s\", \"total_ms\": {\"median\": %.4f, \"p95\": %.4f}, \"passes\": {", v.name.substr(0, v.name.find(' ')).c_str(), percentile(v.st.total, 0.5), percentile(v.st.total, 0.95));
         bool first = true;
-        for (int e = 0; e < kEntries; ++e) {
+        for (int e = 0; e < kSteps; ++e) {
             if (v.st.ms[e].empty()) continue;
             s += fmtStr("%s\"%s\": {\"median\": %.4f, \"p95\": %.4f}", first ? "" : ", ", kPassLabels[e], percentile(v.st.ms[e], 0.5), percentile(v.st.ms[e], 0.95));
             first = false;

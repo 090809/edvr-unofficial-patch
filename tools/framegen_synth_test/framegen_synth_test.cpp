@@ -118,7 +118,6 @@ struct Gpu {
         D3D_FEATURE_LEVEL level{};
         if (FAILED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, 0, nullptr, 0, D3D11_SDK_VERSION, &dev, &level, &ctx))) return false;
         const struct { const unsigned char* code; size_t size; } codes[kEntries] = {
-            {kFrameGenSynthClearBytecode, sizeof(kFrameGenSynthClearBytecode)},
             {kFrameGenSynthSplatBytecode, sizeof(kFrameGenSynthSplatBytecode)}, {kFrameGenSynthSrcBytecode, sizeof(kFrameGenSynthSrcBytecode)},
             {kFrameGenSynthResolveBytecode, sizeof(kFrameGenSynthResolveBytecode)}, {kFrameGenSynthResampleBytecode, sizeof(kFrameGenSynthResampleBytecode)},
             {kFrameGenSynthLumaBytecode, sizeof(kFrameGenSynthLumaBytecode)}, {kFrameGenSynthScoreBytecode, sizeof(kFrameGenSynthScoreBytecode)}};

@@ -9,15 +9,16 @@
 
 namespace edvr {
 
-constexpr int kFrameGenSynthEntries = 7;
+constexpr int kFrameGenSynthEntries = 6;
+constexpr int kFrameGenSynthSteps = kFrameGenSynthEntries + 1;   // the entries and the API clear before them, for timing
 constexpr int kFrameGenSynthSrvSlots = 10;   // t0..t9
 constexpr int kFrameGenSynthUavSlots = 8;    // u0..u7
 
-enum FrameGenSynthEntry : int { kFgSynClear = 0, kFgSynSplat, kFgSynSrc, kFgSynResolve, kFgSynResample, kFgSynLuma, kFgSynScore };
+enum FrameGenSynthEntry : int { kFgSynSplat = 0, kFgSynSrc, kFgSynResolve, kFgSynResample, kFgSynLuma, kFgSynScore, kFgSynClear /* a step, not a shader */ };
 
 // The HLSL entry points, in entry order (tools\temporal_shader_build compiles them to kFrameGenSynth*Bytecode in the same order).
-constexpr const char* const kFrameGenSynthEntryNames[kFrameGenSynthEntries] = {"fgSynClear", "fgSynSplat", "fgSynSrc", "fgSynResolve", "fgSynResample", "fgSynLuma", "fgSynScore"};
-constexpr const char* const kFrameGenSynthPassLabels[kFrameGenSynthEntries] = {"clear", "splat", "src", "resolve", "resample", "luma", "score"};
+constexpr const char* const kFrameGenSynthEntryNames[kFrameGenSynthEntries] = {"fgSynSplat", "fgSynSrc", "fgSynResolve", "fgSynResample", "fgSynLuma", "fgSynScore"};
+constexpr const char* const kFrameGenSynthStepLabels[kFrameGenSynthSteps] = {"splat", "src", "resolve", "resample", "luma", "score", "clear"};
 
 // One eye's views for a call. The inputs: B's output (the upscaler's, before the interface; C's on a score), B's depth copy, the DLSS vectors. The synth's own: the key and source
 // grids and the read offsets (render size, scratch), S (output size), the kept S luma and B's luma and class (quarter grid), the stats words.
@@ -43,9 +44,10 @@ struct FrameGenSynthPassViews {
     uint32_t qw = 0, qh = 0;   // the quarter grid
 };
 
-// The sequence of one call: clear; the score of the kept f = 1 S against this frame when `score`; then, when `build`, splat, source, resolve, resample and, when `keep`, the luma
-// pass that keeps this f = 1 S for the next frame. `after(int entry)` runs after each dispatch (the bench's timestamps). Every dispatch starts with nothing bound from the last
-// (a resource still bound as a UAV would silently null the SRV set for it), and nothing stays bound at the end.
+// The sequence of one call: the clear (the key grid and the stats words to 0 by the API; the source grid needs none, framegen_synth_shader.h); the score of the kept f = 1 S
+// against this frame when `score`; then, when `build`, splat, source, resolve, resample and, when `keep`, the luma pass that keeps this f = 1 S for the next frame.
+// `after(int step)` runs after the clear and after each dispatch (the bench's timestamps). Every dispatch starts with nothing bound from the last (a resource still bound as a
+// UAV would silently null the SRV set for it), and nothing stays bound at the end.
 template <class After>
 inline void frameGenSynthRunPasses(ID3D11DeviceContext* ctx, ID3D11ComputeShader* const cs[kFrameGenSynthEntries], const FrameGenSynthPassViews& v, bool score, bool build, bool keep,
                                    After&& after) {
@@ -63,9 +65,11 @@ inline void frameGenSynthRunPasses(ID3D11DeviceContext* ctx, ID3D11ComputeShader
     const uint32_t rgx = (v.rw + 7u) / 8u, rgy = (v.rh + 7u) / 8u;
     const uint32_t ogx = (v.ow + 7u) / 8u, ogy = (v.oh + 7u) / 8u;
     const uint32_t qgx = (v.qw + 7u) / 8u, qgy = (v.qh + 7u) / 8u;
-    {   // clear: the key and source grids and the stats words
-        ID3D11UnorderedAccessView* uav[kFrameGenSynthUavSlots] = {nullptr, v.keyUav, v.srcUav, nullptr, nullptr, v.statsUav};
-        dispatch(kFgSynClear, noSrv, uav, rgx, rgy);
+    {   // clear: the key grid (0 = a hole) and the stats words
+        const UINT zeros[4] = {};
+        ctx->ClearUnorderedAccessViewUint(v.keyUav, zeros);
+        ctx->ClearUnorderedAccessViewUint(v.statsUav, zeros);
+        after(kFgSynClear);
     }
     if (score) {   // the f = 1 S kept from the frame before against this frame, which is C: its luma, S's and B's, by B's class
         ID3D11ShaderResourceView* srv[kFrameGenSynthSrvSlots] = {v.out, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, v.sLumaSrv, v.bInfoSrv};

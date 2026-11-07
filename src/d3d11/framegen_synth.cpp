@@ -26,7 +26,7 @@ namespace {
 
 constexpr int kStagingDepth = 4;
 constexpr int kTimerRing = 8;
-constexpr int kEntries = kFrameGenSynthEntries;   // clear, splat, source, resolve, resample, luma, score (framegen_synth_pass.h)
+constexpr int kEntries = kFrameGenSynthEntries;   // splat, source, resolve, resample, luma, score (framegen_synth_pass.h)
 
 std::atomic<bool> g_on{false};
 std::atomic<bool> g_told{false};   // the armed line has been said since the key last went on
@@ -330,7 +330,6 @@ bool uavStoreOk(ID3D11Device* dev, DXGI_FORMAT fmt) {
 bool createCommon(ID3D11Device* dev, ID3D11DeviceContext* ctx) {
     struct Item { int entry; const unsigned char* code; size_t size; const char* name; };
     const Item entries[kEntries] = {   // in framegen_synth_pass.h's entry order
-        {kFgSynClear, kFrameGenSynthClearBytecode, sizeof(kFrameGenSynthClearBytecode), "framegen_synth_clear"},
         {kFgSynSplat, kFrameGenSynthSplatBytecode, sizeof(kFrameGenSynthSplatBytecode), "framegen_synth_splat"},
         {kFgSynSrc, kFrameGenSynthSrcBytecode, sizeof(kFrameGenSynthSrcBytecode), "framegen_synth_src"},
         {kFgSynResolve, kFrameGenSynthResolveBytecode, sizeof(kFrameGenSynthResolveBytecode), "framegen_synth_resolve"},
