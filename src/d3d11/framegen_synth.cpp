@@ -456,6 +456,35 @@ bool ensureScratch(ID3D11Device* dev, uint32_t rw, uint32_t rh) {
     return false;
 }
 
+// The bytes of what was made, from the descriptors (a texture: width x height x bytes per texel; a buffer: its byte width), for the VRAM line.
+uint64_t texBytes(const Tex& t) {
+    if (!t.tex) return 0;
+    D3D11_TEXTURE2D_DESC d{};
+    t.tex->GetDesc(&d);
+    return static_cast<uint64_t>(d.Width) * d.Height * frameGenReplayFormatBytes(static_cast<uint32_t>(d.Format));
+}
+
+uint64_t bufBytes(ID3D11Buffer* b) {
+    if (!b) return 0;
+    D3D11_BUFFER_DESC d{};
+    b->GetDesc(&d);
+    return d.ByteWidth;
+}
+
+FrameGenSynthVram vramOf(const EyeRes& r, const Scratch& sc) {
+    FrameGenSynthVram v;
+    v.s = texBytes(r.s);
+    v.luma = texBytes(r.sLuma);
+    v.cls = texBytes(r.bInfo);
+    v.stats = bufBytes(r.stats);
+    for (ID3D11Buffer* s : r.staging) v.stats += bufBytes(s);
+    v.key = texBytes(sc.key);
+    v.src = texBytes(sc.src);
+    v.read = texBytes(sc.read);
+    v.holes = bufBytes(sc.holes);
+    return v;
+}
+
 // The staging slots already copied, oldest first, read without waiting: a slot not done yet is left for the next frame.
 void pollReadbacks(ID3D11DeviceContext* ctx, EyeRes& r, uint32_t nextSlot) {
     for (int k = 0; k < kStagingDepth; ++k) {
@@ -546,7 +575,9 @@ void frameGenSynthEyeFrame(ID3D11Device* dev, ID3D11DeviceContext* ctx, uint32_t
         return;
     }
     const DXGI_FORMAT sFormat = viewFormat(f.outSrv);
+    bool made = false;   // the eye's textures were made on this call: the VRAM line follows once the scratch exists too
     if (!r.created || r.rw != f.renderW || r.rh != f.renderH || r.ow != f.outW || r.oh != f.outH || r.sFormat != sFormat) {
+        made = true;
         releaseEye(r);
         if (!createEye(dev, r, f.renderW, f.renderH, f.outW, f.outH, sFormat)) {
             g.failed = true;
@@ -564,6 +595,10 @@ void frameGenSynthEyeFrame(ID3D11Device* dev, ID3D11DeviceContext* ctx, uint32_t
         g.failed = true;
         Log::get().note("frame generation (synth): the scratch textures could not be created (%ux%u render); it stands down.", static_cast<unsigned>(f.renderW), static_cast<unsigned>(f.renderH));
         return;
+    }
+    if (made) {
+        const std::string vram = formatFrameGenSynthVram(eye, vramOf(r, g.scratch));
+        Log::get().note("%s", vram.c_str());
     }
     pollReadbacks(ctx, r, r.writes);
     pollTimers(ctx);

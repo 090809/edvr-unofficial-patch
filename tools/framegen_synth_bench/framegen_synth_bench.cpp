@@ -552,7 +552,7 @@ struct Synth {
     Tex s, sLuma, bInfo, key, src, read;
     ComPtr<ID3D11Buffer> stats, staging[4], holes;
     ComPtr<ID3D11UnorderedAccessView> statsUav, holesUav;
-    uint64_t eyeBytes = 0, scratchBytes = 0;
+    FrameGenSynthVram vram;   // measured from what was made, as the module's VRAM line is
 
     bool create(Gpu& g, uint32_t rw_, uint32_t rh_, uint32_t ow_, uint32_t oh_, DXGI_FORMAT sFmt) {
         rw = rw_; rh = rh_; ow = ow_; oh = oh_; qw = (rw + 3) / 4; qh = (rh + 3) / 4; sFormat = sFmt;
@@ -577,7 +577,8 @@ struct Synth {
         bd.MiscFlags = 0;
         bd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
         for (auto& st : staging) if (FAILED(g.dev->CreateBuffer(&bd, nullptr, &st))) return false;
-        eyeBytes = s.bytes + sLuma.bytes + bInfo.bytes + bd.ByteWidth * 5ull;   // the stats buffer and its four staging slots
+        vram.s = s.bytes; vram.luma = sLuma.bytes; vram.cls = bInfo.bytes;
+        vram.stats = bd.ByteWidth * 5ull;   // the stats buffer and its four staging slots
         const uint32_t cap = frameGenSynthHoleCapacity(rw, rh);   // the hole list (framegen_synth.cpp ensureScratch)
         bd = D3D11_BUFFER_DESC{};
         bd.ByteWidth = cap * 4u;
@@ -587,7 +588,7 @@ struct Synth {
         bd.StructureByteStride = 4;
         ud.Buffer.NumElements = cap;
         if (FAILED(g.dev->CreateBuffer(&bd, nullptr, &holes)) || FAILED(g.dev->CreateUnorderedAccessView(holes.Get(), &ud, &holesUav))) return false;
-        scratchBytes = key.bytes + src.bytes + read.bytes + bd.ByteWidth;
+        vram.key = key.bytes; vram.src = src.bytes; vram.read = read.bytes; vram.holes = bd.ByteWidth;
         return true;
     }
 
@@ -963,7 +964,7 @@ struct BenchOptions {
 struct BenchOutput {
     std::string adapter;
     std::vector<VariantResult> variants;
-    uint64_t eyeBytes = 0, scratchBytes = 0;
+    FrameGenSynthVram vram;
     std::string sanity;   // the scene's own fill/guard/clamp shares, so a bench scene that exercises nothing shows
     bool ok = false;
 };
@@ -987,8 +988,7 @@ bool runBench(Gpu& g, BenchOptions& o, BenchOutput& bo, std::string& err) {
     Synth sy;
     if (!sy.create(g, o.rw, o.rh, o.ow, o.oh, meta.outFmt)) { err = "the synth's textures could not be created"; return false; }
     bo.adapter = g.adapterName;
-    bo.eyeBytes = sy.eyeBytes;
-    bo.scratchBytes = sy.scratchBytes;
+    bo.vram = sy.vram;
 
     // A kept f = 1 S to score against: one build with the luma pass; the residual is a small head turn (0.05 degrees) and the tangents the kept S was built with are this frame's.
     const FrameGenSynthCb cb1 = fillCb(meta, 1.0f, nullptr, nullptr);
@@ -1042,18 +1042,21 @@ void printBench(const BenchOptions& o, const BenchOutput& bo, const Gpu& g) {
         std::printf("  %-10s %10.3f %10.3f   (sum of pass medians %.3f; p90 %.3f p99 %.3f max %.3f: a total past the sum is a gap between passes)\n", "TOTAL",
                     percentile(v.st.total, 0.5), percentile(v.st.total, 0.95), sumMed, percentile(v.st.total, 0.9), percentile(v.st.total, 0.99), percentile(v.st.total, 1.0));
     }
-    const double mib = 1048576.0;
     std::printf("\n%s\n", bo.sanity.c_str());
-    std::printf("VRAM the synth allocates: %.1f MiB per eye (S + luma + class + stats + 4 staging) + %.1f MiB shared scratch (key, source, read offsets, hole list) = %.1f MiB for two eyes\n",
-                static_cast<double>(bo.eyeBytes) / mib, static_cast<double>(bo.scratchBytes) / mib, (2.0 * static_cast<double>(bo.eyeBytes) + static_cast<double>(bo.scratchBytes)) / mib);
+    // The VRAM the synth allocates, as the module's own line says it (framegen_synth_report.h formatFrameGenSynthVram), measured from the bench's textures.
+    std::printf("%s\n", formatFrameGenSynthVram(0, bo.vram).c_str());
 }
 
 std::string benchJson(const BenchOptions& o, const BenchOutput& bo, const Gpu& g) {
     std::string s = "{\n";
     s += fmtStr("  \"adapter\": \"%s\", \"warp\": %s, \"render\": [%u, %u], \"output\": [%u, %u], \"iterations\": %d, \"warmup\": %d, \"source\": \"%s\",\n", bo.adapter.c_str(),
                 g.warp ? "true" : "false", o.rw, o.rh, o.ow, o.oh, o.iters, o.warm, o.frameDir.empty() ? "synthetic" : fmtStr("frame %d of a capture", o.frameIndex).c_str());
-    s += fmtStr("  \"vram_bytes\": {\"per_eye\": %llu, \"scratch\": %llu, \"two_eyes\": %llu},\n", static_cast<unsigned long long>(bo.eyeBytes), static_cast<unsigned long long>(bo.scratchBytes),
-                static_cast<unsigned long long>(2 * bo.eyeBytes + bo.scratchBytes));
+    const FrameGenSynthVram& v = bo.vram;
+    s += fmtStr("  \"vram_bytes\": {\"per_eye\": %llu, \"scratch\": %llu, \"two_eyes\": %llu, \"eye\": {\"s\": %llu, \"luma\": %llu, \"class\": %llu, \"stats\": %llu}, "
+                "\"shared\": {\"key\": %llu, \"src\": %llu, \"read\": %llu, \"holes\": %llu}},\n",
+                static_cast<unsigned long long>(v.eye()), static_cast<unsigned long long>(v.scratch()), static_cast<unsigned long long>(v.total()),
+                static_cast<unsigned long long>(v.s), static_cast<unsigned long long>(v.luma), static_cast<unsigned long long>(v.cls), static_cast<unsigned long long>(v.stats),
+                static_cast<unsigned long long>(v.key), static_cast<unsigned long long>(v.src), static_cast<unsigned long long>(v.read), static_cast<unsigned long long>(v.holes));
     s += "  \"variants\": [\n";
     for (size_t i = 0; i < bo.variants.size(); ++i) {
         const VariantResult& v = bo.variants[i];
@@ -1243,7 +1246,7 @@ int selfTest() {
         BenchOutput out;
         if (runBench(g, bo, out, err)) {
             check(out.variants.size() == 2 && out.variants[0].st.total.size() == 4 && out.variants[1].st.ms[kFgSynScore].size() == 4 && out.variants[0].st.ms[kFgSynScore].empty() &&
-                      out.eyeBytes > 0 && !benchJson(bo, out, g).empty(),
+                      out.vram.eye() > 0 && out.vram.scratch() > 0 && !benchJson(bo, out, g).empty(),
                   "the bench times both variants pass by pass (f = 0.5 has no score pass, f = 1 does) and reports the VRAM");
         } else {
             std::printf("SKIP: the bench on WARP gave nothing (%s); WARP may not support timestamp queries\n", err.c_str());

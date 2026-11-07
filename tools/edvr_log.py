@@ -10622,6 +10622,11 @@ H_FRAMEGEN_POSE = (r"frame generation \(shadow\) pose: frames=(?P<frames>\d+) le
                    r" vel_src=(?P<sxr>\d+)/(?P<spair>\d+)/(?P<snone>\d+) expired=(?P<expired>\d+) refused=(?P<refused>\d+) unpredicted=(?P<unpredicted>\d+)$")
 H_FRAMEGEN_RUNTIME_READ = "_framegen runtime log read"   # a pseudo-entry of the scan's rows (as H_CARRIED is): the runtime log was read, so a missing pose line can be judged
 H_FRAMEGEN_ARMED = r"frame generation \(shadow\): armed, quarter (?P<qw>\d+)x(?P<qh>\d+) per eye, classes far cockpit world"
+# The VRAM line (src\common\framegen_shadow_report.h kFrameGenShadowVramFmt), said once per eye when its resources are made: the bytes by group (the groups are read as one
+# field, so a group added or taken away does not drift the line), the eye's total and twice it. State, like the armed line.
+_HFG_GROUPS = r"[a-z]+=\d+(?: [a-z]+=\d+)*"
+H_FRAMEGEN_VRAM = (r"frame generation \(shadow\): eye (?P<eye>\d+) VRAM (?P<bytes>\d+) B \((?P<mib>[\d.]+) MiB\): (?P<groups>" + _HFG_GROUPS +
+                   r"); two eyes (?P<two>\d+) B \((?P<two_mib>[\d.]+) MiB\)$")
 _HFG_CLASS = r" {n}=(?P<{n}_share>[\d.]+)%,(?P<{n}_mean>\d+),(?P<{n}_p50>\d+),(?P<{n}_p95>\d+),(?P<{n}_o02>[\d.]+)%,(?P<{n}_o05>[\d.]+)%\|id:(?P<{n}_idmean>\d+),(?P<{n}_idp95>\d+)"
 # The oracle set (frame B's true transform for far and world) and the jump set (camera_jump frames), each with the three class fields under group prefixes o_ and j_, then the CPU
 # motion facts (a number, or "-" when nothing was sampled). All of it is optional: a line from before these fields ends at rig_mm.
@@ -10654,6 +10659,10 @@ H_FRAMEGEN_SYNTH_LABEL = "frame generation (synth):"
 H_FRAMEGEN_SYNTH_ARMED = (r"frame generation \(synth\): armed, render (?P<rw>\d+)x(?P<rh>\d+) output (?P<ow>\d+)x(?P<oh>\d+) per eye, S format (?P<fmt>\d+), "
                           r"f=0.5 built on the even frames and f=1 scored against the next real frame \(nothing is shown\)$")
 _HFGS_GPU = r"(?:(?P<{p}_med>[\d.]+)/(?P<{p}_max>[\d.]+)\(n=(?P<{p}_n>[1-9]\d*)\)|-\(n=0\))"
+# The synthesizer's VRAM line (framegen_synth_report.h kFrameGenSynthVramFmt): the eye's groups, the shared scratch's, and two eyes with the scratch. State, like the armed line.
+H_FRAMEGEN_SYNTH_VRAM = (r"frame generation \(synth\): eye (?P<eye>\d+) VRAM (?P<bytes>\d+) B \((?P<mib>[\d.]+) MiB\): (?P<groups>" + _HFG_GROUPS +
+                         r"); shared scratch (?P<scratch>\d+) B \((?P<scratch_mib>[\d.]+) MiB\): (?P<sgroups>" + _HFG_GROUPS +
+                         r"); two eyes and the scratch (?P<two>\d+) B \((?P<two_mib>[\d.]+) MiB\)$")
 H_FRAMEGEN_SYNTH_REPORT = (r"frame generation \(synth\): frames=(?P<f05>\d+)/(?P<f1>\d+) scored=(?P<scored>\d+) skipped=(?P<skipped>\d+) gpu_ms=" + _HFGS_GPU.format(p="g05") + "/" +
                            _HFGS_GPU.format(p="g1") + r" holes=(?P<filled>[\d.]+)%/(?P<left>[\d.]+)% guard=(?P<guard>[\d.]+)%(?: clamp=(?P<clamp>[\d.]+)%)?" +
                            "".join(_HFG_CLASS.format(n=n) for n in ("far", "cockpit", "world")) +
@@ -16890,6 +16899,9 @@ def _hj_framegen_shadow(rows, ctx=None):
         text += "; armed at quarter %sx%s per eye" % (armed[-1]["qw"], armed[-1]["qh"])
     else:
         text += "; the armed line is before the window"
+    vram = rows.get("vram", [])
+    if vram:
+        text += "; VRAM %s MiB for two eyes (%s; the last VRAM line)" % (vram[-1]["two_mib"], vram[-1]["groups"])
     if not frames:
         text += "; no frame was scored (every frame skipped)"
     # The oracle set (frame B's true transform): the world class's p95 error with it against the prediction's, over the lines that carry it (older lines do not).
@@ -16953,6 +16965,9 @@ def _hj_framegen_synth(rows, ctx=None):
         text += "; armed at render %sx%s, output %sx%s per eye" % (armed[-1]["rw"], armed[-1]["rh"], armed[-1]["ow"], armed[-1]["oh"])
     else:
         text += "; the armed line is before the window"
+    vram = rows.get("vram", [])
+    if vram:
+        text += "; VRAM %s MiB for two eyes and the scratch (eye %s; scratch %s; the last VRAM line)" % (vram[-1]["two_mib"], vram[-1]["groups"], vram[-1]["sgroups"])
     text += "; holes filled %.2f%% / left %.2f%% of the render pixels (mean), guard %.2f%%" % tuple(sum(float(r[k]) for r in reports) / len(reports) for k in ("filled", "left", "guard"))
     withScore = [r for r in reports if int(r["scored"]) > 0]
     if withScore:
@@ -18151,6 +18166,7 @@ HEALTH_RULES = (
     # Frame generation, Phase 1 (TEMPORARY): the armed line and the one-second report, graphics-log lines with no build tag, read the desktop window's way.
     _hrule(H_FRAMEGEN, (), (H_FRAMEGEN_LABEL, H_FRAMEGEN_EX_LABEL), (
         ("armed", H_FRAMEGEN_ARMED),
+        ("vram", H_FRAMEGEN_VRAM),
         ("report", H_FRAMEGEN_REPORT),
         ("extrap", H_FRAMEGEN_EXTRAP),
         ("pose", H_FRAMEGEN_POSE),
@@ -18158,6 +18174,7 @@ HEALTH_RULES = (
     # Frame generation, Phase 2.1 (TEMPORARY): the synthesizer's armed line and one-second report, read the scorer's way; it judges against the scorer's rows (the key is the same).
     _hrule(H_FRAMEGEN_SYNTH, (), (H_FRAMEGEN_SYNTH_LABEL,), (
         ("armed", H_FRAMEGEN_SYNTH_ARMED),
+        ("vram", H_FRAMEGEN_SYNTH_VRAM),
         ("report", H_FRAMEGEN_SYNTH_REPORT),
     ), _hj_framegen_synth),
     # The SRV turret view (issue 140): lines of the graphics log that carry no build tag (health_scan reads them, as it reads the desktop window's, before it drops the untagged lines).
@@ -18252,14 +18269,14 @@ def health_scan(text, since=None, until=None):
                 u[1] = u[1] or raw.strip()[:160]
             continue
         if H_FRAMEGEN_SYNTH_LABEL in raw:
-            # The synthesizer's lines carry no build tag either. The armed line is state, kept whatever --since says; the report lines are events and are cut by the window.
+            # The synthesizer's lines carry no build tag either. The armed and VRAM lines are state, kept whatever --since says; the report lines are events and are cut by the window.
             sm = HEALTH_STAMP_RE.match(raw)
             tod = int(sm.group(1)) * 3600 + int(sm.group(2)) * 60 + int(sm.group(3)) + int(sm.group(4)) / 1000.0 if sm else None
             body = raw[sm.end():] if sm else raw
             for kind, rx in synth.kinds:
                 g = rx.search(body)
                 if g:
-                    if kind == "armed" or _health_in_window(tod, since, until):
+                    if kind in ("armed", "vram") or _health_in_window(tod, since, until):
                         rows[H_FRAMEGEN_SYNTH].setdefault(kind, []).append(dict(g.groupdict(), _t=tod))
                     break
             else:
@@ -18268,14 +18285,14 @@ def health_scan(text, since=None, until=None):
                 u[1] = u[1] or raw.strip()[:160]
             continue
         if H_FRAMEGEN_LABEL in raw or H_FRAMEGEN_EX_LABEL in raw:
-            # The frame generation shadow's lines carry no build tag. The armed line is state, so it is kept whatever --since says; the report lines are events and are cut by the window.
+            # The frame generation shadow's lines carry no build tag. The armed and VRAM lines are state, so they are kept whatever --since says; the report lines are events and are cut by the window.
             sm = HEALTH_STAMP_RE.match(raw)
             tod = int(sm.group(1)) * 3600 + int(sm.group(2)) * 60 + int(sm.group(3)) + int(sm.group(4)) / 1000.0 if sm else None
             body = raw[sm.end():] if sm else raw
             for kind, rx in framegen.kinds:
                 g = rx.search(body)
                 if g:
-                    if kind == "armed" or _health_in_window(tod, since, until):
+                    if kind in ("armed", "vram") or _health_in_window(tod, since, until):
                         rows[H_FRAMEGEN].setdefault(kind, []).append(dict(g.groupdict(), _t=tod))
                     break
             else:
@@ -25187,6 +25204,10 @@ def self_test_health():
                     line += RF(" mv=%u", 29) + mcls + RF(" bdepth=%u", 29) + bcls + RF(" mvdis_world_px=%s/%s mvdis_cockpit_px=%s/%s", dis, "4.36", "-", "-")
             return line
 
+        def fg_vram(eye=0, groups="captures=6291456 vectors=33554432 keys=12582912 stats=31900"):
+            """The scorer's VRAM line, rendered from the C format string: the groups are one %s."""
+            return RF("frame generation (shadow): eye %u VRAM %llu B", eye, 52460700, 50.0, groups, 104921400, 100.1)
+
         def fg_extrap(x2_p95=33, xh_p95=12, rows=("25.0%", "-")):
             """The extrapolation sets' own line, rendered from the C format strings."""
             x2 = "".join(RF(" %s=%.1f%%,%u", n, 10.0, 12, 8, x2_p95, 5.5, 1.5, 9, 30) for n in ("far", "cockpit", "world"))
@@ -25207,6 +25228,10 @@ def self_test_health():
         def fg_synth_armed(rw=612, rh=699, ow=1224, oh=1398, fmt=10):
             return RS("frame generation (synth): armed, render %ux%u", rw, rh, ow, oh, fmt)
 
+        def fg_synth_vram(eye=0):
+            return RS("frame generation (synth): eye %u VRAM %llu B", eye, 53364996, 50.9, "s=49038336 luma=862920 class=3451680 stats=12060", 86200200, 82.2,
+                      "key=27584064 src=27584064 read=27584064 holes=3448008", 192930192, 184.0)
+
         def fg_synth_report(f05=40, f1=39, scored=38, skipped=2, timed=True, p95=20, filled=0.25, left=0.01, guard=1.5, turned=True, tp95=7, rot=(0.4, 1.2), clamp=0.0):
             cls = "".join(RF(" %s=%.1f%%,%u", n, 10.0, 12, 8, p95, 5.5, 1.5, 9, 30) for n in ("far", "cockpit", "world"))
             gpu = RF("%.2f/%.2f(n=%u)", 0.31, 0.8, 40) if timed else health_c_format(fgsrc, "-(n=0)")
@@ -25222,6 +25247,12 @@ def self_test_health():
         check("frame generation shadow: no line at all, nothing said (the key off)", fg_off, 0, [("OK", F90S)], lacks=["frame generation", "NEVER APPLIED"])
         check("frame generation shadow: armed and reporting is OK", fg_ok + [fg_armed(), fg_report(), fg_report(frames=58)], 0, [("OK", FG)],
               has=["2 report line(s), 118 frame(s) scored, 30 skipped; armed at quarter 612x699 per eye"], lacks=["UNPARSED"])
+        check("frame generation shadow: the VRAM line is read as state and the OK summary says the two-eye figure and the groups",
+              fg_ok + [(1, fg_armed()), (1, fg_vram()), (1, fg_vram(eye=1)), (70, fg_report()), (70, fg_synth_report())], 0, [("OK", FG)],
+              has=["VRAM 100.1 MiB for two eyes (captures=6291456 vectors=33554432 keys=12582912 stats=31900; the last VRAM line)"], lacks=["UNPARSED"], extra=["--since", "10:01:00"])
+        check("frame generation shadow: a VRAM line whose groups changed still parses (the groups are one field)",
+              fg_ok + [fg_armed(), fg_vram(groups="captures=6291456 keys=3145728 stats=19100"), fg_report()], 0, [("OK", FG)],
+              has=["VRAM 100.1 MiB for two eyes (captures=6291456 keys=3145728 stats=19100"], lacks=["UNPARSED"])
         check("frame generation shadow: a line with the oracle and jump sets and the motion facts is OK and says oracle world p95 against the prediction's",
               fg_ok + [fg_armed(), fg_report(sets=True), fg_report(sets=True, oracle_p95=10, jump=2)], 0, [("OK", FG)],
               has=["2 report line(s), 120 frame(s) scored", "world p95 40 milli-luma predicted vs 15 oracle (mean of 2 line(s)), 6 jump frame(s) scored apart"], lacks=["UNPARSED"])
@@ -25278,6 +25309,10 @@ def self_test_health():
               fg_off + [fg_armed(), fg_report(), fg_synth_armed(), fg_synth_report(), fg_synth_report(f05=41, f1=40, scored=39, p95=24)], 0, [("OK", FGS)],
               has=["2 report line(s), 81 frame(s) built at f=0.5 and 79 at f=1, 77 scored against the next real frame, 4 call(s) built nothing; armed at render 612x699, output 1224x1398 per eye",
                    "holes filled 0.25% / left 0.01% of the render pixels (mean), guard 1.50%", "p95 error far 22 / cockpit 22 / world 22 milli-luma, no warp 30 / 30 / 30 (mean of 2 line(s))"], lacks=["UNPARSED"])
+        check("frame generation synth: the VRAM line is read as state and the OK summary says the figure for two eyes and the scratch",
+              fg_off + [(1, fg_armed()), (1, fg_synth_armed()), (1, fg_synth_vram()), (70, fg_report()), (70, fg_synth_report())], 0, [("OK", FGS)],
+              has=["VRAM 184.0 MiB for two eyes and the scratch (eye s=49038336 luma=862920 class=3451680 stats=12060; scratch key=27584064 src=27584064 read=27584064 holes=3448008; the last VRAM line)"],
+              lacks=["UNPARSED"], extra=["--since", "10:01:00"])
         check("frame generation synth: a report line with no gpu timing (\"-(n=0)\") and no scored frame is OK", fg_off + [fg_armed(), fg_report(), fg_synth_armed(), fg_synth_report(timed=False, scored=0)], 0, [("OK", FGS)],
               has=["1 report line(s)", "0 scored"], lacks=["UNPARSED", "f=1 S against the next frame"])
         check("frame generation synth: the turned score is read and the OK summary sets the world p95 raw against turned",

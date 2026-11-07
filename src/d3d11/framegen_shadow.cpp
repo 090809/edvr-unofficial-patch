@@ -5,6 +5,7 @@
 #include "gpu_frame_timing.h"
 #include "gpu_timing.h"
 #include "shader_swap.h"
+#include "../common/framegen_replay_math.h"   // frameGenReplayFormatBytes: the DXGI format table the VRAM line reads the descriptors with
 #include "../common/framegen_shadow_report.h"
 #include "../common/log.h"
 
@@ -221,6 +222,33 @@ bool createEye(ID3D11Device* dev, EyeRes& r, uint32_t rw, uint32_t rh, uint32_t 
     return true;
 }
 
+// The bytes of what was made, from the descriptors (a texture: width x height x bytes per texel; a buffer: its byte width), for the VRAM line.
+uint64_t texBytes(const Tex& t) {
+    if (!t.tex) return 0;
+    D3D11_TEXTURE2D_DESC d{};
+    t.tex->GetDesc(&d);
+    return static_cast<uint64_t>(d.Width) * d.Height * frameGenReplayFormatBytes(static_cast<uint32_t>(d.Format));
+}
+
+uint64_t bufBytes(ID3D11Buffer* b) {
+    if (!b) return 0;
+    D3D11_BUFFER_DESC d{};
+    b->GetDesc(&d);
+    return d.ByteWidth;
+}
+
+FrameGenShadowVram eyeVram(const EyeRes& r) {
+    FrameGenShadowVram v;
+    for (int i = 0; i < 2; ++i) {
+        v.captures += texBytes(r.luma[i]) + texBytes(r.depth[i]);
+        v.vectors += texBytes(r.mvq[i]);
+    }
+    v.keys = texBytes(r.key) + texBytes(r.keyE) + texBytes(r.srcE);
+    v.stats = bufBytes(r.stats);
+    for (ID3D11Buffer* s : r.staging) v.stats += bufBytes(s);
+    return v;
+}
+
 // The staging slots already copied, oldest first, read without waiting: a slot not done yet is left for the next frame.
 void pollReadbacks(ID3D11DeviceContext* ctx, EyeRes& r, uint32_t nextSlot) {
     for (int k = 0; k < kStagingDepth; ++k) {
@@ -318,6 +346,8 @@ void frameGenShadowEyeFrame(ID3D11Device* dev, ID3D11DeviceContext* ctx, uint32_
                             static_cast<unsigned>(f.renderW), static_cast<unsigned>(f.renderH));
             return;
         }
+        const std::string vram = formatFrameGenShadowVram(eye, eyeVram(r));
+        Log::get().note("%s", vram.c_str());
     }
     ++g.eyeFrames;
     pollReadbacks(ctx, r, r.writes);

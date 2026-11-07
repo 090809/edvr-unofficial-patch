@@ -269,6 +269,13 @@ void caseLines() {
     const std::string xl = formatFrameGenShadowExtrapolation(xb);
     check(xl.size() < 1165 && xl.find("rowsoff_cockpit=100.0%") != std::string::npos, "the widest extrapolation line fits Log::note's 1200 bytes and ends with its rows-off fields");
     check(formatFrameGenShadowReport(xw).find("extrapolation") == std::string::npos, "the main report line does not carry the extrapolation");
+
+    // The VRAM line: the groups in order, the eye's total and twice it, bytes and MiB.
+    FrameGenShadowVram v;
+    v.captures = 6291456; v.vectors = 33554432; v.keys = 12582912; v.stats = 31900;
+    checkText(formatFrameGenShadowVram(1, v),
+              "frame generation (shadow): eye 1 VRAM 52460700 B (50.0 MiB): captures=6291456 vectors=33554432 keys=12582912 stats=31900; two eyes 104921400 B (100.1 MiB)",
+              "the VRAM line");
 }
 
 void caseDisagreement() {

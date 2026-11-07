@@ -284,6 +284,44 @@ inline std::string formatFrameGenShadowArmed(uint32_t qw, uint32_t qh) {
     return buf;
 }
 
+// ---- the VRAM line ----
+// Said once per eye when the eye's resources are made, from the descriptors of what was made (width x height x bytes per texel; a buffer's byte width), by group:
+// "<label> eye N VRAM <bytes> B (<MiB>): name=bytes name=bytes ...; <tail>". The synthesizer's line (framegen_synth_report.h) is built the same way.
+struct FrameGenVramGroup {
+    const char* name;
+    uint64_t bytes;
+};
+
+inline std::string formatFrameGenVramGroups(const FrameGenVramGroup* groups, int n) {
+    std::string s;
+    for (int i = 0; i < n; ++i) {
+        char b[64];
+        std::snprintf(b, sizeof(b), "%s%s=%llu", i ? " " : "", groups[i].name, static_cast<unsigned long long>(groups[i].bytes));
+        s += b;
+    }
+    return s;
+}
+
+inline double frameGenMiB(uint64_t bytes) { return static_cast<double>(bytes) / 1048576.0; }
+
+// The scorer's groups: the captures (the quarter-size luma and depth of this frame and the previous, ping-ponged), the vectors (the captured DLSS vectors with the depth where
+// they point, ping-ponged: the extrapolation sets' input), the key grids (the main splat's, the extrapolation's key and source grids) and the stats words with their staging copies.
+struct FrameGenShadowVram {
+    uint64_t captures = 0, vectors = 0, keys = 0, stats = 0;
+    uint64_t eye() const { return captures + vectors + keys + stats; }
+};
+
+constexpr const char* kFrameGenShadowVramFmt = "frame generation (shadow): eye %u VRAM %llu B (%.1f MiB): %s; two eyes %llu B (%.1f MiB)";
+
+inline std::string formatFrameGenShadowVram(uint32_t eye, const FrameGenShadowVram& v) {
+    const FrameGenVramGroup groups[] = {{"captures", v.captures}, {"vectors", v.vectors}, {"keys", v.keys}, {"stats", v.stats}};
+    const std::string g = formatFrameGenVramGroups(groups, 4);
+    char buf[320];
+    std::snprintf(buf, sizeof(buf), kFrameGenShadowVramFmt, static_cast<unsigned>(eye), static_cast<unsigned long long>(v.eye()), frameGenMiB(v.eye()), g.c_str(),
+                  static_cast<unsigned long long>(2u * v.eye()), frameGenMiB(2u * v.eye()));
+    return buf;
+}
+
 inline unsigned frameGenShadowMilli(double luma) {
     return luma <= 0.0 ? 0u : static_cast<unsigned>(luma * 1000.0 + 0.5);
 }

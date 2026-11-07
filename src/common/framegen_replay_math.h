@@ -86,7 +86,7 @@ inline const FrameGenReplayFormat* frameGenReplayFormat(uint32_t f) {
         {23, "R10G10B10A2_TYPELESS", 4}, {24, "R10G10B10A2_UNORM", 4}, {26, "R11G11B10_FLOAT", 4},
         {27, "R8G8B8A8_TYPELESS", 4}, {28, "R8G8B8A8_UNORM", 4}, {29, "R8G8B8A8_UNORM_SRGB", 4},
         {33, "R16G16_TYPELESS", 4}, {34, "R16G16_FLOAT", 4}, {35, "R16G16_UNORM", 4}, {37, "R16G16_SNORM", 4},
-        {39, "R32_TYPELESS", 4}, {40, "D32_FLOAT", 4}, {41, "R32_FLOAT", 4},
+        {39, "R32_TYPELESS", 4}, {40, "D32_FLOAT", 4}, {41, "R32_FLOAT", 4}, {42, "R32_UINT", 4},
         {53, "R16_TYPELESS", 2}, {54, "R16_FLOAT", 2}, {56, "R16_UNORM", 2}, {60, "R8_TYPELESS", 1}, {61, "R8_UNORM", 1},
         {87, "B8G8R8A8_UNORM", 4}, {91, "B8G8R8A8_UNORM_SRGB", 4}};
     for (const FrameGenReplayFormat& e : table) if (e.id == f) return &e;
