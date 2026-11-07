@@ -655,13 +655,15 @@ constexpr float kBakeNearDefaultM = 50.0f, kBakeNearMinM = 5.0f, kBakeNearMaxM =
 // Orbis, and another room could lose its own objects or have no anchor. Everything else, and a type not known, stays the game's own; diag.concourse_cull = on, or the hotkey, forces it
 // for a test. Once a type's windows are known, its row can name only the directions they need.
 // CraterOutpost: flown at one, by Sean's word after Flights 36 and 37. Its room is told by its own anchor (kPortAnchorName), so a type that names another room still gets no cull.
+// Outpost: flown at one with F2, "Outpost looks good, bake it" (Flight 39). The same: its own anchor, kOutpostAnchorName.
 struct BakePlan {
     bool run = false;
     uint32_t dirs = kBakeDirsAll;
 };
 inline BakePlan bakePlanFor(journal_station::Kind k) noexcept {
     BakePlan p;
-    p.run = k == journal_station::Kind::kOrbis || k == journal_station::Kind::kCoriolis || k == journal_station::Kind::kOcellus || k == journal_station::Kind::kCraterOutpost;
+    p.run = k == journal_station::Kind::kOrbis || k == journal_station::Kind::kCoriolis || k == journal_station::Kind::kOcellus || k == journal_station::Kind::kCraterOutpost ||
+            k == journal_station::Kind::kOutpost;
     return p;
 }
 inline uint32_t bakeDirCount(uint32_t mask) noexcept {

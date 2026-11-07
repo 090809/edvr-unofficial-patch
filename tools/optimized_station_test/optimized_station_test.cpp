@@ -4252,7 +4252,8 @@ int main(int argc, char** argv) {
                     check(cc::bakePlanFor(T::kOrbis).run && cc::bakePlanFor(T::kCoriolis).run && cc::bakePlanFor(T::kOcellus).run && cc::bakePlanFor(T::kOrbis).dirs == cc::kBakeDirsAll,
                           "bake plan: the large stations run, with every direction");
                     check(cc::bakePlanFor(T::kCraterOutpost).run && cc::bakePlanFor(T::kCraterOutpost).dirs == cc::kBakeDirsAll, "bake plan: so does a CraterOutpost, flown");
-                    check(!cc::bakePlanFor(T::kUnknown).run && !cc::bakePlanFor(T::kOutpost).run && !cc::bakePlanFor(T::kCraterPort).run &&
+                    check(cc::bakePlanFor(T::kOutpost).run && cc::bakePlanFor(T::kOutpost).dirs == cc::kBakeDirsAll, "bake plan: and an orbital outpost, flown");
+                    check(!cc::bakePlanFor(T::kUnknown).run && !cc::bakePlanFor(T::kCraterPort).run &&
                               !cc::bakePlanFor(T::kSurfaceStation).run && !cc::bakePlanFor(T::kAsteroidBase).run && !cc::bakePlanFor(T::kFleetCarrier).run && !cc::bakePlanFor(T::kMegaShip).run &&
                               !cc::bakePlanFor(T::kOnFootSettlement).run && !cc::bakePlanFor(T::kOther).run,
                           "bake plan: everything else, and not knowing, stays the game's own");
