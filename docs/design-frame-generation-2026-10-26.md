@@ -1166,6 +1166,33 @@ variant), the others at f = 1, scored against C's real luma.
 - **VRAM:** 98% of the budget with pressure lines (11.36 of 11.57 GB);
   the synth adds about 20 B per render pixel per eye.
 
+### 2026-11-07: Phase 2.1, flight 8 and ten replays (v0.22.0-rc.7-55-gcfcf06b9)
+
+The turned score (S at f = 1 turned by the residual between its predicted
+head and C's true head, the compositor's step) in game, and ten captures
+(`fgreplay_*`, 6 frames each, two of them all camera jumps) replayed on the
+RTX 5080 with `framegen_synth_bench`. p95 (luma x 1024), synth / unwarped:
+
+- **Game, turned vs raw:** far raw 2-136 -> turned 0-17; world raw 24-162
+  -> turned 14-48, equal to Phase 1's ex2dh (true head) within a bin in
+  every second (e.g. 41/41, 20/20, 48/48); cockpit raw 24-229 -> turned
+  14-68 against 17-229 unwarped.
+- **Replays, aggregates:** world turned 20-41 against 48-136 unwarped
+  (one flight capture 115/136); far turned 0-1; cockpit turned 20-48
+  against 34-136. Residual turn median 0.07-0.4 deg, max 2.0-2.5 deg.
+- ruled out: the synthesis pipeline (dilation, splat, guard, fill,
+  resample) as the source of flight 7's gap, because turning S by the
+  head's residual brings the far class to 0-1 and the world to ex2dh's
+  score: the gap was the head's extrapolation over one Elite step.
+- **Bench (idle RTX 5080, 2817x2448 / 3756x3264):** 0.53 ms per eye for the
+  shown variant (median; p95 0.69), five passes of 0.05-0.14 ms each; 274
+  MB for two eyes.
+- **VRAM:** pressure lines all flight, at the end 104-107% of budget with
+  the capture's staging in flight (nonlocal 1.4 GB). The baseline before
+  the synth was already 94-95% (flight 3).
+- **Next:** 2.2 (the slot's pose from the runtime, S's own transfer); an
+  optimization pass against the bench and the replays first if wanted.
+
 ### 2026-11-07: Phase 2.1, the turned score and the VRAM cut (built, not flown)
 
 - **The compositor's turn, scored (the flight 7 discriminator).** At B the f = 1
