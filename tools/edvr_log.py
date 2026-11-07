@@ -10619,9 +10619,17 @@ H_FRAMEGEN_POSE = (r"frame generation \(shadow\) pose: frames=(?P<frames>\d+) le
 H_FRAMEGEN_RUNTIME_READ = "_framegen runtime log read"   # a pseudo-entry of the scan's rows (as H_CARRIED is): the runtime log was read, so a missing pose line can be judged
 H_FRAMEGEN_ARMED = r"frame generation \(shadow\): armed, quarter (?P<qw>\d+)x(?P<qh>\d+) per eye, classes far cockpit world"
 _HFG_CLASS = r" {n}=(?P<{n}_share>[\d.]+)%,(?P<{n}_mean>\d+),(?P<{n}_p50>\d+),(?P<{n}_p95>\d+),(?P<{n}_o02>[\d.]+)%,(?P<{n}_o05>[\d.]+)%\|id:(?P<{n}_idmean>\d+),(?P<{n}_idp95>\d+)"
+# The oracle set (frame B's true transform for far and world) and the jump set (camera_jump frames), each with the three class fields under group prefixes o_ and j_, then the CPU
+# motion facts (a number, or "-" when nothing was sampled). All of it is optional: a line from before these fields ends at rig_mm.
+_HFG_SET_CLASS = _HFG_CLASS.replace("(?P<{n}_", "(?P<{p}{n}_")
+_HFG_NUM = r"(?:[\d.]+|-)"
 H_FRAMEGEN_REPORT = (r"frame generation \(shadow\): frames=(?P<frames>\d+) skipped=(?P<s0>\d+)/(?P<s1>\d+)/(?P<s2>\d+)/(?P<s3>\d+)/(?P<s4>\d+)"
                      + "".join(_HFG_CLASS.format(n=n) for n in ("far", "cockpit", "world")) +
-                     r" holes=(?P<holes>[\d.]+)% gpu_ms=(?:(?P<gpu_med>[\d.]+)/(?P<gpu_max>[\d.]+)\(n=(?P<gpu_n>[1-9]\d*)\)|-\(n=0\)) rig_deg=(?P<deg_med>[\d.]+)/(?P<deg_max>[\d.]+) rig_mm=(?P<mm_med>[\d.]+)/(?P<mm_max>[\d.]+)$")
+                     r" holes=(?P<holes>[\d.]+)% gpu_ms=(?:(?P<gpu_med>[\d.]+)/(?P<gpu_max>[\d.]+)\(n=(?P<gpu_n>[1-9]\d*)\)|-\(n=0\)) rig_deg=(?P<deg_med>[\d.]+)/(?P<deg_max>[\d.]+) rig_mm=(?P<mm_med>[\d.]+)/(?P<mm_max>[\d.]+)"
+                     r"(?: oracle=(?P<oracle_n>\d+)" + "".join(_HFG_SET_CLASS.format(n=n, p="o_") for n in ("far", "cockpit", "world")) +
+                     r" jump=(?P<jump_n>\d+)" + "".join(_HFG_SET_CLASS.format(n=n, p="j_") for n in ("far", "cockpit", "world")) +
+                     r" motion_mm=(?P<motion_med>{N})/(?P<motion_max>{N}) mag_ratio=(?P<mag5>{N})/(?P<mag50>{N})/(?P<mag95>{N})"
+                     r" dt_ratio=(?P<dtr5>{N})/(?P<dtr50>{N})/(?P<dtr95>{N}) dt_ms=(?P<dtms_med>{N})/(?P<dtms_max>{N}) rig_dt_mm=(?P<rigdt_med>{N})/(?P<rigdt_max>{N}))?$".replace("{N}", _HFG_NUM))
 # The SRV turret view (issue 140; src\d3d11\srv_turret.cpp, the vehicle latch's line in journal_watch.cpp, and the geometry shader's creation line in shader_swap.cpp, shaderSwapCreateGs,
 # called with who "srv turret hud"): lines of the graphics log with no build tag, read the way the desktop window's are. The settings and vehicle lines are state, so health_scan keeps
 # every one whatever --since says; the rest are events and are cut by the window. Every kind of line the DLL writes has a pattern of its own, so a labelled line that none matches is
@@ -16854,6 +16862,12 @@ def _hj_framegen_shadow(rows, ctx=None):
         text += "; the armed line is before the window"
     if not frames:
         text += "; no frame was scored (every frame skipped)"
+    # The oracle set (frame B's true transform): the world class's p95 error with it against the prediction's, over the lines that carry it (older lines do not).
+    withOracle = [r for r in reports if r.get("o_world_p95") is not None and int(r.get("oracle_n") or 0) > 0]
+    if withOracle:
+        text += ("; world p95 %.0f milli-luma predicted vs %.0f oracle (mean of %d line(s)), %d jump frame(s) scored apart" %
+                 (sum(int(r["world_p95"]) for r in withOracle) / len(withOracle), sum(int(r["o_world_p95"]) for r in withOracle) / len(withOracle), len(withOracle),
+                  sum(int(r.get("jump_n") or 0) for r in withOracle)))
     if poses:
         scored = sum(int(r["frames"]) for r in poses)
         text += ("; pose: %d line(s), %d frame(s) scored, runtime miss max %.2f mm / %.3f deg, velocity miss max %.2f mm / %.3f deg, lead median %s ms (last line), %d refused, %d expired, "
@@ -25045,15 +25059,29 @@ def self_test_health():
         def fg_armed(qw=612, qh=699):
             return RF("armed, quarter %ux%u", qw, qh)
 
-        def fg_report(frames=60, skipped=(1, 2, 3, 4, 5), timed=True):
+        def fg_report(frames=60, skipped=(1, 2, 3, 4, 5), timed=True, sets=False, oracle_p95=20, jump=4):
             cls = "".join(RF(" %s=%.1f%%,%u", n, 10.0, 12, 8, 40, 5.5, 1.5, 9, 30) for n in ("far", "cockpit", "world"))
             gpu = RF("%.2f/%.2f(n=%u)", 0.85, 1.2, 3) if timed else health_c_format(fgsrc, "-(n=0)")
-            return (RF("frames=%u skipped=%u/", frames, *skipped) + cls + RF(" holes=%.1f%% gpu_ms=%s", 3.5, gpu, 0.012, 0.034, 0.4, 1.25))
+            line = RF("frames=%u skipped=%u/", frames, *skipped) + cls + RF(" holes=%.1f%% gpu_ms=%s", 3.5, gpu, 0.012, 0.034, 0.4, 1.25)
+            if sets:   # the oracle and jump sets and the CPU motion facts, appended after rig_mm; "-" for the facts of an idle window
+                ocls = "".join(RF(" %s=%.1f%%,%u", n, 10.0, 12, 8, oracle_p95, 5.5, 1.5, 9, 30) for n in ("far", "cockpit", "world"))
+                jcls = "".join(RF(" %s=%.1f%%,%u", n, 10.0, 12, 8, 40, 5.5, 1.5, 9, 30) for n in ("far", "cockpit", "world"))
+                line += RF(" oracle=%u", 29) + ocls + RF(" jump=%u", jump) + jcls
+                line += RF(" motion_mm=%s/%s mag_ratio=%s/%s/%s dt_ratio=%s/%s/%s dt_ms=%s/%s rig_dt_mm=%s/%s", "12.3", "80.0", "0.50", "1.00", "2.00", "0.50", "1.00", "2.00",
+                           "-", "-", "0.40", "1.25")
+            return line
 
         FG, fg_ok = H_FRAMEGEN, [f90_part()]
         check("frame generation shadow: no line at all, nothing said (the key off)", fg_ok, 0, [("OK", F90S)], lacks=["frame generation", "NEVER APPLIED"])
         check("frame generation shadow: armed and reporting is OK", fg_ok + [fg_armed(), fg_report(), fg_report(frames=58)], 0, [("OK", FG)],
               has=["2 report line(s), 118 frame(s) scored, 30 skipped; armed at quarter 612x699 per eye"], lacks=["UNPARSED"])
+        check("frame generation shadow: a line with the oracle and jump sets and the motion facts is OK and says oracle world p95 against the prediction's",
+              fg_ok + [fg_armed(), fg_report(sets=True), fg_report(sets=True, oracle_p95=10, jump=2)], 0, [("OK", FG)],
+              has=["2 report line(s), 120 frame(s) scored", "world p95 40 milli-luma predicted vs 15 oracle (mean of 2 line(s)), 6 jump frame(s) scored apart"], lacks=["UNPARSED"])
+        check("frame generation shadow: a line from before the oracle fields has no oracle part in its summary", fg_ok + [fg_armed(), fg_report()], 0, [("OK", FG)],
+              lacks=["oracle", "UNPARSED"])
+        check("frame generation shadow: a drifted oracle part is UNPARSED, not a report", fg_ok + [fg_armed(), fg_report(sets=True).replace(" jump=", " leap=")], 3, [("NEVER APPLIED", FG)],
+              has=["line(s) the rule's patterns do not match"])
         check("frame generation shadow: armed and no report line is NEVER APPLIED", fg_ok + [fg_armed()], 3, [("NEVER APPLIED", FG)],
               has=["the key was on (armed, quarter 612x699 per eye) but no 'frame generation (shadow): frames=' report line follows", "exit 3"])
         check("frame generation shadow: the armed line before --since still counts as armed", fg_ok + [(1, fg_armed()), (70, fg_report())], 0, [("OK", FG)],

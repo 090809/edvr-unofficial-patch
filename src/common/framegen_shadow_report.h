@@ -8,6 +8,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <string>
 
 namespace edvr {
@@ -39,12 +40,45 @@ struct FrameGenShadowEyeResult {
     uint64_t cells = 0;   // every cell looked at, holes included
 };
 
-struct FrameGenShadowWindow {
-    uint32_t framesScored = 0;
-    uint32_t skipped[kFrameGenShadowSkipCount] = {};
+// Which stats set a scored frame belongs to: the normal one (predicted transforms), the oracle one (frame B's true transforms for far and world, every second
+// normal frame per eye: what the warp scores when the prediction is exact) and the jump one (camera_jump frames, predicted transforms).
+enum FrameGenShadowSet : int {
+    kSetPredicted = 0,
+    kSetOracle,
+    kSetJump,
+    kFrameGenShadowSetCount
+};
+
+// The oracle and jump sets: the same per-class stats as the window's own, plus how many frames went in.
+struct FrameGenShadowSetStats {
+    uint32_t frames = 0;
     FrameGenShadowClassStats cls[kFrameGenShadowClasses];
     uint64_t holes = 0;
     uint64_t cells = 0;
+};
+
+// The per-frame CPU facts of the window, each already summarised; an n of 0 reads "-" in the line.
+struct FrameGenShadowMotion {
+    uint32_t motionN = 0;     // |tvCam_B| in mm
+    float motionMedian = 0.0f, motionMax = 0.0f;
+    uint32_t magN = 0;        // |tvCam_B| / |tvCam_A|, where |tvCam_A| > 1 mm
+    float magP5 = 0.0f, magP50 = 0.0f, magP95 = 0.0f;
+    uint32_t dtRatioN = 0;    // dt_B / dt_A
+    float dtRatioP5 = 0.0f, dtRatioP50 = 0.0f, dtRatioP95 = 0.0f;
+    uint32_t dtN = 0;         // dt_B in ms
+    float dtMedian = 0.0f, dtMax = 0.0f;
+    uint32_t rigDtN = 0;      // the miss in mm of the translation prediction with the ship's step scaled by dt_B / dt_A
+    float rigDtMedian = 0.0f, rigDtMax = 0.0f;
+};
+
+struct FrameGenShadowWindow {
+    uint32_t framesScored = 0;   // the normal (predicted) set's frames
+    uint32_t skipped[kFrameGenShadowSkipCount] = {};   // kSkipCameraJump counts the frames routed to the jump set, not frames dropped
+    FrameGenShadowClassStats cls[kFrameGenShadowClasses];
+    uint64_t holes = 0;
+    uint64_t cells = 0;
+    FrameGenShadowSetStats oracle, jump;
+    FrameGenShadowMotion motion;
     float gpuMsMedian = 0.0f, gpuMsMax = 0.0f;
     uint32_t gpuSamples = 0;   // the timed frames behind the two numbers; 0 reads "-" in the line
     float rigDegMedian = 0.0f, rigDegMax = 0.0f, rigMmMedian = 0.0f, rigMmMax = 0.0f;
@@ -115,6 +149,14 @@ inline void frameGenShadowMerge(FrameGenShadowWindow& w, const FrameGenShadowEye
     w.cells += eye.cells;
 }
 
+// The same for the oracle or jump set; counts the frame.
+inline void frameGenShadowMergeSet(FrameGenShadowSetStats& s, const FrameGenShadowEyeResult& eye) {
+    for (int c = 0; c < kFrameGenShadowClasses; ++c) frameGenShadowAddClass(s.cls[c], eye.cls[c]);
+    s.holes += eye.holes;
+    s.cells += eye.cells;
+    ++s.frames;
+}
+
 // ---- the two log lines ----
 // The format strings are the single source: the DLL logs with them, the rig renders from them, and tools\edvr_log.py --health reads them from this file.
 constexpr const char* kFrameGenShadowArmedFmt =
@@ -124,6 +166,15 @@ constexpr const char* kFrameGenShadowReportHeadFmt = "frame generation (shadow):
 // name=share%,mean,p50,p95,over0.02%,over0.05%|id:mean,p95 -- errors in milli-luma, the shares in percent (the class's share is of all cells, the over shares of the class)
 constexpr const char* kFrameGenShadowReportClassFmt = " %s=%.1f%%,%u,%u,%u,%.1f%%,%.1f%%|id:%u,%u";
 constexpr const char* kFrameGenShadowReportTailFmt = " holes=%.1f%% gpu_ms=%s rig_deg=%.3f/%.3f rig_mm=%.2f/%.2f";
+// Appended after rig_mm, so a parser of the older line still matches its head. The oracle set (frame B's true transforms for far and world; frames=n), then the jump
+// set (camera_jump frames, predicted transforms; n), each followed by the same three class fields as above, then the CPU motion facts: motion_mm median/max,
+// mag_ratio p5/p50/p95, dt_ratio p5/p50/p95, dt_ms median/max, rig_dt_mm median/max (a number is "-" when nothing was sampled). The main class fields cover only
+// the normal predicted set; in the skipped field the fourth count (camera_jump) is the number of frames routed to the jump set.
+constexpr const char* kFrameGenShadowOracleHeadFmt = " oracle=%u";
+constexpr const char* kFrameGenShadowJumpHeadFmt = " jump=%u";
+constexpr const char* kFrameGenShadowMotionFmt = " motion_mm=%s/%s mag_ratio=%s/%s/%s dt_ratio=%s/%s/%s dt_ms=%s/%s rig_dt_mm=%s/%s";
+constexpr const char* kFrameGenShadowNumFmtMotion = "%.1f";   // motion_mm, dt_ms
+constexpr const char* kFrameGenShadowNumFmtRatio = "%.2f";    // mag_ratio, dt_ratio, rig_dt_mm
 // The gpu_ms field: median/max over the timed frames and how many there were (the timer runs only on frames the GPU census has its scope open), or "-" when none were.
 constexpr const char* kFrameGenShadowGpuFmt = "%.2f/%.2f(n=%u)";
 constexpr const char* kFrameGenShadowGpuNoneFmt = "-(n=0)";
@@ -139,23 +190,53 @@ inline unsigned frameGenShadowMilli(double luma) {
     return luma <= 0.0 ? 0u : static_cast<unsigned>(luma * 1000.0 + 0.5);
 }
 
-inline std::string formatFrameGenShadowReport(const FrameGenShadowWindow& w) {
-    char buf[768];
-    int n = std::snprintf(buf, sizeof(buf), kFrameGenShadowReportHeadFmt, static_cast<unsigned>(w.framesScored), static_cast<unsigned>(w.skipped[0]),
-                          static_cast<unsigned>(w.skipped[1]), static_cast<unsigned>(w.skipped[2]), static_cast<unsigned>(w.skipped[3]),
-                          static_cast<unsigned>(w.skipped[4]));
-    const double cells = w.cells ? static_cast<double>(w.cells) : 1.0;
-    for (int c = 0; c < kFrameGenShadowClasses && n > 0 && n < static_cast<int>(sizeof(buf)); ++c) {
-        const FrameGenShadowClassStats& s = w.cls[c];
+// The three class fields of one set, appended at buf + n; returns the new length.
+inline int formatFrameGenShadowClasses(char* buf, size_t cap, int n, const FrameGenShadowClassStats cls[kFrameGenShadowClasses], uint64_t cellsTotal) {
+    const double cells = cellsTotal ? static_cast<double>(cellsTotal) : 1.0;
+    for (int c = 0; c < kFrameGenShadowClasses && n > 0 && n < static_cast<int>(cap); ++c) {
+        const FrameGenShadowClassStats& s = cls[c];
         const double px = s.pixels ? static_cast<double>(s.pixels) : 1.0;
         const double mean = static_cast<double>(s.sumErr1024) / 1024.0 / px;
         const double meanId = static_cast<double>(s.sumErrId1024) / 1024.0 / px;
-        n += std::snprintf(buf + n, sizeof(buf) - n, kFrameGenShadowReportClassFmt, kFrameGenShadowClassNames[c], 100.0 * static_cast<double>(s.pixels) / cells,
+        n += std::snprintf(buf + n, cap - n, kFrameGenShadowReportClassFmt, kFrameGenShadowClassNames[c], 100.0 * static_cast<double>(s.pixels) / cells,
                            frameGenShadowMilli(s.pixels ? mean : 0.0), frameGenShadowMilli(frameGenShadowPercentile(s.hist, 0.50f)),
                            frameGenShadowMilli(frameGenShadowPercentile(s.hist, 0.95f)), 100.0 * frameGenShadowShareOver(s.hist, 0.02f),
                            100.0 * frameGenShadowShareOver(s.hist, 0.05f), frameGenShadowMilli(s.pixels ? meanId : 0.0),
                            frameGenShadowMilli(frameGenShadowPercentile(s.histId, 0.95f)));
     }
+    return n;
+}
+
+// One number of the motion field, or "-" when nothing was sampled.
+inline std::string formatFrameGenShadowNum(const char* fmt, uint32_t samples, float v) {
+    if (!samples) return "-";
+    char b[32];
+    std::snprintf(b, sizeof(b), fmt, static_cast<double>(v));
+    return b;
+}
+
+inline std::string formatFrameGenShadowMotion(const FrameGenShadowMotion& m) {
+    const char* const f1 = kFrameGenShadowNumFmtMotion;
+    const char* const f2 = kFrameGenShadowNumFmtRatio;
+    const std::string a[12] = {
+        formatFrameGenShadowNum(f1, m.motionN, m.motionMedian), formatFrameGenShadowNum(f1, m.motionN, m.motionMax),
+        formatFrameGenShadowNum(f2, m.magN, m.magP5), formatFrameGenShadowNum(f2, m.magN, m.magP50), formatFrameGenShadowNum(f2, m.magN, m.magP95),
+        formatFrameGenShadowNum(f2, m.dtRatioN, m.dtRatioP5), formatFrameGenShadowNum(f2, m.dtRatioN, m.dtRatioP50), formatFrameGenShadowNum(f2, m.dtRatioN, m.dtRatioP95),
+        formatFrameGenShadowNum(f1, m.dtN, m.dtMedian), formatFrameGenShadowNum(f1, m.dtN, m.dtMax),
+        formatFrameGenShadowNum(f2, m.rigDtN, m.rigDtMedian), formatFrameGenShadowNum(f2, m.rigDtN, m.rigDtMax)};
+    char buf[320];
+    std::snprintf(buf, sizeof(buf), kFrameGenShadowMotionFmt, a[0].c_str(), a[1].c_str(), a[2].c_str(), a[3].c_str(), a[4].c_str(), a[5].c_str(), a[6].c_str(), a[7].c_str(),
+                  a[8].c_str(), a[9].c_str(), a[10].c_str(), a[11].c_str());
+    return buf;
+}
+
+inline std::string formatFrameGenShadowReport(const FrameGenShadowWindow& w) {
+    char buf[1792];
+    int n = std::snprintf(buf, sizeof(buf), kFrameGenShadowReportHeadFmt, static_cast<unsigned>(w.framesScored), static_cast<unsigned>(w.skipped[0]),
+                          static_cast<unsigned>(w.skipped[1]), static_cast<unsigned>(w.skipped[2]), static_cast<unsigned>(w.skipped[3]),
+                          static_cast<unsigned>(w.skipped[4]));
+    n = formatFrameGenShadowClasses(buf, sizeof(buf), n, w.cls, w.cells);
+    const double cells = w.cells ? static_cast<double>(w.cells) : 1.0;
     char gpu[48];
     if (w.gpuSamples)
         std::snprintf(gpu, sizeof(gpu), kFrameGenShadowGpuFmt, static_cast<double>(w.gpuMsMedian), static_cast<double>(w.gpuMsMax), static_cast<unsigned>(w.gpuSamples));
@@ -165,7 +246,16 @@ inline std::string formatFrameGenShadowReport(const FrameGenShadowWindow& w) {
         std::snprintf(buf + n, sizeof(buf) - n, kFrameGenShadowReportTailFmt, 100.0 * static_cast<double>(w.holes) / cells, gpu,
                       static_cast<double>(w.rigDegMedian), static_cast<double>(w.rigDegMax), static_cast<double>(w.rigMmMedian),
                       static_cast<double>(w.rigMmMax));
-    return buf;
+    n = static_cast<int>(std::strlen(buf));
+    const FrameGenShadowSetStats* const sets[2] = {&w.oracle, &w.jump};
+    const char* const heads[2] = {kFrameGenShadowOracleHeadFmt, kFrameGenShadowJumpHeadFmt};
+    for (int i = 0; i < 2 && n < static_cast<int>(sizeof(buf)); ++i) {
+        n += std::snprintf(buf + n, sizeof(buf) - n, heads[i], static_cast<unsigned>(sets[i]->frames));
+        n = formatFrameGenShadowClasses(buf, sizeof(buf), n, sets[i]->cls, sets[i]->cells);
+    }
+    std::string out = buf;
+    out += formatFrameGenShadowMotion(w.motion);
+    return out;
 }
 
 }  // namespace edvr

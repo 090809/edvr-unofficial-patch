@@ -135,19 +135,50 @@ void caseLines() {
     w.rigDegMax = 0.034f;
     w.rigMmMedian = 0.4f;
     w.rigMmMax = 1.25f;
+    // The oracle set (world only, a perfect warp) and the jump set (far only, a mean of 0.05), then the CPU motion facts.
+    w.oracle.frames = 20;
+    w.oracle.cells = 100;
+    w.oracle.cls[2].pixels = 50;
+    w.oracle.cls[2].hist[0] = 50;
+    w.jump.frames = 5;
+    w.jump.cells = 40;
+    w.jump.cls[0].pixels = 20;
+    w.jump.cls[0].sumErr1024 = 1024;   // mean 0.05
+    w.jump.cls[0].hist[23] = 20;
+    w.motion.motionN = 60; w.motion.motionMedian = 12.34f; w.motion.motionMax = 80.0f;
+    w.motion.magN = 50; w.motion.magP5 = 0.5f; w.motion.magP50 = 1.0f; w.motion.magP95 = 2.0f;
+    w.motion.dtRatioN = 55; w.motion.dtRatioP5 = 0.5f; w.motion.dtRatioP50 = 1.0f; w.motion.dtRatioP95 = 2.0f;
+    w.motion.dtN = 56; w.motion.dtMedian = 11.1f; w.motion.dtMax = 22.3f;
+    w.motion.rigDtN = 40; w.motion.rigDtMedian = 0.4f; w.motion.rigDtMax = 1.25f;
     const std::string line = formatFrameGenShadowReport(w);
     checkText(line,
               "frame generation (shadow): frames=60 skipped=1/2/3/4/5 far=10.0%,0,0,0,0.0%,0.0%|id:0,0 cockpit=20.0%,50,48,48,100.0%,0.0%|id:0,0 "
-              "world=30.0%,100,0,193,50.0%,50.0%|id:100,48 holes=10.0% gpu_ms=0.85/1.20(n=3) rig_deg=0.012/0.034 rig_mm=0.40/1.25",
+              "world=30.0%,100,0,193,50.0%,50.0%|id:100,48 holes=10.0% gpu_ms=0.85/1.20(n=3) rig_deg=0.012/0.034 rig_mm=0.40/1.25 "
+              "oracle=20 far=0.0%,0,0,0,0.0%,0.0%|id:0,0 cockpit=0.0%,0,0,0,0.0%,0.0%|id:0,0 world=50.0%,0,0,0,0.0%,0.0%|id:0,0 "
+              "jump=5 far=50.0%,50,48,48,100.0%,0.0%|id:0,0 cockpit=0.0%,0,0,0,0.0%,0.0%|id:0,0 world=0.0%,0,0,0,0.0%,0.0%|id:0,0 "
+              "motion_mm=12.3/80.0 mag_ratio=0.50/1.00/2.00 dt_ratio=0.50/1.00/2.00 dt_ms=11.1/22.3 rig_dt_mm=0.40/1.25",
               "the report line");
     check(line.find('\n') == std::string::npos, "the report is one line");
+    check(line.compare(0, 5, "frame") == 0 && line.find(" rig_mm=0.40/1.25 oracle=20 ") != std::string::npos, "the new fields follow rig_mm, so the older head still matches");
 
-    // An empty window still prints (no division by zero), every figure zero.
+    // An empty window still prints (no division by zero), every figure zero, the empty CPU facts "-".
     FrameGenShadowWindow z;
     checkText(formatFrameGenShadowReport(z),
               "frame generation (shadow): frames=0 skipped=0/0/0/0/0 far=0.0%,0,0,0,0.0%,0.0%|id:0,0 cockpit=0.0%,0,0,0,0.0%,0.0%|id:0,0 "
-              "world=0.0%,0,0,0,0.0%,0.0%|id:0,0 holes=0.0% gpu_ms=-(n=0) rig_deg=0.000/0.000 rig_mm=0.00/0.00",
+              "world=0.0%,0,0,0,0.0%,0.0%|id:0,0 holes=0.0% gpu_ms=-(n=0) rig_deg=0.000/0.000 rig_mm=0.00/0.00 "
+              "oracle=0 far=0.0%,0,0,0,0.0%,0.0%|id:0,0 cockpit=0.0%,0,0,0,0.0%,0.0%|id:0,0 world=0.0%,0,0,0,0.0%,0.0%|id:0,0 "
+              "jump=0 far=0.0%,0,0,0,0.0%,0.0%|id:0,0 cockpit=0.0%,0,0,0,0.0%,0.0%|id:0,0 world=0.0%,0,0,0,0.0%,0.0%|id:0,0 "
+              "motion_mm=-/- mag_ratio=-/-/- dt_ratio=-/-/- dt_ms=-/- rig_dt_mm=-/-",
               "an empty window");
+
+    // The sets merge apart: an oracle merge counts its own frame and leaves the normal set alone.
+    FrameGenShadowEyeResult e;
+    e.cls[2].pixels = 7;
+    e.cells = 9;
+    FrameGenShadowSetStats s;
+    frameGenShadowMergeSet(s, e);
+    frameGenShadowMergeSet(s, e);
+    check(s.frames == 2 && s.cls[2].pixels == 14 && s.cells == 18, "a set merge counts its frames and adds the stats");
 }
 
 // ---- the head-pose miss (framegen_pose_report.h) ----
