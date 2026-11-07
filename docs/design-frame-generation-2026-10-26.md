@@ -1297,6 +1297,23 @@ predicted period 11.1 ms, Elite at 57-59 fps unthrottled.
   `skipped=` 0 while engaged, and the native temporal resets not climbing per
   engaged pair.
 
+### 2026-11-07: Phase 2.3, flight 12, Lock holds (v0.22.0-rc.7-90-g9a58cf0f)
+
+With the sequence fix (63a29232), the Monitor block and the menu row.
+
+- **Lock held 36 s** (18:09:49-18:10:25) until the pilot opened EDVR's menu:
+  every second `slots=45/45 s_from=45/0 late_s=0`, S slot wait 8.4-9.7
+  ms; `late_real` 0 but one second of 21 (a stall). Replays of B only as
+  `kept` on an engage's first slot. `no_s` never again.
+- **The menu disengages Lock by design** (S does not carry the menu), so
+  the Monitor page always read "Lock waiting (menu)".
+- **Flicker the pilot still felt, 18:12-18:15:** with Lock disengaged the
+  runtime's period flips between 11.1 and 22.2 ms (SteamVR throttling a
+  ~49 fps app); `period_halved` blocked engaging and the dwell restarted
+  every second. The period never halved while Lock was engaged.
+- **Next:** engage from a halved period (disengage only if it stays halved
+  while engaged), and the menu drawn on S.
+
 ### 2026-11-07: Phase 2.3, flight 11, the first Lock flight (same build)
 
 `fix.frame_generation = on`, about 12 minutes. Pilot: "a slight flicker",
