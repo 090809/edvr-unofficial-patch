@@ -1166,6 +1166,37 @@ variant), the others at f = 1, scored against C's real luma.
 - **VRAM:** 98% of the budget with pressure lines (11.36 of 11.57 GB);
   the synth adds about 20 B per render pixel per eye.
 
+### 2026-11-07: Phase 2.1, the turned score and the VRAM cut (built, not flown)
+
+- **The compositor's turn, scored (the flight 7 discriminator).** At B the f = 1
+  S keeps the head rotation it was built for (`rs`, B's eye space to S's, the
+  extrapolated Hd_B^T) and the tangents it was built with. At C the true head
+  rotation B -> C is C's own backward delta (x_B = Hd_C x_C + th), so a C-cell
+  direction reaches the S eye as `kept * Hd_C`: that matrix is the residual
+  (`frameGenSynthResidual`), the identity when the head did what S was built
+  for. The score shader rotates each C quarter-cell's direction by it,
+  projects with the kept tangents, reads the kept S quarter luma bilinearly
+  and scores that against C's luma by B's class of the cell; a direction
+  outside S is not scored and is counted (`out=`). The raw per-class fields
+  are unchanged; the line gains ` turned: far=... cockpit=... world=...
+  rot_res_deg=<median>/<max> out=<%>` (711 characters at the widest, one line).
+  `edvr_log --health` says the world p95 raw against turned. Rig: a far scene
+  from a head turning at a changing rate scores 0.061 raw and 0.003 turned;
+  not applying the residual or applying it transposed each fail that case.
+  Flight to run: world/cockpit/far turned against ex2dh's 17-34 / 0-1.
+- **VRAM, per eye at 2817x2448 render, 3756x3264 output (RGBA16F S):** the
+  synth held 20 bytes per render pixel (dilated depth 4, key 4, source 4, read
+  position 8) = 138 MB, S 98 MB, the quarter grids 4 MB: 240 MB. Now 12 bytes:
+  the dilated depth is the 3x3 nearest taken where it is read (no texture), the
+  read position is an R16G16_FLOAT offset from the S pixel centre, and the key,
+  source and offset textures are scratch rebuilt by every call, so the two eyes
+  share one set (6 bytes per eye amortised): 185 MB per eye with a set each,
+  144 MB per eye shared. S stays per eye (the shown f = 0.5 S must outlive the
+  call in a later phase); sharing it across the eyes would take another 49 MB
+  per eye. Offsets are exact to 1/16 px up to 256 px, 1/8 px up to 512, 1/2 px
+  up to the clamp at 2000 px; past it the read is clamped (wrong) and counted
+  (`clamp=` of the render pixels). Cost: the 3x3 depth is re-read per use.
+
 ### 2026-11-07: Phase 1, extrapolation sets built (not flown)
 
 - **Built:** the scorer keeps A's own DLSS vectors (a quarter-grid copy, with
