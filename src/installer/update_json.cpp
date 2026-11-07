@@ -13,6 +13,23 @@ const JsonValue* JsonValue::find(const std::string& key) const {
     return nullptr;
 }
 
+const JsonValue* JsonValue::findNoCase(const std::string& key) const {
+    if (type != Type::Object) return nullptr;
+    auto same = [](const std::string& a, const std::string& b) {
+        if (a.size() != b.size()) return false;
+        for (size_t i = 0; i < a.size(); ++i) {
+            const char x = a[i] >= 'A' && a[i] <= 'Z' ? static_cast<char>(a[i] + 32) : a[i];
+            const char y = b[i] >= 'A' && b[i] <= 'Z' ? static_cast<char>(b[i] + 32) : b[i];
+            if (x != y) return false;
+        }
+        return true;
+    };
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (same(keys[i], key)) return &items[i];
+    }
+    return nullptr;
+}
+
 namespace {
 
 class Parser {

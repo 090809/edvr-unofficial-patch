@@ -6,7 +6,10 @@
 #include <objbase.h>
 
 #include <functional>
+#include <vector>
 
+#include "direct_launch.h"
+#include "launch_route.h"
 #include "launcher_plan.h"
 #include "launcher_register.h"
 #include "launcher_state.h"
@@ -54,6 +57,23 @@ public:
             WriteConsoleW(h, w.c_str(), static_cast<DWORD>(w.size()), &written, nullptr);
         } else {
             WriteFile(h, withBreak.data(), static_cast<DWORD>(withBreak.size()), &written, nullptr);
+        }
+    }
+
+    // Text exactly as given, with no line end added: --licenses prints a file's bytes.
+    void raw(const std::string& text) {
+        if (!console_) {
+            collected_ += text;
+            return;
+        }
+        HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
+        if (h == INVALID_HANDLE_VALUE || h == nullptr) return;
+        DWORD mode = 0, written = 0;
+        if (GetConsoleMode(h, &mode)) {
+            const std::wstring w = fromUtf8(text);
+            WriteConsoleW(h, w.c_str(), static_cast<DWORD>(w.size()), &written, nullptr);
+        } else {
+            WriteFile(h, text.data(), static_cast<DWORD>(text.size()), &written, nullptr);
         }
     }
 
@@ -158,6 +178,38 @@ int runUpdateCommand(const AppArgs& args, Output& out) {
     return 0;
 }
 
+// The text of min-ed-launcher's licence, which gen_installer_rc.py embeds as RCDATA 120.
+constexpr int kLicenseResource = 120;
+
+int runLicensesCommand(Output& out) {
+    HRSRC found = FindResourceW(nullptr, MAKEINTRESOURCEW(kLicenseResource), RT_RCDATA);
+    HGLOBAL loaded = found ? LoadResource(nullptr, found) : nullptr;
+    const void* data = loaded ? LockResource(loaded) : nullptr;
+    const DWORD size = found ? SizeofResource(nullptr, found) : 0;
+    if (!data || size == 0) {
+        out.line("This launcher carries no licence text. That is a build fault: please report it.");
+        return 1;
+    }
+    out.raw(std::string(static_cast<const char*>(data), size));
+    return 0;
+}
+
+// --direct-dry-run on the real network and the real Steam client. The elevated copy is refused before
+// anything is contacted.
+int runDirectDryRun(const AppArgs& args, Output& out) {
+    if (isElevated()) {
+        out.line(elevatedRefusal());
+        return 2;
+    }
+    WinHttpClient http(false, EDUP_LAUNCHER_VERSION);
+    DirectEnv env;
+    env.http = &http;
+    std::vector<std::string> lines;
+    const int code = directDryRunLines(args, env, &lines);
+    for (const std::string& line : lines) out.line(line);
+    return code;
+}
+
 int runUnregisterCommand(const AppArgs& args, Output& out) {
     const LauncherRoots roots = launcherRootsFor(args);
     const std::wstring self = selfPath();
@@ -177,6 +229,35 @@ int runUnregisterCommand(const AppArgs& args, Output& out) {
 
 }  // namespace
 
+int directDryRunLines(const AppArgs& args, DirectEnv env, std::vector<std::string>* lines) {
+    if (args.dir.empty() || args.vr == args.novr) {
+        lines->push_back("--direct-dry-run needs --dir <the game's product folder> and exactly one of --vr and --novr.");
+        return 2;
+    }
+    env.progress = [lines](const std::string& line) { lines->push_back(line); };
+    DirectRequest request;
+    request.productDir = args.dir;
+    request.vr = args.vr;
+    const DirectPlan plan = planDirectLaunch(env, request);
+
+    size_t start = 0;
+    while (start < plan.detail.size()) {
+        size_t end = plan.detail.find('\n', start);
+        if (end == std::string::npos) end = plan.detail.size();
+        std::string line = plan.detail.substr(start, end - start);
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (!line.empty()) lines->push_back(maskSecrets(line, plan.secrets));
+        start = end + 1;
+    }
+    if (!plan.start) {
+        lines->push_back(maskSecrets(fallbackLine(plan.reason), plan.secrets));
+        return 3;
+    }
+    lines->push_back("Dry run: nothing was started. The command line would be:");
+    lines->push_back("    " + maskSecrets(narrowUtf8(plan.exe) + " " + narrowUtf8(plan.args), plan.secrets));
+    return 0;
+}
+
 LauncherRoots launcherRootsFor(const AppArgs& args) { return launcherRoots(args.dataRoot); }
 
 std::wstring launcherMirrorRoot(const AppArgs& args) { return launcherRootsFor(args).dataRoot; }
@@ -189,11 +270,17 @@ bool launcherPreparePayload(const AppArgs& args, std::string* note) {
     return false;
 }
 
-bool launcherHasCommand(const AppArgs& args) { return args.checkUpdate || args.update || args.unregister; }
+bool launcherHasCommand(const AppArgs& args) {
+    return args.checkUpdate || args.update || args.unregister || args.directDryRun || args.licenses;
+}
 
 int runLauncherCommand(const AppArgs& args, bool haveConsole) {
     Output out(haveConsole);
-    const int code = args.unregister ? runUnregisterCommand(args, out) : runUpdateCommand(args, out);
+    int code;
+    if (args.licenses) code = runLicensesCommand(out);
+    else if (args.directDryRun) code = runDirectDryRun(args, out);
+    else if (args.unregister) code = runUnregisterCommand(args, out);
+    else code = runUpdateCommand(args, out);
     out.finish();
     return code;
 }

@@ -17,6 +17,7 @@
 #include <thread>
 #include <vector>
 
+#include "direct_launch.h"
 #include "launch_route.h"
 #include "launcher_core.h"
 #include "launcher_plan.h"
@@ -24,6 +25,15 @@
 #include "updater.h"
 
 namespace edvr::installer {
+
+// What the window asks before it turns direct launch on. No is the default button, and a No leaves it off.
+inline constexpr const char* kDirectLaunchQuestion =
+    "Start Elite directly instead of through Frontier's launcher?\n\n"
+    "The launcher signs in to Frontier's servers itself with your Steam login, then starts the game. "
+    "It starts faster, and you can pick VR or flat here. No password or token is stored.\n\n"
+    "Frontier has not approved this. It could act against an account that signs in this way, and the choice "
+    "is yours. Untick this at any time to go back to Frontier's launcher.\n\n"
+    "Turn it on?";
 
 enum class PayloadState { Loading, Ready, None };
 enum class CheckState { NotYet, Checking, UpToDate, Available, Refused, Skipped };
@@ -48,11 +58,21 @@ struct SessionEnv {
     std::function<void()> payloadSwitched;  // an update was adopted and the payload is now it: carry on to the install
     std::function<void()> closeWindow;      // the new launcher is running: this one is done
     std::function<void(bool aside)> windowAside;  // the game started (true) or is over (false)
+    // A direct launch hides the window while the game runs (windowAside's minimising is the fallback
+    // when this is empty) and closes it when the game exits.
+    std::function<void()> hideWindow;
+
+    // Direct launch's seams. Empty or default means the real one; the rig uses its own.
+    std::string frontierBase;                  // empty means api.zaonce.net
+    std::function<std::unique_ptr<SteamSession>(const std::wstring& dllPath)> makeSteam;
+    MachineIdKeys machineKeys;
+    ApiClock clock;
+    GameStarter startGame;                     // returns the process to wait on; empty means startGameProcess
 };
 
 class LauncherSession {
 public:
-    explicit LauncherSession(SessionEnv env) : env_(std::move(env)) {}
+    explicit LauncherSession(SessionEnv env);
     ~LauncherSession() { shutdown(); }
     LauncherSession(const LauncherSession&) = delete;
     LauncherSession& operator=(const LauncherSession&) = delete;
@@ -79,11 +99,18 @@ public:
     // the canonical copy), restarting; then the cache, the manifest and the payload.
     void beginUpdate();
 
-    // Starts the game by the route and watches until it is over. `elevated` refuses.
+    // Starts the game and watches until it is over. `elevated` refuses, before anything is contacted.
+    // A Steam install with direct launch on signs in to Frontier and starts the game itself, and falls
+    // back to Steam's route, saying why, when it cannot. Every other install takes its route.
     void beginPlay(const std::wstring& source, const std::wstring& gameDir, bool vr, bool elevated,
                    const RouteOps& ops, const WatchNames& names, const WatchTiming& timing);
     bool playing() const { return playing_; }
     const std::string& playLine() const { return playLine_; }
+
+    // launcher.ini's direct_launch: off unless it says on. Turning it on calls `confirm` first (the
+    // window's question), and a false from it leaves the setting as it was. Returns the setting after.
+    bool directLaunch() const { return directLaunch_; }
+    bool setDirectLaunch(bool on, const std::function<bool()>& confirm);
 
     // The elevated apply, waited for on a worker. `done` runs on the window's thread.
     void beginElevatedApply(const PlanFile& plan, const ElevatedRunner& runner,
@@ -103,6 +130,12 @@ private:
         if (env_.changed) env_.changed();
     }
     void spawn(std::function<void()> work) { workers_.emplace_back(std::move(work)); }
+    void rememberMode(const std::wstring& gameDir, bool vr);
+    void startRouteAndWatch(const std::wstring& source, const std::wstring& gameDir, bool vr, bool elevated,
+                            const RouteOps& ops, const WatchNames& names, const WatchTiming& timing,
+                            const std::string& startLine);
+    void beginDirectPlay(const std::wstring& source, const std::wstring& gameDir, bool vr, const RouteOps& ops,
+                         const WatchNames& names, const WatchTiming& timing);
 
     SessionEnv env_;
     std::vector<std::thread> workers_;
@@ -117,6 +150,7 @@ private:
     bool updating_ = false;
     bool autoResumed_ = false;  // the update that followed a self-update's restart was started
     bool playing_ = false;
+    bool directLaunch_ = false;
     bool applying_ = false;
     std::string playLine_;
 };

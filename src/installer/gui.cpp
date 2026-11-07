@@ -34,6 +34,7 @@
 #include "launch_route.h"
 #include "launcher_main.h"
 #include "launcher_session.h"
+#include "layout_dpi.h"
 #endif
 
 #pragma comment(lib, "comctl32.lib")
@@ -66,9 +67,11 @@ enum : int {
 
 const UINT kMsgFirstScan = WM_APP + 1;
 
+#ifndef EDUP_LAUNCHER   // the launcher has no tip link
 const wchar_t* kTipUrl = L"https://ko-fi.com/seancharacterecho";
-const wchar_t* kDiscordUrl = L"https://discord.gg/AWJ6djKKzr";
 const wchar_t* kTipText = L"ED-UP is free. If it makes your flight more enjoyable, you can";
+#endif
+const wchar_t* kDiscordUrl = L"https://discord.gg/AWJ6djKKzr";
 #ifdef EDUP_LAUNCHER
 // The launcher's update and Play band sits between the report card and the tip line (launcher_gui.inc).
 constexpr int kTipTop = 758;  // the tip line's top: the painted sentence and both links share it
@@ -135,7 +138,8 @@ struct Gui {
     SettingsModel settings;
     std::string   settingsEdition = "vr";   // the file the settings screen edits: "vr" (edvr.ini) or "flat" (edvr-flat.ini)
     edvr::ModeRead mode = edvr::readGameMode(nullptr);  // Elite's 3D mode, read when the folder is surveyed
-    UINT dpi = 96;
+    UINT dpi = 96;      // what the client area is laid out at: the real dpi, or less when the window would not fit
+    UINT realDpi = 96;  // the window's own, which its frame and title bar are drawn at
 
     std::vector<Place>      places;
     std::vector<StatusRow>  status;
@@ -322,12 +326,14 @@ void applyLayout() {
     if (g.tip || g.discord) {
         HDC dc = GetDC(g.window);
         const HFONT caption = ui::fonts().caption;
+        const int discordWidth = ui::textWidth(dc, L"Ask on Discord", caption) + dp(2);
+#ifndef EDUP_LAUNCHER   // the launcher has no tip link, so there is no sentence to measure
         const int prefix = ui::textWidth(dc, kTipText, caption);
         const int space = ui::textWidth(dc, L" ", caption);
         const int tipWidth = ui::textWidth(dc, L"leave a tip", caption) + dp(2);
-        const int discordWidth = ui::textWidth(dc, L"Ask on Discord", caption) + dp(2);
-        ReleaseDC(g.window, dc);
         if (g.tip) MoveWindow(g.tip, dp(kMargin) + prefix + space, dp(kTipTop), tipWidth, dp(20), TRUE);
+#endif
+        ReleaseDC(g.window, dc);
         if (g.discord)
             MoveWindow(g.discord, dp(kClientWidth - kMargin) - discordWidth, dp(kTipTop), discordWidth, dp(20), TRUE);
     }
@@ -380,12 +386,46 @@ void applyLayout() {
     InvalidateRect(g.window, nullptr, TRUE);
 }
 
+// The dpi to lay the client area out at. The installer's window always fits, and takes the window's dpi.
+// The launcher's is taller: where it would not fit the monitor's work area (150% on a 1080p screen, or
+// 100% on the Steam Deck's 800 pixels) it is laid out smaller, so that Play is on the screen. `onMonitor`
+// names the monitor when the window has not moved there yet (WM_DPICHANGED); null means the window's own.
+UINT fitLayoutDpi(HWND window, UINT realDpi, const RECT* onMonitor) {
+#ifdef EDUP_LAUNCHER
+    const HMONITOR monitor = onMonitor ? MonitorFromRect(onMonitor, MONITOR_DEFAULTTONEAREST)
+                                       : MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO info{};
+    info.cbSize = sizeof(info);
+    if (!monitor || !GetMonitorInfoW(monitor, &info)) return realDpi;
+    RECT frame{0, 0, 0, 0};
+    AdjustWindowRectExForDpi(&frame, static_cast<DWORD>(GetWindowLongPtrW(window, GWL_STYLE)), FALSE, 0, realDpi);
+    return edvr::installer::layoutDpiFor(realDpi, info.rcWork.bottom - info.rcWork.top, kClientHeight, frame.bottom - frame.top);
+#else
+    (void)window;
+    (void)onMonitor;
+    return realDpi;
+#endif
+}
+
 void sizeWindowToLayout() {
     const DWORD style = static_cast<DWORD>(GetWindowLongPtrW(g.window, GWL_STYLE));
     RECT wanted{0, 0, dp(kClientWidth), dp(kClientHeight)};
-    AdjustWindowRectExForDpi(&wanted, style, FALSE, 0, g.dpi);
+    // The frame and title bar are the system's size, whatever the client area was laid out at.
+    AdjustWindowRectExForDpi(&wanted, style, FALSE, 0, g.realDpi);
     SetWindowPos(g.window, nullptr, 0, 0, wanted.right - wanted.left, wanted.bottom - wanted.top,
                  SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+#ifdef EDUP_LAUNCHER
+    // A window that opened low on the screen is moved up until its bottom edge, and Play, is in view.
+    MONITORINFO info{};
+    info.cbSize = sizeof(info);
+    RECT now{};
+    if (GetWindowRect(g.window, &now) &&
+        GetMonitorInfoW(MonitorFromWindow(g.window, MONITOR_DEFAULTTONEAREST), &info) && now.bottom > info.rcWork.bottom) {
+        const int top = now.top - (now.bottom - info.rcWork.bottom);
+        SetWindowPos(g.window, nullptr, now.left, top < info.rcWork.top ? info.rcWork.top : top, 0, 0,
+                     SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+#endif
 }
 
 // ---------------------------------------------------------------------------
@@ -716,8 +756,10 @@ void paintWindow(HWND window) {
     else
         paintSettingsScreen(dc);
 
+#ifndef EDUP_LAUNCHER   // no tip sentence in the launcher: the Discord link stands alone at the right
     RECT tip{dp(kMargin), dp(kTipTop), dp(kClientWidth - kMargin), dp(kTipTop + 20)};
     ui::drawText(dc, kTipText, tip, f.caption, t.subtext, DT_LEFT | DT_SINGLELINE);
+#endif
 
     BitBlt(screenDc, 0, 0, client.right, client.bottom, dc, 0, 0, SRCCOPY);
     SelectObject(dc, previous);
@@ -1161,7 +1203,8 @@ void showScreen(Screen screen) {
 }
 
 void createControls(HWND window) {
-    g.dpi = GetDpiForWindow(window);
+    g.realDpi = GetDpiForWindow(window);
+    g.dpi = fitLayoutDpi(window, g.realDpi, nullptr);
     ui::buildFonts(g.dpi);
     const ui::Fonts& f = ui::fonts();
 
@@ -1265,8 +1308,10 @@ void createControls(HWND window) {
     SetWindowSubclass(g.report, reportProc, 1, 0);
     place(g.report, kMargin + kCardPad - 4, 536, 636, 102, Screen::Install);
 
+#ifndef EDUP_LAUNCHER   // the launcher carries no tip link
     g.tip = ui::makeButton(window, L"leave a tip", kIdKofi, ui::ButtonStyle::Link, f.caption);
     place(g.tip, kMargin, kTipTop, 76, 20, Screen::Install, true);  // x and width fixed up in applyLayout
+#endif
 
     g.discord = ui::makeButton(window, L"Ask on Discord", kIdDiscord, ui::ButtonStyle::Link,
                                f.caption);
@@ -1299,14 +1344,15 @@ void createControls(HWND window) {
 }
 
 void rescale(HWND window, UINT dpi, const RECT* suggested) {
-    g.dpi = dpi;
-    ui::buildFonts(dpi);
+    g.realDpi = dpi;
+    g.dpi = fitLayoutDpi(window, dpi, suggested);
+    ui::buildFonts(g.dpi);
     const ui::Fonts& f = ui::fonts();
     for (const Place& p : g.places) {
         SendMessageW(p.hwnd, WM_SETFONT, reinterpret_cast<WPARAM>(f.body), TRUE);
     }
     SendMessageW(g.report, WM_SETFONT, reinterpret_cast<WPARAM>(f.body), TRUE);
-    settingsListRescale(g.settingsList, dpi);
+    settingsListRescale(g.settingsList, g.dpi);
     applyLayout();
     if (suggested) {
         SetWindowPos(window, nullptr, suggested->left, suggested->top,
@@ -1385,9 +1431,11 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wparam, LPARAM lpa
                 case kIdShowFolder: showSavedFolder(); return 0;
                 case kIdTabInstall: showScreen(Screen::Install); return 0;
                 case kIdTabSettings: showScreen(Screen::Settings); return 0;
+#ifndef EDUP_LAUNCHER   // no control has this id in the launcher
                 case kIdKofi:
                     ShellExecuteW(window, L"open", kTipUrl, nullptr, nullptr, SW_SHOWNORMAL);
                     return 0;
+#endif
                 case kIdDiscord:
                     ShellExecuteW(window, L"open", kDiscordUrl, nullptr, nullptr, SW_SHOWNORMAL);
                     return 0;

@@ -811,7 +811,8 @@ set INSTALLER_LIBS=user32.lib gdi32.lib gdiplus.lib dwmapi.lib uxtheme.lib ^
     shell32.lib ole32.lib comctl32.lib advapi32.lib version.lib bcrypt.lib dxgi.lib kernel32.lib
 REM What the launcher adds to INSTALLER_SRC (its main.cpp, gui.cpp and the rest are the same files, built
 REM with /DEDUP_LAUNCHER): the update core and the launcher_* and selfupdate files. launcher_test links
-REM these too. winhttp.lib is the one library the installer does not need.
+REM these too (the last four are direct launch: Frontier's API, the machine ID, the Steam ticket, the sequence).
+REM winhttp.lib is the one library the installer does not need.
 set LAUNCHER_SRC="src\installer\launcher_core.cpp" "src\installer\launcher_register.cpp" ^
     "src\installer\launcher_plan.cpp" "src\installer\launch_route.cpp" ^
     "src\installer\launcher_session.cpp" "src\installer\launcher_main.cpp" ^
@@ -819,7 +820,9 @@ set LAUNCHER_SRC="src\installer\launcher_core.cpp" "src\installer\launcher_regis
     "src\installer\update_http.cpp" "src\installer\update_json.cpp" ^
     "src\installer\update_manifest.cpp" "src\installer\update_zip.cpp" ^
     "src\installer\update_cache.cpp" "src\installer\update_util.cpp" ^
-    "src\installer\launcher_state.cpp"
+    "src\installer\launcher_state.cpp" "src\installer\frontier_api.cpp" ^
+    "src\installer\machine_id.cpp" "src\installer\steam_ticket.cpp" ^
+    "src\installer\direct_launch.cpp"
 
 if defined EDVR_DLL_ONLY goto dll_only_finish
 
@@ -3266,6 +3269,17 @@ REM Does it START? --help reads nothing and writes nothing, and does not copy, r
     echo        configuration problem, the manifest is the suspect.
     exit /b 1
 )
+REM --licenses prints the licence it carries as RCDATA 120, byte for byte. Contacts nothing.
+"%BUILD%\ed-up-launcher.exe" --licenses > "%BUILD%\launcher_licenses.txt" || (
+    echo [edvr] ERROR: the launcher would not print its licence
+    exit /b 1
+)
+fc /b "%BUILD%\launcher_licenses.txt" "third_party\min_ed_launcher\LICENSE" >nul
+if errorlevel 1 (
+    echo [edvr] ERROR: the licence the launcher prints is not third_party\min_ed_launcher\LICENSE
+    exit /b 1
+)
+echo [edvr] launcher --licenses prints third_party\min_ed_launcher\LICENSE
 exit /b 0
 
 REM One compile of the launcher into %~1 (the exe's folder). %~2 is its obj folder, %~3 the folder
@@ -3348,6 +3362,15 @@ if errorlevel 1 ( echo [edvr] ERROR: the fake EDLaunch build failed & exit /b 1 
     "tools\launcher_test\fake_proc.cpp" ^
     /link /INCREMENTAL:NO /SUBSYSTEM:WINDOWS user32.lib shell32.lib
 if errorlevel 1 ( echo [edvr] ERROR: the fake game build failed & exit /b 1 )
+REM A stand-in for Steam's library, with the exports the launcher binds and a canned ticket, so the real
+REM loader and export binding run in the rig and the real Steam is never touched. It is the one DLL here.
+if not exist "%OBJ%\launchertest\fakesteam" mkdir "%OBJ%\launchertest\fakesteam"
+%CC% /nologo /O2 /MT /std:c++17 /EHsc /W4 /GR- /DWIN32_LEAN_AND_MEAN /DNOMINMAX ^
+    /D_CRT_SECURE_NO_WARNINGS /LD ^
+    /Fo"%OBJ%\launchertest\fakesteam"\ /Fe"%BUILD%\launcher_fakes\steam_api64.dll" ^
+    "tools\launcher_test\fake_steam_api.cpp" ^
+    /link /INCREMENTAL:NO kernel32.lib
+if errorlevel 1 ( echo [edvr] ERROR: the fake steam_api64.dll build failed & exit /b 1 )
 %CC% /nologo /O2 /MT /std:c++17 /EHsc /W4 /GR- /DWIN32_LEAN_AND_MEAN /DNOMINMAX ^
     /D_CRT_SECURE_NO_WARNINGS /DUNICODE /D_UNICODE /DEDUP_LAUNCHER /I"%GEN%" ^
     /Fo"%OBJ%\launchertest"\ /Fe"%BUILD%\launcher_test.exe" ^

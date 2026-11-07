@@ -4,8 +4,10 @@
 #ifdef EDUP_LAUNCHER
 
 #include <string>
+#include <vector>
 
 #include "app.h"
+#include "direct_launch.h"
 #include "launcher_core.h"
 
 namespace edvr::installer {
@@ -21,11 +23,17 @@ std::wstring launcherMirrorRoot(const AppArgs& args);
 // there is one; otherwise `note` says what to do.
 bool launcherPreparePayload(const AppArgs& args, std::string* note);
 
-// The commands that need no window: --check-update, --update and --unregister. Prints through
+// The commands that need no window: --check-update, --update, --unregister, --direct-dry-run and
+// --licenses. Prints through
 // the console when there is one, and otherwise (--unregister from Windows' list of programs) in
 // one message box at the end. Returns the exit code.
 bool launcherHasCommand(const AppArgs& args);
 int runLauncherCommand(const AppArgs& args, bool haveConsole);
+
+// --direct-dry-run over `env` (its http and seams): the lines to print and the exit code, 0 for a plan, 3
+// for a fallback and 2 for a command line that is not usable. Starts nothing; every token, the Steam ticket
+// and the machine ID are replaced by <masked> in the lines. runLauncherCommand makes the real environment.
+int directDryRunLines(const AppArgs& args, DirectEnv env, std::vector<std::string>* lines);
 
 // --apply-plan: the elevated copy. No window, no console; returns the exit code.
 int runApplyPlanFile(const AppArgs& args);

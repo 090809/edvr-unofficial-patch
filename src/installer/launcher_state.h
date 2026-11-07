@@ -3,6 +3,8 @@
 //   channel            stable or rc
 //   current_manifest   SHA-256 of the manifest the payload was last switched to
 //   highest_issued     the highest `issued` of any manifest accepted; never lowered
+//   direct_launch      on: a Steam install is started by the launcher itself, without Frontier's
+//                      launcher. Missing, or anything but "on", is off.
 //   mode.<16 hex>      the play mode remembered for one install folder: the first
 //                      16 hex characters of the SHA-256 of the folder's path,
 //                      lower-cased, with backslashes and no trailing separator
@@ -42,6 +44,10 @@ public:
     long long highestIssued() const;
     // Raises the stored value; a lower or equal one changes nothing.
     void raiseHighestIssued(long long issued);
+
+    // True only when the file says "on". Off is the default, and writing it removes nothing: it says "off".
+    bool directLaunch() const;
+    void setDirectLaunch(bool on);
 
     static std::string modeKey(const std::wstring& installFolder);
     std::string mode(const std::wstring& installFolder) const;

@@ -36,6 +36,8 @@ struct JsonValue {
 
     // The value of `key` in an object, or null when this is no object or lacks it.
     const JsonValue* find(const std::string& key) const;
+    // The same, ignoring ASCII case. For documents whose key spelling the launcher did not choose.
+    const JsonValue* findNoCase(const std::string& key) const;
 };
 
 // Parses all of `text`. On failure `error` (may be null) gets a sentence with

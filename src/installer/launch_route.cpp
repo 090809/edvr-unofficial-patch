@@ -121,12 +121,16 @@ RouteOps realRouteOps() {
     return ops;
 }
 
+const char* elevatedRefusal() {
+    return "This launcher is running with administrator rights, and Elite must not be started from one. Close it and open it again normally.";
+}
+
 bool startRoute(const LaunchRoute& route, const RouteOps& ops, bool elevated, std::string* error) {
     auto fail = [&](const std::string& text) {
         if (error) *error = text;
         return false;
     };
-    if (elevated) return fail("This launcher is running with administrator rights, and Elite must not be started from one. Close it and open it again normally.");
+    if (elevated) return fail(elevatedRefusal());
     switch (route.kind) {
         case RouteKind::Steam:
         case RouteKind::Epic:

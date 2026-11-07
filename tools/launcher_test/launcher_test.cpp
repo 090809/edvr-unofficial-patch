@@ -23,6 +23,11 @@
 //   route        the store addresses and EDLaunch's flags, recorded and never opened
 //   watcher      the game watcher against fake programs: EDLaunch asked to close, left alone
 //   session      the window's behaviour without a window: payload, check, update, self-update, Play
+//   machine id   the machine ID Frontier is told, from fixed strings and a registry subkey this rig makes
+//   layout dpi   the scale the window is laid out at when the real one would not fit the screen
+//   direct       direct launch: Frontier scripted by hand, Steam a fake library the real loader loads,
+//                every row of the fallback table, the order of the ticket, the sign-in and the start
+//   dry run      --direct-dry-run's masked output
 //   args         the launcher's command line
 //
 // Nothing here touches the real %LOCALAPPDATA%\EDVR, a game folder or any host but
@@ -55,6 +60,8 @@
 
 #include "../../src/installer/app.h"
 #include "../../src/installer/detect.h"
+#include "../../src/installer/direct_launch.h"
+#include "../../src/installer/frontier_api.h"
 #include "../../src/installer/launch_route.h"
 #include "../../src/installer/launcher_core.h"
 #include "../../src/installer/launcher_main.h"
@@ -62,9 +69,12 @@
 #include "../../src/installer/launcher_register.h"
 #include "../../src/installer/launcher_session.h"
 #include "../../src/installer/launcher_state.h"
+#include "../../src/installer/layout_dpi.h"
+#include "../../src/installer/machine_id.h"
 #include "../../src/installer/selfupdate.h"
 #include "../../src/installer/payload.h"
 #include "../../src/installer/probe.h"
+#include "../../src/installer/steam_ticket.h"
 #include "../../src/installer/update_cache.h"
 #include "../../src/installer/update_http.h"
 #include "../../src/installer/update_json.h"
@@ -801,6 +811,22 @@ void testState() {
           "a mode is found by folder, whatever the case or separators");
     check(t.mode(L"C:\\Games\\Other").empty(), "another folder has no mode");
     check(LauncherState::modeKey(L"C:\\Games\\Elite") == "mode.3d6b05c4d8ea02f1", "the mode key is the first 16 hex of the SHA-256 of the lower-cased folder");
+
+    // direct_launch: off unless the file says exactly "on".
+    check(!t.directLaunch(), "direct launch is off when the key is missing");
+    t.setDirectLaunch(true);
+    check(t.directLaunch() && t.get("direct_launch") == "on", "setDirectLaunch(true) writes on");
+    check(t.save(&err), "and saves: " + err);
+    LauncherState direct;
+    check(direct.load(path, &err) && direct.directLaunch() && direct.channel() == "rc", "on survives a reload, beside the other keys");
+    direct.setDirectLaunch(false);
+    check(!direct.directLaunch() && direct.get("direct_launch") == "off", "setDirectLaunch(false) writes off");
+    int notOn = 0;
+    for (const char* value : {"", "off", "ON", "On", "yes", "true", "1", " on", "on "}) {
+        direct.set("direct_launch", value);
+        notOn += direct.directLaunch() ? 0 : 1;
+    }
+    check(notOn == 9, "anything but on is off (" + std::to_string(notOn) + " of 9 values)");
 
     // Unknown lines survive, in place.
     check(writeAll(path, "# kept comment\nfuture_key=7\nchannel=stable\nweird line\nhighest_issued=5\n"), "the rig writes a hand-made file");
@@ -1586,6 +1612,12 @@ private:
             }
         } else if (path == "/echo") {
             reply(s, 200, "OK", "", request);
+        } else if (path == "/1.1/server/time") {
+            reply(s, 200, "OK", "", "{\"unixTimestamp\":1800000000}");
+        } else if (path == "/3.0/user/steam/auth") {
+            reply(s, 302, "Found", "Location: /echo\r\n", "");
+        } else if (path == "/3.0/user/purchases") {
+            reply(s, 307, "Temporary Redirect", "Location: /echo\r\n", "");
         } else {
             reply(s, 404, "Not Found", "", "");
         }
@@ -1780,6 +1812,68 @@ void testHttp() {
         WinHttpClient defaultAgent(true);
         resp = defaultAgent.get(e);
         check(requestHeader(resp.body, "User-Agent") == std::string("ed-up-launcher/") + EDUP_LAUNCHER_VERSION, "the default user agent carries the launcher's version");
+    }
+
+    // A request that asks not to follow redirects gets the redirect as its answer, with nothing else sent.
+    {
+        HttpRequest stay;
+        stay.url = server.url("/redir");
+        stay.headers = {{"Authorization", "bearer TOKEN-NOT-FOR-ELSEWHERE"}};
+        stay.followRedirects = false;
+        const size_t before = server.requests().size();
+        resp = client.get(stay);
+        check(resp.transportOk && resp.status == 302 && resp.body.empty(), "with followRedirects off a 302 is the answer, not a transport failure");
+        check(server.requests().size() == before + 1, "and the Location was not requested: one request reached the server");
+        for (const char* path : {"/redir-307", "/redir-abs", "/redir-plain"}) {
+            stay.url = server.url(path);
+            resp = client.get(stay);
+            check(resp.transportOk && (resp.status == 307 || resp.status == 301 || resp.status == 302) && resp.body.empty(), std::string(path) + " is returned as it is, even to an address the redirect rules would refuse");
+        }
+        stay.followRedirects = true;
+        stay.url = server.url("/redir");
+        resp = client.get(stay);
+        check(resp.transportOk && resp.status == 200 && resp.body == "hello", "and the default still follows");
+    }
+
+    // Frontier's calls through the real client: no redirect is followed, the user agent is honest, and the
+    // wire shows what the rig's scripted replies assumed.
+    {
+        WinHttpClient wire(true, "9.8.7");
+        FrontierApi api(wire, "http://127.0.0.1:" + std::to_string(server.port));
+        const size_t before = server.requests().size();
+        check(api.syncTime(), "the time call reaches the server and reads unixTimestamp");
+        FrontierSession none;
+        const ApiResult auth = api.steamAuth("0123456789abcdef", "AABB01", &none);
+        check(auth.outcome == ApiOutcome::RegistrationRequired && auth.httpStatus == 302 && none.authToken.empty(), "a 302 to sign-in is registration required, with no tokens");
+        FrontierSession held;
+        held.authToken = "TOKEN-A";
+        held.machineToken = "TOKEN-M";
+        PurchaseList list;
+        const ApiResult bought = api.purchases(held, &list);
+        check(bought.outcome == ApiOutcome::LinkAvailable && bought.httpStatus == 307 && list.items.empty(), "a 307 on purchases is link available");
+        const std::vector<std::string> seen = server.requests();
+        check(seen.size() == before + 3, "three requests reached the server and no redirect target was fetched: " + std::to_string(seen.size() - before));
+        if (seen.size() == before + 3) {
+            const std::string& time = seen[before];
+            const std::string& signIn = seen[before + 1];
+            const std::string& purchases = seen[before + 2];
+            check(time.find("GET /1.1/server/time HTTP/1.1") == 0, "the time request is a plain GET with no query");
+            check(signIn.find("GET /3.0/user/steam/auth?steamTicket=AABB01&machineId=0123456789abcdef&fTime=") == 0, "the sign-in's query is steamTicket, machineId, fTime, in that order");
+            check(requestHeader(signIn, "Authorization").empty() && !contains(signIn, "Authorization"), "the sign-in carries no Authorization header");
+            check(requestHeader(purchases, "Authorization") == "bearer TOKEN-A", "purchases carries the bearer token: " + requestHeader(purchases, "Authorization"));
+            for (const std::string* request : {&time, &signIn, &purchases})
+                check(requestHeader(*request, "User-Agent") == "ed-up-launcher/9.8.7" && !contains(*request, "min-ed-launcher") && !contains(*request, "EDLaunch"), "the user agent is the launcher's own");
+        }
+        // A transport failure puts no address and no token in its message: these URLs carry tokens.
+        FrontierApi down(wire, "http://127.0.0.1:1");
+        FrontierSession tokens;
+        const ApiResult failed = down.steamAuth("0123456789abcdef", "SENTINEL-TICKET-1f2e3d", &tokens);
+        check(failed.outcome == ApiOutcome::Unavailable && !contains(failed.message, "127.0.0.1") && !contains(failed.message, "SENTINEL") && !contains(failed.message, "0123456789abcdef"),
+              "a connection that fails says so without the address or any value: " + failed.message);
+        HttpRequest direct;
+        direct.url = "http://127.0.0.1:1/x?authToken=SENTINEL-TOKEN-9a8b7c";
+        resp = client.get(direct);
+        check(!resp.transportOk && !contains(resp.error, "SENTINEL") && !contains(resp.error, "127.0.0.1") && !contains(resp.error, "authToken"), "and neither does the HTTP client's own error: " + resp.error);
     }
     server.shutdown();
 }
@@ -2908,6 +3002,987 @@ void testSession() {
     }
 }
 
+// ---- direct launch -------------------------------------------------------------------------------------
+//
+// Frontier's servers are never contacted and the real Steam is never loaded. Every reply below is written
+// by hand from what min-ed-launcher's source reads; the Steam library is build\launcher_fakes\steam_api64.dll
+// (fake_steam_api.cpp), loaded by the launcher's own loader and export binding; and the game that "starts"
+// is the fake program. The fake library and this rig write what happens, in order, to one log, so the
+// order is proved from what the code did, not from what it says.
+
+const char* kFrontier = "https://frontier.example.invalid";
+const char* kAuthToken = "SENTINEL-AUTH-7f3a91c2";
+const char* kMachineToken = "SENTINEL-MACHINE-c20e55d1";
+const char* kFakeTicket = "14000000ABCDEF010203";               // the fake library's canned ticket, as hex
+const char* kMachineGuid = "6f4e2c1a-9b3d-4e8f-a1c2-0d5b7e9f3a11";
+const char* kFrontierGuid = "c0ffee00-1234-4abc-8def-0123456789ab";
+const char* kExpectedMachineId = "be7640f19fe2be22";             // sha1(kMachineGuid + kFrontierGuid), first 16 hex
+std::wstring g_steamLog;
+
+void appendFile(const std::wstring& path, const std::string& text) {
+    HANDLE f = CreateFileW(path.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return;
+    DWORD wrote = 0;
+    WriteFile(f, text.data(), static_cast<DWORD>(text.size()), &wrote, nullptr);
+    CloseHandle(f);
+}
+
+void eventLog(const std::string& line) { appendFile(g_steamLog, line + "\n"); }
+void resetEvents() { DeleteFileW(g_steamLog.c_str()); }
+
+// The events as tags: the fake library's lines by their first word, the rig's own whole.
+std::vector<std::string> eventTags() {
+    std::vector<std::string> out;
+    for (const std::string& line : lines(readAll(g_steamLog))) {
+        if (line.compare(0, 5, "HTTP ") == 0 || line == "START") out.push_back(line);
+        else out.push_back(line.substr(0, line.find(' ')));
+    }
+    return out;
+}
+
+int eventIndex(const std::vector<std::string>& tags, const std::string& tag) {
+    for (size_t i = 0; i < tags.size(); ++i) {
+        if (tags[i] == tag) return static_cast<int>(i);
+    }
+    return -1;
+}
+
+std::string joined(const std::vector<std::string>& parts) {
+    std::string out;
+    for (const std::string& p : parts) out += (out.empty() ? "" : " | ") + p;
+    return out;
+}
+
+// Text that must never hold a token, the ticket or the machine ID.
+bool leaks(const std::string& text) {
+    for (const char* secret : {kAuthToken, kMachineToken, kFakeTicket, kExpectedMachineId}) {
+        if (contains(text, secret)) return true;
+    }
+    return false;
+}
+
+bool treeHas(const std::wstring& dir, const std::vector<std::string>& needles) {
+    WIN32_FIND_DATAW find;
+    HANDLE h = FindFirstFileW(P(dir, L"*").c_str(), &find);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    bool found = false;
+    do {
+        const std::wstring name = find.cFileName;
+        if (name == L"." || name == L"..") continue;
+        const std::wstring full = P(dir, name);
+        if (find.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            found = found || treeHas(full, needles);
+            continue;
+        }
+        const std::string bytes = readAll(full);
+        for (const std::string& n : needles) found = found || contains(bytes, n);
+    } while (FindNextFileW(h, &find));
+    FindClose(h);
+    return found;
+}
+
+std::string percentDecode(const std::string& s) {
+    std::string out;
+    for (size_t i = 0; i < s.size(); ++i) {
+        if (s[i] == '%' && i + 2 < s.size() && std::isxdigit(static_cast<unsigned char>(s[i + 1])) && std::isxdigit(static_cast<unsigned char>(s[i + 2]))) {
+            out.push_back(static_cast<char>(std::strtol(s.substr(i + 1, 2).c_str(), nullptr, 16)));
+            i += 2;
+        } else {
+            out.push_back(s[i]);
+        }
+    }
+    return out;
+}
+
+std::string pathOf(const std::string& url) {
+    const size_t scheme = url.find("://");
+    const size_t slash = url.find('/', scheme == std::string::npos ? 0 : scheme + 3);
+    if (slash == std::string::npos) return std::string();
+    const size_t query = url.find('?', slash);
+    return url.substr(slash, query == std::string::npos ? std::string::npos : query - slash);
+}
+
+std::vector<std::pair<std::string, std::string>> queryOf(const std::string& url) {
+    std::vector<std::pair<std::string, std::string>> out;
+    const size_t q = url.find('?');
+    if (q == std::string::npos) return out;
+    for (const std::string& pair : split(url.substr(q + 1), '&')) {
+        const size_t eq = pair.find('=');
+        out.emplace_back(percentDecode(pair.substr(0, eq)), eq == std::string::npos ? std::string() : percentDecode(pair.substr(eq + 1)));
+    }
+    return out;
+}
+
+std::string queryNames(const std::string& url) {
+    std::string out;
+    for (const auto& kv : queryOf(url)) out += (out.empty() ? "" : ",") + kv.first;
+    return out;
+}
+
+std::string queryValue(const std::string& url, const std::string& name) {
+    for (const auto& kv : queryOf(url)) {
+        if (kv.first == name) return kv.second;
+    }
+    return "<missing>";
+}
+
+std::string headerOf(const HttpRequest& r, const std::string& name) {
+    for (const auto& h : r.headers) {
+        if (h.first == name) return h.second;
+    }
+    return "<none>";
+}
+
+// Frontier, scripted by path. A path's replies are served in order and the last one repeats. Every request
+// is also written to the event log, so it sits in its place among the Steam library's events.
+class FrontierHttp : public HttpClient {
+public:
+    std::map<std::string, std::vector<Reply>> script;
+    std::vector<HttpRequest> requests;
+
+    HttpResponse get(const HttpRequest& request) override {
+        std::lock_guard<std::mutex> guard(lock_);
+        requests.push_back(request);
+        const std::string path = pathOf(request.url);
+        eventLog("HTTP " + path);
+        Reply reply;
+        reply.status = 404;
+        const auto found = script.find(path);
+        if (found != script.end() && !found->second.empty()) {
+            reply = found->second.front();
+            if (found->second.size() > 1) found->second.erase(found->second.begin());
+        }
+        HttpResponse out;
+        out.transportOk = reply.transportOk;
+        out.status = reply.status;
+        out.error = reply.error;
+        if (!out.transportOk) return out;
+        if (request.maxBytes && reply.body.size() > request.maxBytes) {
+            out.transportOk = false;
+            out.error = "the reply is larger than allowed";
+            return out;
+        }
+        if (out.status == 200) {
+            out.body = reply.body;
+            out.bytes = reply.body.size();
+        }
+        return out;
+    }
+
+    int count(const std::string& path) {
+        std::lock_guard<std::mutex> guard(lock_);
+        int n = 0;
+        for (const HttpRequest& r : requests) n += pathOf(r.url) == path ? 1 : 0;
+        return n;
+    }
+    // The nth request for `path`, or null.
+    const HttpRequest* nth(const std::string& path, int index = 0) {
+        std::lock_guard<std::mutex> guard(lock_);
+        for (const HttpRequest& r : requests) {
+            if (pathOf(r.url) == path && index-- == 0) return &r;
+        }
+        return nullptr;
+    }
+
+private:
+    std::mutex lock_;
+};
+
+// One client the session can own, over the rig's.
+class Share : public HttpClient {
+public:
+    explicit Share(HttpClient* target) : target_(target) {}
+    HttpResponse get(const HttpRequest& request) override { return target_->get(request); }
+
+private:
+    HttpClient* target_;
+};
+
+const std::string kTimePath = "/1.1/server/time";
+const std::string kAuthPath = "/3.0/user/steam/auth";
+const std::string kPurchasesPath = "/3.0/user/purchases";
+const std::string kInstallerPath = "/3.0/user/installer";
+
+Reply jsonReply(const std::string& body) {
+    Reply r;
+    r.body = body;
+    return r;
+}
+Reply statusReply(int code) {
+    Reply r;
+    r.status = code;
+    return r;
+}
+Reply htmlReply() { return jsonReply("<!DOCTYPE html><html><head><title>Sign in</title></head><body>?</body></html>"); }
+Reply noAnswer(const std::string& why) {
+    Reply r;
+    r.transportOk = false;
+    r.error = why;
+    return r;
+}
+
+std::string purchasesJson(const std::string& gameArgs, const std::string& serverArgs, bool testApi = false) {
+    return "{\"purchases\":[{\"product_sku\":\"FORC-FDEV-D-1010\",\"product_name\":\"Elite Dangerous: Horizons\",\"directory\":\"elite-dangerous-64\",\"filter\":\"edh\","
+           "\"gameargs\":\"\",\"serverargs\":\"\",\"testapi\":false,\"sortkey\":10},"
+           "{\"product_sku\":\"FORC-FDEV-DO-38-IBE\",\"product_name\":\"Elite Dangerous: Odyssey\",\"directory\":\"elite-dangerous-odyssey-64\",\"filter\":\"edo\","
+           "\"gameargs\":\"" + gameArgs + "\",\"serverargs\":\"" + serverArgs + "\",\"testapi\":" + (testApi ? "true" : "false") + ",\"sortkey\":20}]}";
+}
+
+void scriptHappy(FrontierHttp* http, const std::string& installerVersion = "4.2.1.0") {
+    http->script[kTimePath] = {jsonReply("{\"unixTimestamp\":1800000000}")};
+    http->script[kAuthPath] = {jsonReply(std::string("{\"authToken\":\"") + kAuthToken + "\",\"machineToken\":\"" + kMachineToken +
+                                         "\",\"fid\":\"F1\",\"registeredName\":\"CMDR Test\"}")};
+    http->script[kPurchasesPath] = {jsonReply(purchasesJson("/edo --foo", "/Zz"))};
+    http->script[kInstallerPath] = {jsonReply("{\"version\":\"" + installerVersion + "\",\"remotePath\":\"68747470\",\"localFile\":\"x.zip\",\"md5\":\"00\",\"size\":1}")};
+}
+
+struct GameTree {
+    std::wstring root, product, edlaunch, dll;
+};
+
+void writeVersionInfo(const std::wstring& product, const std::string& version, bool steamAware = true, bool offline = false, bool bom = false) {
+    writeAll(P(product, L"VersionInfo.txt"),
+             std::string(bom ? "\xEF\xBB\xBF" : "") + "{\"name\":\"Elite Dangerous Odyssey\",\"Version\":\"" + version + "\",\"executable\":\"EliteDangerous64.exe\","
+             "\"useWatchDog64\":true,\"steamaware\":" + (steamAware ? "true" : "false") + ",\"offline\":" + (offline ? "true" : "false") + "}");
+}
+
+// <base>\Steam\steamapps\common\Elite Dangerous: EDLaunch.exe and steam_api64.dll at the top, the Odyssey product inside.
+GameTree makeGame(const std::wstring& base, bool withDll = true) {
+    GameTree g;
+    g.root = P(base, L"Steam\\steamapps\\common\\Elite Dangerous");
+    g.product = P(g.root, L"Products\\elite-dangerous-odyssey-64");
+    g.edlaunch = P(g.root, L"EDLaunch.exe");
+    g.dll = P(g.root, L"steam_api64.dll");
+    writeAll(g.edlaunch, "x");
+    writeAll(P(g.product, L"EliteDangerous64.exe"), "x");
+    writeVersionInfo(g.product, "4.2.1.0");
+    if (withDll) CopyFileW(P(g_fakes, L"steam_api64.dll").c_str(), g.dll.c_str(), FALSE);
+    return g;
+}
+
+struct RigKeys {
+    MachineIdKeys keys;
+    std::wstring root;
+};
+
+bool regSet(const std::wstring& path, const wchar_t* name, const std::string& value) {
+    HKEY key = nullptr;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, path.c_str(), 0, nullptr, REG_OPTION_NON_VOLATILE, KEY_WRITE | KEY_WOW64_64KEY, nullptr, &key, nullptr) != ERROR_SUCCESS) return false;
+    const std::wstring wide = widenUtf8(value);
+    const LONG status = RegSetValueExW(key, name, 0, REG_SZ, reinterpret_cast<const BYTE*>(wide.c_str()), static_cast<DWORD>((wide.size() + 1) * sizeof(wchar_t)));
+    RegCloseKey(key);
+    return status == ERROR_SUCCESS;
+}
+
+std::string regGet(const std::wstring& path, const wchar_t* name) {
+    wchar_t buffer[260]{};
+    DWORD size = sizeof(buffer);
+    if (RegGetValueW(HKEY_CURRENT_USER, path.c_str(), name, RRF_RT_REG_SZ | RRF_SUBKEY_WOW6464KEY, nullptr, buffer, &size) != ERROR_SUCCESS) return "<none>";
+    return narrowUtf8(buffer);
+}
+
+// A pair of HKCU subkeys standing in for the two MachineGuid keys; the machine one always holds kMachineGuid.
+RigKeys rigKeys(const std::wstring& tag, bool presetFrontier) {
+    RigKeys k;
+    k.root = L"Software\\EdUpLauncherRigDirect-" + std::to_wstring(GetCurrentProcessId()) + L"-" + tag;
+    RegDeleteTreeW(HKEY_CURRENT_USER, k.root.c_str());
+    k.keys.machineRoot = HKEY_CURRENT_USER;
+    k.keys.machinePath = k.root + L"\\Machine";
+    k.keys.frontierRoot = HKEY_CURRENT_USER;
+    k.keys.frontierPath = k.root + L"\\Frontier";
+    regSet(k.keys.machinePath, L"MachineGuid", kMachineGuid);
+    if (presetFrontier) regSet(k.keys.frontierPath, L"MachineGuid", kFrontierGuid);
+    return k;
+}
+void dropKeys(const RigKeys& k) { RegDeleteTreeW(HKEY_CURRENT_USER, k.root.c_str()); }
+
+DirectEnv directEnv(FrontierHttp* http, const MachineIdKeys& keys, std::vector<std::string>* progress) {
+    DirectEnv e;
+    e.http = http;
+    e.apiBase = kFrontier;
+    e.machineKeys = keys;
+    e.clock.unixNow = []() { return 1700000000ll; };
+    // 2 s per reading: the running time then moves by whole, countable seconds.
+    const std::shared_ptr<unsigned long long> tick = std::make_shared<unsigned long long>(0);
+    e.clock.tickMs = [tick]() { return *tick += 2000; };
+    if (progress) e.progress = [progress](const std::string& line) { progress->push_back(line); };
+    return e;
+}
+
+DirectRequest requestFor(const std::wstring& product, bool vr) {
+    DirectRequest r;
+    r.productDir = product;
+    r.vr = vr;
+    return r;
+}
+
+void setSteamMode(const char* mode) { SetEnvironmentVariableW(L"EDUP_FAKE_STEAM_MODE", mode && *mode ? widenUtf8(mode).c_str() : nullptr); }
+
+std::vector<std::string> cat(std::initializer_list<std::vector<std::string>> parts) {
+    std::vector<std::string> out;
+    for (const auto& p : parts) out.insert(out.end(), p.begin(), p.end());
+    return out;
+}
+
+void testMachineId() {
+    section("machine id");
+    // Worked out from MachineId.fs: Trim each, join with nothing, SHA-1, hex, 16 characters, lower case.
+    check(makeMachineId(kMachineGuid, kFrontierGuid) == kExpectedMachineId, "the ID of two fixed strings is sha1 of their concatenation, first 16 hex characters: " + makeMachineId(kMachineGuid, kFrontierGuid));
+    check(makeMachineId(std::string("  ") + kMachineGuid + "\r\n", std::string("\t") + kFrontierGuid + " \n") == kExpectedMachineId, "each value is trimmed before it is joined");
+    check(makeMachineId(kFrontierGuid, kMachineGuid) == "aff75376bbb5009e" && makeMachineId(kFrontierGuid, kMachineGuid) != kExpectedMachineId, "the machine's value comes first: swapping them is another ID");
+    check(makeMachineId("", "") == "da39a3ee5e6b4b0d", "the empty input hashes to the SHA-1 of nothing, shortened: " + makeMachineId("", ""));
+
+    // Through the registry: a subkey this rig makes and removes.
+    {
+        RigKeys keys = rigKeys(L"id-preset", true);
+        std::string id, err;
+        check(readMachineId(keys.keys, &id, &err) && id == kExpectedMachineId, "the ID is read from the two keys: " + err + id);
+        check(regGet(keys.keys.frontierPath, L"MachineGuid") == kFrontierGuid, "and a Frontier value that is there is kept as it is");
+        dropKeys(keys);
+    }
+    {
+        RigKeys keys = rigKeys(L"id-made", false);
+        check(regGet(keys.keys.frontierPath, L"MachineGuid") == "<none>", "the Frontier key starts missing");
+        std::string first, second, err;
+        check(readMachineId(keys.keys, &first, &err) && first.size() == 16, "a missing Frontier value is made: " + err);
+        const std::string made = regGet(keys.keys.frontierPath, L"MachineGuid");
+        bool guidShaped = made.size() == 36 && made[8] == '-' && made[13] == '-' && made[18] == '-' && made[23] == '-';
+        for (char c : made) guidShaped = guidShaped && (c == '-' || (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'));
+        check(guidShaped, "it holds a random GUID, lower case with hyphens: " + made);
+        check(readMachineId(keys.keys, &second, &err) && second == first && regGet(keys.keys.frontierPath, L"MachineGuid") == made, "and a later read keeps it, giving the same ID");
+        check(first == makeMachineId(kMachineGuid, made), "the ID is made from the two values");
+        dropKeys(keys);
+    }
+    {
+        RigKeys keys = rigKeys(L"id-nomachine", true);
+        RegDeleteTreeW(HKEY_CURRENT_USER, keys.keys.machinePath.c_str());
+        std::string id, err;
+        check(!readMachineId(keys.keys, &id, &err) && !err.empty() && !contains(err, kFrontierGuid), "no machine value is an error that names no value: " + err);
+        dropKeys(keys);
+    }
+}
+
+void testLayoutDpi() {
+    section("layout dpi");
+    // 1080p at 150%: a 1040 pixel work area, and a 70 pixel frame and title bar at 144 dpi.
+    const unsigned fhd = layoutDpiFor(144, 1040, 786, 70);
+    check(fhd < 144 && fhd >= 72 && 786 * fhd / 96 + 70 <= 1040, "1080p at 144 dpi is laid out smaller, and fits: " + std::to_string(fhd));
+    check(fhd == 118, "and the largest dpi that fits is 118, not less: " + std::to_string(fhd));
+    // The Steam Deck: 800 pixels, about 760 of them work area, at 96 dpi.
+    const unsigned deck = layoutDpiFor(96, 760, 786, 39);
+    check(deck < 96 && deck >= 72 && 786 * deck / 96 + 39 <= 760, "800p at 96 dpi is laid out smaller, and fits: " + std::to_string(deck));
+    check(deck == 88, "and the largest dpi that fits is 88: " + std::to_string(deck));
+    check(layoutDpiFor(144, 1400, 786, 70) == 144, "a 1440p screen at 144 dpi is left alone");
+    check(layoutDpiFor(192, 2120, 786, 94) == 192, "a 4K screen at 192 dpi is left alone");
+    check(layoutDpiFor(96, 1040, 786, 39) == 96, "1080p at 100% is left alone");
+    check(layoutDpiFor(96, 400, 786, 39) == 72 && layoutDpiFor(144, 300, 786, 70) == 72, "it never goes below 72 dpi");
+    check(layoutDpiFor(60, 400, 786, 39) == 60, "a system dpi already below 72 is not raised");
+    check(layoutDpiFor(144, 1040, 0, 70) == 144 && layoutDpiFor(144, 60, 786, 70) == 144, "an unusable height or work area changes nothing");
+    int rows = 0;
+    for (int work = 500; work <= 2200; work += 50) {
+        for (unsigned system : {96u, 120u, 144u, 192u}) {
+            const unsigned got = layoutDpiFor(system, work, 786, 40 + static_cast<int>(system) / 4);
+            ++rows;
+            const bool fits = 786 * static_cast<int>(got) / 96 + 40 + static_cast<int>(system) / 4 <= work;
+            check(got <= system && (got == 72 || fits), "work area " + std::to_string(work) + " at " + std::to_string(system) + " dpi gives " + std::to_string(got) + ", which fits or is the floor");
+            if (got < system && got > 72) check(786ll * (got + 1) > static_cast<long long>(work - 40 - static_cast<int>(system) / 4) * 96, "and one dpi more would not fit");
+        }
+    }
+    check(rows == 35 * 4, "the sweep saw every row: " + std::to_string(rows));
+}
+
+void testDirectPlan() {
+    section("direct: the sequence");
+    g_steamLog = P(g_scratch, L"steam_events.log");
+    SetEnvironmentVariableW(L"EDUP_FAKE_STEAM_LOG", g_steamLog.c_str());
+    setSteamMode("");
+
+    // The pure parts.
+    check(directCommandLine(true, "MT", "AT", "/Zz", true, true, "/edo --foo") == "\"ServerToken MT AT /Zz\" /steam /vr /edo --foo", "VR with game arguments and /steam: " + directCommandLine(true, "MT", "AT", "/Zz", true, true, "/edo --foo"));
+    check(directCommandLine(true, "MT", "AT", "/Zz", true, false, "/edo --foo") == "\"ServerToken MT AT /Zz\" /steam /novr /edo --foo", "flat is /novr, and exactly one of the two is there");
+    check(directCommandLine(true, "MT", "AT", "", true, true, "") == "\"ServerToken MT AT \" /steam /vr", "no server or game arguments: the quote closes after one space, as in Product.fs");
+    check(directCommandLine(true, "MT", "AT", "", false, false, "") == "\"ServerToken MT AT \" /novr", "a product that is not steamaware gets no /steam");
+    check(directCommandLine(false, "MT", "AT", "/Zz", true, true, "/g") == "\"\" /steam /vr /g", "an offline product has an empty quoted token");
+    check(sameGameVersion("4.2.1.0", "4.2.1.0") && !sameGameVersion("4.2.1.0", "4.2.2.0") && !sameGameVersion("4.2.1", "4.2.1.0") && !sameGameVersion("a.b", "a.b") && sameGameVersion("4.2", "4.2"),
+          "game versions are equal as System.Version is: the same numbers in the same count");
+    {
+        // Odyssey and live Horizons share a folder, and only the filter tells them apart.
+        const auto purchase = [](const char* sku, const char* directory, const char* filter, long long sortKey) {
+            Purchase p;
+            p.sku = sku;
+            p.directory = directory;
+            p.filter = filter;
+            p.sortKey = sortKey;
+            return p;
+        };
+        const std::string live = "elite-dangerous-odyssey-64";
+        const std::vector<Purchase> both = {purchase("OLD", "elite-dangerous-64", "edh", 1), purchase("H4", live.c_str(), "edh4", 5), purchase("ODY", live.c_str(), "edh4, edo", 9)};
+        const Purchase* pick = chooseProduct(both, live);
+        check(pick && pick->sku == "H4", "a filter piece is matched whole and untrimmed, as App.fs's split on commas does, so ' edo' does not count");
+        const std::vector<Purchase> withEdo = {purchase("H4", live.c_str(), "edh4", 5), purchase("ODY", live.c_str(), "edh4,EDO", 9)};
+        pick = chooseProduct(withEdo, live);
+        check(pick && pick->sku == "ODY", "the edo product wins over a lower sortkey in the same folder, whatever the filter's case");
+        const std::vector<Purchase> twoEdo = {purchase("B", live.c_str(), "edo", 9), purchase("A", live.c_str(), "edo", 3)};
+        pick = chooseProduct(twoEdo, live);
+        check(pick && pick->sku == "A", "among edo products the lowest sortkey wins, wherever it is listed");
+        const std::vector<Purchase> onlyHorizons = {purchase("H4B", live.c_str(), "edh4", 7), purchase("H4A", live.c_str(), "edh4", 2)};
+        pick = chooseProduct(onlyHorizons, live);
+        check(pick && pick->sku == "H4A", "with no edo product in the folder the lowest sortkey is used");
+        const std::vector<Purchase> bySku = {purchase("FORC-FDEV-DO-38", "elsewhere", "edo", 1)};
+        pick = chooseProduct(bySku, "forc-fdev-do-38");
+        check(pick && pick->sku == "FORC-FDEV-DO-38", "a folder named by the SKU matches, whatever its case");
+        check(chooseProduct({purchase("OLD", "elite-dangerous-64", "edh", 1)}, live) == nullptr, "a purchase for another folder is not chosen");
+        check(chooseProduct({purchase("", live.c_str(), "edo", 1)}, live) == nullptr, "a purchase with no SKU is not chosen, since the version check needs one");
+    }
+    check(maskSecrets("a TOKEN b TOKEN c ID", {"TOKEN", "ID", ""}) == "a <masked> b <masked> c <masked>", "maskSecrets removes every occurrence of each secret, and skips an empty one");
+    check(contains(fallbackLine("Frontier refused the request (HTTP 403)"), "Frontier refused the request (HTTP 403)") && contains(fallbackLine("x"), "Steam") && contains(fallbackLine("x"), "mode it is set to"),
+          "a fallback line gives the reason, names Steam, and says the game uses the mode it is set to: " + fallbackLine("x"));
+
+    // The happy path, in full.
+    {
+        const std::wstring base = fresh("direct-happy");
+        const GameTree game = makeGame(base);
+        RigKeys keys = rigKeys(L"happy", true);
+        FrontierHttp http;
+        scriptHappy(&http);
+        std::vector<std::string> progress;
+        resetEvents();
+        SetEnvironmentVariableW(L"SteamAppId", nullptr);
+        const DirectPlan plan = planDirectLaunch(directEnv(&http, keys.keys, &progress), requestFor(game.product, true));
+        check(plan.start && plan.reason.empty(), "everything answers: the plan is to start the game: " + plan.reason);
+        check(plan.exe == P(game.product, L"EliteDangerous64.exe") && plan.workDir == game.product, "from the product's folder, the executable VersionInfo.txt names");
+        check(narrowUtf8(plan.args) == std::string("\"ServerToken ") + kMachineToken + " " + kAuthToken + " /Zz\" /steam /vr /edo --foo", "the command line is the port's, in full");
+
+        check(http.requests.size() == 4 && pathOf(http.requests[0].url) == kTimePath && pathOf(http.requests[1].url) == kAuthPath && pathOf(http.requests[2].url) == kPurchasesPath &&
+                  pathOf(http.requests[3].url) == kInstallerPath,
+              "four calls, in order: time, steam/auth, purchases, installer");
+        if (http.requests.size() == 4) {
+            for (const HttpRequest& r : http.requests) {
+                check(!r.followRedirects && r.maxBytes == kFrontierMaxBytes && r.url.compare(0, std::strlen(kFrontier), kFrontier) == 0, "no redirect is followed, replies are capped at 4 MiB, and the host is the one given: " + pathOf(r.url));
+            }
+            const HttpRequest& time = http.requests[0];
+            const HttpRequest& auth = http.requests[1];
+            const HttpRequest& purchases = http.requests[2];
+            const HttpRequest& installer = http.requests[3];
+            check(time.url == std::string(kFrontier) + kTimePath && time.headers.empty(), "time has no query and no header");
+            check(queryNames(auth.url) == "steamTicket,machineId,fTime" && queryValue(auth.url, "steamTicket") == kFakeTicket && queryValue(auth.url, "machineId") == kExpectedMachineId, "auth: steamTicket, machineId, fTime, with the ticket as hex and the machine ID");
+            check(auth.headers.empty() && headerOf(auth, "Authorization") == "<none>", "and no Authorization header at all");
+            check(queryNames(purchases.url) == "fTime" && headerOf(purchases, "Authorization") == std::string("bearer ") + kAuthToken, "purchases: fTime only, with the bearer token");
+            check(queryNames(installer.url) == "machineToken,authToken,machineId,sku,os,fTime" && queryValue(installer.url, "machineToken") == kMachineToken &&
+                      queryValue(installer.url, "authToken") == kAuthToken && queryValue(installer.url, "machineId") == kExpectedMachineId && queryValue(installer.url, "sku") == "FORC-FDEV-DO-38-IBE" &&
+                      queryValue(installer.url, "os") == "win" && headerOf(installer, "Authorization") == std::string("bearer ") + kAuthToken,
+                  "installer: machineToken, authToken, machineId, sku, os=win, fTime, with the same header, for the Odyssey sku");
+            // The server said 1800000000; this machine's clock said 1700000000 and is not used. Each reading
+            // of the fake clock is two seconds on.
+            check(queryValue(auth.url, "fTime") == "1800000002.00000" && queryValue(purchases.url, "fTime") == "1800000004.00000" && queryValue(installer.url, "fTime") == "1800000006.00000",
+                  "fTime is the server's time plus the seconds since, not the local clock: " + queryValue(auth.url, "fTime") + ", " + queryValue(purchases.url, "fTime") + ", " + queryValue(installer.url, "fTime"));
+        }
+
+        // Steam: the library beside EDLaunch.exe, in this order, and shut down before the game could start.
+        const std::vector<std::string> tags = eventTags();
+        const std::vector<std::string> expected = cat({{"HTTP " + kTimePath}, {"load", "init", "client", "pipe", "global_user", "user", "steamid", "ticket"}, {"HTTP " + kAuthPath},
+                                                        {"cancel", "shutdown", "unload"}, {"HTTP " + kPurchasesPath, "HTTP " + kInstallerPath}});
+        check(tags == expected, "events: " + joined(tags));
+        const std::vector<std::string> raw = lines(readAll(g_steamLog));
+        bool loadedFromGame = false, appId = false, version = false, cancelled = false;
+        for (const std::string& line : raw) {
+            std::string lowerLine = line, lowerPath = narrowUtf8(game.dll);
+            for (char& c : lowerLine) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            for (char& c : lowerPath) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            loadedFromGame = loadedFromGame || lowerLine == "load path=" + lowerPath;
+            appId = appId || line == "init appid=359320";
+            version = version || line == "user version=SteamUser019";
+            cancelled = cancelled || line == "cancel ticket=4242";
+        }
+        check(loadedFromGame, "steam_api64.dll was loaded by its absolute path, from beside EDLaunch.exe");
+        check(appId && version && cancelled, "SteamAppId was 359320 when Steam started, the user interface asked for is SteamUser019, and the ticket handle is the one cancelled");
+        wchar_t appIdNow[32]{};
+        GetEnvironmentVariableW(L"SteamAppId", appIdNow, 32);
+        check(std::wstring(appIdNow) == L"359320", "and SteamAppId is still set in this process, for the game to inherit");
+        check(!leaks(plan.reason) && !leaks(plan.detail), "the reason and the detail hold no token");
+        bool progressLeaks = false;
+        for (const std::string& line : progress) progressLeaks = progressLeaks || leaks(line);
+        check(progress.size() >= 6 && !progressLeaks, "the window was told each step (" + std::to_string(progress.size()) + " lines) and none holds a token");
+        check(plan.secrets.size() == 4 && !leaks(maskSecrets(narrowUtf8(plan.args), plan.secrets)) && contains(maskSecrets(narrowUtf8(plan.args), plan.secrets), "<masked>"),
+              "masking the command line takes out both tokens and leaves the rest: " + maskSecrets(narrowUtf8(plan.args), plan.secrets));
+        check(contains(plan.detail, "Version on disk: 4.2.1.0, Frontier's: 4.2.1.0"), "the detail says the two versions: " + plan.detail);
+
+        // Flat is /novr, the same sign-in.
+        FrontierHttp again;
+        scriptHappy(&again);
+        resetEvents();
+        const DirectPlan flat = planDirectLaunch(directEnv(&again, keys.keys, nullptr), requestFor(game.product, false));
+        check(flat.start && narrowUtf8(flat.args) == std::string("\"ServerToken ") + kMachineToken + " " + kAuthToken + " /Zz\" /steam /novr /edo --foo", "flat is /novr");
+
+        // The product's own arguments.
+        FrontierHttp bare;
+        scriptHappy(&bare);
+        bare.script[kPurchasesPath] = {jsonReply(purchasesJson("", ""))};
+        const DirectPlan none = planDirectLaunch(directEnv(&bare, keys.keys, nullptr), requestFor(game.product, true));
+        check(none.start && narrowUtf8(none.args) == std::string("\"ServerToken ") + kMachineToken + " " + kAuthToken + " \" /steam /vr", "with no arguments of its own: " + narrowUtf8(none.args));
+        FrontierHttp test;
+        scriptHappy(&test);
+        test.script[kPurchasesPath] = {jsonReply(purchasesJson("", "/Zz", true))};
+        const DirectPlan testApi = planDirectLaunch(directEnv(&test, keys.keys, nullptr), requestFor(game.product, true));
+        check(testApi.start && contains(narrowUtf8(testApi.args), " /Test /Zz\" /steam /vr"), "a test-API product adds /Test before its server arguments: " + narrowUtf8(testApi.args));
+
+        // VersionInfo.txt: steamaware, offline, a byte order mark.
+        writeVersionInfo(game.product, "4.2.1.0", false, false, true);
+        FrontierHttp unaware;
+        scriptHappy(&unaware);
+        const DirectPlan notSteam = planDirectLaunch(directEnv(&unaware, keys.keys, nullptr), requestFor(game.product, true));
+        check(notSteam.start && !contains(narrowUtf8(notSteam.args), "/steam") && contains(narrowUtf8(notSteam.args), "/vr"), "steamaware false drops /steam (and a byte order mark in VersionInfo.txt is read past)");
+        writeVersionInfo(game.product, "4.2.1.0", true, true);
+        FrontierHttp offline;
+        scriptHappy(&offline);
+        const DirectPlan off = planDirectLaunch(directEnv(&offline, keys.keys, nullptr), requestFor(game.product, true));
+        check(off.start && narrowUtf8(off.args).compare(0, 6, "\"\" /st") == 0, "an offline product is given an empty server token: " + std::string(contains(narrowUtf8(off.args), kAuthToken) ? "(tokens present)" : narrowUtf8(off.args)));
+        dropKeys(keys);
+    }
+
+    // A time call that fails is not a failure: the local clock stands in.
+    {
+        int rows = 0;
+        for (const Reply& timeReply : {noAnswer("no route"), statusReply(500), jsonReply("not json"), jsonReply("{\"unixTimestamp\":\"soon\"}")}) {
+            ++rows;
+            const std::wstring base = fresh("direct-time");
+            const GameTree game = makeGame(base);
+            RigKeys keys = rigKeys(L"time", true);
+            FrontierHttp http;
+            scriptHappy(&http);
+            http.script[kTimePath] = {timeReply};
+            resetEvents();
+            const DirectPlan plan = planDirectLaunch(directEnv(&http, keys.keys, nullptr), requestFor(game.product, true));
+            check(plan.start, "a time call that fails does not stop the launch (row " + std::to_string(rows) + "): " + plan.reason);
+            check(http.requests.size() == 4 && queryValue(http.requests[1].url, "fTime") == "1700000002.00000", "and fTime is the local UTC clock plus the seconds since: " + (http.requests.size() > 1 ? queryValue(http.requests[1].url, "fTime") : std::string("?")));
+            dropKeys(keys);
+        }
+        check(rows == 4, "the time rows were all run");
+    }
+
+    // Falling back: every row of the table, with Steam closed down each time and nothing started.
+    {
+        const std::string T = "HTTP " + kTimePath, A = "HTTP " + kAuthPath, Pu = "HTTP " + kPurchasesPath, I = "HTTP " + kInstallerPath;
+        const std::vector<std::string> up = {"load", "init", "client", "pipe", "global_user", "user", "steamid", "ticket"};
+        const std::vector<std::string> down = {"cancel", "shutdown", "unload"};
+        struct Row {
+            std::string name;
+            std::function<void(FrontierHttp&, const GameTree&)> arrange;
+            std::string steamMode;
+            std::vector<std::string> events;
+            std::string reason;
+        };
+        auto authReplies = [](std::vector<Reply> replies) {
+            return [replies](FrontierHttp& h, const GameTree&) { h.script[kAuthPath] = replies; };
+        };
+        auto purchaseReplies = [](std::vector<Reply> replies) {
+            return [replies](FrontierHttp& h, const GameTree&) { h.script[kPurchasesPath] = replies; };
+        };
+        auto installerReplies = [](std::vector<Reply> replies) {
+            return [replies](FrontierHttp& h, const GameTree&) { h.script[kInstallerPath] = replies; };
+        };
+        auto nothing = [](FrontierHttp&, const GameTree&) {};
+        const std::vector<std::string> afterAuth1 = cat({{T}, up, {A}, down});
+        Reply bigBody;
+        bigBody.body = "{\"purchases\":[],\"pad\":\"" + std::string(5u << 20, 'x') + "\"}";
+        std::vector<Row> rows = {
+            // transport failure, 5xx, or 400, 401, 403: say so, EDLaunch route
+            {"auth: no answer", authReplies({noAnswer("could not connect (Windows error 12029)")}), "", afterAuth1, "could not be reached"},
+            {"auth: 503", authReplies({statusReply(503)}), "", afterAuth1, "unavailable"},
+            {"auth: 500", authReplies({statusReply(500)}), "", afterAuth1, "unavailable"},
+            {"auth: 400", authReplies({statusReply(400)}), "", afterAuth1, "refused the request (HTTP 400)"},
+            {"auth: 401", authReplies({statusReply(401)}), "", afterAuth1, "refused the request (HTTP 401)"},
+            {"auth: 403", authReplies({statusReply(403)}), "", afterAuth1, "refused the request (HTTP 403)"},
+            // the ownership page: once more, and a second page is the answer
+            {"auth: the ownership page twice", authReplies({htmlReply(), htmlReply()}), "", cat({{T}, up, {A, A}, down}), "confirm that this account owns the game"},
+            // 302 and 307: the accounts need linking
+            {"auth: 302", authReplies({statusReply(302)}), "", afterAuth1, "Steam and Frontier accounts need linking (HTTP 302)"},
+            {"auth: 307", authReplies({statusReply(307)}), "", afterAuth1, "Steam and Frontier accounts need linking (HTTP 307)"},
+            // an unexpected reply
+            {"auth: 404", authReplies({statusReply(404)}), "", afterAuth1, "does not know (HTTP 404)"},
+            {"auth: no tokens", authReplies({jsonReply("{\"error_enum\":\"x\",\"message\":\"y\"}")}), "", afterAuth1, "carried no tokens"},
+            {"auth: one token only", authReplies({jsonReply(std::string("{\"authToken\":\"") + kAuthToken + "\"}")}), "", afterAuth1, "carried no tokens"},
+            {"auth: not JSON", authReplies({jsonReply("nonsense")}), "", afterAuth1, "not in the form"},
+            {"auth: too large", authReplies({bigBody}), "", afterAuth1, "larger than allowed"},
+            // the purchases
+            {"purchases: 403", purchaseReplies({statusReply(403)}), "", cat({afterAuth1, {Pu}}), "refused the request (HTTP 403)"},
+            {"purchases: 503", purchaseReplies({statusReply(503)}), "", cat({afterAuth1, {Pu}}), "unavailable"},
+            {"purchases: the ownership page twice", purchaseReplies({htmlReply(), htmlReply()}), "", cat({afterAuth1, {Pu, Pu}}), "confirm that this account owns the game"},
+            {"purchases: 307", purchaseReplies({statusReply(307)}), "", cat({afterAuth1, {Pu}}), "need linking"},
+            {"purchases: not the product", purchaseReplies({jsonReply("{\"purchases\":[{\"product_sku\":\"X\",\"directory\":\"elite-dangerous-64\"}]}")}), "", cat({afterAuth1, {Pu}}), "not among the products"},
+            {"purchases: none", purchaseReplies({jsonReply("{\"purchases\":[]}")}), "", cat({afterAuth1, {Pu}}), "not among the products"},
+            {"purchases: not a list", purchaseReplies({jsonReply("{\"purchases\":5}")}), "", cat({afterAuth1, {Pu}}), "not in the form"},
+            {"purchases: too large", purchaseReplies({bigBody}), "", cat({afterAuth1, {Pu}}), "larger than allowed"},
+            // the game's version
+            {"installer: 503", installerReplies({statusReply(503)}), "", cat({afterAuth1, {Pu, I}}), "unavailable"},
+            {"installer: a different version", installerReplies({jsonReply("{\"version\":\"4.2.2.0\"}")}), "", cat({afterAuth1, {Pu, I}}), "game needs patching (installed 4.2.1.0, current 4.2.2.0)"},
+            {"installer: no version", installerReplies({jsonReply("{\"remotePath\":\"x\"}")}), "", cat({afterAuth1, {Pu, I}}), "carried no version"},
+            {"installer: the ownership page twice", installerReplies({htmlReply(), htmlReply()}), "", cat({afterAuth1, {Pu, I, I}}), "confirm that this account owns the game"},
+            // Steam: no library, a library that will not load or is not Steam's, Steam not running, no user, no id, no ticket
+            {"steam: the library is missing", [](FrontierHttp&, const GameTree& g) { DeleteFileW(g.dll.c_str()); }, "", {},"steam_api64.dll was not found beside Elite's launcher"},
+            {"steam: the library will not load", [](FrontierHttp&, const GameTree& g) { writeAll(g.dll, "this is not a library"); }, "", {T}, "could not be loaded"},
+            {"steam: the library is not Steam's", [](FrontierHttp&, const GameTree& g) { copyOfSystemDll(g.dll); }, "", {T}, "not a version the launcher can use"},
+            {"steam: not running", nothing, "init_fails", {T, "load", "init", "unload"}, "Make sure the Steam client is running"},
+            {"steam: no client", nothing, "no_client", {T, "load", "init", "client", "shutdown", "unload"}, "would not give the launcher your account"},
+            {"steam: no pipe", nothing, "no_pipe", {T, "load", "init", "client", "pipe", "shutdown", "unload"}, "would not give the launcher your account"},
+            {"steam: no global user", nothing, "no_global_user", {T, "load", "init", "client", "pipe", "global_user", "shutdown", "unload"}, "would not give the launcher your account"},
+            {"steam: no user interface", nothing, "no_user", {T, "load", "init", "client", "pipe", "global_user", "user", "shutdown", "unload"}, "would not give the launcher your account"},
+            {"steam: a zero Steam ID", nothing, "zero_id", {T, "load", "init", "client", "pipe", "global_user", "user", "steamid", "shutdown", "unload"}, "would not give the launcher your account"},
+            {"steam: no ticket", nothing, "no_ticket", {T, "load", "init", "client", "pipe", "global_user", "user", "steamid", "ticket", "shutdown", "unload"}, "would not give the launcher your account"},
+            // the folder
+            {"folder: no VersionInfo.txt", [](FrontierHttp&, const GameTree& g) { DeleteFileW(P(g.product, L"VersionInfo.txt").c_str()); }, "", {}, "VersionInfo.txt could not be read"},
+            {"folder: a version nobody can read", [](FrontierHttp&, const GameTree& g) { writeVersionInfo(g.product, "four"); }, "", {}, "cannot read"},
+            {"folder: no executable", [](FrontierHttp&, const GameTree& g) { DeleteFileW(P(g.product, L"EliteDangerous64.exe").c_str()); }, "", {}, "program was not found"},
+            {"folder: no EDLaunch.exe above it", [](FrontierHttp&, const GameTree& g) { DeleteFileW(g.edlaunch.c_str()); }, "", {}, "steam_api64.dll was not found"},
+        };
+        int ran = 0;
+        for (const Row& row : rows) {
+            ++ran;
+            const std::wstring base = fresh("direct-row");
+            const GameTree game = makeGame(base);
+            RigKeys keys = rigKeys(L"row", true);
+            FrontierHttp http;
+            scriptHappy(&http);
+            row.arrange(http, game);
+            setSteamMode(row.steamMode.c_str());
+            resetEvents();
+            std::vector<std::string> progress;
+            const DirectPlan plan = planDirectLaunch(directEnv(&http, keys.keys, &progress), requestFor(game.product, true));
+            setSteamMode("");
+            check(!plan.start && plan.exe.empty() && plan.args.empty(), row.name + ": the plan is to fall back, with nothing to start");
+            check(contains(plan.reason, row.reason), row.name + ": the reason says so (" + row.reason + "): " + plan.reason);
+            const std::string line = fallbackLine(plan.reason);
+            check(contains(line, "Steam instead") && contains(line, "mode it is set to") && contains(line, plan.reason), row.name + ": the band's line gives the reason and the way on: " + line);
+            check(eventTags() == row.events, row.name + ": events " + joined(eventTags()) + "   expected " + joined(row.events));
+            bool progressLeaks = leaks(plan.reason) || leaks(plan.detail) || leaks(line);
+            for (const std::string& p : progress) progressLeaks = progressLeaks || leaks(p);
+            check(!progressLeaks, row.name + ": no token in the reason, the detail, the line or the progress");
+            dropKeys(keys);
+        }
+        check(ran == 40 && static_cast<size_t>(ran) == rows.size(), "every row of the fallback table was run: " + std::to_string(ran));
+    }
+
+    // The ownership page that recovers on the retry: the second answer is taken, and Steam was only asked once.
+    {
+        const std::wstring base = fresh("direct-retry");
+        const GameTree game = makeGame(base);
+        RigKeys keys = rigKeys(L"retry", true);
+        const std::string T = "HTTP " + kTimePath, A = "HTTP " + kAuthPath, Pu = "HTTP " + kPurchasesPath, I = "HTTP " + kInstallerPath;
+        for (int which = 0; which < 3; ++which) {
+            FrontierHttp http;
+            scriptHappy(&http);
+            const Reply good = http.script[which == 0 ? kAuthPath : which == 1 ? kPurchasesPath : kInstallerPath].front();
+            http.script[which == 0 ? kAuthPath : which == 1 ? kPurchasesPath : kInstallerPath] = {htmlReply(), good};
+            resetEvents();
+            std::vector<std::string> progress;
+            const DirectPlan plan = planDirectLaunch(directEnv(&http, keys.keys, &progress), requestFor(game.product, true));
+            check(plan.start, "an ownership page that goes away on the retry is not the end (call " + std::to_string(which + 1) + "): " + plan.reason);
+            const std::vector<std::string> expected =
+                cat({{T}, {"load", "init", "client", "pipe", "global_user", "user", "steamid", "ticket"}, which == 0 ? std::vector<std::string>{A, A} : std::vector<std::string>{A},
+                     {"cancel", "shutdown", "unload"}, which == 1 ? std::vector<std::string>{Pu, Pu} : std::vector<std::string>{Pu}, which == 2 ? std::vector<std::string>{I, I} : std::vector<std::string>{I}});
+            check(eventTags() == expected, "the call was made twice and nothing else was repeated: " + joined(eventTags()));
+            bool said = false;
+            for (const std::string& p : progress) said = said || contains(p, "once more");
+            check(said, "and the window was told it was trying again");
+        }
+        dropKeys(keys);
+    }
+
+    // The reply cap and the tokens on the wire, through the real client, in testHttp. A stop in the middle:
+    {
+        const std::wstring base = fresh("direct-cancel");
+        const GameTree game = makeGame(base);
+        RigKeys keys = rigKeys(L"cancel", true);
+        FrontierHttp http;
+        scriptHappy(&http);
+        std::atomic<bool> stop{true};
+        DirectEnv env = directEnv(&http, keys.keys, nullptr);
+        env.cancel = &stop;
+        resetEvents();
+        const DirectPlan plan = planDirectLaunch(env, requestFor(game.product, true));
+        check(!plan.start && http.requests.empty() && eventTags().empty(), "a launch stopped before it began contacts nothing and loads nothing");
+        dropKeys(keys);
+    }
+}
+
+// The session: the band's behaviour without a window.
+struct DirectRig {
+    Ui ui;
+    FrontierHttp http;
+    RigKeys keys;
+    std::wstring base;
+    GameTree game;
+    std::vector<std::string> seen;  // the line at every change
+    struct Start {
+        std::wstring exe, args, dir;
+    };
+    std::vector<Start> started;
+    std::vector<HANDLE> processes;
+    int hidden = 0;
+    Recorder rec;
+    std::unique_ptr<LauncherSession> session;
+
+    explicit DirectRig(const std::string& name, const std::string& ini) {
+        base = fresh(name);
+        game = makeGame(base);
+        keys = rigKeys(widenUtf8(name), true);
+        scriptHappy(&http);
+        if (!ini.empty()) writeAll(P(base, L"launcher\\launcher.ini"), ini);
+        resetEvents();
+        SessionEnv e;
+        e.roots.dataRoot = base;
+        e.roots.canonical = false;
+        e.selfExe = P(base, L"self.exe");
+        e.keys = g_testKeys;
+        e.makeHttp = [this]() { return std::unique_ptr<HttpClient>(new Share(&http)); };
+        e.post = [this](std::function<void()> f) { ui.post(std::move(f)); };
+        e.changed = [this]() {
+            ++ui.changed;
+            seen.push_back(session ? session->playLine() : std::string());
+        };
+        e.closeWindow = [this]() { ++ui.closed; };
+        e.windowAside = [this](bool aside) { ui.aside.push_back(aside); };
+        e.hideWindow = [this]() { ++hidden; };
+        e.frontierBase = kFrontier;
+        e.machineKeys = keys.keys;
+        e.clock.unixNow = []() { return 1700000000ll; };
+        e.startGame = [this](const std::wstring& exe, const std::wstring& args, const std::wstring& dir) -> HANDLE {
+            started.push_back({exe, args, dir});
+            eventLog("START");
+            return startProgram(P(g_fakes, kFakeGame), L"--run-ms 700");
+        };
+        session.reset(new LauncherSession(e));
+    }
+    ~DirectRig() {
+        session.reset();
+        dropKeys(keys);
+    }
+    // Play, with the fake programs' names and quick timing for the Steam route that follows a fallback.
+    void play(const std::wstring& source, bool vr, bool elevated) {
+        WatchNames names;
+        names.game = kFakeGame;
+        names.edlaunch = kFakeEd;
+        WatchTiming timing;
+        timing.pollMs = 40;
+        timing.startupWaitMs = 300;
+        timing.closeWaitMs = 100;
+        session->beginPlay(source, game.product, vr, elevated, rec.ops(), names, timing);
+    }
+    bool anyLineLeaks() const {
+        for (const std::string& s : seen) {
+            if (leaks(s)) return true;
+        }
+        return leaks(session->playLine());
+    }
+};
+
+void testDirectSession() {
+    section("direct: the session");
+    endFakes();
+    const std::string steamUri = "steam://rungameid/359320";
+    auto uris = [](const Recorder& r) {
+        std::vector<std::string> out;
+        for (const std::wstring& u : r.uris) out.push_back(narrowUtf8(u));
+        return out;
+    };
+
+    // Off by default: no key, the Steam route as before, and nothing contacted or loaded.
+    {
+        DirectRig rig("direct-off", std::string());
+        check(!rig.session->directLaunch(), "with no key the setting is off");
+        rig.play(L"Steam", true, false);
+        check(rig.ui.pump([&]() { return !rig.session->playing(); }), "the Steam route's watcher ends");
+        check(uris(rig.rec) == std::vector<std::string>{steamUri} && rig.started.empty() && rig.http.requests.empty() && eventTags().empty(),
+              "Play on Steam opens steam://rungameid/359320 and contacts nothing, starts nothing and loads nothing");
+        // Other values are off too.
+        int others = 0;
+        for (const char* value : {"off", "ON", "yes", "1", "true", "on "}) {
+            DirectRig other("direct-off-" + std::to_string(++others), std::string("direct_launch=") + value + "\n");
+            check(!other.session->directLaunch(), std::string("direct_launch=") + value + " is off");
+        }
+        check(others == 6, "every other value was tried");
+    }
+
+    // On: direct. The game is started by the launcher, the window hides and closes, nothing else is opened.
+    {
+        DirectRig rig("direct-on", "direct_launch=on\n");
+        check(rig.session->directLaunch(), "direct_launch=on is on");
+        rig.play(L"Steam", false, false);
+        check(rig.session->playing() && contains(rig.session->playLine(), "Signing in"), "Play marks the session busy at once, with the first line: " + rig.session->playLine());
+        check(rig.ui.pump([&]() { return rig.ui.closed == 1; }), "the window closes when the game exits");
+        check(rig.started.size() == 1 && rig.started[0].exe == P(rig.game.product, L"EliteDangerous64.exe") && rig.started[0].dir == rig.game.product, "the game is started once, from its own folder");
+        check(!rig.started.empty() && narrowUtf8(rig.started[0].args) == std::string("\"ServerToken ") + kMachineToken + " " + kAuthToken + " /Zz\" /steam /novr /edo --foo", "with the port's command line, /novr for flat");
+        check(rig.rec.uris.empty() && rig.rec.spawns.empty(), "no store address is opened and nothing is spawned");
+        check(rig.hidden == 1 && rig.ui.aside.empty(), "the window was hidden once, when the game started");
+        check(!rig.session->playing() && rig.session->playLine() == "Elite has closed.", "and the line ends: " + rig.session->playLine());
+        const std::vector<std::string> tags = eventTags();
+        const int start = eventIndex(tags, "START");
+        check(start >= 0 && eventIndex(tags, "cancel") >= 0 && eventIndex(tags, "cancel") < start && eventIndex(tags, "shutdown") < start && eventIndex(tags, "unload") < start && start == static_cast<int>(tags.size()) - 1,
+              "the ticket was cancelled, Steam shut down and its library unloaded before the game was started: " + joined(tags));
+        LauncherState state;
+        state.load(P(P(rig.base, L"launcher"), L"launcher.ini"), nullptr);
+        check(state.mode(rig.game.product) == "flat" && state.directLaunch(), "flat is remembered for the install, and the setting is still on");
+        check(!rig.anyLineLeaks(), "no line the band showed (" + std::to_string(rig.seen.size()) + ") holds a token");
+        check(!treeHas(rig.base, {kAuthToken, kMachineToken, kFakeTicket, kExpectedMachineId}), "no token, ticket or machine ID is in any file under the data root");
+    }
+
+    // VR: the same, with /vr.
+    {
+        DirectRig rig("direct-vr", "direct_launch=on\n");
+        rig.play(L"Steam", true, false);
+        check(rig.ui.pump([&]() { return rig.ui.closed == 1; }) && rig.started.size() == 1 && contains(narrowUtf8(rig.started[0].args), " /steam /vr /edo --foo"), "Play VR starts the game with /vr");
+    }
+
+    // Elevated: refused before anything is contacted.
+    {
+        DirectRig rig("direct-elevated", "direct_launch=on\n");
+        rig.play(L"Steam", true, true);
+        check(!rig.session->playing() && contains(rig.session->playLine(), "administrator") && rig.session->playLine() == elevatedRefusal(), "an elevated launcher says why it will not start Elite: " + rig.session->playLine());
+        check(rig.http.requests.empty() && rig.started.empty() && rig.rec.uris.empty() && rig.rec.spawns.empty() && eventTags().empty(), "and contacts nothing, loads nothing and starts nothing");
+    }
+
+    // Fallbacks, through the session: the reason in the line, then the Steam route, and no game started.
+    {
+        struct Case {
+            const char* name;
+            std::function<void(DirectRig&)> arrange;
+            const char* mode;
+            const char* reason;
+        };
+        const std::vector<Case> cases = {
+            {"a refusal", [](DirectRig& r) { r.http.script[kAuthPath] = {statusReply(403)}; }, "", "refused the request (HTTP 403)"},
+            {"no answer", [](DirectRig& r) { r.http.script[kAuthPath] = {noAnswer("no route")}; }, "", "could not be reached"},
+            {"the ownership page twice", [](DirectRig& r) { r.http.script[kAuthPath] = {htmlReply(), htmlReply()}; }, "", "confirm that this account owns the game"},
+            {"accounts to link", [](DirectRig& r) { r.http.script[kAuthPath] = {statusReply(302)}; }, "", "need linking"},
+            {"a game that needs patching", [](DirectRig& r) { r.http.script[kInstallerPath] = {jsonReply("{\"version\":\"9.9.9.9\"}")}; }, "", "game needs patching"},
+            {"Steam not running", [](DirectRig&) {}, "init_fails", "Steam client is running"},
+        };
+        int ran = 0;
+        for (const Case& c : cases) {
+            ++ran;
+            DirectRig rig(std::string("direct-fallback-") + std::to_string(ran), "direct_launch=on\n");
+            c.arrange(rig);
+            setSteamMode(c.mode);
+            rig.play(L"Steam", true, false);
+            check(rig.ui.pump([&]() { return rig.rec.uris.size() == 1 && !rig.session->playing(); }), std::string(c.name) + ": the Steam route is taken and its watcher ends");
+            setSteamMode("");
+            check(uris(rig.rec) == std::vector<std::string>{steamUri} && rig.started.empty() && rig.hidden == 0 && rig.ui.closed == 0, std::string(c.name) + ": Steam's address is opened and no game is started");
+            bool said = false;
+            for (const std::string& line : rig.seen) said = said || (contains(line, "Direct launch did not work") && contains(line, c.reason) && contains(line, "mode it is set to"));
+            check(said, std::string(c.name) + ": the band's line said why and that the game uses the mode it is set to");
+            check(eventIndex(eventTags(), "START") < 0, std::string(c.name) + ": nothing was started");
+            check(!rig.anyLineLeaks() && !treeHas(rig.base, {kAuthToken, kMachineToken, kFakeTicket, kExpectedMachineId}), std::string(c.name) + ": no token in a line or a file");
+        }
+        check(ran == 6, "every fallback case was run through the session");
+    }
+
+    // Only a Steam install goes direct, even with the key on.
+    {
+        DirectRig rig("direct-other-stores", "direct_launch=on\n");
+        writeAll(P(rig.game.root, L"EDLaunch\\EDLaunch.exe"), "x");
+        WatchNames names;
+        names.game = kFakeGame;
+        names.edlaunch = kFakeEd;
+        WatchTiming timing;
+        timing.pollMs = 40;
+        timing.startupWaitMs = 200;
+        timing.closeWaitMs = 100;
+        rig.session->beginPlay(L"Epic", rig.game.product, true, false, rig.rec.ops(), names, timing);
+        rig.session->shutdown();
+        check(rig.rec.uris.size() == 1 && rig.rec.uris[0].find(L"com.epicgames.launcher://") == 0 && rig.http.requests.empty() && rig.started.empty() && eventTags().empty(), "an Epic install takes its own route and contacts nothing");
+        DirectRig frontier("direct-frontier-store", "direct_launch=on\n");
+        writeAll(P(frontier.game.root, L"EDLaunch\\EDLaunch.exe"), "x");
+        frontier.session->beginPlay(L"Folder you chose", frontier.game.product, true, false, frontier.rec.ops(), names, timing);
+        frontier.session->shutdown();
+        check(frontier.rec.spawns.size() == 1 && frontier.http.requests.empty() && frontier.started.empty(), "and so does a folder started through EDLaunch");
+    }
+
+    // The checkbox's rules: asked first, a No leaves it off, turning it off does not ask.
+    {
+        DirectRig rig("direct-dialog", std::string());
+        int asked = 0;
+        check(!rig.session->setDirectLaunch(true, [&]() { ++asked; return false; }) && asked == 1 && !rig.session->directLaunch(), "turning it on asks, and a No leaves it off");
+        check(!exists(P(P(rig.base, L"launcher"), L"launcher.ini")) || !contains(readAll(P(P(rig.base, L"launcher"), L"launcher.ini")), "direct_launch"), "and writes nothing");
+        rig.play(L"Steam", true, false);
+        rig.ui.pump([&]() { return !rig.session->playing() && rig.rec.uris.size() == 1; });
+        check(rig.http.requests.empty() && rig.started.empty(), "so Play after a No is the Steam route");
+        check(!rig.session->setDirectLaunch(true, nullptr), "with no way to ask, it stays off");
+        check(rig.session->setDirectLaunch(true, [&]() { ++asked; return true; }) && asked == 2 && rig.session->directLaunch(), "a Yes turns it on");
+        LauncherState state;
+        state.load(P(P(rig.base, L"launcher"), L"launcher.ini"), nullptr);
+        check(state.get("direct_launch") == "on" && state.directLaunch(), "and launcher.ini says on");
+        check(rig.session->setDirectLaunch(true, [&]() { ++asked; return false; }) && asked == 2, "turning it on when it is on does not ask again");
+        check(!rig.session->setDirectLaunch(false, [&]() { ++asked; return false; }) && asked == 2 && !rig.session->directLaunch(), "turning it off does not ask");
+        state.load(P(P(rig.base, L"launcher"), L"launcher.ini"), nullptr);
+        check(state.get("direct_launch") == "off" && !state.directLaunch(), "and launcher.ini says off");
+        const std::string question = kDirectLaunchQuestion;
+        check(question.find("Start Elite directly instead of through Frontier's launcher?") == 0 && contains(question, "No password or token is stored.") && contains(question, "Frontier has not approved this.") &&
+                  contains(question, "Untick this at any time to go back to Frontier's launcher.") && question.size() > 11 && question.substr(question.size() - 11) == "Turn it on?",
+              "the question says what the setting does and that Frontier has not approved it");
+    }
+}
+
+// --direct-dry-run: the sign-in as far as the command line, masked, with nothing started.
+void testDryRun() {
+    section("direct: --direct-dry-run");
+    const std::wstring base = fresh("direct-dry");
+    const GameTree game = makeGame(base);
+    RigKeys keys = rigKeys(L"dry", true);
+    AppArgs a;
+    a.directDryRun = true;
+    a.dir = game.product;
+    a.vr = true;
+
+    {
+        FrontierHttp http;
+        scriptHappy(&http);
+        // The machine ID turns up in the game's own arguments here, so the mask has something of each kind to take out.
+        http.script[kPurchasesPath] = {jsonReply(purchasesJson(std::string("--id ") + kExpectedMachineId, "/Zz"))};
+        std::vector<std::string> out;
+        resetEvents();
+        const int code = directDryRunLines(a, directEnv(&http, keys.keys, nullptr), &out);
+        const std::string all = joined(out);
+        check(code == 0 && !out.empty(), "a good sign-in gives a plan and exit code 0: " + std::to_string(code));
+        check(!leaks(all), "no token, ticket or machine ID is anywhere in what is printed");
+        check(!out.empty() && out.back() == "    " + narrowUtf8(P(game.product, L"EliteDangerous64.exe")) + " \"ServerToken <masked> <masked> /Zz\" /steam /vr --id <masked>",
+              "the last line is the program and its arguments, every token and the machine ID as <masked>: " + (out.empty() ? std::string() : out.back()));
+        check(contains(all, "Purchases: 2, fields: product_sku, product_name, directory") && contains(all, "Version on disk: 4.2.1.0, Frontier's: 4.2.1.0"), "it says what it found, as a person comparing it with min-ed-launcher needs");
+        const std::vector<std::string> tags = eventTags();
+        check(eventIndex(tags, "ticket") >= 0 && eventIndex(tags, "unload") >= 0 && eventIndex(tags, "START") < 0 && http.requests.size() == 4, "the whole sign-in ran, Steam was closed down, and nothing was started: " + joined(tags));
+        a.vr = false;
+        a.novr = true;
+        out.clear();
+        FrontierHttp again;
+        scriptHappy(&again);
+        check(directDryRunLines(a, directEnv(&again, keys.keys, nullptr), &out) == 0 && !out.empty() && contains(out.back(), "/steam /novr /edo --foo") && !contains(out.back(), "/steam /vr"), "--novr prints /novr");
+        a.vr = true;
+        a.novr = false;
+    }
+    {
+        FrontierHttp http;
+        scriptHappy(&http);
+        http.script[kAuthPath] = {statusReply(403)};
+        std::vector<std::string> out;
+        const int code = directDryRunLines(a, directEnv(&http, keys.keys, nullptr), &out);
+        check(code == 3 && !out.empty() && contains(out.back(), "Direct launch did not work: Frontier refused the request (HTTP 403)") && !leaks(joined(out)), "a fallback prints its reason and exits 3: " + (out.empty() ? std::string() : out.back()));
+    }
+    {
+        int refused = 0;
+        for (int which = 0; which < 3; ++which) {
+            AppArgs bad = a;
+            if (which == 0) bad.dir.clear();
+            if (which == 1) bad.vr = bad.novr = false;
+            if (which == 2) bad.vr = bad.novr = true;
+            FrontierHttp http;
+            scriptHappy(&http);
+            std::vector<std::string> out;
+            if (directDryRunLines(bad, directEnv(&http, keys.keys, nullptr), &out) == 2 && http.requests.empty() && out.size() == 1 && contains(out[0], "--direct-dry-run needs --dir")) ++refused;
+        }
+        check(refused == 3, "no folder, neither of --vr and --novr, or both: exit 2, with one line, and nothing contacted (" + std::to_string(refused) + " of 3)");
+    }
+    dropKeys(keys);
+}
+
 // ---- the command line ---------------------------------------------------------------------------
 
 AppArgs parse(std::vector<std::wstring> words) {
@@ -2926,10 +4001,16 @@ void testArgs() {
     check(launcherHasCommand(parse({L"--check-update"})) && launcherHasCommand(parse({L"--update"})) && launcherHasCommand(parse({L"--unregister"})) && !launcherHasCommand(parse({L"--install"})) &&
               !launcherHasCommand(parse({})),
           "the commands that need no window are --check-update, --update and --unregister");
+    const AppArgs dry = parse({L"--direct-dry-run", L"--dir", L"D:\\Elite\\Products\\p", L"--vr"});
+    const AppArgs dryFlat = parse({L"--direct-dry-run", L"--dir", L"D:\\Elite\\Products\\p", L"--novr"});
+    check(!dry.badArg && dry.directDryRun && dry.vr && !dry.novr && dry.dir == L"D:\\Elite\\Products\\p" && dryFlat.novr && !dryFlat.vr && launcherHasCommand(dry),
+          "--direct-dry-run, --dir and --vr or --novr are read, and the dry run needs no window");
+    const AppArgs licences = parse({L"--licenses"});
+    check(!licences.badArg && licences.licenses && launcherHasCommand(licences) && !parse({}).licenses && !parse({}).directDryRun, "--licenses is a command with no window");
     check(parse({L"--channel", L"nightly"}).badArg && parse({L"--payload"}).badArg && parse({L"--data-root"}).badArg, "a bad channel and flags missing their value are refused");
     check(parse({L"--channel", L"stable"}).channel == "stable", "stable is accepted");
     const std::string usage = usageText();
-    for (const char* flag : {"--check-update", "--update", "--channel", "--payload", "--data-root", "--unregister", "ed-up-launcher.exe"})
+    for (const char* flag : {"--check-update", "--update", "--channel", "--payload", "--data-root", "--unregister", "--direct-dry-run", "--licenses", "<masked>", "ed-up-launcher.exe"})
         check(contains(usage, flag), std::string("the help names ") + flag);
     check(!contains(usage, "edvr-installer.exe"), "and speaks of the launcher, not the installer");
     check(launcherRootsFor(parse({})).canonical && !launcherRootsFor(parse({L"--data-root", L"E:\\y"})).canonical && launcherMirrorRoot(parse({L"--data-root", L"E:\\y"})) == L"E:\\y",
@@ -2993,8 +4074,14 @@ int main(int argc, char** argv) {
     testRoute();
     testWatcher();
     testSession();
+    testMachineId();
+    testLayoutDpi();
+    testDirectPlan();
+    testDirectSession();
+    testDryRun();
     testArgs();
     endFakes();
+    SetEnvironmentVariableW(L"EDUP_FAKE_STEAM_LOG", nullptr);
 
     std::printf("\nlauncher_test: %d checks, %d failed\n", g_checks, g_fails);
     std::printf("%s\n", g_fails == 0 ? "launcher_test: all good" : "launcher_test: FAILURES");

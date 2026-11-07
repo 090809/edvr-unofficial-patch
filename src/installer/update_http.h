@@ -28,6 +28,10 @@ struct HttpRequest {
     std::wstring toFile;
     // The most body bytes accepted; more fails the request. 0 means the default (64 MiB).
     unsigned long long maxBytes = 0;
+    // False: a 301, 302, 303, 307 or 308 is the answer, returned as a status with no body, and is
+    // never followed. The Frontier calls use this, since a reply that sends a bearer token somewhere
+    // else is not one to obey.
+    bool followRedirects = true;
     // When set and true, the request stops at the next chance.
     const std::atomic<bool>* cancel = nullptr;
     // Called as body bytes arrive: bytes so far, and the total when the server said.

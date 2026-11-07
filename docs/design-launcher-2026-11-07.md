@@ -91,8 +91,9 @@ created as `edvr-unofficial-patch` under this account, so that name is never reu
 
 What users see follows the new name: the README title, release titles, ZIP and exe
 names, `ProductName`, `CompanyName` and window text. The window's heading and title
-bar read "Elite: Dangerous Unofficial Patch" (the maintainer's choice, 2026-11-07), and
-its running text keeps ED-UP. What code and existing installs rely on stays: `edvr.ini`, `edvr-flat.ini`,
+bar read "ED Unofficial Patch", and its running text keeps ED-UP. "Elite: Dangerous
+Unofficial Patch" was tried on 2026-11-07 and dropped the same day, because "Elite:
+Dangerous" is one of Frontier's listed trade marks. What code and existing installs rely on stays: `edvr.ini`, `edvr-flat.ini`,
 the `edvr_*` exports the planner recognises, `%LOCALAPPDATA%\EDVR`, `edvr_install\`
 and log file names. Dated docs keep their old links, which redirect.
 

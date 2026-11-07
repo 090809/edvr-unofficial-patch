@@ -49,10 +49,16 @@ MIN_LAUNCHER = "0.1.0"
 MANIFEST = sign_manifest.MANIFEST_NAME
 LAUNCHER_ASSET = "ed-up-launcher.exe"
 LAUNCHER_VERSION_HEADER = ("src", "installer", "launcher_version.h")
+# The licence of the code direct launch is ported from (min-ed-launcher, MIT). The launcher exe carries it
+# as RCDATA 120 and prints it with --licenses; the core zip carries it as MIN-ED-LAUNCHER-LICENSE.txt.
+LAUNCHER_LICENSE_FILE = ("third_party", "min_ed_launcher", "LICENSE")
+LAUNCHER_LICENSE_NAME = "MIN-ED-LAUNCHER-LICENSE.txt"
+LAUNCHER_LICENSE_RESOURCE = 120
 KEYS_HEADER = ("src", "installer", "update_keys.h")
 CORE_NAMES = ("d3d11.dll", "openvr/openvr_api.dll", "openvr/openxr_loader.dll",
               "openvr/OPENXR-LOADER-LICENSE.txt", "edvr.ini", "edvr-flat.ini", "edvr_profile.ini",
-              "LICENSE.txt", "DXBC-HASH-LICENSE.txt", "FIDELITYFX-SDK-DX11-LICENSE.txt")
+              "LICENSE.txt", "DXBC-HASH-LICENSE.txt", "FIDELITYFX-SDK-DX11-LICENSE.txt",
+              "MIN-ED-LAUNCHER-LICENSE.txt")
 DLSS_NAMES = ("nvngx_dlss.dll", "NVIDIA-DLSS-LICENSE.txt")
 XESS_NAMES = ("libxess.dll", "INTEL-XESS-LICENSE.txt", "INTEL-XESS-THIRD-PARTY.txt")
 # Manifest item -> path in the zips. A licence file not listed here ships in its
@@ -108,6 +114,7 @@ def _files(root, no_dlss):
                    (build / "edvr-flat.ini", "edvr-flat.ini"),
                    (root / "LICENSE", "LICENSE.txt")])
     result.append((root / "third_party" / "dxbc_hash" / "LICENSE.TXT", "DXBC-HASH-LICENSE.txt"))
+    result.append((root.joinpath(*LAUNCHER_LICENSE_FILE), LAUNCHER_LICENSE_NAME))
     # AMD's FSR3 D3D11 port (MIT). Unlike NVIDIA's runtime it ships no DLL --
     # it is statically linked into d3d11.dll -- so its presence in a build is
     # exactly this notice, which build.bat copies beside the binaries when it
@@ -335,7 +342,8 @@ def _validate_launcher(root):
 
       * build\\ed-up-launcher.exe exists (build.bat writes it);
       * its FileVersion and ProductVersion are exactly src\\installer\\launcher_version.h's;
-      * it carries none of the installer's payload resources, 101 to 111;
+      * it carries none of the installer's payload resources, 101 to 111, and carries the min-ed-launcher
+        licence as resource 120, byte for byte the file in third_party;
       * src\\installer\\update_keys.h lists two distinct keys, and neither is the public test key
         of RFC 6979, whose private half is in every library's tests."""
     launcher = root / "build" / LAUNCHER_ASSET
@@ -351,6 +359,12 @@ def _validate_launcher(root):
     for resource_id in range(101, 112):
         if _embedded_resource(launcher, resource_id, required=False) is not None:
             problems.append("%s carries resource %d: the launcher has no embedded payload" % (LAUNCHER_ASSET, resource_id))
+    licence = _embedded_resource(launcher, LAUNCHER_LICENSE_RESOURCE, required=False)
+    licence_file = root.joinpath(*LAUNCHER_LICENSE_FILE)
+    if licence is None:
+        problems.append("%s does not carry resource %d, the min-ed-launcher licence" % (LAUNCHER_ASSET, LAUNCHER_LICENSE_RESOURCE))
+    elif not licence_file.is_file() or licence != licence_file.read_bytes():
+        problems.append("%s resource %d differs from %s" % (LAUNCHER_ASSET, LAUNCHER_LICENSE_RESOURCE, "/".join(LAUNCHER_LICENSE_FILE)))
     keys = sign_manifest.header_keys(root.joinpath(*KEYS_HEADER))
     if len(keys) != 2:
         problems.append("update_keys.h lists %d keys; a release needs the main key and the recovery key" % len(keys))
@@ -599,7 +613,9 @@ def self_test():
         old_resource = globals()['_embedded_resource']
         resources = {101: b"payload", 102: b"payload", 103: b"payload",
                      105: b"payload", 106: b"notice", 107: vr_descriptor, 111: b"payload"}
-        launcher_resources = {}   # a case puts a payload resource into the launcher here
+        # The launcher carries the min-ed-launcher licence as resource 120, the bytes of the file in third_party;
+        # a case puts a payload resource into it, or spoils the licence.
+        launcher_resources = {LAUNCHER_LICENSE_RESOURCE: root.joinpath(*LAUNCHER_LICENSE_FILE).read_bytes()}
 
         def fake_resource(executable, resource_id, required=True):
             if Path(executable).name == LAUNCHER_ASSET:
@@ -752,7 +768,7 @@ def self_test():
                                  "openvr/OPENXR-LOADER-LICENSE.txt", "edvr-installer.exe",
                                  "README.txt", "openvr/READ-ME-FIRST.txt", "edvr.ini", "edvr-flat.ini",
                                   "README-linux.txt", LINUX_WRAPPER, LINUX_LAUNCHER,
-                                  "LICENSE.txt", "DXBC-HASH-LICENSE.txt"}
+                                  "LICENSE.txt", "DXBC-HASH-LICENSE.txt", LAUNCHER_LICENSE_NAME}
                 assert archive.read(LINUX_WRAPPER) == wrapper_source.read_bytes()
                 assert archive.getinfo(LINUX_WRAPPER).external_attr >> 16 == 0o100755
                 assert archive.read(LINUX_LAUNCHER) == launcher_source.read_bytes()
@@ -899,7 +915,7 @@ def self_test():
             xess_names = set(xess_files.values())
             core_names = {"d3d11.dll", "openvr/openvr_api.dll", "openvr/openxr_loader.dll",
                           "openvr/OPENXR-LOADER-LICENSE.txt", "edvr.ini", "edvr-flat.ini",
-                          "edvr_profile.ini", "LICENSE.txt", "DXBC-HASH-LICENSE.txt"}
+                          "edvr_profile.ini", "LICENSE.txt", "DXBC-HASH-LICENSE.txt", LAUNCHER_LICENSE_NAME}
 
             def snapshot():
                 return {path.relative_to(dist).as_posix(): (path.read_bytes() if path.is_file() else None)
@@ -1041,6 +1057,11 @@ def self_test():
                 launcher_resources[resource_id] = b"payload"
                 refused_launcher("launcher with resource %d" % resource_id, "carries resource %d" % resource_id)
                 del launcher_resources[resource_id]
+            good_licence = launcher_resources.pop(LAUNCHER_LICENSE_RESOURCE)
+            refused_launcher("launcher without the licence", "does not carry resource 120")
+            launcher_resources[LAUNCHER_LICENSE_RESOURCE] = good_licence + b" "
+            refused_launcher("launcher with another licence", "resource 120 differs from third_party/min_ed_launcher/LICENSE")
+            launcher_resources[LAUNCHER_LICENSE_RESOURCE] = good_licence
             rfc = sign_manifest.RFC_PUBLIC.lower()
             real_pair = [k for k in re.findall(r'"([0-9a-f]{128})"', real_keys_text)]
             assert len(real_pair) == 2 and real_pair[0] != rfc and real_pair[1] != rfc, "the repository's own keys"

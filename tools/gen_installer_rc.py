@@ -168,6 +168,10 @@ def versioninfo_lines(version, file_description, internal_name, original_filenam
 
 
 LAUNCHER_VERSION_HEADER = ('src', 'installer', 'launcher_version.h')
+# min-ed-launcher's MIT licence, which direct launch's ported code obliges the launcher to carry.
+# src/installer/launcher_main.cpp reads this id; package_native.py checks the bytes.
+IDR_MIN_ED_LAUNCHER_LICENSE = 120
+LAUNCHER_LICENSE_FILE = ('third_party', 'min_ed_launcher', 'LICENSE')
 LAUNCHER_COMMENTS = 'Source and releases: https://github.com/characterecho-sean/ed-unofficial-patch'
 
 
@@ -184,15 +188,20 @@ def launcher_version(root):
 
 
 def write_launcher_rc(root, out, dry_run):
-    """--launcher-rc: launcher.rc with the manifest, the icon and a VERSIONINFO, and no RCDATA at
-    all. The launcher carries no payload (package_native.py refuses one that does), and nothing
-    in the file depends on the build's `git describe` or on the clock, so two builds of the same
-    sources are the same bytes."""
+    """--launcher-rc: launcher.rc with the manifest, the icon, a VERSIONINFO and one RCDATA, the
+    licence of the code direct launch is ported from (id 120, printed by --licenses). The launcher
+    carries no payload (package_native.py refuses one that does, ids 101 to 111), and nothing in the
+    file depends on the build's `git describe` or on the clock, so two builds of the same sources
+    are the same bytes."""
     manifest = os.path.join(root, 'src', 'installer', 'installer.manifest')
+    license_path = os.path.join(root, *LAUNCHER_LICENSE_FILE)
     try:
         version = launcher_version(root)
     except (OSError, ValueError) as exc:
         print('gen_installer_rc: ERROR: %s' % exc)
+        return 1
+    if not os.path.isfile(license_path):
+        print('gen_installer_rc: ERROR: %s is missing: the launcher carries it' % license_path)
         return 1
     try:
         import xml.etree.ElementTree as ElementTree
@@ -212,6 +221,7 @@ def write_launcher_rc(root, out, dry_run):
         '',
         '1 %d "%s"' % (RT_MANIFEST, rc_path(manifest)),
         '1 ICON "%s"' % rc_path(icon_path),
+        '%d RCDATA "%s"' % (IDR_MIN_ED_LAUNCHER_LICENSE, rc_path(license_path)),
         '',
     ] + versioninfo_lines(
         version,
@@ -223,7 +233,7 @@ def write_launcher_rc(root, out, dry_run):
     out_path = os.path.join(out, 'launcher.rc')
     with open(out_path, 'w', encoding='utf-8', newline='\r\n') as f:
         f.write('\n'.join(lines))
-    print('gen_installer_rc: wrote %s (launcher %s, no embedded payload)' % (out_path, version))
+    print('gen_installer_rc: wrote %s (launcher %s, no embedded payload, the min-ed-launcher licence)' % (out_path, version))
     return 0
 
 
@@ -661,6 +671,15 @@ def self_test():
         with open(header, 'w') as stream:
             stream.write('#pragma once\n#define EDUP_LAUNCHER_VERSION "0.1.0"\n')
         lout = os.path.join(lroot, 'out')
+        # The licence the launcher carries is required: without it there is nothing to embed.
+        import contextlib, io
+        no_license = io.StringIO()
+        with contextlib.redirect_stdout(no_license):
+            assert main(['--launcher-rc', '--root', lroot, '--out', lout]) == 1
+        assert 'min_ed_launcher' in no_license.getvalue() and not os.path.exists(lout)
+        os.makedirs(os.path.join(lroot, 'third_party', 'min_ed_launcher'))
+        with open(os.path.join(lroot, 'third_party', 'min_ed_launcher', 'LICENSE'), 'w') as stream:
+            stream.write('MIT License\n')
         assert main(['--launcher-rc', '--root', lroot, '--out', lout, '--dry-run']) == 0 and not os.path.exists(lout)
         assert main(['--launcher-rc', '--root', lroot, '--out', lout, '--version', 'v9.9.9-5-gabc-dirty']) == 0
         with open(os.path.join(lout, 'launcher.rc'), encoding='utf-8') as stream:
@@ -669,7 +688,9 @@ def self_test():
         assert 'FileDescription", "ED-UP launcher"' in launcher_text
         assert 'FileVersion", "0.1.0"' in launcher_text and 'ProductVersion", "0.1.0"' in launcher_text
         assert 'FILEVERSION 0,1,0,0' in launcher_text
-        assert 'RCDATA' not in launcher_text and '9.9.9' not in launcher_text  # no payload, and not the build's describe
+        # No payload, only the licence as 120, and not the build's describe.
+        assert launcher_text.count('RCDATA') == 1 and '120 RCDATA "' in launcher_text and 'LICENSE"' in launcher_text
+        assert '9.9.9' not in launcher_text
         assert '24 "' in launcher_text and 'ICON' in launcher_text
         with open(os.path.join(lout, 'launcher.rc'), 'rb') as stream:
             first = stream.read()
@@ -683,7 +704,6 @@ def self_test():
             assert 'FILEVERSION 0,2,0,0' in stream.read()  # it follows launcher_version.h
         with open(header, 'w') as stream:
             stream.write('#pragma once\n')
-        import contextlib, io
         silent = io.StringIO()
         with contextlib.redirect_stdout(silent):
             assert main(['--launcher-rc', '--root', lroot, '--out', lout]) == 1

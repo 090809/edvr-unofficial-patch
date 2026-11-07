@@ -107,6 +107,10 @@ void LauncherState::raiseHighestIssued(long long issued) {
     if (issued > highestIssued()) set("highest_issued", std::to_string(issued));
 }
 
+bool LauncherState::directLaunch() const { return get("direct_launch") == "on"; }
+
+void LauncherState::setDirectLaunch(bool on) { set("direct_launch", on ? "on" : "off"); }
+
 std::string LauncherState::modeKey(const std::wstring& installFolder) {
     std::wstring folder = installFolder;
     for (wchar_t& c : folder) {

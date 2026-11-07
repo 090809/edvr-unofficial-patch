@@ -17,6 +17,7 @@ enum : int {
     kIdPlay = 1082,
     kIdPlayVr = 1083,
     kIdPlayFlat = 1084,
+    kIdDirect = 1085,
 };
 
 // Posted by the session's worker threads: lParam is a heap std::function<void()> to run here.
@@ -31,8 +32,10 @@ struct LauncherGui {
     HWND play = nullptr;
     HWND playVr = nullptr;
     HWND playFlat = nullptr;
+    HWND direct = nullptr;           // "Start Elite directly", for a Steam install
     std::unique_ptr<LauncherSession> session;
-    std::wstring playCaption;        // under the Play buttons, for the folder shown
+    std::wstring playCaption;        // beside or under the Play buttons, for the folder shown
+    int directLeft = 0;              // where the "Start Elite directly" checkbox starts, in design units
     bool restoreViaPlan = false;     // the user agreed to a settings restore the elevated copy does
     bool noPayloadShown = false;
     std::wstring developerNote;      // set per Install, read by confirmText
@@ -90,16 +93,20 @@ void updateLauncherControls() {
     EnableWindow(lg.update, !lg.session->applying());
     ShowWindow(lg.rc, onScreen ? SW_SHOW : SW_HIDE);
 
-    // Play. Only the Frontier route carries VR or flat, so only it gets two buttons.
+    // Play. Only a route that carries VR or flat gets two buttons: Frontier's, and Steam's once the
+    // launcher starts Elite itself (direct launch, which is off unless the user turned it on).
     lg.playCaption.clear();
-    bool showPlay = false, showPair = false, playEnabled = false;
+    bool showPlay = false, showPair = false, showDirect = false, playEnabled = false;
     if (survey) {
         const LaunchRoute route = routeFor(g.survey.game.source, g.survey.game.dir, true);
         const bool anyGame = g.survey.gameRunningHere || g.survey.gameRunningElsewhere;
         playEnabled = !lg.session->playing() && !busy && !anyGame && !g.survey.gameRunStateUnknown;
-        if (route.kind == RouteKind::Frontier) {
+        showDirect = route.kind == RouteKind::Steam;
+        const bool directOn = showDirect && lg.session->directLaunch();
+        if (route.kind == RouteKind::Frontier || directOn) {
             showPair = true;
-            lg.playCaption = L"Starts EDLaunch with the mode you pick, then closes it when Elite exits.";
+            lg.playCaption = directOn ? L"Signs in with your Steam login and starts Elite itself. If that fails it uses Steam."
+                                      : L"Starts EDLaunch with the mode you pick, then closes it when Elite exits.";
             const bool flat = launcherRememberedMode() == "flat";
             ui::setButtonStyle(lg.playVr, flat ? ui::ButtonStyle::Secondary : ui::ButtonStyle::Primary);
             ui::setButtonStyle(lg.playFlat, flat ? ui::ButtonStyle::Primary : ui::ButtonStyle::Secondary);
@@ -120,6 +127,14 @@ void updateLauncherControls() {
     ShowWindow(lg.playVr, onScreen && showPair ? SW_SHOW : SW_HIDE);
     ShowWindow(lg.playFlat, onScreen && showPair ? SW_SHOW : SW_HIDE);
     for (HWND button : {lg.play, lg.playVr, lg.playFlat}) EnableWindow(button, playEnabled);
+
+    // The checkbox is on the second row, right of whichever Play buttons are showing, and what is under
+    // it is the caption. It follows the saved setting, which is the session's to say.
+    ShowWindow(lg.direct, onScreen && showDirect ? SW_SHOW : SW_HIDE);
+    EnableWindow(lg.direct, !lg.session->playing() && !busy);
+    if (ui::checkboxChecked(lg.direct) != lg.session->directLaunch()) ui::toggleCheckbox(lg.direct);
+    lg.directLeft = kMargin + kCardPad + (showPair ? 262 : 134);
+    MoveWindow(lg.direct, dp(lg.directLeft), dp(696), dp(kClientWidth - kMargin - kCardPad - lg.directLeft), dp(22), TRUE);
 }
 
 void launcherRefresh() {
@@ -136,7 +151,7 @@ void launcherRefresh() {
 void layoutLauncherControls() {
     if (!lg.update) return;
     // These are not in `places`, so a change of scale does not reach their font on its own.
-    for (HWND control : {lg.update, lg.rc, lg.play, lg.playVr, lg.playFlat})
+    for (HWND control : {lg.update, lg.rc, lg.play, lg.playVr, lg.playFlat, lg.direct})
         SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(ui::fonts().body), TRUE);
     MoveWindow(lg.update, dp(574), dp(666), dp(102), dp(26), TRUE);
     MoveWindow(lg.rc, dp(336), dp(666), dp(226), dp(26), TRUE);
@@ -159,11 +174,13 @@ void paintLauncherBand(HDC dc) {
     RECT line{dp(kMargin + kCardPad), dp(666), dp(330), dp(692)};
     ui::drawText(dc, fromUtf8(lg.session->updateLine()), line, f.body, colour, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
 
-    // Beside the pair of buttons, or beside the single one, whichever is showing.
+    // Under the "Start Elite directly" checkbox when that is showing, which is a line shorter than the
+    // card's second row; otherwise beside the pair of buttons, or beside the single one.
     const bool pair = lg.playVr && IsWindowVisible(lg.playVr);
     const bool single = lg.play && IsWindowVisible(lg.play);
-    const int captionLeft = pair ? kMargin + kCardPad + 252 : single ? kMargin + kCardPad + 134 : kMargin + kCardPad;
-    RECT caption{dp(captionLeft), dp(698), dp(kClientWidth - kMargin - kCardPad), dp(742)};
+    const bool underCheckbox = lg.direct && IsWindowVisible(lg.direct);
+    const int captionLeft = underCheckbox ? lg.directLeft : pair ? kMargin + kCardPad + 252 : single ? kMargin + kCardPad + 134 : kMargin + kCardPad;
+    RECT caption{dp(captionLeft), dp(underCheckbox ? 719 : 698), dp(kClientWidth - kMargin - kCardPad), dp(underCheckbox ? 749 : 742)};
     ui::drawText(dc, lg.playCaption, caption, f.caption, t.subtext, DT_LEFT | DT_VCENTER | DT_WORDBREAK | DT_END_ELLIPSIS);
 }
 
@@ -175,7 +192,8 @@ void createLauncherControls(HWND window) {
     lg.play = ui::makeButton(window, L"Play", kIdPlay, ui::ButtonStyle::Primary, f.body);
     lg.playVr = ui::makeButton(window, L"Play VR", kIdPlayVr, ui::ButtonStyle::Primary, f.body);
     lg.playFlat = ui::makeButton(window, L"Play flat", kIdPlayFlat, ui::ButtonStyle::Secondary, f.body);
-    for (HWND control : {lg.update, lg.rc, lg.play, lg.playVr, lg.playFlat}) ShowWindow(control, SW_HIDE);
+    lg.direct = ui::makeCheckbox(window, L"Start Elite directly (no Frontier launcher)", kIdDirect, false, f.body);
+    for (HWND control : {lg.update, lg.rc, lg.play, lg.playVr, lg.playFlat, lg.direct}) ShowWindow(control, SW_HIDE);
 }
 
 // The window is up: load the payload, ask GitHub, and say what start-up had to say.
@@ -202,6 +220,7 @@ void launcherBegin() {
         runAction(AppArgs::Act::Install);
     };
     env.closeWindow = [window]() { PostMessageW(window, WM_CLOSE, 0, 0); };
+    env.hideWindow = [window]() { ShowWindow(window, SW_HIDE); };
     env.windowAside = [window](bool aside) {
         ShowWindow(window, aside ? SW_MINIMIZE : SW_RESTORE);
         if (!aside) SetForegroundWindow(window);
@@ -256,6 +275,16 @@ bool launcherCommand(int id, int code) {
             ui::toggleCheckbox(lg.rc);
             lg.session->setIncludeReleaseCandidates(ui::checkboxChecked(lg.rc));
             return true;
+        case kIdDirect: {
+            // Turning it on asks first, with No as the default; a No leaves it off. Turning it off just does.
+            const bool want = !ui::checkboxChecked(lg.direct);
+            lg.session->setDirectLaunch(want, []() {
+                return MessageBoxW(g.window, fromUtf8(kDirectLaunchQuestion).c_str(), kAppTitle,
+                                   MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) == IDYES;
+            });
+            updateLauncherControls();
+            return true;
+        }
         case kIdPlay:
         case kIdPlayVr:
         case kIdPlayFlat: {

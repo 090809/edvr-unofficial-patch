@@ -227,6 +227,11 @@ HttpResponse WinHttpClient::get(const HttpRequest& request) {
                                  WINHTTP_HEADER_NAME_BY_INDEX, &status, &statusBytes, WINHTTP_NO_HEADER_INDEX))
             return stop(failureText("the reply has no status"));
 
+        if (isRedirect(static_cast<int>(status)) && !request.followRedirects) {
+            result.status = static_cast<int>(status);
+            result.transportOk = true;
+            return result;
+        }
         if (isRedirect(static_cast<int>(status))) {
             const std::string location = queryString(req.h, WINHTTP_QUERY_LOCATION);
             if (location.empty()) return stop("a redirect named no place");

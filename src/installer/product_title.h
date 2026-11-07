@@ -4,12 +4,12 @@
 
 namespace edvr::installer {
 
-inline constexpr const wchar_t* kProductTitle = L"Elite: Dangerous Unofficial Patch";
+inline constexpr const wchar_t* kProductTitle = L"ED Unofficial Patch";
 
 #ifdef EDUP_LAUNCHER
-inline constexpr const wchar_t* kAppTitle = L"Elite: Dangerous Unofficial Patch";
+inline constexpr const wchar_t* kAppTitle = L"ED Unofficial Patch";
 #else
-inline constexpr const wchar_t* kAppTitle = L"Elite: Dangerous Unofficial Patch installer";
+inline constexpr const wchar_t* kAppTitle = L"ED Unofficial Patch installer";
 #endif
 
 }  // namespace edvr::installer

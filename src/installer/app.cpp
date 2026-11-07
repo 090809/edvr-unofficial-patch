@@ -83,6 +83,11 @@ std::string usageText() {
            "                       the launcher itself.\r\n"
            "  --unregister         remove the launcher, its Start menu shortcut and its downloaded files.\r\n"
            "                       ED-UP in your game folders and your settings copies are left alone.\r\n"
+           "  --direct-dry-run --dir <game folder> --vr|--novr\r\n"
+           "                       sign in to Frontier through Steam as a direct launch would, print the\r\n"
+           "                       command line it would start Elite with, every token and your machine ID\r\n"
+           "                       replaced by <masked>, and start nothing. Needs the Steam client running.\r\n"
+           "  --licenses           print the licence of the third-party code the launcher is ported from.\r\n"
 #endif
            "\r\n"
            "  A copy of your settings files (and the install record) is kept outside the game\r\n"
@@ -165,6 +170,14 @@ AppArgs parseArgs(int argc, wchar_t** argv) {
             a.unregister = true;
         else if (arg == L"--updated")
             a.updated = true;
+        else if (arg == L"--direct-dry-run")
+            a.directDryRun = true;
+        else if (arg == L"--vr")
+            a.vr = true;
+        else if (arg == L"--novr")
+            a.novr = true;
+        else if (arg == L"--licenses")
+            a.licenses = true;
 #endif
         else if (arg == L"--help" || arg == L"-h" || arg == L"/?")
             a.help = true;

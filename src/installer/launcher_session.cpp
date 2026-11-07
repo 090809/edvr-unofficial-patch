@@ -4,6 +4,7 @@
 
 #include <cctype>
 
+#include "launch_route.h"
 #include "launcher_state.h"
 #include "probe.h"
 #include "update_util.h"
@@ -226,9 +227,56 @@ void LauncherSession::finishSelfUpdate() {
     if (env_.closeWindow) env_.closeWindow();
 }
 
+LauncherSession::LauncherSession(SessionEnv env) : env_(std::move(env)) {
+    LauncherState state;
+    if (state.load(launcherIniPath(env_.roots), nullptr)) directLaunch_ = state.directLaunch();
+}
+
+bool LauncherSession::setDirectLaunch(bool on, const std::function<bool()>& confirm) {
+    if (on == directLaunch_) return directLaunch_;
+    // Only turning it on is a decision to be asked about; a No leaves it exactly as it was.
+    if (on && (!confirm || !confirm())) return directLaunch_;
+    directLaunch_ = on;
+    LauncherState state;
+    std::string error;
+    if (state.load(launcherIniPath(env_.roots), &error)) {
+        state.setDirectLaunch(on);
+        createDirectories(env_.roots.launcherDir());
+        state.save(&error);
+    }
+    changed();
+    return directLaunch_;
+}
+
+void LauncherSession::rememberMode(const std::wstring& gameDir, bool vr) {
+    LauncherState state;
+    std::string ignored;
+    if (state.load(launcherIniPath(env_.roots), &ignored)) {
+        state.setMode(gameDir, vr ? "vr" : "flat");
+        createDirectories(env_.roots.launcherDir());
+        state.save(&ignored);
+    }
+}
+
 void LauncherSession::beginPlay(const std::wstring& source, const std::wstring& gameDir, bool vr, bool elevated,
                                 const RouteOps& ops, const WatchNames& names, const WatchTiming& timing) {
     if (playing_) return;
+    if (directLaunch_ && _wcsicmp(source.c_str(), L"Steam") == 0) {
+        // Refused before anything is contacted, as the routes are.
+        if (elevated) {
+            playLine_ = elevatedRefusal();
+            changed();
+            return;
+        }
+        beginDirectPlay(source, gameDir, vr, ops, names, timing);
+        return;
+    }
+    startRouteAndWatch(source, gameDir, vr, elevated, ops, names, timing, "Starting Elite...");
+}
+
+void LauncherSession::startRouteAndWatch(const std::wstring& source, const std::wstring& gameDir, bool vr, bool elevated,
+                                         const RouteOps& ops, const WatchNames& names, const WatchTiming& timing,
+                                         const std::string& startLine) {
     const LaunchRoute route = routeFor(source, gameDir, vr);
     std::string error;
     if (!startRoute(route, ops, elevated, &error)) {
@@ -237,17 +285,9 @@ void LauncherSession::beginPlay(const std::wstring& source, const std::wstring& 
         return;
     }
     // The Frontier route is the only one that carried a choice, so only it is remembered.
-    if (route.carriesMode) {
-        LauncherState state;
-        std::string ignored;
-        if (state.load(launcherIniPath(env_.roots), &ignored)) {
-            state.setMode(gameDir, vr ? "vr" : "flat");
-            createDirectories(env_.roots.launcherDir());
-            state.save(&ignored);
-        }
-    }
+    if (route.carriesMode) rememberMode(gameDir, vr);
     playing_ = true;
-    playLine_ = "Starting Elite...";
+    playLine_ = startLine;
     changed();
     spawn([this, names, timing]() {
         const WatchOutcome outcome = watchLaunch(names, timing, &cancel_, [this](WatchEvent e) {
@@ -284,6 +324,78 @@ void LauncherSession::beginPlay(const std::wstring& source, const std::wstring& 
                     break;  // cancelled: the window is closing
             }
             changed();
+        });
+    });
+}
+
+// Direct launch (docs\design-launcher-2026-11-07.md, "Direct, on Steam and the Frontier store"): the
+// sign-in on a worker, the start, and the wait on the process handle held here. A fallback goes back
+// to the window's thread and takes the Steam route, with its reason as the line.
+void LauncherSession::beginDirectPlay(const std::wstring& source, const std::wstring& gameDir, bool vr, const RouteOps& ops,
+                                      const WatchNames& names, const WatchTiming& timing) {
+    rememberMode(gameDir, vr);
+    playing_ = true;
+    playLine_ = "Signing in to Frontier...";
+    changed();
+    const std::string base = env_.frontierBase.empty() ? std::string(kFrontierApiBase) : env_.frontierBase;
+    spawn([this, source, gameDir, vr, ops, names, timing, base]() {
+        std::unique_ptr<HttpClient> http = makeHttp();
+        DirectEnv direct;
+        direct.http = http.get();
+        direct.apiBase = base;
+        direct.makeSteam = env_.makeSteam;
+        direct.machineKeys = env_.machineKeys;
+        direct.clock = env_.clock;
+        direct.cancel = &cancel_;
+        direct.progress = [this](const std::string& line) {
+            post([this, line]() {
+                if (!playing_) return;
+                playLine_ = line;
+                changed();
+            });
+        };
+        DirectRequest request;
+        request.productDir = gameDir;
+        request.vr = vr;
+        DirectPlan plan = planDirectLaunch(direct, request);
+        if (cancel_) return;  // the window is closing
+
+        // Whatever went wrong, the game is not running yet: Steam's route is the way on.
+        auto fallBack = [this, source, gameDir, vr, ops, names, timing](const std::string& reason) {
+            post([this, source, gameDir, vr, ops, names, timing, reason]() {
+                playing_ = false;
+                startRouteAndWatch(source, gameDir, vr, false, ops, names, timing, fallbackLine(reason));
+            });
+        };
+        if (!plan.start) {
+            fallBack(plan.reason);
+            return;
+        }
+        const GameStarter start = env_.startGame ? env_.startGame : GameStarter(startGameProcess);
+        HANDLE process = start(plan.exe, plan.args, plan.workDir);
+        plan = DirectPlan();  // the tokens are not needed again
+        if (!process) {
+            fallBack("Elite could not be started directly");
+            return;
+        }
+        post([this]() {
+            playLine_ = "Elite is running.";
+            if (env_.hideWindow) env_.hideWindow();
+            else if (env_.windowAside) env_.windowAside(true);
+            changed();
+        });
+        while (WaitForSingleObject(process, 200) == WAIT_TIMEOUT) {
+            if (cancel_) {
+                CloseHandle(process);
+                return;  // the window is closing; the game is left running
+            }
+        }
+        CloseHandle(process);
+        post([this]() {
+            playing_ = false;
+            playLine_ = "Elite has closed.";
+            changed();
+            if (env_.closeWindow) env_.closeWindow();
         });
     });
 }

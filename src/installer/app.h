@@ -43,6 +43,10 @@ struct AppArgs {
     bool         update = false;       // --update
     bool         unregister = false;   // --unregister
     bool         updated = false;      // --updated: started by a self-update (internal)
+    bool         directDryRun = false; // --direct-dry-run: sign in, print the masked command line, start nothing
+    bool         vr = false;           // --vr, for --direct-dry-run
+    bool         novr = false;         // --novr, for --direct-dry-run
+    bool         licenses = false;     // --licenses: print the third-party licence the launcher carries
 #endif
 };
 

@@ -64,6 +64,9 @@ struct RouteOps {
 };
 RouteOps realRouteOps();
 
+// The sentence for a start refused because the launcher is elevated. Direct launch says the same.
+const char* elevatedRefusal();
+
 // Starts the route. Refuses when `elevated` is true: the game must never start from an
 // elevated process. `error` says why on false.
 bool startRoute(const LaunchRoute& route, const RouteOps& ops, bool elevated, std::string* error);
