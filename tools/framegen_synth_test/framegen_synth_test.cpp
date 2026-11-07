@@ -27,6 +27,10 @@
 //   11 Phase 2.2, S's transfer on two WARP devices: the module writes the f = 0.5 S into the producer texture and publishes it, the runtime's side (framegen_slot_transfer.h)
 //      opens and consumes it and holds the picture; the f = 1 S is kept; an unconsumed S makes the next one busy; a consume before a release times out at 0 ms; a run of
 //      busy builds remakes the producer texture; no consumer lets it go; the key off releases everything
+//   12 Phase 2.3b, S finished like B at B's door (fgSynFinish): held back until the door; with a still head the runtime's S is the UI layer's composite over S (and over B, to the
+//      resample's rounding) through the exact identity; under a head turn and step the layer's block lands where a direction reference puts it (within 0.5 px) and the image
+//      is the homography's composite; an unfinished S (a named reason, a door that never came, a door that did not sharpen an S built to be) is not handed over and gives the
+//      producer texture's key back; a sharpening door's frame is the one finished over; the eye dump's sink sees the finished S
 // Mutations (each replaces one of the shader's six #define switches, or the host's f, and the case it guards must fail): f ignored, the head turn not taken out of the
 // vector, the guard off, the fill from the nearer side, the score's turn not applied, the score's turn applied the wrong way round.
 #include <windows.h>
@@ -1233,6 +1237,234 @@ void case11Transfer(Gpu& g, Scope& sc) {
     frameGenSynthFrameBoundary();
 }
 
+// ---- case 12: S finished like B at B's door (Phase 2.3b) ----------------------------------------------------------------------------------------------------
+// The CPU reference of fgSynFinish (and of ui_layer's composite, which it is line for line): the layer over `frame` at S pixel (x, y), read where H carries it in B.
+void finishRef(const std::vector<float>& frame, const std::vector<float>& layer, int lw, int lh, const float uv[4], const float H[9], int x, int y, float out[4]) {
+    const float* f = &frame[(static_cast<size_t>(y) * RW + x) * 4];
+    float l[4] = {0, 0, 0, 1};
+    float q[2];
+    if (lw > 0 && frameGenSynthFinishLanding(H, static_cast<float>(x), static_cast<float>(y), q)) {
+        const float spanX = (uv[2] - uv[0]) * lw / RW, spanY = (uv[3] - uv[1]) * lh / RH;
+        const float x0 = uv[0] * lw + q[0] * spanX, y0 = uv[1] * lh + q[1] * spanY, x1 = x0 + spanX, y1 = y0 + spanY;
+        const int k0x = std::max(static_cast<int>(std::floor(x0)), 0), k0y = std::max(static_cast<int>(std::floor(y0)), 0);
+        const int k1x = std::min(static_cast<int>(std::ceil(x1)) - 1, lw - 1), k1y = std::min(static_cast<int>(std::ceil(y1)) - 1, lh - 1);
+        float acc[4] = {}, wsum = 0;
+        for (int j = k0y; j <= std::min(k1y, k0y + 3); ++j) {
+            const float wy = std::min(y1, j + 1.0f) - std::max(y0, static_cast<float>(j));
+            if (wy <= 0) continue;
+            for (int i = k0x; i <= std::min(k1x, k0x + 3); ++i) {
+                const float wx = std::min(x1, i + 1.0f) - std::max(x0, static_cast<float>(i));
+                if (wx <= 0) continue;
+                for (int c = 0; c < 4; ++c) acc[c] += layer[(static_cast<size_t>(j) * lw + i) * 4 + c] * wx * wy;
+                wsum += wx * wy;
+            }
+        }
+        if (wsum > 0) for (int c = 0; c < 4; ++c) l[c] = acc[c] / wsum;
+    }
+    for (int c = 0; c < 3; ++c) out[c] = std::min(1.0f, std::max(0.0f, l[c] + f[c] * l[3]));
+    out[3] = f[3];
+}
+
+// The UI block's coverage-weighted centroid in an image: where 1 - alpha-like darkening shows it (the block is pure red over a scene with no red above 0.6).
+bool redCentroid(const std::vector<float>& img, float out[2]) {
+    double sx = 0, sy = 0, sw = 0;
+    for (int y = 0; y < RH; ++y)
+        for (int x = 0; x < RW; ++x) {
+            const float r = img[(static_cast<size_t>(y) * RW + x) * 4 + 0];
+            const float w = std::max(0.0f, r - 0.7f);
+            sx += w * x; sy += w * y; sw += w;
+        }
+    if (sw <= 0) return false;
+    out[0] = static_cast<float>(sx / sw);
+    out[1] = static_cast<float>(sy / sw);
+    return true;
+}
+
+int g_dumpK = -1;
+ID3D11Texture2D* g_dumpS = nullptr;
+ID3D11Texture2D* g_dumpB = nullptr;
+void dumpSink(ID3D11DeviceContext*, int k, ID3D11Texture2D* s, ID3D11Texture2D* b) { g_dumpK = k; g_dumpS = s; g_dumpB = b; }
+
+void case12Finish(Gpu& g, Scope& sc) {
+    char label[260];
+    ComPtr<ID3D11Device> xr;
+    ComPtr<ID3D11DeviceContext> xrCtx;
+    D3D_FEATURE_LEVEL level{};
+    if (FAILED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, 0, nullptr, 0, D3D11_SDK_VERSION, &xr, &level, &xrCtx))) { sc.ok(false, "case 12: a second WARP device"); return; }
+    frameGenSynthConfigure(false);
+    frameGenSynthFrameBoundary();
+    // B: a scene in [0, 1] (the 8-bit range the composite works in) on a cockpit plane at 1 m; the layer: nothing (0,0,0,1) but a red block, opaque in its middle and 40 %
+    // over the scene at its rim, the way a premultiplied HUD is.
+    Scene s;
+    for (int y = 0; y < RH; ++y)
+        for (int x = 0; x < RW; ++x) {
+            float* p = &s.rgba[(static_cast<size_t>(y) * RW + x) * 4];
+            p[0] = 0.1f + 0.4f * x / RW; p[1] = 0.2f + 0.6f * y / RH; p[2] = 0.5f; p[3] = 1.0f;
+        }
+    std::fill(s.depth.begin(), s.depth.end(), depthOf(1.0f));
+    ModuleFrame m;
+    if (!makeInputs(g, s, m.out, m.depth, m.mv)) { sc.ok(false, "case 12: inputs were made"); return; }
+    std::vector<float> layer(static_cast<size_t>(RW) * RH * 4, 0.0f);
+    for (int y = 0; y < RH; ++y)
+        for (int x = 0; x < RW; ++x) {
+            float* p = &layer[(static_cast<size_t>(y) * RW + x) * 4];
+            const bool core = x >= 60 && x < 72 && y >= 40 && y < 52, rim = x >= 58 && x < 74 && y >= 38 && y < 54;
+            if (core) { p[0] = 1.0f; p[3] = 0.0f; }
+            else if (rim) { p[0] = 0.6f; p[3] = 0.4f; }
+            else p[3] = 1.0f;
+        }
+    Tex lt;
+    if (!g.makeTex(RW, RH, DXGI_FORMAT_R32G32B32A32_FLOAT, layer.data(), RW * 16, lt, false)) { sc.ok(false, "case 12: the layer was made"); return; }
+    const float uv[4] = {0, 0, 1, 1};
+    FrameGenSynthFrame f;
+    f.renderW = RW; f.renderH = RH; f.outW = RW; f.outH = RH;
+    f.tanNow = kTan;
+    f.depthA = 0.0f; f.depthB = kDepthB; f.splitMetres = 10.0f;
+    f.depthWritten = true;
+    f.outSrv = m.out.srv.Get(); f.depthSrv = m.depth.srv.Get(); f.mvSrv = m.mv.srv.Get();
+    for (int i = 0; i < 9; ++i) f.slotRot[i] = (i % 4 == 0) ? 1.0f : 0.0f;
+    f.slotPose = true;
+    f.consumer = true;
+    f.everyHalf = true;
+    f.finish = true;
+    frameGenSynthConfigure(true);
+    edvr::openxr::FrameGenSlotTransfer tr;
+    uint64_t seq = 900;
+    uint32_t frame = 19000;
+    const auto take = [&](EdvrNativeFrameGenS& a) {
+        a = EdvrNativeFrameGenS{};
+        a.size = EDVR_NATIVE_FRAMEGEN_S_SIZE_1; a.version = EDVR_NATIVE_FRAMEGEN_VERSION_1;
+        return edvrFrameGenTakeS(0, &a);
+    };
+    const auto build = [&] {
+        f.slotSequence = ++seq;
+        frameGenSynthEyeFrame(g.dev.Get(), g.ctx.Get(), 0, ++frame, f);
+    };
+    FrameGenSynthFinishInputs in;
+    in.why = kFrameGenFinishDone;
+    in.layer = lt.srv.Get();
+    in.layerW = RW; in.layerH = RH;
+    std::memcpy(in.layerUv, uv, sizeof(uv));
+    in.dumpSink = dumpSink;
+    // Runs one build and its door; returns the runtime's copy of the finished S (empty when nothing crossed) and the unfinished S the door started from.
+    const auto finishOnce = [&](std::vector<float>& unfinished, EdvrNativeFrameGenS& a) {
+        build();
+        std::vector<float> got;
+        EdvrNativeFrameGenS before{};
+        take(before);
+        sc.ok(before.state == EDVR_NATIVE_FRAMEGEN_S_KEPT && before.finish == kFrameGenFinishNoDoor, "case 12: built for the door, S is held back until it (kept, no_door)");
+        ID3D11Texture2D* src = frameGenSynthFinishSource(g.dev.Get(), g.ctx.Get(), 0);
+        if (!src) return got;
+        readRgba32(g.dev.Get(), g.ctx.Get(), src, unfinished);
+        frameGenSynthFinish(g.ctx.Get(), 0, in);
+        take(a);
+        if (a.state == EDVR_NATIVE_FRAMEGEN_S_PRODUCED && tr.open(xr.Get(), static_cast<HANDLE>(a.sharedHandle), a.textureSerial) == S_OK) {
+            tr.markProduced(1, seq);
+            if (tr.consume(0) == S_OK) readRgba32(xr.Get(), xrCtx.Get(), tr.privateTexture(), got);
+        }
+        return got;
+    };
+    float H[9];
+    const auto worstAgainstRef = [&](const std::vector<float>& got, const std::vector<float>& frameIn, const float* Hm) {
+        float worst = 0.0f;
+        for (int y = 0; y < RH; ++y)
+            for (int x = 0; x < RW; ++x) {
+                float r[4];
+                finishRef(frameIn, layer, RW, RH, uv, Hm, x, y, r);
+                for (int c = 0; c < 4; ++c) worst = std::max(worst, std::fabs(got[(static_cast<size_t>(y) * RW + x) * 4 + c] - r[c]));
+            }
+        return worst;
+    };
+    // 1: no head motion. S is B (to the resample's rounding); finished, it is B's composite: what the runtime takes equals the reference over S exactly and B's within the
+    // resample's rounding, the layer read texel for texel (the identity homography).
+    std::vector<float> uf;
+    EdvrNativeFrameGenS a{};
+    g_dumpK = -1;
+    f.wantShown = true; f.dumpIndex = 3;
+    std::vector<float> got = finishOnce(uf, a);
+    f.wantShown = false; f.dumpIndex = -1;
+    const float ident[9] = {1, 0, 0, 0, 1, 0, 0, 0, 1};
+    frameGenSynthFinishHomography(f.slotRot, f.slotT, kTan, RW, RH, kFrameGenFinishPanelMetres, H);
+    sc.ok(std::memcmp(H, ident, sizeof(H)) == 0, "case 12: no head step gives exactly the identity homography (S's composite reads B's texels)");
+    sc.ok(a.state == EDVR_NATIVE_FRAMEGEN_S_PRODUCED && a.finish == kFrameGenFinishDone && !got.empty(), "case 12: finished at the door, S is handed over (produced, finished)");
+    if (!got.empty()) {
+        const float wS = worstAgainstRef(got, uf, H), wB = worstAgainstRef(got, s.rgba, H);
+        std::snprintf(label, sizeof(label), "case 12: a still head: the runtime's S is the composite over S (worst %.6f) and B's finished frame (worst %.5f, the resample's rounding)", wS, wB);
+        sc.ok(wS < 1e-5f && wB < 2e-3f, label);
+    }
+    sc.ok(g_dumpK == 3 && g_dumpS != nullptr, "case 12: the eye dump's frame stages the finished S at the door");
+    // 2: a head turn of 5 degrees and a 2 cm step. The block lands where S's eye sees the plane B's eye saw it on: the centroid against a reference from directions alone
+    // (no homography), within 0.5 px; the image against the homography's reference exactly; and it moved (the case is not vacuous).
+    float c0[2] = {}, c1[2] = {};
+    const bool had0 = redCentroid(got, c0);
+    rotY(5.0f, f.slotRot);
+    f.slotT[0] = 0.02f; f.slotT[1] = 0.0f; f.slotT[2] = 0.0f;
+    got = finishOnce(uf, a);
+    frameGenSynthFinishHomography(f.slotRot, f.slotT, kTan, RW, RH, kFrameGenFinishPanelMetres, H);
+    bool had1 = !got.empty() && redCentroid(got, c1);
+    if (had0 && had1) {
+        // The reference: B's centroid direction on the panel plane at D in B's eye, carried into S's eye by x_S = R x_B + t, projected.
+        float dB[3], dS[3], want[2];
+        temporalPixelToDir(c0[0], c0[1], kTan, RW, RH, dB);
+        const float D = kFrameGenFinishPanelMetres;
+        float pB[3] = {dB[0] * D, dB[1] * D, dB[2] * D}, pS[3];
+        temporalApply3(f.slotRot, pB, pS);
+        for (int i = 0; i < 3; ++i) dS[i] = pS[i] + f.slotT[i];
+        const bool front = temporalDirToPixel(dS, kTan, RW, RH, &want[0], &want[1]);
+        const float err = std::hypot(c1[0] - want[0], c1[1] - want[1]), moved = std::hypot(c1[0] - c0[0], c1[1] - c0[1]);
+        std::snprintf(label, sizeof(label), "case 12: a head turn and step: the UI lands where S's eye sees it (%.3f px off a direction reference; moved %.2f px)", err, moved);
+        sc.ok(front && err <= 0.5f && moved > 2.0f, label);
+        const float wS = worstAgainstRef(got, uf, H);
+        std::snprintf(label, sizeof(label), "case 12: ...and the image is the homography's composite over S (worst %.6f)", wS);
+        sc.ok(wS < 1e-5f, label);
+        if (g_verbose) std::printf("  case 12: centroid B (%.3f, %.3f) -> S (%.3f, %.3f), want (%.3f, %.3f)\n", c0[0], c0[1], c1[0], c1[1], want[0], want[1]);
+    } else {
+        sc.ok(false, "case 12: the block shows in both finished S");
+    }
+    // 3: the door could not finish S (here: the scope lens): nothing crosses, the runtime is told why, and the key is back with the game device (the next S is not busy).
+    in.why = kFrameGenFinishScope;
+    got = finishOnce(uf, a);
+    sc.ok(got.empty() && a.state == EDVR_NATIVE_FRAMEGEN_S_KEPT && a.finish == kFrameGenFinishScope, "case 12: an S the door cannot finish is not handed over, and says why (scope)");
+    in.why = kFrameGenFinishDone;
+    got = finishOnce(uf, a);
+    sc.ok(a.state == EDVR_NATIVE_FRAMEGEN_S_PRODUCED && !got.empty(), "case 12: ...the producer texture's key came back: the next S is finished and handed over, not busy");
+    // 4: no door before the next build: that S was never handed over, and the build after it is not held back by it.
+    const uint32_t unf0 = frameGenSynthOpenWindow().unfinished;
+    build();
+    build();
+    EdvrNativeFrameGenS last{};
+    take(last);
+    sc.ok(last.state == EDVR_NATIVE_FRAMEGEN_S_KEPT && last.finish == kFrameGenFinishNoDoor && frameGenSynthOpenWindow().unfinished > unf0,
+          "case 12: an S whose door never came is counted unfinished, and the next build goes ahead (kept for its own door, not busy)");
+    sc.ok(frameGenSynthFinishSource(g.dev.Get(), g.ctx.Get(), 0) != nullptr, "case 12: ...and waits for its door");
+    frameGenSynthFinish(g.ctx.Get(), 0, in);
+    take(last);
+    if (last.state == EDVR_NATIVE_FRAMEGEN_S_PRODUCED && tr.open(xr.Get(), static_cast<HANDLE>(last.sharedHandle), last.textureSerial) == S_OK) {
+        tr.markProduced(2, seq);
+        tr.consume(0);
+    }
+    // 5: the door sharpens: S is built in the producer texture and finished over the sharpened frame the door hands (a flat grey frame stands for it here).
+    f.finishSharpen = true;
+    std::fill(f.slotRot, f.slotRot + 9, 0.0f); f.slotRot[0] = f.slotRot[4] = f.slotRot[8] = 1.0f; f.slotT[0] = 0.0f;
+    std::vector<float> greyFrame(static_cast<size_t>(RW) * RH * 4, 0.25f);
+    Tex gt;
+    g.makeTex(RW, RH, DXGI_FORMAT_R32G32B32A32_FLOAT, greyFrame.data(), RW * 16, gt, false);
+    in.frame = gt.t.Get();
+    got = finishOnce(uf, a);
+    frameGenSynthFinishHomography(f.slotRot, f.slotT, kTan, RW, RH, kFrameGenFinishPanelMetres, H);
+    sc.ok(a.state == EDVR_NATIVE_FRAMEGEN_S_PRODUCED && !got.empty() && worstAgainstRef(got, greyFrame, H) < 1e-5f,
+          "case 12: B's door sharpens: S is finished over the sharpened frame it hands (the producer texture written from it)");
+    in.frame = nullptr;
+    got = finishOnce(uf, a);
+    sc.ok(got.empty() && a.finish == kFrameGenFinishSharpen, "case 12: ...a door that then does not sharpen leaves that S unfinished (sharpen), not finished over itself");
+    const FrameGenSynthWindow w = frameGenSynthOpenWindow();
+    sc.ok(w.finished >= 4 && w.unfinished >= 3 && w.unfinishedWhy == kFrameGenFinishSharpen, "case 12: the window counts finished and unfinished S and the last reason");
+    tr.release();
+    frameGenSynthConfigure(false);
+    frameGenSynthFrameBoundary();
+    sc.ok(!frameGenSynthResident(), "case 12: the key off releases the finish's shader and textures with the rest");
+}
+
 // ---- the run ---------------------------------------------------------------------------------------------------------------------------------------------
 
 void swapIn(Gpu& g, ComPtr<ID3D11ComputeShader> saved[kEntries], const ComPtr<ID3D11ComputeShader> mutated[kEntries]) {
@@ -1270,7 +1502,8 @@ int run() {
     if (!alive("cases 7 to 9")) return 1;
     case10Slot(g, sc, 0);
     case11Transfer(g, sc);
-    if (!alive("cases 10 and 11")) return 1;
+    case12Finish(g, sc);
+    if (!alive("cases 10 to 12")) return 1;
     (void)edge;
     // The host's mutations of case 10 (the block, not the shader): the slot's pose ignored (the extrapolation built instead), and the step taken the wrong way round (S to B).
     unsigned poseIgnored = 0, poseInverted = 0;

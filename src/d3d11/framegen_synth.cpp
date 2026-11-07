@@ -70,6 +70,17 @@ struct EyeRes {
     uint32_t sharedPath = 0;
     uint64_t serial = 0;
     uint32_t busyRun = 0;
+    // Phase 2.3b: the f = 0.5 S waiting for B's door (frameGenSynthFinish). finHeld: the producer texture's key 0 is held from the build to the door (uav path); finInShared: S
+    // was written in it (the door sharpens it from there), else in `s`; finConsumer: hand it over once finished. The step and tangents S was built with move the UI layer;
+    // finDump is the eye dump's frame. fin: the finished S when neither the producer texture nor `s` can take it (no consumer and no sharpening). finFrameSrv views the door's
+    // sharpened S (finFrameRes, identity only).
+    bool finPending = false, finHeld = false, finInShared = false, finConsumer = false;
+    float finRot[9] = {}, finT[3] = {}, finTan[4] = {};
+    int finDump = -1;
+    EdvrNativeFrameGenS finAnswer = {};
+    Tex fin;
+    void* finFrameRes = nullptr;
+    ID3D11ShaderResourceView* finFrameSrv = nullptr;
 };
 constexpr uint32_t kBusyRemake = 8;
 
@@ -92,13 +103,15 @@ struct State {
     ID3D11Device* dev = nullptr;   // identity only
     bool failed = false;           // creation failed on this device: stand down until it changes or the key is toggled
     ID3D11ComputeShader* cs[kEntries] = {};
+    ID3D11ComputeShader* csFinish = nullptr;   // Phase 2.3b: fgSynFinish, outside the pass sequence
+    TimerSlot* finTimer[2] = {};               // the finish's timer per eye, from frameGenSynthFinishSource to frameGenSynthFinish
     ID3D11Buffer* cb = nullptr;
     DXGI_FORMAT lumaFormat = DXGI_FORMAT_R16_FLOAT;
     EyeRes eye[2];
     Scratch scratch;
     TimerSlot timers[kTimerRing];
     FrameGenSynthWindow win;
-    std::vector<float> gpuMs[2];
+    std::vector<float> gpuMs[3];   // [0] the f = 0.5 build, [1] the f = 1 build, [2] the finish (Phase 2.3b)
     std::vector<float> rotRes;     // the residual rotation's angle of each scored frame in the window, degrees
     int64_t windowTicks = 0;
     // Phase 2.2: the runtime's answer per eye (frameGenSynthTakeS), the serial the next producer texture takes, whether any slot reached the module since the key went on (and
@@ -135,6 +148,8 @@ void releaseShared(EyeRes& r) {
 
 void releaseEye(EyeRes& r) {
     releaseShared(r);
+    releaseTex(r.fin);
+    releaseCom(r.finFrameSrv);
     releaseTex(r.s);
     releaseTex(r.sLuma);
     releaseTex(r.bInfo);
@@ -156,13 +171,12 @@ bool anyResources() {
     if (g.cb || g.scratch.key.tex) return true;
     for (const EyeRes& r : g.eye) if (r.created) return true;
     for (ID3D11ComputeShader* c : g.cs) if (c) return true;
-    return false;
+    return g.csFinish != nullptr;
 }
 
 void windowReset() {
     g.win = FrameGenSynthWindow{};
-    g.gpuMs[0].clear();
-    g.gpuMs[1].clear();
+    for (auto& v : g.gpuMs) v.clear();
     g.rotRes.clear();
 }
 
@@ -349,6 +363,8 @@ void releaseAll() {
     for (EyeRes& r : g.eye) releaseEye(r);
     releaseScratch();
     for (auto& c : g.cs) releaseCom(c);
+    releaseCom(g.csFinish);
+    g.finTimer[0] = g.finTimer[1] = nullptr;   // a timer slot in flight is polled on as before (pollTimers); only the eye's claim on it goes
     releaseCom(g.cb);
     g.dev = nullptr;
     g.failed = false;
@@ -379,6 +395,8 @@ bool createCommon(ID3D11Device* dev, ID3D11DeviceContext* ctx) {
         g.cs[e.entry] = shaderSwapCreateCs(ctx, e.code, e.size, e.name, "frame generation (synth)");
         if (!g.cs[e.entry]) return false;
     }
+    g.csFinish = shaderSwapCreateCs(ctx, kFrameGenSynthFinishBytecode, sizeof(kFrameGenSynthFinishBytecode), "framegen_synth_finish", "frame generation (synth)");
+    if (!g.csFinish) return false;
     D3D11_BUFFER_DESC bd{};
     bd.ByteWidth = sizeof(FrameGenSynthCb);
     bd.Usage = D3D11_USAGE_DYNAMIC;
@@ -506,7 +524,7 @@ uint64_t bufBytes(ID3D11Buffer* b) {
 
 FrameGenSynthVram vramOf(const EyeRes& r, const Scratch& sc) {
     FrameGenSynthVram v;
-    v.s = texBytes(r.s);
+    v.s = texBytes(r.s) + texBytes(r.fin);   // Phase 2.3b: the finished S's own texture, when it has one, counts as S
     v.shared = texBytes(r.shared);
     v.luma = texBytes(r.sLuma);
     v.cls = texBytes(r.bInfo);
@@ -600,7 +618,7 @@ bool makeShared(ID3D11Device* dev, EyeRes& r) {
 
 // Where this call's S goes: the producer texture while the runtime consumes S (made here when first needed, let go when it stops), else the private `s`; on the copy path both.
 // `changed` says the eye's set was made or let go (its VRAM line is due). False only when the private texture could not be made.
-bool ensureTarget(ID3D11Device* dev, EyeRes& r, uint32_t eye, bool consumer, bool& changed) {
+bool ensureTarget(ID3D11Device* dev, EyeRes& r, uint32_t eye, bool consumer, bool& changed, bool needPrivate = false) {
     if (consumer && !r.shared.tex && !g.sharedRefused) {
         if (makeShared(dev, r)) {
             changed = true;
@@ -614,7 +632,7 @@ bool ensureTarget(ID3D11Device* dev, EyeRes& r, uint32_t eye, bool consumer, boo
         releaseShared(r);
         changed = true;
     }
-    const bool wantPrivate = r.sharedPath != 1;
+    const bool wantPrivate = r.sharedPath != 1 || needPrivate;   // needPrivate (Phase 2.3b): S is finished from `s` into the producer texture
     if (wantPrivate && !r.s.tex) {
         if (!makeTex(dev, r.ow, r.oh, r.sFormat, r.s)) return false;
         changed = true;
@@ -648,6 +666,50 @@ void sharedFault(EyeRes& r, uint32_t eye, HRESULT hr) {
     g.sharedRefused = true;
     Log::get().note("frame generation (synth): eye %u: the producer texture's keyed mutex failed (0x%08X); S stays on the game device for the rest of the arm.", static_cast<unsigned>(eye),
                     static_cast<unsigned>(hr));
+}
+
+// Phase 2.3b: a waiting S whose door did not come before the eye's next build: the producer texture's key goes back to the game device, the finish's timer is closed, and the S is
+// counted unfinished (its answer already said no_door, and it was not handed over).
+void abandonFinish(ID3D11DeviceContext* ctx, EyeRes& r, uint32_t eye) {
+    if (!r.finPending) return;
+    r.finPending = false;
+    if (r.finHeld && r.mutex) {
+        const HRESULT rel = r.mutex->ReleaseSync(0);
+        if (rel != S_OK) sharedFault(r, eye, rel);
+    }
+    r.finHeld = false;
+    if (g.finTimer[eye]) {
+        g.finTimer[eye]->timer.end(ctx);
+        g.finTimer[eye] = nullptr;
+    }
+    ++g.win.unfinished;
+    g.win.unfinishedWhy = kFrameGenFinishNoDoor;
+}
+
+// The SRV a finish reads its frame through: the module's own views for S's textures, else a view over the door's sharpened S (made when that texture changes).
+ID3D11ShaderResourceView* finishFrameView(EyeRes& r, ID3D11Texture2D* tex) {
+    if (tex == r.shared.tex) return r.shared.srv;
+    if (tex == r.s.tex) return r.s.srv;
+    if (r.finFrameRes != static_cast<void*>(tex) || !r.finFrameSrv) {
+        releaseCom(r.finFrameSrv);
+        r.finFrameRes = nullptr;
+        ID3D11Device* dev = nullptr;
+        tex->GetDevice(&dev);
+        D3D11_TEXTURE2D_DESC d{};
+        tex->GetDesc(&d);
+        D3D11_SHADER_RESOURCE_VIEW_DESC vd{};
+        vd.Format = r.sFormat;   // the sharpener writes S's own format family; read it in S's view format
+        vd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+        vd.Texture2D.MipLevels = 1;
+        const bool ok = dev && (d.BindFlags & D3D11_BIND_SHADER_RESOURCE) && SUCCEEDED(dev->CreateShaderResourceView(tex, &vd, &r.finFrameSrv));
+        if (dev) dev->Release();
+        if (!ok) {
+            releaseCom(r.finFrameSrv);
+            return nullptr;
+        }
+        r.finFrameRes = tex;
+    }
+    return r.finFrameSrv;
 }
 
 }  // namespace
@@ -703,6 +765,7 @@ void frameGenSynthEyeFrame(ID3D11Device* dev, ID3D11DeviceContext* ctx, uint32_t
     }
     EyeRes& r = g.eye[eye];
     r.shownValid = false;
+    abandonFinish(ctx, r, eye);   // Phase 2.3b: the last S's door never came
     if (f.slotSequence) g.slotSeen = true;
     // This call's answer to the runtime (frameGenSynthTakeS), stored on every way out below.
     EdvrNativeFrameGenS answer{};
@@ -754,7 +817,8 @@ void frameGenSynthEyeFrame(ID3D11Device* dev, ID3D11DeviceContext* ctx, uint32_t
         return;
     }
     bool changed = false;
-    if (!ensureTarget(dev, r, eye, f.consumer, changed)) {
+    // Phase 2.3b: S finished at the door without sharpening is written in `s` and finished into the producer texture, so `s` is kept on the uav path too.
+    if (!ensureTarget(dev, r, eye, f.consumer, changed, f.finish && !f.finishSharpen)) {
         g.failed = true;
         Log::get().note("frame generation (synth): the S texture could not be created (%ux%u output, format %u); it stands down.", static_cast<unsigned>(f.outW), static_cast<unsigned>(f.outH),
                         static_cast<unsigned>(sFormat));
@@ -768,6 +832,7 @@ void frameGenSynthEyeFrame(ID3D11Device* dev, ID3D11DeviceContext* ctx, uint32_t
     pollTimers(ctx);
 
     const bool half = f.wantShown || f.everyHalf || ((r.calls++ & 1u) == 0u);   // the even frames (and the dump's, and every frame under Lock's key) build the f = 0.5 S
+    const bool finishing = half && f.finish;   // Phase 2.3b: this S waits for B's door
     const bool score = r.havePending && r.bFrame + 1u == frame && !f.cameraJump;
     const bool keep = !half && !f.cameraJump;
 
@@ -839,7 +904,9 @@ void frameGenSynthEyeFrame(ID3D11Device* dev, ID3D11DeviceContext* ctx, uint32_t
     v.keySrv = sc.key.srv; v.keyUav = sc.key.uav;
     v.readSrv = sc.read.srv; v.readUav = sc.read.uav;
     v.holesUav = sc.holesUav;
-    const Tex& target = held ? r.shared : r.s;
+    // Phase 2.3b: an S the door finishes without sharpening is built in `s` (the finish then writes the producer texture from it); one it sharpens is built where it is handed from.
+    const bool sharedTarget = held && !(finishing && !f.finishSharpen);
+    const Tex& target = sharedTarget ? r.shared : r.s;
     v.sSrv = target.srv; v.sUav = target.uav;
     v.sLumaSrv = r.sLuma.srv; v.sLumaUav = r.sLuma.uav;
     v.bInfoSrv = r.bInfo.srv; v.bInfoUav = r.bInfo.uav;
@@ -854,11 +921,28 @@ void frameGenSynthEyeFrame(ID3D11Device* dev, ID3D11DeviceContext* ctx, uint32_t
     if (timer) timer->timer.end(ctx);
     save.restore(ctx);
 
-    // The dump stages the f = 0.5 S while the module still holds it.
-    if (half && f.wantShown && f.shownSink) f.shownSink(f.shownSinkContext, ctx, target.tex);
-    // Phase 2.2: hand the f = 0.5 S to the runtime (key 1) when it consumes S; everything else stays on the game device (key 0). The flush is the transfer's own discipline
-    // (shared_texture_transfer.cpp): the runtime's copy must not wait on work the game's context has not submitted.
-    if (held) {
+    // The dump stages the f = 0.5 S while the module still holds it (an S the door finishes is staged there, finished).
+    if (half && f.wantShown && f.shownSink && !finishing) f.shownSink(f.shownSinkContext, ctx, target.tex);
+    // Phase 2.3b: an S B's door finishes is not handed over here. The producer texture's key 0 stays held (uav path) until the door; the answer says no_door until the door
+    // replaces it, so a door that never comes leaves an S nobody shows.
+    if (finishing) {
+        r.finPending = true;
+        r.finHeld = held;
+        r.finInShared = sharedTarget;
+        r.finConsumer = f.consumer;
+        for (int i = 0; i < 3; ++i) {
+            for (int k = 0; k < 3; ++k) r.finRot[i * 3 + k] = cb.rs[i][k];
+            r.finT[i] = cb.rs[i][3];
+        }
+        for (int i = 0; i < 4; ++i) r.finTan[i] = f.tanNow[i];
+        r.finDump = f.wantShown ? f.dumpIndex : -1;
+        if (held) r.busyRun = 0;
+        g.win.pathBits |= held ? 2u : (r.sharedPath == 2 && f.consumer ? 4u : 1u);
+        answer.state = EDVR_NATIVE_FRAMEGEN_S_KEPT;
+        answer.finish = kFrameGenFinishNoDoor;
+        storeAnswer();
+        r.finAnswer = answer;
+    } else if (held) {
         HRESULT rel;
         if (half && f.consumer) {
             ctx->Flush();
@@ -898,7 +982,8 @@ void frameGenSynthEyeFrame(ID3D11Device* dev, ID3D11DeviceContext* ctx, uint32_t
         answer.state = EDVR_NATIVE_FRAMEGEN_S_KEPT;
         g.win.pathBits |= r.sharedPath == 2 ? 4u : 1u;   // the copy path's other builds are its own; private means no producer texture at all
     }
-    storeAnswer();
+    if (half && !finishing) answer.finish = kFrameGenFinishNoDoor;   // Phase 2.3b: no door finishes this S (the runtime does not show it)
+    if (!finishing) storeAnswer();
 
     r.havePending = keep;
     if (keep) {
@@ -910,6 +995,142 @@ void frameGenSynthEyeFrame(ID3D11Device* dev, ID3D11DeviceContext* ctx, uint32_t
     r.shownValid = half && !held;   // frameGenSynthShown hands out the private S only
     r.shownFrame = frame;
     if (f.replay) replayCapture(dev, ctx, f, frame, cb);
+}
+
+// ---- Phase 2.3b: S finished as B is, at B's door ----
+ID3D11Texture2D* frameGenSynthFinishSource(ID3D11Device* dev, ID3D11DeviceContext* ctx, uint32_t eye) {
+    if (!g_on.load() || eye > 1 || !dev || !ctx) return nullptr;
+    EyeRes& r = g.eye[eye];
+    if (!r.finPending) return nullptr;
+    if (!g.finTimer[eye]) g.finTimer[eye] = beginTimer(dev, ctx, 2);
+    return r.finInShared ? r.shared.tex : r.s.tex;
+}
+
+ID3D11Texture2D* frameGenSynthFinish(ID3D11DeviceContext* ctx, uint32_t eye, const FrameGenSynthFinishInputs& in) {
+    if (!g_on.load() || eye > 1 || !ctx) return nullptr;
+    EyeRes& r = g.eye[eye];
+    if (!r.finPending) return nullptr;
+    r.finPending = false;
+    EdvrNativeFrameGenS answer = r.finAnswer;
+    const auto store = [&] {
+        answer.path = r.sharedPath;
+        answer.sharedHandle = r.handle;
+        answer.textureSerial = r.shared.tex ? r.serial : 0;
+        answer.gameBytes = texBytes(r.s) + texBytes(r.shared) + texBytes(r.fin);
+        std::lock_guard<std::mutex> l(g_answerMu);
+        g.answer[eye] = answer;
+    };
+    const auto endTimer = [&] {
+        if (g.finTimer[eye]) {
+            g.finTimer[eye]->timer.end(ctx);
+            g.finTimer[eye] = nullptr;
+        }
+    };
+    // Unfinished: the key goes back to the game device, nothing is handed over, and the runtime is told why.
+    const auto unfinished = [&](uint32_t why) -> ID3D11Texture2D* {
+        if (r.finHeld && r.mutex) {
+            const HRESULT rel = r.mutex->ReleaseSync(0);
+            if (rel != S_OK) sharedFault(r, eye, rel);
+        }
+        r.finHeld = false;
+        ++g.win.unfinished;
+        g.win.unfinishedWhy = why;
+        answer.state = EDVR_NATIVE_FRAMEGEN_S_KEPT;
+        answer.finish = why;
+        store();
+        endTimer();
+        return nullptr;
+    };
+    if (in.why != kFrameGenFinishDone) return unfinished(in.why);
+    ID3D11Texture2D* const sTex = r.finInShared ? r.shared.tex : r.s.tex;
+    ID3D11Texture2D* const src = in.frame ? in.frame : sTex;
+    if (!src || !g.csFinish) return unfinished(kFrameGenFinishFault);
+    // S itself in the producer texture is there to be sharpened from: a door that did not sharpen it leaves nothing to finish into (the strength changed between the build and
+    // the door).
+    if (!in.frame && r.finInShared) return unfinished(kFrameGenFinishSharpen);
+    D3D11_TEXTURE2D_DESC sd{};
+    src->GetDesc(&sd);
+    if (sd.Width != r.ow || sd.Height != r.oh) return unfinished(kFrameGenFinishCropped);
+    ID3D11Device* dev = nullptr;
+    ctx->GetDevice(&dev);
+    if (!dev) return unfinished(kFrameGenFinishFault);
+    // Where the finished S goes: the producer texture while its key is held (uav path); else `s` when S is not being read from it; else the module's own texture.
+    Tex* dst = nullptr;
+    if (r.finHeld && r.sharedPath == 1) dst = &r.shared;
+    else if (src != r.s.tex && r.s.tex) dst = &r.s;
+    else {
+        if (!r.fin.tex && makeTex(dev, r.ow, r.oh, r.sFormat, r.fin)) Log::get().note("%s", formatFrameGenSynthVram(eye, vramOf(r, g.scratch)).c_str());
+        dst = r.fin.tex ? &r.fin : nullptr;
+    }
+    dev->Release();
+    ID3D11ShaderResourceView* const frameSrv = finishFrameView(r, src);
+    if (!dst || !dst->uav || !frameSrv) return unfinished(kFrameGenFinishFault);
+    float H[9];
+    frameGenSynthFinishHomography(r.finRot, r.finT, r.finTan, r.ow, r.oh, kFrameGenFinishPanelMetres, H);
+    FrameGenSynthCb cb;
+    frameGenSynthFinishFillCb(cb, r.ow, r.oh, 0, 0, H, in.layerUv, in.layer ? in.layerW : 0u, in.layer ? in.layerH : 0u, in.layer && in.mult);
+    D3D11_MAPPED_SUBRESOURCE m{};
+    if (FAILED(ctx->Map(g.cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) return unfinished(kFrameGenFinishFault);
+    std::memcpy(m.pData, &cb, sizeof(cb));
+    ctx->Unmap(g.cb, 0);
+    {
+        CsStageSave save;
+        save.save(ctx);
+        ID3D11ShaderResourceView* nullSrv[11] = {};
+        ID3D11UnorderedAccessView* nullUav[7] = {};   // u0..u6, the slots CsStageSave puts back
+        ctx->CSSetShaderResources(0, 11, nullSrv);
+        ctx->CSSetUnorderedAccessViews(0, 7, nullUav, nullptr);
+        ctx->CSSetShader(g.csFinish, nullptr, 0);
+        ctx->CSSetConstantBuffers(0, 1, &g.cb);
+        ctx->CSSetShaderResources(3, 1, &frameSrv);
+        ID3D11ShaderResourceView* layer = in.layer;
+        ctx->CSSetShaderResources(5, 1, &layer);
+        ID3D11ShaderResourceView* mult = in.layer ? in.mult : nullptr;
+        ctx->CSSetShaderResources(10, 1, &mult);
+        ctx->CSSetUnorderedAccessViews(2, 1, &dst->uav, nullptr);
+        ctx->Dispatch((r.ow + 7u) / 8u, (r.oh + 7u) / 8u, 1);
+        ctx->CSSetShaderResources(0, 11, nullSrv);
+        ctx->CSSetUnorderedAccessViews(0, 7, nullUav, nullptr);
+        save.restore(ctx);
+    }
+    // The eye dump stages the finished S while the module still holds it.
+    if (r.finDump >= 0 && in.dumpSink) in.dumpSink(ctx, r.finDump, dst->tex, in.bFinished);
+    // Handed over as 2.2 hands S: on the uav path the held key goes to the runtime; on the copy path the finished S is copied in under the key.
+    answer.state = EDVR_NATIVE_FRAMEGEN_S_KEPT;
+    if (r.finConsumer && r.finHeld) {
+        ctx->Flush();
+        const HRESULT rel = r.mutex->ReleaseSync(1);
+        r.finHeld = false;
+        if (rel == S_OK) answer.state = EDVR_NATIVE_FRAMEGEN_S_PRODUCED;
+        else sharedFault(r, eye, rel);
+    } else if (r.finHeld) {
+        const HRESULT rel = r.mutex->ReleaseSync(0);
+        r.finHeld = false;
+        if (rel != S_OK) sharedFault(r, eye, rel);
+    } else if (r.finConsumer && r.sharedPath == 2 && r.mutex) {
+        const HRESULT a = r.mutex->AcquireSync(0, 0);
+        if (a == static_cast<HRESULT>(WAIT_TIMEOUT)) {
+            noteBusy(r, eye);
+            answer.state = EDVR_NATIVE_FRAMEGEN_S_BUSY;
+        } else if (a == S_OK) {
+            ctx->CopyResource(r.shared.tex, dst->tex);
+            ctx->Flush();
+            const HRESULT rel = r.mutex->ReleaseSync(1);
+            if (rel == S_OK) {
+                answer.state = EDVR_NATIVE_FRAMEGEN_S_PRODUCED;
+                r.busyRun = 0;
+            } else {
+                sharedFault(r, eye, rel);
+            }
+        } else {
+            sharedFault(r, eye, a);
+        }
+    }
+    answer.finish = kFrameGenFinishDone;
+    ++g.win.finished;
+    store();
+    endTimer();
+    return dst->tex;
 }
 
 bool frameGenReplayFinish(const wchar_t* eyesDir, const wchar_t* stamp) {
@@ -1006,7 +1227,7 @@ void frameGenSynthFrameBoundary() {
         windowReset();
         return;
     }
-    for (int k = 0; k < 2; ++k) {
+    for (int k = 0; k < 3; ++k) {
         g.win.gpuSamples[k] = static_cast<uint32_t>(g.gpuMs[k].size());
         g.win.gpuMax[k] = 0.0f;
         for (float v : g.gpuMs[k]) if (v > g.win.gpuMax[k]) g.win.gpuMax[k] = v;

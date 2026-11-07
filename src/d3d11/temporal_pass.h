@@ -295,6 +295,9 @@ void temporalPassNoteEyes(int eye, const float (*prevEyes)[12],
 // S (framegen_synth_math.h frameGenSlotStep; rot row-major 3x3, t metres, B's eye space to S's), null when the runtime handed none; and whether the runtime consumes this frame's S
 // (edvrFrameGenNoteSlot's consumer), with the treat's sequence the module stamps its answer with. Good for the treat that follows on the same frame only. Internal to d3d11.dll.
 void temporalPassNoteFrameGenSlot(int eye, const float* rot, const float* t, bool consumer, uint64_t sequence);
+// Phase 2.3b: the eye dump's frame k, at B's door (native_sharpen.cpp through framegen_synth.h's dumpSink): the synthesized S as finished (eye_<stamp>_S<k>.bmp) and B as its door
+// finished it (eye_<stamp>_SB<k>.bmp), both in the pre-interface output's crop, so the two are compared pixel for pixel. Copies only; written with the run's other files.
+void temporalPassStageFrameGenDump(ID3D11DeviceContext* ctx, int k, ID3D11Texture2D* finishedS, ID3D11Texture2D* finishedB);
 // Frame generation, Phase 2.3 (fix.frame_generation): whether the runtime's slot for the treat being made said Lock 2:1 is engaged (native_temporal.cpp; false with a 2.2
 // runtime, which hands a size 1 slot, or with no slot). Read by the pass right after the treat's note, on the same thread.
 bool nativeTemporalFrameGenLock();

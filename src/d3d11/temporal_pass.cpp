@@ -63,6 +63,7 @@
 #include "binding_shadow.h"   // the render target a camera write is drawn into (bindingGet, bindingResolve)
 #include "framegen_shadow.h"   // frame generation Phase 1 (fix.frame_generation_shadow, TEMPORARY)
 #include "framegen_synth.h"    // frame generation Phase 2.1, the synthesizer (the same key; nothing it builds is shown)
+#include "../common/native_sharpen.h"   // Phase 2.3b: B's door, which finishes S (nativeSharpenActive, nativeSharpenWillSharpen)
 #include "../common/native_frame.h"   // nativeFrameSetFrameGenShadow: the key, carried to the runtime in a version 12 answer
 #include "sky_ring.h"   // I-2: the sky ring (diag.sky_ring, TEMPORARY; docs/sky-flicker-2026-10-13.md)
 #include "../common/camera_nearest.h"       // the nearest write: a veto on the legacy pick (fix.camera_nearest, TEMPORARY A/B)
@@ -204,6 +205,7 @@ struct EyeState {
     ID3D11ShaderResourceView*  dlOutSrv = nullptr;
     ID3D11Texture2D*           dlSubmit = nullptr;  // NVIDIA's frame copied into the game's own format: what goes out
     ID3D11UnorderedAccessView* dlSubmitUav = nullptr;
+    ID3D11ShaderResourceView*  dlSubmitSrv = nullptr;  // frame generation, Phase 2.3b: the synthesizer reads it (made when first needed, with fix.frame_generation(_shadow) on)
     bool                      uiResolvedHistory = false;
     bool                      screenHistory = false;
     uint32_t                   dlW = 0, dlH = 0;
@@ -308,6 +310,7 @@ void releaseDl(EyeState& e) {
     if (e.dlOut) { e.dlOut->Release(); e.dlOut = nullptr; }
     if (e.dlSubmit) { e.dlSubmit->Release(); e.dlSubmit = nullptr; }
     if (e.dlSubmitUav) { e.dlSubmitUav->Release(); e.dlSubmitUav = nullptr; }
+    if (e.dlSubmitSrv) { e.dlSubmitSrv->Release(); e.dlSubmitSrv = nullptr; }
     e.uiResolvedHistory = false;
     e.dlW = e.dlH = 0;
     e.dlOutW = e.dlOutH = 0;
@@ -1287,6 +1290,7 @@ ID3D11Texture2D* g_eyeDecisionStaging[kEyeRun] = {};
 ID3D11Texture2D* g_eyePreUiStaging[kEyeRun] = {};
 std::atomic<bool> g_frameGenLockKey{false};   // fix.frame_generation (Phase 2.3, TEMPORARY): Lock 2:1 forced; set where the keys are read, read by the treat
 ID3D11Texture2D* g_eyeSynthStaging[kEyeRun] = {};   // the frame-generation synthesizer's f = 0.5 S of frame k (fix.frame_generation_shadow on; S<k> beside the P<k> pre-interface output and the next frame's P<k+1>)
+ID3D11Texture2D* g_eyeSynthBStaging[kEyeRun] = {};  // Phase 2.3b: B of frame k as its door finished it, in S<k>'s crop (SB<k>), staged with the finished S
 int              g_eyeRunLeft = 0;    // captures still to take
 int              g_eyeRunTaken = 0;
 wchar_t          g_eyeRunStamp[16] = L"";
@@ -2378,6 +2382,13 @@ void writeEyeDecisionArtifacts(ID3D11DeviceContext* ctx, const std::wstring& dir
             D3D11_TEXTURE2D_DESC desc{}; g_eyeSynthStaging[k]->GetDesc(&desc);
             writeEyeBmp(ctx, g_eyeSynthStaging[k], desc, 0, path);
             g_eyeSynthStaging[k]->Release(); g_eyeSynthStaging[k]=nullptr;
+        }
+        // Phase 2.3b: B of the same frame as its door finished it (sharpened, the UI composited), in S<k>'s crop: eye_<stamp>_SB<k>.bmp, S<k> being the finished S.
+        if (g_eyeSynthBStaging[k]) {
+            _snwprintf_s(path, MAX_PATH, _TRUNCATE, L"%s\\eye_%s_SB%02d.bmp", dir.c_str(), g_eyeRunStamp, k);
+            D3D11_TEXTURE2D_DESC desc{}; g_eyeSynthBStaging[k]->GetDesc(&desc);
+            writeEyeBmp(ctx, g_eyeSynthBStaging[k], desc, 0, path);
+            g_eyeSynthBStaging[k]->Release(); g_eyeSynthBStaging[k]=nullptr;
         }
     }
     wchar_t manifest[MAX_PATH];
@@ -5220,6 +5231,21 @@ void* temporalInner(void* srcTex, int eye, const float* bounds,
                             FrameGenSynthFrame sy;
                             sy.renderW = w; sy.renderH = h; sy.outW = oW; sy.outH = oH;
                             sy.outSrv = e.dlOutSrv;
+                            // Phase 2.3b: B's door (native_sharpen.cpp) finishes S as it finishes B. S is then made from what goes to the door, dlSubmit (the UI resolve's
+                            // output, or dlOut copied), read through a UNORM view as dlOut is; a game format the view cannot take keeps dlOut.
+                            sy.finish = nativeSharpenActive();
+                            if (sy.finish) {
+                                if (!e.dlSubmitSrv && e.dlSubmitUav) {
+                                    D3D11_SHADER_RESOURCE_VIEW_DESC vd{};
+                                    vd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+                                    vd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+                                    vd.Texture2D.MipLevels = 1;
+                                    if (FAILED(dev->CreateShaderResourceView(e.dlSubmit, &vd, &e.dlSubmitSrv))) e.dlSubmitSrv = nullptr;
+                                }
+                                if (e.dlSubmitSrv) sy.outSrv = e.dlSubmitSrv;
+                                sy.finishSharpen = nativeSharpenWillSharpen();
+                                sy.dumpIndex = dumpFrame ? g_eyeRunTaken : -1;
+                            }
                             sy.depthSrv = e.dlDepthSrv;
                             sy.mvSrv = e.dlMvSrv;
                             sy.tanNow = tanNow;
@@ -6408,6 +6434,18 @@ void temporalPassNoteFrameGenSlot(int eye, const float* rot, const float* t, boo
     e.fgSlotSequence = sequence;
     e.fgSlotFrame = g_rowsFrame;
 }
+void temporalPassStageFrameGenDump(ID3D11DeviceContext* ctx, int k, ID3D11Texture2D* finishedS, ID3D11Texture2D* finishedB) {
+    if (!ctx || k < 0 || k >= kEyeRun) return;
+    uint32_t wantW = 0, wantH = 0, cw = 0, ch = 0;
+    if (finishedS) {
+        eyeOutputCropSize(k, finishedS, &wantW, &wantH);
+        stageEyeCrop(ctx, finishedS, &g_eyeSynthStaging[k], &cw, &ch, nullptr, wantW, wantH);
+    }
+    if (finishedB) {
+        eyeOutputCropSize(k, finishedB, &wantW, &wantH);
+        stageEyeCrop(ctx, finishedB, &g_eyeSynthBStaging[k], &cw, &ch, nullptr, wantW, wantH);
+    }
+}
 
 void temporalPassLogMap() {
     if (g_mapKept == 0 && g_mapReset == 0) return;
@@ -6983,6 +7021,7 @@ static bool beginEyeRun(bool companion,const edvr::NativeOnFootAirborneSnapshot*
         if(g_eyeDecisionStaging[k]){g_eyeDecisionStaging[k]->Release();g_eyeDecisionStaging[k]=nullptr;}
         if(g_eyePreUiStaging[k]){g_eyePreUiStaging[k]->Release();g_eyePreUiStaging[k]=nullptr;}
         if(g_eyeSynthStaging[k]){g_eyeSynthStaging[k]->Release();g_eyeSynthStaging[k]=nullptr;}
+        if(g_eyeSynthBStaging[k]){g_eyeSynthBStaging[k]->Release();g_eyeSynthBStaging[k]=nullptr;}
         g_eyeDecisions[k]=EyeDecisionFrame{};
     }
     for(auto& texture:g_eyeInputs)if(texture){texture->Release();texture=nullptr;}
@@ -7104,6 +7143,7 @@ void temporalPassShutdown() {
         if (g_eyeDecisionStaging[k]) { g_eyeDecisionStaging[k]->Release(); g_eyeDecisionStaging[k] = nullptr; }
         if (g_eyePreUiStaging[k]) { g_eyePreUiStaging[k]->Release(); g_eyePreUiStaging[k] = nullptr; }
         if (g_eyeSynthStaging[k]) { g_eyeSynthStaging[k]->Release(); g_eyeSynthStaging[k] = nullptr; }
+        if (g_eyeSynthBStaging[k]) { g_eyeSynthBStaging[k]->Release(); g_eyeSynthBStaging[k] = nullptr; }
     }
     g_eyeRunLeft = 0;
     g_eyeRunTaken = 0;

@@ -52,8 +52,16 @@ struct FrameGenSynthFrame {
     // Phase 2.3 (fix.frame_generation): build the f = 0.5 S on this frame whatever the alternation says, and no f = 1 S (Lock shows S in every other slot).
     bool everyHalf = false;
     // Called with the f = 0.5 S on a wantShown frame while the module still holds it (on the transfer's path it is the runtime's once handed over): the eye dump stages it here.
+    // Not called for an S left to be finished (finish): the door stages the finished one.
     void (*shownSink)(void* context, ID3D11DeviceContext* ctx, ID3D11Texture2D* shown) = nullptr;
     void* shownSinkContext = nullptr;
+    // Phase 2.3b: B's door (native_sharpen.cpp, the last d3d11 step of B's eye) finishes this frame's f = 0.5 S as it finishes B (frameGenSynthFinish): until then S is held, not
+    // handed over, and its answer says it was not finished (no_door). finishSharpen: the door will sharpen S, so S is written where the sharpener reads it and the finish writes
+    // over it (the producer texture on the uav path); otherwise S is written in the private texture and finished into the producer texture. dumpIndex: the eye dump's frame k,
+    // whose finished S the door stages (-1: none).
+    bool finish = false;
+    bool finishSharpen = false;
+    int dumpIndex = -1;
 };
 
 // Once per treated eye-frame (usedDlaa, key on). `frame` is the pass's frame counter: the f = 1 S is scored only against the frame right after it.
@@ -66,6 +74,29 @@ ID3D11Texture2D* frameGenSynthShown(uint32_t eye, uint32_t frame);
 // Phase 2.2, the runtime's read of one eye's S after its treat (edvrFrameGenTakeS is this, exported). Fills `out` (its size and version set by the caller) and clears the eye's
 // answer: a second take before the next build answers sequence 0. The answer carries the slot sequence its build was handed (slotSequence).
 HRESULT frameGenSynthTakeS(uint32_t eye, EdvrNativeFrameGenS* out);
+
+// ---- Phase 2.3b: S finished as B is, at B's door ----
+// The f = 0.5 S this eye's last build left for B's door, or null when none waits (S was not built, or was built without finish). Opens the finish's GPU timer when one is due.
+// Same thread and context as the build; the texture stays the module's.
+ID3D11Texture2D* frameGenSynthFinishSource(ID3D11Device* dev, ID3D11DeviceContext* ctx, uint32_t eye);
+// What B's door did to B, for S. `why` other than kFrameGenFinishDone (framegen_slot_report.h) leaves S unfinished: not handed over, the runtime told why, the producer texture
+// given back to the game device. Otherwise `frame` is S as B's door would composite over it (S sharpened by B's sharpener, region-sized = S's size), or null for S itself; and
+// `layer` the UI layer B's composite read this sequence (null: B got no UI composite, so S gets none), with its multiply (null: none drew), its size and the rectangle the
+// composite took for the region. dumpSink stages the finished S for the eye dump's frame k before it is handed over, with B as its door finished it (bFinished) beside it.
+struct FrameGenSynthFinishInputs {
+    uint32_t why = 0;
+    ID3D11Texture2D* frame = nullptr;
+    ID3D11ShaderResourceView* layer = nullptr;
+    ID3D11ShaderResourceView* mult = nullptr;
+    uint32_t layerW = 0, layerH = 0;
+    float layerUv[4] = {};
+    ID3D11Texture2D* bFinished = nullptr;
+    void (*dumpSink)(ID3D11DeviceContext* ctx, int dumpIndex, ID3D11Texture2D* finishedS, ID3D11Texture2D* finishedB) = nullptr;
+};
+// Finishes the waiting S (fgSynFinish: the layer over S, moved by the head's step S was built with, framegen_synth_math.h frameGenSynthFinishHomography) into the texture the
+// runtime takes it from, then hands it over (key 1) when the runtime consumes S; or leaves it unfinished. Its answer (edvrFrameGenTakeS) is stored either way. Returns the finished
+// texture (valid until the next build for the eye; on the transfer's path the runtime's once handed over) or null.
+ID3D11Texture2D* frameGenSynthFinish(ID3D11DeviceContext* ctx, uint32_t eye, const FrameGenSynthFinishInputs& in);
 
 // Once a frame: the one-second report when the key is on, the release of the resources when it went off.
 void frameGenSynthFrameBoundary();
