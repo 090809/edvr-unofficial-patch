@@ -296,6 +296,9 @@ at all in a log with neither (the key off).
 The frame generation synthesizer (Phase 2.1, the same key) is the next rule, "frame generation synth": the graphics log's "frame generation (synth):" lines, an armed line once and
 a report line every second. It says OK when a report line shows frames built, NEVER APPLIED when the shadow scorer is armed (or reporting) and no synth line follows, when the synth
 armed and never reported, or when it reported only calls that built nothing (frames=0/0), and nothing at all in a log with neither it nor the scorer (the key off).
+Lock (fix.frame_generation = on, Phase 2.3) is "frame generation lock": the graphics log's untagged key line and the runtime log's "frame generation lock:" lines (armed, each engage
+and disengage with its reason, one line a second). It says OK when Lock engaged, PARTIAL when late_s or late_real passes 5% of the S slots, NEVER APPLIED when the key is on and the
+runtime log (read) has no lock line, when it armed and never reported, or when it reported and never engaged (the reasons it gave are said), and nothing at all with the key off.
 The SRV turret view (experimental.srv_turret_camera_back, experimental.srv_turret_hud_forward, experimental.srv_turret_radar_forward, experimental.srv_turret_panels_back, experimental.srv_turret_radar_back, experimental.srv_turret_hud_gap, experimental.srv_turret_hud_depth, experimental.srv_turret_hud_scissor) is the third: the graphics log's "srv turret ..." lines. The settings lines and the vehicle latch's lines
 ("srv turret: the vehicle is the Scorpion|not the Scorpion (event X)", written by the journal watcher) are kept whatever --since says; the last vehicle line is said in the detail, and
 vehicle lines alone are not the rule's lines (nothing is said for them). The pass acts in the Scorpion only: when the turret view bit is on in an SRV the journal does not call the Scorpion
@@ -10618,7 +10621,9 @@ H_FRAMEGEN_POSE_LABEL = "frame generation (shadow) pose:"
 _HFGP_TRIPLE = r"(?P<{n}0>[\d.]+)/(?P<{n}1>[\d.]+)/(?P<{n}2>[\d.]+)"
 H_FRAMEGEN_POSE = (r"frame generation \(shadow\) pose: frames=(?P<frames>\d+) lead_ms=(?P<lead>-?[\d.]+) runtime_mm=" + _HFGP_TRIPLE.format(n="rmm") + " runtime_deg=" +
                    _HFGP_TRIPLE.format(n="rdeg") + " velocity_mm=" + _HFGP_TRIPLE.format(n="vmm") + " velocity_deg=" + _HFGP_TRIPLE.format(n="vdeg") +
-                   r" vel_src=(?P<sxr>\d+)/(?P<spair>\d+)/(?P<snone>\d+) expired=(?P<expired>\d+) refused=(?P<refused>\d+) unpredicted=(?P<unpredicted>\d+)$")
+                   r" vel_src=(?P<sxr>\d+)/(?P<spair>\d+)/(?P<snone>\d+) expired=(?P<expired>\d+) refused=(?P<refused>\d+) unpredicted=(?P<unpredicted>\d+)"
+                   # Phase 2.3, H6 at the slot (optional: a line from before it ends at unpredicted): the slot poses scored, their miss and their lead.
+                   r"(?: slot=(?P<slot>\d+) slot_mm=" + _HFGP_TRIPLE.format(n="smm") + " slot_deg=" + _HFGP_TRIPLE.format(n="sdeg") + r" slot_lead_ms=(?P<slead>-?[\d.]+))?$")
 H_FRAMEGEN_RUNTIME_READ = "_framegen runtime log read"   # a pseudo-entry of the scan's rows (as H_CARRIED is): the runtime log was read, so a missing pose line can be judged
 H_FRAMEGEN_ARMED = r"frame generation \(shadow\): armed, quarter (?P<qw>\d+)x(?P<qh>\d+) per eye, classes far cockpit world"
 # The VRAM line (src\common\framegen_shadow_report.h kFrameGenShadowVramFmt), said once per eye when its resources are made: the bytes by group (the groups are read as one
@@ -10674,6 +10679,21 @@ H_FRAMEGEN_SLOT = (r"frame generation \(synth\) transfer: produced=(?P<produced>
                    r"ready_ms=(?P<ready_med>-?[\d.]+|-)/(?P<ready_max>-?[\d.]+|-) consume_ms=(?P<cons_med>[\d.]+|-)/(?P<cons_max>[\d.]+|-) "
                    r"pose=(?P<pose_rt>\d+)/(?P<pose_none>\d+) path=(?P<path>uav|copy|none|mixed) vram_game_mib=(?P<vgame>[\d.]+) vram_xr_mib=(?P<vxr>[\d.]+)$")
 H_FRAMEGEN_SLOT_NOCHANNEL = r"frame generation \(synth\) transfer: the d3d11 half has no slot channel \(edvrFrameGenNoteSlot missing: an older d3d11\.dll\)"
+# Frame generation, Phase 2.3 (fix.frame_generation = on, TEMPORARY; src\common\framegen_lock_report.h, written by the OpenXR runtime): Lock 2:1. The runtime log says armed once at the
+# key, each engage and disengage with its reason, and once a second engaged=<s> slots=<real>/<S> late_real= late_s= s_from=<S>/<B replayed> wait_ms= period_ms= disengages= reason=.
+# The graphics log says the key (src\d3d11\temporal_pass.cpp, untagged, state) when it is first read and when it changes. The rule reads both, the runtime's the way the pose line is read.
+H_FRAMEGEN_LOCK = "frame generation lock"
+H_FRAMEGEN_LOCK_LABEL = "frame generation lock:"
+H_FRAMEGEN_LOCK_KEY_LABEL = "frame generation: fix.frame_generation="
+H_FRAMEGEN_LOCK_KEY = r"frame generation: fix\.frame_generation=(?P<key>on|off) \("
+H_FRAMEGEN_LOCK_ARMED = r"frame generation lock: armed \(fix\.frame_generation = on"
+H_FRAMEGEN_LOCK_ENGAGE = r"frame generation lock: engage reason=(?P<reason>[a-z_0-9]+) period_ms=(?P<period>[\d.]+)$"
+H_FRAMEGEN_LOCK_DISENGAGE = r"frame generation lock: disengage reason=(?P<reason>[a-z_]+) period_ms=(?P<period>[\d.]+)(?P<note> \(Lock stands aside for deferred pacing in 2\.3\))?$"
+H_FRAMEGEN_LOCK_REPORT = (r"frame generation lock: engaged=(?P<engaged>[\d.]+) slots=(?P<real>\d+)/(?P<s>\d+) late_real=(?P<late_real>\d+) late_s=(?P<late_s>\d+) "
+                          r"s_from=(?P<from_s>\d+)/(?P<from_b>\d+) wait_ms=(?P<wait_med>[\d.]+|-)/(?P<wait_max>[\d.]+|-) period_ms=(?P<period>[\d.]+|-) "
+                          r"disengages=(?P<disengages>\d+) reason=(?P<reason>[a-z_]+)$")
+H_FRAMEGEN_LOCK_FORMAT = r"frame generation lock: S's format (?P<fmt>\d+) cannot be shown"
+H_FRAMEGEN_LOCK_LATE_SHARE = 0.05   # late_s or late_real over this share of the S slots is PARTIAL
 # The SRV turret view (issue 140; src\d3d11\srv_turret.cpp, the vehicle latch's line in journal_watch.cpp, and the geometry shader's creation line in shader_swap.cpp, shaderSwapCreateGs,
 # called with who "srv turret hud"): lines of the graphics log with no build tag, read the way the desktop window's are. The settings and vehicle lines are state, so health_scan keeps
 # every one whatever --since says; the rest are events and are cut by the window. Every kind of line the DLL writes has a pattern of its own, so a labelled line that none matches is
@@ -10742,7 +10762,7 @@ H_F125_LABEL = "native on foot log (F125)"
 H_F125_RE = re.compile(r"native on foot log \(F125\): detail (?P<detail>on|off), summary window (?P<wl>\d+) s")
 # Rules whose absence says nothing about a feature, so a log without their lines does not list them as not present: every log written before F125 has no F125
 # line, and its report stays as it was.
-HEALTH_QUIET_WHEN_ABSENT = frozenset((H_F125, H_WORLD, H_DESKTOP, H_SRV_TURRET, H_FRAMEGEN, H_FRAMEGEN_SYNTH))   # the frame generation shadow is off by default and says nothing then; world scale writes nothing while the value stays 100; the desktop window nothing while the setting is game; the SRV turret view nothing in a log with no VR profile
+HEALTH_QUIET_WHEN_ABSENT = frozenset((H_F125, H_WORLD, H_DESKTOP, H_SRV_TURRET, H_FRAMEGEN, H_FRAMEGEN_SYNTH, H_FRAMEGEN_LOCK))   # the frame generation shadow is off by default and says nothing then; world scale writes nothing while the value stays 100; the desktop window nothing while the setting is game; the SRV turret view nothing in a log with no VR profile
 
 # ---- F125: summary windows (the on-foot log diet) ----
 # By default an on-foot summary line covers a window of 10 s, 1 s with log.on_foot_detail = on, and 1 to 10 s when a window is flushed early (a held-item change,
@@ -16924,6 +16944,10 @@ def _hj_framegen_shadow(rows, ctx=None):
                  "%d unpredicted" % (len(poses), scored, max(float(r["rmm2"]) for r in poses), max(float(r["rdeg2"]) for r in poses), max(float(r["vmm2"]) for r in poses),
                                      max(float(r["vdeg2"]) for r in poses), poses[-1]["lead"], sum(int(r["refused"]) for r in poses), sum(int(r["expired"]) for r in poses),
                                      sum(int(r["unpredicted"]) for r in poses)))
+        slotted = [r for r in poses if r.get("slot") is not None and int(r["slot"]) > 0]
+        if slotted:   # Phase 2.3, H6 at the slot
+            text += "; slot pose: %d scored, miss max %.2f mm / %.3f deg, lead median %s ms (last line)" % (
+                sum(int(r["slot"]) for r in slotted), max(float(r["smm2"]) for r in slotted), max(float(r["sdeg2"]) for r in slotted), slotted[-1]["slead"])
     elif armed and _hrows(ctx or {}, H_FRAMEGEN_RUNTIME_READ, "read"):
         return ("NEVER APPLIED", "the scorer reported (%d line(s)) but the runtime log has no 'frame generation (shadow) pose:' line: the head-pose measure never ran (the runtime or the "
                                  "d3d11.dll is older than the version 12 frame answer, or the measure is dead)" % len(reports))
@@ -17004,6 +17028,55 @@ def _hj_framegen_synth(rows, ctx=None):
         text += "; the runtime log was not read, so the transfer is not judged"
     return ("OK", text)
 
+
+def _hj_framegen_lock(rows, ctx=None):
+    """Frame generation, Phase 2.3 (fix.frame_generation = on, TEMPORARY): Lock 2:1 in the runtime. ran is the key (the graphics log's key line saying on, or the runtime's armed
+    or report line), applied is a report line with engaged time or an engage edge. NEVER APPLIED when the key is on and the runtime log (read) has no lock line at all, when it
+    armed and never reported, or when it reported and never engaged (the reasons it gave are said); PARTIAL when late_s or late_real passes 5% of the slots; None (nothing said)
+    with the key off and no lock line."""
+    keys = rows.get("key", [])
+    armed, reports = rows.get("armed", []), rows.get("report", [])
+    engages, disengages = rows.get("engage", []), rows.get("disengage", [])
+    key_on = bool(keys) and keys[-1]["key"] == "on"
+    runtime_read = bool(_hrows(ctx or {}, H_FRAMEGEN_RUNTIME_READ, "read"))
+    if not key_on and not armed and not reports and not engages and not disengages:
+        return None
+    if not armed and not reports and not engages and not disengages:
+        if not runtime_read:
+            return ("OK", "fix.frame_generation is on (the graphics log); the runtime log was not read, so Lock is not judged")
+        return ("NEVER APPLIED", "fix.frame_generation is on (the graphics log) but the runtime log has no 'frame generation lock:' line: the runtime never read the key (an "
+                                 "openvr_api.dll older than 2.3, or a frame answer older than version 12)")
+    if not reports:
+        return ("NEVER APPLIED", "the runtime armed Lock (%d armed line(s), %d engage edge(s)) but no 'frame generation lock: engaged=' line follows: its one-second line is dead"
+                % (len(armed), len(engages)))
+    engaged = sum(float(r["engaged"]) for r in reports)
+    real, s = sum(int(r["real"]) for r in reports), sum(int(r["s"]) for r in reports)
+    late_real, late_s = sum(int(r["late_real"]) for r in reports), sum(int(r["late_s"]) for r in reports)
+    from_s, from_b = sum(int(r["from_s"]) for r in reports), sum(int(r["from_b"]) for r in reports)
+    reasons = {}
+    for r in reports:
+        if r["reason"] != "none":
+            reasons[r["reason"]] = reasons.get(r["reason"], 0) + 1
+    for d in disengages:
+        reasons[d["reason"]] = reasons.get(d["reason"], 0) + 1
+    why = ", ".join("%s %d" % kv for kv in sorted(reasons.items(), key=lambda kv: -kv[1])) or "none given"
+    if engaged <= 0.0 and not engages:
+        return ("NEVER APPLIED", "Lock never engaged: %d lock line(s), engaged 0.00 s, no engage edge; the reasons it gave (lines/edges): %s" % (len(reports), why))
+    text = ("%d lock line(s), engaged %.2f s, %d engage / %d disengage edge(s); %d real pair(s) and %d S slot(s) while engaged, S shown %d / B replayed %d, late_s %d, late_real %d; "
+            "wait %s ms median (last line), period %s ms; reasons when off: %s" % (len(reports), engaged, len(engages), len(disengages), real, s, from_s, from_b, late_s, late_real,
+                                                                               reports[-1]["wait_med"], reports[-1]["period"], why))
+    if any(d.get("note") for d in disengages):
+        text += "; Lock stood aside for deferred pacing"
+    if rows.get("format"):
+        text += "; S's format %s cannot be shown (every S slot replays B)" % rows["format"][-1]["fmt"]
+    over = []
+    if s and late_s > H_FRAMEGEN_LOCK_LATE_SHARE * s:
+        over.append("late_s %d of %d S slots (%.1f%%)" % (late_s, s, 100.0 * late_s / s))
+    if s and late_real > H_FRAMEGEN_LOCK_LATE_SHARE * s:
+        over.append("late_real %d against %d S slots (%.1f%%)" % (late_real, s, 100.0 * late_real / s))
+    if over:
+        return ("PARTIAL", text + "; over %d%%: %s" % (int(100 * H_FRAMEGEN_LOCK_LATE_SHARE), "; ".join(over)))
+    return ("OK", text)
 
 SRV_TURRET_REFUSE_NAMES = ("no-eye", "game-gs", "topology", "not-ready", "no-geometry")   # the order of the 10 s line's refused[...] counts (srv_turret_math.h refuseName)
 SRV_TURRET_HUD_MIN_SECS = 12.0   # the turret view this long with no 10 s line and no first draw: the HUD half never ran (a 10 s line is due within 10 s of the view going on, and the first draw within a frame)
@@ -18197,6 +18270,15 @@ HEALTH_RULES = (
         ("transfer", H_FRAMEGEN_SLOT),
         ("nochannel", H_FRAMEGEN_SLOT_NOCHANNEL),
     ), _hj_framegen_synth),
+    # Frame generation, Phase 2.3 (TEMPORARY): Lock. The key line is the graphics log's (untagged, state); the rest are the runtime log's (health_scan_runtime).
+    _hrule(H_FRAMEGEN_LOCK, (), (H_FRAMEGEN_LOCK_KEY_LABEL,), (
+        ("key", H_FRAMEGEN_LOCK_KEY),
+        ("armed", H_FRAMEGEN_LOCK_ARMED),
+        ("engage", H_FRAMEGEN_LOCK_ENGAGE),
+        ("disengage", H_FRAMEGEN_LOCK_DISENGAGE),
+        ("report", H_FRAMEGEN_LOCK_REPORT),
+        ("format", H_FRAMEGEN_LOCK_FORMAT),
+    ), _hj_framegen_lock),
     # The SRV turret view (issue 140): lines of the graphics log that carry no build tag (health_scan reads them, as it reads the desktop window's, before it drops the untagged lines).
     _hrule(H_SRV_TURRET, (), H_SRV_TURRET_LABELS, (
         ("setting", H_SRV_TURRET_SETTING),
@@ -18270,6 +18352,7 @@ def health_scan(text, since=None, until=None):
     desktop = next(r for r in HEALTH_RULES if r.name == H_DESKTOP)
     framegen = next(r for r in HEALTH_RULES if r.name == H_FRAMEGEN)
     synth = next(r for r in HEALTH_RULES if r.name == H_FRAMEGEN_SYNTH)
+    lock = next(r for r in HEALTH_RULES if r.name == H_FRAMEGEN_LOCK)
     turret =next(r for r in HEALTH_RULES if r.name == H_SRV_TURRET)
     for raw in text.splitlines():
         if "srv turret" in raw and any(label in raw for label in H_SRV_TURRET_LABELS):
@@ -18285,6 +18368,16 @@ def health_scan(text, since=None, until=None):
                     break
             else:
                 u = unparsed[H_SRV_TURRET]
+                u[0] += 1
+                u[1] = u[1] or raw.strip()[:160]
+            continue
+        if H_FRAMEGEN_LOCK_KEY_LABEL in raw:
+            # Frame generation 2.3: Lock's key line (no build tag): state, kept whatever --since says.
+            g = re.compile(H_FRAMEGEN_LOCK_KEY).search(raw)
+            if g:
+                rows[H_FRAMEGEN_LOCK].setdefault("key", []).append(dict(g.groupdict(), _t=None))
+            else:
+                u = unparsed[H_FRAMEGEN_LOCK]
                 u[0] += 1
                 u[1] = u[1] or raw.strip()[:160]
             continue
@@ -18430,7 +18523,20 @@ def health_scan_runtime(scan, text):
     pose_rx = dict(next(r for r in HEALTH_RULES if r.name == H_FRAMEGEN).kinds)["pose"]
     synth_kinds = dict(next(r for r in HEALTH_RULES if r.name == H_FRAMEGEN_SYNTH).kinds)
     scan["rows"][H_FRAMEGEN_RUNTIME_READ] = {"read": [{}]}
+    lock_kinds = dict(next(r for r in HEALTH_RULES if r.name == H_FRAMEGEN_LOCK).kinds)
     for order, raw in enumerate(text.splitlines()):
+        if H_FRAMEGEN_LOCK_LABEL in raw:
+            # Frame generation 2.3: Lock's lines (armed, an edge, the one-second line, the format note).
+            for kind in ("report", "engage", "disengage", "armed", "format"):
+                g = lock_kinds[kind].search(raw)
+                if g:
+                    scan["rows"][H_FRAMEGEN_LOCK].setdefault(kind, []).append(dict(g.groupdict(), _order=order, _t=None))
+                    break
+            else:
+                u = scan["unparsed"][H_FRAMEGEN_LOCK]
+                u[0] += 1
+                u[1] = u[1] or raw.strip()[:160]
+            continue
         if H_FRAMEGEN_SLOT_LABEL in raw:
             # Frame generation 2.2: S's transfer line, or the line that says the d3d11 half has no slot channel.
             for kind in ("transfer", "nochannel"):
@@ -25404,6 +25510,67 @@ def self_test_health():
         check("frame generation synth: an extrapolated window (no slot pose: an older runtime) on the private path reads as such", fg_off + [fg_armed(), fg_report(), fg_synth_armed(), fg_synth_report(slot=(0, 45, "private", 0))], 0,
               [("OK", FGS)], has=["f=0.5 S head: 0 on the runtime's slot pose, 45 on the extrapolation; S written private"], lacks=["UNPARSED"])
 
+        # Phase 2.3: Lock (src\common\framegen_lock_report.h, the runtime log's lines) and its key (src\d3d11\temporal_pass.cpp, the graphics log's untagged line).
+        flsrc = read_text(os.path.join(repo_root(), "src", "common", "framegen_lock_report.h"))
+        tpsrc = read_text(os.path.join(repo_root(), "src", "d3d11", "temporal_pass.cpp"))
+
+        def RL(src, needle, *vals):
+            key = "fl:" + needle
+            if key not in fmts:
+                fmts[key] = health_c_format(src, needle)
+            if fmts[key] is None:
+                raise AssertionError("frame generation lock: no log format holds %r: the --health rule that reads it is out of date" % needle)
+            return health_render(fmts[key], vals)
+
+        def fl_key(on=True):
+            return RL(tpsrc, "frame generation: fix.frame_generation=%s", "on" if on else "off", "Lock 2:1 forced" if on else "no Lock")
+
+        def fl_armed():
+            return RL(flsrc, "frame generation lock: armed")
+
+        def fl_engage():
+            return RL(flsrc, "frame generation lock: engage reason=", 11.11)
+
+        def fl_disengage(reason="no_projection", note=""):
+            return RL(flsrc, "frame generation lock: disengage reason=", reason, 11.11, note)
+
+        def fl_report(engaged=1.0, real=45, s=45, late_real=0, late_s=0, from_s=45, from_b=0, disengages=0, reason="none"):
+            return RL(flsrc, "frame generation lock: engaged=%.2f", engaged, real, s, late_real, late_s, from_s, from_b, "9.40", "10.20", "11.11", disengages, reason)
+
+        FL = H_FRAMEGEN_LOCK
+        fl_gfx = fg_off + [fl_key()]
+        check("frame generation lock: the key on, armed, engaged and reporting is OK and says the slots", fl_gfx, 0, [("OK", FL)], lacks=["UNPARSED"],
+              extra=["--runtime-file", runtime([fl_armed(), fl_engage(), fl_report(engaged=0.5, real=22, s=22, from_s=22), fl_report(late_s=1, from_s=44, from_b=1)])],
+              has=["2 lock line(s), engaged 1.50 s, 1 engage / 0 disengage edge(s); 67 real pair(s) and 67 S slot(s) while engaged, S shown 66 / B replayed 1, late_s 1, late_real 0"])
+        check("frame generation lock: the key on and no lock line in the runtime log is NEVER APPLIED", fl_gfx, 3, [("NEVER APPLIED", FL)],
+              extra=["--runtime-file", runtime(["native_frame: unrelated runtime line"])], has=["but the runtime log has no 'frame generation lock:' line", "exit 3"])
+        check("frame generation lock: the key on and no runtime log read leaves Lock unjudged, and says so", fl_gfx, 0, [("OK", FL)],
+              has=["the runtime log was not read, so Lock is not judged"])
+        check("frame generation lock: lock lines that never engaged are NEVER APPLIED and say why", fl_gfx, 3, [("NEVER APPLIED", FL)],
+              extra=["--runtime-file", runtime([fl_armed(), fl_report(engaged=0.0, real=0, s=0, from_s=0, reason="no_s"), fl_report(engaged=0.0, real=0, s=0, from_s=0, reason="dwell")])],
+              has=["Lock never engaged: 2 lock line(s), engaged 0.00 s, no engage edge; the reasons it gave (lines/edges): no_s 1, dwell 1"])
+        check("frame generation lock: armed and no one-second line is NEVER APPLIED", fl_gfx, 3, [("NEVER APPLIED", FL)],
+              extra=["--runtime-file", runtime([fl_armed(), fl_engage()])], has=["no 'frame generation lock: engaged=' line follows"])
+        check("frame generation lock: late_s over 5% of the S slots is PARTIAL", fl_gfx, 0, [("PARTIAL", FL)],
+              extra=["--runtime-file", runtime([fl_armed(), fl_engage(), fl_report(late_s=4, from_s=41, from_b=4)])], has=["over 5%: late_s 4 of 45 S slots (8.9%)"])
+        check("frame generation lock: late_real over 5% of the S slots is PARTIAL", fl_gfx, 0, [("PARTIAL", FL)],
+              extra=["--runtime-file", runtime([fl_armed(), fl_engage(), fl_report(late_real=3)])], has=["late_real 3 against 45 S slots (6.7%)"])
+        check("frame generation lock: a disengage for deferred pacing says Lock stood aside", fl_gfx, 0, [("OK", FL)], lacks=["UNPARSED"],
+              extra=["--runtime-file", runtime([fl_armed(), fl_engage(), fl_report(), fl_disengage("deferred_pacing", " (Lock stands aside for deferred pacing in 2.3)"),
+                                                fl_report(engaged=0.2, real=9, s=9, from_s=9, disengages=1, reason="deferred_pacing")])],
+              has=["1 engage / 1 disengage edge(s)", "reasons when off: deferred_pacing 2", "Lock stood aside for deferred pacing"])
+        check("frame generation lock: a drifted lock line is counted as unparsed", fl_gfx, 3, [("NEVER APPLIED", FL)],
+              extra=["--runtime-file", runtime([fl_armed(), fl_engage(), fl_report().replace("late_s=", "lates=")])], has=["line(s) the rule's patterns do not match"])
+        check("frame generation lock: the key off, no lock line, nothing said", fg_off + [fl_key(on=False)], 0, [("OK", F90S)], lacks=["frame generation lock", "NEVER APPLIED"],
+              extra=["--runtime-file", runtime(["native_frame: unrelated runtime line"])])
+        check("frame generation lock: no key line and no lock line, nothing said", fg_off, 0, [("OK", F90S)], lacks=["frame generation lock"])
+        # H6 at the slot: the pose line's slot tail is read and summarised; a line without it (before 2.3) still parses.
+        check("frame generation shadow: a pose line with the slot tail says the slot pose's miss", fg_all, 0, [("OK", FG)], lacks=["UNPARSED"],
+              extra=["--runtime-file", runtime([health_render(fmts["fgp:pose"], (4, 14.1, 4.11, 4.11, 4.11, 0.471, 0.471, 0.471, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 3, 0, 1, 0, 0, 0,
+                                                                                  44, 0.4, 0.9, 1.2, 0.05, 0.1, 0.15, 21.5))])],
+              has=["slot pose: 44 scored, miss max 1.20 mm / 0.150 deg, lead median 21.5 ms (last line)"])
+        check("frame generation shadow: a pose line from before the slot tail still parses", fg_all, 0, [("OK", FG)], lacks=["UNPARSED", "slot pose:"],
+              extra=["--runtime-file", runtime([fg_pose().split(" slot=")[0]])])
         # ---- the SRV turret view: the graphics log's untagged lines, rendered from the C format strings in src\d3d11\srv_turret.cpp and (the geometry shader's creation line) shader_swap.cpp ----
         stsrc = read_text(os.path.join(repo_root(), "src", "d3d11", "srv_turret.cpp"))
 

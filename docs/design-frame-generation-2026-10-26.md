@@ -49,12 +49,12 @@
 - **Phase 0 (no EDVR code):** fly stock OFXR-Bridge and VectorXR (colour-only
   routes) over EDVR at a bright settlement and in space, with each runtime's
   own smoothing off and then on. This is the visual reference to beat.
-- **Next: not decided** ("flight 5" entry, Open). H1, H8, H9 and the
-  surface classifier are still unbuilt; on foot unflown.
-- **Temporary key (built 2026-11-07, hidden):** `fix.frame_generation_shadow`
-  (off | on), Phase 1 only. The user key `fix.frame_generation` (off | auto)
-  comes with Phase 2. Its `on` value (forced, ignoring the gate's performance
-  terms) is temporary, for A/B flights.
+- **Next: Phase 2.3 built, not flown** (Lock 2:1 in the runtime, S shown;
+  runtime lines `frame generation lock:`, `--health` rule of that name).
+  H1, H8, H9 and the surface classifier are still unbuilt; on foot unflown.
+- **Temporary keys (hidden):** `fix.frame_generation_shadow` (off | on), and
+  `fix.frame_generation` (off | on; built 2.3: `on` forces Lock, for A/B
+  flights; `auto` replaces it in 2.4).
 - **Declined in design (re-open on new evidence):** ## Declined, including AFW
   as a replacement and flat-profile frame generation (2026-10-27).
 - **Open:** ## Open questions.
