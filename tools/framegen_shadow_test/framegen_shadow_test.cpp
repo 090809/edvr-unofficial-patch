@@ -16,11 +16,11 @@
 //   4  a world plane at 50 m, ship motion constant over the two frames: the world class, the rig miss 0 and the score near 0; then with an acceleration the
 //      rig miss is the figure worked out by hand and the score is worse
 //   5  reversed-Z far (the written depth at or under A) and the on-foot 1 mm split: 0.5 mm is the cockpit, 2 mm the world; the ship's 10 m split puts both in the cockpit
-//   6  the module itself (framegen_shadow.cpp) on WARP: the key off creates nothing; on, a static scene scores with every error in bin 0, and each skip reason counts
-//   7  the second score kernel (fgShadowScoreB): a world plane at constant ship motion with the DLSS vectors filled in exactly (the mv set and the bdepth set both
-//      score near 0 and the two landings agree to under 1/16 px), then every vector offset by +2 px (the mv set is worse, the disagreement reads 2 px), then a cockpit
-//      plane under a head translation (the cockpit disagreement histogram). Mutations: vectors of the wrong sign (the same as a kernel that reads the sign wrong) and
-//      the shader itself recompiled with the sign flipped must each fail the exact case
+//   6  the module itself (framegen_shadow.cpp) on WARP: the key off creates nothing; on, a static scene scores with every error in bin 0 (the mv set too), each skip
+//      reason counts, and a camera_jump frame goes to the jump set
+//   7  the second score kernel (fgShadowScoreB): a world plane at constant ship motion with the DLSS vectors filled in exactly (the mv set scores near 0), then every
+//      vector offset by +2 px (the mv set is worse), then a cockpit plane under a head translation (the cockpit's mv set). Mutations: vectors of the wrong sign (the
+//      same as a kernel that reads the sign wrong) and the shader itself recompiled with the sign flipped must each fail the exact case
 #include <windows.h>
 #include <d3d11.h>
 #include <wrl/client.h>
@@ -120,19 +120,17 @@ struct Tex {
 struct Gpu {
     ComPtr<ID3D11Device> dev;
     ComPtr<ID3D11DeviceContext> ctx;
-    ComPtr<ID3D11ComputeShader> cs[9];
+    ComPtr<ID3D11ComputeShader> cs[5];
     ComPtr<ID3D11Buffer> cb;
 
     bool init() {
         D3D_FEATURE_LEVEL level{};
         if (FAILED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, 0, nullptr, 0, D3D11_SDK_VERSION, &dev, &level, &ctx))) return false;
-        const struct { const unsigned char* code; size_t size; } codes[9] = {
+        const struct { const unsigned char* code; size_t size; } codes[5] = {
             {kFrameGenShadowCaptureBytecode, sizeof(kFrameGenShadowCaptureBytecode)}, {kFrameGenShadowClearBytecode, sizeof(kFrameGenShadowClearBytecode)},
             {kFrameGenShadowSplatBytecode, sizeof(kFrameGenShadowSplatBytecode)}, {kFrameGenShadowScoreBytecode, sizeof(kFrameGenShadowScoreBytecode)},
-            {kFrameGenShadowScoreBBytecode, sizeof(kFrameGenShadowScoreBBytecode)}, {kFrameGenShadowExClearBytecode, sizeof(kFrameGenShadowExClearBytecode)},
-            {kFrameGenShadowExSplatBytecode, sizeof(kFrameGenShadowExSplatBytecode)}, {kFrameGenShadowExSrcBytecode, sizeof(kFrameGenShadowExSrcBytecode)},
-            {kFrameGenShadowExScoreBytecode, sizeof(kFrameGenShadowExScoreBytecode)}};
-        for (int i = 0; i < 9; ++i)
+            {kFrameGenShadowScoreBBytecode, sizeof(kFrameGenShadowScoreBBytecode)}};
+        for (int i = 0; i < 5; ++i)
             if (FAILED(dev->CreateComputeShader(codes[i].code, codes[i].size, nullptr, &cs[i]))) return false;
         D3D11_BUFFER_DESC bd{};
         bd.ByteWidth = sizeof(FrameGenShadowCb);
@@ -179,15 +177,15 @@ struct Gpu {
         ctx->CSSetConstantBuffers(0, 1, &b);
     }
 
-    void run(int entry, ID3D11ShaderResourceView* const srv[8], ID3D11UnorderedAccessView* const uav[7]) {
+    void run(int entry, ID3D11ShaderResourceView* const srv[7], ID3D11UnorderedAccessView* const uav[4]) {
         ctx->CSSetShader(cs[entry].Get(), nullptr, 0);
-        // Nothing stays bound from the last dispatch: a resource still bound as a UAV would silently null its SRV here (the frame before A is a UAV, then A's capture reads it).
-        ID3D11ShaderResourceView* const noSrv[8] = {};
-        ID3D11UnorderedAccessView* const noUav[7] = {};
-        ctx->CSSetShaderResources(0, 8, noSrv);
-        ctx->CSSetUnorderedAccessViews(0, 7, noUav, nullptr);
-        ctx->CSSetShaderResources(0, 8, srv);
-        ctx->CSSetUnorderedAccessViews(0, 7, uav, nullptr);
+        // Nothing stays bound from the last dispatch: a resource still bound as a UAV would silently null its SRV here (A's capture is a UAV, then the splat reads it).
+        ID3D11ShaderResourceView* const noSrv[7] = {};
+        ID3D11UnorderedAccessView* const noUav[4] = {};
+        ctx->CSSetShaderResources(0, 7, noSrv);
+        ctx->CSSetUnorderedAccessViews(0, 4, noUav, nullptr);
+        ctx->CSSetShaderResources(0, 7, srv);
+        ctx->CSSetUnorderedAccessViews(0, 4, uav, nullptr);
         ctx->Dispatch((QW + 7) / 8, (QH + 7) / 8, 1);
     }
 };
@@ -220,34 +218,20 @@ bool makeInputs(Gpu& g, const Scene& s, Tex& out, Tex& depth) {
            g.makeTex(s.w, s.h, DXGI_FORMAT_R32_FLOAT, D3D11_BIND_SHADER_RESOURCE, s.depth.data(), static_cast<UINT>(s.w * 4), depth, true, false);
 }
 
-// What the extrapolation sets need beyond A and B: the scene before A (its depth is read where A's vectors point) and A's own vector field (2 floats a render pixel, pixels,
-// A -> the frame before). Null for neither: the extrapolation does not run.
-struct ExIn {
-    const Scene* am1 = nullptr;
-    const std::vector<float>* mvA = nullptr;
-};
-
 // Frame A is captured, then frame B is captured and scored against it with `cb`, in the module's order of dispatches.
 // `mv`, when given, is the DLSS vector field (2 floats a render pixel, pixels, B -> A) and the second kernel runs after the score.
-// `ex`, when given, captures the frame before A and A's vectors and runs the extrapolation sets (ex2d then ex2dh) after it.
-GpuResult runGpu(Gpu& g, const Scene& A, const Scene& B, const FrameGenShadowCb& cb, const std::vector<float>* mv = nullptr, const ExIn* ex = nullptr) {
+GpuResult runGpu(Gpu& g, const Scene& A, const Scene& B, const FrameGenShadowCb& cb, const std::vector<float>* mv = nullptr) {
     GpuResult r;
-    Tex outA, depA, outB, depB, outM, depM;
+    Tex outA, depA, outB, depB;
     if (!makeInputs(g, A, outA, depA) || !makeInputs(g, B, outB, depB)) return r;
-    if (ex && ex->am1 && !makeInputs(g, *ex->am1, outM, depM)) return r;
-    Tex luma[3], dq[3], key, mvq[2], keyE, srcE;
+    Tex luma[2], dq[2], key;
     ComPtr<ID3D11Buffer> stats, staging;
     ComPtr<ID3D11UnorderedAccessView> statsUav;
-    for (int i = 0; i < 3; ++i)
+    for (int i = 0; i < 2; ++i)
         if (!g.makeTex(QW, QH, DXGI_FORMAT_R16_FLOAT, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS, nullptr, 0, luma[i], true, true) ||
             !g.makeTex(QW, QH, DXGI_FORMAT_R32_FLOAT, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS, nullptr, 0, dq[i], true, true))
             return r;
-    for (int i = 0; i < 2; ++i)
-        if (!g.makeTex(QW, QH, DXGI_FORMAT_R32G32B32A32_FLOAT, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS, nullptr, 0, mvq[i], true, true)) return r;
-    if (!g.makeTex(QW, QH, DXGI_FORMAT_R32_UINT, D3D11_BIND_UNORDERED_ACCESS, nullptr, 0, key, false, true) ||
-        !g.makeTex(QW, QH, DXGI_FORMAT_R32_UINT, D3D11_BIND_UNORDERED_ACCESS, nullptr, 0, keyE, false, true) ||
-        !g.makeTex(QW, QH, DXGI_FORMAT_R32_UINT, D3D11_BIND_UNORDERED_ACCESS, nullptr, 0, srcE, false, true))
-        return r;
+    if (!g.makeTex(QW, QH, DXGI_FORMAT_R32_UINT, D3D11_BIND_UNORDERED_ACCESS, nullptr, 0, key, false, true)) return r;
     D3D11_BUFFER_DESC bd{};
     bd.ByteWidth = kFrameGenShadowStatsUints * 4; bd.Usage = D3D11_USAGE_DEFAULT; bd.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
     bd.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED; bd.StructureByteStride = 4;
@@ -263,60 +247,37 @@ GpuResult runGpu(Gpu& g, const Scene& A, const Scene& B, const FrameGenShadowCb&
         for (size_t i = 0; i < v.size(); ++i) half[i] = floatToHalf(v[i]);
         return g.makeTex(RW, RH, DXGI_FORMAT_R16G16_FLOAT, D3D11_BIND_SHADER_RESOURCE, half.data(), RW * 4, t, true, false);
     };
-    Tex mvTex, mvATex;
+    Tex mvTex;
     if (mv && !halfField(*mv, mvTex)) return r;
-    if (ex && ex->mvA && !halfField(*ex->mvA, mvATex)) return r;
     g.setCb(cb);
-    ID3D11ShaderResourceView* none[8] = {};
-    if (ex && ex->am1) {   // the frame before A: only its depth is read, where A's vectors point
-        ID3D11ShaderResourceView* srv[8] = {outM.srv.Get(), depM.srv.Get()};
-        ID3D11UnorderedAccessView* uav[7] = {luma[2].uav.Get(), dq[2].uav.Get()};
-        g.run(0, srv, uav);
-    }
+    ID3D11ShaderResourceView* none[7] = {};
     for (int f = 0; f < 2; ++f) {
-        ID3D11ShaderResourceView* srv[8] = {f == 0 ? outA.srv.Get() : outB.srv.Get(), f == 0 ? depA.srv.Get() : depB.srv.Get()};
-        srv[3] = f == 0 ? ((ex && ex->am1) ? dq[2].srv.Get() : nullptr) : dq[0].srv.Get();
-        srv[5] = f == 0 ? mvATex.srv.Get() : mvTex.srv.Get();
-        ID3D11UnorderedAccessView* uav[7] = {luma[f].uav.Get(), dq[f].uav.Get(), nullptr, nullptr, mvq[f].uav.Get()};
+        ID3D11ShaderResourceView* srv[7] = {f == 0 ? outA.srv.Get() : outB.srv.Get(), f == 0 ? depA.srv.Get() : depB.srv.Get()};
+        ID3D11UnorderedAccessView* uav[4] = {luma[f].uav.Get(), dq[f].uav.Get()};
         g.run(0, srv, uav);
     }
     {
-        ID3D11UnorderedAccessView* uav[7] = {nullptr, nullptr, key.uav.Get(), statsUav.Get()};
+        ID3D11UnorderedAccessView* uav[4] = {nullptr, nullptr, key.uav.Get(), statsUav.Get()};
         g.run(1, none, uav);
     }
     {
-        ID3D11ShaderResourceView* srv[8] = {nullptr, nullptr, nullptr, dq[0].srv.Get()};
-        ID3D11UnorderedAccessView* uav[7] = {nullptr, nullptr, key.uav.Get()};
+        ID3D11ShaderResourceView* srv[7] = {nullptr, nullptr, nullptr, dq[0].srv.Get()};
+        ID3D11UnorderedAccessView* uav[4] = {nullptr, nullptr, key.uav.Get()};
         g.run(2, srv, uav);
     }
     {
-        ID3D11ShaderResourceView* srv[8] = {nullptr, nullptr, luma[0].srv.Get(), nullptr, luma[1].srv.Get()};
-        ID3D11UnorderedAccessView* uav[7] = {nullptr, nullptr, key.uav.Get(), statsUav.Get()};
+        ID3D11ShaderResourceView* srv[7] = {nullptr, nullptr, luma[0].srv.Get(), nullptr, luma[1].srv.Get()};
+        ID3D11UnorderedAccessView* uav[4] = {nullptr, nullptr, key.uav.Get(), statsUav.Get()};
         g.run(3, srv, uav);
     }
     if (mv) {
-        ID3D11ShaderResourceView* srv[8] = {nullptr, nullptr, luma[0].srv.Get(), nullptr, luma[1].srv.Get(), mvTex.srv.Get(), dq[1].srv.Get()};
-        ID3D11UnorderedAccessView* uav[7] = {nullptr, nullptr, nullptr, statsUav.Get()};
+        ID3D11ShaderResourceView* srv[7] = {nullptr, nullptr, luma[0].srv.Get(), nullptr, luma[1].srv.Get(), mvTex.srv.Get(), dq[1].srv.Get()};
+        ID3D11UnorderedAccessView* uav[4] = {nullptr, nullptr, nullptr, statsUav.Get()};
         g.run(4, srv, uav);
     }
-    if (ex) {
-        for (int variant = 0; variant < 2; ++variant) {
-            FrameGenShadowCb c2 = cb;
-            c2.qz[2] = variant;
-            g.setCb(c2);
-            ID3D11ShaderResourceView* sA[8] = {nullptr, nullptr, nullptr, dq[0].srv.Get(), nullptr, nullptr, nullptr, mvq[0].srv.Get()};
-            ID3D11ShaderResourceView* sS[8] = {nullptr, nullptr, luma[0].srv.Get(), dq[0].srv.Get(), luma[1].srv.Get(), nullptr, nullptr, mvq[0].srv.Get()};
-            ID3D11UnorderedAccessView* uK[7] = {nullptr, nullptr, nullptr, nullptr, nullptr, keyE.uav.Get(), srcE.uav.Get()};
-            ID3D11UnorderedAccessView* uS[7] = {nullptr, nullptr, nullptr, statsUav.Get(), nullptr, keyE.uav.Get(), srcE.uav.Get()};
-            g.run(5, none, uK);
-            g.run(6, sA, uK);
-            g.run(7, sA, uK);
-            g.run(8, sS, uS);
-        }
-    }
-    ID3D11UnorderedAccessView* noUav[7] = {};
-    g.ctx->CSSetShaderResources(0, 8, none);
-    g.ctx->CSSetUnorderedAccessViews(0, 7, noUav, nullptr);
+    ID3D11UnorderedAccessView* noUav[4] = {};
+    g.ctx->CSSetShaderResources(0, 7, none);
+    g.ctx->CSSetUnorderedAccessViews(0, 4, noUav, nullptr);
     g.ctx->CopyResource(staging.Get(), stats.Get());
     D3D11_MAPPED_SUBRESOURCE m{};
     if (FAILED(g.ctx->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &m))) return r;
@@ -469,19 +430,15 @@ void expectAgree(Scope& sc, const GpuResult& g, const Ref& c, const char* tag) {
     sc.ok(k.holeDiff <= 8 && k.pixelDiff <= 8 && k.histL1 <= 32, label);
 }
 
-FrameGenShadowCb makeCb(const Scene& a, const FrameGenDeltas& dA, const FrameGenDeltas& dB, float split, bool mutateForward = false, bool identityBackward = false, float depthA = 0.0f, bool oracle = false) {
+FrameGenShadowCb makeCb(const Scene& a, const FrameGenDeltas& dA, const FrameGenDeltas& dB, float split, bool mutateForward = false, bool identityBackward = false, float depthA = 0.0f) {
     (void)a;
     float Wp[9], tp[3];
     frameGenPredictWorld(dA, dB, Wp, tp);
     FrameGenAffine bwd[kFrameGenShadowClasses];
-    // An oracle frame uses frame B's own measured transform in place of the prediction (framegen_shadow.cpp).
-    if (oracle) frameGenBackward(dB, dB.W, dB.tv, bwd);
-    else frameGenBackward(dB, Wp, tp, bwd);
+    frameGenBackward(dB, Wp, tp, bwd);
     if (identityBackward) for (auto& b : bwd) b = FrameGenAffine{};
     FrameGenShadowCb cb;
-    FrameGenAffine truth[kFrameGenShadowClasses];
-    frameGenBackward(dB, dB.W, dB.tv, truth);
-    frameGenFillCb(cb, RW, RH, RW, RH, kTan, kTan, depthA, kDepthB, split, bwd, truth, dA.Hd);
+    frameGenFillCb(cb, RW, RH, RW, RH, kTan, kTan, depthA, kDepthB, split, bwd);
     if (mutateForward) std::memcpy(cb.fw, cb.bw, sizeof(cb.fw));
     return cb;
 }
@@ -744,18 +701,6 @@ World4 case4World(Gpu& g, Scope& sc, bool identityBackward) {
     std::snprintf(label, sizeof(label), "case 4 (acceleration): the score is worse than at constant velocity (%.4f against %.4f)", out.meanAccel, out.meanConst);
     sc.ok(out.meanAccel > 2.5 * out.meanConst, label);
     expectAgree(sc, r, cpuScore(cb, r.lumaA, r.depthA, r.lumaB), "case 4 (acceleration)");
-
-    // The oracle: the same accelerating images scored with B's true transform instead of the prediction reproduce B as well as constant motion does.
-    const FrameGenShadowCb cbO = makeCb(A2, dA, dB2, 10.0f, false, identityBackward, 0.0f, true);
-    const GpuResult ro = runGpu(g, A2, B2, cbO);
-    sc.ok(ro.ok, "case 4 (oracle): the scorer ran");
-    if (!ro.ok) return out;
-    FrameGenShadowEyeResult resO;
-    frameGenDecodeStats(ro.stats.data(), resO);
-    const double meanOracle = meanErr(resO, 2, false);
-    std::snprintf(label, sizeof(label), "case 4 (oracle): B's true transform reproduces the accelerating frame: warped mean %.4f against the prediction's %.4f", meanOracle, out.meanAccel);
-    sc.ok(meanOracle < 0.008 && out.meanAccel > 2.5 * meanOracle, label);
-    expectAgree(sc, ro, cpuScore(cbO, ro.lumaA, ro.depthA, ro.lumaB), "case 4 (oracle)");
     if (g_verbose && !identityBackward) std::printf("  case 4: constant mean %.5f (no-warp %.5f), acceleration mean %.5f, rig miss %.4f deg %.3f mm\n", out.meanConst, idMean, out.meanAccel, static_cast<double>(out.degAccel), static_cast<double>(out.mmAccel));
     return out;
 }
@@ -867,36 +812,19 @@ void case6Module(Gpu& g, Scope& sc) {
     for (int c = 0; c < kFrameGenShadowClasses; ++c) { scored += w.cls[c].pixels; bin0 += w.cls[c].hist[0]; }
     char label[220];
     std::snprintf(label, sizeof(label), "case 6: a static scene scores through the module: %u eye-frames read back, skipped %u/%u/%u/%u/%u", w.framesScored, w.skipped[0], w.skipped[1], w.skipped[2], w.skipped[3], w.skipped[4]);
-    sc.ok(w.framesScored + w.oracle.frames >= 8 && w.skipped[kSkipNoPrevDepth] == 2, label);
+    sc.ok(w.framesScored >= 8 && w.skipped[kSkipNoPrevDepth] == 2, label);
     std::snprintf(label, sizeof(label), "case 6: every scored cell's error is in bin 0 (%llu of %llu) with no hole (%llu)", static_cast<unsigned long long>(bin0), static_cast<unsigned long long>(scored),
                   static_cast<unsigned long long>(w.holes));
     sc.ok(scored > 0 && bin0 == scored && w.holes == 0, label);
     sc.ok(scored == static_cast<uint64_t>(w.framesScored) * QW * QH, "case 6: each scored eye-frame covers all 768 cells");
-    // Every second scored frame of an eye is an oracle frame: the two sets are about equal, and a static scene scores the same in both.
-    uint64_t oScored = 0, oBin0 = 0;
-    for (int c = 0; c < kFrameGenShadowClasses; ++c) { oScored += w.oracle.cls[c].pixels; oBin0 += w.oracle.cls[c].hist[0]; }
-    std::snprintf(label, sizeof(label), "case 6: every second scored frame is an oracle frame (%u predicted, %u oracle), with every oracle error in bin 0 (%llu of %llu)", w.framesScored,
-                  w.oracle.frames, static_cast<unsigned long long>(oBin0), static_cast<unsigned long long>(oScored));
-    sc.ok(w.oracle.frames >= 3 && w.framesScored >= 3 && (w.framesScored > w.oracle.frames ? w.framesScored - w.oracle.frames : w.oracle.frames - w.framesScored) <= 4 &&
-              oScored == static_cast<uint64_t>(w.oracle.frames) * QW * QH && oBin0 == oScored,
-          label);
 
-    // The second kernel runs on every scored frame, whatever its set: a static scene with zero vectors lands every cell on itself both ways.
+    // The second kernel runs on every scored frame, whatever its set: a static scene with zero vectors lands every cell on itself.
     {
-        uint64_t mvPx = 0, mvBin0 = 0, bdPx = 0, bdBin0 = 0, dis = 0;
-        for (int c = 0; c < kFrameGenShadowClasses; ++c) { mvPx += w.mv.cls[c].pixels; mvBin0 += w.mv.cls[c].hist[0]; bdPx += w.bdepth.cls[c].pixels; bdBin0 += w.bdepth.cls[c].hist[0]; }
-        for (int i = 0; i < kFrameGenShadowBins; ++i) dis += w.disWorld[i] + w.disCockpit[i];
-        std::snprintf(label, sizeof(label), "case 6: the mv and bdepth sets cover every scored eye-frame (mv %u, bdepth %u of %u + %u + %u) with every error in bin 0 (%llu of %llu, %llu of %llu)", w.mv.frames,
-                      w.bdepth.frames, w.framesScored, w.oracle.frames, w.jump.frames, static_cast<unsigned long long>(mvBin0), static_cast<unsigned long long>(mvPx),
-                      static_cast<unsigned long long>(bdBin0), static_cast<unsigned long long>(bdPx));
-        sc.ok(w.mv.frames == w.framesScored + w.oracle.frames + w.jump.frames && w.bdepth.frames == w.mv.frames && mvPx == bdPx && mvPx > 0 && mvBin0 == mvPx && bdBin0 == bdPx, label);
-        sc.ok(dis > 0 && w.disWorld[0] + w.disCockpit[0] == dis, "case 6: with zero vectors and identity rows the two landings coincide (every disagreement is in bin 0)");
-        uint64_t ex2Px = 0, ex2Bin0 = 0, ehPx = 0, ehBin0 = 0;
-        for (int c = 0; c < kFrameGenShadowClasses; ++c) { ex2Px += w.ex2d.cls[c].pixels; ex2Bin0 += w.ex2d.cls[c].hist[0]; ehPx += w.ex2dh.cls[c].pixels; ehBin0 += w.ex2dh.cls[c].hist[0]; }
-        std::snprintf(label, sizeof(label), "case 6: the extrapolation sets run once the vectors of a previous frame are in hand (ex2d %u, ex2dh %u of %u eye-frames) and a static scene is predicted (%llu of %llu, %llu of %llu in bin 0)",
-                      w.ex2d.frames, w.ex2dh.frames, w.mv.frames, static_cast<unsigned long long>(ex2Bin0), static_cast<unsigned long long>(ex2Px), static_cast<unsigned long long>(ehBin0),
-                      static_cast<unsigned long long>(ehPx));
-        sc.ok(w.ex2d.frames > 0 && w.ex2d.frames == w.ex2dh.frames && w.ex2d.frames <= w.mv.frames && ex2Px > 0 && ex2Bin0 == ex2Px && ehPx == ex2Px && ehBin0 == ehPx, label);
+        uint64_t mvPx = 0, mvBin0 = 0;
+        for (int c = 0; c < kFrameGenShadowClasses; ++c) { mvPx += w.mv.cls[c].pixels; mvBin0 += w.mv.cls[c].hist[0]; }
+        std::snprintf(label, sizeof(label), "case 6: the mv set covers every scored eye-frame (%u of %u + %u) with every error in bin 0 (%llu of %llu)", w.mv.frames, w.framesScored, w.jump.frames,
+                      static_cast<unsigned long long>(mvBin0), static_cast<unsigned long long>(mvPx));
+        sc.ok(w.mv.frames == w.framesScored + w.jump.frames && mvPx > 0 && mvBin0 == mvPx && mvPx == static_cast<uint64_t>(w.mv.frames) * QW * QH, label);
     }
 
     // The skip reasons, each counted once on its own frame.
@@ -930,8 +858,8 @@ void case6Module(Gpu& g, Scope& sc) {
     const FrameGenShadowWindow done = frameGenShadowOpenWindow();
     uint64_t jScored = 0, jBin0 = 0;
     for (int c = 0; c < kFrameGenShadowClasses; ++c) { jScored += done.jump.cls[c].pixels; jBin0 += done.jump.cls[c].hist[0]; }
-    std::snprintf(label, sizeof(label), "case 6: a camera_jump frame is scored into the jump set (%u frames, %llu of %llu cells in bin 0), not skipped and not in the normal set (%u + %u frames)",
-                  done.jump.frames, static_cast<unsigned long long>(jBin0), static_cast<unsigned long long>(jScored), done.framesScored, done.oracle.frames);
+    std::snprintf(label, sizeof(label), "case 6: a camera_jump frame is scored into the jump set (%u frames, %llu of %llu cells in bin 0), not skipped and not in the normal set (%u frames)",
+                  done.jump.frames, static_cast<unsigned long long>(jBin0), static_cast<unsigned long long>(jScored), done.framesScored);
     sc.ok(done.jump.frames == 2 && jScored == 2ull * QW * QH && jBin0 == jScored, label);
 
     // The key off again: the next boundary releases everything.
@@ -942,15 +870,23 @@ void case6Module(Gpu& g, Scope& sc) {
 
 // ---- case 7: the second kernel -----------------------------------------------------------------------------------------------------------------------------
 
-// The exact vector field of a plane under `cb`'s TRUE rows: for each render pixel of B at depth z metres (class row `cls`), where it is in A minus where it is.
-std::vector<float> exactMv(const FrameGenShadowCb& cb, float z, int cls) {
+// The exact vector field of a plane under B's TRUE rows (frameGenBackward of B's measured deltas): for each render pixel of B at depth z metres (class `cls`), where it is in
+// A minus where it is.
+std::vector<float> exactMv(const FrameGenDeltas& dB, float z, int cls) {
+    FrameGenAffine truth[kFrameGenShadowClasses];
+    frameGenBackward(dB, dB.W, dB.tv, truth);
+    float rows[3][4];
+    for (int r = 0; r < 3; ++r) {
+        for (int k = 0; k < 3; ++k) rows[r][k] = truth[cls].R[r * 3 + k];
+        rows[r][3] = truth[cls].t[r];
+    }
     std::vector<float> mv(static_cast<size_t>(RW) * RH * 2);
     for (int y = 0; y < RH; ++y)
         for (int x = 0; x < RW; ++x) {
             float d[3], dp[3], px = 0.0f, py = 0.0f;
             pixelDir(x, y, d);
-            carryCpu(d, z, false, cb.tb + cls * 3, dp);
-            if (!temporalDirToPixel(dp, cb.tanA, RW, RH, &px, &py)) { px = static_cast<float>(x) + 1000.0f; py = static_cast<float>(y); }
+            carryCpu(d, z, false, rows, dp);
+            if (!temporalDirToPixel(dp, kTan, RW, RH, &px, &py)) { px = static_cast<float>(x) + 1000.0f; py = static_cast<float>(y); }
             mv[(static_cast<size_t>(y) * RW + x) * 2] = px - static_cast<float>(x);
             mv[(static_cast<size_t>(y) * RW + x) * 2 + 1] = py - static_cast<float>(y);
         }
@@ -958,7 +894,7 @@ std::vector<float> exactMv(const FrameGenShadowCb& cb, float z, int cls) {
 }
 
 struct Case7Out {
-    double mvErr = 0.0, bdErr = 0.0, dis50 = 0.0;
+    double mvErr = 0.0;
     bool ran = false;
 };
 
@@ -974,10 +910,9 @@ Case7Out case7World(Gpu& g, Scope& sc, int mode) {
     Scene A, B;
     worldPlane(A, B, W, tv);
     const FrameGenShadowCb cb = makeCb(A, dA, dB, 10.0f);
-    std::vector<float> mv = exactMv(cb, 50.0f, 2);
+    std::vector<float> mv = exactMv(dB, 50.0f, 2);
     for (size_t i = 0; i < mv.size(); i += 2) {
         if (mode == 1) mv[i] += 2.0f;
-        if (mode == 3) mv[i] += 6.0f;
         if (mode == 2) { mv[i] = -mv[i]; mv[i + 1] = -mv[i + 1]; }
     }
     const GpuResult r = runGpu(g, A, B, cb, &mv);
@@ -987,46 +922,23 @@ Case7Out case7World(Gpu& g, Scope& sc, int mode) {
     FrameGenShadowEyeResult res;
     frameGenDecodeStats(r.stats.data(), res);
     const double mvErr = res.mv.cls[2].pixels ? static_cast<double>(res.mv.cls[2].sumErr1024) / 1024.0 / res.mv.cls[2].pixels : 1.0;
-    const double bdErr = res.bdepth.cls[2].pixels ? static_cast<double>(res.bdepth.cls[2].sumErr1024) / 1024.0 / res.bdepth.cls[2].pixels : 1.0;
     out.mvErr = mvErr;
-    out.bdErr = bdErr;
-    uint64_t disN = 0;
-    for (int i = 0; i < kFrameGenShadowBins; ++i) disN += res.disWorld[i];
-    out.dis50 = frameGenShadowDisPercentile(res.disWorld, 0.5f);
-    char label[240], label0[240];
-    const char* tag = mode == 0 ? "case 7 (exact vectors)" : (mode == 1 ? "case 7 (+2 px)" : (mode == 3 ? "case 7 (+6 px)" : "case 7 (negated vectors)"));
-    // How often the true rows part from the vector by more than 4 px: never for the exact field and for 2 px, always for 6 px.
-    if (mode == 0 || mode == 1 || mode == 3) {
-        std::snprintf(label0, sizeof(label0), "%s: the rows-off share of the world cells is %u of %u", tag, res.rowsWorldOff, res.rowsWorld);
-        sc.ok(res.rowsWorld > static_cast<uint32_t>(QW * QH) * 8 / 10 && res.rowsCockpit == 0 &&
-                  (mode == 3 ? res.rowsWorldOff * 100u >= res.rowsWorld * 95u : res.rowsWorldOff * 100u <= res.rowsWorld * 3u),
-              label0);
-        if (mode == 3) return out;
-    }
-    std::snprintf(label, sizeof(label), "%s: the plane is the world class in both sets (mv %u, bdepth %u of %d cells, all %llu cells looked at)", tag, res.mv.cls[2].pixels, res.bdepth.cls[2].pixels, QW * QH,
+    char label[240];
+    const char* tag = mode == 0 ? "case 7 (exact vectors)" : (mode == 1 ? "case 7 (+2 px)" : "case 7 (negated vectors)");
+    std::snprintf(label, sizeof(label), "%s: the plane is the world class in the mv set (%u of %d cells, all %llu cells looked at)", tag, res.mv.cls[2].pixels, QW * QH,
                   static_cast<unsigned long long>(res.mv.cells));
-    sc.ok(res.mv.cls[2].pixels > static_cast<uint32_t>(QW * QH) * 8 / 10 && res.bdepth.cls[2].pixels > static_cast<uint32_t>(QW * QH) * 9 / 10 && res.mv.cls[1].pixels == 0 &&
-              res.bdepth.cls[1].pixels == 0 && res.bdepth.cells == static_cast<uint64_t>(QW * QH) && res.mv.cells == res.bdepth.cells,
-          label);
-    // bdepth does not use the vectors: its figure is the same whatever the field.
-    std::snprintf(label, sizeof(label), "%s: the bdepth landing reproduces B (mean error %.4f)", tag, bdErr);
-    sc.ok(bdErr < 0.008, label);
+    sc.ok(res.mv.cls[2].pixels > static_cast<uint32_t>(QW * QH) * 8 / 10 && res.mv.cls[1].pixels == 0 && res.mv.cells == static_cast<uint64_t>(QW * QH), label);
     if (mode != 1) {
-        std::snprintf(label, sizeof(label), "%s: the mv landing reproduces B as well as bdepth (mean error %.4f against %.4f)", tag, mvErr, bdErr);
+        std::snprintf(label, sizeof(label), "%s: the mv landing reproduces B (mean error %.4f)", tag, mvErr);
         sc.ok(mvErr < 0.008, label);
-        std::snprintf(label, sizeof(label), "%s: the two landings agree to under 1/16 px (%llu of %llu world cells in bin 0)", tag, static_cast<unsigned long long>(res.disWorld[0]),
-                      static_cast<unsigned long long>(disN));
-        sc.ok(disN > static_cast<uint64_t>(QW * QH) * 8 / 10 && res.disWorld[0] * 100 >= disN * 98, label);
-    } else if (mode == 1) {
-        std::snprintf(label, sizeof(label), "%s: the mv landing is worse than bdepth (%.4f against %.4f)", tag, mvErr, bdErr);
-        sc.ok(mvErr > 3.0 * bdErr && mvErr > 0.012, label);
-        std::snprintf(label, sizeof(label), "%s: the median disagreement reads about 2 px (%.2f)", tag, out.dis50);
-        sc.ok(disN > static_cast<uint64_t>(QW * QH) * 8 / 10 && out.dis50 > 1.8 && out.dis50 < 2.5, label);
+    } else {
+        std::snprintf(label, sizeof(label), "%s: the mv landing is off (mean error %.4f)", tag, mvErr);
+        sc.ok(mvErr > 0.012, label);
     }
     return out;
 }
 
-// A cockpit plane 1 m ahead under an 8 cm head translation, exact vectors: the cockpit disagreement histogram is filled and reads 0.
+// A cockpit plane 1 m ahead under an 8 cm head translation, exact vectors: the cockpit's mv set reproduces B.
 void case7Cockpit(Gpu& g, Scope& sc) {
     FrameGenDeltas dA, dB;
     dB.th[0] = 0.08f;
@@ -1041,180 +953,16 @@ void case7Cockpit(Gpu& g, Scope& sc) {
             A.depth[static_cast<size_t>(y) * RW + x] = B.depth[static_cast<size_t>(y) * RW + x] = kDepthB / 1.0f;
         }
     const FrameGenShadowCb cb = makeCb(A, dA, dB, 10.0f);
-    const std::vector<float> mv = exactMv(cb, 1.0f, 1);
+    const std::vector<float> mv = exactMv(dB, 1.0f, 1);
     const GpuResult r = runGpu(g, A, B, cb, &mv);
     sc.ok(r.ok, "case 7 (cockpit): the scorer ran");
     if (!r.ok) return;
     FrameGenShadowEyeResult res;
     frameGenDecodeStats(r.stats.data(), res);
-    uint64_t world = 0, cockpit = 0;
-    for (int i = 0; i < kFrameGenShadowBins; ++i) { world += res.disWorld[i]; cockpit += res.disCockpit[i]; }
     char label[240];
-    std::snprintf(label, sizeof(label), "case 7 (cockpit): the cockpit disagreement histogram holds the cells (%llu, the world one %llu) and they agree to under 1/16 px (%u in bin 0)",
-                  static_cast<unsigned long long>(cockpit), static_cast<unsigned long long>(world), res.disCockpit[0]);
-    sc.ok(world == 0 && cockpit > static_cast<uint64_t>(QW * QH) * 8 / 10 && res.disCockpit[0] * 100 >= cockpit * 98, label);
     const double mvErr = res.mv.cls[1].pixels ? static_cast<double>(res.mv.cls[1].sumErr1024) / 1024.0 / res.mv.cls[1].pixels : 1.0;
     std::snprintf(label, sizeof(label), "case 7 (cockpit): the cockpit's mv set reproduces B (mean error %.4f, %u cells)", mvErr, res.mv.cls[1].pixels);
-    sc.ok(mvErr < 0.008 && res.mv.cls[0].pixels == 0 && res.mv.cls[2].pixels == 0, label);
-    std::snprintf(label, sizeof(label), "case 7 (cockpit): the rows-off share of the cockpit cells is %u of %u, the world's %u of %u", res.rowsCockpitOff, res.rowsCockpit, res.rowsWorldOff, res.rowsWorld);
-    sc.ok(res.rowsCockpit > static_cast<uint32_t>(QW * QH) * 8 / 10 && res.rowsCockpitOff * 100u <= res.rowsCockpit * 3u && res.rowsWorld == 0, label);
-}
-
-// ---- case 8: the extrapolation sets ----------------------------------------------------------------------------------------------------------------------------
-
-// The texture of the extrapolation scenes, a function of a continuous position on the plane.
-float exContent(float x, float y) {
-    return 0.5f + 0.25f * std::sin(0.11f * x + 0.7f) + 0.15f * std::sin(0.083f * y + 0.3f) + 0.1f * std::sin(0.05f * (x + y));
-}
-
-double blockMean(const FrameGenShadowEyeBlock& b, int cls, bool noWarp) {
-    const FrameGenShadowClassStats& s = b.cls[cls];
-    if (!s.pixels) return 1.0;
-    return static_cast<double>(noWarp ? s.sumErrId1024 : s.sumErr1024) / 1024.0 / s.pixels;
-}
-
-struct Case8Out {
-    double e2 = 1.0, eh = 1.0, id = 1.0;
-    uint64_t holes2 = 0;
-    bool ran = false;
-};
-
-// mode 0: a world plane 50 m away whose texture scrolls at constant screen velocity (8 px = 2 cells a frame to the right), exact vectors; mode 1: the same with every vector
-// offset by +4 px in x. Both variants run with the head still (identity rotations), where ex2dh must equal ex2d.
-Case8Out case8(Gpu& g, Scope& sc, int mode) {
-    Case8Out out;
-    Scene Am1, A, B;
-    std::vector<float> mvA(static_cast<size_t>(RW) * RH * 2, 0.0f);
-    for (int y = 0; y < RH; ++y)
-        for (int x = 0; x < RW; ++x) {
-            const size_t i = static_cast<size_t>(y) * RW + x;
-            const float v = 8.0f;
-            Am1.out[i] = exContent(static_cast<float>(x) + v, static_cast<float>(y));
-            A.out[i] = exContent(static_cast<float>(x), static_cast<float>(y));
-            B.out[i] = exContent(static_cast<float>(x) - v, static_cast<float>(y));
-            Am1.depth[i] = A.depth[i] = B.depth[i] = kDepthB / 50.0f;
-            mvA[i * 2] = -v + (mode == 1 ? 4.0f : 0.0f);
-        }
-    const FrameGenDeltas dA, dB;
-    const FrameGenShadowCb cb = makeCb(A, dA, dB, 10.0f);
-    ExIn in;
-    in.am1 = &Am1;
-    in.mvA = &mvA;
-    const GpuResult r = runGpu(g, A, B, cb, nullptr, &in);
-    const char* const tag = mode == 0 ? "case 8 (scrolling plane)" : "case 8 (vectors +4 px)";
-    char label[260];
-    std::snprintf(label, sizeof(label), "%s: the scorer ran", tag);
-    sc.ok(r.ok, label);
-    if (!r.ok) return out;
-    out.ran = true;
-    FrameGenShadowEyeResult res;
-    frameGenDecodeStats(r.stats.data(), res);
-    out.e2 = blockMean(res.ex2d, 2, false);
-    out.eh = blockMean(res.ex2dh, 2, false);
-    out.id = blockMean(res.ex2d, 2, true);
-    out.holes2 = res.ex2d.holes;
-    if (g_verbose) std::printf("  %s: ex2d mean %.5f (holes %llu), ex2dh mean %.5f (holes %llu), no-warp %.5f; rows-off world %u of %u\n", tag, out.e2, static_cast<unsigned long long>(res.ex2d.holes),
-                               out.eh, static_cast<unsigned long long>(res.ex2dh.holes), out.id, res.rowsWorldOff, res.rowsWorld);
-    std::snprintf(label, sizeof(label), "%s: both sets score the plane as the world class (ex2d %u, ex2dh %u of %d cells, %llu and %llu looked at)", tag, res.ex2d.cls[2].pixels, res.ex2dh.cls[2].pixels, QW * QH,
-                  static_cast<unsigned long long>(res.ex2d.cells), static_cast<unsigned long long>(res.ex2dh.cells));
-    sc.ok(res.ex2d.cls[2].pixels > static_cast<uint32_t>(QW * QH) * 8 / 10 && res.ex2dh.cls[2].pixels > static_cast<uint32_t>(QW * QH) * 8 / 10 && res.ex2d.cls[0].pixels == 0 &&
-              res.ex2d.cls[1].pixels == 0 && res.ex2d.cells == static_cast<uint64_t>(QW * QH) && res.ex2dh.cells == res.ex2d.cells,
-          label);
-    if (mode == 0) {
-        std::snprintf(label, sizeof(label), "%s: constant screen velocity with exact vectors is predicted: ex2d mean error %.4f, ex2dh %.4f, no-warp %.4f", tag, out.e2, out.eh, out.id);
-        sc.ok(out.e2 < 0.008 && out.eh < 0.008 && out.id > 4.0 * out.e2 && std::fabs(out.eh - out.e2) < 0.002, label);
-        std::snprintf(label, sizeof(label), "%s: the holes are the leading edge (%llu ex2d holes, %u to %d expected)", tag, static_cast<unsigned long long>(res.ex2d.holes), QH, 4 * QH);
-        sc.ok(res.ex2d.holes >= static_cast<uint64_t>(QH) && res.ex2d.holes <= static_cast<uint64_t>(4 * QH), label);
-    }
-    return out;
-}
-
-// ---- case 9: the head's rotation in the extrapolation -----------------------------------------------------------------------------------------------------------
-
-struct Case9Out {
-    double e2 = 1.0, eh = 1.0, id = 1.0;
-    bool ran = false;
-};
-
-// A world plane 50 m away whose texture moves at a constant ship-screen offset m = (-8, 0) px a frame while the head turns about Y by headA degrees from the frame before A to A
-// (Hd_A) and headB from A to B (Hd_B; the rows are B to A), so the rate changes between the two intervals. The model is the shader's: A's pixel p is at P(Hd_A dir(p)) + m in the frame
-// before A (so A's vector is that minus p), and B's pixel pB shows what A shows at P(Hd_B dir(pB)) + m, P being the pixel of a direction. ex2dh must land on B; ex2d, which carries the
-// head's part of A's rate forward unchanged, must not once the rate changed.
-Case9Out case9(Gpu& g, Scope& sc, const char* tag, float headA, float headB) {
-    Case9Out out;
-    Scene Am1, A, B;
-    std::vector<float> mvA(static_cast<size_t>(RW) * RH * 2, 0.0f);
-    float hdA[9], hdB[9];
-    rotY(headA, hdA);
-    rotY(headB, hdB);
-    const float mx = -8.0f, my = 0.0f;
-    for (int y = 0; y < RH; ++y)
-        for (int x = 0; x < RW; ++x) {
-            const size_t i = static_cast<size_t>(y) * RW + x;
-            float d[3], r[3], px = 0.0f, py = 0.0f;
-            pixelDir(x, y, d);
-            // B: what A shows at P(Hd_B dir(pB)) + m
-            temporalApply3(hdB, d, r);
-            temporalDirToPixel(r, kTan, RW, RH, &px, &py);
-            B.out[i] = exContent(px + mx, py + my);
-            A.out[i] = exContent(static_cast<float>(x), static_cast<float>(y));
-            // A's vector: P(Hd_A dir(p)) + m - p
-            temporalApply3(hdA, d, r);
-            temporalDirToPixel(r, kTan, RW, RH, &px, &py);
-            mvA[i * 2] = px + mx - static_cast<float>(x);
-            mvA[i * 2 + 1] = py + my - static_cast<float>(y);
-            Am1.out[i] = 0.5f;
-            Am1.depth[i] = A.depth[i] = B.depth[i] = kDepthB / 50.0f;
-        }
-    FrameGenDeltas dA, dB;
-    std::memcpy(dA.Hd, hdA, sizeof(hdA));
-    std::memcpy(dB.Hd, hdB, sizeof(hdB));
-    const FrameGenShadowCb cb = makeCb(A, dA, dB, 10.0f);
-    ExIn in;
-    in.am1 = &Am1;
-    in.mvA = &mvA;
-    const GpuResult r = runGpu(g, A, B, cb, nullptr, &in);
-    char label[260];
-    std::snprintf(label, sizeof(label), "%s: the scorer ran", tag);
-    sc.ok(r.ok, label);
-    if (!r.ok) return out;
-    out.ran = true;
-    FrameGenShadowEyeResult res;
-    frameGenDecodeStats(r.stats.data(), res);
-    out.e2 = blockMean(res.ex2d, 2, false);
-    out.eh = blockMean(res.ex2dh, 2, false);
-    out.id = blockMean(res.ex2d, 2, true);
-    if (g_verbose) std::printf("  %s: ex2d mean %.5f, ex2dh mean %.5f (holes %llu and %llu), no-warp %.5f\n", tag, out.e2, out.eh, static_cast<unsigned long long>(res.ex2d.holes), static_cast<unsigned long long>(res.ex2dh.holes), out.id);
-    std::snprintf(label, sizeof(label), "%s: both sets score the plane as the world class (ex2d %u, ex2dh %u of %d cells)", tag, res.ex2d.cls[2].pixels, res.ex2dh.cls[2].pixels, QW * QH);
-    sc.ok(res.ex2d.cls[2].pixels > static_cast<uint32_t>(QW * QH) * 7 / 10 && res.ex2dh.cls[2].pixels > static_cast<uint32_t>(QW * QH) * 7 / 10 && res.ex2d.cls[1].pixels == 0, label);
-    if (headA == 0.0f && headB == 0.0f) {
-        std::snprintf(label, sizeof(label), "%s: with the head still ex2dh equals ex2d (mean error %.4f and %.4f)", tag, out.eh, out.e2);
-        sc.ok(out.eh < 0.008 && std::fabs(out.eh - out.e2) < 0.002, label);
-    } else {
-        std::snprintf(label, sizeof(label), "%s: a head turn at a changing rate is predicted by ex2dh (mean error %.4f) and not by ex2d (%.4f; no warp %.4f)", tag, out.eh, out.e2, out.id);
-        sc.ok(out.eh < 0.01 && out.e2 > 4.0 * out.eh && out.e2 > 0.02, label);
-    }
-    return out;
-}
-
-// The shader itself with one piece of text in the extrapolation's target replaced, in the three entries that compute the target (the splat, the source pass and the score).
-bool compileMutatedEx(Gpu& g, ComPtr<ID3D11ComputeShader> out[3], const std::string& from, const std::string& to) {
-    HMODULE lib = LoadLibraryA("d3dcompiler_47.dll");
-    if (!lib) return false;
-    using CompileFn = HRESULT(WINAPI*)(LPCVOID, SIZE_T, LPCSTR, const D3D_SHADER_MACRO*, ID3DInclude*, LPCSTR, LPCSTR, UINT, UINT, ID3DBlob**, ID3DBlob**);
-    const CompileFn compile = reinterpret_cast<CompileFn>(GetProcAddress(lib, "D3DCompile"));
-    if (!compile) return false;
-    std::string text = frameGenShadowShaderSource();
-    const size_t at = text.find(from);
-    if (at == std::string::npos) return false;
-    text.replace(at, from.size(), to);
-    const char* const entries[3] = {"fgShadowExSplat", "fgShadowExSrc", "fgShadowExScore"};
-    for (int i = 0; i < 3; ++i) {
-        ComPtr<ID3DBlob> code, err;
-        if (FAILED(compile(text.data(), text.size(), "framegen_mutated_ex", nullptr, nullptr, entries[i], "cs_5_0", 0, 0, &code, &err))) return false;
-        if (FAILED(g.dev->CreateComputeShader(code->GetBufferPointer(), code->GetBufferSize(), nullptr, &out[i]))) return false;
-    }
-    return true;
+    sc.ok(mvErr < 0.008 && res.mv.cls[1].pixels > static_cast<uint32_t>(QW * QH) * 8 / 10 && res.mv.cls[0].pixels == 0 && res.mv.cls[2].pixels == 0, label);
 }
 
 // The shader itself with the sign flipped: fgShadowScoreB recompiled from the production text with `c + Mv.Load` made `c - Mv.Load`.
@@ -1253,21 +1001,10 @@ int run() {
     const Case7Out c7exact = case7World(g, sc, 0);
     const Case7Out c7off = case7World(g, sc, 1);
     case7Cockpit(g, sc);
-    case7World(g, sc, 3);
-    const Case8Out c8scroll = case8(g, sc, 0);
-    const Case8Out c8off = case8(g, sc, 1);
-    case9(g, sc, "case 9 (head still)", 0.0f, 0.0f);
-    case9(g, sc, "case 9 (head turning faster)", 1.0f, 3.0f);
-    case9(g, sc, "case 9 (head reversing)", -2.0f, 3.0f);
     {
         char label[200];
-        std::snprintf(label, sizeof(label), "case 8: the extrapolation moves with the vectors (exact ex2d %.4f, vectors +4 px %.4f)", c8scroll.e2, c8off.e2);
-        sc.ok(c8scroll.ran && c8off.ran && c8off.e2 > 3.0 * c8scroll.e2 && c8off.e2 > 0.02, label);
-    }
-    {
-        char label[200];
-        std::snprintf(label, sizeof(label), "case 7: the vectors' error moves with the vectors, the bdepth one does not (exact mv %.4f, +2 px mv %.4f; bdepth %.4f, %.4f)", c7exact.mvErr, c7off.mvErr, c7exact.bdErr, c7off.bdErr);
-        sc.ok(c7exact.ran && c7off.ran && c7off.mvErr > 3.0 * c7exact.mvErr && std::fabs(c7off.bdErr - c7exact.bdErr) < 1e-4, label);
+        std::snprintf(label, sizeof(label), "case 7: the vectors' error moves with the vectors (exact mv %.4f, +2 px mv %.4f)", c7exact.mvErr, c7off.mvErr);
+        sc.ok(c7exact.ran && c7off.ran && c7off.mvErr > 3.0 * c7exact.mvErr, label);
     }
 
     // The mutations: each must break its case.
@@ -1302,49 +1039,9 @@ int run() {
             if (m4.fails == 0) { ++g_failures; std::printf("FAIL: mutation: the shader reading the vector with the wrong sign still passes case 7\n"); }
         }
     }
-    Scope m5;
-    m5.quiet = true;
-    {
-        ComPtr<ID3D11ComputeShader> flipped[3];
-        const ComPtr<ID3D11ComputeShader> saved[3] = {g.cs[6], g.cs[7], g.cs[8]};
-        ++g_checks;
-        if (!compileMutatedEx(g, flipped, "pp = pA - m.xy;", "pp = pA + m.xy;")) {
-            ++g_failures;
-            std::printf("FAIL: mutation: the extrapolation's sign-flipped shader could not be built (is `pp = pA - m.xy;` still in the kernel?)\n");
-        } else {
-            for (int i = 0; i < 3; ++i) g.cs[6 + i] = flipped[i];
-            case8(g, m5, 0);
-            for (int i = 0; i < 3; ++i) g.cs[6 + i] = saved[i];
-            if (m5.fails == 0) { ++g_failures; std::printf("FAIL: mutation: the extrapolation with the vector's sign flipped still passes case 8\n"); }
-        }
-    }
-    // The head's part of the extrapolation: B's true head rotation applied with the transposed rows (the wrong sign), and A's head part left in the vector (not taken out).
-    Scope m6, m7;
-    m6.quiet = true;
-    m7.quiet = true;
-    {
-        const ComPtr<ID3D11ComputeShader> saved[3] = {g.cs[6], g.cs[7], g.cs[8]};
-        const char* const from[2] = {"dot(fw[3].xyz, dS), dot(fw[4].xyz, dS), dot(fw[5].xyz, dS)", "float2 shipM = (pA + m.xy) - pHeadPrev;"};
-        const char* const to[2] = {"dot(bw[3].xyz, dS), dot(bw[4].xyz, dS), dot(bw[5].xyz, dS)", "float2 shipM = (pA + m.xy) - pA;"};
-        Scope* const ms[2] = {&m6, &m7};
-        const char* const what[2] = {"B's head rotation with the wrong sign", "A's head part left in the vector"};
-        for (int k = 0; k < 2; ++k) {
-            ComPtr<ID3D11ComputeShader> mutated[3];
-            ++g_checks;
-            if (!compileMutatedEx(g, mutated, from[k], to[k])) {
-                ++g_failures;
-                std::printf("FAIL: mutation: the shader with %s could not be built (is the text it replaces still in the kernel?)\n", what[k]);
-                continue;
-            }
-            for (int i = 0; i < 3; ++i) g.cs[6 + i] = mutated[i];
-            case9(g, *ms[k], "case 9 mutation", 1.0f, 3.0f);
-            for (int i = 0; i < 3; ++i) g.cs[6 + i] = saved[i];
-            if (ms[k]->fails == 0) { ++g_failures; std::printf("FAIL: mutation: %s still passes case 9\n", what[k]); }
-        }
-    }
     (void)w4;
-    std::printf("%s: %u checks, %u failures (mutations: forward-not-inverted broke %u checks, identity-backward broke %u, wrong-sign vectors broke %u, wrong-sign shader broke %u, wrong-sign extrapolation broke %u, wrong-sign head broke %u, head not taken out broke %u)\n", g_failures ? "FAIL" : "PASS", g_checks,
-                g_failures, m1.fails, m2.fails, m3.fails, m4.fails, m5.fails, m6.fails, m7.fails);
+    std::printf("%s: %u checks, %u failures (mutations: forward-not-inverted broke %u checks, identity-backward broke %u, wrong-sign vectors broke %u, wrong-sign shader broke %u)\n", g_failures ? "FAIL" : "PASS", g_checks,
+                g_failures, m1.fails, m2.fails, m3.fails, m4.fails);
     return g_failures ? 1 : 0;
 }
 

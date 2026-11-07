@@ -10612,7 +10612,6 @@ H_DESKTOP_OTHER = r"desktop window: (?!setting |10 s: |stopped \()"
 # window's are. The armed line is said once per change to on (so health_scan keeps it whatever --since says); the report line every second.
 H_FRAMEGEN = "frame generation shadow"
 H_FRAMEGEN_LABEL = "frame generation (shadow):"
-H_FRAMEGEN_EX_LABEL = "frame generation (shadow) extrapolation:"   # the extrapolation sets' own line, said right after the report (the report is at the widest a line takes)
 # The head-pose miss (src\common\framegen_pose_report.h kFrameGenPoseReportFmt, written by the OpenXR runtime): a line of the runtime log, which carries no build tag and a UTC clock, so
 # health_scan_runtime reads it, as it reads the world scale's, and --since/--until do not cut it.
 H_FRAMEGEN_POSE_LABEL = "frame generation (shadow) pose:"
@@ -10628,27 +10627,23 @@ _HFG_GROUPS = r"[a-z]+=\d+(?: [a-z]+=\d+)*"
 H_FRAMEGEN_VRAM = (r"frame generation \(shadow\): eye (?P<eye>\d+) VRAM (?P<bytes>\d+) B \((?P<mib>[\d.]+) MiB\): (?P<groups>" + _HFG_GROUPS +
                    r"); two eyes (?P<two>\d+) B \((?P<two_mib>[\d.]+) MiB\)$")
 _HFG_CLASS = r" {n}=(?P<{n}_share>[\d.]+)%,(?P<{n}_mean>\d+),(?P<{n}_p50>\d+),(?P<{n}_p95>\d+),(?P<{n}_o02>[\d.]+)%,(?P<{n}_o05>[\d.]+)%\|id:(?P<{n}_idmean>\d+),(?P<{n}_idp95>\d+)"
-# The oracle set (frame B's true transform for far and world) and the jump set (camera_jump frames), each with the three class fields under group prefixes o_ and j_, then the CPU
-# motion facts (a number, or "-" when nothing was sampled). All of it is optional: a line from before these fields ends at rig_mm.
+# The jump set (camera_jump frames) with the three class fields under the group prefix j_, then the CPU motion facts (a number, or "-" when nothing was sampled), then the second
+# kernel's mv set (the DLSS vector's landing, prefix m_). All of it is optional: a line from before these fields ends at rig_mm, one from before the second kernel at rig_dt_mm.
+# The lines of the builds before 2026-11-07 carried an oracle set (prefix o_) before the jump set, and a bdepth set (prefix b_) with the disagreement of the two landings after
+# the mv set: both are read so those logs still parse, and judged no further. Their extrapolation line ("frame generation (shadow) extrapolation: ...") carries none of the
+# rule's labels and is passed over.
 _HFG_SET_CLASS = _HFG_CLASS.replace("(?P<{n}_", "(?P<{p}{n}_")
 _HFG_NUM = r"(?:[\d.]+|-)"
 H_FRAMEGEN_REPORT = (r"frame generation \(shadow\): frames=(?P<frames>\d+) skipped=(?P<s0>\d+)/(?P<s1>\d+)/(?P<s2>\d+)/(?P<s3>\d+)/(?P<s4>\d+)"
                      + "".join(_HFG_CLASS.format(n=n) for n in ("far", "cockpit", "world")) +
                      r" holes=(?P<holes>[\d.]+)% gpu_ms=(?:(?P<gpu_med>[\d.]+)/(?P<gpu_max>[\d.]+)\(n=(?P<gpu_n>[1-9]\d*)\)|-\(n=0\)) rig_deg=(?P<deg_med>[\d.]+)/(?P<deg_max>[\d.]+) rig_mm=(?P<mm_med>[\d.]+)/(?P<mm_max>[\d.]+)"
-                     r"(?: oracle=(?P<oracle_n>\d+)" + "".join(_HFG_SET_CLASS.format(n=n, p="o_") for n in ("far", "cockpit", "world")) +
+                     r"(?:(?: oracle=(?P<oracle_n>\d+)" + "".join(_HFG_SET_CLASS.format(n=n, p="o_") for n in ("far", "cockpit", "world")) + r")?"
                      r" jump=(?P<jump_n>\d+)" + "".join(_HFG_SET_CLASS.format(n=n, p="j_") for n in ("far", "cockpit", "world")) +
                      r" motion_mm=(?P<motion_med>{N})/(?P<motion_max>{N}) mag_ratio=(?P<mag5>{N})/(?P<mag50>{N})/(?P<mag95>{N})"
                      r" dt_ratio=(?P<dtr5>{N})/(?P<dtr50>{N})/(?P<dtr95>{N}) dt_ms=(?P<dtms_med>{N})/(?P<dtms_max>{N}) rig_dt_mm=(?P<rigdt_med>{N})/(?P<rigdt_max>{N})"
-                     # the second kernel, appended after rig_dt_mm (optional: a line from before it ends there): the mv set (the DLSS vector's landing) and the bdepth set (B's true rows
-                     # and own depth), each with a frame count and the three class fields (prefixes m_ and b_), then the disagreement of the two landings in render px, p50/p95
                      r"(?: mv=(?P<mv_n>\d+)" + "".join(_HFG_SET_CLASS.format(n=n, p="m_") for n in ("far", "cockpit", "world")) +
-                     r" bdepth=(?P<bd_n>\d+)" + "".join(_HFG_SET_CLASS.format(n=n, p="b_") for n in ("far", "cockpit", "world")) +
-                     r" mvdis_world_px=(?P<dw50>{N})/(?P<dw95>{N}) mvdis_cockpit_px=(?P<dc50>{N})/(?P<dc95>{N}))?)?$").replace("{N}", _HFG_NUM)
-# The extrapolation line (optional: a log from before it has none): ex2d (constant screen velocity) and ex2dh (the same with the head's rotation taken out of A's vector and B's true head rotation put back) as the score sets; a line from the build that said ex3d there is counted as unparsed, then how often B's true rows
-# part from the DLSS vector by more than 4 px (a percentage, or "-" when no cell of the class landed).
-H_FRAMEGEN_EXTRAP = (r"frame generation \(shadow\) extrapolation: ex2d=(?P<x2_n>\d+)" + "".join(_HFG_SET_CLASS.format(n=n, p="x2_") for n in ("far", "cockpit", "world")) +
-                     r" ex2dh=(?P<xh_n>\d+)" + "".join(_HFG_SET_CLASS.format(n=n, p="xh_") for n in ("far", "cockpit", "world")) +
-                     r" rowsoff_world=(?P<rows_world>[\d.]+%|-) rowsoff_cockpit=(?P<rows_cockpit>[\d.]+%|-)$")
+                     r"(?: bdepth=(?P<bd_n>\d+)" + "".join(_HFG_SET_CLASS.format(n=n, p="b_") for n in ("far", "cockpit", "world")) +
+                     r" mvdis_world_px=(?P<dw50>{N})/(?P<dw95>{N}) mvdis_cockpit_px=(?P<dc50>{N})/(?P<dc95>{N}))?)?)?$").replace("{N}", _HFG_NUM)
 # Frame generation, Phase 2.1 (the synthesizer, the same key; src\common\framegen_synth_report.h): its armed line (once per key-on, said when the first eye's textures are made) and its
 # one-second line, graphics-log lines with no build tag, read the way the scorer's are. The report is frames=<f=0.5 built>/<f=1 built> scored=<f=1 frames scored against the next real
 # frame> skipped=<calls that built nothing> gpu_ms=<f=0.5 median/max(n=)>/<f=1 ...> holes=<filled>%/<left>% guard=<%> clamp=<%>, then the scorer's three class fields (the f = 1 S against the
@@ -16884,8 +16879,7 @@ def _hj_framegen_shadow(rows, ctx=None):
     armed = rows.get("armed", [])
     reports = rows.get("report", [])
     poses = rows.get("pose", [])
-    extraps = rows.get("extrap", [])
-    if not armed and not reports and not poses and not extraps:
+    if not armed and not reports and not poses:
         return None
     if not reports and not armed:
         return ("PARTIAL", "%d pose line(s) in the runtime log but no scorer line in the graphics log (the graphics log of another flight, or the scorer's lines are cut)" % len(poses))
@@ -16904,27 +16898,15 @@ def _hj_framegen_shadow(rows, ctx=None):
         text += "; VRAM %s MiB for two eyes (%s; the last VRAM line)" % (vram[-1]["two_mib"], vram[-1]["groups"])
     if not frames:
         text += "; no frame was scored (every frame skipped)"
-    # The oracle set (frame B's true transform): the world class's p95 error with it against the prediction's, over the lines that carry it (older lines do not).
-    withOracle = [r for r in reports if r.get("o_world_p95") is not None and int(r.get("oracle_n") or 0) > 0]
-    if withOracle:
-        text += ("; world p95 %.0f milli-luma predicted vs %.0f oracle (mean of %d line(s)), %d jump frame(s) scored apart" %
-                 (sum(int(r["world_p95"]) for r in withOracle) / len(withOracle), sum(int(r["o_world_p95"]) for r in withOracle) / len(withOracle), len(withOracle),
-                  sum(int(r.get("jump_n") or 0) for r in withOracle)))
-    # The second kernel (lines from after it only): the world class's p95 error for the four landings, and where the DLSS vector and B's true rows part, in render pixels.
-    withMv = [r for r in withOracle if r.get("m_world_p95") is not None and int(r.get("mv_n") or 0) > 0]
+    # The jump set and the second kernel (lines that carry them: older lines do not): the world class's p95 error of the prediction against the DLSS vector's landing (the mv set,
+    # the ceiling the vectors give a warp), and the camera_jump frames scored apart.
+    withJump = [r for r in reports if r.get("jump_n") is not None]
+    if withJump:
+        text += "; %d jump frame(s) scored apart" % sum(int(r["jump_n"]) for r in withJump)
+    withMv = [r for r in reports if r.get("m_world_p95") is not None and int(r.get("mv_n") or 0) > 0]
     if withMv:
-        last = withMv[-1]
-        text += ("; world p95 %.0f predicted vs %.0f oracle vs %.0f mv vs %.0f bdepth milli-luma (mean of %d line(s)); mv vs bdepth landing disagreement p50/p95 %s/%s px world, %s/%s px cockpit (last line)" %
-                 (sum(int(r["world_p95"]) for r in withMv) / len(withMv), sum(int(r["o_world_p95"]) for r in withMv) / len(withMv),
-                  sum(int(r["m_world_p95"]) for r in withMv) / len(withMv), sum(int(r["b_world_p95"]) for r in withMv) / len(withMv), len(withMv),
-                  last["dw50"], last["dw95"], last["dc50"], last["dc95"]))
-    # The extrapolation line (lines from after it only): the world class's p95 error for A's cells carried forward at constant screen velocity and at constant view-space velocity, and
-    # how often B's true rows part from the DLSS vector by more than 4 px.
-    withEx = [r for r in extraps if int(r.get("x2_n") or 0) > 0]
-    if withEx:
-        last = withEx[-1]
-        text += ("; extrapolation world p95 %.0f ex2d vs %.0f ex2dh milli-luma (mean of %d line(s)); rows part from the vector by over 4 px on %s of world cells, %s of cockpit cells (last line)" %
-                 (sum(int(r["x2_world_p95"]) for r in withEx) / len(withEx), sum(int(r["xh_world_p95"]) for r in withEx) / len(withEx), len(withEx), last["rows_world"], last["rows_cockpit"]))
+        text += ("; world p95 %.0f predicted vs %.0f mv milli-luma (mean of %d line(s))" %
+                 (sum(int(r["world_p95"]) for r in withMv) / len(withMv), sum(int(r["m_world_p95"]) for r in withMv) / len(withMv), len(withMv)))
     if poses:
         scored = sum(int(r["frames"]) for r in poses)
         text += ("; pose: %d line(s), %d frame(s) scored, runtime miss max %.2f mm / %.3f deg, velocity miss max %.2f mm / %.3f deg, lead median %s ms (last line), %d refused, %d expired, "
@@ -18164,11 +18146,10 @@ HEALTH_RULES = (
         ("_", H_DESKTOP_OTHER),
     ), _hj_desktop_window),
     # Frame generation, Phase 1 (TEMPORARY): the armed line and the one-second report, graphics-log lines with no build tag, read the desktop window's way.
-    _hrule(H_FRAMEGEN, (), (H_FRAMEGEN_LABEL, H_FRAMEGEN_EX_LABEL), (
+    _hrule(H_FRAMEGEN, (), (H_FRAMEGEN_LABEL,), (
         ("armed", H_FRAMEGEN_ARMED),
         ("vram", H_FRAMEGEN_VRAM),
         ("report", H_FRAMEGEN_REPORT),
-        ("extrap", H_FRAMEGEN_EXTRAP),
         ("pose", H_FRAMEGEN_POSE),
     ), _hj_framegen_shadow),
     # Frame generation, Phase 2.1 (TEMPORARY): the synthesizer's armed line and one-second report, read the scorer's way; it judges against the scorer's rows (the key is the same).
@@ -18284,7 +18265,7 @@ def health_scan(text, since=None, until=None):
                 u[0] += 1
                 u[1] = u[1] or raw.strip()[:160]
             continue
-        if H_FRAMEGEN_LABEL in raw or H_FRAMEGEN_EX_LABEL in raw:
+        if H_FRAMEGEN_LABEL in raw:
             # The frame generation shadow's lines carry no build tag. The armed and VRAM lines are state, so they are kept whatever --since says; the report lines are events and are cut by the window.
             sm = HEALTH_STAMP_RE.match(raw)
             tod = int(sm.group(1)) * 3600 + int(sm.group(2)) * 60 + int(sm.group(3)) + int(sm.group(4)) / 1000.0 if sm else None
@@ -25188,31 +25169,34 @@ def self_test_health():
         def fg_armed(qw=612, qh=699):
             return RF("armed, quarter %ux%u", qw, qh)
 
-        def fg_report(frames=60, skipped=(1, 2, 3, 4, 5), timed=True, sets=False, oracle_p95=20, jump=4, probe=False, mv_p95=33, bd_p95=12, dis="2.18"):
+        def fg_report(frames=60, skipped=(1, 2, 3, 4, 5), timed=True, sets=False, jump=4, probe=False, mv_p95=33, old=False, oracle_p95=20, bd_p95=12, dis="2.18"):
+            """sets: the jump set and the motion facts after rig_mm; probe: the mv set after them. old: the line of the builds before 2026-11-07, whose oracle set (before the jump
+            set), bdepth set and disagreement (after the mv set) are literal here, their formats gone from the header."""
             cls = "".join(RF(" %s=%.1f%%,%u", n, 10.0, 12, 8, 40, 5.5, 1.5, 9, 30) for n in ("far", "cockpit", "world"))
             gpu = RF("%.2f/%.2f(n=%u)", 0.85, 1.2, 3) if timed else health_c_format(fgsrc, "-(n=0)")
             line = RF("frames=%u skipped=%u/", frames, *skipped) + cls + RF(" holes=%.1f%% gpu_ms=%s", 3.5, gpu, 0.012, 0.034, 0.4, 1.25)
-            if sets:   # the oracle and jump sets and the CPU motion facts, appended after rig_mm; "-" for the facts of an idle window
-                ocls = "".join(RF(" %s=%.1f%%,%u", n, 10.0, 12, 8, oracle_p95, 5.5, 1.5, 9, 30) for n in ("far", "cockpit", "world"))
+            if sets:   # the jump set and the CPU motion facts, appended after rig_mm; "-" for the facts of an idle window
                 jcls = "".join(RF(" %s=%.1f%%,%u", n, 10.0, 12, 8, 40, 5.5, 1.5, 9, 30) for n in ("far", "cockpit", "world"))
-                line += RF(" oracle=%u", 29) + ocls + RF(" jump=%u", jump) + jcls
+                if old:
+                    line += " oracle=29" + "".join(RF(" %s=%.1f%%,%u", n, 10.0, 12, 8, oracle_p95, 5.5, 1.5, 9, 30) for n in ("far", "cockpit", "world"))
+                line += RF(" jump=%u", jump) + jcls
                 line += RF(" motion_mm=%s/%s mag_ratio=%s/%s/%s dt_ratio=%s/%s/%s dt_ms=%s/%s rig_dt_mm=%s/%s", "12.3", "80.0", "0.50", "1.00", "2.00", "0.50", "1.00", "2.00",
                            "-", "-", "0.40", "1.25")
-                if probe:   # the second kernel's mv and bdepth sets and the disagreement, appended after rig_dt_mm
+                if probe:   # the second kernel's mv set, appended after rig_dt_mm
                     mcls = "".join(RF(" %s=%.1f%%,%u", n, 10.0, 12, 8, mv_p95, 5.5, 1.5, 9, 30) for n in ("far", "cockpit", "world"))
-                    bcls = "".join(RF(" %s=%.1f%%,%u", n, 10.0, 12, 8, bd_p95, 5.5, 1.5, 9, 30) for n in ("far", "cockpit", "world"))
-                    line += RF(" mv=%u", 29) + mcls + RF(" bdepth=%u", 29) + bcls + RF(" mvdis_world_px=%s/%s mvdis_cockpit_px=%s/%s", dis, "4.36", "-", "-")
+                    line += RF(" mv=%u", 29) + mcls
+                    if old:
+                        bcls = "".join(RF(" %s=%.1f%%,%u", n, 10.0, 12, 8, bd_p95, 5.5, 1.5, 9, 30) for n in ("far", "cockpit", "world"))
+                        line += " bdepth=29" + bcls + " mvdis_world_px=%s/4.36 mvdis_cockpit_px=-/-" % dis
             return line
 
-        def fg_vram(eye=0, groups="captures=6291456 vectors=33554432 keys=12582912 stats=31900"):
+        def fg_vram(eye=0, groups="captures=5177520 keys=1725840 stats=11960"):
             """The scorer's VRAM line, rendered from the C format string: the groups are one %s."""
-            return RF("frame generation (shadow): eye %u VRAM %llu B", eye, 52460700, 50.0, groups, 104921400, 100.1)
+            return RF("frame generation (shadow): eye %u VRAM %llu B", eye, 6915320, 6.6, groups, 13830640, 13.2)
 
-        def fg_extrap(x2_p95=33, xh_p95=12, rows=("25.0%", "-")):
-            """The extrapolation sets' own line, rendered from the C format strings."""
-            x2 = "".join(RF(" %s=%.1f%%,%u", n, 10.0, 12, 8, x2_p95, 5.5, 1.5, 9, 30) for n in ("far", "cockpit", "world"))
-            xh = "".join(RF(" %s=%.1f%%,%u", n, 10.0, 12, 8, xh_p95, 5.5, 1.5, 9, 30) for n in ("far", "cockpit", "world"))
-            return RF("frame generation (shadow) extrapolation: ex2d=%u", 29) + x2 + RF(" ex2dh=%u", 29) + xh + RF(" rowsoff_world=%s rowsoff_cockpit=%s", *rows)
+        def fg_extrap_old():
+            """The extrapolation line of the builds before 2026-11-07, literal: it carries none of the rule's labels and is passed over."""
+            return "frame generation (shadow) extrapolation: ex2d=29 far=10.0%,12,8,33,5.5%,1.5%|id:9,30 cockpit=10.0%,12,8,33,5.5%,1.5%|id:9,30 world=10.0%,12,8,33,5.5%,1.5%|id:9,30 ex2dh=29 far=10.0%,12,8,12,5.5%,1.5%|id:9,30 cockpit=10.0%,12,8,12,5.5%,1.5%|id:9,30 world=10.0%,12,8,12,5.5%,1.5%|id:9,30 rowsoff_world=25.0% rowsoff_cockpit=-"
 
         # The synthesizer's armed and one-second lines (Phase 2.1), rendered from the C format strings in src\common\framegen_synth_report.h.
         fgssrc = read_text(os.path.join(repo_root(), "src", "common", "framegen_synth_report.h"))
@@ -25249,30 +25233,28 @@ def self_test_health():
               has=["2 report line(s), 118 frame(s) scored, 30 skipped; armed at quarter 612x699 per eye"], lacks=["UNPARSED"])
         check("frame generation shadow: the VRAM line is read as state and the OK summary says the two-eye figure and the groups",
               fg_ok + [(1, fg_armed()), (1, fg_vram()), (1, fg_vram(eye=1)), (70, fg_report()), (70, fg_synth_report())], 0, [("OK", FG)],
-              has=["VRAM 100.1 MiB for two eyes (captures=6291456 vectors=33554432 keys=12582912 stats=31900; the last VRAM line)"], lacks=["UNPARSED"], extra=["--since", "10:01:00"])
+              has=["VRAM 13.2 MiB for two eyes (captures=5177520 keys=1725840 stats=11960; the last VRAM line)"], lacks=["UNPARSED"], extra=["--since", "10:01:00"])
         check("frame generation shadow: a VRAM line whose groups changed still parses (the groups are one field)",
-              fg_ok + [fg_armed(), fg_vram(groups="captures=6291456 keys=3145728 stats=19100"), fg_report()], 0, [("OK", FG)],
-              has=["VRAM 100.1 MiB for two eyes (captures=6291456 keys=3145728 stats=19100"], lacks=["UNPARSED"])
-        check("frame generation shadow: a line with the oracle and jump sets and the motion facts is OK and says oracle world p95 against the prediction's",
-              fg_ok + [fg_armed(), fg_report(sets=True), fg_report(sets=True, oracle_p95=10, jump=2)], 0, [("OK", FG)],
-              has=["2 report line(s), 120 frame(s) scored", "world p95 40 milli-luma predicted vs 15 oracle (mean of 2 line(s)), 6 jump frame(s) scored apart"], lacks=["UNPARSED"])
-        check("frame generation shadow: a line with the mv and bdepth sets and the disagreement is OK and says the four world p95s and the disagreement",
-              fg_ok + [fg_armed(), fg_report(sets=True, probe=True), fg_report(sets=True, probe=True, oracle_p95=10, mv_p95=31, bd_p95=14, dis="3.00")], 0, [("OK", FG)],
-              has=["world p95 40 predicted vs 15 oracle vs 32 mv vs 13 bdepth milli-luma (mean of 2 line(s))", "disagreement p50/p95 3.00/4.36 px world, -/- px cockpit (last line)"], lacks=["UNPARSED"])
-        check("frame generation shadow: the extrapolation line is read and says the two world p95s and the rows-off shares",
-              fg_ok + [fg_armed(), fg_report(), fg_extrap(), fg_report(), fg_extrap(x2_p95=31, xh_p95=14, rows=("30.0%", "0.4%"))], 0, [("OK", FG)],
-              has=["extrapolation world p95 32 ex2d vs 13 ex2dh milli-luma (mean of 2 line(s)); rows part from the vector by over 4 px on 30.0% of world cells, 0.4% of cockpit cells (last line)"],
-              lacks=["UNPARSED"])
-        check("frame generation shadow: a log with no extrapolation line has no such part", fg_ok + [fg_armed(), fg_report()], 0, [("OK", FG)], lacks=["extrapolation", "UNPARSED"])
-        check("frame generation shadow: a drifted extrapolation line (including the older one that said ex3d) is counted as unparsed beside the report it follows, not read as one", fg_ok + [fg_armed(), fg_report(), fg_extrap().replace(" ex2dh=", " ex3d=")], 0, [("OK", FG)],
-              has=["1 report line(s)", "+1 line(s) the rule's patterns do not match"], lacks=["extrapolation world p95"])
-        check("frame generation shadow: a line from before the mv and bdepth sets still parses and has no such part", fg_ok + [fg_armed(), fg_report(sets=True)], 0, [("OK", FG)],
-              lacks=["vs bdepth", "UNPARSED"])
-        check("frame generation shadow: a drifted mv and bdepth part is UNPARSED, not a report", fg_ok + [fg_armed(), fg_report(sets=True, probe=True).replace(" bdepth=", " depth=")], 3, [("NEVER APPLIED", FG)],
+              fg_ok + [fg_armed(), fg_vram(groups="captures=6291456 vectors=33554432 keys=12582912 stats=31900"), fg_report()], 0, [("OK", FG)],
+              has=["VRAM 13.2 MiB for two eyes (captures=6291456 vectors=33554432 keys=12582912 stats=31900"], lacks=["UNPARSED"])
+        check("frame generation shadow: a line with the jump set and the motion facts is OK and says the jump frames scored apart",
+              fg_ok + [fg_armed(), fg_report(sets=True), fg_report(sets=True, jump=2)], 0, [("OK", FG)],
+              has=["2 report line(s), 120 frame(s) scored", "6 jump frame(s) scored apart"], lacks=["UNPARSED", "oracle"])
+        check("frame generation shadow: a line with the mv set is OK and says the world p95 predicted against the vectors' landing",
+              fg_ok + [fg_armed(), fg_report(sets=True, probe=True), fg_report(sets=True, probe=True, mv_p95=31)], 0, [("OK", FG)],
+              has=["world p95 40 predicted vs 32 mv milli-luma (mean of 2 line(s))"], lacks=["UNPARSED", "bdepth", "oracle"])
+        check("frame generation shadow: a line of the builds before 2026-11-07 (the oracle set, the bdepth set and the disagreement) still parses and is read for what stays",
+              fg_ok + [fg_armed(), fg_report(sets=True, probe=True, old=True), fg_report(sets=True, probe=True, old=True, mv_p95=31)], 0, [("OK", FG)],
+              has=["2 report line(s), 120 frame(s) scored", "8 jump frame(s) scored apart", "world p95 40 predicted vs 32 mv milli-luma (mean of 2 line(s))"], lacks=["UNPARSED", "bdepth", "oracle"])
+        check("frame generation shadow: an extrapolation line of the builds before 2026-11-07 is passed over, neither read nor counted as unparsed",
+              fg_ok + [fg_armed(), fg_report(), fg_extrap_old()], 0, [("OK", FG)], lacks=["extrapolation", "UNPARSED", "the rule's patterns do not match"])
+        check("frame generation shadow: a line from before the mv set still parses and has no such part", fg_ok + [fg_armed(), fg_report(sets=True)], 0, [("OK", FG)],
+              lacks=["vs 32 mv", "UNPARSED"])
+        check("frame generation shadow: a drifted mv part is UNPARSED, not a report", fg_ok + [fg_armed(), fg_report(sets=True, probe=True).replace(" mv=", " vm=")], 3, [("NEVER APPLIED", FG)],
               has=["line(s) the rule's patterns do not match"])
-        check("frame generation shadow: a line from before the oracle fields has no oracle part in its summary", fg_ok + [fg_armed(), fg_report()], 0, [("OK", FG)],
-              lacks=["oracle", "UNPARSED"])
-        check("frame generation shadow: a drifted oracle part is UNPARSED, not a report", fg_ok + [fg_armed(), fg_report(sets=True).replace(" jump=", " leap=")], 3, [("NEVER APPLIED", FG)],
+        check("frame generation shadow: a line from before the jump fields has no jump part in its summary", fg_ok + [fg_armed(), fg_report()], 0, [("OK", FG)],
+              lacks=["jump frame", "UNPARSED"])
+        check("frame generation shadow: a drifted jump part is UNPARSED, not a report", fg_ok + [fg_armed(), fg_report(sets=True).replace(" jump=", " leap=")], 3, [("NEVER APPLIED", FG)],
               has=["line(s) the rule's patterns do not match"])
         check("frame generation shadow: armed and no report line is NEVER APPLIED", fg_ok + [fg_armed()], 3, [("NEVER APPLIED", FG)],
               has=["the key was on (armed, quarter 612x699 per eye) but no 'frame generation (shadow): frames=' report line follows", "exit 3"])

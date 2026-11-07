@@ -1,6 +1,7 @@
 #pragma once
-// The frame-generation shadow scorer's statistics and its two log lines (fix.frame_generation_shadow, TEMPORARY; docs/design-frame-generation-2026-10-26.md,
-// Phase 1). Pure: no Windows or D3D includes, so the test rig and tools\edvr_log.py's --health self-test read the same format strings the DLL logs with.
+// The frame-generation shadow scorer's statistics and its log lines (fix.frame_generation_shadow, TEMPORARY; docs/design-frame-generation-2026-10-26.md,
+// Phase 1): the armed line, the VRAM line and the one-second report. Pure: no Windows or D3D includes, so the test rig and tools\edvr_log.py's --health self-test read
+// the same format strings the DLL logs with.
 //
 // An error is the absolute luma difference between the warped previous frame and the real one, 0..1. The scorer bins it into 48 log bins (frameGenShadowBin),
 // keeps a pixel count and a fixed-point sum (error x 1024) per class, and the 1 s report reads percentiles back from the histogram. Errors are printed as
@@ -33,7 +34,7 @@ struct FrameGenShadowClassStats {
     uint32_t histId[kFrameGenShadowBins] = {};
 };
 
-// The per-class stats of one extra score set of one eye-frame (the mv and bdepth sets of the second kernel).
+// The per-class stats of one extra score set of one eye-frame (the mv set of the second kernel).
 struct FrameGenShadowEyeBlock {
     FrameGenShadowClassStats cls[kFrameGenShadowClasses];
     uint64_t holes = 0;
@@ -45,30 +46,19 @@ struct FrameGenShadowEyeResult {
     FrameGenShadowClassStats cls[kFrameGenShadowClasses];
     uint64_t holes = 0;
     uint64_t cells = 0;   // every cell looked at, holes included
-    // The second kernel (fgShadowScoreB, scored on every scored frame whatever its set): each B cell classed by B's own depth and carried back to A two ways, by the
-    // DLSS motion vector (mv) and by B's TRUE backward rows and B's own depth (bdepth), and how far apart the two landings are (the disagreement, 48 log bins in
-    // pixels of render size, bin 0 for under 1/16 px) for the world and cockpit cells where both landed inside the image.
-    FrameGenShadowEyeBlock mv, bdepth;
-    uint32_t disWorld[kFrameGenShadowBins] = {};
-    uint32_t disCockpit[kFrameGenShadowBins] = {};
-    // The extrapolation sets (fgShadowEx*; zero when the frame had no usable vectors of the previous frame, then cells is 0): A's cells carried FORWARD by A's own DLSS vector,
-    // ex2d at constant screen velocity, ex2dh the same with the head's rotation taken out of A's vector and B's true head rotation put back, each scored against the previous frame's luma at the cell that won the B cell.
-    FrameGenShadowEyeBlock ex2d, ex2dh;
-    // How often B's true rows part from the DLSS vector by more than 4 render px: of the cells of the class where either landing was inside the image, those where only one
-    // was or the two are more than 4 px apart.
-    uint32_t rowsWorld = 0, rowsWorldOff = 0, rowsCockpit = 0, rowsCockpitOff = 0;
+    // The second kernel (fgShadowScoreB, scored on every scored frame whatever its set): each B cell classed by B's own depth and carried back to A by the DLSS motion
+    // vector (the mv set: the ceiling the vectors give a warp).
+    FrameGenShadowEyeBlock mv;
 };
 
-// Which stats set a scored frame belongs to: the normal one (predicted transforms), the oracle one (frame B's true transforms for far and world, every second
-// normal frame per eye: what the warp scores when the prediction is exact) and the jump one (camera_jump frames, predicted transforms).
+// Which stats set a scored frame belongs to: the normal one (predicted transforms) and the jump one (camera_jump frames, predicted transforms).
 enum FrameGenShadowSet : int {
     kSetPredicted = 0,
-    kSetOracle,
     kSetJump,
     kFrameGenShadowSetCount
 };
 
-// The oracle and jump sets: the same per-class stats as the window's own, plus how many frames went in.
+// The jump and mv sets: the same per-class stats as the window's own, plus how many frames went in.
 struct FrameGenShadowSetStats {
     uint32_t frames = 0;
     FrameGenShadowClassStats cls[kFrameGenShadowClasses];
@@ -96,12 +86,8 @@ struct FrameGenShadowWindow {
     FrameGenShadowClassStats cls[kFrameGenShadowClasses];
     uint64_t holes = 0;
     uint64_t cells = 0;
-    FrameGenShadowSetStats oracle, jump;
-    FrameGenShadowSetStats mv, bdepth;                  // frames = eye-frames merged, every scored frame of every set
-    FrameGenShadowSetStats ex2d, ex2dh;                  // the extrapolation sets: frames = the eye-frames that had the previous frame's vectors
-    uint64_t rowsWorld = 0, rowsWorldOff = 0, rowsCockpit = 0, rowsCockpitOff = 0;   // see FrameGenShadowEyeResult
-    uint32_t disWorld[kFrameGenShadowBins] = {};        // |p_mv - p_bdepth| in render px, world cells where both landed inside the image
-    uint32_t disCockpit[kFrameGenShadowBins] = {};
+    FrameGenShadowSetStats jump;
+    FrameGenShadowSetStats mv;                          // frames = eye-frames merged, every scored frame of either set
     FrameGenShadowMotion motion;
     float gpuMsMedian = 0.0f, gpuMsMax = 0.0f;
     uint32_t gpuSamples = 0;   // the timed frames behind the two numbers; 0 reads "-" in the line
@@ -173,7 +159,7 @@ inline void frameGenShadowMerge(FrameGenShadowWindow& w, const FrameGenShadowEye
     w.cells += eye.cells;
 }
 
-// The same for the oracle or jump set; counts the frame.
+// The same for the jump set; counts the frame.
 inline void frameGenShadowMergeSet(FrameGenShadowSetStats& s, const FrameGenShadowEyeResult& eye) {
     for (int c = 0; c < kFrameGenShadowClasses; ++c) frameGenShadowAddClass(s.cls[c], eye.cls[c]);
     s.holes += eye.holes;
@@ -181,67 +167,15 @@ inline void frameGenShadowMergeSet(FrameGenShadowSetStats& s, const FrameGenShad
     ++s.frames;
 }
 
-// The same for the second kernel's result: both extra sets and both disagreement histograms. The caller picks the frame's own set (above) separately.
+// The same for the second kernel's result: the mv set. The caller picks the frame's own set (above) separately.
 inline void frameGenShadowMergeProbe(FrameGenShadowWindow& w, const FrameGenShadowEyeResult& eye) {
-    FrameGenShadowSetStats* const to[2] = {&w.mv, &w.bdepth};
-    const FrameGenShadowEyeBlock* const from[2] = {&eye.mv, &eye.bdepth};
-    for (int i = 0; i < 2; ++i) {
-        for (int c = 0; c < kFrameGenShadowClasses; ++c) frameGenShadowAddClass(to[i]->cls[c], from[i]->cls[c]);
-        to[i]->holes += from[i]->holes;
-        to[i]->cells += from[i]->cells;
-        ++to[i]->frames;
-    }
-    for (int i = 0; i < kFrameGenShadowBins; ++i) {
-        w.disWorld[i] += eye.disWorld[i];
-        w.disCockpit[i] += eye.disCockpit[i];
-    }
-    FrameGenShadowSetStats* const ex[2] = {&w.ex2d, &w.ex2dh};
-    const FrameGenShadowEyeBlock* const exFrom[2] = {&eye.ex2d, &eye.ex2dh};
-    for (int i = 0; i < 2; ++i) {
-        if (exFrom[i]->cells == 0) continue;   // the extrapolation did not run on this frame
-        for (int c = 0; c < kFrameGenShadowClasses; ++c) frameGenShadowAddClass(ex[i]->cls[c], exFrom[i]->cls[c]);
-        ex[i]->holes += exFrom[i]->holes;
-        ex[i]->cells += exFrom[i]->cells;
-        ++ex[i]->frames;
-    }
-    w.rowsWorld += eye.rowsWorld;
-    w.rowsWorldOff += eye.rowsWorldOff;
-    w.rowsCockpit += eye.rowsCockpit;
-    w.rowsCockpitOff += eye.rowsCockpitOff;
+    for (int c = 0; c < kFrameGenShadowClasses; ++c) frameGenShadowAddClass(w.mv.cls[c], eye.mv.cls[c]);
+    w.mv.holes += eye.mv.holes;
+    w.mv.cells += eye.mv.cells;
+    ++w.mv.frames;
 }
 
-// The disagreement bins: 0 for d < 1/16 px, else clamp(1 + floor(4 * log2(d * 16)), 1, 47). Bin b >= 1 spans [2^((b-1)/4), 2^(b/4)) / 16 px.
-inline int frameGenShadowDisBin(float d) {
-    if (!(d >= 1.0f / 16.0f)) return 0;   // also catches NaN
-    const float l = 4.0f * std::log2(d * 16.0f);
-    if (!(l < 46.0f)) return kFrameGenShadowBins - 1;
-    const int b = 1 + static_cast<int>(std::floor(l));
-    return b < 1 ? 1 : (b > kFrameGenShadowBins - 1 ? kFrameGenShadowBins - 1 : b);
-}
-
-// The pixels a disagreement bin stands for, the way frameGenShadowBinValue stands for an error bin: the geometric middle of its edges, 2^((bin - 0.5) / 4) / 16 px
-// (so a true 2 px reads 2.18); bin 0 reads 0.
-inline float frameGenShadowDisValue(int bin) {
-    if (bin <= 0) return 0.0f;
-    if (bin > kFrameGenShadowBins - 1) bin = kFrameGenShadowBins - 1;
-    return std::exp2((static_cast<float>(bin) - 0.5f) * 0.25f) / 16.0f;
-}
-
-// The disagreement at quantile q of a histogram in pixels (the bin value where the cumulative count first reaches q of the total); 0 for an empty one (check the total).
-inline float frameGenShadowDisPercentile(const uint32_t hist[kFrameGenShadowBins], float q) {
-    const uint64_t total = frameGenShadowHistTotal(hist);
-    if (total == 0) return 0.0f;
-    uint64_t need = static_cast<uint64_t>(std::ceil(static_cast<double>(q < 0.0f ? 0.0f : (q > 1.0f ? 1.0f : q)) * static_cast<double>(total)));
-    if (need < 1) need = 1;
-    uint64_t run = 0;
-    for (int i = 0; i < kFrameGenShadowBins; ++i) {
-        run += hist[i];
-        if (run >= need) return frameGenShadowDisValue(i);
-    }
-    return frameGenShadowDisValue(kFrameGenShadowBins - 1);
-}
-
-// ---- the two log lines ----
+// ---- the log lines ----
 // The format strings are the single source: the DLL logs with them, the rig renders from them, and tools\edvr_log.py --health reads them from this file.
 constexpr const char* kFrameGenShadowArmedFmt =
     "frame generation (shadow): armed, quarter %ux%u per eye, classes far cockpit world (mover, reactive not scored)";
@@ -250,26 +184,15 @@ constexpr const char* kFrameGenShadowReportHeadFmt = "frame generation (shadow):
 // name=share%,mean,p50,p95,over0.02%,over0.05%|id:mean,p95 -- errors in milli-luma, the shares in percent (the class's share is of all cells, the over shares of the class)
 constexpr const char* kFrameGenShadowReportClassFmt = " %s=%.1f%%,%u,%u,%u,%.1f%%,%.1f%%|id:%u,%u";
 constexpr const char* kFrameGenShadowReportTailFmt = " holes=%.1f%% gpu_ms=%s rig_deg=%.3f/%.3f rig_mm=%.2f/%.2f";
-// Appended after rig_mm, so a parser of the older line still matches its head. The oracle set (frame B's true transforms for far and world; frames=n), then the jump
-// set (camera_jump frames, predicted transforms; n), each followed by the same three class fields as above, then the CPU motion facts: motion_mm median/max,
-// mag_ratio p5/p50/p95, dt_ratio p5/p50/p95, dt_ms median/max, rig_dt_mm median/max (a number is "-" when nothing was sampled). The main class fields cover only
-// the normal predicted set; in the skipped field the fourth count (camera_jump) is the number of frames routed to the jump set.
-constexpr const char* kFrameGenShadowOracleHeadFmt = " oracle=%u";
+// Appended after rig_mm, so a parser of the older line still matches its head. The jump set (camera_jump frames, predicted transforms; frames=n) followed by the same
+// three class fields as above, then the CPU motion facts: motion_mm median/max, mag_ratio p5/p50/p95, dt_ratio p5/p50/p95, dt_ms median/max, rig_dt_mm median/max (a
+// number is "-" when nothing was sampled). The main class fields cover only the normal predicted set; in the skipped field the fourth count (camera_jump) is the number
+// of frames routed to the jump set. (Lines of the builds before 2026-11-07 carried an oracle set before the jump set, and a bdepth set and the mvdis fields after the mv
+// set: tools\edvr_log.py still reads them.)
 constexpr const char* kFrameGenShadowJumpHeadFmt = " jump=%u";
-// Appended after rig_dt_mm: the second kernel's sets, each as the oracle's (a count of eye-frames merged, then far cockpit world in the class format): mv (B's cell carried
-// to A by the DLSS motion vector read at the cell's centre texel) and bdepth (by B's true backward rows and B's own depth), then the disagreement of the two landings,
-// p50/p95 in render pixels from frameGenShadowDisValue (the bin's geometric middle; "-/-" when no cell had both inside), for the world cells and for the cockpit cells.
+// Appended after rig_dt_mm: the second kernel's set as the jump set's (a count of eye-frames merged, then far cockpit world in the class format): mv (B's cell carried
+// to A by the DLSS motion vector read at the cell's centre texel), the ceiling the vectors give a warp.
 constexpr const char* kFrameGenShadowMvHeadFmt = " mv=%u";
-constexpr const char* kFrameGenShadowBdepthHeadFmt = " bdepth=%u";
-constexpr const char* kFrameGenShadowDisFmt = " mvdis_world_px=%s/%s mvdis_cockpit_px=%s/%s";
-// The extrapolation line, said right after the report (the report is at the widest a Log::note line takes): ex2d (A's cells carried forward at constant screen velocity by A's own
-// DLSS vector) and ex2dh (the same with the head's rotation taken out of A's vector and B's true head rotation put back), each a count of eye-frames merged and the three class fields, then the share of
-// world and of cockpit cells where B's true rows and the DLSS vector land more than 4 px apart ("-" when there were none).
-constexpr const char* kFrameGenShadowExtrapHeadFmt = "frame generation (shadow) extrapolation: ex2d=%u";
-constexpr const char* kFrameGenShadowExtrap2dhHeadFmt = " ex2dh=%u";
-constexpr const char* kFrameGenShadowRowsOffFmt = " rowsoff_world=%s rowsoff_cockpit=%s";
-constexpr const char* kFrameGenShadowRowsOffNumFmt = "%.1f%%";
-constexpr const char* kFrameGenShadowNumFmtPx = "%.2f";
 constexpr const char* kFrameGenShadowMotionFmt = " motion_mm=%s/%s mag_ratio=%s/%s/%s dt_ratio=%s/%s/%s dt_ms=%s/%s rig_dt_mm=%s/%s";
 constexpr const char* kFrameGenShadowNumFmtMotion = "%.1f";   // motion_mm, dt_ms
 constexpr const char* kFrameGenShadowNumFmtRatio = "%.2f";    // mag_ratio, dt_ratio, rig_dt_mm
@@ -304,18 +227,17 @@ inline std::string formatFrameGenVramGroups(const FrameGenVramGroup* groups, int
 
 inline double frameGenMiB(uint64_t bytes) { return static_cast<double>(bytes) / 1048576.0; }
 
-// The scorer's groups: the captures (the quarter-size luma and depth of this frame and the previous, ping-ponged), the vectors (the captured DLSS vectors with the depth where
-// they point, ping-ponged: the extrapolation sets' input), the key grids (the main splat's, the extrapolation's key and source grids) and the stats words with their staging copies.
+// The scorer's groups: the captures (the quarter-size luma and depth of this frame and the previous, ping-ponged), the key grid and the stats words with their staging copies.
 struct FrameGenShadowVram {
-    uint64_t captures = 0, vectors = 0, keys = 0, stats = 0;
-    uint64_t eye() const { return captures + vectors + keys + stats; }
+    uint64_t captures = 0, keys = 0, stats = 0;
+    uint64_t eye() const { return captures + keys + stats; }
 };
 
 constexpr const char* kFrameGenShadowVramFmt = "frame generation (shadow): eye %u VRAM %llu B (%.1f MiB): %s; two eyes %llu B (%.1f MiB)";
 
 inline std::string formatFrameGenShadowVram(uint32_t eye, const FrameGenShadowVram& v) {
-    const FrameGenVramGroup groups[] = {{"captures", v.captures}, {"vectors", v.vectors}, {"keys", v.keys}, {"stats", v.stats}};
-    const std::string g = formatFrameGenVramGroups(groups, 4);
+    const FrameGenVramGroup groups[] = {{"captures", v.captures}, {"keys", v.keys}, {"stats", v.stats}};
+    const std::string g = formatFrameGenVramGroups(groups, 3);
     char buf[320];
     std::snprintf(buf, sizeof(buf), kFrameGenShadowVramFmt, static_cast<unsigned>(eye), static_cast<unsigned long long>(v.eye()), frameGenMiB(v.eye()), g.c_str(),
                   static_cast<unsigned long long>(2u * v.eye()), frameGenMiB(2u * v.eye()));
@@ -366,41 +288,8 @@ inline std::string formatFrameGenShadowMotion(const FrameGenShadowMotion& m) {
     return buf;
 }
 
-// One disagreement percentile in pixels, or "-" when the histogram is empty.
-inline std::string formatFrameGenShadowDisNum(const uint32_t hist[kFrameGenShadowBins], float q) {
-    return formatFrameGenShadowNum(kFrameGenShadowNumFmtPx, frameGenShadowHistTotal(hist) ? 1u : 0u, frameGenShadowDisPercentile(hist, q));
-}
-
-inline std::string formatFrameGenShadowDis(const FrameGenShadowWindow& w) {
-    const std::string a[4] = {formatFrameGenShadowDisNum(w.disWorld, 0.50f), formatFrameGenShadowDisNum(w.disWorld, 0.95f),
-                              formatFrameGenShadowDisNum(w.disCockpit, 0.50f), formatFrameGenShadowDisNum(w.disCockpit, 0.95f)};
-    char buf[160];
-    std::snprintf(buf, sizeof(buf), kFrameGenShadowDisFmt, a[0].c_str(), a[1].c_str(), a[2].c_str(), a[3].c_str());
-    return buf;
-}
-
-// The extrapolation line, or "" when no eye-frame had the previous frame's vectors (nothing to say).
-inline std::string formatFrameGenShadowExtrapolation(const FrameGenShadowWindow& w) {
-    if (w.ex2d.frames == 0 && w.ex2dh.frames == 0) return std::string();
-    char buf[640];
-    int n = std::snprintf(buf, sizeof(buf), kFrameGenShadowExtrapHeadFmt, static_cast<unsigned>(w.ex2d.frames));
-    n = formatFrameGenShadowClasses(buf, sizeof(buf), n, w.ex2d.cls, w.ex2d.cells);
-    if (n > 0 && n < static_cast<int>(sizeof(buf))) n += std::snprintf(buf + n, sizeof(buf) - n, kFrameGenShadowExtrap2dhHeadFmt, static_cast<unsigned>(w.ex2dh.frames));
-    n = formatFrameGenShadowClasses(buf, sizeof(buf), n, w.ex2dh.cls, w.ex2dh.cells);
-    std::string rows[2];
-    const uint64_t tot[2] = {w.rowsWorld, w.rowsCockpit}, off[2] = {w.rowsWorldOff, w.rowsCockpitOff};
-    for (int i = 0; i < 2; ++i) {
-        if (!tot[i]) { rows[i] = "-"; continue; }
-        char b[24];
-        std::snprintf(b, sizeof(b), kFrameGenShadowRowsOffNumFmt, 100.0 * static_cast<double>(off[i]) / static_cast<double>(tot[i]));
-        rows[i] = b;
-    }
-    if (n > 0 && n < static_cast<int>(sizeof(buf))) std::snprintf(buf + n, sizeof(buf) - n, kFrameGenShadowRowsOffFmt, rows[0].c_str(), rows[1].c_str());
-    return buf;
-}
-
 inline std::string formatFrameGenShadowReport(const FrameGenShadowWindow& w) {
-    char buf[2048];
+    char buf[1400];
     int n = std::snprintf(buf, sizeof(buf), kFrameGenShadowReportHeadFmt, static_cast<unsigned>(w.framesScored), static_cast<unsigned>(w.skipped[0]),
                           static_cast<unsigned>(w.skipped[1]), static_cast<unsigned>(w.skipped[2]), static_cast<unsigned>(w.skipped[3]),
                           static_cast<unsigned>(w.skipped[4]));
@@ -416,22 +305,17 @@ inline std::string formatFrameGenShadowReport(const FrameGenShadowWindow& w) {
                       static_cast<double>(w.rigDegMedian), static_cast<double>(w.rigDegMax), static_cast<double>(w.rigMmMedian),
                       static_cast<double>(w.rigMmMax));
     n = static_cast<int>(std::strlen(buf));
-    const FrameGenShadowSetStats* const sets[2] = {&w.oracle, &w.jump};
-    const char* const heads[2] = {kFrameGenShadowOracleHeadFmt, kFrameGenShadowJumpHeadFmt};
-    for (int i = 0; i < 2 && n < static_cast<int>(sizeof(buf)); ++i) {
-        n += std::snprintf(buf + n, sizeof(buf) - n, heads[i], static_cast<unsigned>(sets[i]->frames));
-        n = formatFrameGenShadowClasses(buf, sizeof(buf), n, sets[i]->cls, sets[i]->cells);
+    if (n < static_cast<int>(sizeof(buf))) {
+        n += std::snprintf(buf + n, sizeof(buf) - n, kFrameGenShadowJumpHeadFmt, static_cast<unsigned>(w.jump.frames));
+        n = formatFrameGenShadowClasses(buf, sizeof(buf), n, w.jump.cls, w.jump.cells);
     }
     std::string out = buf;
     out += formatFrameGenShadowMotion(w.motion);
-    // The second kernel's sets and the disagreement, last.
-    char tail[640];
+    // The second kernel's set, last.
+    char tail[320];
     int m = std::snprintf(tail, sizeof(tail), kFrameGenShadowMvHeadFmt, static_cast<unsigned>(w.mv.frames));
-    m = formatFrameGenShadowClasses(tail, sizeof(tail), m, w.mv.cls, w.mv.cells);
-    if (m > 0 && m < static_cast<int>(sizeof(tail))) m += std::snprintf(tail + m, sizeof(tail) - m, kFrameGenShadowBdepthHeadFmt, static_cast<unsigned>(w.bdepth.frames));
-    m = formatFrameGenShadowClasses(tail, sizeof(tail), m, w.bdepth.cls, w.bdepth.cells);
+    formatFrameGenShadowClasses(tail, sizeof(tail), m, w.mv.cls, w.mv.cells);
     out += tail;
-    out += formatFrameGenShadowDis(w);
     return out;
 }
 

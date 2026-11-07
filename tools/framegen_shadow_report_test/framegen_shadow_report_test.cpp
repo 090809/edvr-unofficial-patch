@@ -1,6 +1,6 @@
 // framegen_shadow_report_test: the pure half of the frame-generation shadow scorer (src/common/framegen_shadow_report.h; fix.frame_generation_shadow,
 // TEMPORARY, docs/design-frame-generation-2026-10-26.md Phase 1): the histogram binning, the percentile and share-over arithmetic, the merge, and the exact
-// text of the armed and report lines; and the pure half of the head-pose miss (src/common/framegen_pose_report.h, H6): the miss arithmetic, the summaries, the probe's ring
+// text of the armed, VRAM and report lines; and the pure half of the head-pose miss (src/common/framegen_pose_report.h, H6): the miss arithmetic, the summaries, the probe's ring
 // and the exact text of its line.
 //
 //   --dry-run    the same run (the rig never writes a file), for the gate's --dry-run convention
@@ -135,29 +135,16 @@ void caseLines() {
     w.rigDegMax = 0.034f;
     w.rigMmMedian = 0.4f;
     w.rigMmMax = 1.25f;
-    // The oracle set (world only, a perfect warp) and the jump set (far only, a mean of 0.05), then the CPU motion facts.
-    w.oracle.frames = 20;
-    w.oracle.cells = 100;
-    w.oracle.cls[2].pixels = 50;
-    w.oracle.cls[2].hist[0] = 50;
+    // The jump set (far only, a mean of 0.05), then the CPU motion facts, then the second kernel's mv set (world only, a perfect landing).
     w.jump.frames = 5;
     w.jump.cells = 40;
     w.jump.cls[0].pixels = 20;
     w.jump.cls[0].sumErr1024 = 1024;   // mean 0.05
     w.jump.cls[0].hist[23] = 20;
-    // The second kernel's sets (mv: world only, a perfect landing; bdepth: cockpit only, a mean of 0.05) and the disagreement histograms.
     w.mv.frames = 60;
     w.mv.cells = 100;
     w.mv.cls[2].pixels = 50;
     w.mv.cls[2].hist[0] = 50;
-    w.bdepth.frames = 60;
-    w.bdepth.cells = 100;
-    w.bdepth.cls[1].pixels = 40;
-    w.bdepth.cls[1].sumErr1024 = 2048;   // mean 0.05
-    w.bdepth.cls[1].hist[23] = 40;
-    w.disWorld[21] = 100;                 // 2 px: bin 21 spans 2 to 2.38 px, read as 2.18
-    w.disCockpit[0] = 10;
-    w.disCockpit[25] = 10;                // bin 25 reads as 4.36
     w.motion.motionN = 60; w.motion.motionMedian = 12.34f; w.motion.motionMax = 80.0f;
     w.motion.magN = 50; w.motion.magP5 = 0.5f; w.motion.magP50 = 1.0f; w.motion.magP95 = 2.0f;
     w.motion.dtRatioN = 55; w.motion.dtRatioP5 = 0.5f; w.motion.dtRatioP50 = 1.0f; w.motion.dtRatioP95 = 2.0f;
@@ -167,36 +154,30 @@ void caseLines() {
     checkText(line,
               "frame generation (shadow): frames=60 skipped=1/2/3/4/5 far=10.0%,0,0,0,0.0%,0.0%|id:0,0 cockpit=20.0%,50,48,48,100.0%,0.0%|id:0,0 "
               "world=30.0%,100,0,193,50.0%,50.0%|id:100,48 holes=10.0% gpu_ms=0.85/1.20(n=3) rig_deg=0.012/0.034 rig_mm=0.40/1.25 "
-              "oracle=20 far=0.0%,0,0,0,0.0%,0.0%|id:0,0 cockpit=0.0%,0,0,0,0.0%,0.0%|id:0,0 world=50.0%,0,0,0,0.0%,0.0%|id:0,0 "
               "jump=5 far=50.0%,50,48,48,100.0%,0.0%|id:0,0 cockpit=0.0%,0,0,0,0.0%,0.0%|id:0,0 world=0.0%,0,0,0,0.0%,0.0%|id:0,0 "
               "motion_mm=12.3/80.0 mag_ratio=0.50/1.00/2.00 dt_ratio=0.50/1.00/2.00 dt_ms=11.1/22.3 rig_dt_mm=0.40/1.25 "
-              "mv=60 far=0.0%,0,0,0,0.0%,0.0%|id:0,0 cockpit=0.0%,0,0,0,0.0%,0.0%|id:0,0 world=50.0%,0,0,0,0.0%,0.0%|id:0,0 "
-              "bdepth=60 far=0.0%,0,0,0,0.0%,0.0%|id:0,0 cockpit=40.0%,50,48,48,100.0%,0.0%|id:0,0 world=0.0%,0,0,0,0.0%,0.0%|id:0,0 "
-              "mvdis_world_px=2.18/2.18 mvdis_cockpit_px=0.00/4.36",
+              "mv=60 far=0.0%,0,0,0,0.0%,0.0%|id:0,0 cockpit=0.0%,0,0,0,0.0%,0.0%|id:0,0 world=50.0%,0,0,0,0.0%,0.0%|id:0,0",
               "the report line");
     check(line.find(" rig_dt_mm=0.40/1.25 mv=60 ") != std::string::npos, "the second kernel's fields follow rig_dt_mm, so the older heads still match");
     check(line.find('\n') == std::string::npos, "the report is one line");
-    check(line.compare(0, 5, "frame") == 0 && line.find(" rig_mm=0.40/1.25 oracle=20 ") != std::string::npos, "the new fields follow rig_mm, so the older head still matches");
+    check(line.compare(0, 5, "frame") == 0 && line.find(" rig_mm=0.40/1.25 jump=5 ") != std::string::npos, "the jump set follows rig_mm, so the older head still matches");
 
     // An empty window still prints (no division by zero), every figure zero, the empty CPU facts "-".
     FrameGenShadowWindow z;
     checkText(formatFrameGenShadowReport(z),
               "frame generation (shadow): frames=0 skipped=0/0/0/0/0 far=0.0%,0,0,0,0.0%,0.0%|id:0,0 cockpit=0.0%,0,0,0,0.0%,0.0%|id:0,0 "
               "world=0.0%,0,0,0,0.0%,0.0%|id:0,0 holes=0.0% gpu_ms=-(n=0) rig_deg=0.000/0.000 rig_mm=0.00/0.00 "
-              "oracle=0 far=0.0%,0,0,0,0.0%,0.0%|id:0,0 cockpit=0.0%,0,0,0,0.0%,0.0%|id:0,0 world=0.0%,0,0,0,0.0%,0.0%|id:0,0 "
               "jump=0 far=0.0%,0,0,0,0.0%,0.0%|id:0,0 cockpit=0.0%,0,0,0,0.0%,0.0%|id:0,0 world=0.0%,0,0,0,0.0%,0.0%|id:0,0 "
               "motion_mm=-/- mag_ratio=-/-/- dt_ratio=-/-/- dt_ms=-/- rig_dt_mm=-/- "
-              "mv=0 far=0.0%,0,0,0,0.0%,0.0%|id:0,0 cockpit=0.0%,0,0,0,0.0%,0.0%|id:0,0 world=0.0%,0,0,0,0.0%,0.0%|id:0,0 "
-              "bdepth=0 far=0.0%,0,0,0,0.0%,0.0%|id:0,0 cockpit=0.0%,0,0,0,0.0%,0.0%|id:0,0 world=0.0%,0,0,0,0.0%,0.0%|id:0,0 "
-              "mvdis_world_px=-/- mvdis_cockpit_px=-/-",
+              "mv=0 far=0.0%,0,0,0,0.0%,0.0%|id:0,0 cockpit=0.0%,0,0,0,0.0%,0.0%|id:0,0 world=0.0%,0,0,0,0.0%,0.0%|id:0,0",
               "an empty window");
 
     // The longest line the format can plausibly print (every class full, every figure at its widest) stays inside Log::note's 1200-byte line: less the 15-byte stamp, the
-    // NUL and the 16-byte truncation marker's reserve (log.cpp formatStamped) that leaves 1165 characters. The widest is 1159 as of the second kernel's fields.
+    // NUL and the 16-byte truncation marker's reserve (log.cpp formatStamped) that leaves 1165 characters.
     FrameGenShadowWindow big = w;
-    FrameGenShadowSetStats* const sets[4] = {&big.oracle, &big.jump, &big.mv, &big.bdepth};
+    FrameGenShadowSetStats* const sets[2] = {&big.jump, &big.mv};
     for (int c = 0; c < kFrameGenShadowClasses; ++c) {
-        FrameGenShadowClassStats* cs[5] = {&big.cls[c], &big.oracle.cls[c], &big.jump.cls[c], &big.mv.cls[c], &big.bdepth.cls[c]};
+        FrameGenShadowClassStats* cs[3] = {&big.cls[c], &big.jump.cls[c], &big.mv.cls[c]};
         for (FrameGenShadowClassStats* k : cs) {
             *k = FrameGenShadowClassStats{};
             k->pixels = 1000;
@@ -208,17 +189,15 @@ void caseLines() {
     }
     big.cells = 1000;
     for (FrameGenShadowSetStats* st : sets) st->cells = 1000;
-    for (int i = 0; i < kFrameGenShadowBins; ++i) big.disWorld[i] = big.disCockpit[i] = 0;
-    big.disWorld[47] = big.disCockpit[47] = 1;
     big.holes = 1000;
     big.motion.motionMedian = 9999.9f; big.motion.motionMax = 9999.9f;
     big.rigDegMax = 179.999f; big.rigMmMax = 99999.99f;
     const std::string bigLine = formatFrameGenShadowReport(big);
     if (bigLine.size() >= 1165) std::printf("framegen_shadow_report_test: the widest report line is %zu bytes\n", bigLine.size());
     check(bigLine.size() < 1165, "the widest report line fits Log::note's 1200 bytes with the stamp and the truncation marker");
-    check(bigLine.find("mvdis_cockpit_px=") != std::string::npos && bigLine.find("[truncated]") == std::string::npos, "the widest line still ends with the disagreement fields");
+    check(bigLine.find(" mv=60 far=") != std::string::npos && bigLine.find("[truncated]") == std::string::npos, "the widest line still ends with the mv set's fields");
 
-    // The sets merge apart: an oracle merge counts its own frame and leaves the normal set alone.
+    // The sets merge apart: a jump merge counts its own frame and leaves the normal set alone.
     FrameGenShadowEyeResult e;
     e.cls[2].pixels = 7;
     e.cells = 9;
@@ -227,70 +206,21 @@ void caseLines() {
     frameGenShadowMergeSet(s, e);
     check(s.frames == 2 && s.cls[2].pixels == 14 && s.cells == 18, "a set merge counts its frames and adds the stats");
 
-    // The second kernel's merge: both sets and both histograms, one frame each, whatever the frame's own set.
+    // The second kernel's merge: the mv set, one frame each, whatever the frame's own set.
     FrameGenShadowEyeResult p;
     p.mv.cls[2].pixels = 5; p.mv.cells = 8; p.mv.holes = 3;
-    p.bdepth.cls[1].pixels = 6; p.bdepth.cells = 8; p.bdepth.holes = 2;
-    p.disWorld[21] = 4; p.disCockpit[0] = 2;
     FrameGenShadowWindow pw;
     frameGenShadowMergeProbe(pw, p);
     frameGenShadowMergeProbe(pw, p);
-    check(pw.mv.frames == 2 && pw.bdepth.frames == 2 && pw.mv.cls[2].pixels == 10 && pw.bdepth.cls[1].pixels == 12 && pw.mv.cells == 16 && pw.bdepth.holes == 4 && pw.mv.holes == 6,
-          "a probe merge counts a frame in each of the mv and bdepth sets and adds their stats");
-    check(pw.disWorld[21] == 8 && pw.disCockpit[0] == 4 && pw.framesScored == 0 && pw.cls[2].pixels == 0, "a probe merge adds the disagreement histograms and leaves the main set alone");
-    check(pw.ex2d.frames == 0 && pw.ex2dh.frames == 0 && formatFrameGenShadowExtrapolation(pw).empty(), "a probe merge of frames without the extrapolation counts none and the extrapolation line is empty");
-
-    // The extrapolation sets: a frame counts only when its block looked at cells; the rows-off counters add.
-    FrameGenShadowEyeResult x;
-    x.ex2d.cls[2].pixels = 30; x.ex2d.cls[2].hist[0] = 30; x.ex2d.cells = 40; x.ex2d.holes = 10;
-    x.ex2dh.cls[2].pixels = 20; x.ex2dh.cls[2].sumErr1024 = 20480; x.ex2dh.cls[2].hist[23] = 20; x.ex2dh.cells = 40; x.ex2dh.holes = 20;
-    x.rowsWorld = 100; x.rowsWorldOff = 25; x.rowsCockpit = 0;
-    FrameGenShadowWindow xw;
-    frameGenShadowMergeProbe(xw, x);
-    frameGenShadowMergeProbe(xw, p);   // no extrapolation on this one
-    frameGenShadowMergeProbe(xw, x);
-    check(xw.ex2d.frames == 2 && xw.ex2dh.frames == 2 && xw.ex2d.cls[2].pixels == 60 && xw.ex2dh.holes == 40 && xw.ex2d.cells == 80, "an extrapolation merge counts only the frames that ran it and adds the stats");
-    check(xw.rowsWorld == 200 && xw.rowsWorldOff == 50 && xw.rowsCockpit == 0, "the rows-off counters add");
-    checkText(formatFrameGenShadowExtrapolation(xw),
-              "frame generation (shadow) extrapolation: ex2d=2 far=0.0%,0,0,0,0.0%,0.0%|id:0,0 cockpit=0.0%,0,0,0,0.0%,0.0%|id:0,0 world=75.0%,0,0,0,0.0%,0.0%|id:0,0 "
-              "ex2dh=2 far=0.0%,0,0,0,0.0%,0.0%|id:0,0 cockpit=0.0%,0,0,0,0.0%,0.0%|id:0,0 world=50.0%,1000,48,48,100.0%,0.0%|id:0,0 rowsoff_world=25.0% rowsoff_cockpit=-",
-              "the extrapolation line");
-    // The widest extrapolation line, as its own Log::note line.
-    FrameGenShadowWindow xb = xw;
-    for (int c = 0; c < kFrameGenShadowClasses; ++c) {
-        FrameGenShadowClassStats* cs[2] = {&xb.ex2d.cls[c], &xb.ex2dh.cls[c]};
-        for (FrameGenShadowClassStats* k : cs) {
-            *k = FrameGenShadowClassStats{};
-            k->pixels = 1000; k->sumErr1024 = 1000ull * 1024ull; k->sumErrId1024 = 1000ull * 1024ull; k->hist[47] = 1000; k->histId[47] = 1000;
-        }
-    }
-    xb.ex2d.cells = xb.ex2dh.cells = 1000;
-    xb.rowsWorld = xb.rowsCockpit = 1; xb.rowsWorldOff = xb.rowsCockpitOff = 1;
-    const std::string xl = formatFrameGenShadowExtrapolation(xb);
-    check(xl.size() < 1165 && xl.find("rowsoff_cockpit=100.0%") != std::string::npos, "the widest extrapolation line fits Log::note's 1200 bytes and ends with its rows-off fields");
-    check(formatFrameGenShadowReport(xw).find("extrapolation") == std::string::npos, "the main report line does not carry the extrapolation");
+    check(pw.mv.frames == 2 && pw.mv.cls[2].pixels == 10 && pw.mv.cells == 16 && pw.mv.holes == 6 && pw.framesScored == 0 && pw.cls[2].pixels == 0,
+          "a probe merge counts a frame in the mv set, adds its stats and leaves the main set alone");
 
     // The VRAM line: the groups in order, the eye's total and twice it, bytes and MiB.
     FrameGenShadowVram v;
-    v.captures = 6291456; v.vectors = 33554432; v.keys = 12582912; v.stats = 31900;
+    v.captures = 6291456; v.keys = 3145728; v.stats = 11960;
     checkText(formatFrameGenShadowVram(1, v),
-              "frame generation (shadow): eye 1 VRAM 52460700 B (50.0 MiB): captures=6291456 vectors=33554432 keys=12582912 stats=31900; two eyes 104921400 B (100.1 MiB)",
+              "frame generation (shadow): eye 1 VRAM 9449144 B (9.0 MiB): captures=6291456 keys=3145728 stats=11960; two eyes 18898288 B (18.0 MiB)",
               "the VRAM line");
-}
-
-void caseDisagreement() {
-    check(frameGenShadowDisBin(0.0f) == 0 && frameGenShadowDisBin(0.06f) == 0 && frameGenShadowDisBin(std::nanf("")) == 0, "a disagreement under 1/16 px (or NaN) is bin 0");
-    check(frameGenShadowDisBin(1.0f / 16.0f) == 1 && frameGenShadowDisBin(0.07f) == 1, "exactly 1/16 px is bin 1");
-    check(frameGenShadowDisBin(1.0f) == 17 && frameGenShadowDisBin(2.0f) == 21 && frameGenShadowDisBin(4.0f) == 25, "1 px is bin 17, 2 px bin 21, 4 px bin 25 (four bins an octave)");
-    check(frameGenShadowDisBin(1.0e9f) == 47, "a huge disagreement clamps to bin 47");
-    bool back = true;
-    for (int b = 1; b < kFrameGenShadowBins; ++b) if (frameGenShadowDisBin(frameGenShadowDisValue(b)) != b) back = false;
-    check(back && frameGenShadowDisValue(0) == 0.0f, "every bin's value bins back to it, and bin 0 reads 0");
-    uint32_t h[kFrameGenShadowBins] = {};
-    check(frameGenShadowDisPercentile(h, 0.5f) == 0.0f, "an empty disagreement histogram reads 0");
-    h[0] = 50; h[21] = 50;
-    check(frameGenShadowDisPercentile(h, 0.5f) == 0.0f && std::fabs(frameGenShadowDisPercentile(h, 0.51f) - 2.181f) < 0.001f && std::fabs(frameGenShadowDisPercentile(h, 0.95f) - 2.181f) < 0.001f,
-          "p50 of half zeros and half 2 px is 0, p51 and p95 are 2.18");
 }
 
 // ---- the head-pose miss (framegen_pose_report.h) ----
@@ -440,7 +370,6 @@ int main(int argc, char** argv) {
     caseStats();
     caseMerge();
     caseLines();
-    caseDisagreement();
     casePoseMath();
     casePoseProbe();
     casePoseLine();

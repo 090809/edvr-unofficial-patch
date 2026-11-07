@@ -22,9 +22,9 @@ namespace {
 
 constexpr int kStagingDepth = 4;
 constexpr int kTimerRing = 8;
-constexpr int kEntries = 9;      // capture, clear, splat, score, score B, extrapolation clear, splat, source, score
-constexpr int kSrvSlots = 8;     // t0..t7
-constexpr int kUavSlots = 7;     // u0..u6
+constexpr int kEntries = 5;      // capture, clear, splat, score, score B
+constexpr int kSrvSlots = 7;     // t0..t6
+constexpr int kUavSlots = 4;     // u0..u3
 
 std::atomic<bool> g_on{false};
 std::atomic<bool> g_told{false};   // the armed line has been said since the key last went on
@@ -40,16 +40,12 @@ struct EyeRes {
     bool created = false;
     uint32_t rw = 0, rh = 0, ow = 0, oh = 0, qw = 0, qh = 0;
     Tex luma[2], depth[2], key;
-    Tex mvq[2];                   // the DLSS vectors at the cells (xy) and the frame before's depth where they point (z), ping-ponged with the luma
-    Tex keyE, srcE;               // the extrapolation's key grid and the winner's cell
-    bool mvValid[2] = {};         // the slot's vectors were captured from a bound vector texture, a frame after the slot before it
     ID3D11Buffer* stats = nullptr;
     ID3D11UnorderedAccessView* statsUav = nullptr;
     ID3D11Buffer* staging[kStagingDepth] = {};
     bool pending[kStagingDepth] = {};
     uint8_t slotSet[kStagingDepth] = {};   // the stats set (FrameGenShadowSet) each pending slot's frame belongs to
     uint32_t writes = 0;
-    uint32_t normalCount = 0;     // normal (non-jump) scored frames so far: every second one is an oracle frame
     int64_t lastT = 0;            // QPC at the previous frame call, 0 before the first
     double prevDtMs = 0.0;        // the previous frame's interval (A minus its own predecessor), 0 when unknown
     int cur = 0;                  // the slot of the latest capture
@@ -67,7 +63,7 @@ struct TimerSlot {
 struct State {
     ID3D11Device* dev = nullptr;   // identity only
     bool failed = false;           // creation failed on this device: stand down until it changes or the key is toggled
-    ID3D11ComputeShader* cs[kEntries] = {};   // capture, clear, splat, score, score B, extrapolation clear, splat, source, score
+    ID3D11ComputeShader* cs[kEntries] = {};   // capture, clear, splat, score, score B
     ID3D11Buffer* cb = nullptr;
     DXGI_FORMAT lumaFormat = DXGI_FORMAT_R16_FLOAT;
     EyeRes eye[2];
@@ -96,10 +92,7 @@ void releaseTex(Tex& t) {
 void releaseEye(EyeRes& r) {
     for (Tex& t : r.luma) releaseTex(t);
     for (Tex& t : r.depth) releaseTex(t);
-    for (Tex& t : r.mvq) releaseTex(t);
     releaseTex(r.key);
-    releaseTex(r.keyE);
-    releaseTex(r.srcE);
     releaseCom(r.statsUav);
     releaseCom(r.stats);
     for (auto& s : r.staging) releaseCom(s);
@@ -144,10 +137,6 @@ bool createCommon(ID3D11Device* dev, ID3D11DeviceContext* ctx) {
         {kFrameGenShadowSplatBytecode, sizeof(kFrameGenShadowSplatBytecode), "framegen_shadow_splat"},
         {kFrameGenShadowScoreBytecode, sizeof(kFrameGenShadowScoreBytecode), "framegen_shadow_score"},
         {kFrameGenShadowScoreBBytecode, sizeof(kFrameGenShadowScoreBBytecode), "framegen_shadow_score_b"},
-        {kFrameGenShadowExClearBytecode, sizeof(kFrameGenShadowExClearBytecode), "framegen_shadow_ex_clear"},
-        {kFrameGenShadowExSplatBytecode, sizeof(kFrameGenShadowExSplatBytecode), "framegen_shadow_ex_splat"},
-        {kFrameGenShadowExSrcBytecode, sizeof(kFrameGenShadowExSrcBytecode), "framegen_shadow_ex_src"},
-        {kFrameGenShadowExScoreBytecode, sizeof(kFrameGenShadowExScoreBytecode), "framegen_shadow_ex_score"},
     };
     for (int i = 0; i < kEntries; ++i) {
         g.cs[i] = shaderSwapCreateCs(ctx, entries[i].code, entries[i].size, entries[i].name, "frame generation (shadow)");
@@ -189,11 +178,9 @@ bool createEye(ID3D11Device* dev, EyeRes& r, uint32_t rw, uint32_t rh, uint32_t 
     if (r.qw == 0 || r.qh == 0) return false;
     bool ok = true;
     for (int i = 0; i < 2 && ok; ++i) {
-        ok = makeTex(dev, r.qw, r.qh, g.lumaFormat, true, r.luma[i]) && makeTex(dev, r.qw, r.qh, DXGI_FORMAT_R32_FLOAT, true, r.depth[i]) &&
-             makeTex(dev, r.qw, r.qh, DXGI_FORMAT_R32G32B32A32_FLOAT, true, r.mvq[i]);
+        ok = makeTex(dev, r.qw, r.qh, g.lumaFormat, true, r.luma[i]) && makeTex(dev, r.qw, r.qh, DXGI_FORMAT_R32_FLOAT, true, r.depth[i]);
     }
-    ok = ok && makeTex(dev, r.qw, r.qh, DXGI_FORMAT_R32_UINT, false, r.key) && makeTex(dev, r.qw, r.qh, DXGI_FORMAT_R32_UINT, false, r.keyE) &&
-         makeTex(dev, r.qw, r.qh, DXGI_FORMAT_R32_UINT, false, r.srcE);
+    ok = ok && makeTex(dev, r.qw, r.qh, DXGI_FORMAT_R32_UINT, false, r.key);
     if (ok) {
         D3D11_BUFFER_DESC bd{};
         bd.ByteWidth = kFrameGenShadowStatsUints * 4u;
@@ -239,11 +226,8 @@ uint64_t bufBytes(ID3D11Buffer* b) {
 
 FrameGenShadowVram eyeVram(const EyeRes& r) {
     FrameGenShadowVram v;
-    for (int i = 0; i < 2; ++i) {
-        v.captures += texBytes(r.luma[i]) + texBytes(r.depth[i]);
-        v.vectors += texBytes(r.mvq[i]);
-    }
-    v.keys = texBytes(r.key) + texBytes(r.keyE) + texBytes(r.srcE);
+    for (int i = 0; i < 2; ++i) v.captures += texBytes(r.luma[i]) + texBytes(r.depth[i]);
+    v.keys = texBytes(r.key);
     v.stats = bufBytes(r.stats);
     for (ID3D11Buffer* s : r.staging) v.stats += bufBytes(s);
     return v;
@@ -263,10 +247,8 @@ void pollReadbacks(ID3D11DeviceContext* ctx, EyeRes& r, uint32_t nextSlot) {
         frameGenDecodeStats(static_cast<const uint32_t*>(m.pData), res);
         ctx->Unmap(r.staging[slot], 0);
         const int set = r.slotSet[slot];
-        frameGenShadowMergeProbe(g.win, res);   // the second kernel's sets, on every scored frame whatever its set
-        if (set == kSetOracle) {
-            frameGenShadowMergeSet(g.win.oracle, res);
-        } else if (set == kSetJump) {
+        frameGenShadowMergeProbe(g.win, res);   // the second kernel's set, on every scored frame whatever its set
+        if (set == kSetJump) {
             frameGenShadowMergeSet(g.win.jump, res);
         } else {
             frameGenShadowMerge(g.win, res);
@@ -370,9 +352,7 @@ void frameGenShadowEyeFrame(ID3D11Device* dev, ID3D11DeviceContext* ctx, uint32_
     if (skip < 0 && !canCapture) skip = kSkipNoPrevDepth;
     const int next = r.haveCapture ? 1 - r.cur : 0;
     bool scored = skip < 0 && canCapture;
-    // The set: jump frames apart, else every second normal frame of the eye is an oracle frame.
-    int set = kSetPredicted;
-    if (scored) set = jump ? kSetJump : ((r.normalCount++ & 1u) ? kSetOracle : kSetPredicted);
+    const int set = (scored && jump) ? kSetJump : kSetPredicted;   // jump frames apart
 
     // A staging slot still unread when it comes round again is overwritten: counted, not waited for.
     const int slot = static_cast<int>(r.writes % kStagingDepth);
@@ -385,13 +365,9 @@ void frameGenShadowEyeFrame(ID3D11Device* dev, ID3D11DeviceContext* ctx, uint32_
         FrameGenShadowCb cb;
         float Wp[9], tp[3];
         FrameGenAffine bwd[kFrameGenShadowClasses];
-        FrameGenAffine truth[kFrameGenShadowClasses];   // B's true backward rows, whatever the set: the second kernel's bdepth landing
         if (scored) {
-            frameGenBackward(f.deltas, f.deltas.W, f.deltas.tv, truth);
             frameGenPredictWorld(r.prev, f.deltas, Wp, tp);
-            // An oracle frame scores far and world with frame B's own measured transform instead of the prediction.
-            if (set == kSetOracle) frameGenBackward(f.deltas, f.deltas.W, f.deltas.tv, bwd);
-            else frameGenBackward(f.deltas, Wp, tp, bwd);
+            frameGenBackward(f.deltas, Wp, tp, bwd);
             // The prediction's own miss, and the same with the ship's step scaled by dt_B / dt_A; a jump frame's miss is the jump, so it is left out of both.
             const float scale = (dtA > 0.0 && dtB > 0.0) ? static_cast<float>(dtB / dtA) : 0.0f;
             if (!jump) {
@@ -414,7 +390,7 @@ void frameGenShadowEyeFrame(ID3D11Device* dev, ID3D11DeviceContext* ctx, uint32_
             if (scale > 0.0f) g.dtRatio.push_back(scale);
             if (dtB > 0.0) g.dtMs.push_back(static_cast<float>(dtB));
         }
-        frameGenFillCb(cb, f.renderW, f.renderH, f.outW, f.outH, scored ? f.tanPrev : f.tanNow, f.tanNow, f.depthA, f.depthB, f.splitMetres, bwd, scored ? truth : nullptr, r.prev.Hd);   // r.prev is frame A's deltas here: its head rotation is the ex2dh variant's
+        frameGenFillCb(cb, f.renderW, f.renderH, f.outW, f.outH, scored ? f.tanPrev : f.tanNow, f.tanNow, f.depthA, f.depthB, f.splitMetres, bwd);
         D3D11_MAPPED_SUBRESOURCE m{};
         if (SUCCEEDED(ctx->Map(g.cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {
             std::memcpy(m.pData, &cb, sizeof(cb));
@@ -430,11 +406,10 @@ void frameGenShadowEyeFrame(ID3D11Device* dev, ID3D11DeviceContext* ctx, uint32_
         const uint32_t gx = (r.qw + 7u) / 8u, gy = (r.qh + 7u) / 8u;
         ID3D11ShaderResourceView* noSrv[kSrvSlots] = {};
         ID3D11UnorderedAccessView* noUav[kUavSlots] = {};
-        {   // capture this frame into the slot the next frame will read as its previous: luma, depth, and the vectors (with the previous frame's depth where they point)
-            ID3D11ShaderResourceView* srv[kSrvSlots] = {f.outSrv, f.depthSrv, nullptr, r.haveCapture ? r.depth[r.cur].srv : nullptr, nullptr, f.mvSrv};
-            ID3D11UnorderedAccessView* uav[kUavSlots] = {r.luma[next].uav, r.depth[next].uav, nullptr, nullptr, r.mvq[next].uav, nullptr, nullptr};
+        {   // capture this frame into the slot the next frame will read as its previous: luma and depth
+            ID3D11ShaderResourceView* srv[kSrvSlots] = {f.outSrv, f.depthSrv};
+            ID3D11UnorderedAccessView* uav[kUavSlots] = {r.luma[next].uav, r.depth[next].uav};
             bindAndDispatch(ctx, 0, srv, uav, gx, gy);
-            r.mvValid[next] = f.mvSrv && r.haveCapture && r.captureFrame + 1u == frame;
         }
         if (scored) {
             const int prevSlot = r.cur;
@@ -452,27 +427,10 @@ void frameGenShadowEyeFrame(ID3D11Device* dev, ID3D11DeviceContext* ctx, uint32_
                 ID3D11UnorderedAccessView* uav[kUavSlots] = {nullptr, nullptr, r.key.uav, r.statsUav};
                 bindAndDispatch(ctx, 3, srv, uav, gx, gy);
             }
-            if (f.mvSrv) {   // score B: this frame's cells by its own depth, carried back by the DLSS vector and by the true rows (the stats words add to the score's)
+            if (f.mvSrv) {   // score B: this frame's cells by its own depth, carried back by the DLSS vector (the mv set's block of the stats words)
                 ID3D11ShaderResourceView* srv[kSrvSlots] = {nullptr, nullptr, r.luma[prevSlot].srv, nullptr, r.luma[next].srv, f.mvSrv, r.depth[next].srv};
                 ID3D11UnorderedAccessView* uav[kUavSlots] = {nullptr, nullptr, nullptr, r.statsUav};
                 bindAndDispatch(ctx, 4, srv, uav, gx, gy);
-            }
-            if (r.mvValid[prevSlot]) {   // the extrapolation sets: the previous frame's cells carried forward by their own vectors, once per variant (0 ex2d, 1 ex2dh: the head's part of A's vector swapped for B's true head rotation)
-                for (int variant = 0; variant < 2; ++variant) {
-                    cb.qz[2] = variant;
-                    if (SUCCEEDED(ctx->Map(g.cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {
-                        std::memcpy(m.pData, &cb, sizeof(cb));
-                        ctx->Unmap(g.cb, 0);
-                    }
-                    ID3D11ShaderResourceView* sA[kSrvSlots] = {nullptr, nullptr, nullptr, r.depth[prevSlot].srv, nullptr, nullptr, nullptr, r.mvq[prevSlot].srv};
-                    ID3D11ShaderResourceView* sS[kSrvSlots] = {nullptr, nullptr, r.luma[prevSlot].srv, r.depth[prevSlot].srv, r.luma[next].srv, nullptr, nullptr, r.mvq[prevSlot].srv};
-                    ID3D11UnorderedAccessView* uClear[kUavSlots] = {nullptr, nullptr, nullptr, nullptr, nullptr, r.keyE.uav, r.srcE.uav};
-                    ID3D11UnorderedAccessView* uScore[kUavSlots] = {nullptr, nullptr, nullptr, r.statsUav, nullptr, r.keyE.uav, r.srcE.uav};
-                    bindAndDispatch(ctx, 5, noSrv, uClear, gx, gy);
-                    bindAndDispatch(ctx, 6, sA, uClear, gx, gy);
-                    bindAndDispatch(ctx, 7, sA, uClear, gx, gy);
-                    bindAndDispatch(ctx, 8, sS, uScore, gx, gy);
-                }
             }
             ctx->CSSetShaderResources(0, kSrvSlots, noSrv);
             ctx->CSSetUnorderedAccessViews(0, kUavSlots, noUav, nullptr);
@@ -550,8 +508,6 @@ void frameGenShadowFrameBoundary() {
     m.rigDtMedian = frameGenMedian(g.rigDtMm.data(), g.rigDtMm.size());
     const std::string line = formatFrameGenShadowReport(g.win);
     Log::get().note("%s", line.c_str());
-    const std::string extrap = formatFrameGenShadowExtrapolation(g.win);   // its own line: the report is at the widest a line takes
-    if (!extrap.empty()) Log::get().note("%s", extrap.c_str());
     windowReset();
 }
 

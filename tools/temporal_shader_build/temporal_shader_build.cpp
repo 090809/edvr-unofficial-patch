@@ -652,8 +652,8 @@ static void selfTest() {
     coreLegacy.insert(coreLegacy.end(), originalCore.begin(), originalCore.end());
     coreLegacy.insert(coreLegacy.end(), originalExtra.begin(), originalExtra.end());
     auto coreFixed = fixedVariants(extractCore(edvr::kTemporalCsHlsl));
-    check(originalCore.size() == 28 && originalExtra.size() == 12 && coreFixed.size() == 123 && coreLegacy.size() + 76 == coreFixed.size(),
-          "all original fixed shader contracts, three bounded diagnostics, six flat foreground shaders, the supercruise bars' geometry shader, the foreground map's four sibling-pass compute shaders (donor, fit and the shadow's two), the sky ring's compute shader, the UI layer's in-place composite, the explosion billboards' five facing transcriptions the sharp weapons' two source-pass shaders, the shield ripple's door pass, the HUD bloom feed pass, the star light pass, the visor's axis-centred vertex shader, the desktop window's two draw shaders, the scope lens's three compute passes, the SRV turret HUD's eleven geometry shaders, the VR maps' twelve (five transcribed vertex shaders, the probe's vertex and pixel shader, the sprites' depth issue's two pixel shaders, the System Map's marker vertex shader and the cut-out's vertex and pixel shader) the legacy cockpit glass's three pixel shaders (intact, ice overlay, condensation overlay) the frame-generation shadow scorer's nine compute entries and the frame-generation synthesizer's seven (splat, source, resolve, holes, resample, luma, score) are registered");
+    check(originalCore.size() == 28 && originalExtra.size() == 12 && coreFixed.size() == 119 && coreLegacy.size() + 72 == coreFixed.size(),
+          "all original fixed shader contracts, three bounded diagnostics, six flat foreground shaders, the supercruise bars' geometry shader, the foreground map's four sibling-pass compute shaders (donor, fit and the shadow's two), the sky ring's compute shader, the UI layer's in-place composite, the explosion billboards' five facing transcriptions the sharp weapons' two source-pass shaders, the shield ripple's door pass, the HUD bloom feed pass, the star light pass, the visor's axis-centred vertex shader, the desktop window's two draw shaders, the scope lens's three compute passes, the SRV turret HUD's eleven geometry shaders, the VR maps' twelve (five transcribed vertex shaders, the probe's vertex and pixel shader, the sprites' depth issue's two pixel shaders, the System Map's marker vertex shader and the cut-out's vertex and pixel shader) the legacy cockpit glass's three pixel shaders (intact, ice overlay, condensation overlay) the frame-generation shadow scorer's five compute entries and the frame-generation synthesizer's seven (splat, source, resolve, holes, resample, luma, score) are registered");
     for(size_t i=0;i<coreFixed.size();++i)for(size_t j=0;j<i;++j)
         check(std::strcmp(coreFixed[i].symbol,coreFixed[j].symbol)!=0,"generated shader symbols do not collide");
     using ReflectFn = HRESULT(WINAPI*)(LPCVOID, SIZE_T, REFIID, void**);
@@ -1427,22 +1427,18 @@ static void selfTest() {
         }
     }
 
-    // The frame-generation shadow scorer (src/d3d11/framegen_shadow_shader.h): nine entries of one text, the carry functions cut from kTemporalCsHlsl and the scorer's own.
+    // The frame-generation shadow scorer (src/d3d11/framegen_shadow_shader.h): five entries of one text, the carry functions cut from kTemporalCsHlsl and the scorer's own.
     // Held to the symbols, the source name, the entries, the profile, the text (the carry region is in it, once, and is the pass's text byte for byte), the 8x8 group each
     // is dispatched with, and the bindings each reads at the slots src/d3d11/framegen_shadow.cpp sets them at.
     {
         struct Binding { const char* name; D3D_SHADER_INPUT_TYPE type; UINT slot; };
         struct ShadowContract { const char* symbol; const char* entry; std::vector<Binding> bindings; };
         const std::vector<ShadowContract> contracts = {
-            {"kFrameGenShadowCaptureBytecode", "fgShadowCapture", {{"Out", D3D_SIT_TEXTURE, 0}, {"Depth", D3D_SIT_TEXTURE, 1}, {"DepthA", D3D_SIT_TEXTURE, 3}, {"Mv", D3D_SIT_TEXTURE, 5}, {"LumaOut", D3D_SIT_UAV_RWTYPED, 0}, {"DepthOut", D3D_SIT_UAV_RWTYPED, 1}, {"MvOut", D3D_SIT_UAV_RWTYPED, 4}, {"P", D3D_SIT_CBUFFER, 0}}},
+            {"kFrameGenShadowCaptureBytecode", "fgShadowCapture", {{"Out", D3D_SIT_TEXTURE, 0}, {"Depth", D3D_SIT_TEXTURE, 1}, {"LumaOut", D3D_SIT_UAV_RWTYPED, 0}, {"DepthOut", D3D_SIT_UAV_RWTYPED, 1}, {"P", D3D_SIT_CBUFFER, 0}}},
             {"kFrameGenShadowClearBytecode", "fgShadowClear", {{"Key", D3D_SIT_UAV_RWTYPED, 2}, {"Stats", D3D_SIT_UAV_RWSTRUCTURED, 3}, {"P", D3D_SIT_CBUFFER, 0}}},
             {"kFrameGenShadowSplatBytecode", "fgShadowSplat", {{"DepthA", D3D_SIT_TEXTURE, 3}, {"Key", D3D_SIT_UAV_RWTYPED, 2}, {"P", D3D_SIT_CBUFFER, 0}}},
             {"kFrameGenShadowScoreBytecode", "fgShadowScore", {{"LumaA", D3D_SIT_TEXTURE, 2}, {"LumaB", D3D_SIT_TEXTURE, 4}, {"Key", D3D_SIT_UAV_RWTYPED, 2}, {"Stats", D3D_SIT_UAV_RWSTRUCTURED, 3}, {"P", D3D_SIT_CBUFFER, 0}}},
             {"kFrameGenShadowScoreBBytecode", "fgShadowScoreB", {{"LumaA", D3D_SIT_TEXTURE, 2}, {"LumaB", D3D_SIT_TEXTURE, 4}, {"Mv", D3D_SIT_TEXTURE, 5}, {"DepthB", D3D_SIT_TEXTURE, 6}, {"Stats", D3D_SIT_UAV_RWSTRUCTURED, 3}, {"P", D3D_SIT_CBUFFER, 0}}},
-            {"kFrameGenShadowExClearBytecode", "fgShadowExClear", {{"KeyE", D3D_SIT_UAV_RWTYPED, 5}, {"SrcE", D3D_SIT_UAV_RWTYPED, 6}, {"P", D3D_SIT_CBUFFER, 0}}},
-            {"kFrameGenShadowExSplatBytecode", "fgShadowExSplat", {{"DepthA", D3D_SIT_TEXTURE, 3}, {"MvA", D3D_SIT_TEXTURE, 7}, {"KeyE", D3D_SIT_UAV_RWTYPED, 5}, {"P", D3D_SIT_CBUFFER, 0}}},
-            {"kFrameGenShadowExSrcBytecode", "fgShadowExSrc", {{"DepthA", D3D_SIT_TEXTURE, 3}, {"MvA", D3D_SIT_TEXTURE, 7}, {"KeyE", D3D_SIT_UAV_RWTYPED, 5}, {"SrcE", D3D_SIT_UAV_RWTYPED, 6}, {"P", D3D_SIT_CBUFFER, 0}}},
-            {"kFrameGenShadowExScoreBytecode", "fgShadowExScore", {{"MvA", D3D_SIT_TEXTURE, 7}, {"LumaA", D3D_SIT_TEXTURE, 2}, {"LumaB", D3D_SIT_TEXTURE, 4}, {"KeyE", D3D_SIT_UAV_RWTYPED, 5}, {"SrcE", D3D_SIT_UAV_RWTYPED, 6}, {"Stats", D3D_SIT_UAV_RWSTRUCTURED, 3}, {"P", D3D_SIT_CBUFFER, 0}}},
         };
         const std::string& text = edvr::frameGenShadowShaderSource();
         const std::string carry = edvr::frameGenCarryText();
@@ -1473,8 +1469,8 @@ static void selfTest() {
                 }
                 D3D11_SHADER_BUFFER_DESC bufferDesc{};
                 ID3D11ShaderReflectionConstantBuffer* cbuffer = reflection ? reflection->GetConstantBufferByName("P") : nullptr;
-                check(bound && cbuffer && SUCCEEDED(cbuffer->GetDesc(&bufferDesc)) && bufferDesc.Size == 560 && desc.BoundResources == want.bindings.size(),
-                      "each frame-generation shadow entry keeps its inputs, outputs and the 560-byte parameter block at the slots the module sets them at, and binds nothing else");
+                check(bound && cbuffer && SUCCEEDED(cbuffer->GetDesc(&bufferDesc)) && bufferDesc.Size == sizeof(edvr::FrameGenShadowCb) && desc.BoundResources == want.bindings.size(),
+                      "each frame-generation shadow entry keeps its inputs, outputs and the 368-byte parameter block at the slots the module sets them at, and binds nothing else");
             }
         }
     }
@@ -1503,7 +1499,7 @@ static void selfTest() {
               text.find("#define FG_TURN 1") != std::string::npos && text.find("#define FG_TURN_SIGN 1") != std::string::npos,
               "the synthesizer's text is the pass's carry region byte for byte, then its own entries, with the rig's six mutation points all on");
         for (size_t v = 0; v < contracts.size(); ++v) {
-            auto& shader = coreFixed[coreLegacy.size() + 69 + v];
+            auto& shader = coreFixed[coreLegacy.size() + 65 + v];
             const SynthContract& want = contracts[v];
             check(!std::strcmp(shader.symbol, want.symbol) && !std::strcmp(shader.sourceName, "framegen synth") && !std::strcmp(shader.entry, want.entry) &&
                   !std::strcmp(shader.profile, "cs_5_0") && shader.alternate == text.c_str() && shader.macros == nullptr && !shader.flags1 && !shader.flags2,
