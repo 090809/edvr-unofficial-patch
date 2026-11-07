@@ -3902,13 +3902,14 @@ int main(int argc, char** argv) {
                 check(cc::camTestNextMode(0) == 1 && cc::camTestNextMode(1) == 2 && cc::camTestNextMode(2) == 3 && cc::camTestNextMode(3) == 0, "camera test: the key steps off, log only, look, bake, off");
                 {
                     int wash = 0;
-                    bool scatter = false;
+                    bool scatter = false, cones = false;
                     for (size_t i = 0; i < cc::kWithheldPsCount; ++i)
                         if (cc::kWithheldPs[i].washToo) {
                             ++wash;
-                            scatter = std::strcmp(cc::kWithheldPs[i].name, "scatter") == 0;
+                            scatter = scatter || std::strcmp(cc::kWithheldPs[i].name, "scatter") == 0;
+                            cones = cones || std::strcmp(cc::kWithheldPs[i].name, "light cones") == 0;
                         }
-                    check(wash == 1 && scatter, "the bake: the scatter alone stays off while the windows show the bake");
+                    check(wash == 2 && scatter && cones, "the bake: the scatter and the light cones alone stay off while the windows show the bake");
                 }
                 {
                     CamTestTimer b;
@@ -4341,7 +4342,7 @@ int main(int argc, char** argv) {
         // The withheld outside draws: named by shader, found by a bloom and a scan.
         {
             static_assert(cc::kWithheldPs[0].hash == cc::kPlumePs && cc::kWithheldPs[1].hash == cc::kTwinPs, "the plume pair leads the list");
-            check(cc::kWithheldPsCount == 21 && cc::kWithheldVsCount == 10, "concourse withheld: 21 pixel shaders and 10 vertex shaders");
+            check(cc::kWithheldPsCount == 22 && cc::kWithheldVsCount == 10, "concourse withheld: 22 pixel shaders and 10 vertex shaders");
             check(!cc::withheldHasDuplicate(cc::kWithheldPs, cc::kWithheldPsCount) && !cc::withheldHasDuplicate(cc::kWithheldVs, cc::kWithheldVsCount),
                   "concourse withheld: no list holds a hash twice");
             const cc::WithheldFamily dup[] = {{1, "a"}, {2, "b"}, {1, "c"}};
@@ -4369,7 +4370,12 @@ int main(int argc, char** argv) {
             check(missed, "concourse withheld: near-miss hashes are not found");
             check(cc::withheldPsIndex(0) == -1 && cc::withheldVsIndex(0) == -1, "concourse withheld: no shader (hash 0) is not found");
             check(cc::withheldPsIndex(cc::kPaneFamilyPs) == -1 && cc::withheldVsIndex(cc::kPaneFamilyVs) == -1, "concourse withheld: the glass family is not withheld");
-            check(cc::farLimitedPs(0x2519C9050946D545ull) && cc::farLimitedPs(0x92FF8499ED345759ull), "concourse far-limited: the cones and the glow quads");
+            check(!cc::farLimitedPs(0x2519C9050946D545ull) && cc::farLimitedPs(0x92FF8499ED345759ull), "concourse far-limited: the glow quads, and no longer the cones");
+            {
+                const int coneAt = cc::withheldPsIndex(0x2519C9050946D545ull);
+                check(coneAt >= 0 && cc::kWithheldPs[coneAt].washToo && !cc::kWithheldPs[coneAt].sealedToo && std::strcmp(cc::kWithheldPs[coneAt].name, "light cones") == 0,
+                      "concourse withheld: the light cones go with the cull and stay off while the windows show the bake, and a sealed hangar keeps its own");
+            }
             const auto sealedPs = [](uint64_t h) { const int i = cc::withheldPsIndex(h); return i >= 0 && cc::kWithheldPs[i].sealedToo; };
             const auto sealedVs = [](uint64_t h) { const int i = cc::withheldVsIndex(h); return i >= 0 && cc::kWithheldVs[i].sealedToo; };
             check(sealedPs(0xA75C1DB6562B8CA7ull) && sealedPs(0x3B0B38CD96F53BC1ull) && sealedPs(0x43E5E6EB67AC751Bull) && sealedPs(0xDD371C57C9093BB8ull) && sealedVs(0x26FC402B1274EE7Bull),
@@ -4381,7 +4387,7 @@ int main(int argc, char** argv) {
             cc::fillPaneGlowT10(glowT10);
             check(glowT10[0] == 255 && glowT10[3] == 255 && glowT10[sizeof(glowT10) - 1] == 255, "concourse glow: a white, fully rough material");
             check(!cc::farLimitedPs(0) && !cc::farLimitedPs(cc::kPaneFamilyPs) && !cc::farLimitedPs(0x06332CA168B6DA63ull), "concourse far-limited: nothing else (no shader, the glass, the stars)");
-            check(cc::withheldPsIndex(0x2519C9050946D545ull) == -1 && cc::withheldPsIndex(0x92FF8499ED345759ull) == -1, "concourse far-limited: not also withheld, or the room's would go");
+            check(cc::withheldPsIndex(0x92FF8499ED345759ull) == -1, "concourse far-limited: not also withheld, or the room's would go");
             const uint64_t keep[] = {0x88DCF1164C640EC3ull, 0x494506A6ull, 0x1C506222ull, 0x359BF8FFull, 0xF8FA801Full, 0x68DDDEF0ull, 0xF7A6E916ull, 0xE904D334ull};
             bool kept = true;
             for (uint64_t h : keep) kept = kept && cc::withheldPsIndex(h) == -1 && cc::withheldVsIndex(h) == -1;

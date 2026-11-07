@@ -149,7 +149,7 @@ constexpr uint64_t kTwinPs = 0x34A1475B2C790DFAull;
 
 // ---- The draws withheld while the cull is on: what is outside the room (smoke, volumetrics, ship lasers, engine trails, the planet) --------------------
 // Named by pixel shader hash or vertex shader hash (a draw with either is not issued). A terrain patch has no pixel shader, so it is named by its vertex
-// shader. Not here, on purpose: the player's first-person laser (0x88DCF1164C640EC3 / 494506A6), the room's glows (1C506222, 359BF8FF), the sky (F8FA801F),
+// shader. Not here, on purpose: the player's first-person laser (0x88DCF1164C640EC3 / 494506A6), the room's glow quads (359BF8FF), the sky (F8FA801F),
 // the stars (68DDDEF0, F7A6E916), the dust (E904D334). Beams, flares and the scatter are non-indexed draws, so the plain draw thunks carry the scope too.
 // sealedToo: also withheld while the hangar is sealed (fix.optimized_stations): it can only be outside. Not so for what a hangar may draw itself: flares, the scatter,
 // the particle batches and an engine glow (its own ship's on the pad); no census has been taken in a sealed hangar yet to say otherwise.
@@ -183,6 +183,9 @@ constexpr WithheldFamily kWithheldPs[] = {
     {0x6EAA86EFE135B2D4ull, "shield strike part 2", true},  // VS 820E5C13, the same 3984 indices as the shield strike
     {0xDD371C57C9093BB8ull, "ship ribbon", true},           // VS 5EAFFCD0: a triangle strip of about 100 indices, two draws a frame, the orange double trail
     {0x89B662E266E5D73Eull, "ship engine glow"},      // VS 2D8263CC: n=36, additive, one vertex buffer each, seen with a ship's hull in view
+    // VS 1C506222: n=384, additive, depth-tested volumes, about 46 a frame. The pale look at the lift bank, the near walls clear and the far ones washed out (Flight 33: leaving these out took
+    // it away). Limited by the mark they still lit whatever was within kMirrorBeyondDefaultM of the camera, which is INFERRED to be why it stopped a few metres from the lifts.
+    {0x2519C9050946D545ull, "light cones", false, true},
 };
 constexpr WithheldFamily kWithheldVs[] = {
     {0x72BDD292154158ADull, "body surface", true},
@@ -218,10 +221,9 @@ inline int withheldIndex(const WithheldFamily* list, size_t n, uint64_t bloom, u
 inline int withheldPsIndex(uint64_t hash) noexcept { return withheldIndex(kWithheldPs, kWithheldPsCount, kWithheldPsBloom, hash); }
 inline int withheldVsIndex(uint64_t hash) noexcept { return withheldIndex(kWithheldVs, kWithheldVsCount, kWithheldVsBloom, hash); }
 
-// The light cones (VS 1C506222, n=384) and their glow quads (VS 359BF8FF, n=6): the green haze and the pale wedges past the glass, up to 40% of the screen in Flight 1's
-// capture. Nothing yet says none of them is a room lamp's, so while the cull is on they are not withheld: they are limited by the mirror's stencil mark, so a pixel
-// with nothing near behind it is dropped and one over the room stays.
-inline bool farLimitedPs(uint64_t ps) noexcept { return ps == 0x2519C9050946D545ull || ps == 0x92FF8499ED345759ull; }
+// The glow quads (VS 359BF8FF, n=6) of the light cones: part of the green haze past the glass in Flight 1's capture. Nothing yet says none of them is a room lamp's, so while the cull is on
+// they are not withheld: they are limited by the mirror's stencil mark, so a pixel with nothing near behind it is dropped and one over the room stays. The cones themselves are withheld.
+inline bool farLimitedPs(uint64_t ps) noexcept { return ps == 0x92FF8499ED345759ull; }
 
 // True when a list holds the same hash twice (the tests fail on it).
 constexpr bool withheldHasDuplicate(const WithheldFamily* list, size_t n) noexcept {
