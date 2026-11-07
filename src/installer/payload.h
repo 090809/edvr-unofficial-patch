@@ -53,6 +53,9 @@ struct PayloadFile {
 // payload; a file whose hash does not match is refused, and so is an unknown or
 // repeated item. Nothing changes unless every file is accepted. With no files the
 // payload is empty: payloadItem finds nothing, which is how "no payload" reads.
+// A file given a hash is hashed here, once: payloadInfo reuses that value rather than
+// reading the same bytes again, and Updater::loadCurrentManifest leaves the hashing to
+// this call, so a launcher reads its payload once at start-up, not three times.
 // Call it from the thread that owns the payload; it does not synchronise with a
 // reader running at the same time.
 bool usePayloadFiles(const std::vector<PayloadFile>& files, const std::string& version, std::string* error);

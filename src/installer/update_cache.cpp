@@ -71,6 +71,13 @@ bool PayloadCache::hasVerified(const std::string& sha256, unsigned long long siz
     return sha256File(path) == sha256;
 }
 
+bool PayloadCache::hasSized(const std::string& sha256, unsigned long long size) const {
+    const std::wstring path = pathFor(sha256);
+    if (path.empty()) return false;
+    unsigned long long actual = 0;
+    return fileSizeOf(path, &actual) && actual == size;
+}
+
 bool PayloadCache::hasAll(const Manifest& manifest) const {
     for (const ManifestFile& f : manifest.files) {
         if (!hasVerified(f.sha256, f.size)) return false;

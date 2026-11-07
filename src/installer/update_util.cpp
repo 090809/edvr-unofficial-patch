@@ -82,11 +82,4 @@ bool createDirectories(const std::wstring& path) {
     return GetLastError() == ERROR_ALREADY_EXISTS;
 }
 
-std::wstring joinPath(const std::wstring& base, const std::wstring& leaf) {
-    if (base.empty()) return leaf;
-    const wchar_t last = base.back();
-    if (last == L'\\' || last == L'/') return base + leaf;
-    return base + L"\\" + leaf;
-}
-
 }  // namespace edvr::installer

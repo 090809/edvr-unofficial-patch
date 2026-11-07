@@ -58,6 +58,9 @@ struct Mapped {
     HANDLE mapping = nullptr;
     const void* view = nullptr;
     size_t size = 0;
+    // The hash usePayloadFiles checked this file against, or empty when the caller gave
+    // none. buildInfo reuses it instead of hashing the same bytes again.
+    std::string sha;
 };
 
 void unmap(Mapped* m) {
@@ -123,6 +126,17 @@ bool lookup(const std::string& item, const void** data, size_t* size) {
     return findBlob(id, data, size);
 }
 
+// The SHA-256 of what lookup() returned for `item`. A file outside the executable that
+// usePayloadFiles already verified against the caller's hash keeps that hash, so the
+// launcher reads each of its ~200 MB of files once, not once more per payloadInfo.
+std::string shaOfItem(const std::string& item, const void* data, size_t size) {
+    if (g_external) {
+        const auto found = g_files.find(canonicalItem(item));
+        if (found != g_files.end() && !found->second.sha.empty()) return found->second.sha;
+    }
+    return sha256Bytes(data, size);
+}
+
 PayloadInfo buildInfo() {
     PayloadInfo p;
     p.version = g_external ? g_version : std::string(EDVR_VERSION_STRING);
@@ -131,33 +145,33 @@ PayloadInfo buildInfo() {
     size_t size = 0;
     if (lookup("d3d11", &data, &size)) {
         p.haveD3d11 = true;
-        p.d3d11Sha = sha256Bytes(data, size);
+        p.d3d11Sha = shaOfItem("d3d11", data, size);
     }
     if (lookup("openvr", &data, &size)) {
         p.haveOpenvr = true;
-        p.openvrSha = sha256Bytes(data, size);
+        p.openvrSha = shaOfItem("openvr", data, size);
     }
     if (lookup("ngx", &data, &size)) {
         p.haveNgx = true;
-        p.ngxSha = sha256Bytes(data, size);
+        p.ngxSha = shaOfItem("ngx", data, size);
     }
     if (lookup("xess", &data, &size)) {
         p.haveXess = true;
-        p.xessSha = sha256Bytes(data, size);
+        p.xessSha = shaOfItem("xess", data, size);
     }
-    if (lookup("xess_license", &data, &size)) p.xessLicenseSha = sha256Bytes(data, size);
-    if (lookup("xess_third_party", &data, &size)) p.xessThirdPartySha = sha256Bytes(data, size);
+    if (lookup("xess_license", &data, &size)) p.xessLicenseSha = shaOfItem("xess_license", data, size);
+    if (lookup("xess_third_party", &data, &size)) p.xessThirdPartySha = shaOfItem("xess_third_party", data, size);
     const bool graphicsPresent = lookup("native_graphics", &data, &size);
     const bool graphics = graphicsPresent && validateNativePayloadBytes(data, size, NativeImageKind::Graphics);
     p.nativeGraphicsValid = graphics;
     const bool runtimePresent = lookup("native_runtime", &data, &size);
     const bool runtime = runtimePresent && validateNativePayloadBytes(data, size, NativeImageKind::Runtime);
     const bool loaderPresent = lookup("openxr_loader", &data, &size);
-    if (loaderPresent) { p.haveOpenxrLoader = true; p.openxrLoaderSha = sha256Bytes(data, size); }
+    if (loaderPresent) { p.haveOpenxrLoader = true; p.openxrLoaderSha = shaOfItem("openxr_loader", data, size); }
     const bool loader = loaderPresent && validateNativePayloadBytes(data, size, NativeImageKind::Loader);
     const bool license = lookup("openxr_license", &data, &size);
     p.nativePairValid = graphics && runtime && loader && license;
-    if (license) { p.haveOpenxrLicense = true; p.openxrLicenseSha = sha256Bytes(data, size); }
+    if (license) { p.haveOpenxrLicense = true; p.openxrLicenseSha = shaOfItem("openxr_license", data, size); }
     // Resource 103 is edvr.ini; resource 111 is edvr-flat.ini. Both are carried, and the
     // scope the install asks for decides which of them it writes.
     if (lookup("ini", &data, &size)) {
@@ -170,7 +184,7 @@ PayloadInfo buildInfo() {
     }
     if (lookup("profile", &data, &size)) {
         p.descriptorText.assign(static_cast<const char*>(data), size);
-        p.descriptorSha = sha256Bytes(data, size);
+        p.descriptorSha = shaOfItem("profile", data, size);
     }
     return p;
 }
@@ -221,6 +235,7 @@ bool usePayloadFiles(const std::vector<PayloadFile>& files, const std::string& v
             releaseFresh();
             return refuse("the payload file for " + file.item + " does not match its hash");
         }
+        mapped.sha = file.sha256;  // empty when unchecked; non-empty only after the comparison above
         fresh[name] = mapped;
     }
     std::lock_guard<std::mutex> lock(g_mutex);

@@ -22,7 +22,8 @@ bool readFileBytes(const std::wstring& path, std::string* out, unsigned long lon
 // CreateDirectory for every missing level; true when the folder exists after.
 bool createDirectories(const std::wstring& path);
 
-// a + "\" + b, without doubling a separator.
+// a + "\" + b, without doubling a separator. Defined in detect.cpp, where the installer has
+// always had it: the launcher links both files, and two definitions would not link.
 std::wstring joinPath(const std::wstring& base, const std::wstring& leaf);
 
 }  // namespace edvr::installer

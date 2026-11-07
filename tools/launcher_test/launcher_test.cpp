@@ -16,16 +16,29 @@
 //   updater      GitHub scripted: 304, 403, 429, 5xx, bad signature, tag, issued, ...
 //   http         WinHttpClient against a loopback server thread in this process
 //   payload      usePayloadFiles
+//   core         roots, --payload folders, the stored manifest, the developer-install check
+//   register     the Start menu shortcut and the HKCU entry, and taking them away
+//   selfupdate   downloading the launcher, the two renames and their rollback, on a running exe
+//   planfile     the plan and result files, and the elevated copy's work (this rig is the copy)
+//   route        the store addresses and EDLaunch's flags, recorded and never opened
+//   watcher      the game watcher against fake programs: EDLaunch asked to close, left alone
+//   session      the window's behaviour without a window: payload, check, update, self-update, Play
+//   args         the launcher's command line
 //
 // Nothing here touches the real %LOCALAPPDATA%\EDVR, a game folder or any host but
 // 127.0.0.1: the updater sections use a scripted client, and the http section
 // speaks only to a listener this process opens on the loopback address.
 //
-// Usage: launcher_test.exe <repo root> <fixtures dir> <scratch dir>
-//   fixtures are written by tools\launcher_fixtures.py.
+// Usage: launcher_test.exe <repo root> <fixtures dir> <scratch dir> <fakes dir>
+//   fixtures are written by tools\launcher_fixtures.py; the fakes are build.bat's
+//   (tools\launcher_test\fake_proc.cpp, built as ed_up_fake_game.exe and ed_up_fake_edlaunch.exe).
+//   launcher_test.exe --apply-plan <file> --key <hex> is the elevated copy's work, run unelevated.
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
+#include <shellapi.h>
+#include <shlobj.h>
+#include <shobjidl.h>
 
 #include <algorithm>
 #include <atomic>
@@ -40,7 +53,16 @@
 #include <thread>
 #include <vector>
 
+#include "../../src/installer/app.h"
+#include "../../src/installer/detect.h"
+#include "../../src/installer/launch_route.h"
+#include "../../src/installer/launcher_core.h"
+#include "../../src/installer/launcher_main.h"
+#include "../../src/installer/launcher_plan.h"
+#include "../../src/installer/launcher_register.h"
+#include "../../src/installer/launcher_session.h"
 #include "../../src/installer/launcher_state.h"
+#include "../../src/installer/selfupdate.h"
 #include "../../src/installer/payload.h"
 #include "../../src/installer/probe.h"
 #include "../../src/installer/update_cache.h"
@@ -1290,6 +1312,26 @@ void testUpdater() {
         std::vector<std::string> refetched;
         check(cache.ensureFiles(minLauncher.manifest, serveFrom(minLauncher, &refetched), &err) && refetched.size() == 1, "the cache repairs itself from the release: " + err);
         check(off.loadCurrentManifest(&loaded, &files, &err), "after the repair the current manifest loads again: " + err);
+        // The hash is compared once, in usePayloadFiles: a same-size file with other bytes passes the
+        // listing (size only) and is refused where the file is read.
+        {
+            const std::wstring victim = cache.pathFor(minLauncher.manifest.files[0].sha256);
+            const std::string good = readAll(victim);
+            std::string bad = good;
+            bad[0] = static_cast<char>(bad[0] ^ 1);
+            writeAll(victim, bad);
+            check(off.loadCurrentManifest(&loaded, &files, &err), "a same-size tampered cache file passes the size listing: " + err);
+            check(!usePayloadFiles(files, loaded.version, &err) && contains(err, "hash"), "usePayloadFiles refuses the tampered cache file: " + err);
+            check(!cache.hasVerified(minLauncher.manifest.files[0].sha256, good.size()), "and the cache itself no longer calls it verified");
+            writeAll(victim, good);
+            check(off.loadCurrentManifest(&loaded, &files, &err), "the restored file lists again: " + err);
+            // By path: the file name has to be the manifest's hash.
+            Manifest byPath;
+            std::vector<PayloadFile> byPathFiles;
+            check(off.loadManifestFile(P(manifests, widenUtf8(lastSha) + L".json"), &byPath, &byPathFiles, &err) && byPath.version == "1.3.0" && byPathFiles.size() == 4,
+                  "a stored manifest loads by its path: " + err);
+            check(!off.loadManifestFile(P(manifests, L"renamed.json"), &byPath, &byPathFiles, &err) && contains(err, "not its hash"), "a manifest not named for its hash is refused: " + err);
+        }
         check(usePayloadFiles(files, loaded.version, &err), "the payload switches to those files: " + err);
         const void* data = nullptr;
         size_t size = 0;
@@ -1732,15 +1774,1180 @@ void testHttp() {
     server.shutdown();
 }
 
+
+// ===========================================================================================
+// The launcher's exe: everything around the update core that has no window of its own.
+//
+// Programs are only ever the two fakes build.bat compiles into <fakes dir> (fake_proc.cpp), the
+// store addresses are recorded by RouteOps and never opened, the registry is one subkey of
+// HKCU this rig creates and removes, and every folder is under the scratch folder.
+// ===========================================================================================
+
+std::wstring g_fakes;  // build\launcher_fakes
+std::wstring g_self;   // this program, started again as the stand-in for the elevated copy
+const wchar_t* kFakeGame = L"ed_up_fake_game.exe";
+const wchar_t* kFakeEd = L"ed_up_fake_edlaunch.exe";
+
+HANDLE startProgram(const std::wstring& exe, const std::wstring& args) {
+    std::wstring line = L"\"" + exe + L"\" " + args;
+    STARTUPINFOW si{};
+    si.cb = sizeof(si);
+    PROCESS_INFORMATION pi{};
+    if (!CreateProcessW(exe.c_str(), &line[0], nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) return nullptr;
+    CloseHandle(pi.hThread);
+    return pi.hProcess;
+}
+
+bool stillRunning(HANDLE p) { return p && WaitForSingleObject(p, 0) == WAIT_TIMEOUT; }
+
+void endProgram(HANDLE p) {
+    if (!p) return;
+    TerminateProcess(p, 0);
+    WaitForSingleObject(p, 3000);
+    CloseHandle(p);
+}
+
+// Anything an earlier run of this rig left behind under the fakes' names.
+void endFakes() {
+    for (const wchar_t* name : {kFakeGame, kFakeEd}) {
+        std::vector<unsigned long> pids;
+        pidsNamed(name, &pids);
+        for (unsigned long pid : pids) {
+            HANDLE h = OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, FALSE, pid);
+            if (!h) continue;
+            TerminateProcess(h, 0);
+            WaitForSingleObject(h, 3000);
+            CloseHandle(h);
+        }
+    }
+}
+
+std::string logText(const std::wstring& path) { return readAll(path); }
+
+// ---- core: roots, payload folders, the developer check ---------------------------------------
+
+std::wstring copyOfSystemDll(const std::wstring& dest) {
+    wchar_t system[MAX_PATH]{};
+    GetSystemDirectoryW(system, MAX_PATH);
+    CopyFileW(P(system, L"wsock32.dll").c_str(), dest.c_str(), FALSE);
+    return dest;
+}
+
+void testCore() {
+    section("core");
+    const LauncherRoots real = launcherRoots(L"");
+    check(real.canonical && !real.dataRoot.empty() && real.dataRoot.size() > 4 && real.dataRoot.substr(real.dataRoot.size() - 4) == L"EDVR",
+          "with no --data-root the root is %LOCALAPPDATA%\\EDVR and the run is canonical");
+    const LauncherRoots trial = launcherRoots(L"C:\\scratch\\root");
+    check(!trial.canonical && trial.dataRoot == L"C:\\scratch\\root" && trial.launcherDir() == L"C:\\scratch\\root\\launcher" &&
+              trial.cacheDir() == L"C:\\scratch\\root\\payload" && trial.exePath() == L"C:\\scratch\\root\\launcher\\ed-up-launcher.exe",
+          "--data-root names the folder, marks the run as a trial, and the folders under it are launcher and payload");
+
+    // quoteArg: what CommandLineToArgvW reads back is what went in.
+    {
+        const std::vector<std::wstring> awkward = {L"plain", L"with space", L"quote\"inside", L"trailing\\", L"C:\\Program Files\\Elite Dangerous\\", L"", L"two  spaces\\\\", L"a\\\"b"};
+        std::wstring line = L"prog";
+        for (const std::wstring& a : awkward) line += L" " + quoteArg(a);
+        int argc = 0;
+        wchar_t** argv = CommandLineToArgvW(line.c_str(), &argc);
+        bool same = argv && argc == static_cast<int>(awkward.size()) + 1;
+        for (size_t i = 0; same && i < awkward.size(); ++i) same = awkward[i] == argv[i + 1];
+        if (argv) LocalFree(argv);
+        check(same, "quoteArg survives CommandLineToArgvW for spaces, quotes and trailing backslashes");
+    }
+
+    // A payload folder: the table of paths, and the version from d3d11.dll's own stamp.
+    {
+        const std::wstring dir = fresh("core-folder");
+        copyOfSystemDll(P(dir, L"d3d11.dll"));
+        writeAll(P(dir, L"edvr.ini"), "[fix]\nx=1\n");
+        writeAll(P(dir, L"Openvr\\openvr_api.dll"), "runtime");
+        writeAll(P(dir, L"unrelated.txt"), "ignored");
+        std::vector<PayloadFile> files;
+        std::string version, err;
+        check(listPayloadFolder(dir, &files, &version, &err), "an unpacked zip lists: " + err);
+        check(files.size() == 3, "only the files the table names are listed: " + std::to_string(files.size()));
+        check(version == narrowUtf8(fileVersionOf(P(dir, L"d3d11.dll"))) && !version.empty(), "the version is d3d11.dll's FileVersion: " + version);
+        bool graphics = false, ini = false, runtime = false;
+        for (const PayloadFile& f : files) {
+            graphics |= f.item == "native_graphics" && f.sha256.empty();
+            ini |= f.item == "ini";
+            runtime |= f.item == "native_runtime" && _wcsicmp(f.path.c_str(), P(dir, L"Openvr\\openvr_api.dll").c_str()) == 0;
+        }
+        check(graphics && ini && runtime, "the items are the manifest's names, and no hash is claimed for the user's folder");
+
+        const LauncherRoots roots = launcherRoots(L"");
+        const PayloadLoad load = loadLauncherPayload(roots, dir, g_testKeys);
+        check(load.ok && load.kind == PayloadKind::Folder && load.version == version, "loadLauncherPayload takes the folder: " + load.note);
+        const void* data = nullptr;
+        size_t size = 0;
+        check(payloadItem("ini", &data, &size) && std::string(static_cast<const char*>(data), size) == "[fix]\nx=1\n", "payloadItem now serves the folder's edvr.ini");
+        check(payloadPresent(payloadInfo()) && payloadInfo().version == version, "payloadPresent says there is a payload, with its version");
+        resetPayloadFiles();
+        check(!payloadPresent(payloadInfo()), "reset: a build with no embedded resources has no payload (the state the launcher starts in)");
+
+        check(!loadLauncherPayload(roots, P(dir, L"nowhere"), g_testKeys).ok, "a folder that is not there is refused");
+        const std::wstring empty = fresh("core-folder-empty");
+        const PayloadLoad none = loadLauncherPayload(roots, empty, g_testKeys);
+        check(!none.ok && contains(none.note, "d3d11.dll"), "a folder with no d3d11.dll is refused, and says what to point at: " + none.note);
+        check(!payloadPresent(payloadInfo()), "and a refused load leaves the process with no payload");
+        // (The folder above is still mapped by the retired payload, so this is another one.)
+        const std::wstring plain = fresh("core-folder-plain");
+        writeAll(P(plain, L"d3d11.dll"), "no version resource in these bytes");
+        check(!listPayloadFolder(plain, &files, &version, &err) && contains(err, "version"), "a d3d11.dll without a stamp is refused: " + err);
+    }
+
+    // A stored manifest: the first run has none, and after an adoption it loads.
+    {
+        const Rel a = loadRel("relA");
+        const std::wstring base = fresh("core-manifest");
+        const LauncherRoots roots = launcherRoots(base);
+        const PayloadLoad first = loadLauncherPayload(roots, L"", g_testKeys);
+        check(!first.ok && first.firstRun && first.kind == PayloadKind::None, "nothing adopted yet is the first run, not an error");
+        check(!payloadPresent(payloadInfo()), "and it leaves no payload");
+
+        ScriptedHttp http;
+        http.replies[latestUrl()] = ok(releaseJson(a), "\"etag-A\"");
+        serveRelease(&http, a);
+        UpdaterSettings s = settingsFor(base);
+        Updater up(http, s);
+        std::string err;
+        const UpdateCheck c = up.check();
+        check(c.outcome == UpdateOutcome::Available && adopt(&up, c, &err), "release A is adopted: " + err);
+        const PayloadLoad load = loadLauncherPayload(roots, L"", g_testKeys);
+        check(load.ok && load.kind == PayloadKind::Manifest && load.version == "v1.0.0" && !load.firstRun, "the adopted manifest loads, with its build stamp as the version: " + load.note);
+        check(load.manifestPath == P(P(roots.launcherDir(), L"manifests"), widenUtf8(sha(a.manifestBytes)) + L".json") && exists(load.manifestPath), "the load names the stored manifest it used");
+        const void* data = nullptr;
+        size_t size = 0;
+        check(payloadItem("native_graphics", &data, &size) && std::string(static_cast<const char*>(data), size) == "graphics one", "payloadItem serves the cached graphics file");
+        resetPayloadFiles();
+
+        // The cache lost a file: named, and not a first run. (Another root: the files above are still mapped.)
+        const std::wstring base2 = fresh("core-manifest-broken");
+        const LauncherRoots roots2 = launcherRoots(base2);
+        ScriptedHttp http2;
+        http2.replies[latestUrl()] = ok(releaseJson(a), "\"etag-A\"");
+        serveRelease(&http2, a);
+        Updater up2(http2, settingsFor(base2));
+        const UpdateCheck c2 = up2.check();
+        check(c2.outcome == UpdateOutcome::Available && adopt(&up2, c2, &err), "release A is adopted into a second root: " + err);
+        check(DeleteFileW(PayloadCache(roots2.cacheDir()).pathFor(a.manifest.files[0].sha256).c_str()) != 0, "and one of its cached files is deleted");
+        const PayloadLoad broken = loadLauncherPayload(roots2, L"", g_testKeys);
+        check(!broken.ok && !broken.firstRun && contains(broken.note, "cache lacks"), "a cache missing a file is reported: " + broken.note);
+        check(!payloadPresent(payloadInfo()), "and the payload stays empty");
+    }
+
+    // Developer installs: a receipt newer than the install record, or a receipt with no record.
+    {
+        const std::wstring game = fresh("core-dev");
+        check(!isDeveloperInstall(game), "a folder with no receipt and no record is not a developer's");
+        writeAll(P(game, L"edvr_install\\state.ini"), "version=1\n");
+        check(!isDeveloperInstall(game), "a record alone is not either");
+        auto stamp = [](const std::wstring& path, int secondsFromNow) {
+            HANDLE f = CreateFileW(path.c_str(), FILE_WRITE_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+            FILETIME now;
+            GetSystemTimeAsFileTime(&now);
+            ULARGE_INTEGER t;
+            t.LowPart = now.dwLowDateTime;
+            t.HighPart = now.dwHighDateTime;
+            t.QuadPart += static_cast<ULONGLONG>(static_cast<LONGLONG>(secondsFromNow) * 10000000LL);
+            FILETIME ft{t.LowPart, static_cast<DWORD>(t.HighPart)};
+            SetFileTime(f, nullptr, nullptr, &ft);
+            CloseHandle(f);
+        };
+        stamp(P(game, L"edvr_install\\state.ini"), -1000);
+        writeAll(P(game, L"edvr_native_receipt.json"), "{}");
+        stamp(P(game, L"edvr_native_receipt.json"), -2000);
+        check(!isDeveloperInstall(game), "a receipt older than the record is the launcher's own past, not a developer's");
+        writeAll(P(game, L"edvr_flat_receipt.json.pre-20260101-000000-1"), "{}");
+        stamp(P(game, L"edvr_flat_receipt.json.pre-20260101-000000-1"), -500);
+        check(isDeveloperInstall(game), "a backup-named receipt newer than the record counts");
+        const std::wstring bare = fresh("core-dev-bare");
+        writeAll(P(bare, L"edvr_flat_receipt.json"), "{}");
+        check(isDeveloperInstall(bare), "a receipt with no install record at all counts");
+    }
+}
+
+// ---- register and unregister ------------------------------------------------------------------
+
+std::wstring shortcutTarget(const std::wstring& link) {
+    std::wstring target;
+    IShellLinkW* l = nullptr;
+    if (SUCCEEDED(CoCreateInstance(CLSID_ShellLink, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&l)))) {
+        IPersistFile* f = nullptr;
+        if (SUCCEEDED(l->QueryInterface(IID_PPV_ARGS(&f)))) {
+            if (SUCCEEDED(f->Load(link.c_str(), STGM_READ))) {
+                wchar_t path[MAX_PATH]{};
+                l->GetPath(path, MAX_PATH, nullptr, SLGP_RAWPATH);
+                target = path;
+            }
+            f->Release();
+        }
+        l->Release();
+    }
+    return target;
+}
+
+std::wstring regString(const std::wstring& key, const wchar_t* value) {
+    wchar_t buf[1024]{};
+    DWORD size = sizeof(buf);
+    if (RegGetValueW(HKEY_CURRENT_USER, key.c_str(), value, RRF_RT_REG_SZ, nullptr, buf, &size) != ERROR_SUCCESS) return std::wstring();
+    return buf;
+}
+
+bool regDword(const std::wstring& key, const wchar_t* value, DWORD* out) {
+    DWORD size = sizeof(*out);
+    return RegGetValueW(HKEY_CURRENT_USER, key.c_str(), value, RRF_RT_REG_DWORD, nullptr, out, &size) == ERROR_SUCCESS;
+}
+
+void testRegister() {
+    section("register");
+    const std::wstring root = fresh("register");
+    const std::wstring key = L"Software\\EdUpLauncherRigTest-" + std::to_wstring(GetCurrentProcessId());
+    RegDeleteKeyW(HKEY_CURRENT_USER, key.c_str());
+    RegisterTargets t;
+    t.launcherDir = P(root, L"launcher");
+    t.payloadDir = P(root, L"payload");
+    t.exePath = P(t.launcherDir, L"ed-up-launcher.exe");
+    t.startMenuDir = P(root, L"StartMenu");
+    t.registryKey = key;
+    t.version = "0.1.0";
+    writeAll(t.exePath, "the launcher");
+    writeAll(P(t.launcherDir, L"launcher.ini"), "channel=rc\n");
+    writeAll(P(P(t.launcherDir, L"manifests"), L"x.json"), "{}");
+    writeAll(P(t.payloadDir, L"abc"), "cached");
+    writeAll(P(root, L"mirror-folder\\edvr.ini"), "settings");   // beside the launcher folder, as the real mirror is
+
+    std::string err;
+    check(registerLauncher(t, &err), "registering works: " + err);
+    const std::wstring link = P(t.startMenuDir, kShortcutName);
+    check(exists(link), "the Start menu shortcut is written");
+    check(_wcsicmp(shortcutTarget(link).c_str(), t.exePath.c_str()) == 0, "and points at the launcher exe: " + narrowUtf8(shortcutTarget(link)));
+    check(regString(key, L"DisplayName") == L"ED Unofficial Patch (ED-UP)" && regString(key, L"DisplayVersion") == L"0.1.0" &&
+              regString(key, L"Publisher") == L"ED-UP (unofficial)" && regString(key, L"InstallLocation") == t.launcherDir,
+          "DisplayName, DisplayVersion, Publisher and InstallLocation are set");
+    check(regString(key, L"UninstallString") == L"\"" + t.exePath + L"\" --unregister", "UninstallString runs the launcher with --unregister: " + narrowUtf8(regString(key, L"UninstallString")));
+    DWORD noModify = 0, noRepair = 0;
+    check(regDword(key, L"NoModify", &noModify) && noModify == 1 && regDword(key, L"NoRepair", &noRepair) && noRepair == 1, "NoModify and NoRepair are 1");
+    check(registerLauncher(t, &err), "registering again replaces rather than fails: " + err);
+
+    // Refusals before anything is deleted.
+    UnregisterResult result;
+    RegisterTargets wrong = t;
+    wrong.launcherDir = P(root, L"somewhere-else");
+    writeAll(P(wrong.launcherDir, L"precious.txt"), "keep");
+    check(!unregisterLauncher(wrong, std::wstring(), &result, &err) && contains(err, "launcher"), "a launcher folder not named launcher is refused: " + err);
+    check(exists(P(wrong.launcherDir, L"precious.txt")) && exists(link), "and nothing was removed");
+    wrong = t;
+    wrong.payloadDir = P(root, L"mirror-folder");
+    check(!unregisterLauncher(wrong, std::wstring(), &result, &err) && contains(err, "payload") && exists(P(root, L"mirror-folder\\edvr.ini")), "a cache folder not named payload is refused: " + err);
+
+    // The running exe cannot be deleted: it is held open here without delete sharing, as Windows holds a running image.
+    HANDLE hold = CreateFileW(t.exePath.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    check(unregisterLauncher(t, t.exePath, &result, &err), "unregistering works: " + err);
+    CloseHandle(hold);
+    check(!exists(link) && regString(key, L"DisplayName").empty(), "the shortcut and the registry entry are gone");
+    check(!exists(t.payloadDir), "the downloaded files are gone");
+    check(!exists(P(t.launcherDir, L"launcher.ini")) && !exists(P(t.launcherDir, L"manifests")), "the launcher folder's other contents are gone");
+    check(result.exeRemains && exists(t.exePath), "the exe that is running stays, and the result says so");
+    check(exists(P(root, L"mirror-folder\\edvr.ini")), "the settings copy beside the launcher folder is untouched");
+    std::string said;
+    for (const std::string& n : result.notes) said += n + "\n";
+    check(contains(said, "game folders") && contains(said, "settings"), "the report says the game folders and the settings copy were left alone: " + said);
+    // With nothing held it goes all the way.
+    check(unregisterLauncher(t, std::wstring(), &result, &err) && !result.exeRemains && !exists(t.launcherDir), "unregistering again, with the exe free, removes the folder too: " + err);
+    RegDeleteKeyW(HKEY_CURRENT_USER, key.c_str());
+}
+
+// ---- self-update -------------------------------------------------------------------------------
+
+void testSelfUpdate() {
+    section("selfupdate");
+    const Rel b = loadRel("relB");
+    const std::string newBytes = readAll(P(b.dir, L"ed-up-launcher.exe"));
+    check(!newBytes.empty() && b.manifest.hasLauncher, "release B carries a launcher");
+    const std::wstring base = fresh("self");
+    ScriptedHttp http;
+    http.replies[latestUrl()] = ok(releaseJson(b), "\"etag-B\"");
+    serveRelease(&http, b);
+    UpdaterSettings s = settingsFor(base);
+    Updater up(http, s);
+    const UpdateCheck c = up.check();
+    check(c.outcome == UpdateOutcome::Available && c.launcherNeedsUpdate, "B offers a newer launcher: " + c.message);
+
+    // The installed launcher is a program that is running, so the rename really is of a running image.
+    const std::wstring exe = P(P(base, L"launcher"), L"ed-up-launcher.exe");
+    createDirectories(P(base, L"launcher"));
+    CopyFileW(P(g_fakes, kFakeGame).c_str(), exe.c_str(), FALSE);
+    const std::string oldBytes = readAll(exe);
+    HANDLE running = startProgram(exe, L"--run-ms 20000");
+    check(running != nullptr && stillRunning(running), "the stand-in launcher is running from its own path");
+
+    std::string err;
+    std::string names;
+    check(downloadLauncher(http, c, exe, nullptr, [&](const std::string& n, unsigned long long, unsigned long long) { names = n; }, &err), "the launcher downloads: " + err);
+    check(readAll(newLauncherPath(exe)) == newBytes && names == "ed-up-launcher.exe", "to <exe>.new, byte for byte, with progress under the asset's name");
+    check(readAll(exe) == oldBytes, "the running exe is untouched by the download");
+
+    // A same-size download with other bytes is refused, and leaves no .new behind.
+    {
+        ScriptedHttp bad = http;
+        std::string tampered = newBytes;
+        tampered[tampered.size() - 1] = static_cast<char>(tampered[tampered.size() - 1] ^ 1);
+        bad.replies[std::string(kDownloads) + "relB/ed-up-launcher.exe"].body = tampered;
+        std::string e2;
+        check(!downloadLauncher(bad, c, exe, nullptr, nullptr, &e2) && contains(e2, "hash") && !exists(newLauncherPath(exe)), "a changed download is refused by hash and removed: " + e2);
+        std::string longer = newBytes + "x";
+        bad.replies[std::string(kDownloads) + "relB/ed-up-launcher.exe"].body = longer;
+        check(!downloadLauncher(bad, c, exe, nullptr, nullptr, &e2) && !exists(newLauncherPath(exe)), "a longer download is refused, by the size cap or the size check: " + e2);
+        UpdateCheck noAsset = c;
+        noAsset.assets.clear();
+        check(!downloadLauncher(http, noAsset, exe, nullptr, nullptr, &e2) && contains(e2, "no asset"), "a release without the asset is refused: " + e2);
+        UpdateCheck noEntry = c;
+        noEntry.manifest.hasLauncher = false;
+        check(!downloadLauncher(http, noEntry, exe, nullptr, nullptr, &e2) && contains(e2, "no launcher"), "a manifest without a launcher entry is refused: " + e2);
+        // Put the good download back for the swaps below.
+    }
+    check(downloadLauncher(http, c, exe, nullptr, nullptr, &err), "the good download is back: " + err);
+
+    // A failing second rename: the original is restored, and the error says which step.
+    {
+        int calls = 0;
+        FileMover failSecond = [&](const std::wstring& from, const std::wstring& to) {
+            ++calls;
+            if (calls == 2) return false;
+            return moveReplacing(from, to);
+        };
+        std::string e2;
+        check(!swapInNewLauncher(exe, failSecond, &e2) && contains(e2, "old one is back"), "when the new file cannot take the name, the old one is put back: " + e2);
+        check(calls == 3 && readAll(exe) == oldBytes && !exists(oldLauncherPath(exe)) && exists(newLauncherPath(exe)), "three moves were tried, the exe is the old one again, and the download is kept for a retry");
+        // The first rename failing changes nothing.
+        calls = 0;
+        FileMover failFirst = [&](const std::wstring&, const std::wstring&) {
+            ++calls;
+            return false;
+        };
+        check(!swapInNewLauncher(exe, failFirst, &e2) && calls == 1 && readAll(exe) == oldBytes, "when the running exe cannot be renamed nothing else is tried: " + e2);
+        // The restore failing too says where the old exe is.
+        calls = 0;
+        FileMover failRestore = [&](const std::wstring& from, const std::wstring& to) {
+            ++calls;
+            if (calls >= 2) return false;
+            return moveReplacing(from, to);
+        };
+        check(!swapInNewLauncher(exe, failRestore, &e2) && contains(e2, "could not be put back") && contains(e2, "ed-up-launcher.exe.old"), "when the restore fails too, the old exe's new name is given: " + e2);
+        moveReplacing(oldLauncherPath(exe), exe);  // the rig puts it back itself
+        check(readAll(exe) == oldBytes, "the rig restored the stand-in");
+    }
+
+    // The real swap, with the old program still running from its renamed file.
+    std::string e3;
+    check(swapInNewLauncher(exe, FileMover(moveReplacing), &e3), "the swap works on a running exe: " + e3);
+    check(readAll(exe) == newBytes && readAll(oldLauncherPath(exe)) == oldBytes && !exists(newLauncherPath(exe)), "the new bytes are at the exe's path and the old ones at .old");
+    check(stillRunning(running), "the old program is still running, from the .old file");
+    check(!swapInNewLauncher(exe, FileMover(moveReplacing), &e3) && contains(e3, "no downloaded"), "with no download there is nothing to switch to: " + e3);
+    endProgram(running);
+    removeLauncherLeftovers(exe);
+    check(!exists(oldLauncherPath(exe)) && readAll(exe) == newBytes, "the next start deletes .old and keeps the exe");
+}
+
+// ---- the plan file and the elevated copy ----------------------------------------------------------
+
+bool sameBytesOf(const std::wstring& a, const std::wstring& b) { return readAll(a) == readAll(b); }
+
+void testPlanFile() {
+    section("planfile");
+    const std::wstring base = fresh("plan");
+    PlanFile p;
+    p.action = "install";
+    p.dir = L"C:\\Program Files (x86)\\Steam\\steamapps\\common\\Elite Dangerous\\Products\\elite-dangerous-odyssey-64";
+    p.source = L"Steam";
+    p.scope = "flat";
+    p.keepSettings = false;
+    p.removeSettings = true;
+    p.restoreMirror = true;
+    p.payloadDir = L"D:\\unpacked\\ed-up-0.22.0 \xe9";
+    p.manifestPath = L"C:\\Users\\a\\AppData\\Local\\EDVR\\launcher\\manifests\\" + widenUtf8(std::string(64, 'a')) + L".json";
+    p.cacheDir = L"C:\\Users\\a\\AppData\\Local\\EDVR\\payload";
+    p.mirrorDir = L"C:\\Users\\a\\AppData\\Local\\EDVR\\elite-steam";
+    p.resultPath = P(base, L"result.txt");
+    const std::wstring file = P(base, L"plan.txt");
+    std::string err;
+    check(writePlanFile(file, p, &err), "a plan file is written: " + err);
+    PlanFile q;
+    check(readPlanFile(file, &q, &err), "and read: " + err);
+    check(q.action == p.action && q.dir == p.dir && q.source == p.source && q.scope == p.scope && q.keepSettings == p.keepSettings && q.removeSettings == p.removeSettings &&
+              q.restoreMirror == p.restoreMirror && q.payloadDir == p.payloadDir && q.manifestPath == p.manifestPath && q.cacheDir == p.cacheDir && q.mirrorDir == p.mirrorDir &&
+              q.resultPath == p.resultPath,
+          "every field round-trips, a non-ASCII path included");
+    const std::string text = readAll(file);
+    check(contains(text, "version=1\n") && contains(text, "restore_mirror=1\n") && !contains(text, "\r"), "the file is plain key=value lines with a version first: " + text.substr(0, 40));
+
+    PlanFile bad;
+    p.dir = L"C:\\game\nrm";
+    check(!writePlanFile(file, p, &err) && contains(err, "line break"), "a value with a line break is not written: " + err);
+    p.dir = L"C:\\game";
+    auto reads = [&](const std::string& body) {
+        writeAll(file, body);
+        return readPlanFile(file, &bad, &err);
+    };
+    const std::string good = text;
+    check(!reads(good + "extra=1\n") && contains(err, "extra"), "a key the reader does not know is refused: " + err);
+    check(!reads(good + "action=uninstall\n") && contains(err, "twice"), "a repeated key is refused: " + err);
+    check(!reads("version=2\n" + good.substr(good.find('\n') + 1)) && contains(err, "version"), "another plan version is refused: " + err);
+    {
+        std::string s = good;
+        s.replace(s.find("keep_settings=0"), 15, "keep_settings=7");
+        check(!reads(s) && contains(err, "keep_settings"), "a boolean that is not 0 or 1 is refused: " + err);
+        s = good;
+        s.replace(s.find("scope=flat"), 10, "scope=nonsense");
+        check(!reads(s) && contains(err, "scope"), "an unknown scope is refused: " + err);
+        s = good;
+        s.erase(s.find("result="), good.size());
+        check(!reads(s), "a plan with no result path is refused: " + err);
+        check(!reads("not a plan at all\n"), "a file that is not key=value is refused: " + err);
+    }
+
+    // Result files.
+    ApplyOutcome o;
+    o.status = ApplyOutcome::Status::Blocked;
+    o.lines = {"first = with equals", "second"};
+    const std::wstring result = P(base, L"result-file.txt");
+    check(writeResultFile(result, o, &err), "a result is written");
+    ApplyOutcome r;
+    check(readResultFile(result, &r, &err) && r.status == ApplyOutcome::Status::Blocked && r.lines == o.lines, "and read back with its lines intact: " + err);
+    for (ApplyOutcome::Status st : {ApplyOutcome::Status::Done, ApplyOutcome::Status::NothingToDo, ApplyOutcome::Status::Failed}) {
+        o.status = st;
+        writeResultFile(result, o, nullptr);
+        check(readResultFile(result, &r, &err) && r.status == st, "each status round-trips");
+    }
+    writeAll(result, "status=maybe\n");
+    check(!readResultFile(result, &r, &err), "an unknown status is refused");
+    writeAll(result, "line=only a line\n");
+    check(!readResultFile(result, &r, &err) && contains(err, "no status"), "a result with no status is refused: " + err);
+    o.status = ApplyOutcome::Status::Failed;
+    check(contains(outcomeReport(o), "did not finish") && contains(outcomeReport(o), "first = with equals"), "a failed outcome reads as one, with its lines");
+    o.status = ApplyOutcome::Status::Done;
+    check(contains(outcomeReport(o), "Done."), "a done outcome says Done");
+}
+
+// A game folder that is not Elite: describeDir accepts it (the exe is there), the planner will not.
+std::wstring fakeGameFolder(const std::string& name) {
+    const std::wstring dir = fresh(name);
+    writeAll(P(dir, L"EliteDangerous64.exe"), "not an executable");
+    return dir;
+}
+
+void testElevatedApply() {
+    section("elevated");
+    const Rel a = loadRel("relA");
+    const std::wstring base = fresh("elev");
+    ScriptedHttp http;
+    http.replies[latestUrl()] = ok(releaseJson(a), "\"etag-A\"");
+    serveRelease(&http, a);
+    Updater up(http, settingsFor(base));
+    std::string err;
+    const UpdateCheck c = up.check();
+    check(c.outcome == UpdateOutcome::Available && adopt(&up, c, &err), "release A is adopted for the elevated copy to read: " + err);
+    const LauncherRoots roots = launcherRoots(base);
+    const std::wstring manifestPath = P(P(roots.launcherDir(), L"manifests"), widenUtf8(sha(a.manifestBytes)) + L".json");
+    const std::wstring game = fakeGameFolder("elev-game");
+
+    PlanFile plan;
+    plan.action = "install";
+    plan.dir = game;
+    plan.source = L"Folder you chose";
+    plan.manifestPath = manifestPath;
+    plan.cacheDir = roots.cacheDir();
+    plan.mirrorDir = P(base, L"mirror");
+    plan.resultPath = P(base, L"result.txt");
+    const std::wstring planPath = P(base, L"plan.txt");
+    auto run = [&](const PlanFile& p, const char* const* keys, ApplyOutcome* out) {
+        DeleteFileW(p.resultPath.c_str());
+        std::string e;
+        writePlanFile(planPath, p, &e);
+        const int code = applyPlanFile(planPath, keys);
+        std::string readError;
+        const bool have = readResultFile(p.resultPath, out, &readError);
+        return std::make_pair(code, have);
+    };
+
+    // The copy checks the signature for itself: the other key is not the manifest's.
+    {
+        const char* other[2] = {g_otherKey.c_str(), nullptr};
+        ApplyOutcome out;
+        const auto r = run(plan, other, &out);
+        check(r.second && r.first == 1 && out.status == ApplyOutcome::Status::Failed && !out.lines.empty() && contains(out.lines[0], "downloaded files cannot be used"),
+              "a manifest the copy's keys do not verify is refused: " + (out.lines.empty() ? std::string("(no line)") : out.lines[0]));
+        check(!exists(P(game, L"d3d11.dll")) && !exists(P(game, L"edvr_install")), "and the game folder was not touched");
+    }
+    // A cached file that no longer matches its hash is refused where it is read.
+    {
+        PayloadCache cache(roots.cacheDir());
+        const std::wstring victim = cache.pathFor(a.manifest.files[0].sha256);
+        const std::string good = readAll(victim);
+        std::string tampered = good;
+        tampered[0] = static_cast<char>(tampered[0] ^ 1);
+        writeAll(victim, tampered);
+        ApplyOutcome out;
+        const auto r = run(plan, g_testKeys, &out);
+        check(r.second && r.first == 1 && out.status == ApplyOutcome::Status::Failed && contains(out.lines.empty() ? "" : out.lines[0], "hash"),
+              "a cache file changed since the window checked it is refused by the copy: " + (out.lines.empty() ? std::string("(no line)") : out.lines[0]));
+        check(!exists(P(game, L"d3d11.dll")), "nothing was written");
+        writeAll(victim, good);
+    }
+    // A plan naming a payload that is not there, and a folder that is not a game.
+    {
+        PlanFile p2 = plan;
+        p2.manifestPath.clear();
+        ApplyOutcome out;
+        auto r = run(p2, g_testKeys, &out);
+        check(r.second && out.status == ApplyOutcome::Status::Failed && contains(out.lines[0], "no payload"), "an install with no payload is refused: " + out.lines[0]);
+        p2 = plan;
+        p2.dir = fresh("elev-empty");
+        r = run(p2, g_testKeys, &out);
+        check(r.second && out.status == ApplyOutcome::Status::Failed && contains(out.lines[0], "EliteDangerous64.exe"), "a folder with no game in it is refused: " + out.lines[0]);
+        p2 = plan;
+        p2.action = "frobnicate";
+        r = run(p2, g_testKeys, &out);
+        check(r.second && out.status == ApplyOutcome::Status::Failed && contains(out.lines[0], "action"), "an unknown action is refused: " + out.lines[0]);
+    }
+    // The good case reaches the planner, which declines an executable that is not Elite: Blocked, and still nothing written.
+    {
+        ApplyOutcome out;
+        const auto r = run(plan, g_testKeys, &out);
+        check(r.second && r.first == 1 && out.status == ApplyOutcome::Status::Blocked && !out.lines.empty(), "a verified payload gets as far as the planner, which blocks a folder whose exe is not Elite");
+        check(!exists(P(game, L"d3d11.dll")) && !exists(P(game, L"edvr_install")) && !exists(plan.mirrorDir), "and the folder holds nothing new");
+        std::string said;
+        for (const std::string& l : out.lines) said += l + " | ";
+        check(contains(outcomeReport(out), "blocked"), "the report says the plan is blocked: " + said);
+    }
+    // An unreadable plan has nowhere to report, and says so by its exit code.
+    writeAll(planPath, "garbage");
+    DeleteFileW(plan.resultPath.c_str());
+    check(applyPlanFile(planPath, g_testKeys) == 2 && !exists(plan.resultPath), "an unreadable plan exits 2 and writes no result");
+
+    // The unelevated half, with this rig standing in for the elevated copy (started as itself, unelevated).
+    {
+        ElevatedRunner viaSelf = [](const std::wstring& exePath, const std::wstring& arguments) {
+            ElevatedLaunch l;
+            HANDLE h = startProgram(exePath, arguments + L" --key " + widenUtf8(g_testKey));
+            if (!h) {
+                l.error = "no start";
+                return l;
+            }
+            l.started = true;
+            WaitForSingleObject(h, 30000);
+            DWORD code = 99;
+            GetExitCodeProcess(h, &code);
+            l.exitCode = code;
+            CloseHandle(h);
+            return l;
+        };
+        const std::wstring launcherDir = roots.launcherDir();
+        const ElevatedResult result = applyElevated(g_self, launcherDir, plan, viaSelf);
+        check(!result.declined && result.error.empty() && result.outcome.status == ApplyOutcome::Status::Blocked && !result.outcome.lines.empty(),
+              "applyElevated ran the copy and read its result: " + result.error);
+        bool leftovers = false;
+        for (const std::string& n : names(launcherDir)) leftovers = leftovers || n.compare(0, 5, "plan-") == 0 || n.compare(0, 7, "result-") == 0;
+        check(!leftovers, "and deleted the plan and the result afterwards");
+
+        ElevatedRunner declined = [](const std::wstring&, const std::wstring&) {
+            ElevatedLaunch l;
+            l.declined = true;
+            l.error = "the permission prompt was declined";
+            return l;
+        };
+        const ElevatedResult no = applyElevated(g_self, launcherDir, plan, declined);
+        check(no.declined && no.outcome.lines.empty(), "a declined prompt is reported as declined, with no outcome");
+        bool leftovers2 = false;
+        for (const std::string& n : names(launcherDir)) leftovers2 = leftovers2 || n.compare(0, 5, "plan-") == 0;
+        check(!leftovers2 && !exists(P(game, L"d3d11.dll")), "and leaves no plan behind and the game folder alone");
+
+        ElevatedRunner silent = [](const std::wstring&, const std::wstring&) {
+            ElevatedLaunch l;
+            l.started = true;
+            l.exitCode = 5;
+            return l;
+        };
+        const ElevatedResult mute = applyElevated(g_self, launcherDir, plan, silent);
+        check(!mute.declined && contains(mute.error, "without reporting") && mute.outcome.status == ApplyOutcome::Status::Failed, "a copy that exits without a result is a failure that says so: " + mute.error);
+    }
+}
+
+// ---- routes and the watcher -----------------------------------------------------------------------
+
+struct Recorder {
+    std::vector<std::wstring> uris;
+    struct Spawn {
+        std::wstring exe, args, dir;
+    };
+    std::vector<Spawn> spawns;
+    RouteOps ops() {
+        RouteOps o;
+        o.openUri = [this](const std::wstring& uri) {
+            uris.push_back(uri);
+            return true;
+        };
+        o.spawn = [this](const std::wstring& exe, const std::wstring& args, const std::wstring& dir) {
+            spawns.push_back({exe, args, dir});
+            return true;
+        };
+        return o;
+    }
+};
+
+void testRoute() {
+    section("route");
+    const std::wstring tree = fresh("route");
+    const std::wstring frontier = P(tree, L"Frontier");
+    const std::wstring products = P(frontier, L"Products\\elite-dangerous-odyssey-64");
+    writeAll(P(products, L"EliteDangerous64.exe"), "x");
+    writeAll(P(frontier, L"EDLaunch\\EDLaunch.exe"), "x");
+
+    const LaunchRoute steam = routeFor(L"Steam", products, true);
+    check(steam.kind == RouteKind::Steam && steam.uri == L"steam://rungameid/359320" && !steam.carriesMode, "Steam: the address is steam://rungameid/359320, and it carries no mode");
+    const LaunchRoute epic = routeFor(L"Epic", products, false);
+    check(epic.kind == RouteKind::Epic && epic.uri == L"com.epicgames.launcher://apps/9c203b6ed35846e8a4a9ff1e314f6593?action=launch&silent=true" && !epic.carriesMode,
+          "Epic: the address is the launcher URI for app 9c203b6e..., launch and silent");
+    const LaunchRoute vr = routeFor(L"Frontier launcher", products, true);
+    check(vr.kind == RouteKind::Frontier && vr.exe == P(frontier, L"EDLaunch\\EDLaunch.exe") && vr.args == L"/autorun /autoquit /edo /vr" && vr.carriesMode && vr.workDir == P(frontier, L"EDLaunch"),
+          "Frontier VR: EDLaunch.exe /autorun /autoquit /edo /vr, from the EDLaunch folder found above Products");
+    const LaunchRoute flat = routeFor(L"Frontier launcher", products, false);
+    check(flat.args == L"/autorun /autoquit /edo /novr", "Frontier flat: the same with /novr");
+    const LaunchRoute chosen = routeFor(L"Folder you chose", products, true);
+    check(chosen.kind == RouteKind::Frontier && chosen.exe == vr.exe, "a folder the user picked walks up to an EDLaunch.exe");
+    writeAll(P(tree, L"Steam\\steamapps\\common\\Elite Dangerous\\EDLaunch.exe"), "x");
+    const LaunchRoute steamWithEd = routeFor(L"Steam", P(tree, L"Steam\\steamapps\\common\\Elite Dangerous\\Products\\elite-dangerous-odyssey-64"), true);
+    check(steamWithEd.kind == RouteKind::Steam && steamWithEd.exe.empty(), "a Steam install with an EDLaunch.exe beside it still goes through Steam");
+    check(findEdLaunch(P(tree, L"Steam\\steamapps\\common\\Elite Dangerous\\Products\\elite-dangerous-odyssey-64")) == P(tree, L"Steam\\steamapps\\common\\Elite Dangerous\\EDLaunch.exe"), "findEdLaunch finds the one at the top of a Steam install");
+    const std::wstring lone = P(tree, L"Games\\Elite");
+    writeAll(P(lone, L"EliteDangerous64.exe"), "x");
+    const LaunchRoute none = routeFor(L"Folder you chose", lone, true);
+    check(none.kind == RouteKind::None && !none.why.empty() && contains(none.why, "EDLaunch.exe"), "a folder with no EDLaunch.exe above it has no route, and says why: " + none.why);
+
+    // The Frontier store's own layout: the game under AppData, EDLaunch under Program Files, and
+    // nothing above the game folder that leads to it.
+    const std::wstring apart = P(tree, L"AppData\\Frontier_Developments\\Products\\elite-dangerous-odyssey-64");
+    writeAll(P(apart, L"EliteDangerous64.exe"), "x");
+    const std::wstring programFiles = P(tree, L"Program Files (x86)\\Frontier");
+    writeAll(P(programFiles, L"EDLaunch\\EDLaunch.exe"), "x");
+    check(findEdLaunch(apart).empty(), "the store's game folder has no EDLaunch.exe above it, so walking up cannot be enough");
+    const std::vector<std::wstring> storeRoots = {L"", P(tree, L"NotInstalledHere"), programFiles};
+    const std::vector<std::wstring> noRoots;
+    const LaunchRoute apartRoute = routeFor(L"Frontier launcher", apart, true, &storeRoots);
+    check(apartRoute.kind == RouteKind::Frontier && apartRoute.exe == P(programFiles, L"EDLaunch\\EDLaunch.exe") &&
+              apartRoute.workDir == P(programFiles, L"EDLaunch") && apartRoute.args == L"/autorun /autoquit /edo /vr" && apartRoute.carriesMode,
+          "Frontier with the game under AppData finds EDLaunch in the launcher's install folder");
+    check(routeFor(L"Frontier launcher", apart, true, &noRoots).kind == RouteKind::None, "and has no route when no install folder holds one");
+    check(routeFor(L"Folder you chose", apart, true, &storeRoots).kind == RouteKind::None,
+          "a picked folder does not borrow the store's EDLaunch, which would start the store's own copy");
+    wchar_t programFilesEnv[MAX_PATH]{};
+    if (GetEnvironmentVariableW(L"ProgramFiles", programFilesEnv, MAX_PATH)) {
+        const std::wstring expected = P(programFilesEnv, L"Frontier");
+        const std::vector<std::wstring> machineRoots = frontierLauncherRoots();
+        check(std::find(machineRoots.begin(), machineRoots.end(), expected) != machineRoots.end(),
+              "frontierLauncherRoots holds the default install folder under Program Files");
+    }
+
+    // Starting records and never opens anything.
+    Recorder rec;
+    std::string err;
+    check(startRoute(steam, rec.ops(), false, &err) && rec.uris.size() == 1 && rec.uris[0] == L"steam://rungameid/359320" && rec.spawns.empty(), "Steam is started by opening exactly the Steam address, and spawns nothing: " + err);
+    check(startRoute(epic, rec.ops(), false, &err) && rec.uris.size() == 2 && rec.uris[1] == epic.uri && rec.spawns.empty(), "Epic is started by opening exactly the Epic address");
+    check(startRoute(vr, rec.ops(), false, &err) && rec.spawns.size() == 1 && rec.spawns[0].exe == vr.exe && rec.spawns[0].args == vr.args && rec.spawns[0].dir == vr.workDir && rec.uris.size() == 2,
+          "Frontier is started by spawning EDLaunch.exe with its flags, and opens no address");
+    Recorder refused;
+    check(!startRoute(steam, refused.ops(), true, &err) && contains(err, "administrator") && refused.uris.empty() && refused.spawns.empty(), "an elevated launcher refuses to start Steam: " + err);
+    check(!startRoute(epic, refused.ops(), true, &err) && !startRoute(vr, refused.ops(), true, &err) && refused.uris.empty() && refused.spawns.empty(), "and Epic and Frontier, with nothing opened or spawned");
+    check(!startRoute(none, refused.ops(), false, &err) && contains(err, "EDLaunch.exe") && refused.uris.empty() && refused.spawns.empty(), "a route with none starts nothing: " + err);
+    RouteOps failing;
+    failing.openUri = [](const std::wstring&) { return false; };
+    failing.spawn = [](const std::wstring&, const std::wstring&, const std::wstring&) { return false; };
+    check(!startRoute(steam, failing, false, &err) && !startRoute(vr, failing, false, &err), "an address Windows will not open, or a program that will not start, is a failure");
+    const RouteOps real = realRouteOps();
+    check(real.openUri && real.spawn, "the real ops exist (and are not called by this rig)");
+}
+
+struct Events {
+    std::vector<WatchEvent> list;
+    bool has(WatchEvent e) const {
+        for (WatchEvent x : list) if (x == e) return true;
+        return false;
+    }
+};
+
+void testWatcher() {
+    section("watcher");
+    endFakes();
+    const std::wstring dir = fresh("watch");
+    const std::wstring ed = P(g_fakes, kFakeEd), game = P(g_fakes, kFakeGame);
+    check(exists(ed) && exists(game), "the fake programs were built");
+    WatchNames names;
+    names.game = kFakeGame;
+    names.edlaunch = kFakeEd;
+    WatchTiming timing;
+    timing.pollMs = 40;
+    timing.startupWaitMs = 1500;
+    timing.closeWaitMs = 800;
+
+    // The process list helper itself.
+    {
+        HANDLE g = startProgram(game, L"--run-ms 3000");
+        Sleep(150);
+        std::vector<unsigned long> pids;
+        check(pidsNamed(kFakeGame, &pids) && pids.size() == 1 && pids[0] == GetProcessId(g), "pidsNamed finds the process by its exe name");
+        check(pidsNamed(L"ED_UP_FAKE_GAME.EXE", &pids) && pids.size() == 1, "and the match ignores case");
+        check(pidsNamed(kFakeEd, &pids) && pids.empty(), "and finds nothing for a name nobody runs");
+        endProgram(g);
+    }
+
+    // The game runs and exits; EDLaunch is asked to close, and goes.
+    {
+        const std::wstring log = P(dir, L"a-ed.log");
+        HANDLE e = startProgram(ed, L"--obey-close --log \"" + log + L"\"");
+        HANDLE g = startProgram(game, L"--run-ms 700");
+        Events ev;
+        const WatchOutcome out = watchLaunch(names, timing, nullptr, [&](WatchEvent x) { ev.list.push_back(x); });
+        check(out.kind == WatchOutcome::Kind::GameRan && out.askedEdlaunchToClose && out.edlaunchClosed, "game ran, EDLaunch was asked to close and left");
+        check(ev.has(WatchEvent::GameSeen) && ev.has(WatchEvent::GameExited) && ev.list.size() == 2 && ev.list[0] == WatchEvent::GameSeen, "the events were: game seen, then game exited");
+        check(contains(logText(log), "WM_CLOSE") && contains(logText(log), "exiting"), "the fake EDLaunch's own log shows the WM_CLOSE arriving: " + logText(log));
+        check(WaitForSingleObject(e, 3000) == WAIT_OBJECT_0, "and the process is gone");
+        CloseHandle(e);
+        CloseHandle(g);
+    }
+    // EDLaunch leaves by itself and the game never starts.
+    {
+        const std::wstring log = P(dir, L"b-ed.log");
+        HANDLE e = startProgram(ed, L"--run-ms 500 --log \"" + log + L"\"");
+        Events ev;
+        const WatchOutcome out = watchLaunch(names, timing, nullptr, [&](WatchEvent x) { ev.list.push_back(x); });
+        check(out.kind == WatchOutcome::Kind::EdlaunchLeft && !out.askedEdlaunchToClose, "EDLaunch exited with no game: the watcher stops, and did not ask for anything to close");
+        check(ev.has(WatchEvent::WaitingForGame) && !ev.has(WatchEvent::GameSeen), "having said it was waiting, and never having seen the game");
+        check(!contains(logText(log), "WM_CLOSE"), "no WM_CLOSE reached it");
+        CloseHandle(e);
+    }
+    // EDLaunch stays with no game: the watcher keeps waiting and leaves it alone.
+    {
+        const std::wstring log = P(dir, L"c-ed.log");
+        HANDLE e = startProgram(ed, L"--log \"" + log + L"\"");
+        std::atomic<bool> cancel{false};
+        std::thread stopper([&]() {
+            Sleep(900);
+            cancel = true;
+        });
+        Events ev;
+        const DWORD began = GetTickCount();
+        const WatchOutcome out = watchLaunch(names, timing, &cancel, [&](WatchEvent x) { ev.list.push_back(x); });
+        const DWORD took = GetTickCount() - began;
+        stopper.join();
+        check(out.kind == WatchOutcome::Kind::Cancelled && took >= 800, "with EDLaunch up and no game the watcher kept waiting until it was cancelled (" + std::to_string(took) + " ms)");
+        check(ev.has(WatchEvent::WaitingForGame), "and said it was waiting");
+        check(stillRunning(e) && !contains(logText(log), "WM_CLOSE"), "EDLaunch is still running and was never asked to close");
+        endProgram(e);
+    }
+    // Nothing appears at all.
+    {
+        WatchTiming quick = timing;
+        quick.startupWaitMs = 400;
+        const DWORD began = GetTickCount();
+        const WatchOutcome out = watchLaunch(names, quick, nullptr, nullptr);
+        const DWORD took = GetTickCount() - began;
+        check(out.kind == WatchOutcome::Kind::NeverStarted && took >= 350 && took < 3000, "neither EDLaunch nor the game: it waits out the allowance and says so (" + std::to_string(took) + " ms)");
+    }
+    // The game runs and exits, and EDLaunch ignores the request: it is left running.
+    {
+        const std::wstring log = P(dir, L"e-ed.log");
+        HANDLE e = startProgram(ed, L"--log \"" + log + L"\"");
+        HANDLE g = startProgram(game, L"--run-ms 500");
+        WatchTiming shortClose = timing;
+        shortClose.closeWaitMs = 500;
+        const WatchOutcome out = watchLaunch(names, shortClose, nullptr, nullptr);
+        check(out.kind == WatchOutcome::Kind::GameRan && out.askedEdlaunchToClose && !out.edlaunchClosed, "an EDLaunch that stays after being asked is reported as still open");
+        check(contains(logText(log), "WM_CLOSE") && stillRunning(e), "it received the request and was not ended by the watcher");
+        endProgram(e);
+        CloseHandle(g);
+    }
+    // Cancelled while the game runs: everything is left running.
+    {
+        const std::wstring log = P(dir, L"f-ed.log");
+        HANDLE e = startProgram(ed, L"--obey-close --log \"" + log + L"\"");
+        HANDLE g = startProgram(game, L"--run-ms 20000");
+        std::atomic<bool> cancel{false};
+        std::thread stopper([&]() {
+            Sleep(500);
+            cancel = true;
+        });
+        Events ev;
+        const WatchOutcome out = watchLaunch(names, timing, &cancel, [&](WatchEvent x) { ev.list.push_back(x); });
+        stopper.join();
+        check(out.kind == WatchOutcome::Kind::Cancelled && ev.has(WatchEvent::GameSeen) && !ev.has(WatchEvent::GameExited), "cancelled with the game running: it had seen the game and never saw it end");
+        check(stillRunning(e) && stillRunning(g) && !contains(logText(log), "WM_CLOSE"), "the game and EDLaunch are both still running, and nothing was posted");
+        endProgram(e);
+        endProgram(g);
+    }
+    // A game that is already running when Play is pressed is seen at once.
+    {
+        HANDLE g = startProgram(game, L"--run-ms 400");
+        Events ev;
+        const WatchOutcome out = watchLaunch(names, timing, nullptr, [&](WatchEvent x) { ev.list.push_back(x); });
+        check(out.kind == WatchOutcome::Kind::GameRan && !out.askedEdlaunchToClose && out.edlaunchClosed, "a game with no EDLaunch beside it: seen, ended, and nothing to close");
+        CloseHandle(g);
+    }
+    endFakes();
+}
+
+// ---- the session: the window's behaviour without a window -----------------------------------------------
+
+class Forward : public HttpClient {
+public:
+    explicit Forward(ScriptedHttp* target) : target_(target) {}
+    HttpResponse get(const HttpRequest& request) override {
+        static std::mutex lock;
+        std::lock_guard<std::mutex> guard(lock);
+        return target_->get(request);
+    }
+
+private:
+    ScriptedHttp* target_;
+};
+
+struct Ui {
+    std::mutex m;
+    std::vector<std::function<void()>> queue;
+    int changed = 0, switched = 0, closed = 0;
+    std::vector<bool> aside;
+    std::vector<std::wstring> restarted;
+
+    void post(std::function<void()> f) {
+        std::lock_guard<std::mutex> l(m);
+        queue.push_back(std::move(f));
+    }
+    // The window's thread: runs what the workers posted until `done` or the time runs out.
+    bool pump(const std::function<bool()>& done, unsigned timeoutMs = 20000) {
+        const DWORD end = GetTickCount() + timeoutMs;
+        for (;;) {
+            std::vector<std::function<void()>> jobs;
+            {
+                std::lock_guard<std::mutex> l(m);
+                jobs.swap(queue);
+            }
+            for (auto& j : jobs) j();
+            if (done()) return true;
+            if (static_cast<int>(GetTickCount() - end) > 0) return false;
+            Sleep(5);
+        }
+    }
+};
+
+SessionEnv envFor(Ui* ui, ScriptedHttp* http, const std::wstring& base, bool canonical, const std::wstring& selfExe) {
+    SessionEnv e;
+    e.roots.dataRoot = base;
+    e.roots.canonical = canonical;
+    e.selfExe = selfExe;
+    e.keys = g_testKeys;
+    e.apiBase = kApi;
+    e.makeHttp = [http]() { return std::unique_ptr<HttpClient>(new Forward(http)); };
+    e.post = [ui](std::function<void()> f) { ui->post(std::move(f)); };
+    e.changed = [ui]() { ++ui->changed; };
+    e.payloadSwitched = [ui]() { ++ui->switched; };
+    e.closeWindow = [ui]() { ++ui->closed; };
+    e.windowAside = [ui](bool aside) { ui->aside.push_back(aside); };
+    e.startNewLauncher = [ui](const std::wstring& exe) {
+        ui->restarted.push_back(exe);
+        return true;
+    };
+    return e;
+}
+
+void testSession() {
+    section("session");
+    const Rel a = loadRel("relA"), b = loadRel("relB"), minLauncher = loadRel("relMinLauncher");
+
+    // A first start with a release out: the payload is none, the check offers A, and nothing downloads until Update.
+    {
+        const std::wstring base = fresh("sess-a");
+        const std::wstring self = P(base, L"self.exe");
+        writeAll(self, "the running launcher");
+        ScriptedHttp http;
+        http.replies[latestUrl()] = ok(releaseJson(a), "\"etag-A\"");
+        serveRelease(&http, a);
+        Ui ui;
+        {
+            LauncherSession session(envFor(&ui, &http, base, true, self));
+            check(session.payloadState() == PayloadState::Loading && session.checkState() == CheckState::NotYet, "before start the payload is loading and nothing has been asked");
+            session.start();
+            check(ui.pump([&]() { return session.payloadState() != PayloadState::Loading && session.checkState() == CheckState::Available; }), "the payload resolves and the check finishes");
+            check(session.payloadState() == PayloadState::None && session.payload().firstRun, "with nothing adopted the payload is none, quietly");
+            check(session.updateLine() == "ED-UP 1.0.0 is available." && !session.updating(), "the line says an update is available: " + session.updateLine());
+            check(http.count("ed-up-core") == 0 && http.count("ed-up-dlss") == 0 && http.count("ed-up-launcher") == 0, "nothing was downloaded before Update was pressed");
+            check(names(settingsFor(base).cacheDir).empty(), "and the cache is empty");
+            check(ui.changed > 0 && ui.switched == 0, "the window was told about each change and the payload has not switched");
+
+            session.beginUpdate();
+            check(session.updating(), "Update marks the session busy at once");
+            check(ui.pump([&]() { return ui.switched == 1; }), "the update fills the cache, adopts the manifest and switches the payload");
+            check(!session.updating() && session.payloadState() == PayloadState::Ready && session.payload().version == "v1.0.0", "the payload is ready, at v1.0.0: " + session.updateLine());
+            const void* data = nullptr;
+            size_t size = 0;
+            check(payloadItem("native_graphics", &data, &size) && std::string(static_cast<const char*>(data), size) == "graphics one", "payloadItem serves the update's files");
+            LauncherState state;
+            state.load(P(settingsFor(base).launcherDir, L"launcher.ini"), nullptr);
+            check(state.currentManifest() == sha(a.manifestBytes) && state.highestIssued() == 1794000000, "launcher.ini names the adopted manifest");
+            check(readAll(self) == "the running launcher" && ui.closed == 0 && ui.restarted.empty(), "release A has no launcher: the exe was not touched and nothing restarted");
+            check(session.updateLine() == "ED-UP 1.0.0 is ready to install.", "the line says the update is ready: " + session.updateLine());
+        }
+        resetPayloadFiles();
+    }
+
+    // A failed check is one quiet line, and Update does nothing.
+    {
+        const std::wstring base = fresh("sess-fail");
+        ScriptedHttp http;
+        Reply down;
+        down.transportOk = false;
+        down.error = "no route";
+        http.replies[latestUrl()] = down;
+        Ui ui;
+        LauncherSession session(envFor(&ui, &http, base, true, P(base, L"self.exe")));
+        session.start();
+        check(ui.pump([&]() { return session.checkState() == CheckState::Skipped; }), "an unreachable GitHub ends the check as skipped");
+        check(contains(session.updateLine(), "could not be reached") && session.updateLine().back() == '.', "with one sentence: " + session.updateLine());
+        session.beginUpdate();
+        check(!session.updating() && http.count("ed-up-core") == 0, "Update does nothing when there is nothing to update");
+        check(session.payloadState() == PayloadState::None, "and the payload stays none");
+    }
+
+    // Release candidates: saved, and asked again against the list.
+    {
+        const std::wstring base = fresh("sess-rc");
+        ScriptedHttp http;
+        http.replies[latestUrl()] = ok(releaseJson(a), "\"etag-A\"");
+        http.replies[listUrl()] = ok("[" + releaseJson(b) + "]", "\"etag-L\"");
+        serveRelease(&http, a);
+        serveRelease(&http, b);
+        Ui ui;
+        LauncherSession session(envFor(&ui, &http, base, false, P(base, L"self.exe")));
+        session.start();
+        check(ui.pump([&]() { return session.checkState() == CheckState::Available; }) && !session.includeReleaseCandidates() && session.check().tag == "v1.0.0", "stable reads /releases/latest");
+        session.setIncludeReleaseCandidates(true);
+        check(session.includeReleaseCandidates() && ui.pump([&]() { return session.checkState() == CheckState::Available && session.check().tag == "v1.1.0"; }), "ticking the box re-checks against the release list");
+        LauncherState state;
+        state.load(P(settingsFor(base).launcherDir, L"launcher.ini"), nullptr);
+        check(state.channel() == "rc", "and the choice is saved in launcher.ini");
+        LauncherSession again(envFor(&ui, &http, base, false, P(base, L"self.exe")));
+        again.start();
+        check(again.includeReleaseCandidates(), "a later start begins on the saved channel");
+        ui.pump([&]() { return again.checkState() == CheckState::Available; });
+        resetPayloadFiles();
+    }
+
+    // Self-update: the launcher first, then a restart that carries on without being asked again.
+    {
+        const std::wstring base = fresh("sess-self");
+        const std::wstring exe = P(P(base, L"launcher"), L"ed-up-launcher.exe");
+        writeAll(exe, "the old launcher");
+        ScriptedHttp http;
+        http.replies[latestUrl()] = ok(releaseJson(b), "\"etag-B\"");
+        serveRelease(&http, b);
+        Ui ui;
+        {
+            LauncherSession session(envFor(&ui, &http, base, true, exe));
+            session.start();
+            check(ui.pump([&]() { return session.checkState() == CheckState::Available; }) && session.check().launcherNeedsUpdate, "B offers a newer launcher");
+            session.beginUpdate();
+            check(ui.pump([&]() { return ui.closed == 1; }), "the update replaces the launcher, starts the new one and closes this window");
+            check(readAll(exe) == readAll(P(b.dir, L"ed-up-launcher.exe")) && readAll(oldLauncherPath(exe)) == "the old launcher", "the new launcher is at its path and the old one at .old");
+            check(ui.restarted.size() == 1 && ui.restarted[0] == exe, "the replacement was started from the same path");
+            check(http.count("ed-up-core") == 0 && ui.switched == 0, "and the payload download waits for the restarted launcher");
+        }
+        // The restarted launcher: --updated, so it continues into the update by itself.
+        {
+            Ui ui2;
+            SessionEnv env = envFor(&ui2, &http, base, true, exe);
+            env.updatedFlag = true;
+            LauncherSession session(env);
+            session.start();
+            check(ui2.pump([&]() { return ui2.switched == 1; }), "after the restart the update continues with no further press");
+            check(session.payloadState() == PayloadState::Ready && ui2.closed == 0 && ui2.restarted.empty(), "and does not replace the launcher a second time");
+        }
+        resetPayloadFiles();
+    }
+    // A launcher that is still not the manifest's after the restart does not loop.
+    {
+        const std::wstring base = fresh("sess-loop");
+        const std::wstring exe = P(P(base, L"launcher"), L"ed-up-launcher.exe");
+        writeAll(exe, "a launcher that differs");
+        ScriptedHttp http;
+        http.replies[latestUrl()] = ok(releaseJson(b), "\"etag-B\"");
+        serveRelease(&http, b);
+        Ui ui;
+        SessionEnv env = envFor(&ui, &http, base, true, exe);
+        env.updatedFlag = true;
+        LauncherSession session(env);
+        session.start();
+        check(ui.pump([&]() { return ui.switched == 1; }), "an --updated launcher that still differs carries on with the payload");
+        check(readAll(exe) == "a launcher that differs" && ui.restarted.empty() && ui.closed == 0, "and does not swap or restart again");
+        resetPayloadFiles();
+    }
+    // A download that does not match the signed manifest.
+    {
+        const std::wstring base = fresh("sess-bad");
+        const std::wstring exe = P(P(base, L"launcher"), L"ed-up-launcher.exe");
+        writeAll(exe, "the old launcher");
+        ScriptedHttp http;
+        http.replies[latestUrl()] = ok(releaseJson(b), "\"etag-B\"");
+        serveRelease(&http, b);
+        std::string wrong = readAll(P(b.dir, L"ed-up-launcher.exe"));
+        wrong[wrong.size() - 1] = static_cast<char>(wrong[wrong.size() - 1] ^ 1);
+        http.replies[std::string(kDownloads) + "relB/ed-up-launcher.exe"].body = wrong;
+        Ui ui;
+        LauncherSession session(envFor(&ui, &http, base, true, exe));
+        session.start();
+        ui.pump([&]() { return session.checkState() == CheckState::Available; });
+        session.beginUpdate();
+        check(ui.pump([&]() { return !session.updating(); }) && contains(session.updateLine(), "Could not update the launcher"), "a launcher that does not match the manifest fails the update with a line: " + session.updateLine());
+        check(readAll(exe) == "the old launcher" && !exists(newLauncherPath(exe)) && ui.closed == 0 && ui.restarted.empty(), "and the exe is unchanged, no .new is left, and nothing restarted");
+    }
+    // A trial run (--data-root) never replaces itself; a launcher too old for the release says so.
+    {
+        const std::wstring base = fresh("sess-trial");
+        const std::wstring exe = P(base, L"trial.exe");
+        writeAll(exe, "the trial launcher");
+        ScriptedHttp http;
+        http.replies[latestUrl()] = ok(releaseJson(b), "\"etag-B\"");
+        serveRelease(&http, b);
+        Ui ui;
+        {
+            LauncherSession session(envFor(&ui, &http, base, false, exe));
+            session.start();
+            ui.pump([&]() { return session.checkState() == CheckState::Available; });
+            session.beginUpdate();
+            check(ui.pump([&]() { return ui.switched == 1; }) && readAll(exe) == "the trial launcher" && ui.restarted.empty(), "a trial run takes the payload and leaves its exe alone");
+        }
+        resetPayloadFiles();
+        const std::wstring base2 = fresh("sess-old");
+        ScriptedHttp http2;
+        http2.replies[latestUrl()] = ok(releaseJson(minLauncher), "\"etag-M\"");
+        serveRelease(&http2, minLauncher);
+        Ui ui2;
+        LauncherSession old(envFor(&ui2, &http2, base2, false, P(base2, L"trial.exe")));
+        old.start();
+        ui2.pump([&]() { return old.checkState() == CheckState::Available; });
+        old.beginUpdate();
+        check(!old.updating() && contains(old.updateLine(), "too old") && http2.count("ed-up-core") == 0, "a trial launcher older than min_launcher does not download: " + old.updateLine());
+    }
+
+    // Play: the Frontier route is started, remembered, watched, and the window steps aside and back.
+    {
+        endFakes();
+        const std::wstring base = fresh("sess-play");
+        const std::wstring tree = P(base, L"Frontier");
+        const std::wstring products = P(tree, L"Products\\elite-dangerous-odyssey-64");
+        writeAll(P(products, L"EliteDangerous64.exe"), "x");
+        writeAll(P(tree, L"EDLaunch\\EDLaunch.exe"), "x");
+        ScriptedHttp http;
+        Reply down;
+        down.transportOk = false;
+        http.replies[latestUrl()] = down;
+        Ui ui;
+        LauncherSession session(envFor(&ui, &http, base, false, P(base, L"self.exe")));
+        std::vector<HANDLE> started;
+        RouteOps ops;
+        std::vector<std::wstring> spawned;
+        ops.spawn = [&](const std::wstring& exe, const std::wstring& args, const std::wstring&) {
+            spawned.push_back(exe + L" " + args);
+            started.push_back(startProgram(P(g_fakes, kFakeEd), L"--obey-close"));
+            started.push_back(startProgram(P(g_fakes, kFakeGame), L"--run-ms 700"));
+            return true;
+        };
+        ops.openUri = [&](const std::wstring& uri) {
+            spawned.push_back(uri);
+            return true;
+        };
+        WatchNames names;
+        names.game = kFakeGame;
+        names.edlaunch = kFakeEd;
+        WatchTiming timing;
+        timing.pollMs = 40;
+        timing.startupWaitMs = 1500;
+        timing.closeWaitMs = 800;
+        session.beginPlay(L"Frontier launcher", products, false, false, ops, names, timing);
+        check(session.playing() && spawned.size() == 1 && contains(narrowUtf8(spawned[0]), "/autorun /autoquit /edo /novr"), "Play flat starts EDLaunch with /novr");
+        check(ui.pump([&]() { return !session.playing(); }), "the watcher finishes when the game has been and gone");
+        check(ui.aside.size() == 2 && ui.aside[0] == true && ui.aside[1] == false, "the window stepped aside when the game started and came back when it ended");
+        check(contains(session.playLine(), "Elite has closed"), "the line says so: " + session.playLine());
+        LauncherState state;
+        state.load(P(settingsFor(base).launcherDir, L"launcher.ini"), nullptr);
+        check(state.mode(products) == "flat", "the flat choice is remembered for that folder");
+        for (HANDLE h : started) endProgram(h);
+
+        // Steam: the address only, and no mode remembered.
+        session.beginPlay(L"Steam", P(base, L"SteamGame"), true, false, ops, names, timing);
+        check(spawned.size() == 2 && spawned[1] == L"steam://rungameid/359320", "Steam is started by its address");
+        state.load(P(settingsFor(base).launcherDir, L"launcher.ini"), nullptr);
+        check(state.mode(P(base, L"SteamGame")).empty(), "and a store that cannot carry a mode remembers none");
+        session.shutdown();   // the watcher for it would wait out its 1.5 s otherwise
+        // An elevated launcher refuses, starting nothing.
+        Ui ui3;
+        LauncherSession elevated(envFor(&ui3, &http, base, false, P(base, L"self.exe")));
+        const size_t before = spawned.size();
+        elevated.beginPlay(L"Steam", P(base, L"SteamGame"), true, true, ops, names, timing);
+        check(!elevated.playing() && spawned.size() == before && contains(elevated.playLine(), "administrator"), "an elevated launcher says why it will not start Elite and starts nothing: " + elevated.playLine());
+        endFakes();
+    }
+}
+
+// ---- the command line ---------------------------------------------------------------------------
+
+AppArgs parse(std::vector<std::wstring> words) {
+    std::vector<wchar_t*> argv;
+    std::wstring prog = L"ed-up-launcher.exe";
+    argv.push_back(&prog[0]);
+    for (std::wstring& w : words) argv.push_back(&w[0]);
+    return parseArgs(static_cast<int>(argv.size()), argv.data());
+}
+
+void testArgs() {
+    section("args");
+    AppArgs a = parse({L"--payload", L"D:\\x", L"--data-root", L"E:\\y", L"--channel", L"rc", L"--check-update", L"--update", L"--unregister", L"--updated", L"--apply-plan", L"F:\\plan.txt"});
+    check(!a.badArg && a.payloadDir == L"D:\\x" && a.dataRoot == L"E:\\y" && a.channel == "rc" && a.checkUpdate && a.update && a.unregister && a.updated && a.planFile == L"F:\\plan.txt",
+          "every launcher flag is read");
+    check(launcherHasCommand(parse({L"--check-update"})) && launcherHasCommand(parse({L"--update"})) && launcherHasCommand(parse({L"--unregister"})) && !launcherHasCommand(parse({L"--install"})) &&
+              !launcherHasCommand(parse({})),
+          "the commands that need no window are --check-update, --update and --unregister");
+    check(parse({L"--channel", L"nightly"}).badArg && parse({L"--payload"}).badArg && parse({L"--data-root"}).badArg, "a bad channel and flags missing their value are refused");
+    check(parse({L"--channel", L"stable"}).channel == "stable", "stable is accepted");
+    const std::string usage = usageText();
+    for (const char* flag : {"--check-update", "--update", "--channel", "--payload", "--data-root", "--unregister", "ed-up-launcher.exe"})
+        check(contains(usage, flag), std::string("the help names ") + flag);
+    check(!contains(usage, "edvr-installer.exe"), "and speaks of the launcher, not the installer");
+    check(launcherRootsFor(parse({})).canonical && !launcherRootsFor(parse({L"--data-root", L"E:\\y"})).canonical && launcherMirrorRoot(parse({L"--data-root", L"E:\\y"})) == L"E:\\y",
+          "--data-root moves the roots, the mirror included, and marks a trial");
+    std::string note;
+    check(!launcherPreparePayload(parse({L"--payload", L"Z:\\nowhere"}), &note) && !note.empty(), "a payload folder that is not there gives no payload and a note: " + note);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
-    if (argc < 4) {
-        std::printf("usage: launcher_test <repo root> <fixtures dir> <scratch dir>\n");
+    // The stand-in for the elevated copy: applyElevated starts this program with --apply-plan.
+    if (argc == 5 && std::strcmp(argv[1], "--apply-plan") == 0 && std::strcmp(argv[3], "--key") == 0) {
+        const char* keys[2] = {argv[4], nullptr};
+        return applyPlanFile(widenUtf8(argv[2]), keys);
+    }
+    if (argc < 5) {
+        std::printf("usage: launcher_test <repo root> <fixtures dir> <scratch dir> <fakes dir>\n");
         return 2;
     }
     g_fixtures = widenUtf8(argv[2]);
     g_scratch = widenUtf8(argv[3]);
+    g_fakes = widenUtf8(argv[4]);
+    {
+        wchar_t self[MAX_PATH * 2]{};
+        g_self.assign(self, GetModuleFileNameW(nullptr, self, MAX_PATH * 2));
+    }
+    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     rmtree(g_scratch);
     if (!createDirectories(g_scratch)) {
         std::printf("launcher_test: cannot create the scratch folder\n");
@@ -1768,6 +2975,16 @@ int main(int argc, char** argv) {
     testUpdater();
     testPayload();
     testHttp();
+    testCore();
+    testRegister();
+    testSelfUpdate();
+    testPlanFile();
+    testElevatedApply();
+    testRoute();
+    testWatcher();
+    testSession();
+    testArgs();
+    endFakes();
 
     std::printf("\nlauncher_test: %d checks, %d failed\n", g_checks, g_fails);
     std::printf("%s\n", g_fails == 0 ? "launcher_test: all good" : "launcher_test: FAILURES");

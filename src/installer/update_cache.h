@@ -33,6 +33,10 @@ public:
     // True when the cached file exists, has `size` bytes and hashes to `sha256`.
     bool hasVerified(const std::string& sha256, unsigned long long size) const;
 
+    // True when the cached file exists and has `size` bytes. The hash is not read: a caller
+    // that goes on to read the whole file anyway (usePayloadFiles) checks it there, once.
+    bool hasSized(const std::string& sha256, unsigned long long size) const;
+
     // True when every file of the manifest is cached and verified.
     bool hasAll(const Manifest& manifest) const;
 

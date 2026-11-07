@@ -93,8 +93,19 @@ public:
     bool commitManifest(const UpdateCheck& check, std::string* error);
 
     // Re-verifies the current manifest from disk and lists its files in the cache
-    // as payload files, ready for usePayloadFiles. Works offline.
+    // as payload files, ready for usePayloadFiles. Works offline. The manifest's
+    // signature is checked here; each cached file is only checked for existing and
+    // having its listed size, because the PayloadFile carries its hash and
+    // usePayloadFiles, which reads the whole file anyway, is where it is compared. A
+    // caller that lists files and never calls usePayloadFiles has verified nothing.
     bool loadCurrentManifest(Manifest* manifest, std::vector<PayloadFile>* files, std::string* error);
+
+    // The same, for one stored manifest by path (<launcher>\manifests\<sha>.json, with
+    // its .sig beside it) instead of the one launcher.ini names. The file's name must
+    // be the SHA-256 of its bytes. This is what the elevated copy uses: it is handed a
+    // path, trusts nothing about it, and checks the signature itself.
+    bool loadManifestFile(const std::wstring& jsonPath, Manifest* manifest, std::vector<PayloadFile>* files,
+                          std::string* error);
 
 private:
     std::wstring statePath() const;

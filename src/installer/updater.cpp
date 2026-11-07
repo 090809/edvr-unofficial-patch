@@ -374,7 +374,22 @@ bool Updater::loadCurrentManifest(Manifest* manifest, std::vector<PayloadFile>* 
     if (!state.load(statePath(), error)) return false;
     const std::string sha = state.currentManifest();
     if (sha.empty()) return fail("no update has been adopted yet");
-    const std::wstring base = joinPath(joinPath(settings_.launcherDir, L"manifests"), widenUtf8(sha));
+    return loadManifestFile(joinPath(joinPath(settings_.launcherDir, L"manifests"), widenUtf8(sha)) + L".json",
+                            manifest, files, error);
+}
+
+bool Updater::loadManifestFile(const std::wstring& jsonPath, Manifest* manifest, std::vector<PayloadFile>* files,
+                               std::string* error) {
+    auto fail = [&](const std::string& text) {
+        if (error) *error = text;
+        return false;
+    };
+    const size_t slash = jsonPath.find_last_of(L'\\');
+    const std::string leaf = narrowUtf8(slash == std::wstring::npos ? jsonPath : jsonPath.substr(slash + 1));
+    if (leaf.size() != 64 + 5 || leaf.compare(64, 5, ".json") != 0 || !isLowerHex(leaf.substr(0, 64), 64))
+        return fail("the manifest's file name is not its hash");
+    const std::string sha = leaf.substr(0, 64);
+    const std::wstring base = jsonPath.substr(0, jsonPath.size() - 5);
     std::string bytes, signatureText;
     if (!readFileBytes(base + L".json", &bytes, kMaxManifestBytes, nullptr) ||
         !readFileBytes(base + L".sig", &signatureText, 1024, nullptr))
@@ -386,7 +401,7 @@ bool Updater::loadCurrentManifest(Manifest* manifest, std::vector<PayloadFile>* 
     PayloadCache cache(settings_.cacheDir);
     std::vector<PayloadFile> list;
     for (const ManifestFile& f : loaded.files) {
-        if (!cache.hasVerified(f.sha256, f.size)) return fail("the payload cache lacks " + f.path + "; connect and update to repair it");
+        if (!cache.hasSized(f.sha256, f.size)) return fail("the payload cache lacks " + f.path + "; connect and update to repair it");
         PayloadFile p;
         p.item = f.item;
         p.path = cache.pathFor(f.sha256);

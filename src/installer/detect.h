@@ -32,6 +32,12 @@ struct GameInstall {
 // the executable, deduplicated by path.
 std::vector<GameInstall> findInstalls();
 
+// The folders Frontier's launcher may be installed in: what its installer recorded
+// in the registry, then its default places. The store keeps the game under the
+// user's AppData, well away from EDLaunch.exe, so a walk up from the game folder
+// does not find it. May hold empty strings and folders that do not exist.
+std::vector<std::wstring> frontierLauncherRoots();
+
 // Does this folder hold EliteDangerous64.exe?
 bool gameDirLooksRight(const std::wstring& dir);
 

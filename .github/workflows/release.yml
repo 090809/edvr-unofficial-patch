@@ -360,6 +360,7 @@ jobs:
             build/edvr_openxr_runtime.dll
             build/openxr_loader.dll
             build/edvr-installer.exe
+            build/ed-up-launcher.exe
 
       - name: Upload release packages
         if: success()

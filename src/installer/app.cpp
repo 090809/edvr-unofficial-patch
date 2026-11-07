@@ -11,6 +11,9 @@
 #include "mirror.h"
 #include "payload.h"
 #include "../common/elite_graphics_folder.h"
+#ifdef EDUP_LAUNCHER
+#include "launcher_main.h"
+#endif
 
 namespace edvr::installer {
 namespace {
@@ -39,8 +42,13 @@ std::string bullets(const char* title, const std::vector<std::string>& items) {
 }  // namespace
 
 std::string usageText() {
+#ifdef EDUP_LAUNCHER
+    const char* exe = "ed-up-launcher.exe";
+    std::string out = "ED-UP launcher\r\n";
+#else
     const char* exe = "edvr-installer.exe";
     std::string out = "ED-UP installer\r\n";
+#endif
     out +=
            "\r\n"
            "  " + std::string(exe) + "                        open the window\r\n"
@@ -62,6 +70,20 @@ std::string usageText() {
            "  --remove-settings    with --uninstall, delete the settings files of the installed\r\n"
            "                       scope too.\r\n"
            "  --help               this.\r\n"
+#ifdef EDUP_LAUNCHER
+           "\r\n"
+           "  --check-update       ask GitHub whether a newer release exists, check its signature, and\r\n"
+           "                       say what it found. Writes only the launcher's own state.\r\n"
+           "  --update             --check-update, then download the release's files into the launcher's\r\n"
+           "                       cache, verify each, and adopt its manifest. Touches no game folder.\r\n"
+           "  --channel stable|rc  which releases to look at, for this run (rc includes release candidates).\r\n"
+           "  --payload <dir>      install from an unpacked ed-up-<version>.zip instead of the cache.\r\n"
+           "  --data-root <dir>    keep the launcher's folders, and the settings copies, under <dir>\r\n"
+           "                       instead of %LOCALAPPDATA%\\EDVR, and do not copy, register or update\r\n"
+           "                       the launcher itself.\r\n"
+           "  --unregister         remove the launcher, its Start menu shortcut and its downloaded files.\r\n"
+           "                       ED-UP in your game folders and your settings copies are left alone.\r\n"
+#endif
            "\r\n"
            "  A copy of your settings files (and the install record) is kept outside the game\r\n"
            "  folder, in %LOCALAPPDATA%\\EDVR, so a game update that wipes the folder cannot take\r\n"
@@ -118,6 +140,32 @@ AppArgs parseArgs(int argc, wchar_t** argv) {
             a.removeSettings = true;
         else if (arg == L"--autorun")
             a.autorun = true;
+#ifdef EDUP_LAUNCHER
+        else if (arg == L"--payload")
+            next(&a.payloadDir);
+        else if (arg == L"--data-root")
+            next(&a.dataRoot);
+        else if (arg == L"--apply-plan")
+            next(&a.planFile);
+        else if (arg == L"--channel") {
+            std::wstring value;
+            if (next(&value)) {
+                if (value == L"stable" || value == L"rc") {
+                    a.channel = toUtf8(value);
+                } else {
+                    a.badArg = true;
+                    a.badArgText = L"--channel takes stable or rc, not \"" + value + L"\"";
+                }
+            }
+        } else if (arg == L"--check-update")
+            a.checkUpdate = true;
+        else if (arg == L"--update")
+            a.update = true;
+        else if (arg == L"--unregister")
+            a.unregister = true;
+        else if (arg == L"--updated")
+            a.updated = true;
+#endif
         else if (arg == L"--help" || arg == L"-h" || arg == L"/?")
             a.help = true;
         else {
@@ -300,6 +348,11 @@ int runConsole(const AppArgs& args) {
         return args.badArg ? 2 : 0;
     }
 
+#ifdef EDUP_LAUNCHER
+    // The payload comes from --payload or the adopted manifest, not from this exe.
+    std::string payloadNote;
+    const bool havePayload = launcherPreparePayload(args, &payloadNote);
+#endif
     GameInstall game;
     if (!args.dir.empty()) {
         if (!describeDir(args.dir, L"Folder you chose", &game)) {
@@ -356,7 +409,15 @@ int runConsole(const AppArgs& args) {
         return 0;
     }
 
+#ifdef EDUP_LAUNCHER
+    const std::wstring mirrorDir = mirrorDirFor(survey.game, launcherMirrorRoot(args));
+    if (!havePayload && args.action != AppArgs::Act::Uninstall) {
+        writeOut("\r\nThere is nothing to install from yet: " + payloadNote + "\r\n");
+        return 5;
+    }
+#else
     const std::wstring mirrorDir = mirrorDirFor(survey.game);
+#endif
     const bool canMirror = args.action != AppArgs::Act::Uninstall;
 
     // A folder with no settings file at all but a mirror outside it is exactly

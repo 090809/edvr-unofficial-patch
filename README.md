@@ -91,6 +91,31 @@ To place the files yourself, follow
 done by hand. It shows where each file goes and covers the `openvr_api.dll`
 rename that most manual installs get wrong.
 
+### The launcher
+
+`ed-up-launcher.exe`, a separate download on the release page, is the
+installer's window with two additions: it keeps itself and the ED-UP files up
+to date, and it has a Play button. It carries no files of its own. The first
+time it runs it copies itself to `%LOCALAPPDATA%\EDVR\launcher\`, adds a Start
+menu shortcut and an entry in Windows' list of installed programs, and starts
+from there; removing it from that list (or `ed-up-launcher.exe --unregister`)
+takes all of that away again, and leaves ED-UP in your game folders and your
+settings copies alone.
+
+It contacts two places, and only these: `api.github.com`, to ask this project's
+releases whether a newer one exists, and GitHub's release downloads, for the
+files of a release you chose to install. Each request carries the launcher's
+name and version and nothing that identifies you or your PC. Nothing is
+downloaded or changed until you press Download. A release is offered only if its
+manifest carries a signature that verifies against a public key inside the
+launcher, so a changed or substituted release is refused. If GitHub cannot be
+reached the launcher says so in one line and carries on.
+
+Play starts the game through Steam, Epic or Frontier's own launcher, and
+watches until it exits so that it can close the Frontier launcher window left
+behind. Only Frontier's launcher takes a VR or flat choice from the launcher;
+through Steam or Epic the game starts in the mode it is already set to.
+
 ### Linux on Steam (Proton)
 
 Download `ed-up-installer-linux-<version>.zip` from the release and unzip it. It

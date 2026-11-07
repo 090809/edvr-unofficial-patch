@@ -49,6 +49,7 @@ MIN_LAUNCHER = "0.1.0"
 MANIFEST = sign_manifest.MANIFEST_NAME
 LAUNCHER_ASSET = "ed-up-launcher.exe"
 LAUNCHER_VERSION_HEADER = ("src", "installer", "launcher_version.h")
+KEYS_HEADER = ("src", "installer", "update_keys.h")
 CORE_NAMES = ("d3d11.dll", "openvr/openvr_api.dll", "openvr/openxr_loader.dll",
               "openvr/OPENXR-LOADER-LICENSE.txt", "edvr.ini", "edvr-flat.ini", "edvr_profile.ini",
               "LICENSE.txt", "DXBC-HASH-LICENSE.txt", "FIDELITYFX-SDK-DX11-LICENSE.txt")
@@ -236,9 +237,10 @@ def _embedded_resource(executable, resource_id, required=True):
         resource = kernel.FindResourceW(handle, resource_id, 10)
         if not resource:
             error = ctypes.get_last_error()
-            # Mandatory RCDATA is checked first; only an absent named resource
-            # is an expected result when probing the optional DLSS payload.
-            if not required and error == 1814:  # ERROR_RESOURCE_NAME_NOT_FOUND
+            # Mandatory RCDATA is checked first; only an absent resource is an
+            # expected result when probing the optional DLSS payload, or an exe
+            # that carries no RCDATA at all (the launcher).
+            if not required and error in (1813, 1814):  # ERROR_RESOURCE_TYPE_NOT_FOUND, ..._NAME_NOT_FOUND
                 return None
             raise ValueError("installer resource %d is missing (Windows error %d)" %
                              (resource_id, error))
@@ -326,10 +328,44 @@ def _launcher_version(root):
     return found.group(1)
 
 
+def _validate_launcher(root):
+    """Refuse (ValueError) a release whose launcher is not one. The launcher is an asset like
+    the others, but it is also what installed copies replace themselves with, so a bad one is
+    worse than a missing one:
+
+      * build\\ed-up-launcher.exe exists (build.bat writes it);
+      * its FileVersion and ProductVersion are exactly src\\installer\\launcher_version.h's;
+      * it carries none of the installer's payload resources, 101 to 111;
+      * src\\installer\\update_keys.h lists two distinct keys, and neither is the public test key
+        of RFC 6979, whose private half is in every library's tests."""
+    launcher = root / "build" / LAUNCHER_ASSET
+    if not launcher.is_file():
+        raise ValueError("build\\%s is missing: build.bat writes it, and a release without a launcher "
+                         "leaves installed copies with nothing to update to" % LAUNCHER_ASSET)
+    version = _launcher_version(root)
+    stamp = _stamped_versions(launcher) or {}
+    problems = []
+    for key in STAMP_KEYS:
+        if stamp.get(key) != version:
+            problems.append("%s %s is %s, but launcher_version.h says %s" % (LAUNCHER_ASSET, key, stamp.get(key), version))
+    for resource_id in range(101, 112):
+        if _embedded_resource(launcher, resource_id, required=False) is not None:
+            problems.append("%s carries resource %d: the launcher has no embedded payload" % (LAUNCHER_ASSET, resource_id))
+    keys = sign_manifest.header_keys(root.joinpath(*KEYS_HEADER))
+    if len(keys) != 2:
+        problems.append("update_keys.h lists %d keys; a release needs the main key and the recovery key" % len(keys))
+    if len(set(keys)) != len(keys):
+        problems.append("update_keys.h lists the same key twice")
+    if bytes.fromhex(sign_manifest.RFC_PUBLIC) in keys:
+        problems.append("update_keys.h lists the public test key, so anyone could sign an update")
+    if problems:
+        raise ValueError("the launcher cannot be released:\n  " + "\n  ".join(problems))
+
+
 def _split_outputs(root, version, files):
     """The split assets and the unsigned manifest as [(file name, bytes)], all in
     memory so a dry run builds and checks them and writes nothing. The launcher
-    exe is included when build\\ed-up-launcher.exe exists."""
+    exe, build\\ed-up-launcher.exe, is required (_validate_launcher)."""
     present = {name: source for source, name in files}
     data = {name: present[name].read_bytes() for name in CORE_NAMES + DLSS_NAMES + XESS_NAMES
             if name in present}
@@ -355,11 +391,12 @@ def _split_outputs(root, version, files):
                 else int(time.time()),
                 "min_launcher": MIN_LAUNCHER}
     launcher = root / "build" / LAUNCHER_ASSET
-    if launcher.is_file():
-        blob = launcher.read_bytes()
-        manifest["launcher"] = {"version": _launcher_version(root), "asset": LAUNCHER_ASSET,
-                                "sha256": hashlib.sha256(blob).hexdigest(), "size": len(blob)}
-        outputs.append((LAUNCHER_ASSET, blob))
+    if not launcher.is_file():
+        raise ValueError("build\\%s is missing" % LAUNCHER_ASSET)
+    blob = launcher.read_bytes()
+    manifest["launcher"] = {"version": _launcher_version(root), "asset": LAUNCHER_ASSET,
+                            "sha256": hashlib.sha256(blob).hexdigest(), "size": len(blob)}
+    outputs.append((LAUNCHER_ASSET, blob))
     manifest["assets"] = assets
     manifest["files"] = [{"item": item, "path": path, "asset": held[path],
                           "sha256": hashlib.sha256(data[path]).hexdigest(), "size": len(data[path])}
@@ -400,6 +437,7 @@ def package(root, version, no_dlss=False, dry_run=False):
     except (ImportError, OSError, ValueError) as exc:
         raise ValueError("bundled OpenXR loader validation failed: %s" % exc)
     _validate_installer_resources(root / "build" / INSTALLER, files)
+    _validate_launcher(root)
     print("[edvr] package plan: %s" % archive)
     for _, name in files: print("       %s" % name)
     installer_archive = dist / ("ed-up-installer-" + version + ".zip")
@@ -543,6 +581,15 @@ def self_test():
         launcher_source.write_bytes((ROOT / LINUX_LAUNCHER).read_bytes())
         vr_descriptor = b"[install]\r\nschema = 2\r\nscope = both\r\n"
         (root / "build" / "edvr_profile_vr.ini").write_bytes(vr_descriptor)
+        # The launcher: an exe, its version header and the keys header. The release's own
+        # update_keys.h is copied, so the self-test also holds the repository to two real keys.
+        (root / "build" / LAUNCHER_ASSET).write_bytes(b"launcher exe")
+        header = root.joinpath(*LAUNCHER_VERSION_HEADER)
+        header.parent.mkdir(parents=True, exist_ok=True)
+        header.write_text('inline constexpr const char* kLauncherVersion = "0.1.0";\n', encoding="ascii")
+        keys_header = root.joinpath(*KEYS_HEADER)
+        keys_header.write_bytes((ROOT.joinpath(*KEYS_HEADER)).read_bytes())
+        real_keys_text = keys_header.read_text(encoding="utf-8")
         (root / "build" / "OPENXR-LOADER-LICENSE.txt").write_bytes(b"notice")
         import openxr_pe
         old_native, old_graphics = openxr_pe.native_exports, openxr_pe.native_graphics_exports
@@ -552,7 +599,11 @@ def self_test():
         old_resource = globals()['_embedded_resource']
         resources = {101: b"payload", 102: b"payload", 103: b"payload",
                      105: b"payload", 106: b"notice", 107: vr_descriptor, 111: b"payload"}
+        launcher_resources = {}   # a case puts a payload resource into the launcher here
+
         def fake_resource(executable, resource_id, required=True):
+            if Path(executable).name == LAUNCHER_ASSET:
+                return launcher_resources.get(resource_id)
             if required and resource_id not in resources:
                 raise ValueError("missing fixture resource")
             return resources.get(resource_id)
@@ -569,6 +620,8 @@ def self_test():
         def fake_stamps(path):
             if path.name in stamps["override"]:
                 return stamps["override"][path.name]
+            if path.name == LAUNCHER_ASSET:   # its own number, not the release's: launcher_version.h says 0.1.0
+                return {"FileVersion": "0.1.0", "ProductVersion": "0.1.0"}
             return stamp("v" + stamps["version"])
 
         real_package = globals()['package']
@@ -880,14 +933,16 @@ def self_test():
             assert members(dist / "ed-up-installer-4.0.0.zip") == {INSTALLER}
             assert members(dist / "ed-up-installer-linux-4.0.0.zip") == {
                 INSTALLER, LINUX_WRAPPER, LINUX_LAUNCHER, "README-linux.txt"}
-            # The manifest: valid, ASCII, LF, the real hashes, and no launcher without an exe.
+            # The manifest: valid, ASCII, LF, the real hashes, and the launcher the release carries.
             manifest_bytes = (dist / MANIFEST).read_bytes()
             assert manifest_bytes.decode("ascii") and b"\r" not in manifest_bytes and manifest_bytes.endswith(b"\n")
             parsed, problems = sign_manifest.load_manifest(manifest_bytes)
             assert problems == [], problems
             assert (parsed["version"], parsed["build"], parsed["tag"], parsed["issued"],
                     parsed["min_launcher"]) == ("4.0.0", "v4.0.0", "v4.0.0", 1794000000, MIN_LAUNCHER)
-            assert "launcher" not in parsed
+            assert parsed["launcher"] == {"version": "0.1.0", "asset": LAUNCHER_ASSET,
+                                          "sha256": hashlib.sha256(b"launcher exe").hexdigest(), "size": 12}
+            assert (dist / LAUNCHER_ASSET).read_bytes() == b"launcher exe"
             assert [asset["name"] for asset in parsed["assets"]] == [core.name, dlss_zip.name, xess_zip.name]
             assert {entry["item"] for entry in parsed["files"]} == {
                 "native_graphics", "native_runtime", "ini", "flat_ini", "profile", "openxr_loader",
@@ -949,11 +1004,7 @@ def self_test():
                 {k: v for k, v in before.items() if not k.startswith("ed-up-4.0.3")
                  and not k.startswith("ed-up-installer")}, "a failed publish changed dist"
             assert not target.exists() and not [p for p in dist.iterdir() if p.name.startswith(".")]
-            # The launcher exe, when built, is listed and copied.
-            (root / "build" / LAUNCHER_ASSET).write_bytes(b"launcher exe")
-            header = root.joinpath(*LAUNCHER_VERSION_HEADER)
-            header.parent.mkdir(parents=True, exist_ok=True)
-            header.write_text('inline constexpr const char* kLauncherVersion = "0.1.0";\n', encoding="ascii")
+            # The launcher exe is listed and copied.
             assert package(root, "4.0.4", no_dlss=True) == 0
             parsed = json.loads((dist / MANIFEST).read_text(encoding="ascii"))
             assert parsed["launcher"] == {"version": "0.1.0", "asset": LAUNCHER_ASSET,
@@ -966,7 +1017,49 @@ def self_test():
                 raise AssertionError("launcher without a version accepted")
             except ValueError as error:
                 assert "launcher version" in str(error)
-            (root / "build" / LAUNCHER_ASSET).unlink()
+            header.write_text('inline constexpr const char* kLauncherVersion = "0.1.0";\n', encoding="ascii")
+
+            # The launcher is required, and a bad one is refused, each for its own reason.
+            def refused_launcher(label, needle):
+                try:
+                    package(root, "4.0.6", no_dlss=True, dry_run=True)
+                except ValueError as error:
+                    assert needle in str(error), (label, str(error))
+                    return str(error)
+                raise AssertionError("accepted: " + label)
+
+            launcher_exe = root / "build" / LAUNCHER_ASSET
+            launcher_exe.unlink()
+            print("expected-error: " + refused_launcher("no launcher", "ed-up-launcher.exe is missing").splitlines()[0])
+            launcher_exe.write_bytes(b"launcher exe")
+            stamps["override"][LAUNCHER_ASSET] = {"FileVersion": "0.0.9", "ProductVersion": "0.1.0"}
+            print("expected-error: " + refused_launcher("stale launcher version", "FileVersion is 0.0.9").splitlines()[1].strip())
+            stamps["override"][LAUNCHER_ASSET] = None
+            refused_launcher("launcher without a version resource", "FileVersion is None")
+            del stamps["override"][LAUNCHER_ASSET]
+            for resource_id in (101, 102, 111):
+                launcher_resources[resource_id] = b"payload"
+                refused_launcher("launcher with resource %d" % resource_id, "carries resource %d" % resource_id)
+                del launcher_resources[resource_id]
+            rfc = sign_manifest.RFC_PUBLIC.lower()
+            real_pair = [k for k in re.findall(r'"([0-9a-f]{128})"', real_keys_text)]
+            assert len(real_pair) == 2 and real_pair[0] != rfc and real_pair[1] != rfc, "the repository's own keys"
+            keys_header.write_text('inline constexpr const char* kUpdatePublicKeys[] = {"%s", "%s", nullptr};\n'
+                                   % (real_pair[0], rfc), encoding="ascii")
+            print("expected-error: " + refused_launcher("the test key", "public test key").splitlines()[1].strip())
+            keys_header.write_text('inline constexpr const char* kUpdatePublicKeys[] = {"%s", nullptr};\n' % real_pair[0],
+                                   encoding="ascii")
+            refused_launcher("one key", "lists 1 keys")
+            keys_header.write_text('inline constexpr const char* kUpdatePublicKeys[] = {"%s", "%s", nullptr};\n'
+                                   % (real_pair[0], real_pair[0]), encoding="ascii")
+            refused_launcher("the same key twice", "same key twice")
+            keys_header.write_text(real_keys_text, encoding="utf-8")
+            assert package(root, "4.0.6", no_dlss=True, dry_run=True) == 0   # and the good one passes again
+
+            # The folder table the launcher reads --payload with is this tool's item table.
+            table = re.findall(r'\{"([a-z_]+)", L"([^"]+)"\}', ROOT.joinpath("src", "installer", "launcher_core.cpp").read_text(encoding="utf-8"))
+            assert sorted((item, path.replace("\\\\", "/")) for item, path in table) == sorted(ITEM_PATHS), \
+                "src/installer/launcher_core.cpp's kFolderEntries and package_native.ITEM_PATHS differ"
             if old_epoch is None:
                 del os.environ["SOURCE_DATE_EPOCH"]
             else:

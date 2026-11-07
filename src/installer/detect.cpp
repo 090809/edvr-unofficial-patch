@@ -224,9 +224,10 @@ void findEpic(std::vector<GameInstall>* out) {
 }
 
 // ---- Frontier launcher ---------------------------------------------------
-void findFrontier(std::vector<GameInstall>* out) {
-    // Where the launcher itself keeps Products these days.
-    addFromRoot(joinPath(env(L"LOCALAPPDATA"), L"Frontier_Developments"), L"Frontier launcher", out);
+// The folders Frontier's launcher may be installed in. May hold empty strings and
+// folders that do not exist; a caller probes each one.
+std::vector<std::wstring> frontierInstallRoots() {
+    std::vector<std::wstring> roots;
 
     // The uninstall registry, both views: whatever the launcher's installer
     // recorded is the authoritative answer for an install that moved.
@@ -251,15 +252,13 @@ void findFrontier(std::vector<GameInstall>* out) {
                 name.find(L"frontier") == std::wstring::npos) {
                 continue;
             }
-            addFromRoot(regString(HKEY_LOCAL_MACHINE, path.c_str(), L"InstallLocation", 0),
-                        L"Frontier launcher", out);
+            roots.push_back(regString(HKEY_LOCAL_MACHINE, path.c_str(), L"InstallLocation", 0));
         }
         RegCloseKey(key);
     }
 
     // And the places it has installed itself to by default, on every fixed
     // drive. Cheap: three directory probes per drive, no walking.
-    std::vector<std::wstring> roots;
     const std::wstring progFiles86 = env(L"ProgramFiles(x86)");
     const std::wstring progFiles = env(L"ProgramFiles");
     if (!progFiles86.empty()) roots.push_back(joinPath(progFiles86, L"Frontier"));
@@ -275,7 +274,13 @@ void findFrontier(std::vector<GameInstall>* out) {
         roots.push_back(d + L"Games\\Frontier");
         roots.push_back(d + L"Program Files (x86)\\Frontier");
     }
-    for (const std::wstring& r : roots) addFromRoot(r, L"Frontier launcher", out);
+    return roots;
+}
+
+void findFrontier(std::vector<GameInstall>* out) {
+    // Where the launcher itself keeps Products these days.
+    addFromRoot(joinPath(env(L"LOCALAPPDATA"), L"Frontier_Developments"), L"Frontier launcher", out);
+    for (const std::wstring& r : frontierInstallRoots()) addFromRoot(r, L"Frontier launcher", out);
 }
 
 // ---- who is running ------------------------------------------------------
@@ -458,6 +463,8 @@ GameRunState runStateOf(const wchar_t* exeName, const std::wstring& dir) {
 }
 
 GameRunState gameRunState(const std::wstring& gameDir) { return runStateOf(kGameExe, gameDir); }
+
+std::vector<std::wstring> frontierLauncherRoots() { return frontierInstallRoots(); }
 
 std::vector<GameInstall> findInstalls() {
     std::vector<GameInstall> found;

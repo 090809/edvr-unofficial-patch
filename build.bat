@@ -809,6 +809,17 @@ set INSTALLER_SRC="src\installer\main.cpp" "src\installer\gui.cpp" ^
     "src\installer\payload.cpp"
 set INSTALLER_LIBS=user32.lib gdi32.lib gdiplus.lib dwmapi.lib uxtheme.lib ^
     shell32.lib ole32.lib comctl32.lib advapi32.lib version.lib bcrypt.lib dxgi.lib kernel32.lib
+REM What the launcher adds to INSTALLER_SRC (its main.cpp, gui.cpp and the rest are the same files, built
+REM with /DEDUP_LAUNCHER): the update core and the launcher_* and selfupdate files. launcher_test links
+REM these too. winhttp.lib is the one library the installer does not need.
+set LAUNCHER_SRC="src\installer\launcher_core.cpp" "src\installer\launcher_register.cpp" ^
+    "src\installer\launcher_plan.cpp" "src\installer\launch_route.cpp" ^
+    "src\installer\launcher_session.cpp" "src\installer\launcher_main.cpp" ^
+    "src\installer\selfupdate.cpp" "src\installer\updater.cpp" ^
+    "src\installer\update_http.cpp" "src\installer\update_json.cpp" ^
+    "src\installer\update_manifest.cpp" "src\installer\update_zip.cpp" ^
+    "src\installer\update_cache.cpp" "src\installer\update_util.cpp" ^
+    "src\installer\launcher_state.cpp"
 
 if defined EDVR_DLL_ONLY goto dll_only_finish
 
@@ -3223,6 +3234,60 @@ REM sees. --help reads nothing and writes nothing.
 )
 exit /b 0
 
+:rig_launcher
+echo [edvr] === ed-up-launcher.exe ===
+REM The launcher: the installer's window and engine with the update core, built with
+REM /DEDUP_LAUNCHER, carrying NO payload (package_native.py refuses an exe that does) and with its
+REM VERSIONINFO taken from src\installer\launcher_version.h, not from `git describe`.
+REM
+REM It is built twice, under two different EDVR_VER values and into two folders, and the two exes
+REM must be the same bytes. A release that did not change the launcher then ships the same exe, and
+REM the digest the updater compares stays put. Nothing the build knows about the commit may reach it:
+REM /Brepro on the compile and the link fixes the timestamps, and there is no PDB to name a path.
+REM Both compiles are real ones: a compile cache hit on the second would hand it the first's objects.
+set "EDVR_NO_COMPILE_CACHE=1"
+set "LAUNCHER_VER_FIRST=%EDVR_VER%"
+call :launcher_compile "%BUILD%" "%OBJ%\launcher" "%GEN%\launcher" || exit /b 1
+set "EDVR_VER=determinism-check-with-another-version"
+call :launcher_compile "%BUILD%\launcher_det" "%OBJ%\launcher_det" "%GEN%\launcher_det" || exit /b 1
+set "EDVR_VER=%LAUNCHER_VER_FIRST%"
+fc /b "%BUILD%\ed-up-launcher.exe" "%BUILD%\launcher_det\ed-up-launcher.exe" >nul
+if errorlevel 1 (
+    echo [edvr] ERROR: two builds of the launcher under different EDVR_VER values differ: it is not deterministic
+    exit /b 1
+)
+echo [edvr] launcher determinism: two builds under different EDVR_VER values are identical
+certutil -hashfile "%BUILD%\ed-up-launcher.exe" SHA256 | findstr /v "hash CertUtil"
+echo [edvr] built %BUILD%\ed-up-launcher.exe
+
+REM Does it START? --help reads nothing and writes nothing, and does not copy, register or contact anything.
+"%BUILD%\ed-up-launcher.exe" --help >nul || (
+    echo [edvr] ERROR: the launcher will not run. If Windows called it a side-by-side
+    echo        configuration problem, the manifest is the suspect.
+    exit /b 1
+)
+exit /b 0
+
+REM One compile of the launcher into %~1 (the exe's folder). %~2 is its obj folder, %~3 the folder
+REM its resource script goes in. Reads EDVR_VER only to hand it to gen_installer_rc.py, which must
+REM ignore it (--launcher-rc takes the version from launcher_version.h).
+:launcher_compile
+if not exist "%~1" mkdir "%~1"
+if not exist "%~2" mkdir "%~2"
+if not exist "%~3" mkdir "%~3"
+python "tools\gen_installer_rc.py" --launcher-rc --root "%ROOT%" --out "%~3" --version "%EDVR_VER%"
+if errorlevel 1 ( echo [edvr] ERROR: launcher resource generation failed & exit /b 1 )
+rc.exe /nologo /fo "%~2\launcher.res" "%~3\launcher.rc"
+if errorlevel 1 ( echo [edvr] ERROR: rc.exe failed on the launcher resources & exit /b 1 )
+%CC% /nologo /O2 /MT /std:c++17 /EHsc /W4 /GR- /Brepro /DWIN32_LEAN_AND_MEAN /DNOMINMAX ^
+    /D_CRT_SECURE_NO_WARNINGS /DUNICODE /D_UNICODE /I"%GEN%" ^
+    /DEDUP_LAUNCHER /DEDVR_VERSION_STRING=\"none\" ^
+    /Fo"%~2"\ /Fe"%~1\ed-up-launcher.exe" ^
+    %INSTALLER_SRC% %LAUNCHER_SRC% "%~2\launcher.res" ^
+    /link /INCREMENTAL:NO /Brepro /SUBSYSTEM:WINDOWS /MANIFEST:NO %INSTALLER_LIBS% winhttp.lib
+if errorlevel 1 ( echo [edvr] ERROR: launcher build failed & exit /b 1 )
+exit /b 0
+
 :rig_installer_test
 echo [edvr] === installer_test.exe ===
 REM The planner over folders that are hard to arrange on a real machine: EDHM
@@ -3259,22 +3324,42 @@ REM listener on 127.0.0.1 in the rig's own process, and usePayloadFiles. It
 REM touches only its two folders under build\ (fixtures written by
 REM tools\launcher_fixtures.py, and scratch), never the real EDVR folder in
 REM LOCALAPPDATA and never a host but the loopback address.
+REM The launcher's exe around that core is covered here too, since the same fixtures serve it: the
+REM roots and --payload folders, the Start menu shortcut and the registry entry (one HKCU subkey the
+REM rig makes and removes), the self-update swap on a running exe and its rollback, the plan and
+REM result files with this rig standing in for the elevated copy, the store addresses (recorded,
+REM never opened), the game watcher against two fake programs, the session the window drives, and
+REM the command line. The fake programs have no window the desktop could see: fake_proc.cpp.
 if not exist "%OBJ%\launchertest" mkdir "%OBJ%\launchertest"
+if not exist "%OBJ%\launchertest\fakeg" mkdir "%OBJ%\launchertest\fakeg"
+if not exist "%OBJ%\launchertest\fakee" mkdir "%OBJ%\launchertest\fakee"
+if not exist "%BUILD%\launcher_fakes" mkdir "%BUILD%\launcher_fakes"
 python tools\launcher_fixtures.py --out "%BUILD%\launcher_test_fixtures"
 if errorlevel 1 ( echo [edvr] ERROR: launcher fixtures failed & exit /b 1 )
 %CC% /nologo /O2 /MT /std:c++17 /EHsc /W4 /GR- /DWIN32_LEAN_AND_MEAN /DNOMINMAX ^
+    /D_CRT_SECURE_NO_WARNINGS /DUNICODE /D_UNICODE /DFAKE_EDLAUNCH ^
+    /Fo"%OBJ%\launchertest\fakee"\ /Fe"%BUILD%\launcher_fakes\ed_up_fake_edlaunch.exe" ^
+    "tools\launcher_test\fake_proc.cpp" ^
+    /link /INCREMENTAL:NO /SUBSYSTEM:WINDOWS user32.lib shell32.lib
+if errorlevel 1 ( echo [edvr] ERROR: the fake EDLaunch build failed & exit /b 1 )
+%CC% /nologo /O2 /MT /std:c++17 /EHsc /W4 /GR- /DWIN32_LEAN_AND_MEAN /DNOMINMAX ^
     /D_CRT_SECURE_NO_WARNINGS /DUNICODE /D_UNICODE ^
+    /Fo"%OBJ%\launchertest\fakeg"\ /Fe"%BUILD%\launcher_fakes\ed_up_fake_game.exe" ^
+    "tools\launcher_test\fake_proc.cpp" ^
+    /link /INCREMENTAL:NO /SUBSYSTEM:WINDOWS user32.lib shell32.lib
+if errorlevel 1 ( echo [edvr] ERROR: the fake game build failed & exit /b 1 )
+%CC% /nologo /O2 /MT /std:c++17 /EHsc /W4 /GR- /DWIN32_LEAN_AND_MEAN /DNOMINMAX ^
+    /D_CRT_SECURE_NO_WARNINGS /DUNICODE /D_UNICODE /DEDUP_LAUNCHER /I"%GEN%" ^
     /Fo"%OBJ%\launchertest"\ /Fe"%BUILD%\launcher_test.exe" ^
     "tools\launcher_test\launcher_test.cpp" ^
-    "src\installer\update_json.cpp" "src\installer\update_manifest.cpp" ^
-    "src\installer\update_zip.cpp" "src\installer\update_http.cpp" ^
-    "src\installer\update_cache.cpp" "src\installer\update_util.cpp" ^
-    "src\installer\launcher_state.cpp" "src\installer\updater.cpp" ^
-    "src\installer\payload.cpp" "src\installer\probe.cpp" ^
-    "src\common\iniedit.cpp" ^
+    "src\installer\plan.cpp" "src\installer\apply.cpp" "src\installer\detect.cpp" ^
+    "src\installer\probe.cpp" "src\common\iniedit.cpp" "src\installer\state.cpp" ^
+    "src\installer\mirror.cpp" "src\installer\settings.cpp" ^
+    "src\installer\logbundle.cpp" "src\installer\app.cpp" "src\installer\payload.cpp" ^
+    %LAUNCHER_SRC% ^
     /link /INCREMENTAL:NO %INSTALLER_LIBS% winhttp.lib ws2_32.lib
 if errorlevel 1 ( echo [edvr] ERROR: launcher_test build failed & exit /b 1 )
-"%BUILD%\launcher_test.exe" "%ROOT%" "%BUILD%\launcher_test_fixtures" "%BUILD%\launcher_test_scratch" || (
+"%BUILD%\launcher_test.exe" "%ROOT%" "%BUILD%\launcher_test_fixtures" "%BUILD%\launcher_test_scratch" "%BUILD%\launcher_fakes" || (
     echo [edvr] ERROR: the launcher update core failed its own tests
     exit /b 1
 )
