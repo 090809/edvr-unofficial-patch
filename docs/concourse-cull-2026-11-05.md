@@ -516,7 +516,7 @@ Log `edvr_gfx_20261106_163158`, build a2fca02e. One capture, at cam_local -0.17 
 
 ## Rendering from the concourse's centre (Sean, 2026-11-06)
 
-Sean's idea: a cube around the room, filled from a snapshot at the room's centre, with the render off screen during a lift ride. F6 cannot do that: it records only what shows through the windows from where the player stands. RE, build 334925, not flown, with notes handed to intake as `verify_20261106_concourse_probes.txt`:
+Sean's idea: a cube around the room, filled from a snapshot at the room's centre, with the render off screen during a lift ride. F6 cannot do that: it records only what shows through the windows from where the player stands. RE, build 334925, not flown, `analysis\decomp\verify_20261106_concourse_probes.txt`:
 
 - **The game's probe views: not the route.** They come from an EnvMap state machine, at a placed probe's position (INFERRED). Their faces draw no rigs: layer 0x10 against rig masks of `cfg & 0xF` gives zero (READ). Their size, 256 with 8 mips, is a code constant (READ). Their output feeds the game's reflection cubes through global objects. To carry the station a face would need a rig mask write, an unidentified target and lighting passes, and a way to stay out of the reflections. ruled out as the small route, because of those.
 - **A chosen camera for whole frames: the smaller route, unproven.** `0x1EA9C0` is handed the render views and fills the view slots. A view's camera object is at `RV+0x310` (dirty byte `cam+0x230`). Editing it before `0x1EA9C0` should reach cull, LOD and the rig eval, and may reach the constant buffers, whose source was not found (INFERRED). The frame would still have to be kept from the player, which nobody has looked at. Appending a view is not small.
