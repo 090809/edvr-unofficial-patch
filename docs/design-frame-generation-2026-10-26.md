@@ -1260,7 +1260,11 @@ predicted period 11.1 ms, Elite at 57-59 fps unthrottled.
 
 ### 2026-11-07: Phase 2.3, flight 11, the first Lock flight (same build)
 
-`fix.frame_generation = on`, about 12 minutes. Pilot: "a slight flicker".
+`fix.frame_generation = on`, about 12 minutes. Pilot: "a slight flicker",
+and "a feeling of blur without blur" (sharp frames, smeared motion): read
+as the B replays (303 of 355 S slots show B again, turned only by the
+compositor) and the once-a-second engage/disengage cadence; to be compared
+once S fills the slots.
 `--health`: lock PARTIAL.
 
 - **Lock cycles:** 101 engages and 101 disengages; engaged 8 s in all. Each
