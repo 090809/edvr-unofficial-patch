@@ -2,9 +2,9 @@
 
 ## Status
 
-- **State (2026-11-07): Phase 1 slice FLOWN TWICE, world class failing** (fork
-  `framegen-phase1`; "flight 2" entry). In flight the world warp scores worse
-  than no warp, with the true transform too; W1, W2 ruled out. Design from OFXR-Bridge
+- **State (2026-11-07): Phase 1 slice FLOWN 3 TIMES** (fork
+  `framegen-phase1`; "flight 3" entry). In flight the camera rows' rigid
+  transform is not the world's image motion; EDVR's DLSS vectors are. Design from OFXR-Bridge
   `d7fcca72` and EDVR `6b8ef374`. No issue yet.
 - **Recommendation:** take OFXR-Bridge's frame loop, not its synthesizer. Elite
   renders at half the headset rate and EDVR's runtime presents every display
@@ -49,9 +49,9 @@
 - **Phase 0 (no EDVR code):** fly stock OFXR-Bridge and VectorXR (colour-only
   routes) over EDVR at a bright settlement and in space, with each runtime's
   own smoothing off and then on. This is the visual reference to beat.
-- **Next flight: Phase 1, measure only:** the world class's W3 (scored with
-  the DLSS vectors and at B's own depth; "flight 2" entry). H1, H8, H9 and
-  the surface classifier are still unbuilt.
+- **Next flight: Phase 1, measure only:** the world extrapolated per pixel
+  from A's own vectors ("flight 3" entry). H1, H8, H9 and the surface
+  classifier are still unbuilt.
 - **Temporary key (built 2026-11-07, hidden):** `fix.frame_generation_shadow`
   (off | on), Phase 1 only. The user key `fix.frame_generation` (off | auto)
   comes with Phase 2. Its `on` value (forced, ignoring the gate's performance
@@ -1005,3 +1005,35 @@ world path is the camera rows' `[W | tvCam]`, the oracle's own transform.
   error. Discriminator: score B backward with the DLSS motion vectors and
   with the true transform at B's own depth (no splat), and log how far the
   two land apart.
+
+### 2026-11-07: Phase 1, flight 3 (v0.22.0-rc.7-34-g2ebd6ecd, compile-only)
+
+Same site, about two minutes low and fast (`motion_mm` 0.4-6.4 m a frame),
+40-45 fps, celestial gated off; engine-record motion live. World p95,
+warped / unwarped (luma x 1024), per set:
+
+| set | world p95 | over 0.02 |
+|---|---|---|
+| predicted | 136-771 / 57-459 | 13-57% |
+| oracle (B's rows, splat) | same as predicted | same |
+| bdepth (B's rows, B's depth, no splat) | 136-771, a little worse | 17-56% |
+| mv (EDVR's DLSS vectors, B's depth) | 7-136 / 10-648 | 2-40% |
+
+`mvdis_world_px` (rows landing against DLSS-vector landing): p50 0.00, p95
+40-197 px (197 is the top bin). Cockpit: p50 0.00, p95 under 1 px.
+
+- ruled out: the scorer's capture and frame pairing, because the mv set
+  scores through the same captures and pairs and beats no warp.
+- ruled out: the forward splat, because bdepth (no splat) is no better
+  than the oracle.
+- **Finding:** for most world pixels the camera rows' `[W | tvCam]` and the
+  DLSS vectors agree exactly, but for a large share (over 5% of world
+  cells, often far more) they land 40-200+ px apart, and the vectors are
+  the ones that match the image. The vector pass gives those pixels
+  another motion (engine-record motion is live; which `decisionPath` was
+  not logged). So the world class cannot be extrapolated with one rigid
+  transform from the rows: the world in flight needs per-pixel motion.
+- **Next:** score a per-pixel extrapolation of the world from A's own
+  vectors (constant screen velocity, and constant 3D velocity from A's
+  vector and depth), and log the share of world pixels by the vector
+  pass's decision path.
