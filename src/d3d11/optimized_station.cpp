@@ -3125,8 +3125,8 @@ Hotkey* g_concHotkey = nullptr;
 Hotkey* g_viewHotkey = nullptr;
 std::string g_viewHotkeyText;
 bool g_viewHotkeyBound = false;
-// TEMPORARY (docs\concourse-cull-2026-11-05.md): the camera test. hotkey.concourse_camera_test steps g_camMode (cc::kCamTestMode*); the hook is on 0x1EA9C0 in
-// concourse_camera_test.cpp and is installed only when the key is bound, in the flat profile, on build 334925. Modes 2 to 5 act in a window the tick opens (g_camTimer).
+// TEMPORARY (docs\concourse-cull-2026-11-05.md): the camera test. hotkey.concourse_camera_test steps g_camMode (cc::kCamTestMode*); the hooks are in
+// concourse_camera_test.cpp (the write point is 0x283FA20) and install only when the key is bound, in the flat profile, on build 334925. Modes 2 and 3 act in a window the tick opens (g_camTimer).
 Hotkey* g_camHotkey = nullptr;
 std::string g_camHotkeyText;
 bool g_camHotkeyBound = false;
@@ -3201,28 +3201,59 @@ bool camTestInstall(const char* wher) {
     const char* why = nullptr;
     if (concourseCameraTestInstall(&why)) {
         g_camHooked = true;
-        Log::get().note("concourse camera test: %s: the hook on 0x1EA9C0 is installed (build 334925, TEMPORARY)", wher);
+        Log::get().note("concourse camera test: %s: the camera hooks are installed (build 334925, TEMPORARY; the first status line says which)", wher);
         return true;
     }
     Log::get().note("concourse camera test: %s: not installed: %s", wher, why ? why : "no reason given");
     return false;
 }
 
-// One status line from the hook snapshot. The first part is the fixed form; what follows tells the cases apart: never hooked (no line at all, or "hook calls 0"),
-// hooked and never acting ("camera written on 0"), acting with no effect (the slot minus written is not 0 when the camera did not take).
+// One status line from the hook snapshot. The first part is the fixed form; the rest tells the cases apart. NEVER RAN: "not installed", or "NOT CALLED" for a hook that is in.
+// RAN AND WROTE, NOTHING FOLLOWED: "written N" with the eye pose after the write, "RV cam minus eye pose after" not near 0 and flat camera origin steady. REACHED: that
+// difference near 0 (the RenderView camera took the moved pose) and, in the other lines, flat camera origin stepping about 30 m with a flat resolve reset event on a cut.
 void camTestLine(const char* tag, uint32_t mode) {
     ConcourseCameraTestSnap s;
     concourseCameraTestSnapshot(&s);
-    const unsigned long long dCalls = s.calls - g_camLast.calls, dActed = s.acted - g_camLast.acted;
-    Log::get().note("concourse camera test: mode %u: RV cam before %.2f %.2f %.2f, written %.2f %.2f %.2f; view slot +0x540 %.2f %.2f %.2f after the fill; rv count %u"
-                    " (%s: hook calls %llu since the last line%s, camera written on %llu of them, view 0 not found %llu total, several %llu total, faults %llu total; "
-                    "entries with flags&3 %u, view 0 flags 0x%X, slot %u flags 0x%X, slot %s, slot minus written %.2f %.2f %.2f; held writes put back %llu, overwritten by the game %llu total)",
-                    mode, static_cast<double>(s.before[0]), static_cast<double>(s.before[1]), static_cast<double>(s.before[2]), static_cast<double>(s.written[0]),
-                    static_cast<double>(s.written[1]), static_cast<double>(s.written[2]), static_cast<double>(s.slot[0]), static_cast<double>(s.slot[1]), static_cast<double>(s.slot[2]),
-                    s.rvCount, tag, dCalls, dCalls == 0 ? " (THE HOOK WAS NOT CALLED)" : "", dActed, static_cast<unsigned long long>(s.noView0),
-                    static_cast<unsigned long long>(s.multiView), static_cast<unsigned long long>(s.faults), s.mainCount, s.flags, s.slotIndex, s.slotFlags,
-                    s.slotKnown ? "read" : "NOT read", static_cast<double>(s.slot[0] - s.written[0]), static_cast<double>(s.slot[1] - s.written[1]),
-                    static_cast<double>(s.slot[2] - s.written[2]), static_cast<unsigned long long>(s.heldPutBack), static_cast<unsigned long long>(s.heldRewritten));
+    static const char* const kNames[ConcourseCameraTestSnap::kCalls] = {"0x1EA9C0", "0x2874760", "0x2845730", "0x283FA20"};
+    char calls[360];
+    size_t at = 0;
+    calls[0] = 0;
+    for (int i = 0; i < ConcourseCameraTestSnap::kCalls && at + 60 < sizeof(calls); ++i) {
+        const unsigned long long d = s.calls[i] - g_camLast.calls[i];
+        if (((s.hookMask >> i) & 1u) == 0) at += static_cast<size_t>(std::snprintf(calls + at, sizeof(calls) - at, "%s not installed; ", kNames[i]));
+        else if (d == 0) at += static_cast<size_t>(std::snprintf(calls + at, sizeof(calls) - at, "%s NOT CALLED; ", kNames[i]));
+        else at += static_cast<size_t>(std::snprintf(calls + at, sizeof(calls) - at, "%s %llu; ", kNames[i], d));
+    }
+    char hist[200];
+    size_t hat = 0;
+    hist[0] = 0;
+    for (int i = 0; i < ConcourseCameraTestSnap::kHist && s.histRet[i] != 0 && hat + 40 < sizeof(hist); ++i)
+        hat += static_cast<size_t>(std::snprintf(hist + hat, sizeof(hist) - hat, "0x%X x%llu ", s.histRet[i], static_cast<unsigned long long>(s.histN[i])));
+    char sites[120];
+    size_t sat = 0;
+    sites[0] = 0;
+    for (int i = 0; i < ConcourseCameraTestSnap::kEyeSites && s.eyeSiteRet[i] != 0 && sat + 30 < sizeof(sites); ++i)
+        sat += static_cast<size_t>(std::snprintf(sites + sat, sizeof(sites) - sat, "0x%X x%llu ", s.eyeSiteRet[i], static_cast<unsigned long long>(s.eyeSiteN[i])));
+    char flow[160];
+    if (s.calls[2] == 0) std::snprintf(flow, sizeof(flow), "0x2845730 has never run");
+    else if (s.mailKnown) std::snprintf(flow, sizeof(flow), "pass last %u seen mask 0x%X, mailbox t %.2f %.2f %.2f %s", s.passLast, s.passMask, static_cast<double>(s.mailT[0]), static_cast<double>(s.mailT[1]),
+                                        static_cast<double>(s.mailT[2]), s.mailIdentity ? "= the reset value" : "is NOT the reset value");
+    else std::snprintf(flow, sizeof(flow), "pass last %u seen mask 0x%X, mailbox not read", s.passLast, s.passMask);
+    char who[120];
+    if (s.mainRet != 0) std::snprintf(who, sizeof(who), "view 0 camera handed over by the call at 0x%X", s.mainRet);
+    else std::snprintf(who, sizeof(who), "the call that handed view 0 its camera was not seen");
+    const unsigned long long dWritten = s.eyeWritten - g_camLast.eyeWritten, dRefused = s.eyeRefused - g_camLast.eyeRefused;
+    Log::get().note("concourse camera test: mode %u: eye pose before %.2f %.2f %.2f, after %.2f %.2f %.2f (forward row %.2f %.2f %.2f -> %.2f %.2f %.2f); RV cam %.2f %.2f %.2f; "
+                    "view slot +0x540 %.2f %.2f %.2f after the fill; rv count %u (%s: calls this interval: %swritten %llu, refused %llu (last why %u); RV cam minus eye pose after %.2f %.2f %.2f; "
+                    "%s; %s; return sites %s; eye call sites %s; entries with flags&3 %u, view 0 flags 0x%X, slot %u flags 0x%X, slot %s, view 0 not found %llu total, several %llu total, faults %llu total)",
+                    mode, static_cast<double>(s.eyeBefore[12]), static_cast<double>(s.eyeBefore[13]), static_cast<double>(s.eyeBefore[14]), static_cast<double>(s.eyeAfter[12]),
+                    static_cast<double>(s.eyeAfter[13]), static_cast<double>(s.eyeAfter[14]), static_cast<double>(s.eyeBefore[8]), static_cast<double>(s.eyeBefore[9]),
+                    static_cast<double>(s.eyeBefore[10]), static_cast<double>(s.eyeAfter[8]), static_cast<double>(s.eyeAfter[9]), static_cast<double>(s.eyeAfter[10]),
+                    static_cast<double>(s.rvPos[0]), static_cast<double>(s.rvPos[1]), static_cast<double>(s.rvPos[2]), static_cast<double>(s.slot[0]), static_cast<double>(s.slot[1]),
+                    static_cast<double>(s.slot[2]), s.rvCount, tag, calls, dWritten, dRefused, s.refusedHow, static_cast<double>(s.rvPos[0] - s.eyeAfter[12]),
+                    static_cast<double>(s.rvPos[1] - s.eyeAfter[13]), static_cast<double>(s.rvPos[2] - s.eyeAfter[14]), flow, who, hist[0] ? hist : "none yet", sites[0] ? sites : "none yet", s.mainCount, s.flags,
+                    s.slotIndex, s.slotFlags, s.slotKnown ? "read" : "NOT read", static_cast<unsigned long long>(s.noView0), static_cast<unsigned long long>(s.multiView),
+                    static_cast<unsigned long long>(s.faults));
     g_camLast = s;
 }
 

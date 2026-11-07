@@ -577,22 +577,18 @@ private:
     LiftEnd end_ = LiftEnd::kNone;
 };
 
-// ---- The camera test (TEMPORARY, docs\concourse-cull-2026-11-05.md): does moving view 0's camera before 0x1EA9C0 reach cull, draws, constants and image? -----------
-// Modes 2 to 5 act for kCamTestMs from the tick the lift gate first goes on in a ride, once per ride. The window has its own timer and the gate is not stepped
+// ---- The camera test (TEMPORARY, docs\concourse-cull-2026-11-05.md): does moving the pose that goes into the eye camera builder (0x283FA20) move the picture? ------------
+// Modes 2 and 3 act for kCamTestMs from the tick the lift gate first goes on in a ride, once per ride. The window has its own timer and the gate is not stepped
 // meanwhile (a moved camera would drop it at once: it reads the camera's distance to the cabin). The decision is here so a table can pin it.
-constexpr uint64_t kCamTestMs = 3000;      // how long modes 2 to 5 act
+constexpr uint64_t kCamTestMs = 3000;      // how long modes 2 and 3 act
 constexpr uint64_t kCamTestLogMs = 250;    // the acting lines' spacing
-// Modes 4 and 5 are 2 and 3 with the write held for the whole frame, put back only at the next call: whatever reads the camera after the view builder returns (the constant
-// buffers' source is not known) then sees the moved camera too, so a picture that does not follow in 2 and 3 can be told from one that cannot follow at all.
-constexpr uint32_t kCamTestModeOff = 0, kCamTestModeLog = 1, kCamTestModeLift = 2, kCamTestModeTurn = 3, kCamTestModeLiftHeld = 4, kCamTestModeTurnHeld = 5, kCamTestModes = 6;
+constexpr uint32_t kCamTestModeOff = 0, kCamTestModeLog = 1, kCamTestModeLift = 2, kCamTestModeTurn = 3, kCamTestModes = 4;
 inline uint32_t camTestNextMode(uint32_t m) noexcept { return (m + 1) % kCamTestModes; }
 inline const char* camTestModeName(uint32_t m) noexcept {
     switch (m) {
         case kCamTestModeLog: return "log only";
-        case kCamTestModeLift: return "lift 30 m";
-        case kCamTestModeTurn: return "turn 90 degrees";
-        case kCamTestModeLiftHeld: return "lift 30 m, held";
-        case kCamTestModeTurnHeld: return "turn 90 degrees, held";
+        case kCamTestModeLift: return "lift 30 m at the eye pose";
+        case kCamTestModeTurn: return "turn 90 degrees at the eye pose";
         default: return "off";
     }
 }
@@ -612,7 +608,7 @@ public:
     // another room. Returns whether the window is open after this tick; `*ended` is set only on the tick it closes.
     bool step(uint32_t mode, bool gateOn, const LiftReading& r, bool cut, uint64_t nowMs, CamTestEnd* ended) noexcept {
         if (ended) *ended = CamTestEnd::kNone;
-        const bool acts = mode >= kCamTestModeLift && mode < kCamTestModes;
+        const bool acts = mode == kCamTestModeLift || mode == kCamTestModeTurn;
         if (active_) {
             CamTestEnd why = CamTestEnd::kNone;
             if (!acts) why = CamTestEnd::kModeOff;

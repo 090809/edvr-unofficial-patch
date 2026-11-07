@@ -3900,15 +3900,14 @@ int main(int argc, char** argv) {
                 check(c.step(cc::kCamTestModeLift, false, LiftReading{true, 0.9f, false, 9.0f, 9.0f}, false, 13100, &e) && e == CamTestEnd::kNone, "camera test: unknown doors do not close it");
                 check(!c.step(cc::kCamTestModeOff, false, shut, false, 13200, &e) && e == CamTestEnd::kModeOff, "camera test: the mode turned off closes it");
                 check(c.stop() == false && !c.usedThisRide(), "camera test: stop when closed is a no-op and forgets the ride");
-                check(cc::camTestNextMode(0) == 1 && cc::camTestNextMode(1) == 2 && cc::camTestNextMode(2) == 3 && cc::camTestNextMode(3) == 4 && cc::camTestNextMode(4) == 5 && cc::camTestNextMode(5) == 0,
-                      "camera test: the key steps off, log only, lift, turn, lift held, turn held, off");
+                check(cc::camTestNextMode(0) == 1 && cc::camTestNextMode(1) == 2 && cc::camTestNextMode(2) == 3 && cc::camTestNextMode(3) == 0,
+                      "camera test: the key steps off, log only, lift at the eye pose, turn at the eye pose, off");
                 {
-                    CamTestTimer held;
-                    check(held.step(cc::kCamTestModeLiftHeld, true, shut, false, 20000, &e) && held.active(), "camera test: mode 4 (lift, held) opens the window");
-                    check(!held.step(cc::kCamTestModeLiftHeld, false, shut, false, 20000 + cc::kCamTestMs, &e) && e == CamTestEnd::kTime, "camera test: mode 4 closes at the limit");
-                    check(!held.step(cc::kCamTestModeLiftHeld, false, shut, false, 20000 + cc::kCamTestMs + 100, &e), "camera test: the gate off ends the ride in mode 4");
-                    check(held.step(cc::kCamTestModeTurnHeld, true, shut, false, 30000, &e) && held.active(), "camera test: mode 5 (turn, held) opens the window");
-                    check(!held.step(cc::kCamTestModes, false, shut, false, 30100, &e) && e == CamTestEnd::kModeOff, "camera test: a mode past the last does not act");
+                    CamTestTimer past;
+                    check(!past.step(cc::kCamTestModes, true, shut, false, 20000, &e) && !past.active(), "camera test: a mode past the last does not open the window");
+                    check(std::strcmp(cc::camTestModeName(2), "lift 30 m at the eye pose") == 0 && std::strcmp(cc::camTestModeName(3), "turn 90 degrees at the eye pose") == 0 &&
+                              std::strcmp(cc::camTestModeName(1), "log only") == 0 && std::strcmp(cc::camTestModeName(0), "off") == 0,
+                          "camera test: the toast names the write point");
                 }
             }
         }
