@@ -26,6 +26,7 @@
 #include "logbundle.h"
 #include "mirror.h"
 #include "payload.h"
+#include "product_title.h"
 #include "settings.h"
 #include "settings_view.h"
 #include "ui.h"
@@ -64,12 +65,6 @@ enum : int {
 };
 
 const UINT kMsgFirstScan = WM_APP + 1;
-
-#ifdef EDUP_LAUNCHER
-const wchar_t* kAppTitle = L"ED-UP launcher";
-#else
-const wchar_t* kAppTitle = L"ED-UP installer";
-#endif
 
 const wchar_t* kTipUrl = L"https://ko-fi.com/seancharacterecho";
 const wchar_t* kDiscordUrl = L"https://discord.gg/AWJ6djKKzr";
@@ -703,8 +698,8 @@ void paintWindow(HWND window) {
     const ui::Fonts& f = ui::fonts();
     ui::fillRect(dc, client, t.windowBg);
 
-    RECT title{dp(kMargin), dp(18), dp(400), dp(50)};
-    ui::drawText(dc, L"ED-UP", title, f.title, t.text, DT_LEFT | DT_SINGLELINE);
+    RECT title{dp(kMargin), dp(18), dp(kClientWidth - kMargin), dp(50)};
+    ui::drawText(dc, kProductTitle, title, f.title, t.text, DT_LEFT | DT_SINGLELINE);
 
 #ifdef EDUP_LAUNCHER
     const std::wstring subtitle = launcherSubtitle();

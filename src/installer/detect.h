@@ -28,9 +28,14 @@ struct GameInstall {
     bool odyssey = false;    // Odyssey rather than the Horizons build
 };
 
-// Every install this machine can be shown to have, Odyssey first. Confirmed by
-// the executable, deduplicated by path.
+// Every supported install this machine can be shown to have, Odyssey first.
+// Confirmed by the executable, deduplicated by path. Legacy installs are left out,
+// because no build of this mod supports them. Browse can still reach one, and the
+// planner then says why it refuses.
 std::vector<GameInstall> findInstalls();
+
+// `installs` without those whose EliteDangerous64.exe `isLegacyExe` says is legacy.
+std::vector<GameInstall> withoutLegacyInstalls(const std::vector<GameInstall>& installs, bool (*isLegacyExe)(const std::wstring&));
 
 // The folders Frontier's launcher may be installed in: what its installer recorded
 // in the registry, then its default places. The store keeps the game under the

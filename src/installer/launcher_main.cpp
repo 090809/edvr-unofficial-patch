@@ -12,6 +12,7 @@
 #include "launcher_state.h"
 #include "mirror.h"
 #include "probe.h"
+#include "product_title.h"
 #include "selfupdate.h"
 #include "update_http.h"
 #include "update_keys.h"
@@ -58,7 +59,7 @@ public:
 
     void finish() {
         if (!console_ && !collected_.empty())
-            MessageBoxW(nullptr, fromUtf8(collected_).c_str(), L"ED-UP launcher", MB_OK | MB_ICONINFORMATION);
+            MessageBoxW(nullptr, fromUtf8(collected_).c_str(), kAppTitle, MB_OK | MB_ICONINFORMATION);
     }
 
 private:

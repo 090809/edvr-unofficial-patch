@@ -89,9 +89,10 @@ gets a 404 on `issues/<n>`, because that page redirects only for a browser's
 `Accept` header, so test those links with one. The redirects stop if a repo is ever
 created as `edvr-unofficial-patch` under this account, so that name is never reused.
 
-What users see follows the new name, once a display name is settled: the README
-title, release titles, ZIP and exe names, `ProductName`, `CompanyName` and window
-text. What code and existing installs rely on stays: `edvr.ini`, `edvr-flat.ini`,
+What users see follows the new name: the README title, release titles, ZIP and exe
+names, `ProductName`, `CompanyName` and window text. The window's heading and title
+bar read "Elite: Dangerous Unofficial Patch" (the maintainer's choice, 2026-11-07), and
+its running text keeps ED-UP. What code and existing installs rely on stays: `edvr.ini`, `edvr-flat.ini`,
 the `edvr_*` exports the planner recognises, `%LOCALAPPDATA%\EDVR`, `edvr_install\`
 and log file names. Dated docs keep their old links, which redirect.
 

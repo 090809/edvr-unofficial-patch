@@ -9,6 +9,8 @@
 #include <set>
 #include <vector>
 
+#include "probe.h"
+
 namespace edvr::installer {
 namespace {
 
@@ -466,6 +468,14 @@ GameRunState gameRunState(const std::wstring& gameDir) { return runStateOf(kGame
 
 std::vector<std::wstring> frontierLauncherRoots() { return frontierInstallRoots(); }
 
+std::vector<GameInstall> withoutLegacyInstalls(const std::vector<GameInstall>& installs, bool (*isLegacyExe)(const std::wstring&)) {
+    std::vector<GameInstall> kept;
+    for (const GameInstall& gi : installs) {
+        if (!isLegacyExe(joinPath(gi.dir, kGameExe))) kept.push_back(gi);
+    }
+    return kept;
+}
+
 std::vector<GameInstall> findInstalls() {
     std::vector<GameInstall> found;
     findSteam(&found);
@@ -482,13 +492,12 @@ std::vector<GameInstall> findInstalls() {
         unique.push_back(gi);
     }
 
-    // Odyssey first: it is what EDVR is for, and on a machine with both
-    // products the Horizons folder is the wrong answer offered by default.
+    // Odyssey first, for a folder whose executable does not settle which it is.
     std::stable_sort(unique.begin(), unique.end(),
                      [](const GameInstall& a, const GameInstall& b) {
                          return a.odyssey && !b.odyssey;
                      });
-    return unique;
+    return withoutLegacyInstalls(unique, eliteExeIsLegacy);
 }
 
 bool nvidiaAdapterPresent(std::wstring* name) {
