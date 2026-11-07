@@ -1,0 +1,146 @@
+#pragma once
+// The frame-generation synthesizer's geometry (fix.frame_generation_shadow, TEMPORARY; docs/design-frame-generation-2026-10-26.md, Phase 2.1, "The synthesis pass" and
+// "Motion model"). Pure: the constant block the shaders read, the head's motion from B to S, the stats words, and a CPU reference of one B pixel's landing in S that the
+// WARP rig (tools\framegen_synth_test) holds the shaders to. Conventions are framegen_shadow_math.h's.
+//
+// Motion of a B pixel p (render pixels, centres at integers) to S, f the fraction of B's frame step that S is ahead (Elite's step A to B is two display periods in
+// Lock: f = 0.5 for the S a later phase shows; f = 1 lands on the next real frame's time, which is what is scored):
+//   the head B to S   Hd_B (the pass's head delta) maps B's eye space to A's, x_A = Hd x_B + th, so the head's own forward step A to B is Hd^T (translation -Hd^T th).
+//                     Carried on at constant velocity: the rotation is the f-th power of Hd^T (axis-angle scaled by f), the translation f * (-Hd^T th). This is the fallback
+//                     until the runtime's slot pose (Phase 2.2) replaces it.
+//   cockpit           (the class by B's dilated depth and the pass's split): the rigid head step with B's depth, carried and projected with B's tangents both sides.
+//   far and world     (ex2dh, the flight 5 winner): with the DLSS vector mvB at the pixel (B to A, jitter cancelled): pHeadPrev is the pixel's direction turned by the head's
+//                     B-to-A rotation Hd and projected with B's tangents (A's head turn removed), m = (p + mvB) - pHeadPrev is the ship's screen motion over one Elite step,
+//                     pShip = p - f m (B's side of the step reversed), and the head's step to S turns pShip's direction and projects it.
+#include "framegen_shadow_math.h"
+#include "framegen_synth_report.h"
+
+#include <cmath>
+#include <cstdint>
+
+namespace edvr {
+
+// The synthesizer's constant buffer (b0 of every entry), laid out for the HLSL cbuffer P in src\d3d11\framegen_synth_shader.h: 10 rows of 16 bytes.
+struct FrameGenSynthCb {
+    int32_t sz[4];     // render width, render height, output width, output height
+    int32_t qz[4];     // quarter grid width, height, 0, 0
+    float tanB[4];     // this frame's tangents (left, right, bottom, top), jitter excluded
+    float dk[4];       // the depth encoding's A and B (depth = A + B / z), the ship's split in metres, f
+    float rs[3][4];    // the head's step B to S: rotation rows (xyz), w the translation component
+    float hp[3][4];    // the head's rotation B to A (the pass's Hd), xyz of each row
+};
+static_assert(sizeof(FrameGenSynthCb) == 160, "the synthesizer's cbuffer is 10 16-byte rows");
+
+// The stats words: the score against C (frameGenDecodeBlock's layout: three classes, holes, cells = 299 words), then the render pixels the background filled, the holes left, and
+// the reads the guard moved.
+constexpr uint32_t kFrameGenSynthStatsFilled = kFrameGenShadowStatsBlockUints;
+constexpr uint32_t kFrameGenSynthStatsLeft = kFrameGenSynthStatsFilled + 1;
+constexpr uint32_t kFrameGenSynthStatsGuard = kFrameGenSynthStatsFilled + 2;
+constexpr uint32_t kFrameGenSynthStatsUints = kFrameGenSynthStatsFilled + 3;   // 302
+
+// The rotation R raised to the power f (axis-angle scaled by f, through the quaternion, so a turn of any size is the short way round); R row-major.
+inline void frameGenSynthRotationPow(const float R[9], float f, float out[9]) {
+    double w, x, y, z;
+    const double tr = static_cast<double>(R[0]) + R[4] + R[8];
+    if (tr > 0.0) {
+        const double s = std::sqrt(tr + 1.0) * 2.0;
+        w = 0.25 * s; x = (R[7] - R[5]) / s; y = (R[2] - R[6]) / s; z = (R[3] - R[1]) / s;
+    } else if (R[0] > R[4] && R[0] > R[8]) {
+        const double s = std::sqrt(1.0 + R[0] - R[4] - R[8]) * 2.0;
+        w = (R[7] - R[5]) / s; x = 0.25 * s; y = (R[1] + R[3]) / s; z = (R[2] + R[6]) / s;
+    } else if (R[4] > R[8]) {
+        const double s = std::sqrt(1.0 + R[4] - R[0] - R[8]) * 2.0;
+        w = (R[2] - R[6]) / s; x = (R[1] + R[3]) / s; y = 0.25 * s; z = (R[5] + R[7]) / s;
+    } else {
+        const double s = std::sqrt(1.0 + R[8] - R[0] - R[4]) * 2.0;
+        w = (R[3] - R[1]) / s; x = (R[2] + R[6]) / s; y = (R[5] + R[7]) / s; z = 0.25 * s;
+    }
+    if (w < 0.0) { w = -w; x = -x; y = -y; z = -z; }
+    const double v = std::sqrt(x * x + y * y + z * z);
+    if (v < 1e-12) {
+        for (int i = 0; i < 9; ++i) out[i] = (i % 4 == 0) ? 1.0f : 0.0f;
+        return;
+    }
+    const double half = std::atan2(v, w) * static_cast<double>(f);
+    const double c = std::cos(half), sv = std::sin(half) / v;
+    w = c; x *= sv; y *= sv; z *= sv;
+    out[0] = static_cast<float>(1.0 - 2.0 * (y * y + z * z)); out[1] = static_cast<float>(2.0 * (x * y - z * w)); out[2] = static_cast<float>(2.0 * (x * z + y * w));
+    out[3] = static_cast<float>(2.0 * (x * y + z * w)); out[4] = static_cast<float>(1.0 - 2.0 * (x * x + z * z)); out[5] = static_cast<float>(2.0 * (y * z - x * w));
+    out[6] = static_cast<float>(2.0 * (x * z - y * w)); out[7] = static_cast<float>(2.0 * (y * z + x * w)); out[8] = static_cast<float>(1.0 - 2.0 * (x * x + y * y));
+}
+
+// The head's step from B to S at fraction f: x_S = rot x_B + t. `head` is B's head delta (backward, B to A: x_A = Hd x_B + th).
+inline void frameGenSynthHeadStep(const FrameGenDeltas& head, float f, float rot[9], float t[3]) {
+    float fwd[9], tf[3];
+    temporalTranspose3(head.Hd, fwd);                  // the forward step A to B
+    temporalApply3(fwd, head.th, tf);                  // its translation is -fwd * th
+    frameGenSynthRotationPow(fwd, f, rot);
+    for (int i = 0; i < 3; ++i) t[i] = -f * tf[i];
+}
+
+inline void frameGenSynthFillCb(FrameGenSynthCb& cb, uint32_t renderW, uint32_t renderH, uint32_t outW, uint32_t outH, const float tanB[4], float depthA, float depthB,
+                                float splitMetres, float f, const FrameGenDeltas& head) {
+    cb = FrameGenSynthCb{};
+    cb.sz[0] = static_cast<int32_t>(renderW);
+    cb.sz[1] = static_cast<int32_t>(renderH);
+    cb.sz[2] = static_cast<int32_t>(outW);
+    cb.sz[3] = static_cast<int32_t>(outH);
+    cb.qz[0] = static_cast<int32_t>((renderW + 3u) / 4u);
+    cb.qz[1] = static_cast<int32_t>((renderH + 3u) / 4u);
+    for (int i = 0; i < 4; ++i) cb.tanB[i] = tanB[i];
+    cb.dk[0] = depthA;
+    cb.dk[1] = depthB;
+    cb.dk[2] = splitMetres;
+    cb.dk[3] = f;
+    float rot[9], t[3];
+    frameGenSynthHeadStep(head, f, rot, t);
+    for (int r = 0; r < 3; ++r) {
+        for (int k = 0; k < 3; ++k) {
+            cb.rs[r][k] = rot[r * 3 + k];
+            cb.hp[r][k] = head.Hd[r * 3 + k];
+        }
+        cb.rs[r][3] = t[r];
+    }
+}
+
+// Decodes one eye's stats words. `scored` says the score block holds a pass (a frame that scored nothing leaves it zero, and the decode leaves cells 0).
+inline void frameGenSynthDecodeStats(const uint32_t* s, FrameGenSynthEyeResult& out) {
+    out = FrameGenSynthEyeResult{};
+    uint64_t holes = 0;
+    frameGenDecodeBlock(s, out.cls, holes, out.cells);
+    out.filled = s[kFrameGenSynthStatsFilled];
+    out.left = s[kFrameGenSynthStatsLeft];
+    out.guard = s[kFrameGenSynthStatsGuard];
+}
+
+// The CPU reference of the shader's target for a B pixel (px, py) of depth zMetres (farPlane: no depth) and vector (mvx, mvy): where it lands in S, in render pixels, and its class
+// (0 far plane, 1 cockpit, 2 world). False when the landing is behind the eye. Evaluates the same closed form as fgSynTarget in framegen_synth_shader.h.
+inline bool frameGenSynthTarget(const FrameGenSynthCb& cb, float px, float py, float zMetres, bool farPlane, float mvx, float mvy, float pp[2], int* clsOut = nullptr) {
+    const uint32_t w = static_cast<uint32_t>(cb.sz[0]), h = static_cast<uint32_t>(cb.sz[1]);
+    const int cls = farPlane ? 0 : (zMetres > cb.dk[2] ? 2 : 1);
+    if (clsOut) *clsOut = cls;
+    float d[3];
+    temporalPixelToDir(px, py, cb.tanB, w, h, d);
+    float rot[9], hd[9];
+    for (int r = 0; r < 3; ++r)
+        for (int k = 0; k < 3; ++k) {
+            rot[r * 3 + k] = cb.rs[r][k];
+            hd[r * 3 + k] = cb.hp[r][k];
+        }
+    if (cls == 1) {
+        float dp[3];
+        temporalApply3(rot, d, dp);
+        for (int i = 0; i < 3; ++i) dp[i] = dp[i] * zMetres + cb.rs[i][3];
+        return temporalDirToPixel(dp, cb.tanB, w, h, &pp[0], &pp[1]);
+    }
+    float dh[3], head[2];
+    temporalApply3(hd, d, dh);
+    if (!temporalDirToPixel(dh, cb.tanB, w, h, &head[0], &head[1])) return false;
+    const float mx = (px + mvx) - head[0], my = (py + mvy) - head[1];
+    float ds[3], dr[3];
+    temporalPixelToDir(px - cb.dk[3] * mx, py - cb.dk[3] * my, cb.tanB, w, h, ds);
+    temporalApply3(rot, ds, dr);
+    return temporalDirToPixel(dr, cb.tanB, w, h, &pp[0], &pp[1]);
+}
+
+}  // namespace edvr

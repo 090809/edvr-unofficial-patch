@@ -2123,6 +2123,22 @@ if errorlevel 1 ( echo [edvr] ERROR: framegen_shadow_test build failed & exit /b
 "%OBJ%\framegenshadow\framegen_shadow_test.exe" --self-test || exit /b 1
 exit /b 0
 
+:rig_framegen_synth_report_test
+echo [edvr] === framegen_synth_report_test.exe ===
+REM The frame-generation synthesizer's pure half (src\common\framegen_synth_report.h and framegen_synth_math.h; fix.frame_generation_shadow, TEMPORARY): the armed and report lines'
+REM exact text, the window's merge, the stats decode, the head's step from B to S (a rotation raised to the power f), the constant block and the CPU reference of a pixel's landing.
+REM Needs no GPU.
+if not exist "%OBJ%\framegensynthreport" mkdir "%OBJ%\framegensynthreport"
+%CC% /nologo /O2 /MT /std:c++17 /EHsc /W4 /DWIN32_LEAN_AND_MEAN /DNOMINMAX ^
+    /D_CRT_SECURE_NO_WARNINGS /I"src\common" ^
+    /Fo"%OBJ%\framegensynthreport"\ /Fe"%OBJ%\framegensynthreport\framegen_synth_report_test.exe" ^
+    "tools\framegen_synth_report_test\framegen_synth_report_test.cpp" ^
+    /link /INCREMENTAL:NO
+if errorlevel 1 ( echo [edvr] ERROR: framegen_synth_report_test build failed & exit /b 1 )
+"%OBJ%\framegensynthreport\framegen_synth_report_test.exe" --dry-run || exit /b 1
+"%OBJ%\framegensynthreport\framegen_synth_report_test.exe" --self-test || exit /b 1
+exit /b 0
+
 :rig_ui_depth
 echo [edvr] === private UI depth regression ===
 REM Keep the executable away from build\d3d11.dll: these tests use system
