@@ -49,8 +49,8 @@
 - **Phase 0 (no EDVR code):** fly stock OFXR-Bridge and VectorXR (colour-only
   routes) over EDVR at a bright settlement and in space, with each runtime's
   own smoothing off and then on. This is the visual reference to beat.
-- **Next: Phase 2.3 built, not flown** (Lock 2:1 in the runtime, S shown;
-  runtime lines `frame generation lock:`, `--health` rule of that name).
+- **Next: fly the flight 11 fix** (the game's frame sequences skip the S slots;
+  `frame generation lock: replayed B:` names each replay). Lock 2:1 flown once.
   H1, H8, H9 and the surface classifier are still unbuilt; on foot unflown.
 - **Temporary keys (hidden):** `fix.frame_generation_shadow` (off | on), and
   `fix.frame_generation` (off | on; built 2.3: `on` forces Lock, for A/B
@@ -1257,6 +1257,45 @@ predicted period 11.1 ms, Elite at 57-59 fps unthrottled.
   scanner are present in every S, aligned with the cockpit, text as crisp
   as B's; terrain marginally softer.
 - **Next:** the first Lock flight.
+
+### 2026-11-07: Phase 2.3, flight 11 diagnosed: the S slots broke the d3d11 half's history (built, not flown)
+
+- **Cause, from the flight's own logs and reproduced in the rig:** each S slot
+  that begins takes one of the session's frame sequences, so the game's
+  engaged frames were numbered b, b + 2, b + 4. The d3d11 half reads a gap as
+  a dropped frame (native_temporal.cpp: `continuity + 1 != seq` resets the
+  eye's history); with no head delta the temporal pass writes no depth, and
+  the synthesizer skips the build. So no S existed for any engaged pair but the
+  one built before engaging. Field signature: the graphics log's synth
+  `skipped=` is exactly two per engaged real pair in every burst second (8 for
+  `slots=4/4`, 6 for 3, 0 with no burst). `produced = consumed` held because
+  only S that was built is counted, and four missing pairs in a second do not
+  show against 80.
+- **ruled out: the slot matching S by the wrong sequence, because** the slot
+  asks for `lastPairSequence` and S carries `fs.sequence`, both the same
+  `activeFrameSequence` of the same pair; the rig's first replayed slot asks
+  for pair n + 2 while the copy holds n, and the reason is `not_built`, never
+  `seq_mismatch`. The sequence skip was the root, through the history, not
+  the match.
+- **Also ruled out for this flight:** S consumed after the slot composes
+  (not_consumed would need a built S); the d3d11 half learning Lock a frame
+  late (Lock's slot is handed before the treat of the same pair); the shadow
+  key's alternation (it decides only whether the first slot shows S: 1/3 or
+  0/3, as flown); the finish and door order (s_unfinished would have said it);
+  the pose (`pose=` all runtime).
+- **Fix:** the runtime numbers the game's frames without the S slots'
+  sequences (`FrameGenGameSequence`, framegen_lock.h; reset at a session
+  restart only). No S slot: the session's numbering exactly.
+- **Rig** (openxr_frame_test, `delivery()`): the host's S bookkeeping and the
+  d3d11 continuity, cut to sequences, against the fake runtime: 72 engaged
+  pairs, every S slot shows S. Flight 11's build (the mutant) gives S, B, B, B,
+  then `no_s`, twice: `s_from=2/6`. Reverting the fix fails three checks.
+- **Instrument:** after a one-second line with B replayed, `frame generation
+  lock: replayed B: not_built= kept= busy= unfinished= not_consumed=
+  seq_mismatch= (asked N had M) no_pose= format= adopt=`; `--health` sums it.
+- **Next flight's signature:** `s_from` near `slots`, no `no_s` disengage, synth
+  `skipped=` 0 while engaged, and the native temporal resets not climbing per
+  engaged pair.
 
 ### 2026-11-07: Phase 2.3, flight 11, the first Lock flight (same build)
 
