@@ -2,9 +2,9 @@
 
 ## Status
 
-- **State (2026-11-07): Phase 1 slice FLOWN 3 TIMES** (fork
-  `framegen-phase1`; "flight 3" entry). In flight the camera rows' rigid
-  transform is not the world's image motion; EDVR's DLSS vectors are. Design from OFXR-Bridge
+- **State (2026-11-07): Phase 1 slice FLOWN 4 TIMES** (fork
+  `framegen-phase1`; "flight 4" entry). The world in flight extrapolates
+  from A's own vectors (ex2d), not from the camera rows; fast turns fail. Design from OFXR-Bridge
   `d7fcca72` and EDVR `6b8ef374`. No issue yet.
 - **Recommendation:** take OFXR-Bridge's frame loop, not its synthesizer. Elite
   renders at half the headset rate and EDVR's runtime presents every display
@@ -49,9 +49,9 @@
 - **Phase 0 (no EDVR code):** fly stock OFXR-Bridge and VectorXR (colour-only
   routes) over EDVR at a bright settlement and in space, with each runtime's
   own smoothing off and then on. This is the visual reference to beat.
-- **Next flight: Phase 1, measure only:** the world extrapolated per pixel
-  from A's own vectors ("flight 3" entry). H1, H8, H9 and the surface
-  classifier are still unbuilt.
+- **Next flight: Phase 1, measure only:** ex2d with the head's turn taken
+  out and the true head put in ("flight 4" entry). H1, H8, H9 and the
+  surface classifier are still unbuilt.
 - **Temporary key (built 2026-11-07, hidden):** `fix.frame_generation_shadow`
   (off | on), Phase 1 only. The user key `fix.frame_generation` (off | auto)
   comes with Phase 2. Its `on` value (forced, ignoring the gate's performance
@@ -1037,6 +1037,35 @@ warped / unwarped (luma x 1024), per set:
   vectors (constant screen velocity, and constant 3D velocity from A's
   vector and depth), and log the share of world pixels by the vector
   pass's decision path.
+
+### 2026-11-07: Phase 1, flight 4 (v0.22.0-rc.7-38-gaaf7f861, compile-only)
+
+Same site, about two minutes low and fast (`motion_mm` 0.4-11 m a frame),
+with turns. World p95 (luma x 1024), typical seconds, warped / unwarped:
+
+| set | world p95 | over 0.02 |
+|---|---|---|
+| rows, predicted | 81-648 | 11-60% |
+| mv (B's own vectors: the ceiling) | 24-115 / 34-545 | 7-36% |
+| ex2d (A's vectors, constant screen velocity) | 29-229 | 8-57% |
+| ex3d (A's vectors and depths, constant 3D velocity) | as ex2d, a little worse | |
+
+`rowsoff_world` (rows and B's vectors more than 4 px apart): 16-60% of
+world cells; `rowsoff_cockpit` 0.2-5%.
+
+- **ex2d works for the world in flight:** within 1-2 bins of the mv ceiling
+  in steady flight, and below no warp in most seconds. It fails in fast
+  turns (12:24:11-13: ex2d 324-459 / mv 68-81 / no warp 545), where the
+  screen velocity changes between frames.
+- ruled out: constant 3D velocity as an improvement over constant screen
+  velocity at this site, because ex3d never beats ex2d by a bin.
+- **Cockpit:** ex2d cockpit p95 5-162 is worse than the rigid head path
+  (10-34 in flight 1-3): the cockpit keeps the true head of B, not
+  extrapolated vectors.
+- **Next:** `ex2d` with the head taken out: A's screen velocity less the
+  head's own A-1 -> A turn, plus the head's true A -> B turn (the pose the
+  runtime predicts for the slot), to see how much of the turn failures is
+  the head's.
 
 ### 2026-11-07: Phase 1, extrapolation sets built (not flown)
 
