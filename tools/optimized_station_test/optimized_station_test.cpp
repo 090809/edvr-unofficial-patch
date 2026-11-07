@@ -3365,6 +3365,12 @@ int main(int argc, char** argv) {
         check(&cc::roomLayoutOf("SA_PlanetPortHub_Compact") == &cc::kRoomPort && cc::kRoomPort.bayN == 12u && cc::kRoomPort.backdropRadiusM >= cc::kBackdropRadiusMinM && cc::kRoomPort.backdropRadiusM <= cc::kBackdropRadiusMaxM,
               "concourse layouts: a surface port's bay is n=12, on a sphere the key's range allows");
         check(&cc::roomLayoutOf(nullptr) == &cc::kRoomStation && &cc::roomLayoutOf("") == &cc::kRoomStation, "concourse layouts: no name is a station's");
+        // The anchor means the room: a station's is gone from the store once the lift cuts away, a port's is seen from the hangar too (503 m, Flight 36).
+        check(cc::anchorMeansRoomHere(cc::kRoomStation, false, false, 0.0f) && cc::anchorMeansRoomHere(cc::kRoomStation, true, true, 1090.0f), "concourse layouts: at a station the sighting is enough, as it was");
+        check(cc::anchorMeansRoomHere(cc::kRoomPort, true, true, 3.5f) && cc::anchorMeansRoomHere(cc::kRoomPort, true, true, 22.9f), "concourse layouts: at a port, in the middle of the room and at the bay");
+        check(cc::kRoomPort.roomReachM > 42.1f && !cc::anchorMeansRoomHere(cc::kRoomPort, true, true, 503.0f), "concourse layouts: at a port, the reach is past the hub's radius and short of the hangar");
+        check(!cc::anchorMeansRoomHere(cc::kRoomPort, false, true, 3.5f) && !cc::anchorMeansRoomHere(cc::kRoomPort, true, false, 3.5f), "concourse layouts: at a port, no camera or no anchor read is not the room");
+        check(!cc::anchorMeansRoomHere(cc::kRoomPort, true, true, std::numeric_limits<float>::quiet_NaN()), "concourse layouts: at a port, a distance that is not a number is not the room");
         check(cc::judgeKeeps(cc::concourseJudge(true, true, true, 3.5f, 42.1f, true)), "concourse surface port: its anchor is kept");
         check(cc::judgeKeeps(cc::concourseJudge(true, true, true, 64.9f, 102.2f, false)), "concourse surface port: its exterior shell is kept");
         check(!cc::judgeKeeps(cc::concourseJudge(true, false, true, 126.0f, 9.3f, false)), "concourse surface port: the nearest lamp post outside is culled, past the close distance");

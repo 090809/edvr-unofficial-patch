@@ -153,6 +153,9 @@ bool g_markStatesTried = false;
 std::string g_beyondAppliedText;
 bool g_beyondTextSeen = false;
 constexpr UINT kMarkRef = 0x40;
+// The bake has been painted on this pixel this frame (DsVariant::kMarkedOnce). No draw after the frame's first glass reads this bit: in Flight 36's census they read nothing (83 draws, writing 0x04 and
+// 0x15) or 0x80 (one draw), which is why it is not 0x80. The mark pass clears it, so whatever the game left in it earlier does not count.
+constexpr UINT kBakedBit = 0x02;
 std::atomic<uint64_t> g_markPasses{0}, g_markRefused{0}, g_testsRead{0};
 // The frame the plain mirror phase last began. For kMarkSettleFrames after it, a pane known to be exterior stays whole: the frame in flight may still hold the
 // depth of the structure the cull has just taken away, and the mark would open holes in the pane for that frame.
@@ -360,11 +363,15 @@ struct DsEntry {
     ID3D11DepthStencilState* orig = nullptr;   // held, so the pointer cannot be reused for another state
     ID3D11DepthStencilState* plain = nullptr;
     ID3D11DepthStencilState* marked = nullptr;
+    ID3D11DepthStencilState* markedOnce = nullptr;
     ID3D11DepthStencilState* farOut = nullptr;
     ID3D11DepthStencilState* probe = nullptr;
     ID3D11DepthStencilState* markedProbe = nullptr;
 };
-enum class DsVariant { kPlain, kMarked, kFarOut, kProbe, kMarkedProbe };
+// markedOnce: `marked`, and a pixel takes the bake once. The bake writes its picture's depth, and two panes on one pixel compute that depth along the same ray, so their depth test is a coin
+// toss that differs by the rounding of each: the later pane either repaints the bake over its own glass or leaves its glass on the bake, pixel by pixel and frame by frame (Flight 36, where one
+// glass wall stands inside the room in front of the bay). Now the first pane paints it and sets kBakedBit, and a later pane there keeps the game's glass, on top of the bake, as with the cull off.
+enum class DsVariant { kPlain, kMarked, kMarkedOnce, kFarOut, kProbe, kMarkedProbe };
 std::mutex g_dsMutex;
 DsEntry g_ds[16];
 size_t g_dsN = 0;
@@ -722,7 +729,7 @@ bool makeMarkStates(ID3D11Device* device) noexcept {
     dd.DepthFunc = D3D11_COMPARISON_GREATER_EQUAL;
     dd.StencilEnable = TRUE;
     dd.StencilReadMask = 0;
-    dd.StencilWriteMask = static_cast<UINT8>(kMarkRef);
+    dd.StencilWriteMask = static_cast<UINT8>(kMarkRef | kBakedBit);   // a marked pixel starts this frame with the bake not yet painted on it
     for (D3D11_DEPTH_STENCILOP_DESC* f : {&dd.FrontFace, &dd.BackFace}) {
         f->StencilFunc = D3D11_COMPARISON_ALWAYS;
         f->StencilFailOp = D3D11_STENCIL_OP_KEEP;
@@ -990,7 +997,7 @@ ID3D11DepthStencilState* derivedDepth(ID3D11DeviceContext* ctx, ID3D11DepthStenc
         g_ds[g_dsN].orig = orig;
         ++g_dsN;
     }
-    ID3D11DepthStencilState*& slot = variant == DsVariant::kFarOut ? g_ds[at].farOut : variant == DsVariant::kMarked ? g_ds[at].marked
+    ID3D11DepthStencilState*& slot = variant == DsVariant::kFarOut ? g_ds[at].farOut : variant == DsVariant::kMarked ? g_ds[at].marked : variant == DsVariant::kMarkedOnce ? g_ds[at].markedOnce
                                    : variant == DsVariant::kProbe ? g_ds[at].probe : variant == DsVariant::kMarkedProbe ? g_ds[at].markedProbe : g_ds[at].plain;
     if (slot) return slot;
     D3D11_DEPTH_STENCIL_DESC d{};
@@ -1006,6 +1013,11 @@ ID3D11DepthStencilState* derivedDepth(ID3D11DeviceContext* ctx, ID3D11DepthStenc
             f->StencilFailOp = D3D11_STENCIL_OP_KEEP;
             f->StencilDepthFailOp = D3D11_STENCIL_OP_KEEP;
             f->StencilPassOp = D3D11_STENCIL_OP_KEEP;
+        }
+        if (variant == DsVariant::kMarkedOnce) {   // the reference is kMarkRef, so this passes on the mark with kBakedBit clear, and sets it
+            d.StencilReadMask = static_cast<UINT8>(kMarkRef | kBakedBit);
+            d.StencilWriteMask = static_cast<UINT8>(kBakedBit);
+            for (D3D11_DEPTH_STENCILOP_DESC* f : {&d.FrontFace, &d.BackFace}) f->StencilPassOp = D3D11_STENCIL_OP_INVERT;
         }
     } else {
         d.StencilEnable = FALSE;
@@ -2627,7 +2639,7 @@ bool ConcoursePaneScope::beginMirrorSlow() noexcept {
     if (planOpaque_) {
         UINT ref = 0;
         ctx_->OMGetDepthStencilState(&prevDs_, &ref);
-        derived = prevDs_ ? derivedDepth(ctx_, prevDs_, planMark_ ? DsVariant::kMarked : DsVariant::kPlain) : nullptr;
+        derived = prevDs_ ? derivedDepth(ctx_, prevDs_, planMark_ ? (planBackdrop_ ? DsVariant::kMarkedOnce : DsVariant::kMarked) : DsVariant::kPlain) : nullptr;
         if (!derived) {
             if (prevDs_) prevDs_->Release();
             prevDs_ = nullptr;

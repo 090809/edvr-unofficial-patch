@@ -4221,7 +4221,7 @@ void concourseTick(uint64_t now, uint32_t frame) {
                             (g_statusFlags2Now & sealed::kFlags2OnFootSocialSpace) != 0 ? 1 : 0);
     }
     const uint64_t anchorMs = g_concAnchorMs.load(std::memory_order_relaxed);
-    const bool anchor = anchorMs != 0 && now - anchorMs <= kConcAnchorFreshMs;
+    bool anchor = anchorMs != 0 && now - anchorMs <= kConcAnchorFreshMs;
     {
         // Which room this is: the anchor's name says, whatever the journal has said. An anchor gone stale is read afresh when it is next seen, since a record's address can be used again.
         if (!anchor) g_concLayoutAddr = 0;
@@ -4235,6 +4235,21 @@ void concourseTick(uint64_t now, uint32_t frame) {
                 Log::get().note("concourse cull: the room is %s (its anchor is %s): the bay window has %u indices, and a bake shows on a sphere of %.0f m unless diag.concourse_backdrop_radius says",
                                 layout->name, anchorName, layout->bayN, static_cast<double>(layout->backdropRadiusM));
             }
+        }
+    }
+    if (anchor && g_concLayout->roomReachM > 0.0f) {
+        // A port's hub is seen from the hangar too: the camera says whether this is the room. Said once each time it leaves, so a waiting anchor=0 here is not read as the record being unseen.
+        static bool saidAway = false;
+        const uintptr_t hubAddr = g_concAnchorAddr.load(std::memory_order_relaxed);
+        const WorldRead hub = hubAddr != 0 ? worldOfRecord(hubAddr) : WorldRead{};
+        const bool hubRead = hub.source != 4;
+        const float away = hubRead && g_frameCamValid ? sealed::distance(hub.world, g_frameCam) : 0.0f;
+        anchor = cc::anchorMeansRoomHere(*g_concLayout, g_frameCamValid, hubRead, away);
+        if (anchor) saidAway = false;
+        else if (!saidAway) {
+            saidAway = true;
+            Log::get().note("concourse cull: its anchor is in the store but this is not the room: the camera is %.0f m from it, past %.0f m (camera read %d, anchor read %d)", static_cast<double>(away),
+                            static_cast<double>(g_concLayout->roomReachM), g_frameCamValid ? 1 : 0, hubRead ? 1 : 0);
         }
     }
     const bool gateWanted = armed && social && !sealedNow;

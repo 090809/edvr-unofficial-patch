@@ -916,14 +916,22 @@ inline const char* parallaxName(uint32_t m) noexcept { return m == kParallaxSphe
 constexpr float kBackdropRadiusDefaultM = 600.0f, kBackdropRadiusMinM = 10.0f, kBackdropRadiusMaxM = 60000.0f;   // diag.concourse_backdrop_radius
 // What differs between the rooms, named by the anchor. At a surface port the bay is one window of n=12 (85.5% of the view standing at it, Flight 35), and what stands outside begins nearer than in a
 // station: buildings from about 110 m from the hub, the docks past 1100 m, so the sphere the bake is shown on sits nearer. 300 m is a first value, between those.
+// roomReachM: a station's room leaves the store when the lift cuts away, so its anchor being seen says the commander is there; 0 says so. A port's hub stays in the store from the hangar, 503 m off,
+// and the cull came on down there and took the hangar's walls (Flight 36). So there the camera must be near it too: 23 m at the bay, the hub's own radius 42 m, the hangar 503 m.
 struct RoomLayout {
     uint32_t bayN;
     float backdropRadiusM;
     const char* name;
+    float roomReachM;
 };
-inline constexpr RoomLayout kRoomStation{kBayIndexCount, kBackdropRadiusDefaultM, "a large station's"};
-inline constexpr RoomLayout kRoomPort{12u, 300.0f, "a surface port's"};
+inline constexpr RoomLayout kRoomStation{kBayIndexCount, kBackdropRadiusDefaultM, "a large station's", 0.0f};
+inline constexpr RoomLayout kRoomPort{12u, 300.0f, "a surface port's", 100.0f};
 inline const RoomLayout& roomLayoutOf(const char* anchorName) noexcept { return anchorName && std::strcmp(anchorName, kPortAnchorName) == 0 ? kRoomPort : kRoomStation; }
+// Whether a fresh sighting of the anchor means the commander is in that room. With no reading of where either is, a room with a reach says no: the game's own.
+inline bool anchorMeansRoomHere(const RoomLayout& room, bool cameraKnown, bool anchorRead, float cameraDistM) noexcept {
+    if (room.roomReachM <= 0.0f) return true;
+    return cameraKnown && anchorRead && std::isfinite(cameraDistM) && cameraDistM <= room.roomReachM;
+}
 constexpr float kBackdropNearZ = 0.025f;       // the game's near plane (reversed infinite Z: view depth = this / z)
 constexpr float kBackdropMinDistM = 5.0f;      // a captured pixel nearer than this along its ray is not backdrop and is not written
 constexpr float kBackdropFarM = 60000.0f;      // the distance written for a pixel with no depth (z = 0), and the largest stored distance
