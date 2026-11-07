@@ -296,7 +296,7 @@ void casePoseProbe() {
     check(w.frames == 4 && w.expired == 0 && w.refused == 0 && w.unpredicted == 0, "six frames, 3 ms before T each: the first four are scored once the clock passes their T_S");
     checkText(formatFrameGenPoseReport(w),
               "frame generation (shadow) pose: frames=4 lead_ms=14.1 runtime_mm=4.11/4.11/4.11 runtime_deg=0.471/0.471/0.471 velocity_mm=0.00/0.00/0.00 "
-              "velocity_deg=0.000/0.000/0.000 vel_src=3/0/1 expired=0 refused=0 unpredicted=0",
+              "velocity_deg=0.000/0.000/0.000 vel_src=3/0/1 expired=0 refused=0 unpredicted=0 slot=0 slot_mm=0.00/0.00/0.00 slot_deg=0.000/0.000/0.000 slot_lead_ms=0.0",
               "a runtime that stops predicting at 10 ms misses by the rest of the lead at the head's speed; the velocity fallback does not");
     const FrameGenPoseWindow pair = runProbe(false, false, false, true);
     check(pair.frames == 4 && pair.srcXr == 0 && pair.srcPair == 3 && pair.srcNone == 1 && pair.vDeg[2] < 0.001f && pair.vMm[2] < 0.01f,
@@ -331,6 +331,36 @@ void casePoseProbe() {
     FrameGenPoseProbe quiet;
     FrameGenPoseWindow nothing;
     check(!quiet.takeWindow(nothing), "a window with nothing in it says nothing");
+
+    // Phase 2.3, H6 at the slot: the slot pose located 20 ms ahead by a runtime that predicts only 10 ms misses by the other 10 ms at the head's speed; one exactly right does not.
+    FrameGenPoseProbe slots;
+    const auto truth = [](int64_t t, FgPose& o) { o = poseAt(t, kVx, kYaw); return FgLocate::Ok; };
+    for (int i = 0; i < 3; ++i) {
+        const int64_t now = kBase + i * kPeriod, target = now + 20000000;
+        slots.onSlot(target, now, poseAt(i == 2 ? target : now + 10000000, kVx, kYaw));
+    }
+    slots.resolve(kBase + kPeriod + 15000000, truth);   // only the first slot's T_S has come
+    FrameGenPoseWindow sw1;
+    check(slots.takeWindow(sw1) && sw1.slotFrames == 1 && sw1.frames == 0 && std::fabs(sw1.slotMm[2] - 10.0f) < 0.05f && std::fabs(sw1.slotDeg[2] - 1.15f) < 0.02f &&
+              std::fabs(sw1.slotLeadMsMedian - 20.0f) < 0.01f,
+          "a slot pose 10 ms short of its 20 ms lead misses by 10 mm and 1.15 deg at 1 m/s and 2 rad/s, scored only once its T_S has come");
+    slots.resolve(kBase + 2 * kPeriod + 25000000, truth);
+    FrameGenPoseWindow sw2;
+    check(slots.takeWindow(sw2) && sw2.slotFrames == 2 && std::fabs(sw2.slotMm[2] - 10.0f) < 0.05f, "...and the next two are scored at the next resolve");
+    FrameGenPoseProbe exact;
+    exact.onSlot(kBase + 20000000, kBase, poseAt(kBase + 20000000, kVx, kYaw));
+    exact.resolve(kBase + 21000000, truth);
+    FrameGenPoseWindow swe;
+    check(exact.takeWindow(swe) && swe.slotFrames == 1 && swe.slotMm[2] < 0.01f && swe.slotDeg[2] < 0.001f, "a slot pose located exactly where the head goes misses by nothing");
+    FrameGenPoseProbe slotRing;
+    for (int i = 0; i < 10; ++i) slotRing.onSlot(kBase + i * kPeriod + 20000000, kBase + i * kPeriod, poseAt(kBase, kVx, kYaw));
+    FrameGenPoseWindow sw3;
+    check(slotRing.takeWindow(sw3) && sw3.expired == 2 && sw3.slotFrames == 0, "ten slot poses never resolved: the two oldest fall out of the ring unscored");
+    FrameGenPoseProbe slotRefused;
+    slotRefused.onSlot(kBase + 20000000, kBase, poseAt(kBase, kVx, kYaw));
+    slotRefused.resolve(kBase + 30000000, [](int64_t, FgPose&) { return FgLocate::Refused; });
+    FrameGenPoseWindow sw4;
+    check(slotRefused.takeWindow(sw4) && sw4.refused == 1 && sw4.slotFrames == 0, "a slot whose truth the runtime refuses is counted refused");
 }
 
 void casePoseLine() {
@@ -343,10 +373,11 @@ void casePoseLine() {
     w.vDeg[0] = 0.1f; w.vDeg[1] = 0.2f; w.vDeg[2] = 0.3f;
     w.srcXr = 50; w.srcPair = 5; w.srcNone = 5;
     w.expired = 1; w.refused = 2; w.unpredicted = 3;
+    w.slotFrames = 45; w.slotMm[0] = 0.4f; w.slotMm[1] = 0.9f; w.slotMm[2] = 1.2f; w.slotDeg[0] = 0.05f; w.slotDeg[1] = 0.1f; w.slotDeg[2] = 0.15f; w.slotLeadMsMedian = 21.5f;
     const std::string line = formatFrameGenPoseReport(w);
     checkText(line,
               "frame generation (shadow) pose: frames=60 lead_ms=14.1 runtime_mm=1.50/2.50/3.50 runtime_deg=0.250/0.500/0.750 velocity_mm=0.50/1.00/1.50 "
-              "velocity_deg=0.100/0.200/0.300 vel_src=50/5/5 expired=1 refused=2 unpredicted=3",
+              "velocity_deg=0.100/0.200/0.300 vel_src=50/5/5 expired=1 refused=2 unpredicted=3 slot=45 slot_mm=0.40/0.90/1.20 slot_deg=0.050/0.100/0.150 slot_lead_ms=21.5",
               "the pose line");
     check(line.find('\n') == std::string::npos && line.find("(shadow):") == std::string::npos, "the pose line is one line and does not carry the scorer's label");
 }

@@ -864,6 +864,7 @@ void turboPacingTest() {
   }
 }
 }
+#include "framegen_lock_cases.h"
 
 int main(int argc, char** argv) {
   if (argc == 2 && std::strcmp(argv[1], "--dry-run") == 0) { std::puts("Would test injected OpenXR frame boundary; no runtime or files."); return 0; }
@@ -872,5 +873,6 @@ int main(int argc, char** argv) {
   frameEndOwnerBodyRaceTest();
   latePacingSteadyTest(); latePacingSkippedPeriodTest(); latePacingPeriodChangeTest();
   blockedRuntimeIntegrationTest(); boundaryFailures();backgroundFrames();loadingTransitions();turboPacingTest();
+  lockcases::run();   // frame generation 2.3 (Lock): the gate, the slot schedule, the key-off identity
   std::printf("openxr_frame_test: %u checks, %u failures\n", checks.load(), failures.load()); return failures.load() ? 1 : 0;
 }

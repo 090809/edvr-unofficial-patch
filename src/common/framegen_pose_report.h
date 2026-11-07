@@ -26,9 +26,12 @@ enum class FgLocate { Ok, Refused, Invalid };
 // scored frames by where the fallback's angular velocity came from: the runtime's XrSpaceVelocity / two locates 5 ms apart / none (no fallback that frame).
 // expired counts frames dropped unscored (the ring was full, or the clock was more than a second past T_S); refused the frames whose truth the runtime would not locate;
 // unpredicted the frames whose own T_S the runtime would not locate at t0 (it declines to predict that far).
+// Phase 2.3, H6 at the slot: slot= the slot poses scored (the head the runtime located at the synthetic slot's T_S in capture(), Phase 2.2, before the synthesizer ran), and their
+// miss against the head located once the clock passed T_S: slot_mm, slot_deg (median/p95/max) and slot_lead_ms (T_S less the clock at that locate, median). A line from before
+// 2.3 ends at unpredicted.
 constexpr const char* kFrameGenPoseReportFmt =
     "frame generation (shadow) pose: frames=%u lead_ms=%.1f runtime_mm=%.2f/%.2f/%.2f runtime_deg=%.3f/%.3f/%.3f velocity_mm=%.2f/%.2f/%.2f "
-    "velocity_deg=%.3f/%.3f/%.3f vel_src=%u/%u/%u expired=%u refused=%u unpredicted=%u";
+    "velocity_deg=%.3f/%.3f/%.3f vel_src=%u/%u/%u expired=%u refused=%u unpredicted=%u slot=%u slot_mm=%.2f/%.2f/%.2f slot_deg=%.3f/%.3f/%.3f slot_lead_ms=%.1f";
 
 struct FrameGenPoseWindow {
     uint32_t frames = 0;
@@ -36,15 +39,19 @@ struct FrameGenPoseWindow {
     float rtMm[3] = {}, rtDeg[3] = {}, vMm[3] = {}, vDeg[3] = {};   // median, p95, max
     uint32_t srcXr = 0, srcPair = 0, srcNone = 0;
     uint32_t expired = 0, refused = 0, unpredicted = 0;
+    uint32_t slotFrames = 0;
+    float slotMm[3] = {}, slotDeg[3] = {}, slotLeadMsMedian = 0.0f;
 };
 
 inline std::string formatFrameGenPoseReport(const FrameGenPoseWindow& w) {
-    char buf[512];
+    char buf[640];
     std::snprintf(buf, sizeof(buf), kFrameGenPoseReportFmt, static_cast<unsigned>(w.frames), static_cast<double>(w.leadMsMedian), static_cast<double>(w.rtMm[0]),
                   static_cast<double>(w.rtMm[1]), static_cast<double>(w.rtMm[2]), static_cast<double>(w.rtDeg[0]), static_cast<double>(w.rtDeg[1]),
                   static_cast<double>(w.rtDeg[2]), static_cast<double>(w.vMm[0]), static_cast<double>(w.vMm[1]), static_cast<double>(w.vMm[2]),
                   static_cast<double>(w.vDeg[0]), static_cast<double>(w.vDeg[1]), static_cast<double>(w.vDeg[2]), static_cast<unsigned>(w.srcXr),
-                  static_cast<unsigned>(w.srcPair), static_cast<unsigned>(w.srcNone), static_cast<unsigned>(w.expired), static_cast<unsigned>(w.refused), static_cast<unsigned>(w.unpredicted));
+                  static_cast<unsigned>(w.srcPair), static_cast<unsigned>(w.srcNone), static_cast<unsigned>(w.expired), static_cast<unsigned>(w.refused), static_cast<unsigned>(w.unpredicted),
+                  static_cast<unsigned>(w.slotFrames), static_cast<double>(w.slotMm[0]), static_cast<double>(w.slotMm[1]), static_cast<double>(w.slotMm[2]),
+                  static_cast<double>(w.slotDeg[0]), static_cast<double>(w.slotDeg[1]), static_cast<double>(w.slotDeg[2]), static_cast<double>(w.slotLeadMsMedian));
     return buf;
 }
 
@@ -182,9 +189,47 @@ public:
         pending_[count_++] = p;
     }
 
+    // Phase 2.3, H6 at the slot: the head the runtime located at the synthetic slot's T_S (target) when the clock read now, in the space the probe's locates use. Scored by
+    // resolve() once the clock has passed T_S. A full ring drops its oldest unscored (counted expired).
+    void onSlot(int64_t target, int64_t now, const FgPose& located) {
+        if (target <= 0 || now <= 0) return;
+        SlotPending s;
+        s.target = target;
+        s.leadMs = static_cast<float>(static_cast<double>(target - now) / 1.0e6);
+        s.pose = located;
+        if (slotCount_ == kPending) {
+            ++expired_;
+            for (size_t i = 1; i < kPending; ++i) slotPending_[i - 1] = slotPending_[i];
+            --slotCount_;
+        }
+        slotPending_[slotCount_++] = s;
+    }
+
     // Scores every pending frame whose T_S the clock has passed, truth located through `locate`; drops the ones that expired. Call once per real frame.
     template <class Locate>
     void resolve(int64_t now, Locate&& locate) {
+        size_t slotKeep = 0;
+        for (size_t i = 0; i < slotCount_; ++i) {
+            const SlotPending& s = slotPending_[i];
+            if (now < s.target) {
+                slotPending_[slotKeep++] = s;
+                continue;
+            }
+            if (now - s.target > kExpireNs) {
+                ++expired_;
+                continue;
+            }
+            FgPose truth;
+            if (locate(s.target, truth) != FgLocate::Ok) {
+                ++refused_;
+                continue;
+            }
+            ++slotFrames_;
+            slotLead_.push_back(s.leadMs);
+            slotMm_.push_back(fgPositionMissMm(s.pose.pos, truth.pos));
+            slotDeg_.push_back(fgRotationMissDeg(s.pose.q, truth.q));
+        }
+        slotCount_ = slotKeep;
         size_t keep = 0;
         for (size_t i = 0; i < count_; ++i) {
             const Pending& p = pending_[i];
@@ -236,8 +281,17 @@ public:
         fgSummarise(rtDeg_, w.rtDeg);
         fgSummarise(vMm_, w.vMm);
         fgSummarise(vDeg_, w.vDeg);
-        const bool any = frames_ || expired_ || refused_ || unpredicted_;
-        frames_ = expired_ = refused_ = unpredicted_ = srcXr_ = srcPair_ = srcNone_ = 0;
+        w.slotFrames = slotFrames_;
+        fgSummarise(slotMm_, w.slotMm);
+        fgSummarise(slotDeg_, w.slotDeg);
+        float slotLead[3];
+        fgSummarise(slotLead_, slotLead);
+        w.slotLeadMsMedian = slotLead[0];
+        const bool any = frames_ || expired_ || refused_ || unpredicted_ || slotFrames_;
+        frames_ = expired_ = refused_ = unpredicted_ = srcXr_ = srcPair_ = srcNone_ = slotFrames_ = 0;
+        slotLead_.clear();
+        slotMm_.clear();
+        slotDeg_.clear();
         lead_.clear();
         rtMm_.clear();
         rtDeg_.clear();
@@ -251,6 +305,7 @@ public:
         FrameGenPoseWindow ignored;
         takeWindow(ignored);
         count_ = 0;
+        slotCount_ = 0;
         havePrev_ = false;
     }
 
@@ -270,6 +325,15 @@ private:
     bool havePrev_ = false;
     uint32_t frames_ = 0, expired_ = 0, refused_ = 0, unpredicted_ = 0, srcXr_ = 0, srcPair_ = 0, srcNone_ = 0;
     std::vector<float> lead_, rtMm_, rtDeg_, vMm_, vDeg_;
+    struct SlotPending {
+        int64_t target = 0;
+        float leadMs = 0.0f;
+        FgPose pose;
+    };
+    SlotPending slotPending_[kPending];
+    size_t slotCount_ = 0;
+    uint32_t slotFrames_ = 0;
+    std::vector<float> slotLead_, slotMm_, slotDeg_;
 };
 
 }  // namespace edvr
