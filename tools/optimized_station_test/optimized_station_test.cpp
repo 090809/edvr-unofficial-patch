@@ -3901,13 +3901,13 @@ int main(int argc, char** argv) {
                 check(!c.step(cc::kCamTestModeOff, false, shut, false, 13200, &e) && e == CamTestEnd::kModeOff, "camera test: the mode turned off closes it");
                 check(c.stop() == false && !c.usedThisRide(), "camera test: stop when closed is a no-op and forgets the ride");
                 check(cc::camTestNextMode(0) == 1 && cc::camTestNextMode(1) == 2 && cc::camTestNextMode(2) == 3 && cc::camTestNextMode(3) == 0,
-                      "camera test: the key steps off, log only, lift at the eye pose, turn at the eye pose, off");
+                      "camera test: the key steps off, log only, lift, turn, off");
                 {
                     CamTestTimer past;
                     check(!past.step(cc::kCamTestModes, true, shut, false, 20000, &e) && !past.active(), "camera test: a mode past the last does not open the window");
-                    check(std::strcmp(cc::camTestModeName(2), "lift 30 m at the eye pose") == 0 && std::strcmp(cc::camTestModeName(3), "turn 90 degrees at the eye pose") == 0 &&
+                    check(std::strcmp(cc::camTestModeName(2), "lift 30 m") == 0 && std::strcmp(cc::camTestModeName(3), "turn 90 degrees") == 0 &&
                               std::strcmp(cc::camTestModeName(1), "log only") == 0 && std::strcmp(cc::camTestModeName(0), "off") == 0,
-                          "camera test: the toast names the write point");
+                          "camera test: the toast names the mode");
                 }
             }
         }

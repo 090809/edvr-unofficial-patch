@@ -577,7 +577,7 @@ private:
     LiftEnd end_ = LiftEnd::kNone;
 };
 
-// ---- The camera test (TEMPORARY, docs\concourse-cull-2026-11-05.md): does moving the pose that goes into the eye camera builder (0x283FA20) move the picture? ------------
+// ---- The camera test (TEMPORARY, docs\concourse-cull-2026-11-05.md): does moving flat's camera where it is made (after 0x2874290) move the picture? ------------
 // Modes 2 and 3 act for kCamTestMs from the tick the lift gate first goes on in a ride, once per ride. The window has its own timer and the gate is not stepped
 // meanwhile (a moved camera would drop it at once: it reads the camera's distance to the cabin). The decision is here so a table can pin it.
 constexpr uint64_t kCamTestMs = 3000;      // how long modes 2 and 3 act
@@ -587,8 +587,8 @@ inline uint32_t camTestNextMode(uint32_t m) noexcept { return (m + 1) % kCamTest
 inline const char* camTestModeName(uint32_t m) noexcept {
     switch (m) {
         case kCamTestModeLog: return "log only";
-        case kCamTestModeLift: return "lift 30 m at the eye pose";
-        case kCamTestModeTurn: return "turn 90 degrees at the eye pose";
+        case kCamTestModeLift: return "lift 30 m";
+        case kCamTestModeTurn: return "turn 90 degrees";
         default: return "off";
     }
 }
