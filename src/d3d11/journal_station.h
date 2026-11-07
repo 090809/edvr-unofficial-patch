@@ -6,6 +6,9 @@
 // matches its Body against that. On a carrier Body is the star or planet, so a load on foot there reads unknown. Unknown is "not confirmed": the game's own station.
 // A Stronghold Carrier is "StationType":"SurfaceStation", told apart only by its name. "Bernal" is the journal's other name for an Ocellus: Location has written it where Docked says
 // Ocellus (INFERRED, from the two lists; no one station compared).
+// AT A PORT ON A PLANET it goes differently. Only Docked and Undocked name it. Disembark and Embark there have "OnPlanet":true and no station (579 and 574 such lines, settlements among them), and so does a Location
+// on foot, with "BodyType":"Planet" (399). So the type holds through those until Undocked, and a load on foot on a planet takes the saved type if that is a port on a planet. That also says so at
+// a settlement or on open ground after the last port: what uses the type must have something else to go on, as the concourse cull has its anchor.
 //
 // PRIVACY. What is kept is the type, and a hash of the station's name so that the name itself is neither saved nor logged. A line is held only until its newline.
 #pragma once
@@ -66,13 +69,10 @@ inline uint64_t hashName(const char* p, size_t n) noexcept {
 // Whether the commander is at a port on a planet's surface. The type says it where the journal has given one. A Disembark on a planet names no station, and neither does a load on foot, so
 // with no type Status.json says: Flags bit 21 (a latitude and longitude: near a body) and Flags2 bit 4 (on foot on a planet), as a docked, on-foot commander at a CraterOutpost shows
 // (0x00200005, 0x00014011; at an Orbis 0x00000005, 0x00014009). A type comes first because a station in a low orbit may have a latitude too.
+inline bool surfaceKind(Kind k) noexcept { return k == Kind::kCraterPort || k == Kind::kCraterOutpost || k == Kind::kSurfaceStation || k == Kind::kOnFootSettlement; }
 inline bool atSurfacePort(Kind k, uint32_t flags, uint32_t flags2) noexcept {
+    if (surfaceKind(k)) return true;
     switch (k) {
-        case Kind::kCraterPort:
-        case Kind::kCraterOutpost:
-        case Kind::kSurfaceStation:
-        case Kind::kOnFootSettlement:
-            return true;
         case Kind::kCoriolis:
         case Kind::kOrbis:
         case Kind::kOcellus:
@@ -227,6 +227,12 @@ private:
                 unmatched_ = true;
                 unmatchedHash_ = h;
             }
+            return;
+        }
+        // At a port on a planet: see the head of this file.
+        if (!location && surfaceKind(kind_) && has("\"OnPlanet\":true")) return;
+        if (location && has("\"OnFoot\":true") && has("\"BodyType\":\"Planet\"")) {
+            set(surfaceKind(saved_.kind) ? saved_.kind : Kind::kUnknown, onChange);
             return;
         }
         set(Kind::kUnknown, onChange);   // in space, on a planet, or an event at no station

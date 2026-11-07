@@ -650,13 +650,14 @@ constexpr float kBakeNearDefaultM = 50.0f, kBakeNearMinM = 5.0f, kBakeNearMaxM =
 // What the bake does at each type of station, from the journal (journal_station.h). A row is added when its layout has been flown: the keep list's names and the anchor were read at one
 // Orbis, and another room could lose its own objects or have no anchor. Everything else, and a type not known, stays the game's own; diag.concourse_cull = on, or the hotkey, forces it
 // for a test. Once a type's windows are known, its row can name only the directions they need.
+// CraterOutpost: flown at one, by Sean's word after Flights 36 and 37. Its room is told by its own anchor (kPortAnchorName), so a type that names another room still gets no cull.
 struct BakePlan {
     bool run = false;
     uint32_t dirs = kBakeDirsAll;
 };
 inline BakePlan bakePlanFor(journal_station::Kind k) noexcept {
     BakePlan p;
-    p.run = k == journal_station::Kind::kOrbis || k == journal_station::Kind::kCoriolis || k == journal_station::Kind::kOcellus;
+    p.run = k == journal_station::Kind::kOrbis || k == journal_station::Kind::kCoriolis || k == journal_station::Kind::kOcellus || k == journal_station::Kind::kCraterOutpost;
     return p;
 }
 inline uint32_t bakeDirCount(uint32_t mask) noexcept {

@@ -4151,6 +4151,41 @@ int main(int argc, char** argv) {
                     check(l.kind() == K::kUnknown, "station type: a load on foot somewhere else is unknown");
                     feed(l, "{ \"timestamp\":\"t\", \"event\":\"Location\", \"Docked\":false, \"OnFoot\":true, \"Body\":\"LP 1 a\", \"BodyID\":4, \"BodyType\":\"Planet\" }\r\n");
                     check(l.kind() == K::kUnknown, "station type: on foot on a planet is unknown");
+                    {
+                        // A port on a planet: real lines from a CraterOutpost, Flight 37. Only Docked and Undocked name it.
+                        const char* portDocked = "{ \"timestamp\":\"t\", \"event\":\"Docked\", \"StationName\":\"Test Installation\", \"StationType\":\"CraterOutpost\", \"MarketID\":2 }\r\n";
+                        const char* portDisembark = "{ \"timestamp\":\"t\", \"event\":\"Disembark\", \"SRV\":false, \"Taxi\":false, \"Multicrew\":false, \"ID\":1, \"StarSystem\":\"S\", \"Body\":\"LP 1 a\", \"BodyID\":4, \"OnStation\":false, \"OnPlanet\":true }\r\n";
+                        const char* portEmbark = "{ \"timestamp\":\"t\", \"event\":\"Embark\", \"SRV\":false, \"Taxi\":false, \"Multicrew\":false, \"ID\":1, \"StarSystem\":\"S\", \"Body\":\"LP 1 a\", \"BodyID\":4, \"OnStation\":false, \"OnPlanet\":true }\r\n";
+                        const char* portUndocked = "{ \"timestamp\":\"t\", \"event\":\"Undocked\", \"StationName\":\"Test Installation\", \"StationType\":\"CraterOutpost\", \"MarketID\":2 }\r\n";
+                        const char* planetFoot = "{ \"timestamp\":\"t\", \"event\":\"Location\", \"Docked\":false, \"OnFoot\":true, \"Body\":\"LP 1 a\", \"BodyID\":4, \"BodyType\":\"Planet\" }\r\n";
+                        js::Latch p;
+                        feed(p, portDocked);
+                        check(p.kind() == K::kCraterOutpost && p.takeSavedChanged(), "station type: a port on a planet is named by Docked, and saved");
+                        feed(p, portDisembark);
+                        check(p.kind() == K::kCraterOutpost && !p.takeSavedChanged(), "station type: a Disembark there names no station, and the type holds");
+                        feed(p, portEmbark);
+                        check(p.kind() == K::kCraterOutpost, "station type: so does an Embark");
+                        feed(p, portUndocked);
+                        check(p.kind() == K::kUnknown, "station type: until Undocked");
+                        feed(p, portDisembark);
+                        check(p.kind() == K::kUnknown, "station type: then a Disembark on a planet is open ground");
+                        feed(p, planetFoot);
+                        check(p.kind() == K::kCraterOutpost, "station type: a load on foot on a planet takes a saved port on a planet");
+                        js::Latch next;
+                        next.restore(p.saved());
+                        feed(next, planetFoot);
+                        check(next.kind() == K::kCraterOutpost, "station type: in the next session too");
+                        feed(next, disembark);
+                        check(next.kind() == K::kOrbis, "station type: a station that names itself comes first");
+                        feed(next, portDisembark);
+                        check(next.kind() == K::kUnknown, "station type: a Disembark on a planet does not hold a station's type");
+                        feed(next, planetFoot);
+                        check(next.kind() == K::kUnknown, "station type: nor does a load on foot take one");
+                        js::Latch settlement;
+                        feed(settlement, "{ \"event\":\"Docked\", \"StationName\":\"X\", \"StationType\":\"OnFootSettlement\" }\n");
+                        feed(settlement, portDisembark);
+                        check(settlement.kind() == K::kOnFootSettlement, "station type: any port on a planet holds");
+                    }
 
                     js::Latch fresh;
                     uint64_t askedFor = 0;
@@ -4203,7 +4238,8 @@ int main(int argc, char** argv) {
                     using T = K;
                     check(cc::bakePlanFor(T::kOrbis).run && cc::bakePlanFor(T::kCoriolis).run && cc::bakePlanFor(T::kOcellus).run && cc::bakePlanFor(T::kOrbis).dirs == cc::kBakeDirsAll,
                           "bake plan: the large stations run, with every direction");
-                    check(!cc::bakePlanFor(T::kUnknown).run && !cc::bakePlanFor(T::kOutpost).run && !cc::bakePlanFor(T::kCraterPort).run && !cc::bakePlanFor(T::kCraterOutpost).run &&
+                    check(cc::bakePlanFor(T::kCraterOutpost).run && cc::bakePlanFor(T::kCraterOutpost).dirs == cc::kBakeDirsAll, "bake plan: so does a CraterOutpost, flown");
+                    check(!cc::bakePlanFor(T::kUnknown).run && !cc::bakePlanFor(T::kOutpost).run && !cc::bakePlanFor(T::kCraterPort).run &&
                               !cc::bakePlanFor(T::kSurfaceStation).run && !cc::bakePlanFor(T::kAsteroidBase).run && !cc::bakePlanFor(T::kFleetCarrier).run && !cc::bakePlanFor(T::kMegaShip).run &&
                               !cc::bakePlanFor(T::kOnFootSettlement).run && !cc::bakePlanFor(T::kOther).run,
                           "bake plan: everything else, and not knowing, stays the game's own");
