@@ -3922,6 +3922,94 @@ int main(int argc, char** argv) {
                 check(cc::parallaxNext(cc::kParallaxNone) == cc::kParallaxSphere && cc::parallaxNext(cc::kParallaxSphere) == cc::kParallaxDepth && cc::parallaxNext(cc::kParallaxDepth) == cc::kParallaxNone &&
                           std::strcmp(cc::parallaxName(cc::kParallaxDepth), "depth") == 0 && cc::kBackdropRadiusDefaultM == 600.0f,
                       "backdrop distance: the key steps none, sphere, depth and round; the radius defaults to 600 m");
+            }            // The automatic capture's trigger, as a table.
+            {
+                using In = cc::BackdropAutoInput;
+                const auto ready = [](float share, uint64_t now) {
+                    In in;
+                    in.nowMs = now;
+                    in.share = share;
+                    in.autoOn = in.modeBackdrop = in.cullPartOn = in.plainMirror = true;
+                    return in;
+                };
+                bool ok = true;
+                {
+                    cc::BackdropAutoGate g;
+                    ok = ok && g.step(ready(0.0019f, 10000)).fire == false && g.step(ready(0.002f, 10000)).fire == true;   // below and at the threshold
+                }
+                {
+                    cc::BackdropAutoGate g;
+                    In in = ready(0.01f, 10000);
+                    in.autoOn = false;
+                    ok = ok && !g.step(in).fire;
+                    in = ready(0.01f, 10000); in.modeBackdrop = false; ok = ok && !g.step(in).fire;
+                    in = ready(0.01f, 10000); in.cullPartOn = false; ok = ok && !g.step(in).fire;
+                    in = ready(0.01f, 10000); in.plainMirror = false; ok = ok && !g.step(in).fire;
+                    in = ready(0.01f, 10000); in.liftOn = true; ok = ok && !g.step(in).fire;
+                    in = ready(0.01f, 10000); in.captureRunning = true; ok = ok && !g.step(in).fire;
+                    ok = ok && g.step(ready(0.01f, 10000)).fire;   // none of them: fires
+                }
+                check(ok, "backdrop auto: the share must reach 0.2%, and each blocking condition (auto off, not backdrop, cull part off, not plain mirror, lift, capture running) stops it");
+                cc::BackdropAutoGate g;
+                bool gapOk = g.step(ready(0.01f, 10000)).fire;   // first capture
+                g.captureEnded(10300);
+                gapOk = gapOk && !g.step(ready(0.01f, 11799)).fire && g.step(ready(0.001f, 11799)).fire == false;   // inside the gap; and a share below the threshold never fires
+                check(gapOk && g.gapMs() == 1500, "backdrop auto: no capture within 1500 ms of the last one's end");
+                // The share did not fall: the gap doubles each time, up to 30 s, and the escalation is said once.
+                cc::BackdropAutoGate e;
+                uint64_t now = 10000;
+                bool fired = e.step(ready(0.01f, now)).fire;
+                e.captureEnded(now + 300);
+                now += 300 + 1500;
+                cc::BackdropAutoDecision d = e.step(ready(0.01f, now));   // judged: not fallen, gap 3000, still inside it
+                bool said = d.escalated && d.shareAtStart == 0.01f && d.gapMs == 3000 && !d.fire;
+                now += 1500;
+                d = e.step(ready(0.01f, now));
+                fired = fired && d.fire && !d.escalated;
+                e.captureEnded(now + 300);
+                now += 300 + 3000;
+                d = e.step(ready(0.01f, now));   // doubled again to 6000, and not said again
+                bool again = !d.escalated && d.gapMs == 6000 && !d.fire;
+                uint64_t last = 0;
+                for (int i = 0; i < 12; ++i) {
+                    now += 40000;
+                    d = e.step(ready(0.01f, now));
+                    if (d.fire) { e.captureEnded(now + 300); now += 300; }
+                    last = d.gapMs;
+                }
+                check(fired && said && again && last == cc::kBackdropMaxGapMs, "backdrop auto: a capture that does not lower the share doubles the gap (said once), up to 30 s");
+                // The share falls: the gap starts over, below the threshold or by a tenth.
+                cc::BackdropAutoGate r;
+                now = 10000;
+                r.step(ready(0.01f, now));
+                r.captureEnded(now + 300);
+                now += 300 + 1500;
+                d = r.step(ready(0.005f, now));   // 0.005 < 0.9 * 0.01: fallen, the gap stays 1500 and it fires
+                bool fell = d.fire && d.gapMs == 1500 && !d.escalated;
+                r.captureEnded(now + 300);
+                now += 300 + 1500;
+                d = r.step(ready(0.01f, now));    // up again, not lower than 0.9 * 0.005: the gap doubles
+                bool up = d.gapMs == 3000;
+                now += 100;
+                r.step(ready(0.0f, now));         // nothing missing: reset
+                bool back = r.gapMs() == 1500;
+                r.reset();
+                check(fell && up && back && r.gapMs() == 1500, "backdrop auto: a falling share, or none missing, resets the gap; reset() starts over");
+            }
+            // The glass parser.
+            {
+                float g[6] = {9, 9, 9, 9, 9, 9};
+                char def[64];
+                std::snprintf(def, sizeof(def), "%g,%g,%g,%g,%g,%g", static_cast<double>(cc::kGlassDefault[0]), static_cast<double>(cc::kGlassDefault[1]), static_cast<double>(cc::kGlassDefault[2]),
+                              static_cast<double>(cc::kGlassDefault[3]), static_cast<double>(cc::kGlassDefault[4]), static_cast<double>(cc::kGlassDefault[5]));
+                const bool okDef = cc::parseGlass(def, g) && g[0] == 0.92f && g[3] == 0.06f && g[4] == 0.75f && g[5] == 0.25f;
+                float h[6] = {7, 7, 7, 7, 7, 7};
+                const bool okSp = cc::parseGlass(" 1 , 1 ,1, 0 , 0 , 0 ", h) && h[0] == 1.0f && h[3] == 0.0f && h[5] == 0.0f;
+                float k[6] = {5, 5, 5, 5, 5, 5};
+                const bool bad = !cc::parseGlass("1,1,1,0,0", k) && !cc::parseGlass("1,1,1,0,0,0,0", k) && !cc::parseGlass("1,1,1,2,0,0", k) && !cc::parseGlass("3,1,1,0,0,0", k) &&
+                                 !cc::parseGlass("1,1,1,0,9,0", k) && !cc::parseGlass("-1,1,1,0,0,0", k) && !cc::parseGlass("a,1,1,0,0,0", k) && !cc::parseGlass("1,1,1,0,0,0x", k) &&
+                                 !cc::parseGlass("", k) && !cc::parseGlass(nullptr, k) && k[0] == 5.0f;
+                check(okDef && okSp && bad, "backdrop glass: six numbers parse (spaces allowed), a wrong count, range, letter or trailing text is refused and leaves the values");
             }            using J = cc::Judge;
             check(cc::concourseJudge(true, true, true, 600.0f, 300.0f, false, false) == J::kCull && cc::concourseJudge(true, true, true, 600.0f, 300.0f, false, true) == J::kCull &&
                       cc::concourseJudge(true, true, true, 3.0f, 3.0f, false, true) == J::kKeepSmallClose && cc::concourseJudge(true, true, true, 150.0f, 3.0f, false, false) == J::kKeepName,

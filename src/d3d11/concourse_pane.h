@@ -74,6 +74,8 @@ private:
     void closeGameQueries() noexcept;   // the share query and the side test's first query end with the game's own draw, before any pass of ours
     bool beginCapturePass() noexcept;   // PROTOTYPE (backdrop): binds the capture pass; false leaves the context as it was
     void endCapturePass() noexcept;     // puts the capture pass's state back (the UAV, the pixel shader, t8, the blend and depth states)
+    bool beginProbePass() noexcept;     // PROTOTYPE (automatic capture): the colourless probe pass with its own occlusion query; false leaves the context as it was
+    void endProbePass() noexcept;       // ends the probe's query and puts its state back (all but the constant buffer, which the display pass keeps and end() restores)
     void end() noexcept;
 
     ID3D11DeviceContext* ctx_ = nullptr;
@@ -94,6 +96,10 @@ private:
     bool planCapture_ = false;  // an armed backdrop capture: this exterior pane gets a capture pass before its display pass
     bool capDone_ = false;      // the capture pass has been asked for
     bool capBound_ = false;     // the capture pass's state is bound (endCapturePass puts it back)
+    bool planProbe_ = false;    // a test frame in mirror-backdrop with the mark: a probe pass runs before the display pass
+    bool probeDone_ = false;    // the probe pass has been asked for
+    bool probeBound_ = false;   // the probe pass's state is bound and its query is open (endProbePass closes and restores; the capture pass's save fields are used, the two never share a scope)
+    ID3D11SamplerState* probePrevSampler_ = nullptr;
     ID3D11BlendState* capPrevBs_ = nullptr;
     FLOAT capPrevFactor_[4] = {};
     UINT capPrevMask_ = 0;
@@ -186,8 +192,19 @@ struct ConcourseBackdropStatus {
     char refusal[200] = {};          // kRefused: why
 };
 void concoursePaneSetBackdropMode(const char* why) noexcept;   // F6: the mode becomes mirror-backdrop (a toast says so)
-void concoursePaneArmCapture() noexcept;                       // the capture is armed from the next tick; the status follows
+void concoursePaneArmCapture(bool toast) noexcept;               // the capture is armed from the next tick; the status follows; `toast`: its result is said on screen (F6's, not an automatic one's)
 ConcourseBackdropStatus concoursePaneBackdropStatus() noexcept;
+// Automatic capture: the pane mode is mirror-backdrop and a hotkey (F4 to it, or F6) turned automatic capture on.
+bool concoursePaneBackdropAuto() noexcept;
+bool concoursePaneIsBackdropMode() noexcept;
+// What the probes measured: the share of the viewport the cube cannot show through the exterior panes, over the last 8 frames (0 when nothing was measured), and the probe
+// counters since the process began (issued by the draw threads, read by the tick), so a probe that never ran, or never returned, can be told from a share that is just low.
+struct ConcourseBackdropMissing {
+    float share = 0.0f;
+    uint64_t probesIssued = 0, probesRead = 0;
+    bool cubeValid = false;
+};
+ConcourseBackdropMissing concoursePaneBackdropMissing() noexcept;
 void concoursePaneBackdropEnd() noexcept;                      // the cull's tick has read the result (or gives up): back to idle, and an open capture is closed
 // A toast text, once per hotkey change of the mode and per capture result ("Windows: ..."); false when none is waiting. The tick hands it to menuShowNotice.
 bool concoursePaneTakeToast(char* out, size_t size) noexcept;

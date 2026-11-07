@@ -667,6 +667,115 @@ inline bool backdropSphereHit(const float off[3], const float dir[3], float radi
     for (int i = 0; i < 3; ++i) out[i] = off[i] + d[i] * t;
     return true;
 }
+// ---- Automatic capture (PROTOTYPE, docs\concourse-cull-2026-11-05.md) --------------------------------------------------------------------------------------
+// While mirror-backdrop is the mode, the panes in view are probed for what the cube cannot show (a colourless pass whose occlusion count is the pixels with captured coverage
+// under one half through lod 3). When the missing share of the viewport is at least kBackdropMissingShare, a capture is started, as F6 does, if nothing blocks it and
+// kBackdropMinGapMs have passed since the last capture ended. A capture that does not make the share fall doubles the gap, to kBackdropMaxGapMs, so a direction the capture cannot
+// fill does not cost a lift every 1.5 s; the gap resets when the share falls. Pure: the tick owns the clock and the log.
+constexpr float kBackdropMissingShare = 0.002f;     // 0.2% of the view
+constexpr uint64_t kBackdropMinGapMs = 1500;
+constexpr uint64_t kBackdropMaxGapMs = 30000;
+constexpr float kBackdropFallFactor = 0.9f;          // a share below this fraction of what it was at the capture's start has fallen
+
+struct BackdropAutoInput {
+    uint64_t nowMs = 0;
+    float share = 0.0f;           // the missing share of the viewport over the rolling window (0 to 1)
+    bool autoOn = false;          // a hotkey (F4 to backdrop, or F6) turned automatic capture on
+    bool modeBackdrop = false;    // the pane mode is mirror-backdrop
+    bool cullPartOn = false;      // the cull's own part is on
+    bool plainMirror = false;     // the bay machine is in its plain mirror phase
+    bool liftOn = false;          // the lift cull is on
+    bool captureRunning = false;  // a capture (auto or F6) is in progress
+};
+struct BackdropAutoDecision {
+    bool fire = false;
+    bool escalated = false;       // the gap was doubled by this call and the escalation has not been said yet (the caller logs one line)
+    float shareAtStart = 0.0f;    // with escalated: the share the last capture started from
+    uint64_t gapMs = kBackdropMinGapMs;
+};
+class BackdropAutoGate {
+public:
+    uint64_t gapMs() const noexcept { return gapMs_; }
+    void reset() noexcept {
+        gapMs_ = kBackdropMinGapMs;
+        haveEnd_ = false;
+        judged_ = true;
+        logged_ = false;
+    }
+    // Any capture's end, auto or F6.
+    void captureEnded(uint64_t nowMs) noexcept {
+        lastEndMs_ = nowMs;
+        haveEnd_ = true;
+    }
+    BackdropAutoDecision step(const BackdropAutoInput& in) noexcept {
+        BackdropAutoDecision d;
+        d.gapMs = gapMs_;
+        if (!in.autoOn || !in.modeBackdrop || !in.cullPartOn || !in.plainMirror || in.liftOn || in.captureRunning) return d;
+        if (!(in.share >= kBackdropMissingShare)) {   // nothing meaningful is missing: whatever the last capture did, the gap starts over
+            gapMs_ = kBackdropMinGapMs;
+            judged_ = true;
+            logged_ = false;
+            d.gapMs = gapMs_;
+            return d;
+        }
+        if (haveEnd_ && in.nowMs - lastEndMs_ < kBackdropMinGapMs) return d;   // too soon to read the effect of the last capture
+        if (haveEnd_ && !judged_) {
+            judged_ = true;
+            if (in.share < startShare_ * kBackdropFallFactor) {
+                gapMs_ = kBackdropMinGapMs;
+                logged_ = false;
+            } else {
+                gapMs_ = gapMs_ * 2 > kBackdropMaxGapMs ? kBackdropMaxGapMs : gapMs_ * 2;
+                if (!logged_) {
+                    logged_ = true;
+                    d.escalated = true;
+                    d.shareAtStart = startShare_;
+                }
+            }
+        }
+        d.gapMs = gapMs_;
+        if (haveEnd_ && in.nowMs - lastEndMs_ < gapMs_) return d;
+        startShare_ = in.share;
+        judged_ = false;
+        d.fire = true;
+        return d;
+    }
+
+private:
+    uint64_t gapMs_ = kBackdropMinGapMs;
+    uint64_t lastEndMs_ = 0;
+    bool haveEnd_ = false;
+    bool judged_ = true;     // the last capture's effect has been read (or there was none)
+    bool logged_ = false;    // the escalation has been said since the gap last reset
+    float startShare_ = 0.0f;
+};
+
+// ---- The backdrop's glass look (diag.concourse_glass = "r,g,b,haze,blur,fresnel") ---------------------------------------------------------------------------
+// r,g,b multiply the captured colour (0 to 2); haze is how far the glass's own level colour covers it (0 to 1); blur is added to every mip level of the look-up (0 to 8);
+// fresnel adds up to that much more haze at a grazing angle (0 to 2).
+constexpr float kGlassDefault[6] = {0.92f, 0.97f, 0.96f, 0.06f, 0.75f, 0.25f};
+inline bool parseGlass(const char* text, float out[6]) noexcept {
+    if (!text) return false;
+    static const float kMax[6] = {2.0f, 2.0f, 2.0f, 1.0f, 8.0f, 2.0f};
+    float v[6] = {};
+    const char* s = text;
+    for (int i = 0; i < 6; ++i) {
+        while (*s == ' ' || *s == '\t') ++s;
+        char* end = nullptr;
+        const double d = std::strtod(s, &end);
+        if (end == s || !std::isfinite(d) || d < 0.0 || d > static_cast<double>(kMax[i])) return false;
+        v[i] = static_cast<float>(d);
+        s = end;
+        while (*s == ' ' || *s == '\t') ++s;
+        if (i < 5) {
+            if (*s != ',') return false;
+            ++s;
+        }
+    }
+    if (*s != '\0') return false;
+    for (int i = 0; i < 6; ++i) out[i] = v[i];
+    return true;
+}
 // ---- The glow levels by window type (diag.concourse_glow = "sky,angled,other,bay") ---------------------------------------------------------------------
 // The steady light of a pane: the brightest on overhead skylights, a level between on angled skylights, a middle level on any other window, and its own level on the
 // bay window. Absolute levels, each from 0 to 16. Overhead, angled and other are told by how much the pane faces the anchor's up axis (the pixel shader).

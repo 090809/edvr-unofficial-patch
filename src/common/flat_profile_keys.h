@@ -63,6 +63,7 @@ inline bool flatProfileReadsKey(const char* key) {
         std::strcmp(key, "diag.concourse_mirror_beyond") == 0 ||
         std::strcmp(key, "diag.concourse_glow") == 0 ||
         std::strcmp(key, "diag.concourse_backdrop_radius") == 0 ||
+        std::strcmp(key, "diag.concourse_glass") == 0 ||
         std::strcmp(key, "hotkey.concourse_cull") == 0 ||
         std::strcmp(key, "hotkey.concourse_pane_capture") == 0 ||
         std::strcmp(key, "hotkey.concourse_pane_mode") == 0 ||

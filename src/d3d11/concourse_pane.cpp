@@ -78,6 +78,7 @@ constexpr uint32_t kFlagQuery = 1u << 5;
 constexpr uint32_t kFlagCapQuery = 1u << 6;
 constexpr uint32_t kFlagTestDrawn = 1u << 7;    // the side test's first query (the game's glass draw) is open
 constexpr uint32_t kFlagTestMirror = 1u << 8;   // the side test's second query (the mirror draw) is open
+constexpr uint32_t kFlagProbePass = 1u << 11;   // mirror-backdrop: the probe pass's state is bound and its query is open (endProbePass puts it back)
 constexpr uint32_t kFlagCapPass = 1u << 10;     // mirror-backdrop: the capture pass's state is bound (endCapturePass puts it back)
 constexpr uint32_t kFlagSampler = 1u << 9;      // mirror-backdrop: the sampler slot holds EDVR's sampler (the game's is in prevSampler_)
 
@@ -127,8 +128,8 @@ std::string g_glowAppliedText;
 bool g_glowTextSeen = false;
 std::atomic<float> g_upFed[3] = {};
 std::atomic<bool> g_upFedValid{false};
-float g_glowCbSent[16] = {};     // the tick's: what the buffers hold (rows: up, levels, colour, then the backdrop's distance mode and radius)
-float g_glowCbBaySent[16] = {};
+float g_glowCbSent[24] = {};     // the tick's: what the buffers hold (rows: up, levels, colour, then the backdrop's distance mode and radius)
+float g_glowCbBaySent[24] = {};
 bool g_glowCbSentValid = false;
 bool g_glowLogged = false;
 float g_glowLoggedLv[4] = {};
@@ -202,6 +203,26 @@ std::atomic<uint8_t> g_bdPhase{0};                  // ConcourseBackdropPhase
 std::atomic<bool> g_bdArmRequested{false};
 uint32_t g_bdArmFrame = 0;                          // the tick's
 uint32_t g_bdFramesWaited = 0;
+// The glass look (diag.concourse_glass: r, g, b, haze, blur, fresnel) and its text.
+std::atomic<float> g_glass[6] = {{cc::kGlassDefault[0]}, {cc::kGlassDefault[1]}, {cc::kGlassDefault[2]}, {cc::kGlassDefault[3]}, {cc::kGlassDefault[4]}, {cc::kGlassDefault[5]}};
+std::string g_glassAppliedText;
+bool g_glassTextSeen = false;
+// Automatic capture: the probe pass (a colourless pass whose occlusion count is the pixels the cube cannot show), what it measured, and the sticky enable a hotkey sets.
+std::atomic<bool> g_bdAutoOn{false};                // a hotkey (F4 to backdrop, or F6) turned automatic capture on; it runs only while the mode is mirror-backdrop
+std::atomic<bool> g_bdToast{true};                  // the capture in progress was F6's: its result is a toast (an automatic capture says nothing on screen)
+std::atomic<uint64_t> g_probeIssued{0};             // probe passes issued (the draw threads)
+std::atomic<uint64_t> g_probeRead{0};               // probe results read (the tick)
+std::atomic<ID3D11PixelShader*> g_psBdProbe{nullptr};
+struct MissEntry {
+    uint32_t frame = 0;
+    double missing = 0.0;
+};
+constexpr size_t kMissEntries = 32;
+constexpr uint32_t kMissWindowFrames = 8;
+MissEntry g_miss[kMissEntries];                     // the tick's: measured missing samples by the frame they were drawn in
+size_t g_missNext = 0;
+double g_missPixels = 0.0;                          // the viewport area of the latest measurement
+std::atomic<float> g_missShare{0.0f};               // the tick's result: the share of the viewport missing over the last kMissWindowFrames frames
 Hotkey* g_keyParallax = nullptr;
 std::string g_keyParallaxText;
 std::string g_radiusAppliedText;
@@ -297,6 +318,8 @@ constexpr size_t kTestSlots = 16;
 struct TestSlot {
     ID3D11Query* qDrawn = nullptr;
     ID3D11Query* qMirror = nullptr;
+    ID3D11Query* qProbe = nullptr;   // the backdrop's probe pass (between the game's draw and the display pass); used only on a test frame in mirror-backdrop with a cube
+    uint8_t probe = 0;               // 0 no probe in this test, 1 its query is open, 2 closed (read with the other two)
     uint8_t state = 0;   // 0 free, 1 the game's draw open, 2 closed and waiting for the mirror, 3 the mirror open, 4 both closed, not yet read
     uint32_t frame = 0;
     cc::PaneKey key;
@@ -330,8 +353,9 @@ struct DsEntry {
     ID3D11DepthStencilState* marked = nullptr;
     ID3D11DepthStencilState* farOut = nullptr;
     ID3D11DepthStencilState* probe = nullptr;
+    ID3D11DepthStencilState* markedProbe = nullptr;
 };
-enum class DsVariant { kPlain, kMarked, kFarOut, kProbe };
+enum class DsVariant { kPlain, kMarked, kFarOut, kProbe, kMarkedProbe };
 std::mutex g_dsMutex;
 DsEntry g_ds[16];
 size_t g_dsN = 0;
@@ -472,7 +496,7 @@ void makeWhitePs(ID3D11Device* device) noexcept {
 // overhead (sky), angled, other. A zero `up` gives `other`. A failed compile is logged once and the steady mode falls back to the plain mirror.
 // The steady colour of a pane from its lighting normal and b2 (up, the levels, the colour): shared by the steady shader and the backdrop's fallback, so the two are the same text.
 static const char kSkyCommon[] =
-    "cbuffer GlowCb : register(b2) { float4 up; float4 lv; float4 colour; float4 par; };\n"
+    "cbuffer GlowCb : register(b2) { float4 up; float4 lv; float4 colour; float4 par; float4 glassA; float4 glassB; };\n"
     "float3 fallbackColour(float3 n) {\n"
     "    float ul = length(up.xyz);\n"
     "    float3 nn = n * rsqrt(max(dot(n, n), 1e-12));\n"
@@ -500,7 +524,8 @@ void makeSkyPs(ID3D11Device* device) noexcept {
 }
 
 bool makeGlowCb(ID3D11Device* device) noexcept {
-    float init[16] = {0, 0, 0, 0, 1, 1, 1, 0, kSteadyColour[0], kSteadyColour[1], kSteadyColour[2], 0, static_cast<float>(cc::kParallaxDepth), cc::kBackdropRadiusDefaultM, 0, 0};
+    float init[24] = {0, 0, 0, 0, 1, 1, 1, 0, kSteadyColour[0], kSteadyColour[1], kSteadyColour[2], 0, static_cast<float>(cc::kParallaxDepth), cc::kBackdropRadiusDefaultM, 0, 0,
+                      cc::kGlassDefault[0], cc::kGlassDefault[1], cc::kGlassDefault[2], cc::kGlassDefault[3], cc::kGlassDefault[4], cc::kGlassDefault[5], 0, 0};
     ID3D11Buffer* made[2] = {};
     for (int i = 0; i < 2; ++i) {
         D3D11_BUFFER_DESC bd{};
@@ -733,6 +758,16 @@ bool makeTests(ID3D11Device* device) noexcept {
             return false;
         }
     }
+    // The probe queries (automatic capture): a failure costs only the probes, said once; the tests go on.
+    bool probesOk = true;
+    for (size_t i = 0; i < kTestSlots && probesOk; ++i) probesOk = SUCCEEDED(device->CreateQuery(&qd, &g_tests[i].qProbe)) && g_tests[i].qProbe != nullptr;
+    if (!probesOk) {
+        Log::get().note("concourse backdrop: the probe queries could not be made; automatic capture cannot measure what is missing (F6 still captures)");
+        for (auto& s : g_tests) {
+            if (s.qProbe) s.qProbe->Release();
+            s.qProbe = nullptr;
+        }
+    }
     g_testsMade = true;
     return true;
 }
@@ -947,11 +982,11 @@ ID3D11DepthStencilState* derivedDepth(ID3D11DeviceContext* ctx, ID3D11DepthStenc
         ++g_dsN;
     }
     ID3D11DepthStencilState*& slot = variant == DsVariant::kFarOut ? g_ds[at].farOut : variant == DsVariant::kMarked ? g_ds[at].marked
-                                   : variant == DsVariant::kProbe ? g_ds[at].probe : g_ds[at].plain;
+                                   : variant == DsVariant::kProbe ? g_ds[at].probe : variant == DsVariant::kMarkedProbe ? g_ds[at].markedProbe : g_ds[at].plain;
     if (slot) return slot;
     D3D11_DEPTH_STENCIL_DESC d{};
     orig->GetDesc(&d);
-    if (variant == DsVariant::kProbe) d.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ZERO;   // the backdrop's capture pass: the game's depth test, nothing written
+    if (variant == DsVariant::kProbe || variant == DsVariant::kMarkedProbe) d.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ZERO;   // (kMarkedProbe: the display's mark test, nothing written)   // the backdrop's capture pass: the game's depth test, nothing written
     else if (variant != DsVariant::kFarOut) d.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ALL;
     if (variant != DsVariant::kPlain && variant != DsVariant::kProbe) {
         d.StencilEnable = TRUE;
@@ -1231,6 +1266,7 @@ int testOpen(ID3D11DeviceContext* ctx, const cc::PaneKey& key) noexcept {
             }
         if (idx < 0) return -1;
         g_tests[idx].state = 1;
+        g_tests[idx].probe = 0;
         g_tests[idx].frame = g_frameNow.load(std::memory_order_relaxed);
         g_tests[idx].key = key;
         g_tests[idx].pixels = pixels;
@@ -1272,6 +1308,7 @@ void testCloseMirror(ID3D11DeviceContext* ctx, int idx) noexcept {
 void testAbandon(int idx) noexcept {
     std::lock_guard<std::mutex> lock(g_sideMutex);
     g_tests[idx].state = 0;
+    g_tests[idx].probe = 0;
 }
 
 cc::PaneSide sideOf(const cc::PaneKey& key) noexcept {
@@ -1295,17 +1332,44 @@ void pollTests(ID3D11Device* device, uint32_t frame) noexcept {
             FlatComputeInternalScope internal;
             for (auto& t : g_tests) {
                 if (t.state != 4) {
-                    if (t.state != 0 && static_cast<uint32_t>(frame - t.frame) > 600u) t.state = 0;   // stuck open (a draw that never reached its end)
+                    if (t.state != 0 && static_cast<uint32_t>(frame - t.frame) > 600u) {
+                        t.state = 0;   // stuck open (a draw that never reached its end)
+                        t.probe = 0;
+                    }
                     continue;
                 }
-                UINT64 drawn = 0, mirrored = 0;
-                if (imm->GetData(t.qDrawn, &drawn, sizeof(drawn), D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK) continue;
-                if (imm->GetData(t.qMirror, &mirrored, sizeof(mirrored), D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK) continue;
+                UINT64 drawn = 0, mirrored = 0, probed = 0;
+                const bool hadProbe = t.probe == 2;
+                const bool arrived = imm->GetData(t.qDrawn, &drawn, sizeof(drawn), D3D11_ASYNC_GETDATA_DONOTFLUSH) == S_OK &&
+                                     imm->GetData(t.qMirror, &mirrored, sizeof(mirrored), D3D11_ASYNC_GETDATA_DONOTFLUSH) == S_OK &&
+                                     (!hadProbe || imm->GetData(t.qProbe, &probed, sizeof(probed), D3D11_ASYNC_GETDATA_DONOTFLUSH) == S_OK);
+                if (!arrived) {
+                    if (static_cast<uint32_t>(frame - t.frame) > 600u) {   // a query that never returns: the slot is freed (the probe counters then show issued without read)
+                        t.state = 0;
+                        t.probe = 0;
+                    }
+                    continue;
+                }
                 const cc::PaneKey key = t.key;
                 const double pixels = t.pixels;
+                const uint32_t drawFrame = t.frame;
                 t.state = 0;
+                t.probe = 0;
                 g_testsRead.fetch_add(1, std::memory_order_relaxed);
+                if (hadProbe) g_probeRead.fetch_add(1, std::memory_order_relaxed);
                 const cc::PaneSides::Change c = g_sides.note(key, drawn, mirrored);
+                // The backdrop's missing share: what a probe counted (pixels the cube cannot show), or, with no cube yet, the whole of what the pane would draw (the mirror count).
+                if (g_mode.load(std::memory_order_relaxed) == kModeBackdrop && pixels > 0.0 && g_sides.side(key) == cc::PaneSide::kExterior) {
+                    double miss = -1.0;
+                    if (hadProbe) miss = static_cast<double>(probed);
+                    else if (!g_bdCubeValid.load(std::memory_order_relaxed)) miss = static_cast<double>(mirrored);
+                    if (miss >= 0.0) {
+                        g_miss[g_missNext].frame = drawFrame;
+                        g_miss[g_missNext].missing = miss;
+                        g_missNext = (g_missNext + 1) % kMissEntries;
+                        g_missPixels = pixels;
+                    }
+                }
                 if (plainNow && enterShare > 0.0f && pixels > 0.0 && g_sides.side(key) == cc::PaneSide::kExterior) {
                     const float share = static_cast<float>(static_cast<double>(drawn) / pixels);
                     if (share >= enterShare * cc::clearEntryScale(key.n) && share > candShare && key.n != g_clearN.load(std::memory_order_relaxed)) {
@@ -1371,6 +1435,7 @@ void releaseBackdrop() noexcept {
     releaseAtomic(g_bdDistFront);
     releaseAtomic(g_psBdShow);
     releaseAtomic(g_psBdCapture);
+    releaseAtomic(g_psBdProbe);
     releaseAtomic(g_bdSampler);
     std::lock_guard<std::mutex> lock(g_bdMutex);
     g_bdSceneW = g_bdSceneH = 0;
@@ -1488,24 +1553,28 @@ bool makeBackdropShaders(ID3D11Device* device) noexcept {
     device->GetImmediateContext(&imm);
     if (!imm) return false;
     const std::string cb1 = "cbuffer Cb1 : register(b1) { float4 cb1[327]; };\n";
-    const std::string show = std::string(kSkyCommon) + cb1 +
+    // The display and the probe share everything up to main: the inputs, the resources, the look-up and the direction `s` (what the pane looks up).
+    const std::string head = std::string(kSkyCommon) + cb1 +
         "struct PsIn { nointerpolation uint face : __USER_VERTEX_FACEINVARIANT0; float3 n : __USER_VERTEX_M_LIGHTINGNORMAL0; float3 wp : __USER_VERTEX_M_LIGHTINGPOSITION0; };\n"
         "TextureCube<float4> backdrop : register(t8);\n"
         "TextureCube<float> distMap : register(t9);\n"
         "Buffer<float4> originBuf : register(t10);\n"
         "SamplerState backdropSmp : register(s7);\n"
-        "float4 lookup(float3 s) {\n"
-        "    float4 acc = backdrop.SampleLevel(backdropSmp, s, 0);\n"
-        "    float4 c = backdrop.SampleLevel(backdropSmp, s, 1); acc.rgb += (1.0 - acc.a) * c.rgb; acc.a += (1.0 - acc.a) * c.a;\n"
-        "    c = backdrop.SampleLevel(backdropSmp, s, 2); acc.rgb += (1.0 - acc.a) * c.rgb; acc.a += (1.0 - acc.a) * c.a;\n"
-        "    c = backdrop.SampleLevel(backdropSmp, s, 3); acc.rgb += (1.0 - acc.a) * c.rgb; acc.a += (1.0 - acc.a) * c.a;\n"
-        "    c = backdrop.SampleLevel(backdropSmp, s, 5); acc.rgb += (1.0 - acc.a) * c.rgb; acc.a += (1.0 - acc.a) * c.a;\n"
-        "    c = backdrop.SampleLevel(backdropSmp, s, 7); acc.rgb += (1.0 - acc.a) * c.rgb; acc.a += (1.0 - acc.a) * c.a;\n"
+        // The composite of lods 0 1 2 3 5 7 (up to lastLod), each plus the glass's blur, front to back over premultiplied colour.
+        "float4 lookup(float3 s, float blur, float lastLod) {\n"
+        "    float4 acc = float4(0, 0, 0, 0);\n"
+        "    static const float L[6] = {0.0, 1.0, 2.0, 3.0, 5.0, 7.0};\n"
+        "    [unroll] for (int k = 0; k < 6; ++k) {\n"
+        "        if (L[k] <= lastLod) {\n"
+        "            float4 c = backdrop.SampleLevel(backdropSmp, s, L[k] + blur);\n"
+        "            acc.rgb += (1.0 - acc.a) * c.rgb;\n"
+        "            acc.a += (1.0 - acc.a) * c.a;\n"
+        "        }\n"
+        "    }\n"
         "    return acc;\n"
         "}\n"
-        "float4 main(PsIn i) : SV_Target {\n"
-        "    float3 fb = fallbackColour(i.n);\n"
-        "    float3 dir = i.wp * rsqrt(max(dot(i.wp, i.wp), 1e-12));\n"
+        "float3 backdropS(PsIn i, out float3 dir) {\n"
+        "    dir = i.wp * rsqrt(max(dot(i.wp, i.wp), 1e-12));\n"
         "    float3 off = cb1[275].xyz - originBuf[0].xyz;\n"
         "    float3 s = dir;\n"
         "    float mode = par.x;\n"
@@ -1528,10 +1597,30 @@ bool makeBackdropShaders(ID3D11Device* device) noexcept {
         "        }\n"
         "        s = off + dir * t;\n"
         "    }\n"
-        "    float4 acc = lookup(s);\n"
-        "    return float4(acc.rgb + (1.0 - acc.a) * fb, 1.0);\n"
+        "    return s;\n"
         "}\n";
-    const std::string capture = std::string(cc::cubeTexelHlsl()) + cb1 +
+    // Display: glass after the composite. Tint on the captured colour (premultiplied, so only where captured), the level colour under what is not captured (the fallback,
+    // unchanged), then the glass's own sheen: haze plus a Fresnel term at grazing angles, mixing toward the level colour. Samples: the look-up's 6 (blur is a bias, not
+    // extra samples) plus, in the depth mode, 8 for the march: 14 cube samples at most, 1 buffer load, 1 constant-buffer row.
+    const std::string show = head +
+        "float4 main(PsIn i) : SV_Target {\n"
+        "    float3 fb = fallbackColour(i.n);\n"
+        "    float3 dir;\n"
+        "    float3 s = backdropS(i, dir);\n"
+        "    float4 acc = lookup(s, glassB.x, 7.0);\n"
+        "    float3 base = acc.rgb * glassA.rgb + (1.0 - acc.a) * fb;\n"
+        "    float f = glassB.y * pow(saturate(1.0 - abs(dot(i.n * rsqrt(max(dot(i.n, i.n), 1e-12)), dir))), 5.0);\n"
+        "    return float4(lerp(base, fb, saturate(glassA.w + f)), 1.0);\n"
+        "}\n";
+    // Probe: the same direction and the same blur; a pixel whose composite coverage through lod 3 is under one half survives, and the occlusion count is those pixels.
+    const std::string probe = head +
+        "float4 main(PsIn i) : SV_Target {\n"
+        "    float3 dir;\n"
+        "    float3 s = backdropS(i, dir);\n"
+        "    float4 acc = lookup(s, glassB.x, 3.0);\n"
+        "    clip(0.5 - acc.a);\n"
+        "    return float4(0, 0, 0, 0);\n"
+        "}\n";    const std::string capture = std::string(cc::cubeTexelHlsl()) + cb1 +
         "struct PsIn { nointerpolation uint face : __USER_VERTEX_FACEINVARIANT0; float3 n : __USER_VERTEX_M_LIGHTINGNORMAL0; float3 wp : __USER_VERTEX_M_LIGHTINGPOSITION0;\n"
         "              float3 tg : __USER_VERTEX_M_LIGHTINGTANGENT0; float2 uv : __USER_VERTEX_M_TEXCOORD0; float4 p : SV_POSITION; };\n"
         "Texture2D<float4> scene : register(t8);\n"
@@ -1560,14 +1649,17 @@ bool makeBackdropShaders(ID3D11Device* device) noexcept {
         "}\n";
     ID3D11PixelShader* psShow = shaderSwapCompilePs(imm, show.c_str(), show.size(), "main", "concourse_backdrop_show", nullptr, "concourse backdrop");
     ID3D11PixelShader* psCap = shaderSwapCompilePs(imm, capture.c_str(), capture.size(), "main", "concourse_backdrop_capture", nullptr, "concourse backdrop");
+    ID3D11PixelShader* psProbe = shaderSwapCompilePs(imm, probe.c_str(), probe.size(), "main", "concourse_backdrop_probe", nullptr, "concourse backdrop");
     imm->Release();
-    if (!psShow || !psCap) {
+    if (!psShow || !psCap || !psProbe) {
         if (psShow) psShow->Release();
         if (psCap) psCap->Release();
-        return bdRefuse(!psShow ? "the display pixel shader did not compile" : "the capture pixel shader did not compile");
+        if (psProbe) psProbe->Release();
+        return bdRefuse(!psShow ? "the display pixel shader did not compile" : !psCap ? "the capture pixel shader did not compile" : "the probe pixel shader did not compile");
     }
     g_psBdShow.store(psShow, std::memory_order_release);
     g_psBdCapture.store(psCap, std::memory_order_release);
+    g_psBdProbe.store(psProbe, std::memory_order_release);
     return true;
 }
 
@@ -1593,7 +1685,7 @@ bool bdFormatOk(ID3D11Device* device, DXGI_FORMAT fmt, const char* name) noexcep
 // half-made.
 bool makeBackdropResources(ID3D11Device* device) noexcept {
     if (g_bdBack.load() && g_bdFront.load() && g_bdDistBack.load() && g_bdDistFront.load() && g_bdBackUav.load() && g_bdDistBackUav.load() && g_bdFrontSrv.load() &&
-        g_bdDistFrontSrv.load() && g_bdOrigin.load() && g_bdOriginSrv.load() && g_psBdCapture.load() && g_psBdShow.load() && g_bdSampler.load())
+        g_bdDistFrontSrv.load() && g_bdOrigin.load() && g_bdOriginSrv.load() && g_psBdCapture.load() && g_psBdShow.load() && g_psBdProbe.load() && g_bdSampler.load())
         return true;
     releaseBackdrop();
     const DXGI_FORMAT cfmt = DXGI_FORMAT_R16G16B16A16_FLOAT, dfmt = DXGI_FORMAT_R16_FLOAT;
@@ -2178,7 +2270,10 @@ void ConcoursePaneScope::begin(ID3D11DeviceContext* ctx, UINT indexCount, UINT s
     if (plain && mark && g_testsOn.load(std::memory_order_acquire) && g_markReady.load(std::memory_order_acquire) &&
         cc::paneTestThisFrame(cc::PaneKey{indexCount, startIndex, baseVertex}, g_frameNow.load(std::memory_order_relaxed))) {
         testSlot_ = testOpen(ctx, cc::PaneKey{indexCount, startIndex, baseVertex});
-        if (testSlot_ >= 0) flags_ |= kFlagTestDrawn;
+        if (testSlot_ >= 0) {
+            flags_ |= kFlagTestDrawn;
+            if (planBackdrop_ && !g_bdArmed.load(std::memory_order_acquire)) planProbe_ = true;   // never on a capture frame
+        }
     }
 }
 
@@ -2186,10 +2281,16 @@ void ConcoursePaneScope::begin(ID3D11DeviceContext* ctx, UINT indexCount, UINT s
 // says so and the mark pass could run, binds the mirror's state and returns true. Every false return leaves the context as the game had it.
 bool ConcoursePaneScope::nextMirrorPassSlow() noexcept {
     if (capBound_) endCapturePass();   // the capture pass has drawn: its state goes back before anything else is bound
+    if (probeBound_) endProbePass();   // so has the probe pass: its query ends and its state goes back (the constant buffer stays, for the display pass)
     if (planCapture_ && !capDone_) {
         capDone_ = true;
         closeGameQueries();   // the capture draw must not count in the game's draw's occlusion queries
         if (beginCapturePass()) return true;
+    }
+    if (planProbe_ && !probeDone_) {
+        probeDone_ = true;
+        closeGameQueries();   // the probe must not count in the game's draw's query
+        if (beginProbePass()) return true;
     }
     if (!mirrorBound_) {
         if (!beginMirrorSlow()) {
@@ -2314,6 +2415,85 @@ bool ConcoursePaneScope::beginCapturePass() noexcept {
     flags_ |= kFlagCapPass;
     g_bdPaneDraws.fetch_add(1, std::memory_order_relaxed);
     return true;
+}
+
+// PROTOTYPE (automatic capture). The probe pass: the game's glass geometry again, no colour, the probe pixel shader (the display shader's direction and look-up, `clip` where
+// the composite covers at least a half), the cube bound as the display pass binds it, the game's depth test with the display's mark stencil and no depth write, and its own
+// occlusion query, whose count is the pixels the cube cannot show. Only on a test frame, only with a cube, never on a capture frame.
+bool ConcoursePaneScope::beginProbePass() noexcept {
+    if (testSlot_ < 0 || !planMark_ || !calls_ || !calls_->setBlend || !calls_->setPs || !calls_->setSrv || !calls_->setDepth) return false;
+    if (g_bdArmed.load(std::memory_order_acquire) || !g_bdCubeValid.load(std::memory_order_acquire)) return false;
+    ID3D11Query* q = g_tests[testSlot_].qProbe;
+    ID3D11PixelShader* ps = g_psBdProbe.load(std::memory_order_acquire);
+    ID3D11ShaderResourceView* mine[kBdSrvCount] = {g_bdFrontSrv.load(std::memory_order_acquire), g_bdDistFrontSrv.load(std::memory_order_acquire), g_bdOriginSrv.load(std::memory_order_acquire)};
+    ID3D11SamplerState* smp = g_bdSampler.load(std::memory_order_acquire);
+    ID3D11BlendState* noColour = g_bsMark.load(std::memory_order_acquire);
+    ID3D11Buffer* cb = (keyN_ == cc::kBayIndexCount ? g_cbGlowBay : g_cbGlow).load(std::memory_order_acquire);
+    if (!q || !ps || !mine[0] || !mine[1] || !mine[2] || !smp || !noColour || !cb) return false;
+    if (!ensureMarked(ctx_, *calls_)) return false;   // runs and restores its own state
+    UINT ref = 0;
+    ctx_->OMGetDepthStencilState(&capPrevDs_, &ref);
+    ID3D11DepthStencilState* derived = capPrevDs_ ? derivedDepth(ctx_, capPrevDs_, DsVariant::kMarkedProbe) : nullptr;
+    if (!derived) {
+        if (capPrevDs_) capPrevDs_->Release();
+        capPrevDs_ = nullptr;
+        return false;
+    }
+    capPrevRef_ = ref;
+    ctx_->OMGetBlendState(&capPrevBs_, capPrevFactor_, &capPrevMask_);
+    ctx_->PSGetShader(&capPrevPs_, nullptr, nullptr);
+    ctx_->PSGetShaderResources(kBdSceneSlot, kBdSrvCount, capPrevSrv_);
+    ctx_->PSGetSamplers(kBdSamplerSlot, 1, &probePrevSampler_);
+    const FLOAT zeros[4] = {};
+    calls_->setBlend(ctx_, noColour, zeros, 0xFFFFFFFFu);
+    calls_->setPs(ctx_, ps, nullptr, 0);
+    calls_->setSrv(ctx_, kBdSceneSlot, kBdSrvCount, mine);
+    ctx_->PSSetSamplers(kBdSamplerSlot, 1, &smp);
+    calls_->setDepth(ctx_, derived, kMarkRef);
+    bindPsCb(cb);   // the game's constant buffer 2 is saved once (kFlagCb); the display pass changes the buffer again and end() puts the game's back
+    {
+        FlatComputeInternalScope internal;
+        ctx_->Begin(q);
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_sideMutex);
+        g_tests[testSlot_].probe = 1;
+    }
+    probeBound_ = true;
+    flags_ |= kFlagProbePass;
+    g_probeIssued.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
+void ConcoursePaneScope::endProbePass() noexcept {
+    if (!probeBound_) return;
+    probeBound_ = false;
+    flags_ &= ~kFlagProbePass;
+    if (testSlot_ >= 0) {
+        {
+            FlatComputeInternalScope internal;
+            ctx_->End(g_tests[testSlot_].qProbe);
+        }
+        std::lock_guard<std::mutex> lock(g_sideMutex);
+        g_tests[testSlot_].probe = 2;
+    }
+    ctx_->PSSetSamplers(kBdSamplerSlot, 1, &probePrevSampler_);
+    if (probePrevSampler_) probePrevSampler_->Release();
+    probePrevSampler_ = nullptr;
+    calls_->setDepth(ctx_, capPrevDs_, capPrevRef_);
+    if (capPrevDs_) capPrevDs_->Release();
+    capPrevDs_ = nullptr;
+    calls_->setSrv(ctx_, kBdSceneSlot, kBdSrvCount, capPrevSrv_);
+    for (auto*& v : capPrevSrv_) {
+        if (v) v->Release();
+        v = nullptr;
+    }
+    calls_->setPs(ctx_, capPrevPs_, nullptr, 0);
+    if (capPrevPs_) capPrevPs_->Release();
+    capPrevPs_ = nullptr;
+    calls_->setBlend(ctx_, capPrevBs_, capPrevFactor_, capPrevMask_);
+    if (capPrevBs_) capPrevBs_->Release();
+    capPrevBs_ = nullptr;
 }
 
 void ConcoursePaneScope::endCapturePass() noexcept {
@@ -2453,6 +2633,7 @@ bool ConcoursePaneScope::beginMirrorSlow() noexcept {
 }
 
 void ConcoursePaneScope::end() noexcept {
+    if ((flags_ & kFlagProbePass) != 0) endProbePass();   // before the test slot is touched below: it closes the probe's query
     if ((flags_ & kFlagCapPass) != 0) endCapturePass();   // a capture pass the site never asked past (the loop always does; this is the way out of any other exit)
     if ((flags_ & kFlagSampler) != 0) {
         ctx_->PSSetSamplers(kBdSamplerSlot, 1, &prevSampler_);
@@ -2543,6 +2724,7 @@ void modeToast(uint32_t m) noexcept {
 void setMode(uint32_t m, const char* why, bool toast = false) noexcept {
     const uint32_t before = g_mode.exchange(m, std::memory_order_relaxed);
     if (before != m) Log::get().note("concourse pane: mode %s (%s)", modeText(m), why);
+    if (toast && m == kModeBackdrop) g_bdAutoOn.store(true, std::memory_order_relaxed);   // a hotkey chose the backdrop: automatic capture is on (the ini's own setting does not turn it on)
     if (toast && before != m) modeToast(m);
 }
 
@@ -2707,6 +2889,27 @@ void pollConfig(uint64_t nowMs) {
                 Log::get().note("concourse backdrop: distance mode %s, radius %.0f m", cc::parallaxName(g_bdParallax.load(std::memory_order_relaxed)), static_cast<double>(want));
         }
     }
+    const std::string glassT = Config::get().getString("diag.concourse_glass", "");
+    if (!g_glassTextSeen || glassT != g_glassAppliedText) {
+        const bool first = !g_glassTextSeen;
+        g_glassTextSeen = true;
+        g_glassAppliedText = glassT;
+        float v[6] = {};
+        if (glassT.empty()) {
+            for (int k = 0; k < 6; ++k) g_glass[k].store(cc::kGlassDefault[k], std::memory_order_relaxed);   // unset: the defaults
+            if (!first) Log::get().note("concourse backdrop: glass back to the defaults: tint %g %g %g haze %g blur %g fresnel %g", static_cast<double>(cc::kGlassDefault[0]),
+                                        static_cast<double>(cc::kGlassDefault[1]), static_cast<double>(cc::kGlassDefault[2]), static_cast<double>(cc::kGlassDefault[3]),
+                                        static_cast<double>(cc::kGlassDefault[4]), static_cast<double>(cc::kGlassDefault[5]));
+        } else if (cc::parseGlass(glassT.c_str(), v)) {
+            for (int k = 0; k < 6; ++k) g_glass[k].store(v[k], std::memory_order_relaxed);
+            Log::get().note("concourse backdrop: glass tint %g %g %g haze %g blur %g fresnel %g", static_cast<double>(v[0]), static_cast<double>(v[1]), static_cast<double>(v[2]),
+                            static_cast<double>(v[3]), static_cast<double>(v[4]), static_cast<double>(v[5]));
+        } else {
+            Log::get().note("concourse backdrop: diag.concourse_glass = \"%s\" is not six numbers (r,g,b 0 to 2, haze 0 to 1, blur 0 to 8, fresnel 0 to 2); the glass stays tint %g %g %g haze %g blur %g fresnel %g",
+                            glassT.c_str(), static_cast<double>(g_glass[0].load()), static_cast<double>(g_glass[1].load()), static_cast<double>(g_glass[2].load()),
+                            static_cast<double>(g_glass[3].load()), static_cast<double>(g_glass[4].load()), static_cast<double>(g_glass[5].load()));
+        }
+    }
     const std::string panesT = Config::get().getString("diag.concourse_panes", "");
     if (!g_panesTextSeen || panesT != g_panesAppliedText) {
         const bool first = !g_panesTextSeen;
@@ -2757,19 +2960,21 @@ void updateGlowCb(ID3D11Device* device) noexcept {
     if (!cb || !cbBay) return;
     const float sky = g_glowSky.load(std::memory_order_relaxed), angled = g_glowAngled.load(std::memory_order_relaxed), other = g_glowOther.load(std::memory_order_relaxed),
                 bay = g_glowBay.load(std::memory_order_relaxed);
-    float data[16] = {};
+    float data[24] = {};
     const bool upOk = g_upFedValid.load(std::memory_order_relaxed);
     for (int k = 0; k < 3; ++k) data[k] = upOk ? g_upFed[k].load(std::memory_order_relaxed) : 0.0f;
     data[4] = sky;
     data[5] = angled;
     data[6] = other;
     for (int k = 0; k < 3; ++k) data[8 + k] = kSteadyColour[k];
-    float dataBay[16] = {};
+    float dataBay[24] = {};
     dataBay[4] = dataBay[5] = dataBay[6] = bay;
     for (int k = 0; k < 3; ++k) dataBay[8 + k] = kSteadyColour[k];
     // The backdrop's row 3: the distance mode (cc::kParallax*) and the sphere's radius. Both buffers carry it (the bay window is backdrop too).
     data[12] = dataBay[12] = static_cast<float>(g_bdParallax.load(std::memory_order_relaxed));
     data[13] = dataBay[13] = g_bdRadius.load(std::memory_order_relaxed);
+    // Rows 4 and 5: the glass look (r, g, b, haze; blur, fresnel).
+    for (int k = 0; k < 6; ++k) data[16 + k] = dataBay[16 + k] = g_glass[k].load(std::memory_order_relaxed);
     const bool changed = !g_glowCbSentValid || std::memcmp(data, g_glowCbSent, sizeof(data)) != 0;
     const bool changedBay = !g_glowCbSentValid || std::memcmp(dataBay, g_glowCbBaySent, sizeof(dataBay)) != 0;
     if (changed || changedBay) {
@@ -2884,11 +3089,11 @@ void backdropTick(ID3D11Device* device, uint32_t frame) noexcept {
         if (!device) {
             bdRefuse("no device");
             g_bdPhase.store(static_cast<uint8_t>(ConcourseBackdropPhase::kRefused), std::memory_order_relaxed);
-            queueToast("Windows: capture refused");
+            if (g_bdToast.load(std::memory_order_relaxed)) queueToast("Windows: capture refused");
         } else if (!makeBackdropResources(device) || !g_statesReady.load(std::memory_order_acquire)) {
             if (g_statesReady.load(std::memory_order_acquire) == false && g_bdBack.load() != nullptr) bdRefuse("the pane states are not made (the cull is not treating panes)");
             g_bdPhase.store(static_cast<uint8_t>(ConcourseBackdropPhase::kRefused), std::memory_order_relaxed);
-            queueToast("Windows: capture refused");
+            if (g_bdToast.load(std::memory_order_relaxed)) queueToast("Windows: capture refused");
         } else {
             g_bdPaneDraws.store(0, std::memory_order_relaxed);
             g_bdSceneCopied.store(false, std::memory_order_relaxed);
@@ -2915,17 +3120,17 @@ void backdropTick(ID3D11Device* device, uint32_t frame) noexcept {
             g_bdCaptures.fetch_add(1, std::memory_order_relaxed);
             g_bdCubeValid.store(true, std::memory_order_release);
             g_bdPhase.store(static_cast<uint8_t>(ConcourseBackdropPhase::kDone), std::memory_order_relaxed);
-            queueToast("Windows: view captured");
+            if (g_bdToast.load(std::memory_order_relaxed)) queueToast("Windows: view captured");
         } else {
             bdRefuse("the cube could not be copied (no immediate context or texture)");
             g_bdPhase.store(static_cast<uint8_t>(ConcourseBackdropPhase::kRefused), std::memory_order_relaxed);
-            queueToast("Windows: capture refused");
+            if (g_bdToast.load(std::memory_order_relaxed)) queueToast("Windows: capture refused");
         }
         if (imm) imm->Release();
     } else if (g_bdFramesWaited >= cc::kBackdropWaitFrames) {
         g_bdArmed.store(false, std::memory_order_release);
         g_bdPhase.store(static_cast<uint8_t>(ConcourseBackdropPhase::kEmpty), std::memory_order_relaxed);
-        queueToast("Windows: nothing captured");
+        if (g_bdToast.load(std::memory_order_relaxed)) queueToast("Windows: nothing captured");
     }
 }
 }  // namespace
@@ -3008,6 +3213,13 @@ void concoursePaneTick(ID3D11Device* device, uint32_t frame, uint64_t nowMs) noe
             }
         }
         pollTests(device, frame);
+        {   // the missing share over the last kMissWindowFrames frames (the tick's thread owns the entries)
+            double sum = 0.0;
+            if (g_mode.load(std::memory_order_relaxed) == kModeBackdrop && g_missPixels > 0.0)
+                for (const MissEntry& e : g_miss)
+                    if (e.missing > 0.0 && frame - e.frame < kMissWindowFrames) sum += e.missing;
+            g_missShare.store(g_missPixels > 0.0 ? static_cast<float>(sum / g_missPixels) : 0.0f, std::memory_order_relaxed);
+        }
         const bool measuring = g_feedMeasure.load(std::memory_order_relaxed);
         if (measuring && makeSlots(device)) g_shareOn.store(true, std::memory_order_release);
         if (!measuring) g_shareOn.store(false, std::memory_order_release);
@@ -3021,7 +3233,8 @@ void concoursePaneTick(ID3D11Device* device, uint32_t frame, uint64_t nowMs) noe
 // ---- The backdrop capture's tick and its API (PROTOTYPE) -------------------------------------------------------------------------------------------------
 void concoursePaneSetBackdropMode(const char* why) noexcept { setMode(kModeBackdrop, why, true); }
 
-void concoursePaneArmCapture() noexcept {
+void concoursePaneArmCapture(bool toast) noexcept {
+    g_bdToast.store(toast, std::memory_order_relaxed);
     g_bdPhase.store(static_cast<uint8_t>(ConcourseBackdropPhase::kIdle), std::memory_order_relaxed);
     g_bdArmRequested.store(true, std::memory_order_release);
 }
@@ -3047,6 +3260,17 @@ void concoursePaneBackdropEnd() noexcept {
     g_bdArmed.store(false, std::memory_order_release);
     g_bdPhase.store(static_cast<uint8_t>(ConcourseBackdropPhase::kIdle), std::memory_order_relaxed);
     updateArmed();
+}
+
+bool concoursePaneBackdropAuto() noexcept { return g_bdAutoOn.load(std::memory_order_relaxed) && g_mode.load(std::memory_order_relaxed) == kModeBackdrop; }
+bool concoursePaneIsBackdropMode() noexcept { return g_mode.load(std::memory_order_relaxed) == kModeBackdrop; }
+ConcourseBackdropMissing concoursePaneBackdropMissing() noexcept {
+    ConcourseBackdropMissing m;
+    m.share = g_missShare.load(std::memory_order_relaxed);
+    m.probesIssued = g_probeIssued.load(std::memory_order_relaxed);
+    m.probesRead = g_probeRead.load(std::memory_order_relaxed);
+    m.cubeValid = g_bdCubeValid.load(std::memory_order_relaxed);
+    return m;
 }
 
 bool concoursePaneTakeToast(char* out, size_t size) noexcept {

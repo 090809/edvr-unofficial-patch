@@ -3129,6 +3129,13 @@ bool g_viewHotkeyBound = false;
 enum class BackdropPhase : uint8_t { kIdle, kLifting, kArmed };
 BackdropPhase g_backdropPhase = BackdropPhase::kIdle;
 uint64_t g_backdropStartMs = 0, g_backdropArmMs = 0;
+// Automatic capture (mirror-backdrop, once a hotkey has turned it on): the pane module probes what the cube cannot show; this gate decides, from the share, when to capture.
+cc::BackdropAutoGate g_backdropGate;
+bool g_backdropAutoRun = false;                  // the capture in progress was started by the gate, not F6
+uint32_t g_backdropAutoCount = 0, g_backdropManualCount = 0;   // captures started since this visit began
+uint64_t g_backdropLiftedMs = 0;                 // the cull lifted for captures, in all, this visit
+uint64_t g_backdropSummaryMs = 0;
+uint64_t g_backdropProbeIssued0 = 0, g_backdropProbeRead0 = 0;   // the probe counters at the last 30 s line
 std::string g_concHotkeyText;
 bool g_concHotkeyBound = false;
 bool g_concWasActive = false;
@@ -3236,6 +3243,17 @@ void concoursePoll(uint64_t now) {
 
 bool g_concSurveyListPending = false;   // the next survey is the press's or F3's: it lists the culled names
 
+// The capture begins: the cull is lifted for cc::kBackdropLiftMs, the outside effects stay withheld. `manual`: F6's (its result is a toast), else the gate's.
+void concourseBackdropStart(uint64_t now, bool manual) {
+    g_backdropAutoRun = !manual;
+    if (manual) ++g_backdropManualCount;
+    else ++g_backdropAutoCount;
+    g_backdropPhase = BackdropPhase::kLifting;
+    g_backdropStartMs = now;
+    Log::get().note("concourse backdrop: capture requested (%s): the cull lifts for %llu ms, the outside effects stay withheld", manual ? "F6" : "automatic",
+                    static_cast<unsigned long long>(cc::kBackdropLiftMs));
+}
+
 // A press of hotkey.concourse_view_test: the backdrop capture. Only while the cull's own part is on.
 void concourseBackdropPress(bool cullPartOn, uint64_t now) {
     if (g_backdropPhase != BackdropPhase::kIdle) {
@@ -3246,10 +3264,8 @@ void concourseBackdropPress(bool cullPartOn, uint64_t now) {
         Log::get().note("concourse backdrop: press refused: the cull's own part is not on (no cull, the bay is clearing, or not in the concourse)");
         return;
     }
-    concoursePaneSetBackdropMode("hotkey.concourse_view_test");
-    g_backdropPhase = BackdropPhase::kLifting;
-    g_backdropStartMs = now;
-    Log::get().note("concourse backdrop: capture requested: the cull lifts for %llu ms, the outside effects stay withheld", static_cast<unsigned long long>(cc::kBackdropLiftMs));
+    concoursePaneSetBackdropMode("hotkey.concourse_view_test");   // also turns automatic capture on
+    concourseBackdropStart(now, true);
 }
 
 // One tick of the capture. True while the cull is to stay lifted. The result is logged once, whichever way it ends, and what it says tells the ways apart: never armed
@@ -3258,6 +3274,8 @@ bool concourseBackdropStep(uint64_t now, bool wantCull) {
     if (g_backdropPhase == BackdropPhase::kIdle) return false;
     const unsigned long long lifted = static_cast<unsigned long long>(now - g_backdropStartMs);
     const auto finish = [&]() {
+        g_backdropLiftedMs += lifted;
+        g_backdropGate.captureEnded(now);
         concoursePaneBackdropEnd();
         g_backdropPhase = BackdropPhase::kIdle;
         return false;
@@ -3268,7 +3286,7 @@ bool concourseBackdropStep(uint64_t now, bool wantCull) {
     }
     if (g_backdropPhase == BackdropPhase::kLifting) {
         if (now - g_backdropStartMs >= cc::kBackdropLiftMs) {
-            concoursePaneArmCapture();
+            concoursePaneArmCapture(!g_backdropAutoRun);
             g_backdropPhase = BackdropPhase::kArmed;
             g_backdropArmMs = now;
         }
@@ -3311,6 +3329,7 @@ void concourseSettingOffTick(uint64_t now) {
         concoursePaneBackdropEnd();
         g_backdropPhase = BackdropPhase::kIdle;
     }
+    g_backdropGate.reset();
     g_liftGate.reset();
     g_liftWasOn = false;
     g_concWasCull = false;
@@ -3979,7 +3998,54 @@ void concourseTick(uint64_t now, uint32_t frame) {
     // PROTOTYPE (the backdrop capture): a press while the cull's own part is on lifts it for a moment, as the bay's lifting step does, with the clearing machine untouched.
     // The panes keep their treatment (an exterior pane is opaque over its whole area, as in the lifted phase) and the outside effects stay withheld (feed.effects).
     const bool cullPartRaw = wantCull && clr.cullOn;
-    if (g_viewHotkey && g_viewHotkey->pressed()) concourseBackdropPress(cullPartRaw && !liftOn, now);
+    if (!wantCull) {
+        g_backdropGate.reset();
+        g_backdropSummaryMs = 0;
+    } else if (!g_concWasWant) {   // a new visit: the counts of the 30 s line start over
+        g_backdropAutoCount = g_backdropManualCount = 0;
+        g_backdropLiftedMs = 0;
+    }
+    if (g_viewHotkey && g_viewHotkey->pressed()) {
+        concourseBackdropPress(cullPartRaw && !liftOn, now);
+    } else if (g_backdropPhase == BackdropPhase::kIdle) {
+        // Automatic capture: the same capture F6 starts, when what the panes in view show of nothing is meaningful (concourse_cull_core.h, BackdropAutoGate).
+        const ConcourseBackdropMissing miss = concoursePaneBackdropMissing();
+        cc::BackdropAutoInput in;
+        in.nowMs = now;
+        in.share = miss.share;
+        in.autoOn = concoursePaneBackdropAuto();
+        in.modeBackdrop = concoursePaneIsBackdropMode();
+        in.cullPartOn = cullPartRaw;
+        in.plainMirror = clr.phase == cc::ClearPhase::kMirror;
+        in.liftOn = liftOn;
+        in.captureRunning = false;
+        const cc::BackdropAutoDecision d = g_backdropGate.step(in);
+        if (d.escalated)
+            Log::get().note("concourse backdrop: auto capture: the missing share did not fall after a capture (%.2f%% at its start, %.2f%% now); the gap between captures is now %llu ms, up to %llu ms",
+                            static_cast<double>(d.shareAtStart) * 100.0, static_cast<double>(miss.share) * 100.0, static_cast<unsigned long long>(d.gapMs),
+                            static_cast<unsigned long long>(cc::kBackdropMaxGapMs));
+        if (d.fire) {
+            Log::get().note("concourse backdrop: auto capture: missing %.2f%% of the view", static_cast<double>(miss.share) * 100.0);
+            concourseBackdropStart(now, false);
+        }
+    }
+    // The 30 s line, while in the mode in the concourse: it says whether the cost falls to nothing once the room has been seen. It never waits on a capture.
+    if (wantCull && concoursePaneIsBackdropMode()) {
+        if (g_backdropSummaryMs == 0) {
+            g_backdropSummaryMs = now;
+        } else if (now - g_backdropSummaryMs >= 30000) {
+            g_backdropSummaryMs = now;
+            const ConcourseBackdropMissing miss = concoursePaneBackdropMissing();
+            Log::get().note("concourse backdrop 30s: %u auto captures, %u F6, lifted %llu ms in all, missing now %.2f%% (probes %llu issued, %llu read in these 30 s; auto %s, gap %llu ms)",
+                            g_backdropAutoCount, g_backdropManualCount, static_cast<unsigned long long>(g_backdropLiftedMs), static_cast<double>(miss.share) * 100.0,
+                            static_cast<unsigned long long>(miss.probesIssued - g_backdropProbeIssued0), static_cast<unsigned long long>(miss.probesRead - g_backdropProbeRead0),
+                            concoursePaneBackdropAuto() ? "on" : "off", static_cast<unsigned long long>(g_backdropGate.gapMs()));
+            g_backdropProbeIssued0 = miss.probesIssued;
+            g_backdropProbeRead0 = miss.probesRead;
+        }
+    } else {
+        g_backdropSummaryMs = 0;
+    }
     const bool backdropLift = concourseBackdropStep(now, wantCull);
     const bool cullPart = cullPartRaw && !backdropLift;
     const bool active = cullPart || liftOn;
