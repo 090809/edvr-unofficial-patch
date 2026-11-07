@@ -69,18 +69,53 @@ void caseLines() {
     w.cls[2].pixels = 600;
     w.cls[2].hist[31] = 600;       // about 0.193
     w.cls[2].sumErr1024 = 600u * 200u;
+    w.clamped = 500;
+    w.tcells = 960;                // 40 cells fell outside S when it was turned
+    w.tout = 40;
+    w.tcls[0].pixels = 300;
+    w.tcls[0].hist[0] = 300;
+    w.tcls[2].pixels = 660;
+    w.tcls[2].hist[3] = 660;       // about 0.0037
+    w.tcls[2].sumErr1024 = 660u * 4u;
+    w.rotSamples = 38;
+    w.rotMedian = 0.4f;
+    w.rotMax = 1.2345f;
     const std::string line = formatFrameGenSynthReport(w);
     checkText(line,
-              "frame generation (synth): frames=40/39 scored=38 skipped=2 gpu_ms=0.31/0.80(n=40)/-(n=0) holes=0.25%/0.01% guard=1.50%"
-              " far=30.0%,0,0,0,0.0%,0.0%|id:0,0 cockpit=10.0%,50,48,48,100.0%,0.0%|id:100,115 world=60.0%,195,193,193,100.0%,100.0%|id:0,0",
-              "the report line: counts, the two gpu fields, the hole and guard shares and the scorer's three class fields");
-    check(line.size() < 400, "the report line is far under Log::note's 1165 characters");
+              "frame generation (synth): frames=40/39 scored=38 skipped=2 gpu_ms=0.31/0.80(n=40)/-(n=0) holes=0.25%/0.01% guard=1.50% clamp=0.050%"
+              " far=30.0%,0,0,0,0.0%,0.0%|id:0,0 cockpit=10.0%,50,48,48,100.0%,0.0%|id:100,115 world=60.0%,195,193,193,100.0%,100.0%|id:0,0"
+              " turned: far=31.2%,0,0,0,0.0%,0.0%|id:0,0 cockpit=0.0%,0,0,0,0.0%,0.0%|id:0,0 world=68.8%,4,2,2,0.0%,0.0%|id:0,0 rot_res_deg=0.400/1.235 out=4.00%",
+              "the report line: counts, the two gpu fields, the hole, guard and clamp shares, the scorer's three class fields, then the same turned with the residual rotation and the share outside S");
+    check(line.size() < 700, "the report line is well under Log::note's 1165 characters");
+    {   // the widest the line can be: every number at its widest. One line must still fit.
+        FrameGenSynthWindow x;
+        x.frames[0] = x.frames[1] = x.scored = x.skipped = 4000000000u;
+        x.gpuSamples[0] = x.gpuSamples[1] = 4000000000u;
+        x.gpuMedian[0] = x.gpuMedian[1] = x.gpuMax[0] = x.gpuMax[1] = 99999.99f;
+        x.pixels = 1;
+        x.filled = x.left = x.guard = x.clamped = 1000000000000ull;
+        x.cells = x.tcells = 1;
+        for (int c = 0; c < kFrameGenShadowClasses; ++c) {
+            x.cls[c].pixels = x.tcls[c].pixels = 1;
+            x.cls[c].hist[47] = x.tcls[c].hist[47] = 1;
+            x.cls[c].histId[47] = x.tcls[c].histId[47] = 1;
+            x.cls[c].sumErr1024 = x.tcls[c].sumErr1024 = 4000000000u;
+            x.cls[c].sumErrId1024 = x.tcls[c].sumErrId1024 = 4000000000u;
+        }
+        x.tout = 1000000000000ull;
+        x.rotSamples = 1;
+        x.rotMedian = x.rotMax = 179.999f;
+        const std::string widest = formatFrameGenSynthReport(x);
+        std::printf("framegen_synth_report_test: widest report line %zu characters\n", widest.size());
+        check(widest.size() < 1100, "the widest report line, every number at its widest, is under Log::note's 1165 characters in one line");
+    }
 
     FrameGenSynthWindow idle;
     idle.skipped = 7;
     checkText(formatFrameGenSynthReport(idle),
-              "frame generation (synth): frames=0/0 scored=0 skipped=7 gpu_ms=-(n=0)/-(n=0) holes=0.00%/0.00% guard=0.00%"
-              " far=0.0%,0,0,0,0.0%,0.0%|id:0,0 cockpit=0.0%,0,0,0,0.0%,0.0%|id:0,0 world=0.0%,0,0,0,0.0%,0.0%|id:0,0",
+              "frame generation (synth): frames=0/0 scored=0 skipped=7 gpu_ms=-(n=0)/-(n=0) holes=0.00%/0.00% guard=0.00% clamp=0.000%"
+              " far=0.0%,0,0,0,0.0%,0.0%|id:0,0 cockpit=0.0%,0,0,0,0.0%,0.0%|id:0,0 world=0.0%,0,0,0,0.0%,0.0%|id:0,0"
+              " turned: far=0.0%,0,0,0,0.0%,0.0%|id:0,0 cockpit=0.0%,0,0,0,0.0%,0.0%|id:0,0 world=0.0%,0,0,0,0.0%,0.0%|id:0,0 rot_res_deg=-/- out=0.00%",
               "a window that called the module and built nothing still says so (frames=0/0, the skips), so a synth that never ran reads differently from one that did");
 }
 
@@ -90,18 +125,24 @@ void caseMerge() {
     built.filled = 10;
     built.left = 2;
     built.guard = 7;
+    built.clamped = 3;
     frameGenSynthMergeFrame(w, 0, 100, built);
     frameGenSynthMergeFrame(w, 1, 100, built);
     frameGenSynthMergeFrame(w, 1, 100, built);
-    check(w.frames[0] == 1 && w.frames[1] == 2 && w.pixels == 300 && w.filled == 30 && w.left == 6 && w.guard == 21, "frames are counted by kind and the counters and pixels add");
+    check(w.frames[0] == 1 && w.frames[1] == 2 && w.pixels == 300 && w.filled == 30 && w.left == 6 && w.guard == 21 && w.clamped == 9, "frames are counted by kind and the counters and pixels add");
     FrameGenSynthEyeResult sc;
     sc.cells = 12;
     sc.cls[2].pixels = 12;
     sc.cls[2].hist[5] = 12;
     sc.cls[2].sumErr1024 = 24;
+    sc.tcells = 10;
+    sc.tout = 2;
+    sc.tcls[2].pixels = 10;
+    sc.tcls[2].hist[1] = 10;
     frameGenSynthMergeScore(w, sc);
     frameGenSynthMergeScore(w, sc);
     check(w.scored == 2 && w.cells == 24 && w.cls[2].pixels == 24 && w.cls[2].hist[5] == 24 && w.cls[2].sumErr1024 == 48, "a scored frame adds its classes and counts once");
+    check(w.tcells == 20 && w.tout == 4 && w.tcls[2].pixels == 20 && w.tcls[2].hist[1] == 20 && w.tcls[0].pixels == 0, "and its turned classes, cells and cells outside S");
     check(w.cls[0].pixels == 0 && w.cls[1].pixels == 0, "the other classes stay empty");
 }
 
@@ -114,11 +155,17 @@ void caseDecode() {
     words[kFrameGenSynthStatsFilled] = 40;
     words[kFrameGenSynthStatsLeft] = 5;
     words[kFrameGenSynthStatsGuard] = 77;
+    words[kFrameGenSynthStatsClamp] = 4;
+    words[kFrameGenSynthStatsTurned + 2 * kFrameGenShadowBins] = 6;                             // turned far pixels
+    words[kFrameGenSynthStatsTurned + kFrameGenShadowStatsHoles] = 2;                           // turned: outside S
+    words[kFrameGenSynthStatsTurned + kFrameGenShadowStatsCells] = 6;
     FrameGenSynthEyeResult r;
     frameGenSynthDecodeStats(words, r);
     check(r.cells == 12 && r.cls[0].pixels == 3 && r.cls[0].hist[0] == 3 && r.cls[2].pixels == 9 && r.filled == 40 && r.left == 5 && r.guard == 77,
           "the stats words decode: the score block as the scorer's, then filled, left and guard");
-    check(kFrameGenSynthStatsUints == 302 && kFrameGenSynthStatsFilled == 299, "the stats layout is 299 score words and three counters");
+    check(r.clamped == 4 && r.tcls[0].pixels == 6 && r.tout == 2 && r.tcells == 6 && r.tcls[2].pixels == 0, "and the clamp count and the turned block (its holes word is the cells outside S)");
+    check(kFrameGenSynthStatsUints == 602 && kFrameGenSynthStatsFilled == 299 && kFrameGenSynthStatsClamp == 302 && kFrameGenSynthStatsTurned == 303,
+          "the stats layout is 299 score words, four counters, then the turned block of 299");
 }
 
 void caseRotation() {
@@ -182,7 +229,8 @@ void caseCb() {
     float rot[9], t[3];
     frameGenSynthHeadStep(d, 0.5f, rot, t);
     check(std::fabs(cb.rs[1][1] - rot[4]) < 1e-7f && std::fabs(cb.rs[0][2] - rot[2]) < 1e-7f && std::fabs(cb.rs[0][3] - t[0]) < 1e-9f, "rs holds the step, translation in w");
-    check(sizeof(FrameGenSynthCb) == 160, "ten rows of 16 bytes");
+    check(sizeof(FrameGenSynthCb) == 224, "fourteen rows of 16 bytes");
+    check(cb.rr[0][0] == 1.0f && cb.rr[1][1] == 1.0f && cb.rr[2][2] == 1.0f && cb.rr[0][1] == 0.0f && cb.tanK[1] == cb.tanB[1], "off a score the residual is the identity and the kept tangents are this frame's");
 }
 
 void caseTarget() {
@@ -200,6 +248,30 @@ void caseTarget() {
     check(frameGenSynthTarget(cb, 40.0f, 30.0f, 0.5f, false, 9.0f, 9.0f, pp, &cls) && cls == 1 && std::fabs(pp[0] - 40.0f) < 1e-3f && std::fabs(pp[1] - 30.0f) < 1e-3f,
           "a cockpit pixel with the head still stays whatever its vector says (the class is the head's alone)");
     check(frameGenSynthTarget(cb, 40.0f, 30.0f, 10.0f, false, 0.0f, 0.0f, pp, &cls) && cls == 1, "exactly the split is the cockpit (z <= split)");
+}
+
+// The residual head rotation: S was built for the head step `kept` (B's eye space to S's), C's true head rotation is its backward delta Hd_C (C's eye space to B's).
+void caseResidual() {
+    float hdB[9], hdC[9], kept[9], res[9], keptT[9];
+    rotAxis(1, 3.0f, hdB);
+    temporalTranspose3(hdB, kept);   // the f = 1 step of a head whose backward delta was hdB
+    rotAxis(1, 3.0f, hdC);
+    frameGenSynthResidual(kept, hdC, res);
+    check(std::fabs(temporalRotationAngleDeg(res)) < 1e-3f, "the head doing what S was built for leaves no residual");
+    rotAxis(1, 5.0f, hdC);          // C's head turned 5 degrees (backward), the prediction 3
+    frameGenSynthResidual(kept, hdC, res);
+    check(std::fabs(temporalRotationAngleDeg(res) - 2.0f) < 1e-3f, "a head that turned 5 degrees where 3 were predicted leaves a 2 degree residual");
+    // The direction: a C direction d turned by the residual lands where S shows what C shows. C's backward delta takes d to B (hdC d), the kept step takes B to S.
+    const float d[3] = {0.3f, -0.2f, -1.0f};
+    float dB[3], dS[3], dRes[3];
+    temporalApply3(hdC, d, dB);
+    temporalApply3(kept, dB, dS);
+    temporalApply3(res, d, dRes);
+    check(std::fabs(dS[0] - dRes[0]) < 1e-6f && std::fabs(dS[1] - dRes[1]) < 1e-6f && std::fabs(dS[2] - dRes[2]) < 1e-6f, "the residual is the kept step after C's backward delta: C's direction into S's eye");
+    temporalTranspose3(kept, keptT);
+    frameGenSynthResidual(keptT, hdC, res);   // the wrong way round is not the same turn
+    temporalApply3(res, d, dRes);
+    check(std::fabs(dS[0] - dRes[0]) > 1e-3f, "and the kept step the wrong way round is a different turn");
 }
 
 }  // namespace
@@ -220,6 +292,7 @@ int main(int argc, char** argv) {
     caseLines();
     caseMerge();
     caseDecode();
+    caseResidual();
     caseRotation();
     caseHeadStep();
     caseCb();

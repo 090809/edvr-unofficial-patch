@@ -18,8 +18,12 @@
 //   6  the module itself (framegen_synth.cpp) on the same device: the key off creates nothing; on, it builds the two variants in turn, scores the f = 1 one against the
 //      next frame (a static scene scores in bin 0, a scene scrolling at the vectors' rate scores well against a no-warp comparison that does not), counts the frames it
 //      could not build, leaves a gap unscored, hands out the f = 0.5 S, and releases everything when the key goes off
-// Mutations (each replaces one of the shader's four #define switches, or the host's f, and the case it guards must fail): f ignored, the head turn not taken out of the
-// vector, the guard off, the fill from the nearer side.
+//   7  the f = 1 S scored the way it would be seen (the compositor's turn): a far scene seen from a head turning at a changing rate, the S built for the extrapolated turn,
+//      scored against the next frame raw and turned by the residual rotation (the true head against the predicted): the turned score is near zero where the raw one is
+//      clearly not, and the residual's angle is the sequence's own
+//   8  the read offsets' half-float storage: exact to 1/8 px up to 512 px, and the clamp's bounds
+// Mutations (each replaces one of the shader's six #define switches, or the host's f, and the case it guards must fail): f ignored, the head turn not taken out of the
+// vector, the guard off, the fill from the nearer side, the score's turn not applied, the score's turn applied the wrong way round.
 #include <windows.h>
 #include <d3d11.h>
 #include <wrl/client.h>
@@ -100,8 +104,9 @@ struct Tex {
     ComPtr<ID3D11UnorderedAccessView> uav;
 };
 
-constexpr int kEntries = 8, kSrvSlots = 10, kUavSlots = 8;
-const char* const kEntryNames[kEntries] = {"fgSynClear", "fgSynDilate", "fgSynSplat", "fgSynSrc", "fgSynResolve", "fgSynResample", "fgSynLuma", "fgSynScore"};
+constexpr int kEntries = 7, kSrvSlots = 10, kUavSlots = 8;
+enum { kEClear = 0, kESplat, kESrc, kEResolve, kEResample, kELuma, kEScore };
+const char* const kEntryNames[kEntries] = {"fgSynClear", "fgSynSplat", "fgSynSrc", "fgSynResolve", "fgSynResample", "fgSynLuma", "fgSynScore"};
 
 struct Gpu {
     ComPtr<ID3D11Device> dev;
@@ -113,7 +118,7 @@ struct Gpu {
         D3D_FEATURE_LEVEL level{};
         if (FAILED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, 0, nullptr, 0, D3D11_SDK_VERSION, &dev, &level, &ctx))) return false;
         const struct { const unsigned char* code; size_t size; } codes[kEntries] = {
-            {kFrameGenSynthClearBytecode, sizeof(kFrameGenSynthClearBytecode)}, {kFrameGenSynthDilateBytecode, sizeof(kFrameGenSynthDilateBytecode)},
+            {kFrameGenSynthClearBytecode, sizeof(kFrameGenSynthClearBytecode)},
             {kFrameGenSynthSplatBytecode, sizeof(kFrameGenSynthSplatBytecode)}, {kFrameGenSynthSrcBytecode, sizeof(kFrameGenSynthSrcBytecode)},
             {kFrameGenSynthResolveBytecode, sizeof(kFrameGenSynthResolveBytecode)}, {kFrameGenSynthResampleBytecode, sizeof(kFrameGenSynthResampleBytecode)},
             {kFrameGenSynthLumaBytecode, sizeof(kFrameGenSynthLumaBytecode)}, {kFrameGenSynthScoreBytecode, sizeof(kFrameGenSynthScoreBytecode)}};
@@ -250,14 +255,22 @@ bool makeInputs(Gpu& g, const Scene& sc, Tex& out, Tex& depth, Tex& mv) {
            g.makeTex(sc.w, sc.h, DXGI_FORMAT_R16G16_FLOAT, half.data(), static_cast<UINT>(sc.w * 4), mv, false);
 }
 
-// The module's order of dispatches for one eye-frame, up to and including the resample.
-Run runSynth(Gpu& g, const Scene& sc, const FrameGenSynthCb& cb) {
+// What a built f = 1 S leaves for the next frame's score: the quarter-grid luma of S, and B's luma and class.
+struct Keep {
+    Tex sLuma, bInfo;
+};
+
+// The module's order of dispatches for one eye-frame, up to and including the resample (and, with `keep`, the luma that is kept for the score). The read offsets are the
+// module's: R16G16_FLOAT.
+Run runSynth(Gpu& g, const Scene& sc, const FrameGenSynthCb& cb, Keep* keep = nullptr) {
     Run r;
-    Tex out, depth, mv, depthD, key, src, read, s;
+    Tex out, depth, mv, key, src, read, s;
     if (!makeInputs(g, sc, out, depth, mv)) return r;
-    if (!g.makeTex(sc.w, sc.h, DXGI_FORMAT_R32_FLOAT, nullptr, 0, depthD, true) || !g.makeTex(sc.w, sc.h, DXGI_FORMAT_R32_UINT, nullptr, 0, key, true) ||
-        !g.makeTex(sc.w, sc.h, DXGI_FORMAT_R32_UINT, nullptr, 0, src, true) || !g.makeTex(sc.w, sc.h, DXGI_FORMAT_R32G32_FLOAT, nullptr, 0, read, true) ||
-        !g.makeTex(sc.ow, sc.oh, DXGI_FORMAT_R32G32B32A32_FLOAT, nullptr, 0, s, true))
+    if (!g.makeTex(sc.w, sc.h, DXGI_FORMAT_R32_UINT, nullptr, 0, key, true) || !g.makeTex(sc.w, sc.h, DXGI_FORMAT_R32_UINT, nullptr, 0, src, true) ||
+        !g.makeTex(sc.w, sc.h, DXGI_FORMAT_R16G16_FLOAT, nullptr, 0, read, true) || !g.makeTex(sc.ow, sc.oh, DXGI_FORMAT_R32G32B32A32_FLOAT, nullptr, 0, s, true))
+        return r;
+    if (keep && (!g.makeTex((sc.w + 3) / 4, (sc.h + 3) / 4, DXGI_FORMAT_R32_FLOAT, nullptr, 0, keep->sLuma, true) ||
+                 !g.makeTex((sc.w + 3) / 4, (sc.h + 3) / 4, DXGI_FORMAT_R32G32_FLOAT, nullptr, 0, keep->bInfo, true)))
         return r;
     ComPtr<ID3D11Buffer> stats, staging;
     ComPtr<ID3D11UnorderedAccessView> statsUav;
@@ -273,35 +286,36 @@ Run runSynth(Gpu& g, const Scene& sc, const FrameGenSynthCb& cb) {
 
     g.setCb(cb);
     const int rgx = (sc.w + 7) / 8, rgy = (sc.h + 7) / 8, ogx = (sc.ow + 7) / 8, ogy = (sc.oh + 7) / 8;
+    const int qgx = ((sc.w + 3) / 4 + 7) / 8, qgy = ((sc.h + 3) / 4 + 7) / 8;
     ID3D11ShaderResourceView* const none[kSrvSlots] = {};
     {
         ID3D11UnorderedAccessView* uav[kUavSlots] = {nullptr, key.uav.Get(), src.uav.Get(), nullptr, nullptr, statsUav.Get()};
-        g.run(0, none, uav, rgx, rgy);
+        g.run(kEClear, none, uav, rgx, rgy);
     }
     {
-        ID3D11ShaderResourceView* srv[kSrvSlots] = {nullptr, depth.srv.Get()};
-        ID3D11UnorderedAccessView* uav[kUavSlots] = {depthD.uav.Get()};
-        g.run(1, srv, uav, rgx, rgy);
-    }
-    {
-        ID3D11ShaderResourceView* srv[kSrvSlots] = {nullptr, depth.srv.Get(), mv.srv.Get(), depthD.srv.Get()};
+        ID3D11ShaderResourceView* srv[kSrvSlots] = {nullptr, depth.srv.Get(), mv.srv.Get()};
         ID3D11UnorderedAccessView* uav[kUavSlots] = {nullptr, key.uav.Get()};
-        g.run(2, srv, uav, rgx, rgy);
+        g.run(kESplat, srv, uav, rgx, rgy);
     }
     {
-        ID3D11ShaderResourceView* srv[kSrvSlots] = {nullptr, depth.srv.Get(), mv.srv.Get(), depthD.srv.Get(), key.srv.Get()};
+        ID3D11ShaderResourceView* srv[kSrvSlots] = {nullptr, depth.srv.Get(), mv.srv.Get(), nullptr, key.srv.Get()};
         ID3D11UnorderedAccessView* uav[kUavSlots] = {nullptr, nullptr, src.uav.Get()};
-        g.run(3, srv, uav, rgx, rgy);
+        g.run(kESrc, srv, uav, rgx, rgy);
     }
     {
-        ID3D11ShaderResourceView* srv[kSrvSlots] = {nullptr, depth.srv.Get(), mv.srv.Get(), depthD.srv.Get(), key.srv.Get(), src.srv.Get()};
+        ID3D11ShaderResourceView* srv[kSrvSlots] = {nullptr, depth.srv.Get(), mv.srv.Get(), nullptr, key.srv.Get(), src.srv.Get()};
         ID3D11UnorderedAccessView* uav[kUavSlots] = {nullptr, nullptr, nullptr, read.uav.Get(), nullptr, statsUav.Get()};
-        g.run(4, srv, uav, rgx, rgy);
+        g.run(kEResolve, srv, uav, rgx, rgy);
     }
     {
         ID3D11ShaderResourceView* srv[kSrvSlots] = {out.srv.Get(), nullptr, nullptr, nullptr, nullptr, nullptr, read.srv.Get()};
         ID3D11UnorderedAccessView* uav[kUavSlots] = {nullptr, nullptr, nullptr, nullptr, s.uav.Get()};
-        g.run(5, srv, uav, ogx, ogy);
+        g.run(kEResample, srv, uav, ogx, ogy);
+    }
+    if (keep) {
+        ID3D11ShaderResourceView* srv[kSrvSlots] = {out.srv.Get(), depth.srv.Get(), nullptr, nullptr, nullptr, nullptr, nullptr, s.srv.Get()};
+        ID3D11UnorderedAccessView* uav[kUavSlots] = {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, keep->sLuma.uav.Get(), keep->bInfo.uav.Get()};
+        g.run(kELuma, srv, uav, qgx, qgy);
     }
     ID3D11UnorderedAccessView* noUav[kUavSlots] = {};
     g.ctx->CSSetShaderResources(0, kSrvSlots, none);
@@ -314,6 +328,46 @@ Run runSynth(Gpu& g, const Scene& sc, const FrameGenSynthCb& cb) {
     r.s = g.readTex<float>(s.t.Get(), sc.ow * 4, sc.oh);
     r.ok = true;
     return r;
+}
+
+// The score of frame C against the S kept from B (the module's order: clear the stats, then the score entry on C's output), decoded.
+bool runScore(Gpu& g, const Scene& scC, const FrameGenSynthCb& cbC, const Keep& keep, FrameGenSynthEyeResult& res) {
+    Tex out, depth, mv, key, src;
+    if (!makeInputs(g, scC, out, depth, mv)) return false;
+    if (!g.makeTex(scC.w, scC.h, DXGI_FORMAT_R32_UINT, nullptr, 0, key, true) || !g.makeTex(scC.w, scC.h, DXGI_FORMAT_R32_UINT, nullptr, 0, src, true)) return false;
+    ComPtr<ID3D11Buffer> stats, staging;
+    ComPtr<ID3D11UnorderedAccessView> statsUav;
+    D3D11_BUFFER_DESC bd{};
+    bd.ByteWidth = kFrameGenSynthStatsUints * 4; bd.Usage = D3D11_USAGE_DEFAULT; bd.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
+    bd.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED; bd.StructureByteStride = 4;
+    if (FAILED(g.dev->CreateBuffer(&bd, nullptr, &stats))) return false;
+    D3D11_UNORDERED_ACCESS_VIEW_DESC ud{};
+    ud.Format = DXGI_FORMAT_UNKNOWN; ud.ViewDimension = D3D11_UAV_DIMENSION_BUFFER; ud.Buffer.NumElements = kFrameGenSynthStatsUints;
+    if (FAILED(g.dev->CreateUnorderedAccessView(stats.Get(), &ud, &statsUav))) return false;
+    bd.Usage = D3D11_USAGE_STAGING; bd.BindFlags = 0; bd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    if (FAILED(g.dev->CreateBuffer(&bd, nullptr, &staging))) return false;
+    g.setCb(cbC);
+    const int rgx = (scC.w + 7) / 8, rgy = (scC.h + 7) / 8;
+    const int qgx = ((scC.w + 3) / 4 + 7) / 8, qgy = ((scC.h + 3) / 4 + 7) / 8;
+    ID3D11ShaderResourceView* const none[kSrvSlots] = {};
+    {
+        ID3D11UnorderedAccessView* uav[kUavSlots] = {nullptr, key.uav.Get(), src.uav.Get(), nullptr, nullptr, statsUav.Get()};
+        g.run(kEClear, none, uav, rgx, rgy);
+    }
+    {
+        ID3D11ShaderResourceView* srv[kSrvSlots] = {out.srv.Get(), nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, keep.sLuma.srv.Get(), keep.bInfo.srv.Get()};
+        ID3D11UnorderedAccessView* uav[kUavSlots] = {nullptr, nullptr, nullptr, nullptr, nullptr, statsUav.Get()};
+        g.run(kEScore, srv, uav, qgx, qgy);
+    }
+    ID3D11UnorderedAccessView* noUav[kUavSlots] = {};
+    g.ctx->CSSetShaderResources(0, kSrvSlots, none);
+    g.ctx->CSSetUnorderedAccessViews(0, kUavSlots, noUav, nullptr);
+    g.ctx->CopyResource(staging.Get(), stats.Get());
+    D3D11_MAPPED_SUBRESOURCE m{};
+    if (FAILED(g.ctx->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &m))) return false;
+    frameGenSynthDecodeStats(static_cast<const uint32_t*>(m.pData), res);
+    g.ctx->Unmap(staging.Get(), 0);
+    return true;
 }
 
 // ---- the references --------------------------------------------------------------------------------------------------------------------------------------
@@ -628,6 +682,11 @@ void case6Module(Gpu& g, Scope& sc) {
         std::snprintf(label, sizeof(label), "case 6: a static scene fills no hole from the background (%llu) and leaves none (%llu); the guard moved %llu reads in %llu render pixels",
                       static_cast<unsigned long long>(w.filled), static_cast<unsigned long long>(w.left), static_cast<unsigned long long>(w.guard), static_cast<unsigned long long>(pixels));
         sc.ok(w.left == 0 && w.filled == 0 && pixels == static_cast<uint64_t>(w.frames[0] + w.frames[1]) * RW * RH, label);
+        // The head did not move, so S was built for the head C has: the residual is nothing, the turned score is the raw one and every cell is inside S.
+        std::snprintf(label, sizeof(label), "case 6: a still head has no residual rotation (%u samples, median %.4f, max %.4f deg) and the turned score is the raw one over the same cells (%llu of %llu, %llu outside)",
+                      w.rotSamples, static_cast<double>(w.rotMedian), static_cast<double>(w.rotMax), static_cast<unsigned long long>(w.tcells), static_cast<unsigned long long>(w.cells),
+                      static_cast<unsigned long long>(w.tout));
+        sc.ok(w.rotSamples >= w.scored && w.rotMax < 0.01f && w.tcells == w.cells && w.tout == 0 && w.clamped == 0, label);
         // A gap is not scored: after an f = 1 frame, the next call 5 frames later scores nothing.
         frameGenSynthEyeFrame(g.dev.Get(), g.ctx.Get(), 1, 4000, f);   // reads back what eye 1 still had in flight
         g.ctx->Flush();
@@ -683,6 +742,125 @@ void case6Module(Gpu& g, Scope& sc) {
     sc.ok(!frameGenSynthResident(), "case 6: the key off again releases the resources");
 }
 
+// ---- case 7: the f = 1 S turned the way the compositor would turn it -------------------------------------------------------------------------------------------
+
+void mul3(const float a[9], const float b[9], float out[9]) {
+    for (int r = 0; r < 3; ++r)
+        for (int c = 0; c < 3; ++c) out[r * 3 + c] = a[r * 3] * b[c] + a[r * 3 + 1] * b[3 + c] + a[r * 3 + 2] * b[6 + c];
+}
+
+struct TurnedScore { bool ran = false; double rawMean = 0, turnedMean = 0; uint64_t cells = 0, tcells = 0, tout = 0; float resMed = 0, resMax = 0; float wantMed = 0, wantMax = 0; };
+
+// A far scene seen from a head that yaws by a_k degrees in frame k (the eye space of frame k is Q_k = rotY(a_k) of a fixed world): the picture is a function of the world
+// direction, the vectors are the head's own (B to A, the ship still). The step a_k - a_(k-1) changes from frame to frame, so the head's extrapolation misses; the f = 1 S built
+// at B for the head's constant-velocity step, scored at C raw and turned by the residual rotation.
+TurnedScore case7Turned(Gpu& g) {
+    TurnedScore t;
+    const float angles[12] = {0.0f, 2.0f, 5.0f, 6.0f, 10.0f, 12.0f, 13.0f, 18.0f, 20.0f, 22.0f, 27.0f, 28.0f};   // steps 2 3 1 4 2 1 5 2 2 5 1
+    float Q[12][9];
+    for (int k = 0; k < 12; ++k) rotY(angles[k], Q[k]);
+    const auto frameAt = [&](int k) {
+        Scene sc;
+        sc.grey([&](int x, int y) {
+            float d[3], w[3];
+            temporalPixelToDir(static_cast<float>(x), static_cast<float>(y), kTan, RW, RH, d);
+            float qt[9];
+            temporalTranspose3(Q[k], qt);
+            temporalApply3(qt, d, w);
+            return 0.5f + 0.35f * std::sin(7.0f * std::atan2(w[0], -w[2]));
+        });
+        return sc;
+    };
+    const auto hdOf = [&](int k, float hd[9]) {   // x_(k-1) = Hd x_k
+        float qt[9];
+        temporalTranspose3(Q[k], qt);
+        mul3(Q[k - 1], qt, hd);
+    };
+    std::vector<float> angs;
+    for (int k = 2; k < 12; k += 1) {
+        // B = frame k - 1, C = frame k. The vectors of B are the head's own: its backward delta is hd(B).
+        Scene B = frameAt(k - 1), C = frameAt(k);
+        FrameGenDeltas dB, dC;
+        hdOf(k - 1, dB.Hd);
+        hdOf(k, dC.Hd);
+        for (int y = 0; y < RH; ++y)
+            for (int x = 0; x < RW; ++x) {
+                float d[3], dh[3], pp[2];
+                temporalPixelToDir(static_cast<float>(x), static_cast<float>(y), kTan, RW, RH, d);
+                temporalApply3(dB.Hd, d, dh);
+                if (!temporalDirToPixel(dh, kTan, RW, RH, &pp[0], &pp[1])) continue;
+                B.mv[(static_cast<size_t>(y) * RW + x) * 2] = pp[0] - static_cast<float>(x);
+                B.mv[(static_cast<size_t>(y) * RW + x) * 2 + 1] = pp[1] - static_cast<float>(y);
+            }
+        FrameGenSynthCb cbB;
+        frameGenSynthFillCb(cbB, RW, RH, RW, RH, kTan, 0.0f, kDepthB, 10.0f, 1.0f, dB);
+        Keep keep;
+        const Run rb = runSynth(g, B, cbB, &keep);
+        if (!rb.ok) return t;
+        float kept[9], resid[9];
+        for (int r = 0; r < 3; ++r)
+            for (int c = 0; c < 3; ++c) kept[r * 3 + c] = cbB.rs[r][c];
+        frameGenSynthResidual(kept, dC.Hd, resid);
+        angs.push_back(temporalRotationAngleDeg(resid));
+        FrameGenSynthCb cbC;
+        frameGenSynthFillCb(cbC, RW, RH, RW, RH, kTan, 0.0f, kDepthB, 10.0f, 1.0f, dC, resid, kTan);
+        FrameGenSynthEyeResult res;
+        if (!runScore(g, C, cbC, keep, res)) return t;
+        const FrameGenShadowClassStats& cls = res.cls[0];
+        const FrameGenShadowClassStats& tc = res.tcls[0];
+        t.rawMean += static_cast<double>(cls.sumErr1024) / 1024.0;
+        t.turnedMean += static_cast<double>(tc.sumErr1024) / 1024.0;
+        t.cells += cls.pixels;
+        t.tcells += tc.pixels;
+        t.tout += res.tout;
+    }
+    t.rawMean = t.cells ? t.rawMean / static_cast<double>(t.cells) : 0.0;
+    t.turnedMean = t.tcells ? t.turnedMean / static_cast<double>(t.tcells) : 0.0;
+    std::sort(angs.begin(), angs.end());
+    t.wantMed = angs[angs.size() / 2];
+    t.wantMax = angs.back();
+    t.resMed = t.wantMed;
+    t.resMax = t.wantMax;
+    t.ran = true;
+    return t;
+}
+
+void case7Check(Gpu& g, Scope& sc) {
+    char label[300];
+    const TurnedScore t = case7Turned(g);
+    sc.ok(t.ran, "case 7: the turned score ran");
+    if (!t.ran) return;
+    std::snprintf(label, sizeof(label), "case 7: the head's extrapolation misses (raw mean error %.4f over %llu cells) and the turn by the residual rotation puts it right (turned mean %.4f over %llu cells, %llu outside S)",
+                  t.rawMean, static_cast<unsigned long long>(t.cells), t.turnedMean, static_cast<unsigned long long>(t.tcells), static_cast<unsigned long long>(t.tout));
+    sc.ok(t.cells > 5000 && t.rawMean > 0.03 && t.turnedMean < 0.012 && t.turnedMean * 4.0 < t.rawMean, label);
+    if (g_verbose && !sc.quiet) std::printf("  case 7: raw %.4f, turned %.4f, %llu cells, %llu turned, %llu outside, the residual median %.3f max %.3f deg\n", t.rawMean, t.turnedMean,
+                                            static_cast<unsigned long long>(t.cells), static_cast<unsigned long long>(t.tcells), static_cast<unsigned long long>(t.tout), t.wantMed, t.wantMax);
+}
+
+float halfToFloat(uint16_t h) {
+    const int e = (h >> 10) & 31;
+    const float m = static_cast<float>(h & 1023);
+    const float v = e == 0 ? std::ldexp(m, -24) : std::ldexp(1024.0f + m, e - 25);
+    return (h & 0x8000u) ? -v : v;
+}
+
+// Case 8: the offsets' storage. floatToHalf rounds to nearest, as the GPU's store does.
+void case8Offsets(Scope& sc) {
+    char label[260];
+    float worst512 = 0.0f, worst256 = 0.0f, worst2000 = 0.0f;
+    for (int i = -20000; i <= 20000; ++i) {
+        const float v = static_cast<float>(i) * 0.1f * (1.0f + 0.000137f * static_cast<float>(i % 7));   // up to +-2000, off the grid of halves
+        const float e = std::fabs(halfToFloat(floatToHalf(v)) - v);
+        if (std::fabs(v) <= 256.0f) worst256 = std::max(worst256, e);
+        if (std::fabs(v) <= 512.0f) worst512 = std::max(worst512, e);
+        if (std::fabs(v) <= kFrameGenSynthMaxOffset) worst2000 = std::max(worst2000, e);
+    }
+    std::snprintf(label, sizeof(label), "case 8: a read offset stored in half floats is exact to %.4f px up to 256 px, %.4f px up to 512 px and %.4f px up to the clamp (%.0f px)", worst256, worst512, worst2000,
+                  static_cast<double>(kFrameGenSynthMaxOffset));
+    sc.ok(worst256 <= 0.0625f && worst512 <= 0.125f && worst2000 <= 0.5f && std::fabs(halfToFloat(floatToHalf(kFrameGenSynthNoRead)) - kFrameGenSynthNoRead) == 0.0f &&
+          kFrameGenSynthNoRead < -kFrameGenSynthMaxOffset * 1.5f, label);
+}
+
 // ---- the run ---------------------------------------------------------------------------------------------------------------------------------------------
 
 void swapIn(Gpu& g, ComPtr<ID3D11ComputeShader> saved[kEntries], const ComPtr<ID3D11ComputeShader> mutated[kEntries]) {
@@ -714,15 +892,20 @@ int run() {
     if (!alive("cases 1 to 5")) return 1;
     case6Module(g, sc);
     if (!alive("case 6")) return 1;
+    case7Check(g, sc);
+    case8Offsets(sc);
+    if (!alive("cases 7 and 8")) return 1;
     (void)edge;
 
     // The mutations: each must break its case.
     struct Mutation { const char* define; const char* what; std::function<void(Scope&)> run; unsigned fails = 0; };
-    Mutation muts[4] = {
+    Mutation muts[6] = {
         {"FG_USE_F", "f ignored (the landing uses f = 1 whatever the block says)", [&](Scope& s) { case2World(g, s); }},
         {"FG_REMOVE_HEAD", "the head turn not taken out of the vector", [&](Scope& s) { case2World(g, s); }},
         {"FG_GUARD", "the guard off", [&](Scope& s) { case5Edge(g, s, false); }},
         {"FG_FILL_FAR", "the fill from the nearer side", [&](Scope& s) { case5Edge(g, s, false); }},
+        {"FG_TURN", "the score's turn not applied (the residual ignored)", [&](Scope& s) { case7Check(g, s); }},
+        {"FG_TURN_SIGN", "the score's turn applied the wrong way round (the residual transposed)", [&](Scope& s) { case7Check(g, s); }},
     };
     for (Mutation& m : muts) {
         ComPtr<ID3D11ComputeShader> mutated[kEntries], saved[kEntries];
@@ -741,8 +924,8 @@ int run() {
         if (ms.fails == 0) { ++g_failures; std::printf("FAIL: mutation: %s still passes\n", m.what); }
     }
     // Case 3 reads the head's part the same way as case 2: the head-turn mutation must break it too (a second look, not a second count).
-    std::printf("%s: %u checks, %u failures (mutations: f ignored broke %u checks, head turn not removed broke %u, guard off broke %u, fill from the nearer side broke %u)\n", g_failures ? "FAIL" : "PASS",
-                g_checks, g_failures, muts[0].fails, muts[1].fails, muts[2].fails, muts[3].fails);
+    std::printf("%s: %u checks, %u failures (mutations: f ignored broke %u checks, head turn not removed broke %u, guard off broke %u, fill from the nearer side broke %u, turn not applied broke %u, turn the wrong way round broke %u)\n",
+                g_failures ? "FAIL" : "PASS", g_checks, g_failures, muts[0].fails, muts[1].fails, muts[2].fails, muts[3].fails, muts[4].fails, muts[5].fails);
     return g_failures ? 1 : 0;
 }
 

@@ -21,11 +21,11 @@ namespace {
 
 constexpr int kStagingDepth = 4;
 constexpr int kTimerRing = 8;
-constexpr int kEntries = 8;      // clear, dilate, splat, source, resolve, resample, luma, score
+constexpr int kEntries = 7;      // clear, splat, source, resolve, resample, luma, score
 constexpr int kSrvSlots = 10;    // t0..t9
 constexpr int kUavSlots = 8;     // u0..u7
 
-enum Entry : int { kClear = 0, kDilate, kSplat, kSrc, kResolve, kResample, kLuma, kScore };
+enum Entry : int { kClear = 0, kSplat, kSrc, kResolve, kResample, kLuma, kScore };
 
 std::atomic<bool> g_on{false};
 std::atomic<bool> g_told{false};   // the armed line has been said since the key last went on
@@ -41,7 +41,6 @@ struct EyeRes {
     bool created = false;
     uint32_t rw = 0, rh = 0, ow = 0, oh = 0, qw = 0, qh = 0;
     DXGI_FORMAT sFormat = DXGI_FORMAT_UNKNOWN;
-    Tex depthD, key, src, read;   // render size: the dilated depth, the key grid, the winner's pixel, the read position
     Tex s;                        // output size, the upscaler's format: S
     Tex sLuma, bInfo;             // quarter grid: the kept S luma, B's luma (x) and class (y)
     ID3D11Buffer* stats = nullptr;
@@ -54,8 +53,17 @@ struct EyeRes {
     uint32_t calls = 0;           // built frames so far: the even ones build f = 0.5
     bool havePending = false;     // an f = 1 S luma is kept, built on frame bFrame
     uint32_t bFrame = 0;
+    float keptRot[9] = {};        // the head rotation the kept f = 1 S was built for (B's eye space to S's)
+    float keptTan[4] = {};        // the tangents it was built with
     bool shownValid = false;      // the latest call built the f = 0.5 S into `s`
     uint32_t shownFrame = 0;
+};
+
+// The render-size scratch of one call (the key and source grids and the read offsets): rebuilt from nothing by every call, so both eyes share one set (they run one after the other
+// on the same context). 12 bytes per render pixel in all; recreated when a call's render size differs from the last's.
+struct Scratch {
+    uint32_t rw = 0, rh = 0;
+    Tex key, src, read;
 };
 
 struct TimerSlot {
@@ -71,9 +79,11 @@ struct State {
     ID3D11Buffer* cb = nullptr;
     DXGI_FORMAT lumaFormat = DXGI_FORMAT_R16_FLOAT;
     EyeRes eye[2];
+    Scratch scratch;
     TimerSlot timers[kTimerRing];
     FrameGenSynthWindow win;
     std::vector<float> gpuMs[2];
+    std::vector<float> rotRes;     // the residual rotation's angle of each scored frame in the window, degrees
     int64_t windowTicks = 0;
 };
 // Never destroyed: the process teardown can run under the loader lock, where releasing D3D objects is not safe (see temporalPassShutdown).
@@ -92,10 +102,6 @@ void releaseTex(Tex& t) {
 }
 
 void releaseEye(EyeRes& r) {
-    releaseTex(r.depthD);
-    releaseTex(r.key);
-    releaseTex(r.src);
-    releaseTex(r.read);
     releaseTex(r.s);
     releaseTex(r.sLuma);
     releaseTex(r.bInfo);
@@ -105,8 +111,15 @@ void releaseEye(EyeRes& r) {
     r = EyeRes{};
 }
 
+void releaseScratch() {
+    releaseTex(g.scratch.key);
+    releaseTex(g.scratch.src);
+    releaseTex(g.scratch.read);
+    g.scratch = Scratch{};
+}
+
 bool anyResources() {
-    if (g.cb) return true;
+    if (g.cb || g.scratch.key.tex) return true;
     for (const EyeRes& r : g.eye) if (r.created) return true;
     for (ID3D11ComputeShader* c : g.cs) if (c) return true;
     return false;
@@ -116,12 +129,22 @@ void windowReset() {
     g.win = FrameGenSynthWindow{};
     g.gpuMs[0].clear();
     g.gpuMs[1].clear();
+    g.rotRes.clear();
+}
+
+// The residual rotation's median and maximum over the scored frames of the window.
+void fillRotation(FrameGenSynthWindow& w) {
+    w.rotSamples = static_cast<uint32_t>(g.rotRes.size());
+    w.rotMax = 0.0f;
+    for (float v : g.rotRes) if (v > w.rotMax) w.rotMax = v;
+    w.rotMedian = frameGenMedian(g.rotRes.data(), g.rotRes.size());
 }
 
 // The shaders, the constant buffer and the formats: made once per device. The timers are left as they are (a timer with a query in flight is released only by its owner's
 // context, gpu_timing.h); the ring simply keeps polling them.
 void releaseAll() {
     for (EyeRes& r : g.eye) releaseEye(r);
+    releaseScratch();
     for (auto& c : g.cs) releaseCom(c);
     releaseCom(g.cb);
     g.dev = nullptr;
@@ -138,7 +161,6 @@ bool createCommon(ID3D11Device* dev, ID3D11DeviceContext* ctx) {
     struct Item { const unsigned char* code; size_t size; const char* name; };
     const Item entries[kEntries] = {
         {kFrameGenSynthClearBytecode, sizeof(kFrameGenSynthClearBytecode), "framegen_synth_clear"},
-        {kFrameGenSynthDilateBytecode, sizeof(kFrameGenSynthDilateBytecode), "framegen_synth_dilate"},
         {kFrameGenSynthSplatBytecode, sizeof(kFrameGenSynthSplatBytecode), "framegen_synth_splat"},
         {kFrameGenSynthSrcBytecode, sizeof(kFrameGenSynthSrcBytecode), "framegen_synth_src"},
         {kFrameGenSynthResolveBytecode, sizeof(kFrameGenSynthResolveBytecode), "framegen_synth_resolve"},
@@ -156,9 +178,9 @@ bool createCommon(ID3D11Device* dev, ID3D11DeviceContext* ctx) {
     bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
     bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
     if (FAILED(dev->CreateBuffer(&bd, nullptr, &g.cb))) return false;
-    // The formats the textures are written in: R32_FLOAT and R32_UINT are in every D3D11 part's typed set; the two-float read position and class map need the adapter to store
-    // them (every D3D11 part that matters does); the luma is R16_FLOAT where the adapter stores it, else R32_FLOAT, as the scorer's.
-    if (!uavStoreOk(dev, DXGI_FORMAT_R32G32_FLOAT) || !uavStoreOk(dev, DXGI_FORMAT_R32_UINT) || !uavStoreOk(dev, DXGI_FORMAT_R32_FLOAT)) return false;
+    // The formats the textures are written in: R32_FLOAT and R32_UINT are in every D3D11 part's typed set; the two-half read offset and the two-float class map need the adapter to
+    // store them (every D3D11 part that matters does); the luma is R16_FLOAT where the adapter stores it, else R32_FLOAT, as the scorer's.
+    if (!uavStoreOk(dev, DXGI_FORMAT_R16G16_FLOAT) || !uavStoreOk(dev, DXGI_FORMAT_R32G32_FLOAT) || !uavStoreOk(dev, DXGI_FORMAT_R32_UINT) || !uavStoreOk(dev, DXGI_FORMAT_R32_FLOAT)) return false;
     g.lumaFormat = uavStoreOk(dev, DXGI_FORMAT_R16_FLOAT) ? DXGI_FORMAT_R16_FLOAT : DXGI_FORMAT_R32_FLOAT;
     return true;
 }
@@ -205,9 +227,7 @@ bool createEye(ID3D11Device* dev, EyeRes& r, uint32_t rw, uint32_t rh, uint32_t 
     r.qh = (rh + 3u) / 4u;
     r.sFormat = sFormat;
     if (r.qw == 0 || r.qh == 0 || !uavStoreOk(dev, sFormat)) return false;
-    bool ok = makeTex(dev, rw, rh, DXGI_FORMAT_R32_FLOAT, r.depthD) && makeTex(dev, rw, rh, DXGI_FORMAT_R32_UINT, r.key) && makeTex(dev, rw, rh, DXGI_FORMAT_R32_UINT, r.src) &&
-              makeTex(dev, rw, rh, DXGI_FORMAT_R32G32_FLOAT, r.read) && makeTex(dev, ow, oh, sFormat, r.s) && makeTex(dev, r.qw, r.qh, g.lumaFormat, r.sLuma) &&
-              makeTex(dev, r.qw, r.qh, DXGI_FORMAT_R32G32_FLOAT, r.bInfo);
+    bool ok = makeTex(dev, ow, oh, sFormat, r.s) && makeTex(dev, r.qw, r.qh, g.lumaFormat, r.sLuma) && makeTex(dev, r.qw, r.qh, DXGI_FORMAT_R32G32_FLOAT, r.bInfo);
     if (ok) {
         D3D11_BUFFER_DESC bd{};
         bd.ByteWidth = kFrameGenSynthStatsUints * 4u;
@@ -234,6 +254,20 @@ bool createEye(ID3D11Device* dev, EyeRes& r, uint32_t rw, uint32_t rh, uint32_t 
     }
     r.created = true;
     return true;
+}
+
+bool ensureScratch(ID3D11Device* dev, uint32_t rw, uint32_t rh) {
+    Scratch& sc = g.scratch;
+    if (sc.key.tex && sc.rw == rw && sc.rh == rh) return true;
+    releaseScratch();
+    if (makeTex(dev, rw, rh, DXGI_FORMAT_R32_UINT, g.scratch.key) && makeTex(dev, rw, rh, DXGI_FORMAT_R32_UINT, g.scratch.src) &&
+        makeTex(dev, rw, rh, DXGI_FORMAT_R16G16_FLOAT, g.scratch.read)) {
+        g.scratch.rw = rw;
+        g.scratch.rh = rh;
+        return true;
+    }
+    releaseScratch();
+    return false;
 }
 
 // The staging slots already copied, oldest first, read without waiting: a slot not done yet is left for the next frame.
@@ -281,7 +315,7 @@ TimerSlot* beginTimer(ID3D11Device* dev, ID3D11DeviceContext* ctx, int kind) {
 
 void bindAndDispatch(ID3D11DeviceContext* ctx, int entry, ID3D11ShaderResourceView* const srv[kSrvSlots], ID3D11UnorderedAccessView* const uav[kUavSlots], uint32_t gx, uint32_t gy) {
     ctx->CSSetShader(g.cs[entry], nullptr, 0);
-    // The last dispatch's UAVs come off first: a resource still bound as a UAV would silently null the SRV set for it here (the dilated depth, the key grid, the read positions...).
+    // The last dispatch's UAVs come off first: a resource still bound as a UAV would silently null the SRV set for it here (the key grid, the read offsets...).
     ID3D11UnorderedAccessView* const noUav[kUavSlots] = {};
     ctx->CSSetUnorderedAccessViews(0, kUavSlots, noUav, nullptr);
     ctx->CSSetShaderResources(0, kSrvSlots, srv);
@@ -300,7 +334,11 @@ bool frameGenSynthOn() { return g_on.load(); }
 
 bool frameGenSynthResident() { return anyResources(); }
 
-FrameGenSynthWindow frameGenSynthOpenWindow() { return g.win; }
+FrameGenSynthWindow frameGenSynthOpenWindow() {
+    FrameGenSynthWindow w = g.win;
+    fillRotation(w);
+    return w;
+}
 
 ID3D11Texture2D* frameGenSynthShown(uint32_t eye, uint32_t frame) {
     if (!g_on.load() || eye > 1) return nullptr;
@@ -344,6 +382,11 @@ void frameGenSynthEyeFrame(ID3D11Device* dev, ID3D11DeviceContext* ctx, uint32_t
             Log::get().note("%s", line.c_str());
         }
     }
+    if (!ensureScratch(dev, f.renderW, f.renderH)) {
+        g.failed = true;
+        Log::get().note("frame generation (synth): the scratch textures could not be created (%ux%u render); it stands down.", static_cast<unsigned>(f.renderW), static_cast<unsigned>(f.renderH));
+        return;
+    }
     pollReadbacks(ctx, r, r.writes);
     pollTimers(ctx);
 
@@ -351,8 +394,14 @@ void frameGenSynthEyeFrame(ID3D11Device* dev, ID3D11DeviceContext* ctx, uint32_t
     const bool score = r.havePending && r.bFrame + 1u == frame && !f.cameraJump;
     const bool keep = !half && !f.cameraJump;
 
+    // On a score, the residual head rotation: the rotation the kept f = 1 S was built for against C's true one (this frame's backward head delta), and the tangents S was built with.
+    float residual[9];
+    if (score) {
+        frameGenSynthResidual(r.keptRot, f.deltas.Hd, residual);
+        g.rotRes.push_back(temporalRotationAngleDeg(residual));
+    }
     FrameGenSynthCb cb;
-    frameGenSynthFillCb(cb, f.renderW, f.renderH, f.outW, f.outH, f.tanNow, f.depthA, f.depthB, f.splitMetres, half ? 0.5f : 1.0f, f.deltas);
+    frameGenSynthFillCb(cb, f.renderW, f.renderH, f.outW, f.outH, f.tanNow, f.depthA, f.depthB, f.splitMetres, half ? 0.5f : 1.0f, f.deltas, score ? residual : nullptr, score ? r.keptTan : nullptr);
     D3D11_MAPPED_SUBRESOURCE m{};
     if (FAILED(ctx->Map(g.cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {
         ++g.win.skipped;
@@ -361,6 +410,7 @@ void frameGenSynthEyeFrame(ID3D11Device* dev, ID3D11DeviceContext* ctx, uint32_t
     }
     std::memcpy(m.pData, &cb, sizeof(cb));
     ctx->Unmap(g.cb, 0);
+    Scratch& sc = g.scratch;
 
     // A staging slot still unread when it comes round again is overwritten (its frame is lost to the window, not waited for).
     const int slot = static_cast<int>(r.writes % kStagingDepth);
@@ -379,7 +429,7 @@ void frameGenSynthEyeFrame(ID3D11Device* dev, ID3D11DeviceContext* ctx, uint32_t
     ID3D11ShaderResourceView* const depth = f.depthSrv;
     ID3D11ShaderResourceView* const mv = f.mvSrv;
     {   // clear: the key and source grids and the stats words
-        ID3D11UnorderedAccessView* uav[kUavSlots] = {nullptr, r.key.uav, r.src.uav, nullptr, nullptr, r.statsUav};
+        ID3D11UnorderedAccessView* uav[kUavSlots] = {nullptr, sc.key.uav, sc.src.uav, nullptr, nullptr, r.statsUav};
         bindAndDispatch(ctx, kClear, noSrv, uav, rgx, rgy);
     }
     if (score) {   // the f = 1 S kept from the frame before against this frame, which is C: its luma, S's and B's, by B's class
@@ -387,28 +437,23 @@ void frameGenSynthEyeFrame(ID3D11Device* dev, ID3D11DeviceContext* ctx, uint32_t
         ID3D11UnorderedAccessView* uav[kUavSlots] = {nullptr, nullptr, nullptr, nullptr, nullptr, r.statsUav};
         bindAndDispatch(ctx, kScore, srv, uav, qgx, qgy);
     }
-    {   // dilate B's depth
-        ID3D11ShaderResourceView* srv[kSrvSlots] = {nullptr, depth};
-        ID3D11UnorderedAccessView* uav[kUavSlots] = {r.depthD.uav};
-        bindAndDispatch(ctx, kDilate, srv, uav, rgx, rgy);
-    }
     {   // splat: B's pixels carried to S, the nearer surface's key kept
-        ID3D11ShaderResourceView* srv[kSrvSlots] = {nullptr, depth, mv, r.depthD.srv};
-        ID3D11UnorderedAccessView* uav[kUavSlots] = {nullptr, r.key.uav};
+        ID3D11ShaderResourceView* srv[kSrvSlots] = {nullptr, depth, mv};
+        ID3D11UnorderedAccessView* uav[kUavSlots] = {nullptr, sc.key.uav};
         bindAndDispatch(ctx, kSplat, srv, uav, rgx, rgy);
     }
     {   // source: each footprint pixel whose final key is the pixel's own takes the pixel's index
-        ID3D11ShaderResourceView* srv[kSrvSlots] = {nullptr, depth, mv, r.depthD.srv, r.key.srv};
-        ID3D11UnorderedAccessView* uav[kUavSlots] = {nullptr, nullptr, r.src.uav};
+        ID3D11ShaderResourceView* srv[kSrvSlots] = {nullptr, depth, mv, nullptr, sc.key.srv};
+        ID3D11UnorderedAccessView* uav[kUavSlots] = {nullptr, nullptr, sc.src.uav};
         bindAndDispatch(ctx, kSrc, srv, uav, rgx, rgy);
     }
-    {   // resolve: the position every S pixel reads, the guard and the background pull
-        ID3D11ShaderResourceView* srv[kSrvSlots] = {nullptr, depth, mv, r.depthD.srv, r.key.srv, r.src.srv};
-        ID3D11UnorderedAccessView* uav[kUavSlots] = {nullptr, nullptr, nullptr, r.read.uav, nullptr, r.statsUav};
+    {   // resolve: the offset every S pixel reads at, the guard and the background pull
+        ID3D11ShaderResourceView* srv[kSrvSlots] = {nullptr, depth, mv, nullptr, sc.key.srv, sc.src.srv};
+        ID3D11UnorderedAccessView* uav[kUavSlots] = {nullptr, nullptr, nullptr, sc.read.uav, nullptr, r.statsUav};
         bindAndDispatch(ctx, kResolve, srv, uav, rgx, rgy);
     }
     {   // resample B's output into S at the output size
-        ID3D11ShaderResourceView* srv[kSrvSlots] = {out, nullptr, nullptr, nullptr, nullptr, nullptr, r.read.srv};
+        ID3D11ShaderResourceView* srv[kSrvSlots] = {out, nullptr, nullptr, nullptr, nullptr, nullptr, sc.read.srv};
         ID3D11UnorderedAccessView* uav[kUavSlots] = {nullptr, nullptr, nullptr, nullptr, r.s.uav};
         bindAndDispatch(ctx, kResample, srv, uav, ogx, ogy);
     }
@@ -428,6 +473,11 @@ void frameGenSynthEyeFrame(ID3D11Device* dev, ID3D11DeviceContext* ctx, uint32_t
     save.restore(ctx);
 
     r.havePending = keep;
+    if (keep) {
+        for (int i = 0; i < 3; ++i)
+            for (int k = 0; k < 3; ++k) r.keptRot[i * 3 + k] = cb.rs[i][k];
+        for (int i = 0; i < 4; ++i) r.keptTan[i] = f.tanNow[i];
+    }
     r.bFrame = frame;
     r.shownValid = half;
     r.shownFrame = frame;
@@ -459,6 +509,7 @@ void frameGenSynthFrameBoundary() {
         for (float v : g.gpuMs[k]) if (v > g.win.gpuMax[k]) g.win.gpuMax[k] = v;
         g.win.gpuMedian[k] = frameGenMedian(g.gpuMs[k].data(), g.gpuMs[k].size());
     }
+    fillRotation(g.win);
     const std::string line = formatFrameGenSynthReport(g.win);
     Log::get().note("%s", line.c_str());
     windowReset();

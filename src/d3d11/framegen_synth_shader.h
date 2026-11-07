@@ -1,28 +1,30 @@
 #pragma once
 // The frame-generation synthesizer's compute shaders (fix.frame_generation_shadow, TEMPORARY; docs/design-frame-generation-2026-10-26.md, Phase 2.1, "The synthesis pass").
-// One source, eight entry points, one constant block (src\common\framegen_synth_math.h FrameGenSynthCb). Nothing they write is shown in the headset.
+// One source, seven entry points, one constant block (src\common\framegen_synth_math.h FrameGenSynthCb). Nothing they write is shown in the headset.
 //   fgSynClear     Key and Src to 0 and the stats words to 0 (render size);
-//   fgSynDilate    B's depth, nearest (the larger reversed-Z value) over 3x3, so the class and depth of an edge pixel are the near object's (render size);
-//   fgSynSplat     each B pixel carried to S by its class's motion (fgSynTarget) and scattered as a key into the four pixels of its bilinear footprint (InterlockedMax: the nearer
-//                  surface wins; a pixel that is its own nearest beats one that borrowed the dilated depth);
+//   fgSynSplat     each B pixel carried to S by its class's motion (fgSynTarget; its class and depth are the nearest of the 3x3 around it, synDilated, taken where they are read) and
+//                  scattered as a key into the four pixels of its bilinear footprint (InterlockedMax: the nearer surface wins; a pixel that is its own nearest beats one that borrowed
+//                  the dilated depth);
 //   fgSynSrc       the second pass over the same keys: each pixel writes its index (plus one) to every footprint pixel whose final key is its own;
-//   fgSynResolve   for every S pixel the B position to read: the winner's own position moved by the landing offset (the guard reads the winner's pixel itself when it has a
-//                  nearer 3x3 neighbour on the side the offset points to), or, for a pixel with no winner, the farthest key found within 8 px read 2 px further into its own
-//                  surface (the background pull); the three counters (filled, left, guard) are added to the stats words;
-//   fgSynResample  output size: each output pixel to its S pixel, its read position, B's output there, bilinear, into the S texture (dlOut's format);
+//   fgSynResolve   for every S pixel the B position to read, stored as an OFFSET from the S pixel's own centre in two half floats (kMaxOffset, kNoRead): the winner's own position moved
+//                  by the landing offset (the guard reads the winner's pixel itself when it has a nearer 3x3 neighbour on the side the offset points to), or, for a pixel with no
+//                  winner, the farthest key found within 8 px read 2 px further into its own surface (the background pull); the counters (filled, left, guard, clamped) are added to the
+//                  stats words;
+//   fgSynResample  output size: each output pixel to its S pixel, its read offset, B's output there, bilinear, into the S texture (dlOut's format);
 //   fgSynLuma      quarter grid: S's luma the way the scorer's capture takes it, B's luma and B's class (the f = 1 S is kept for the next real frame);
-//   fgSynScore     quarter grid, on the next real frame C: C's luma against the kept S luma and against B's (the no-warp comparison), binned per class of B as the scorer bins.
+//   fgSynScore     quarter grid, on the next real frame C: C's luma against the kept S luma and against B's (the no-warp comparison), binned per class of B as the scorer bins; and again
+//                  against the kept S luma TURNED by the residual head rotation (the compositor's step: C's cell direction rotated into the eye S was built for, projected with the
+//                  tangents S was built with, a bilinear read of the quarter luma; outside S: not scored, counted).
 // The pixel class and the carry are the temporal pass's own text: the source the build compiles is the text between the two EDVR_TEMPORAL_CARRY markers of kTemporalCsHlsl, then
 // kFrameGenSynthCs (frameGenSynthShaderSource); the markers are read out of kTemporalCsHlsl by frameGenCarryText (framegen_shadow_shader.h).
 //
 // Bindings: t0 B's output (the upscaler's, before the interface; on C's frame the score reads C's there), t1 B's depth copy, t2 the DLSS vectors (R16G16_FLOAT, render size, pixels,
-// this frame to the previous, jitter-free), t3 the dilated depth, t4 the key grid, t5 the source grid, t6 the read positions, t7 the S texture, t8 the kept S luma, t9 the kept B luma
-// (x) and class (y); u0 the dilated depth, u1 the key grid (R32_UINT), u2 the source grid (R32_UINT), u3 the read positions (R32G32_FLOAT), u4 the S texture, u5 the stats words,
-// u6 the S luma, u7 B's luma and class; b0 P.
+// this frame to the previous, jitter-free), t3 unused, t4 the key grid, t5 the source grid, t6 the read offsets, t7 the S texture, t8 the kept S luma, t9 the kept B luma (x) and class
+// (y); u1 the key grid (R32_UINT), u2 the source grid (R32_UINT), u3 the read offsets (R16G16_FLOAT), u4 the S texture, u5 the stats words, u6 the S luma, u7 B's luma and class; b0 P.
 //
 // The key: 0 a hole, 4 the far plane, else (max(asuint(1 / metres), 8) & ~7) | 4 when the pixel is its own nearest | class (1 cockpit, 2 world). A larger key is a nearer surface.
 //
-// The four #defines at the top of kFrameGenSynthCs are the rig's mutation points (tools\framegen_synth_test replaces one with 0 and the case it guards must fail); production
+// The six #defines at the top of kFrameGenSynthCs are the rig's mutation points (tools\framegen_synth_test replaces one with 0 and the case it guards must fail); production
 // compiles them all 1.
 #include <cstring>
 #include <string>
@@ -36,6 +38,8 @@ inline constexpr char kFrameGenSynthCs[] = R"HLSL(
 #define FG_REMOVE_HEAD 1
 #define FG_GUARD 1
 #define FG_FILL_FAR 1
+#define FG_TURN 1        // the score turns S by the residual head rotation (0: it scores it unturned)
+#define FG_TURN_SIGN 1   // the residual is applied the right way round (0: its transpose)
 cbuffer P : register(b0) {
     int4   sz;       // render width, height, output width, height
     int4   qz;       // quarter grid width, height
@@ -43,21 +47,21 @@ cbuffer P : register(b0) {
     float4 dk;       // depth A, depth B, split metres, f
     float4 rs[3];    // the head's step B to S: rotation rows, w the translation component
     float4 hp[3];    // the head's rotation B to A (Hd_B) rows
+    float4 rr[3];    // the score's residual rotation: C's eye space to the eye space the kept S was built for
+    float4 tanK;     // the tangents the kept S was built with
 };
 Texture2D<float4> Out     : register(t0);
 Texture2D<float>  Depth   : register(t1);
 Texture2D<float2> Mv      : register(t2);
-Texture2D<float>  DepthD  : register(t3);
 Texture2D<uint>   KeyT    : register(t4);
 Texture2D<uint>   SrcT    : register(t5);
-Texture2D<float2> ReadT   : register(t6);
+Texture2D<float2> ReadT   : register(t6);   // the read offsets
 Texture2D<float4> SIn     : register(t7);
 Texture2D<float>  SLumaIn : register(t8);
 Texture2D<float2> BInfoIn : register(t9);
-RWTexture2D<float>  DepthDOut : register(u0);
 RWTexture2D<uint>   Key       : register(u1);
 RWTexture2D<uint>   Src       : register(u2);
-RWTexture2D<float2> ReadOut   : register(u3);
+RWTexture2D<float2> ReadOut   : register(u3);   // R16G16_FLOAT
 RWTexture2D<float4> SOut      : register(u4);
 RWStructuredBuffer<uint> Stats : register(u5);
 RWTexture2D<float>  SLumaOut  : register(u6);
@@ -67,12 +71,14 @@ static const uint  kBins = 48;
 static const uint  kPerClass = 99;        // 2 * kBins + 3
 static const uint  kHoles = 297;          // 3 * kPerClass
 static const uint  kBlockUints = 299;     // the score block: 3 classes, holes, cells
-static const uint  kCountBase = 299;      // filled, left, guard
-static const uint  kStatsUints = 302;     // src\common\framegen_synth_math.h kFrameGenSynthStatsUints
+static const uint  kCountBase = 299;      // filled, left, guard, clamped
+static const uint  kTurnBase = 303;       // the turned score block
+static const uint  kStatsUints = 602;     // src\common\framegen_synth_math.h kFrameGenSynthStatsUints
 static const float kGuardMargin = 0.9;    // a 3x3 neighbour nearer by more than a tenth of the pixel's own distance
 static const int   kFillRadius = 8;
 static const float kFillShift = 2.0;
-static const float kNoRead = -1.0e6;
+static const float kNoRead = -4096.0;       // framegen_synth_math.h kFrameGenSynthNoRead
+static const float kMaxOffset = 2000.0;    // kFrameGenSynthMaxOffset
 
 float synLuma(float3 c) { return clamp(dot(c, float3(0.2126, 0.7152, 0.0722)), 0.0, 1.0); }
 
@@ -105,6 +111,18 @@ uint synClass(float zr, out float z) {
     return far ? 0u : (temporalWorldPath(true, far, z, dk.z, false) ? 2u : 1u);
 }
 
+// The nearest of the 3x3 around a pixel (the larger reversed-Z value): the class and depth an edge pixel takes are the near object's.
+float synDilated(int2 q) {
+    float z = 0.0;
+    [unroll] for (int dy = -1; dy <= 1; ++dy) {
+        [unroll] for (int dx = -1; dx <= 1; ++dx) {
+            int2 n = clamp(q + int2(dx, dy), int2(0, 0), int2(sz.x, sz.y) - 1);
+            z = max(z, Depth.Load(int3(n.x, n.y, 0)));
+        }
+    }
+    return z;
+}
+
 float synRawMetres(int2 p) {
     p = clamp(p, int2(0, 0), int2(sz.x, sz.y) - 1);
     bool far;
@@ -117,7 +135,7 @@ float synRawMetres(int2 p) {
 bool fgSynTarget(uint2 id, out float2 pp, out uint key) {
     pp = float2(0.0, 0.0);
     key = 0u;
-    float zr = DepthD.Load(int3(id.x, id.y, 0));
+    float zr = synDilated(int2(id));
     float z;
     uint cls = synClass(zr, z);
     float2 pB = float2(id);
@@ -161,19 +179,6 @@ void fgSynClear(uint3 id : SV_DispatchThreadID) {
 }
 
 [numthreads(8, 8, 1)]
-void fgSynDilate(uint3 id : SV_DispatchThreadID) {
-    if (id.x >= uint(sz.x) || id.y >= uint(sz.y)) return;
-    float z = 0.0;
-    [unroll] for (int dy = -1; dy <= 1; ++dy) {
-        [unroll] for (int dx = -1; dx <= 1; ++dx) {
-            int2 q = clamp(int2(id.xy) + int2(dx, dy), int2(0, 0), int2(sz.x, sz.y) - 1);
-            z = max(z, Depth.Load(int3(q.x, q.y, 0)));
-        }
-    }
-    DepthDOut[id.xy] = z;
-}
-
-[numthreads(8, 8, 1)]
 void fgSynSplat(uint3 id : SV_DispatchThreadID) {
     if (id.x >= uint(sz.x) || id.y >= uint(sz.y)) return;
     float2 pp;
@@ -203,6 +208,7 @@ void fgSynSrc(uint3 id : SV_DispatchThreadID) {
     }
 }
 
+)HLSL" R"HLSL(
 // The winner's read for S pixel c: its source pixel moved by the landing offset (c minus where the source landed). false: no winner, a hole. `guarded` says the guard
 // moved the read: a source pixel with a nearer 3x3 neighbour (by more than kGuardMargin) on the side the offset points to would read across the edge, so it reads itself.
 bool fgSynWinner(int2 c, out float2 rd, out bool guarded) {
@@ -265,28 +271,37 @@ bool fgSynFill(int2 c, out float2 rd) {
     return true;
 }
 
-groupshared uint gCount[3];
+groupshared uint gCount[4];
 
 [numthreads(8, 8, 1)]
 void fgSynResolve(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
-    if (gi < 3) gCount[gi] = 0u;
+    if (gi < 4) gCount[gi] = 0u;
     GroupMemoryBarrierWithGroupSync();
     if (id.x < uint(sz.x) && id.y < uint(sz.y)) {
         int2 c = int2(id.xy);
         float2 rd;
         bool guarded;
+        bool none = false;
         if (fgSynWinner(c, rd, guarded)) {
             if (guarded) InterlockedAdd(gCount[2], 1u);
         } else if (fgSynFill(c, rd)) {
             InterlockedAdd(gCount[0], 1u);
         } else {
-            rd = float2(kNoRead, kNoRead);
+            rd = float2(0.0, 0.0);
+            none = true;
             InterlockedAdd(gCount[1], 1u);
         }
-        ReadOut[id.xy] = rd;
+        float2 off = rd - float2(c);
+        if (!none) {
+            if (any(abs(off) > kMaxOffset)) InterlockedAdd(gCount[3], 1u);
+            off = clamp(off, -kMaxOffset, kMaxOffset);
+        } else {
+            off = float2(kNoRead, 0.0);
+        }
+        ReadOut[id.xy] = off;
     }
     GroupMemoryBarrierWithGroupSync();
-    if (gi < 3 && gCount[gi] != 0u) InterlockedAdd(Stats[kCountBase + gi], gCount[gi]);
+    if (gi < 4 && gCount[gi] != 0u) InterlockedAdd(Stats[kCountBase + gi], gCount[gi]);
 }
 
 [numthreads(8, 8, 1)]
@@ -295,11 +310,12 @@ void fgSynResample(uint3 id : SV_DispatchThreadID) {
     float2 scale = float2(sz.z, sz.w) / float2(sz.x, sz.y);
     float2 ci = (float2(id.xy) + 0.5) / scale - 0.5;       // this output pixel's centre in render pixels
     int2 c = clamp(int2(floor(ci + 0.5)), int2(0, 0), int2(sz.x, sz.y) - 1);
-    float2 rd = ReadT.Load(int3(c.x, c.y, 0));
-    float2 r = (rd.x < -1.0e5) ? ci : rd + (ci - float2(c));
+    float2 off = ReadT.Load(int3(c.x, c.y, 0));
+    float2 r = (off.x < kNoRead * 0.5) ? ci : ci + off;       // the read position is the pixel's own plus its offset
     SOut[id.xy] = synBilinear(Out, (r + 0.5) * scale, int2(sz.z, sz.w));
 }
 
+)HLSL" R"HLSL(
 // The scorer's capture, on the S texture or the output: four taps a cell at (1, 3) of its 4 x 4 render pixels, converted to output pixels.
 float synCellLuma(Texture2D<float4> t, uint2 cell) {
     float2 scale = float2(sz.z, sz.w) / float2(sz.x, sz.y);
@@ -330,14 +346,48 @@ void fgSynLuma(uint3 id : SV_DispatchThreadID) {
     BInfoOut[id.xy] = float2(synCellLuma(Out, id.xy), float(cls));
 }
 
+// The f = 1 S as the compositor would show it: C's cell direction (C's tangents) turned by the residual head rotation into the eye S was built for, projected with the tangents S
+// was built with, and the kept quarter luma read there bilinearly. false: the direction falls outside S (or behind the eye).
+bool synTurnedLuma(uint2 cell, out float lum) {
+    lum = 0.0;
+    float3 d = temporalPixelDir(float2(cell) * 4.0 + 1.5, tanB, int2(sz.x, sz.y));
+#if FG_TURN
+#if FG_TURN_SIGN
+    float3 dS = float3(dot(rr[0].xyz, d), dot(rr[1].xyz, d), dot(rr[2].xyz, d));
+#else
+    float3 dS = rr[0].xyz * d.x + rr[1].xyz * d.y + rr[2].xyz * d.z;
+#endif
+#else
+    float3 dS = d;
+#endif
+    float2 pS;
+    if (!temporalProjectPixel(dS, tanK, int2(sz.x, sz.y), pS)) return false;
+    if (pS.x < -0.5 || pS.y < -0.5 || pS.x > float(sz.x) - 0.5 || pS.y > float(sz.y) - 0.5) return false;
+    float2 f = (pS - 1.5) * 0.25;                       // in cells, centres at integers
+    int2 i0 = int2(floor(f));
+    float2 w = f - float2(i0);
+    int2 hi = int2(qz.x, qz.y) - 1;
+    int2 a = clamp(i0, int2(0, 0), hi);
+    int2 b = clamp(i0 + 1, int2(0, 0), hi);
+    float l00 = SLumaIn.Load(int3(a.x, a.y, 0));
+    float l10 = SLumaIn.Load(int3(b.x, a.y, 0));
+    float l01 = SLumaIn.Load(int3(a.x, b.y, 0));
+    float l11 = SLumaIn.Load(int3(b.x, b.y, 0));
+    lum = lerp(lerp(l00, l10, w.x), lerp(l01, l11, w.x), w.y);
+    return true;
+}
+
 groupshared uint gScore[299];   // kBlockUints
+groupshared uint gTurn[299];    // the same, S turned
 
 [numthreads(8, 8, 1)]
 void fgSynScore(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
-    for (uint i = gi; i < kBlockUints; i += 64) gScore[i] = 0u;
+    for (uint i = gi; i < kBlockUints; i += 64) { gScore[i] = 0u; gTurn[i] = 0u; }
     GroupMemoryBarrierWithGroupSync();
     bool active = id.x < uint(qz.x) && id.y < uint(qz.y);
     uint cls = 0u, bin = 0u, binId = 0u, sumE = 0u, sumId = 0u;
+    bool turnedIn = false;
+    uint binT = 0u, sumT = 0u;
     if (active) {
         float lumC = synCellLuma(Out, id.xy);
         float lumS = SLumaIn.Load(int3(id.x, id.y, 0));
@@ -349,6 +399,13 @@ void fgSynScore(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
         binId = synBin(eId);
         sumE = uint(e * 1024.0 + 0.5);
         sumId = uint(eId * 1024.0 + 0.5);
+        float lumT;
+        turnedIn = synTurnedLuma(id.xy, lumT);
+        if (turnedIn) {
+            float eT = abs(lumC - lumT);
+            binT = synBin(eT);
+            sumT = uint(eT * 1024.0 + 0.5);
+        }
     }
     // The shared-memory adds sit after every read and before the barrier, with no early exit in the group.
     if (active) {
@@ -359,11 +416,23 @@ void fgSynScore(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
         InterlockedAdd(gScore[b + 2 * kBins], 1u);
         InterlockedAdd(gScore[b + 2 * kBins + 1], sumE);
         InterlockedAdd(gScore[b + 2 * kBins + 2], sumId);
+        if (turnedIn) {
+            InterlockedAdd(gTurn[kBlockUints - 1], 1u);
+            InterlockedAdd(gTurn[b + binT], 1u);
+            InterlockedAdd(gTurn[b + kBins + binId], 1u);
+            InterlockedAdd(gTurn[b + 2 * kBins], 1u);
+            InterlockedAdd(gTurn[b + 2 * kBins + 1], sumT);
+            InterlockedAdd(gTurn[b + 2 * kBins + 2], sumId);
+        } else {
+            InterlockedAdd(gTurn[kHoles], 1u);
+        }
     }
     GroupMemoryBarrierWithGroupSync();
     for (uint j = gi; j < kBlockUints; j += 64) {
         uint v = gScore[j];
         if (v != 0u) InterlockedAdd(Stats[j], v);
+        uint vt = gTurn[j];
+        if (vt != 0u) InterlockedAdd(Stats[kTurnBase + j], vt);
     }
 }
 )HLSL";

@@ -28,15 +28,25 @@ struct FrameGenSynthCb {
     float dk[4];       // the depth encoding's A and B (depth = A + B / z), the ship's split in metres, f
     float rs[3][4];    // the head's step B to S: rotation rows (xyz), w the translation component
     float hp[3][4];    // the head's rotation B to A (the pass's Hd), xyz of each row
+    float rr[3][4];    // the score's residual head rotation (frameGenSynthResidual), rows xyz: C's eye space to the eye space the kept f = 1 S was built for (identity off a score)
+    float tanK[4];     // the tangents the kept S was built with (B's); this frame's on a frame that scores nothing
 };
-static_assert(sizeof(FrameGenSynthCb) == 160, "the synthesizer's cbuffer is 10 16-byte rows");
+static_assert(sizeof(FrameGenSynthCb) == 224, "the synthesizer's cbuffer is 14 16-byte rows");
 
 // The stats words: the score against C (frameGenDecodeBlock's layout: three classes, holes, cells = 299 words), then the render pixels the background filled, the holes left, and
-// the reads the guard moved.
+// the reads the guard moved, the read offsets clamped, then the same score block again with S turned by the residual head rotation (its holes word counts the cells whose turned
+// position fell outside S).
 constexpr uint32_t kFrameGenSynthStatsFilled = kFrameGenShadowStatsBlockUints;
 constexpr uint32_t kFrameGenSynthStatsLeft = kFrameGenSynthStatsFilled + 1;
 constexpr uint32_t kFrameGenSynthStatsGuard = kFrameGenSynthStatsFilled + 2;
-constexpr uint32_t kFrameGenSynthStatsUints = kFrameGenSynthStatsFilled + 3;   // 302
+constexpr uint32_t kFrameGenSynthStatsClamp = kFrameGenSynthStatsFilled + 3;
+constexpr uint32_t kFrameGenSynthStatsTurned = kFrameGenSynthStatsFilled + 4;   // 303
+constexpr uint32_t kFrameGenSynthStatsUints = kFrameGenSynthStatsTurned + kFrameGenShadowStatsBlockUints;   // 602
+
+// The read offsets (the source B position minus the S pixel centre, render pixels) are stored as two half floats: exact to 1/16 px up to 256 px, to 1/8 px up to 512 px, to 1/2 px up
+// to 2048 px. An offset past kFrameGenSynthMaxOffset on either axis is clamped to it (a wrong read, counted in the clamp stat); kFrameGenSynthNoRead on x marks a pixel with nothing to read.
+constexpr float kFrameGenSynthMaxOffset = 2000.0f;
+constexpr float kFrameGenSynthNoRead = -4096.0f;
 
 // The rotation R raised to the power f (axis-angle scaled by f, through the quaternion, so a turn of any size is the short way round); R row-major.
 inline void frameGenSynthRotationPow(const float R[9], float f, float out[9]) {
@@ -78,8 +88,16 @@ inline void frameGenSynthHeadStep(const FrameGenDeltas& head, float f, float rot
     for (int i = 0; i < 3; ++i) t[i] = -f * tf[i];
 }
 
+// The residual head rotation of a scored frame, rotation only: the f = 1 S kept from B was built for the head step `kept` (B's eye space to S's, the cb's rs rotation); C's true head
+// rotation is its backward delta `hdC` (C's eye space to B's: x_B = Hd_C x_C + th). A direction in C's eye space is d_B = Hd_C d_C in B's, d_S = kept d_B in the S eye: out =
+// kept * Hd_C, the identity when the head did exactly what S was built for. The compositor turns a submitted frame by this much on display.
+inline void frameGenSynthResidual(const float kept[9], const float hdC[9], float out[9]) {
+    for (int r = 0; r < 3; ++r)
+        for (int c = 0; c < 3; ++c) out[r * 3 + c] = kept[r * 3 + 0] * hdC[0 * 3 + c] + kept[r * 3 + 1] * hdC[1 * 3 + c] + kept[r * 3 + 2] * hdC[2 * 3 + c];
+}
+
 inline void frameGenSynthFillCb(FrameGenSynthCb& cb, uint32_t renderW, uint32_t renderH, uint32_t outW, uint32_t outH, const float tanB[4], float depthA, float depthB,
-                                float splitMetres, float f, const FrameGenDeltas& head) {
+                                float splitMetres, float f, const FrameGenDeltas& head, const float* residual = nullptr, const float* tanKept = nullptr) {
     cb = FrameGenSynthCb{};
     cb.sz[0] = static_cast<int32_t>(renderW);
     cb.sz[1] = static_cast<int32_t>(renderH);
@@ -100,7 +118,9 @@ inline void frameGenSynthFillCb(FrameGenSynthCb& cb, uint32_t renderW, uint32_t 
             cb.hp[r][k] = head.Hd[r * 3 + k];
         }
         cb.rs[r][3] = t[r];
+        for (int k = 0; k < 3; ++k) cb.rr[r][k] = residual ? residual[r * 3 + k] : (r == k ? 1.0f : 0.0f);
     }
+    for (int i = 0; i < 4; ++i) cb.tanK[i] = tanKept ? tanKept[i] : tanB[i];
 }
 
 // Decodes one eye's stats words. `scored` says the score block holds a pass (a frame that scored nothing leaves it zero, and the decode leaves cells 0).
@@ -111,6 +131,8 @@ inline void frameGenSynthDecodeStats(const uint32_t* s, FrameGenSynthEyeResult& 
     out.filled = s[kFrameGenSynthStatsFilled];
     out.left = s[kFrameGenSynthStatsLeft];
     out.guard = s[kFrameGenSynthStatsGuard];
+    out.clamped = s[kFrameGenSynthStatsClamp];
+    frameGenDecodeBlock(s + kFrameGenSynthStatsTurned, out.tcls, out.tout, out.tcells);
 }
 
 // The CPU reference of the shader's target for a B pixel (px, py) of depth zMetres (farPlane: no depth) and vector (mvx, mvy): where it lands in S, in render pixels, and its class
