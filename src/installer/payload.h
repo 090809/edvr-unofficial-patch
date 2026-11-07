@@ -9,6 +9,7 @@
 #pragma once
 
 #include <string>
+#include <vector>
 
 #include "plan.h"
 
@@ -31,7 +32,32 @@ namespace edvr::installer {
 // and profile (the descriptor, resource 107, which the planner no longer reads).
 bool payloadItem(const std::string& item, const void** data, size_t* size);
 
-// Version, hashes and the shipped edvr.ini text, computed once.
+// Version, hashes and the shipped edvr.ini text. Computed on first use, and again
+// after usePayloadFiles or resetPayloadFiles: the reference stays valid, but what
+// it holds changes, so a caller keeps a copy rather than the reference across such
+// a call.
 const PayloadInfo& payloadInfo();
+
+// One file of a payload that lives outside the executable: the item name (as
+// payloadItem knows it, aliases included), where the file is, and its SHA-256 when
+// the caller has one to check it against.
+struct PayloadFile {
+    std::string item;
+    std::wstring path;
+    std::string sha256;  // lower-case hex, or empty to skip the check
+};
+
+// Switches payloadItem and payloadInfo from the embedded resources to these files,
+// for the rest of the process. Each file is mapped read-only and kept mapped, so a
+// pointer payloadItem returned stays valid even after a later call replaces the
+// payload; a file whose hash does not match is refused, and so is an unknown or
+// repeated item. Nothing changes unless every file is accepted. With no files the
+// payload is empty: payloadItem finds nothing, which is how "no payload" reads.
+// Call it from the thread that owns the payload; it does not synchronise with a
+// reader running at the same time.
+bool usePayloadFiles(const std::vector<PayloadFile>& files, const std::string& version, std::string* error);
+
+// Back to the embedded resources, as if usePayloadFiles had never been called.
+void resetPayloadFiles();
 
 }  // namespace edvr::installer

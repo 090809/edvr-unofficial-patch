@@ -243,6 +243,7 @@ python tools\run_jobs.py ^
     --gate "tools\gen_installer_rc.py --self-test" ^
     --gate "tools\package_native.py --self-test" ^
     --gate "tools\sign_manifest.py --self-test" ^
+    --gate "tools\launcher_fixtures.py --self-test" ^
     --gate "tools\install_proton.py --self-test" ^
     --gate "tools\build_diff.py --self-test" ^
     --gate "tools\effects_arc.py --self-test" ^
@@ -3244,6 +3245,37 @@ if not exist "%OBJ%\insttest" mkdir "%OBJ%\insttest"
 if errorlevel 1 ( echo [edvr] ERROR: installer_test build failed & exit /b 1 )
 "%BUILD%\installer_test.exe" "%ROOT%" "%BUILD%\insttest_scratch" || (
     echo [edvr] ERROR: the installer failed its own tests
+    exit /b 1
+)
+exit /b 0
+
+:rig_launcher_test
+echo [edvr] === launcher_test.exe ===
+REM The launcher's update core, with no window: the strict JSON parser, manifest
+REM signatures checked through BCrypt against ones Python signed, the schema rules
+REM held to sign_manifest.py's, our own inflate and zip reader, the payload cache,
+REM the updater scripted against a pretend GitHub, WinHttpClient against a
+REM listener on 127.0.0.1 in the rig's own process, and usePayloadFiles. It
+REM touches only its two folders under build\ (fixtures written by
+REM tools\launcher_fixtures.py, and scratch), never the real EDVR folder in
+REM LOCALAPPDATA and never a host but the loopback address.
+if not exist "%OBJ%\launchertest" mkdir "%OBJ%\launchertest"
+python tools\launcher_fixtures.py --out "%BUILD%\launcher_test_fixtures"
+if errorlevel 1 ( echo [edvr] ERROR: launcher fixtures failed & exit /b 1 )
+%CC% /nologo /O2 /MT /std:c++17 /EHsc /W4 /GR- /DWIN32_LEAN_AND_MEAN /DNOMINMAX ^
+    /D_CRT_SECURE_NO_WARNINGS /DUNICODE /D_UNICODE ^
+    /Fo"%OBJ%\launchertest"\ /Fe"%BUILD%\launcher_test.exe" ^
+    "tools\launcher_test\launcher_test.cpp" ^
+    "src\installer\update_json.cpp" "src\installer\update_manifest.cpp" ^
+    "src\installer\update_zip.cpp" "src\installer\update_http.cpp" ^
+    "src\installer\update_cache.cpp" "src\installer\update_util.cpp" ^
+    "src\installer\launcher_state.cpp" "src\installer\updater.cpp" ^
+    "src\installer\payload.cpp" "src\installer\probe.cpp" ^
+    "src\common\iniedit.cpp" ^
+    /link /INCREMENTAL:NO %INSTALLER_LIBS% winhttp.lib ws2_32.lib
+if errorlevel 1 ( echo [edvr] ERROR: launcher_test build failed & exit /b 1 )
+"%BUILD%\launcher_test.exe" "%ROOT%" "%BUILD%\launcher_test_fixtures" "%BUILD%\launcher_test_scratch" || (
+    echo [edvr] ERROR: the launcher update core failed its own tests
     exit /b 1
 )
 exit /b 0
