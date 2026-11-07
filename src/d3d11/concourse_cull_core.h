@@ -890,6 +890,9 @@ constexpr float kBackdropRadiusDefaultM = 600.0f, kBackdropRadiusMinM = 10.0f, k
 constexpr float kBackdropNearZ = 0.025f;       // the game's near plane (reversed infinite Z: view depth = this / z)
 constexpr float kBackdropMinDistM = 5.0f;      // a captured pixel nearer than this along its ray is not backdrop and is not written
 constexpr float kBackdropFarM = 60000.0f;      // the distance written for a pixel with no depth (z = 0), and the largest stored distance
+// The display's march along the view's ray (concourse_pane.cpp, backdropS). It starts this far along, inside what the bake's near plane left, and its steps are even in 1 / distance.
+constexpr float kBackdropMarchNearM = 30.0f;
+constexpr int kBackdropMarchSteps = 12, kBackdropMarchBisections = 5;
 // The point s = off + dir * t with |s| = radius, t the far root (off inside the sphere has one). A direction that misses (off outside the sphere) takes the nearest point,
 // as the shader does (the discriminant is clamped at 0). `dir` need not be unit; False for a zero direction. With off = 0 the result is dir * radius.
 inline bool backdropSphereHit(const float off[3], const float dir[3], float radius, float out[3]) noexcept {

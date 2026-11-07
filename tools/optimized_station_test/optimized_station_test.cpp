@@ -4079,8 +4079,26 @@ int main(int argc, char** argv) {
                     check(l.kind() == K::kUnknown, "station type: on foot on a planet is unknown");
 
                     js::Latch fresh;
+                    uint64_t askedFor = 0;
+                    check(!fresh.takeUnmatched(&askedFor), "station type: nothing to look for before a load on foot");
                     feed(fresh, onFootLoad);
                     check(fresh.kind() == K::kUnknown, "station type: a load on foot with nothing saved is unknown");
+                    check(fresh.takeUnmatched(&askedFor) && askedFor == js::hashName("Test Market", 11) && !fresh.takeUnmatched(&askedFor), "station type: and it asks once, by the hash of its Body, to look in the older journals");
+                    {
+                        const std::string older = std::string(disembark) + "{ \"timestamp\":\"t\", \"event\":\"Music\", \"MusicTrack\":\"MainMenu\" }\r\n";
+                        js::Saved inOlder;
+                        check(js::lastStationIn(older.c_str(), static_cast<uint32_t>(older.size()), &inOlder) && inOlder.nameHash == askedFor && inOlder.kind == K::kOrbis, "station type: an older journal names it");
+                        fresh.adopt(inOlder, [&](K k) { last = k; });
+                        check(fresh.kind() == K::kOrbis && last == K::kOrbis && fresh.takeSavedChanged(), "station type: what it says is taken, and saved");
+                        const std::string none = "{ \"timestamp\":\"t\", \"event\":\"Fileheader\" }\r\n" + std::string(onFootLoad);
+                        check(!js::lastStationIn(none.c_str(), static_cast<uint32_t>(none.size()), nullptr), "station type: a journal that names no station says nothing");
+                    }
+                    {
+                        js::Latch withMatch;
+                        feed(withMatch, disembark);
+                        feed(withMatch, onFootLoad);
+                        check(!withMatch.takeUnmatched(&askedFor), "station type: a load on foot that matches looks no further");
+                    }
                     js::Latch restored;
                     restored.restore(l.saved());
                     feed(restored, onFootLoad);

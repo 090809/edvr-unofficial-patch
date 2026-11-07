@@ -4,6 +4,7 @@
 
 #include <windows.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstring>
 #include <memory>
@@ -412,6 +413,55 @@ void stationSave(const Session& s) {
     }
 }
 
+void noteStationKind(journal_station::Kind k) {
+    g_stationKind.store(static_cast<uint8_t>(k), std::memory_order_relaxed);
+    Log::get().note("journal: the station's type is %s", journal_station::kindName(k));
+}
+
+// A load on foot where nothing saved says what the station is: the first flight after an install, or after playing without EDVR. The game's own older journals do, newest first, until
+// one names any station. Read on the worker, once a load. Names are hashed here as in the latch, and none is logged.
+void stationSearchJournals(Session& s, uint64_t bodyHash) {
+    constexpr size_t kFilesMax = 40;
+    constexpr uint64_t kFileBytesMax = 32ull * 1024 * 1024;
+    struct Entry {
+        uint64_t when;
+        std::wstring name;
+    };
+    std::vector<Entry> files;
+    WIN32_FIND_DATAW fd{};
+    HANDLE find = FindFirstFileW((s.dir + L"\\Journal.*.log").c_str(), &fd);
+    if (find == INVALID_HANDLE_VALUE) return;
+    do {
+        files.push_back(Entry{(static_cast<uint64_t>(fd.ftLastWriteTime.dwHighDateTime) << 32) | fd.ftLastWriteTime.dwLowDateTime, fd.cFileName});
+    } while (FindNextFileW(find, &fd));
+    FindClose(find);
+    std::sort(files.begin(), files.end(), [](const Entry& a, const Entry& b) { return a.when > b.when; });
+    std::vector<char> buf;
+    const size_t look = files.size() < kFilesMax ? files.size() : kFilesMax;
+    for (size_t i = 0; i < look; ++i) {
+        HANDLE h = CreateFileW((s.dir + L"\\" + files[i].name).c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (h == INVALID_HANDLE_VALUE) continue;
+        LARGE_INTEGER size{};
+        DWORD got = 0;
+        bool ok = false;
+        if (GetFileSizeEx(h, &size) && size.QuadPart > 0 && static_cast<uint64_t>(size.QuadPart) <= kFileBytesMax) {
+            buf.resize(static_cast<size_t>(size.QuadPart));
+            ok = ReadFile(h, buf.data(), static_cast<DWORD>(buf.size()), &got, nullptr) != 0;
+        }
+        CloseHandle(h);
+        journal_station::Saved found;
+        if (!ok || !journal_station::lastStationIn(buf.data(), got, &found)) continue;
+        if (found.nameHash == bodyHash) {
+            Log::get().note("journal: the station is named in an older journal, %zu back", i);
+            s.station.adopt(found, noteStationKind);
+        } else {
+            Log::get().note("journal: the last station named, %zu journals back, is another one: this one's type is not known", i);
+        }
+        return;
+    }
+    Log::get().note("journal: no station is named in the last %zu journals: this one's type is not known", look);
+}
+
 void closeFile(Session& s) {
     if (s.handle != INVALID_HANDLE_VALUE) {
         CloseHandle(s.handle);
@@ -673,10 +723,9 @@ void scanEvents(Session& s, const char* data, uint32_t len) {
     scanRange(s, data, len);
     // Issue 140: the Scorpion latch reads the new bytes themselves, once (a stream: the carry and the stitched head above would feed some bytes twice).
     s.vehicle.feed(data, len, [&s](bool scorpion, journal_vehicle::Event cause) { noteVehicle(s, scorpion, cause); });
-    s.station.feed(data, len, [](journal_station::Kind k) {
-        g_stationKind.store(static_cast<uint8_t>(k), std::memory_order_relaxed);
-        Log::get().note("journal: the station's type is %s", journal_station::kindName(k));
-    });
+    s.station.feed(data, len, noteStationKind);
+    uint64_t unmatchedBody = 0;
+    if (s.station.takeUnmatched(&unmatchedBody)) stationSearchJournals(s, unmatchedBody);
     if (s.station.takeSavedChanged()) stationSave(s);
 
     // Keep the tail as the next carry. Anything already scanned in `stitched`

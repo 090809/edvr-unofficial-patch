@@ -1548,9 +1548,9 @@ static std::string bdFloatText(double v) {
 //   Capture: dir = normalize(v2); the scene's depth z gives the view depth 0.025 / z (reversed infinite Z), along the ray t = depth / |dot(cb1[279].xyz, dir)| (cb1[279] is the
 //   view Z axis, INFERRED); the hit H = C + dir * t; rel = H - O. The colour goes to the colour cube's texel of rel (alpha 1) and |rel| to the distance cube's. A hit nearer than
 //   5 m is not backdrop and is not written.
-//   Display, per pixel: 1 constant-buffer row read and 1 buffer load; None: 6 cube samples (lods 0 1 2 3 5 7). Sphere: the same, with the direction moved. Depth: 4 marching steps
-//   of 2 samples each (the colour cube's alpha at lod 1, and the distance cube at lod 1) and the final 6, so 14 cube samples. Mips fill the holes the splat leaves: the lookup
-//   composites lod 0 over the premultiplied coarser lods front to back.
+//   Display, per pixel: the constant-buffer rows and 1 buffer load; None: 6 cube samples (lods 0 1 2 3 5 7). Sphere: the same, with the direction moved. Depth: a march of the distance
+//   cube, cc::kBackdropMarchSteps at lod 1 and cc::kBackdropMarchBisections at lod 0 at most, and the final 6. Mips fill the holes the splat leaves: the lookup composites lod 0 over the
+//   premultiplied coarser lods front to back.
 bool makeBackdropShaders(ID3D11Device* device) noexcept {
     ID3D11DeviceContext* imm = nullptr;
     device->GetImmediateContext(&imm);
@@ -1576,26 +1576,42 @@ bool makeBackdropShaders(ID3D11Device* device) noexcept {
         "    }\n"
         "    return acc;\n"
         "}\n"
-        "float3 backdropS(PsIn i, out float3 dir) {\n"
+        // `t` is how far along the view's ray the picture lies. In the depth mode it is a march along the ray against the distance cube: even steps in 1 / t, which are even steps of
+        // parallax, until the ray passes behind what the cube holds, then a bisection. Flight 29's look-up repeated t = the distance at the last guess's direction: it does not settle at an
+        // edge, so edges rippled and swam as the camera moved. A texel with no distance is not a surface.
+        "float3 backdropS(PsIn i, out float3 dir, out float t) {\n"
         "    dir = i.wp * rsqrt(max(dot(i.wp, i.wp), 1e-12));\n"
         "    float3 off = cb1[275].xyz - originBuf[0].xyz;\n"
         "    float3 s = dir;\n"
         "    float mode = par.x;\n"
         "    float R = max(par.y, 1.0);\n"
+        "    t = " + bdFloatText(cc::kBackdropFarM) + ";\n"
         "    if (mode > 0.5) {\n"
         "        float b = dot(off, dir);\n"
         "        float cq = dot(off, off) - R * R;\n"
-        "        float t = -b + sqrt(max(b * b - cq, 0.0));\n"
+        "        t = -b + sqrt(max(b * b - cq, 0.0));\n"
         "        if (mode > 1.5) {\n"
-        "            t = R;\n"
-        "            [unroll] for (int k = 0; k < 4; ++k) {\n"
-        "                float3 rel = off + dir * t;\n"
-        "                float cov = backdrop.SampleLevel(backdropSmp, rel, 1).a;\n"
-        "                if (cov > 0.01) {\n"
-        "                    float r = distMap.SampleLevel(backdropSmp, rel, 1) / max(cov, 1e-3);\n"
-        "                    float3 hit = normalize(rel) * r;\n"
-        "                    t = max(dot(hit - off, dir), 1.0);\n"
+        "            const float uFar = 1.0 / " + bdFloatText(cc::kBackdropFarM) + ";\n"
+        "            const float uNear = 1.0 / " + bdFloatText(cc::kBackdropMarchNearM) + ";\n"
+        "            const float du = (uNear - uFar) / " + std::to_string(cc::kBackdropMarchSteps) + ".0;\n"
+        "            float outside = uNear, inside = uFar;\n"
+        "            bool hit = false;\n"
+        "            [loop] for (int k = 1; k <= " + std::to_string(cc::kBackdropMarchSteps) + "; ++k) {\n"
+        "                float u = uNear - du * k;\n"
+        "                float3 rel = off + dir / u;\n"
+        "                float r = distMap.SampleLevel(backdropSmp, rel, 1.0);\n"
+        "                if (r >= 1.0 && dot(rel, rel) >= r * r) { inside = u; hit = true; break; }\n"
+        "                outside = u;\n"
+        "            }\n"
+        "            t = 1.0 / uFar;\n"
+        "            if (hit) {\n"
+        "                [loop] for (int k = 0; k < " + std::to_string(cc::kBackdropMarchBisections) + "; ++k) {\n"
+        "                    float u = 0.5 * (outside + inside);\n"
+        "                    float3 rel = off + dir / u;\n"
+        "                    float r = distMap.SampleLevel(backdropSmp, rel, 0.0);\n"
+        "                    if (r >= 1.0 && dot(rel, rel) >= r * r) inside = u; else outside = u;\n"
         "                }\n"
+        "                t = 2.0 / (outside + inside);\n"
         "            }\n"
         "        }\n"
         "        s = off + dir * t;\n"
@@ -1604,12 +1620,17 @@ bool makeBackdropShaders(ID3D11Device* device) noexcept {
         "}\n";
     // Display: glass after the composite. Tint on the captured colour (premultiplied, so only where captured), the level colour under what is not captured (the fallback,
     // unchanged), then the glass's own sheen: haze plus a Fresnel term at grazing angles, mixing toward the level colour. Samples: the look-up's 6 (blur is a bias, not
-    // extra samples) plus, in the depth mode, 8 for the march: 14 cube samples at most, 1 buffer load, 1 constant-buffer row.
+    // extra samples) plus, in the depth mode, the march's steps and bisections at most, 1 buffer load, the constant-buffer rows.
+    // The depth is the picture's, not the glass's: the camera's motion is worked out from depth for DLAA and the other temporal resolves, so at the glass's depth a far picture moves as
+    // if it were on the glass, and its history lands in the wrong place whenever the camera moves. cb1[270..272].w are the view's forward axis, and cb1[273].z the near plane: reversed
+    // infinite depth is near / view depth. The game's depth test stays, so what stands in front of the glass stays in front.
     const std::string show = head +
-        "float4 main(PsIn i) : SV_Target {\n"
+        "float4 main(PsIn i, out float pictureDepth : SV_Depth) : SV_Target {\n"
         "    float3 fb = fallbackColour(i.n);\n"
         "    float3 dir;\n"
-        "    float3 s = backdropS(i, dir);\n"
+        "    float t;\n"
+        "    float3 s = backdropS(i, dir, t);\n"
+        "    pictureDepth = cb1[273].z / max(t * dot(dir, float3(cb1[270].w, cb1[271].w, cb1[272].w)), 1.0);\n"
         "    float4 acc = lookup(s, glassB.x, 7.0);\n"
         // Flight 25: a hole took the window's level, and that is 4 on a skylight: white shapes where the bake left the room's things out. Colour over coverage takes the neighbours'
         // colour instead, and only a direction with nothing near it falls back. The sheen is the level's colour at no more than 1, so a bright window is not a washed-out one.
@@ -1622,7 +1643,8 @@ bool makeBackdropShaders(ID3D11Device* device) noexcept {
     const std::string probe = head +
         "float4 main(PsIn i) : SV_Target {\n"
         "    float3 dir;\n"
-        "    float3 s = backdropS(i, dir);\n"
+        "    float t;\n"
+        "    float3 s = backdropS(i, dir, t);\n"
         "    float4 acc = lookup(s, glassB.x, 3.0);\n"
         "    clip(0.5 - acc.a);\n"
         "    return float4(0, 0, 0, 0);\n"

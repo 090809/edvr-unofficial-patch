@@ -105,6 +105,20 @@ public:
     }
     // Another file is another stream of bytes. What it means for the station does not change: the events say that, and a part of a long session starts a new file with no event.
     void newFile() noexcept { len_ = 0; }
+    // True once after a load on foot that did not match what was saved, with the hash of where it says it is: the journals before this one may say what that is (lastStationIn).
+    bool takeUnmatched(uint64_t* bodyHash) noexcept {
+        if (!unmatched_) return false;
+        unmatched_ = false;
+        if (bodyHash) *bodyHash = unmatchedHash_;
+        return true;
+    }
+    // What the older journals said of it.
+    template <class OnChange>
+    void adopt(const Saved& s, OnChange&& onChange) {
+        saved_ = s;
+        savedChanged_ = true;
+        set(s.kind, onChange);
+    }
 
     // The next bytes of the journal, in any pieces. onChange(Kind) is called each time the type changes, in stream order.
     template <class OnChange>
@@ -183,7 +197,13 @@ private:
         const char* body = nullptr;
         uint32_t bodyLen = 0;
         if (location && has("\"OnFoot\":true") && has("\"BodyType\":\"Station\"") && field("\"Body\":\"", &body, &bodyLen)) {
-            set(saved_.nameHash != 0 && saved_.nameHash == hashName(body, bodyLen) ? saved_.kind : Kind::kUnknown, onChange);
+            const uint64_t h = hashName(body, bodyLen);
+            const bool match = saved_.nameHash != 0 && saved_.nameHash == h;
+            set(match ? saved_.kind : Kind::kUnknown, onChange);
+            if (!match) {
+                unmatched_ = true;
+                unmatchedHash_ = h;
+            }
             return;
         }
         set(Kind::kUnknown, onChange);   // in space, on a planet, or an event at no station
@@ -194,7 +214,18 @@ private:
     Kind kind_ = Kind::kUnknown;
     Saved saved_;
     bool savedChanged_ = false;
+    bool unmatched_ = false;
+    uint64_t unmatchedHash_ = 0;
 };
+
+// The last station a stretch of journal names, and whether it names one. A commander on foot in a station disembarked there, so the newest journal that names any station says which.
+inline bool lastStationIn(const char* text, uint32_t n, Saved* out) {
+    Latch latch;
+    latch.feed(text, n, [](Kind) {});
+    if (latch.saved().nameHash == 0) return false;
+    if (out) *out = latch.saved();
+    return true;
+}
 
 }  // namespace journal_station
 }  // namespace edvr
