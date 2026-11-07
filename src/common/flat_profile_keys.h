@@ -53,6 +53,8 @@ inline bool flatProfileReadsKey(const char* key) {
         std::strcmp(key, "fix.ui_quality") == 0 ||
         // The optimized station (optimized_station.cpp), on in flat as in VR (built v14.34). Unlisted, getString answers "off" here and the station never starts.
         std::strcmp(key, "fix.optimized_stations") == 0 ||
+        // How far from a station window the real view takes over from the bake (optimized_station.cpp, the Window 3D distance row).
+        std::strcmp(key, "fix.station_window_distance") == 0 ||
         // TEMPORARY (the concourse cull and its glass panes, optimized_station.cpp and concourse_pane.cpp, docs\concourse-cull-2026-11-05.md): flat and VR alike.
         // Unlisted, getString answers "off" here (the cull and the pane mode stay off, a hotkey reads empty and binds nothing) and the keys log nothing. Remove with the arc.
         std::strcmp(key, "diag.concourse_cull") == 0 ||

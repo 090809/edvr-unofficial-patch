@@ -1414,6 +1414,7 @@ void releaseAtomic(std::atomic<T*>& a) noexcept {
 }
 
 void releaseBackdrop() noexcept {
+    g_bakeBaked.store(false, std::memory_order_release);
     g_bdArmed.store(false, std::memory_order_release);
     g_bdCubeValid.store(false, std::memory_order_release);
     g_bdOriginSet.store(false, std::memory_order_release);
@@ -3151,6 +3152,11 @@ std::atomic<bool> g_bakeWantPrepare{false};
 std::atomic<bool> g_bakeHoldSave{false};       // each Present keeps the back buffer
 std::atomic<bool> g_bakeHoldShow{false};       // each Present puts the kept image back
 bool g_bakeArmedNow = false, g_bakeReady = false, g_bakeReleasing = false, g_bakeHeldValid = false, g_bakeAtCentre = false, g_bakeSaidRefused = false, g_bakeLastSeen = false;
+std::atomic<bool> g_bakeWantRelease{false};
+std::atomic<uint32_t> g_bakeFrameHeight{0};    // the render height of the frame last resolved
+uint32_t g_bakeCapHeight = 0;                  // the height the bake's frames had
+uint32_t g_bakeHeightSeen = 0;                 // for the settling of a change of g_bakeFrameHeight
+uint64_t g_bakeHeightMs = 0;
 float g_bakeCentre[3] = {};
 float g_bakeLastFwd[3] = {};                   // where the last direction looks: its arrival ends the bake
 float g_bakeCapFwd[3] = {};                    // the last frame captured: a frame looking the same way adds nothing
@@ -3252,6 +3258,12 @@ void bakeEndHold(const char* why, uint64_t nowMs) noexcept {
 }
 
 void bakeTick(ID3D11Device* device, uint64_t nowMs) noexcept {
+    if (g_bakeWantRelease.exchange(false, std::memory_order_acq_rel) && !g_bakeArmedNow && !g_bakeWatch.load(std::memory_order_acquire) && (g_bakeReady || g_bakeBaked.load(std::memory_order_acquire))) {
+        releaseBackdrop();
+        g_bakeReady = false;
+        g_bakeCapHeight = 0;
+        Log::get().note("concourse bake: the station is left behind: the cube is released");
+    }
     if (g_bakeWantPrepare.exchange(false, std::memory_order_acq_rel)) {
         const uint64_t t0 = GetTickCount64();
         g_bakeReady = device && makeBackdropResources(device) && bakeMakeCompute(device);
@@ -3281,6 +3293,20 @@ void bakeTick(ID3D11Device* device, uint64_t nowMs) noexcept {
     }
 }
 }  // namespace
+
+bool concoursePaneBakeDone() noexcept { return g_bakeBaked.load(std::memory_order_acquire) && g_bdCubeValid.load(std::memory_order_acquire); }
+
+bool concoursePaneBakeWouldBeSharper(uint64_t nowMs) noexcept {
+    const uint32_t h = g_bakeFrameHeight.load(std::memory_order_relaxed);
+    if (h != g_bakeHeightSeen) {
+        g_bakeHeightSeen = h;
+        g_bakeHeightMs = nowMs;
+        return false;
+    }
+    return concoursePaneBakeDone() && cc::bakeWouldBeSharper(h, g_bakeCapHeight) && nowMs - g_bakeHeightMs >= cc::kBakeSharperSettleMs;
+}
+
+void concoursePaneBakeRelease() noexcept { g_bakeWantRelease.store(true, std::memory_order_release); }
 
 void concoursePaneBakeArm(bool on) noexcept {
     if (on && !g_bakeArmedNow) {
@@ -3369,6 +3395,7 @@ void concoursePaneBakeCancel() noexcept {
 }
 
 void concoursePaneBakeFrame(ID3D11DeviceContext* ctx, ID3D11ShaderResourceView* color, ID3D11ShaderResourceView* depth, const float camera[6][4], uint32_t width, uint32_t height) noexcept {
+    g_bakeFrameHeight.store(height, std::memory_order_relaxed);
     if (!g_bakeWatch.load(std::memory_order_acquire)) return;
     const float dx = camera[5][0] - g_bakeCentre[0], dy = camera[5][1] - g_bakeCentre[1], dz = camera[5][2] - g_bakeCentre[2];
     const bool atCentre = dx * dx + dy * dy + dz * dz < 4.0f;
@@ -3447,6 +3474,7 @@ void concoursePaneBakeFrame(ID3D11DeviceContext* ctx, ID3D11ShaderResourceView* 
         for (auto* p : oldUav) if (p) p->Release();
     }
     for (int i = 0; i < 3; ++i) g_bakeCapFwd[i] = fw[i];
+    g_bakeCapHeight = height;
     if (fw[0] * g_bakeLastFwd[0] + fw[1] * g_bakeLastFwd[1] + fw[2] * g_bakeLastFwd[2] > 0.999f) g_bakeLastSeen = true;
     ++g_bakeCaps;
     if (g_bakeCaps <= 16) {

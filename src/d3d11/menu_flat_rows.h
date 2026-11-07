@@ -40,6 +40,8 @@ inline constexpr FlatPageRow kFlatPageRows[] = {
     // menu builds none of, so the row is on this tab and not on VR's Performance page; the generator fails the build for a `flat_performance` row not listed here.
     {"fix", "hud_antialiasing",  FlatRowRead::Allowlist},
     {"fix", "optimized_stations", FlatRowRead::Allowlist},
+    // Directly under Optimized stations, and dimmed while that is off (menu.cpp): flat only for now, since the concourse cull and its bake are.
+    {"fix", "station_window_distance", FlatRowRead::Allowlist},
 };
 inline constexpr size_t kFlatPageRowCount = sizeof(kFlatPageRows) / sizeof(kFlatPageRows[0]);
 

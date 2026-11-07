@@ -356,11 +356,12 @@ bool concourseCameraTestInstall(const char** why) noexcept {
 }
 
 // The mode (0 off, 1 log only, 2 the look, 3 the bake) and whether the camera may be written now. The relay gate is open while the mode is not 0.
-void concourseCameraTestControl(uint32_t mode,bool acting) noexcept {
+void concourseCameraTestControl(uint32_t mode,bool acting,bool busy) noexcept {
     g_ctMode.store(mode,std::memory_order_relaxed);
     g_ctActing.store(acting&&(mode==2||mode==3),std::memory_order_relaxed);
     if(!acting)ctNearRestore();   // after the store: a producer that still saw acting can raise it once more, and the next tick's call puts that back too
-    camTestGate.store(mode!=0?uintptr_t(1):uintptr_t(0),std::memory_order_release);
+    const bool open=mode==1||mode==2||(mode==3&&busy);
+    camTestGate.store(open?uintptr_t(1):uintptr_t(0),std::memory_order_release);
 }
 
 // Where the look stands and which way it faces: set by the tick before it says acting.

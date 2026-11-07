@@ -20,8 +20,10 @@ struct ConcourseCameraTestSnap {
 };
 
 bool concourseCameraTestInstall(const char** why) noexcept;             // true when at least one hook is in; else false, and why (one sentence)
-void concourseCameraTestControl(uint32_t mode, bool acting) noexcept;   // mode 0 off, 1 log only, 2 the look, 3 the bake; acting: the camera may be written now
+// mode 0 off, 1 log only, 2 the look, 3 the bake; acting: the camera may be written now
 void concourseCameraTestLook(const float centre[3], const float up[3], uint32_t dir) noexcept;   // the room's centre and up axis, and the direction 0 to 5
+// `busy` (the bake): a bake is armed or running. The hooks' gate is shut otherwise, so a bake costs nothing between arrivals.
+void concourseCameraTestControl(uint32_t mode, bool acting, bool busy) noexcept;
 void concourseCameraTestAim(const float centre[3], const float forward[3], const float up[3], float fovRad, float nearM) noexcept;   // the bake's frame: unit axes, vertical field of view in radians, near plane in metres
 bool concourseCameraTestHooked() noexcept;
 void concourseCameraTestSnapshot(ConcourseCameraTestSnap* out) noexcept;

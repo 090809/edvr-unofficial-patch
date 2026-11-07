@@ -2567,6 +2567,7 @@ int main(int argc, char** argv) {
         check(!edvr::flatProfileReadsKey("fix.optimized_station_x") && !edvr::flatProfileReadsKey("fix.supercruise_dust") && !edvr::flatProfileReadsKey("fix.fss_mode_latch"),
               "v14.34 flat: only that key was added (a near name and other fixes stay off the list)");
         check(edvr::flatPageHasRow("fix", "optimized_stations"), "v14.34 flat: the F8 flat page has the Optimized station row");
+        check(edvr::flatProfileReadsKey("fix.station_window_distance") && edvr::flatPageHasRow("fix", "station_window_distance"), "flat: the Window 3D distance row is on the F8 page and its key is on the flat key list");
         const edvr::FlatPageRow* refused = edvr::flatPageFirstRefused([](const char* k) { return edvr::flatProfileReadsKey(k); });
         check(refused == nullptr, "v14.34 flat: every row of the flat page, the new one included, passes the flat key list");
         // the flat camera source: no temporal-pass rows, so the position is the render context's view 0 origin
@@ -3986,6 +3987,40 @@ int main(int argc, char** argv) {
                               std::strcmp(cc::camTestModeName(1), "log only") == 0 && std::strcmp(cc::camTestModeName(0), "off") == 0,
                           "camera test: the toast names the mode");
                 }
+                {
+                    // A bake with no ride: a load straight into the room, or a render size that has risen.
+                    CamTestTimer n;
+                    n.armNow(1000);
+                    check(n.armed() && !n.active(), "no ride: arming does not fire");
+                    check(!n.step(cc::kCamTestModeBake, false, true, 1000 + cc::kBakeNoRideArmMs - 1, &e) && n.armed(), "no ride: it waits for the hold to keep a frame, with the room in view");
+                    check(n.step(cc::kCamTestModeBake, false, true, 1000 + cc::kBakeNoRideArmMs, &e) && n.active() && !n.armed(), "no ride: then it fires");
+                    n.armNow(1200);
+                    check(n.active() && !n.armed(), "no ride: a running window is not armed over");
+                    CamTestTimer gone;
+                    gone.armNow(0);
+                    check(!gone.step(cc::kCamTestModeBake, false, false, cc::kCamTestArmMs + 1, &e) && !gone.armed(), "no ride: the room gone for the arming limit lets it go");
+                    CamTestTimer ride;
+                    ride.armNow(0);
+                    ride.stop();
+                    ride.step(cc::kCamTestModeBake, true, false, 5000, &e);
+                    check(ride.armed() && ride.step(cc::kCamTestModeBake, false, true, 5000, &e), "no ride: a ride up after it still fires at the first sighting, with no wait");
+
+                    using cc::BakeNoRide;
+                    check(cc::bakeNoRide(false, cc::kBakeRoomSettleMs - 1, false, 0) == BakeNoRide::kNone && cc::bakeNoRide(false, cc::kBakeRoomSettleMs, false, 0) == BakeNoRide::kFirst,
+                          "no ride: no bake, and the room in view for the settling time, starts one");
+                    check(cc::bakeNoRide(true, 100000, false, 0) == BakeNoRide::kNone && cc::bakeNoRide(true, 0, true, 0) == BakeNoRide::kSharper, "no ride: with a bake, only a sharper one starts another");
+                    check(cc::bakeNoRide(false, 100000, false, cc::kBakeNoRideTries) == BakeNoRide::kNone && cc::bakeNoRide(true, 0, true, cc::kBakeNoRideTries) == BakeNoRide::kNone,
+                          "no ride: a bake that keeps failing stops being tried");
+                    check(cc::bakeWouldBeSharper(2160, 1080) && !cc::bakeWouldBeSharper(1080, 2160) && !cc::bakeWouldBeSharper(1080, 1080) && cc::bakeWouldBeSharper(1080, 0),
+                          "sharper: only a taller frame than the bake's");
+                    check(!cc::bakeWouldBeSharper(4320, cc::kBackdropCubeSize) && !cc::bakeWouldBeSharper(4320, 2160) && cc::bakeWouldBeSharper(4320, 1080), "sharper: not past the cube's own size");
+
+                    const auto near_ = [](float a, float b) { return std::fabs(a - b) < 1e-4f; };
+                    check(near_(cc::windowClearPercent(20.0f, cc::kWindowDistanceDefault), 20.0f), "window distance: 100 is the shipped share");
+                    check(near_(cc::windowClearPercent(20.0f, 200), 5.0f) && near_(cc::windowClearPercent(20.0f, 50), 80.0f), "window distance: the share goes with the inverse square of the distance");
+                    check(cc::windowClearPercent(20.0f, 0) == 0.0f, "window distance: 0 never clears");
+                    check(cc::windowClearPercent(20.0f, 10) == 100.0f, "window distance: the share stops at the whole view");
+                }
             }
         }
 
@@ -4119,7 +4154,7 @@ int main(int argc, char** argv) {
                 char def[64];
                 std::snprintf(def, sizeof(def), "%g,%g,%g,%g,%g,%g", static_cast<double>(cc::kGlassDefault[0]), static_cast<double>(cc::kGlassDefault[1]), static_cast<double>(cc::kGlassDefault[2]),
                               static_cast<double>(cc::kGlassDefault[3]), static_cast<double>(cc::kGlassDefault[4]), static_cast<double>(cc::kGlassDefault[5]));
-                const bool okDef = cc::parseGlass(def, g) && g[0] == 0.92f && g[3] == 0.06f && g[4] == 0.75f && g[5] == 0.25f;
+                const bool okDef = cc::parseGlass(def, g) && g[0] == 0.92f && g[3] == 0.03f && g[4] == 0.25f && g[5] == 0.25f;
                 float h[6] = {7, 7, 7, 7, 7, 7};
                 const bool okSp = cc::parseGlass(" 1 , 1 ,1, 0 , 0 , 0 ", h) && h[0] == 1.0f && h[3] == 0.0f && h[5] == 0.0f;
                 float k[6] = {5, 5, 5, 5, 5, 5};
@@ -4147,7 +4182,7 @@ int main(int argc, char** argv) {
         {
             float v[4] = {-1, -1, -1, -1};
             check(cc::parseGlowLevels("4,0.5,1,0.5", v) && v[0] == 4.0f && v[1] == 0.5f && v[2] == 1.0f && v[3] == 0.5f, "concourse glow: the default text parses to sky 4, angled 0.5, other 1, bay 0.5");
-            check(cc::kGlowSkyDefault == 4.0f && cc::kGlowAngledDefault == 0.5f && cc::kGlowOtherDefault == 1.0f && cc::kGlowBayDefault == 0.5f, "concourse glow: the defaults are 4, 0.5, 1, 0.5");
+            check(cc::kGlowSkyDefault == 0.5f && cc::kGlowAngledDefault == 0.5f && cc::kGlowOtherDefault == 1.0f && cc::kGlowBayDefault == 0.5f, "concourse glow: the defaults are 0.5, 0.5, 1, 0.5");
             check(cc::parseGlowLevels(" 0 , 16 ,  2.5 , 1 ", v) && v[0] == 0.0f && v[1] == 16.0f && v[2] == 2.5f && v[3] == 1.0f, "concourse glow: spaces are allowed, 0 and 16 are the limits");
             float keep[4] = {7, 8, 9, 10};
             check(!cc::parseGlowLevels("", keep) && !cc::parseGlowLevels(nullptr, keep) && !cc::parseGlowLevels("1,2,3", keep) && !cc::parseGlowLevels("4,0.25,1", keep) &&

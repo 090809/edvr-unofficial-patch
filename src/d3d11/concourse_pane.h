@@ -214,6 +214,9 @@ void concoursePaneQueueToast(const char* text) noexcept;   // TEMPORARY: the cam
 // Arm when a ride up is armed: the cubes and the shader are made and cleared in the tick, while the cabin is shut, and the back buffer is kept each Present. Begin when the anchor is first
 // seen: the kept image is shown from then on, and each frame the resolve sees at the centre goes into the cube. Finish when the frames are taken: the cube is published and the pane
 // mode becomes the captured view; the hold ends when the resolve sees the camera back. Cancel ends it with nothing published.
+bool concoursePaneBakeDone() noexcept;                                      // the windows have a bake to show
+bool concoursePaneBakeWouldBeSharper(uint64_t nowMs) noexcept;              // the render size has risen past the bake's and held steady
+void concoursePaneBakeRelease() noexcept;                                   // leaving the station: the cube goes at the next tick, and the next arrival bakes afresh
 void concoursePaneBakeArm(bool on) noexcept;
 bool concoursePaneBakeBegin(const float centre[3], float nearM) noexcept;   // false when the cube was not ready: the frames still move, nothing is captured or held
 void concoursePaneBakeExpectLast(const float forward[3]) noexcept;          // where the last direction looks: its arrival at the resolve is the end of the bake

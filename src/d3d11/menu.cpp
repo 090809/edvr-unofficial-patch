@@ -539,6 +539,18 @@ const char* cockpitGlassDirtHint() { return "Needs Cockpit glass set to Legacy: 
 
 const char* cockpitGlassDirtRefusal() { return "Legacy glass dirt is inactive: set Cockpit glass to Legacy above first."; }
 
+// fix.station_window_distance (the Window 3D distance row, directly under Optimized stations on the flat panel's Performance tab). It is part of that setting, so with the setting
+// off the row stays on the page, dimmed, and stops responding, the way the Legacy glass dirt row does. Read as the station reads it: anything but "off" is on.
+bool isStationWindowDistanceRow(const MenuRowDef& d) {
+    return strcmp(d.section, "fix") == 0 && strcmp(d.key, "station_window_distance") == 0;
+}
+
+bool stationWindowDistanceRowDisabled() { return Config::get().getString("fix.optimized_stations", "on") == "off"; }
+
+const char* stationWindowDistanceHint() { return "Needs Optimized stations: turn it on above to use this."; }
+
+const char* stationWindowDistanceRefusal() { return "Window 3D distance is inactive: turn Optimized stations on above first."; }
+
 // The on-foot panel's width: "auto", or a width in pixels -- never a list, so
 // this is not a headset row despite living beside one in the ini. The height
 // is not a setting any more; it is derived from whichever width applies.
@@ -2540,10 +2552,12 @@ void buildContent(MenuContent& c) {
             const bool sharpenRow = isSharpenRow(d);
             const bool hudAaRow = isHudAntiAliasingRow(d);
             const bool glassDirtRow = isCockpitGlassDirtRow(d);
+            const bool windowDistanceRow = isStationWindowDistanceRow(d);
             const bool dim = (dlssRow && dlssPresetDisabled()) ||
                              (sharpenRow && sharpenRowDisabled()) ||
                              (hudAaRow && hudAntiAliasingRowDisabled()) ||
-                             (glassDirtRow && cockpitGlassDirtRowDisabled());
+                             (glassDirtRow && cockpitGlassDirtRowDisabled()) ||
+                             (windowDistanceRow && stationWindowDistanceRowDisabled());
             l.dim = dim;
             strncpy(l.left, d.label, sizeof(l.left) - 1);
             if (dlssRow) {
@@ -2616,6 +2630,8 @@ void buildContent(MenuContent& c) {
                 snprintf(c.hint, sizeof(c.hint), "%s", hudAntiAliasingHint());
             else if (hi && dim && glassDirtRow)
                 snprintf(c.hint, sizeof(c.hint), "%s", cockpitGlassDirtHint());
+            else if (hi && dim && windowDistanceRow)
+                snprintf(c.hint, sizeof(c.hint), "%s", stationWindowDistanceHint());
             else if (hi && dim && runtimeFlatProfile())
                 snprintf(c.hint, sizeof(c.hint), "%s",
                          sharpenRow ? "Turn anti-aliasing on to sharpen."
@@ -3119,6 +3135,11 @@ void stepRow(int defIndex, int dir, int mult) {
         g_s.contentDirty = true;
         return;
     }
+    if (isStationWindowDistanceRow(d) && stationWindowDistanceRowDisabled()) {
+        g_s.lastWrite = stationWindowDistanceRefusal();
+        g_s.contentDirty = true;
+        return;
+    }
     if (isOpenxrRenderScaleRow(d)) {
         // A width for the worn headset, stepped by 100 px on the grid of
         // round hundreds (steppedResolution); the generated row is Text,
@@ -3524,6 +3545,11 @@ void beginEdit(int entryIndex, int defIndex) {
     }
     if (isCockpitGlassDirtRow(kMenuRows[defIndex]) && cockpitGlassDirtRowDisabled()) {
         s.lastWrite = cockpitGlassDirtRefusal();
+        s.contentDirty = true;
+        return;
+    }
+    if (isStationWindowDistanceRow(kMenuRows[defIndex]) && stationWindowDistanceRowDisabled()) {
+        s.lastWrite = stationWindowDistanceRefusal();
         s.contentDirty = true;
         return;
     }
@@ -3986,6 +4012,9 @@ void dispatchNav(MenuNav nav, uint64_t now) {
                         }
                     } else if (isCockpitGlassDirtRow(d) && cockpitGlassDirtRowDisabled()) {
                         s.lastWrite = cockpitGlassDirtRefusal();
+                        s.contentDirty = true;
+                    } else if (isStationWindowDistanceRow(d) && stationWindowDistanceRowDisabled()) {
+                        s.lastWrite = stationWindowDistanceRefusal();
                         s.contentDirty = true;
                     } else {
                         applyChange(def, d.shipped);

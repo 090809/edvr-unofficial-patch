@@ -253,7 +253,7 @@ std::atomic<uint64_t> g_winSunNotIssued{0}, g_winSunMasked{0};
 std::atomic<bool> g_flatProfile{false};   // set at install: the 30 s line splits the skips by path only where there is more than one
 std::atomic<uint32_t> g_classGen{0};   // moves at every lifecycle point (bumpRigEpoch): every node's class and name are read afresh
 
-// ---- Built 2026-11-05: the concourse cull (docs\concourse-cull-2026-11-05.md). TEMPORARY, off unless diag.concourse_cull or its hotkey turns it on. ----------
+// ---- Built 2026-11-05: the concourse cull (docs\concourse-cull-2026-11-05.md). On by itself in flat with the setting (diag.concourse_cull = auto), with the windows' bake; the diag keys and hotkeys beside it are TEMPORARY. ----------
 // On foot in a station's social space the records that are not the room are not drawn. The judgement is by the record's name (the node cache's allow flag),
 // at the same three levels as the hangar seal: the rig veto, the producer-B veto and the store's clear. The rules are concourse_cull_core.h's.
 namespace cc = edvr::concourse;
@@ -3139,6 +3139,11 @@ std::string g_camHotkeyText;
 bool g_camHotkeyBound = false;
 uint32_t g_camMode = 0;
 bool g_camHooked = false;
+bool g_camModeByKey = false;           // a press of the key chose the mode: the automatic bake leaves it alone
+bool g_camAutoTried = false;           // the automatic install is tried once; one line says why not
+uint64_t g_bakeRoomSinceMs = 0;        // on foot with the room in view since then; 0 is not in view
+uint32_t g_bakeNoRideTries = 0;        // bakes started with no ride and not yet followed by a good one (cc::kBakeNoRideTries)
+uint64_t g_bakeLeftMs = 0;             // neither on foot nor docked since then; 0 is in a station
 cc::CamTestTimer g_camTimer;
 bool g_camLookValid = false;           // the room's centre and up were read when the window opened
 bool g_camLookWasOn = false;
@@ -3264,26 +3269,45 @@ void camTestPress() {
         return;
     }
     g_camMode = cc::camTestNextMode(g_camMode);
+    g_camModeByKey = true;
     Log::get().note("concourse camera test: mode %u (%s) by hotkey.concourse_camera_test", g_camMode, cc::camTestModeName(g_camMode));
     char text[64];
     std::snprintf(text, sizeof(text), "Camera test: %s", cc::camTestModeName(g_camMode));
     concoursePaneQueueToast(text);
 }
 
+// diag.concourse_cull = auto, the default: on with fix.optimized_stations, in flat, once the camera hooks are in. The windows need the bake and the bake needs the hooks, so with no
+// hooks (another game build) there is no cull and the station stays the game's own. VR's camera route is not built, so VR stays off.
+bool concourseAutoOn() {
+    if (!g_setting.load(std::memory_order_acquire) || !runtimeFlatProfile()) return false;
+    if (!g_camHooked && !g_camAutoTried) {
+        g_camAutoTried = true;
+        camTestInstall("automatic");
+    }
+    if (!g_camHooked) return false;
+    if (!g_camModeByKey) g_camMode = cc::kCamTestModeBake;
+    return true;
+}
+
 void concoursePoll(uint64_t now) {
     if (now < g_concNextPollMs) return;
     g_concNextPollMs = now + 1000;
     Config& cfg = Config::get();
-    const bool on = cfg.getString("diag.concourse_cull", "off") == "on";
+    const std::string cullText = cfg.getString("diag.concourse_cull", "auto");
+    const bool on = cullText == "auto" ? concourseAutoOn() : cullText == "on";
     if (!g_concKeySeen || on != g_concKeyOn) {
         if (g_concKeySeen) {
             g_concOverride = ConcOverride::kNone;
-            Log::get().note("concourse cull: diag.concourse_cull is now %s (the hotkey's override is cleared)", on ? "on" : "off");
+            Log::get().note("concourse cull: diag.concourse_cull (%s) now means %s (the hotkey's override is cleared)", cullText.c_str(), on ? "on" : "off");
+        } else {
+            Log::get().note("concourse cull: diag.concourse_cull = %s: %s", cullText.c_str(), on ? "on" : "off");
         }
         g_concKeySeen = true;
         g_concKeyOn = on;
     }
-    float clearPct = runtimeFlatProfile() ? 20.0f : 12.0f;
+    // How much of the view a window fills when it clears: the shipped share at fix.station_window_distance's 100, unless diag.concourse_clear_share names a number.
+    float clearPct = cc::windowClearPercent(runtimeFlatProfile() ? 20.0f : 12.0f,
+                                            cfg.getIntInRange("fix.station_window_distance", cc::kWindowDistanceDefault, cc::kWindowDistanceMin, cc::kWindowDistanceMax));
     {
         const std::string clearText = cfg.getString("diag.concourse_clear_share", "auto");
         char* end = nullptr;
@@ -3293,7 +3317,7 @@ void concoursePoll(uint64_t now) {
     if (!(clearPct > 0.0f)) clearPct = 0.0f;
     if (clearPct > 100.0f) clearPct = 100.0f;
     if (!g_concEnterSeen || clearPct / 100.0f != g_concEnterShare) {
-        if (g_concEnterSeen) Log::get().note("concourse cull: diag.concourse_clear_share is now %.1f (percent of the view; 0 never clears)", static_cast<double>(clearPct));
+        Log::get().note("concourse cull: a window clears at %.1f percent of the view (fix.station_window_distance, or diag.concourse_clear_share; 0 never clears)", static_cast<double>(clearPct));
         g_concEnterSeen = true;
         g_concEnterShare = clearPct / 100.0f;
     }
@@ -3341,8 +3365,11 @@ void concoursePoll(uint64_t now) {
                             camKey.c_str(), static_cast<unsigned long long>(cc::kCamTestMs));
             camTestInstall("bind");
         } else {
-            g_camMode = 0;
-            if (!camKey.empty()) Log::get().note("concourse camera test: hotkey.concourse_camera_test = \"%s\" bound nothing, so nothing is hooked", camKey.c_str());
+            if (g_camModeByKey) {   // the mode was the key's: the automatic bake takes it back at the next poll
+                g_camMode = 0;
+                g_camModeByKey = false;
+            }
+            if (!camKey.empty()) Log::get().note("concourse camera test: hotkey.concourse_camera_test = \"%s\" bound nothing", camKey.c_str());
             else if (!first) Log::get().note("concourse camera test: hotkey.concourse_camera_test cleared (the mode is off; an installed hook stays, shut)");
         }
     }
@@ -3438,13 +3465,17 @@ void concourseSettingOffTick(uint64_t now) {
     }
     g_backdropGate.reset();
     g_liftGate.reset();
-    g_camTimer.stop();
+    if (g_camTimer.stop()) concoursePaneBakeCancel();
+    concoursePaneBakeArm(false);
+    concoursePaneBakeRelease();
+    g_bakeRoomSinceMs = 0;
+    g_bakeNoRideTries = 0;
     g_camLookOn.store(false, std::memory_order_release);
     g_camLookWasOn = false;
     g_camLookValid = false;
     if (g_camHooked && g_camMode != 0) {
         g_camMode = 0;
-        concourseCameraTestControl(0, false);
+        concourseCameraTestControl(0, false, false);
         Log::get().note("concourse camera test: fix.optimized_stations is off: the mode is off");
     }
     g_liftWasOn = false;
@@ -3976,7 +4007,8 @@ cc::LiftReading liftReadNow() noexcept {
 }
 
 void walkSurveyTick(uint64_t now, bool camIn) {
-    const bool gate = concourseArmed() && g_dockedNow.load(std::memory_order_acquire);
+    // On foot only: the cull is on from launch now, and these surveys have no business while the commander sits in the ship.
+    const bool gate = concourseArmed() && g_dockedNow.load(std::memory_order_acquire) && (g_statusFlags2Now & sealed::kFlags2OnFoot) != 0;
     if (!gate) {
         g_liftOn = false;
         g_liftSurveyOn.store(false, std::memory_order_relaxed);
@@ -4108,7 +4140,11 @@ void concourseTick(uint64_t now, uint32_t frame) {
     const uint64_t anchorMs = g_concAnchorMs.load(std::memory_order_relaxed);
     const bool anchor = anchorMs != 0 && now - anchorMs <= kConcAnchorFreshMs;
     const bool gateWanted = armed && social && !sealedNow;
-    const bool wantCull = gateWanted && effective && anchor;   // the cull is wanted: the panes are treated whatever phase the clearing machine is in
+    // The cull waits for the windows' bake: until there is one, the room and its windows are the game's own, and a bake that never comes costs nothing but the saving. A ride up opens
+    // the bake's window at the anchor's first sighting, so this holds for that one tick.
+    const bool bakeMode = g_camHooked && g_camMode == cc::kCamTestModeBake;
+    const bool bakeHolds = bakeMode && !concoursePaneBakeDone() && !g_camTimer.active();
+    const bool wantCull = gateWanted && effective && anchor && !bakeHolds;   // the cull is wanted: the panes are treated whatever phase the clearing machine is in
     const cc::ClearOutput clr = concourseClearStep(now, wantCull, gateWanted, gateWanted ? concoursePaneShares() : ConcoursePaneShares{});
     // Built 2026-11-06: the lift. In a shut cabin the room is not drawn, in either room: the lift gate (concourse_cull_core.h) reads the cabin and its doors from the
     // survey's table. It needs the key on and the commander on foot, with the hangar not sealed; otherwise it stands down.
@@ -4121,6 +4157,21 @@ void concourseTick(uint64_t now, uint32_t frame) {
     cc::CamTestEnd camEnd = cc::CamTestEnd::kNone;
     const bool camWasActive = g_camTimer.active();
     const bool camWasArmed = g_camTimer.armed();
+    // The bake belongs to this stay in the station: gone for good when the commander is neither on foot nor docked for a few seconds. The next arrival bakes afresh.
+    if (onFoot || g_dockedNow.load(std::memory_order_acquire)) {
+        g_bakeLeftMs = 0;
+    } else if (g_bakeLeftMs == 0) {
+        g_bakeLeftMs = now;
+    } else if (now - g_bakeLeftMs >= 5000) {
+        concoursePaneBakeRelease();
+        g_bakeNoRideTries = 0;
+    }
+    const bool roomInView = social && anchor;
+    if (!roomInView) g_bakeRoomSinceMs = 0;
+    else if (g_bakeRoomSinceMs == 0) g_bakeRoomSinceMs = now;
+    const bool bakeSharper = bakeMode && concoursePaneBakeWouldBeSharper(now);
+    if (concoursePaneBakeDone() && !bakeSharper) g_bakeNoRideTries = 0;   // a good one, at the size the frames have now
+    const char* camArmedWhy = "a ride up, the lift gate on with no room seen";
     if (armed && effective && onFoot && !sealedNow && g_frameCamValid) {
         liftRead = liftReadNow();
         if (camWasActive) {
@@ -4128,6 +4179,14 @@ void concourseTick(uint64_t now, uint32_t frame) {
             liftOn = g_camTimer.active() ? false : g_liftGate.step(liftRead, cutNow, now);
         } else {
             liftOn = g_liftGate.step(liftRead, cutNow, now);
+            if (bakeMode && roomInView && !camWasArmed && !liftOn) {
+                const cc::BakeNoRide noRide = cc::bakeNoRide(concoursePaneBakeDone(), now - g_bakeRoomSinceMs, bakeSharper, g_bakeNoRideTries);
+                if (noRide != cc::BakeNoRide::kNone) {
+                    g_camTimer.armNow(now);
+                    ++g_bakeNoRideTries;
+                    camArmedWhy = noRide == cc::BakeNoRide::kFirst ? "no ride, the room in view with no bake" : "no ride, the render size has risen since the bake";
+                }
+            }
             if (g_camTimer.step(g_camMode, liftOn, anchor, now, &camEnd)) {
                 liftOn = false;
                 g_liftGate.stop();
@@ -4179,12 +4238,12 @@ void concourseTick(uint64_t now, uint32_t frame) {
         } else if (lookOn) {
             concourseCameraTestLook(g_camLookCentre, g_camLookAxes[1], cc::camTestLookDir(now - g_camTimer.startMs()));
         }
-        concourseCameraTestControl(g_camMode, lookOn);
+        concourseCameraTestControl(g_camMode, lookOn, g_camTimer.armed() || g_camTimer.active());
         if (camEnd == cc::CamTestEnd::kDone) concoursePaneBakeFinish();
         else if (camEnd != cc::CamTestEnd::kNone && baking) concoursePaneBakeCancel();
         if (g_camTimer.armed() && !camWasArmed)
-            Log::get().note("concourse camera test: armed: a ride up, the lift gate on with no room seen (cabin %.2f m, gaps %.2f %.2f, camera %.2f %.2f %.2f); waiting for the anchor; bake directions 0x%X, near %.0f m",
-                            static_cast<double>(liftRead.cabinDistM), static_cast<double>(liftRead.gap1), static_cast<double>(liftRead.gap2), static_cast<double>(g_frameCam[0]),
+            Log::get().note("concourse camera test: armed: %s (cabin %.2f m, gaps %.2f %.2f, camera %.2f %.2f %.2f); waiting for the anchor; bake directions 0x%X, near %.0f m",
+                            camArmedWhy, static_cast<double>(liftRead.cabinDistM), static_cast<double>(liftRead.gap1), static_cast<double>(liftRead.gap2), static_cast<double>(g_frameCam[0]),
                             static_cast<double>(g_frameCam[1]), static_cast<double>(g_frameCam[2]), g_camBakeMask, static_cast<double>(g_camBakeNear));
         if (camWasArmed && !g_camTimer.armed() && !acting && g_camTimer.startMs() < g_camTimer.armedMs())
             Log::get().note("concourse camera test: armed for %llu ms and the anchor was not seen: it lets go", static_cast<unsigned long long>(now - g_camTimer.armedMs()));
@@ -4319,7 +4378,7 @@ void concourseTick(uint64_t now, uint32_t frame) {
     const bool cullPart = cullPartRaw && !backdropLift;
     const bool active = cullPart || liftOn || lookOn;
     ConcoursePaneFeed feed;   // the look wants the game's own picture: no pane treatment, nothing withheld
-    feed.measure = gateWanted && !lookOn;
+    feed.measure = gateWanted && !lookOn && !bakeHolds;
     feed.treat = wantCull && !lookOn;
     feed.withhold = active && !lookOn;
     feed.effects = (active || backdropLift) && !lookOn;
@@ -4381,12 +4440,12 @@ void concourseTick(uint64_t now, uint32_t frame) {
     g_concWasCull = cullPart;
     if (!wantCull && !transitioned) {
         const uint32_t keyCode = g_concOverride == ConcOverride::kNone ? (g_concKeyOn ? 1u : 0u) : (g_concOverride == ConcOverride::kOn ? 2u : 3u);
-        const uint32_t waitKey = (effective ? 1u : 0u) | (social ? 2u : 0u) | (anchor ? 4u : 0u) | (g_frameCamValid ? 8u : 0u) | (sealedNow ? 16u : 0u) | (keyCode << 5);
+        const uint32_t waitKey = (effective ? 1u : 0u) | (social ? 2u : 0u) | (anchor ? 4u : 0u) | (g_frameCamValid ? 8u : 0u) | (sealedNow ? 16u : 0u) | (keyCode << 5) | (bakeHolds ? 128u : 0u);
         if (armed && (!g_concWaitSet || waitKey != g_concWaitKey)) {
             g_concWaitSet = true;
             g_concWaitKey = waitKey;
-            Log::get().note("concourse cull: waiting (key=%s social=%d anchor=%d camera=%d sealed=%d)", concourseKeyText(), social ? 1 : 0, anchor ? 1 : 0,
-                            g_frameCamValid ? 1 : 0, sealedNow ? 1 : 0);
+            Log::get().note("concourse cull: waiting (key=%s social=%d anchor=%d camera=%d sealed=%d no-bake-yet=%d)", concourseKeyText(), social ? 1 : 0, anchor ? 1 : 0,
+                            g_frameCamValid ? 1 : 0, sealedNow ? 1 : 0, bakeHolds ? 1 : 0);
         } else if (!armed && g_concWasArmed) {
             g_concWaitSet = false;
             Log::get().note("concourse cull: off (the key is off)");

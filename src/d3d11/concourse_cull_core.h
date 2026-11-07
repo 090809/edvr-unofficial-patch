@@ -691,6 +691,7 @@ inline const char* camTestEndName(CamTestEnd e) noexcept {
         default: return "none";
     }
 }
+constexpr uint64_t kBakeNoRideArmMs = 150;   // armed this long before a bake with no ride fires: the hold keeps a frame at each Present once it is armed
 class CamTestTimer {
 public:
     // One tick. `gateOn`: the lift gate's own answer this tick (read only while the window is not open). `anchorFresh`: the store has just seen the room's anchor. Returns whether
@@ -712,7 +713,7 @@ public:
         if (!acts) {
             armed_ = false;
         } else if (armed_) {
-            if (anchorFresh) {
+            if (anchorFresh && nowMs - armedMs_ >= waitMs_) {
                 armed_ = false;
                 active_ = true;
                 startMs_ = nowMs;
@@ -722,8 +723,16 @@ public:
         } else if (gateOn && !anchorFresh) {
             armed_ = true;
             armedMs_ = nowMs;
+            waitMs_ = 0;
         }
         return active_;
+    }
+    // With no ride to arm it: the room is already in view, so it fires once the hold has had time to keep a frame.
+    void armNow(uint64_t nowMs) noexcept {
+        if (active_ || armed_) return;
+        armed_ = true;
+        armedMs_ = nowMs;
+        waitMs_ = kBakeNoRideArmMs;
     }
     // The cull's own conditions are gone (key off, not on foot, hangar sealed): the window closes, nothing is remembered.
     bool stop() noexcept {
@@ -739,7 +748,7 @@ public:
 
 private:
     bool active_ = false, armed_ = false;
-    uint64_t startMs_ = 0, armedMs_ = 0;
+    uint64_t startMs_ = 0, armedMs_ = 0, waitMs_ = 0;
 };
 
 // ---- The backdrop cube (PROTOTYPE on the concourse arc, docs\concourse-cull-2026-11-05.md "The window plan") -----------------------------------------------
@@ -747,6 +756,32 @@ private:
 // The capture shader writes the texel of normalize(v2); the display shader samples the cube with the same direction. The helper below is the C++ twin of the HLSL text
 // beside it (the tests pin the C++; the two are written to be read side by side).
 constexpr uint32_t kBackdropCubeSize = 2048;     // about 23 texels a degree at a face's centre (a bake's frame at 90 degrees is 12 pixels a degree at 1080p, 24 at 4K); 2 textures of 192 MB, the distance pair a quarter of that. Still far more than the windows use: most of a cube is never looked at
+// What starts a bake with no ride. A load straight into the room has no lift to arm one, so the room's being in view for a moment with no bake starts it: until then the cull waits,
+// and the room and its windows are the game's own. A render size that has risen since the bake starts another, once it has held steady: the picture is as sharp as the frames it was
+// captured from, up to the cube's own size. Lowering it does not: a sharper picture does no harm. A bake that fails is tried kBakeNoRideTries times, and the game's own picture stays.
+constexpr uint64_t kBakeRoomSettleMs = 2000;
+constexpr uint64_t kBakeSharperSettleMs = 1000;
+constexpr uint32_t kBakeNoRideTries = 2;
+enum class BakeNoRide : uint8_t { kNone, kFirst, kSharper };
+inline bool bakeWouldBeSharper(uint32_t frameHeight, uint32_t bakedHeight) noexcept {
+    const uint32_t now = frameHeight < kBackdropCubeSize ? frameHeight : kBackdropCubeSize;
+    const uint32_t was = bakedHeight < kBackdropCubeSize ? bakedHeight : kBackdropCubeSize;
+    return now > was;
+}
+inline BakeNoRide bakeNoRide(bool baked, uint64_t roomMs, bool sharper, uint32_t tries) noexcept {
+    if (tries >= kBakeNoRideTries) return BakeNoRide::kNone;
+    if (!baked) return roomMs >= kBakeRoomSettleMs ? BakeNoRide::kFirst : BakeNoRide::kNone;
+    return sharper ? BakeNoRide::kSharper : BakeNoRide::kNone;
+}
+// fix.station_window_distance: how far from a window its view turns from the bake to the real station, in percent of the shipped distance. The trigger is how much of the view the
+// window fills, which falls with the square of the distance, so twice the distance is a quarter of the share. 0 never clears.
+constexpr int kWindowDistanceDefault = 100, kWindowDistanceMin = 0, kWindowDistanceMax = 250;
+inline float windowClearPercent(float shippedPercent, int distancePercent) noexcept {
+    if (distancePercent <= 0) return 0.0f;
+    const float k = static_cast<float>(distancePercent) / 100.0f;
+    const float p = shippedPercent / (k * k);
+    return p < 100.0f ? p : 100.0f;
+}
 constexpr uint64_t kBackdropLiftMs = 200;       // the cull is lifted this long before the capture frame is armed
 constexpr uint32_t kBackdropWaitFrames = 3;     // armed frames with no pane captured before the capture is given up
 
@@ -941,7 +976,7 @@ private:
 // ---- The backdrop's glass look (diag.concourse_glass = "r,g,b,haze,blur,fresnel") ---------------------------------------------------------------------------
 // r,g,b multiply the captured colour (0 to 2); haze is how far the glass's own level colour covers it (0 to 1); blur is added to every mip level of the look-up (0 to 8);
 // fresnel adds up to that much more haze at a grazing angle (0 to 2).
-constexpr float kGlassDefault[6] = {0.92f, 0.97f, 0.96f, 0.06f, 0.75f, 0.25f};
+constexpr float kGlassDefault[6] = {0.92f, 0.97f, 0.96f, 0.03f, 0.25f, 0.25f};
 inline bool parseGlass(const char* text, float out[6]) noexcept {
     if (!text) return false;
     static const float kMax[6] = {2.0f, 2.0f, 2.0f, 1.0f, 8.0f, 2.0f};
@@ -968,7 +1003,7 @@ inline bool parseGlass(const char* text, float out[6]) noexcept {
 // The steady light of a pane: the brightest on overhead skylights, a level between on angled skylights, a middle level on any other window, and its own level on the
 // bay window. Absolute levels, each from 0 to 16. Overhead, angled and other are told by how much the pane faces the anchor's up axis (the pixel shader).
 constexpr float kGlowMax = 16.0f;
-constexpr float kGlowSkyDefault = 4.0f, kGlowAngledDefault = 0.5f, kGlowOtherDefault = 1.0f, kGlowBayDefault = 0.5f;
+constexpr float kGlowSkyDefault = 0.5f, kGlowAngledDefault = 0.5f, kGlowOtherDefault = 1.0f, kGlowBayDefault = 0.5f;
 // "a,b,c,d": four numbers, each 0 to 16, separated by commas, spaces allowed around each. False for anything else (the caller keeps the last value).
 inline bool parseGlowLevels(const char* text, float out[4]) noexcept {
     if (!text) return false;
