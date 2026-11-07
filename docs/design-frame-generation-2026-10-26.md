@@ -2,9 +2,9 @@
 
 ## Status
 
-- **State (2026-11-07): Phase 1 slice FLOWN 5 TIMES** (fork
-  `framegen-phase1`; "flight 5" entry). World in flight: A's vectors less
-  A's head turn plus the slot's head turn (ex2dh) scores at the ceiling. Design from OFXR-Bridge
+- **State (2026-11-07): Phase 1 slice FLOWN 6 TIMES** (fork
+  `framegen-phase1`; "flight 5", "flight 6" entries). The world, near a
+  surface and in supercruise, extrapolates at the ceiling with ex2dh. Design from OFXR-Bridge
   `d7fcca72` and EDVR `6b8ef374`. No issue yet.
 - **Recommendation:** take OFXR-Bridge's frame loop, not its synthesizer. Elite
   renders at half the headset rate and EDVR's runtime presents every display
@@ -50,7 +50,7 @@
   routes) over EDVR at a bright settlement and in space, with each runtime's
   own smoothing off and then on. This is the visual reference to beat.
 - **Next: not decided** ("flight 5" entry, Open). H1, H8, H9 and the
-  surface classifier are still unbuilt; on foot and supercruise unflown.
+  surface classifier are still unbuilt; on foot unflown.
 - **Temporary key (built 2026-11-07, hidden):** `fix.frame_generation_shadow`
   (off | on), Phase 1 only. The user key `fix.frame_generation` (off | auto)
   comes with Phase 2. Its `on` value (forced, ignoring the gate's performance
@@ -1095,6 +1095,26 @@ Cockpit p95 in the head-turn segment: ex2d 136-229, ex2dh 34-81.
   cockpit keeps the rigid true-head path, which scores better; holes are
   not filled; the slot's head pose comes from the runtime (H6: 0.5-1.8 deg
   median miss under turns at 50-70 ms lead, flight 1).
+
+### 2026-11-07: Phase 1, flight 6, supercruise (same build)
+
+Supercruise 12:51:05-12:54:25, leaving the planet, cruising, then a body
+growing to 35% of the frame. The celestial gate opened, but planet patch
+draws stopped 20 s in (`draws=0`), so path 12 never ran; the rows' world
+translation in supercruise is near zero (`motion_mm` mostly under 15 mm).
+p95 (luma x 1024), warped / unwarped:
+
+- **Far (14-48% of the frame):** 0-5 / 0-14 in every set: stars and sky
+  ride the head's rotation.
+- **World (the body, 5-38%):** ex2dh 14-96 / 14-648, within a bin of mv
+  everywhere; ex2d one to three bins worse under turns (12:52:16: 324
+  against 96); the rows' prediction fails on bursts (12:51:40: 545
+  against 96).
+- **Cockpit:** rigid 12-68, ex2dh 12-68.
+- **H3, answered for space in this flight:** far and cockpit predict to
+  the floor, and the world through ex2dh to the ceiling. Not covered: a
+  near approach with path 12 live, and a fast drop (the drop itself reads
+  as a camera jump and a loading screen).
 
 ### 2026-11-07: Phase 1, extrapolation sets built (not flown)
 
