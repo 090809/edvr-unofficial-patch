@@ -11,7 +11,8 @@
 //       FOLDER is an fgreplay_<stamp> capture (.agents/framegen-replay-format.md). For each consecutive pair (B = k, C = k + 1): the f = 1 S is built from B, kept, and scored against C's
 //       output exactly as the DLL scores it (raw, and turned by the residual head rotation, per class; the |id: fields of the line are the no-warp baseline); the f = 0.5 S is built
 //       from B too. B, S(f = 0.5) and S(f = 1) are written as PNGs (8-bit, clamped to 0..1, sRGB encoded) into DIR (default FOLDER\bench_out); --dry-run writes nothing.
-//       Each pair also prints S's sharpness against B's (Sharpness: the mean |Laplacian| of luma per class, S over B) for both S.
+//       Each pair also prints S's sharpness against B's (Sharpness: the mean |Laplacian| of luma per class, S over B) for both S, and the hole region's error (HoleError: the
+//       mean |luma| of the f = 1 S against C over the output pixels whose render pixel was a hole, the fill's, with B against C beside it).
 //   --define NAME=V (with --bench or --replay): the shader's `#define NAME 1` compiled as V instead, for a comparison (FG_SHARP 0 bilinear, 2 Lanczos-2, 3 unclamped).
 //   --self-test
 //       The format reader and writer round trip, the constant block rebuilt from a frame's JSON against the production fill (memcmp), a synthetic capture written, read back and
@@ -711,15 +712,17 @@ bool uploadFrame(Gpu& g, const FrameData& fd, GpuFrame& gf) {
 
 // S's sharpness against B's, the eye dumps' measure: the mean |Laplacian| of luma (4-neighbour, output pixels, the interior), summed per class of the B pixel each S pixel reads
 // (the f = 1 call's B info: 0 far, 1 cockpit, 2 world) and over all; the ratio S/B is the share of B's high-frequency energy S kept (1.0: as sharp; a bilinear resample of an 8-bit
-// source reads about 0.8). The far class is the stars'.
+// source reads about 0.8). The far class is the stars'. `holes` (2026-11-07): the pixels whose render pixel was a hole of that S (the fill's), also counted in their class and
+// in all: a torn fill's false edges read as sharpness there, so the fill is judged by the hole region's error and the resample by the rest.
 struct Sharpness {
-    double s[4] = {}, b[4] = {};   // far, cockpit, world, all
-    void add(const Sharpness& o) { for (int i = 0; i < 4; ++i) { s[i] += o.s[i]; b[i] += o.b[i]; } }
+    double s[5] = {}, b[5] = {};   // far, cockpit, world, all, holes
+    void add(const Sharpness& o) { for (int i = 0; i < 5; ++i) { s[i] += o.s[i]; b[i] += o.b[i]; } }
     double ratio(int i) const { return b[i] > 0.0 ? s[i] / b[i] : -1.0; }
+    double restRatio() const { return b[3] - b[4] > 0.0 ? (s[3] - s[4]) / (b[3] - b[4]) : -1.0; }   // all but the holes
     std::string text() const {
-        static const char* const kNames[4] = {"far", "cockpit", "world", "all"};
+        static const char* const kNames[5] = {"far", "cockpit", "world", "all", "holes"};
         std::string t;
-        for (int i = 0; i < 4; ++i) t += fmtStr("%s%s %s", i ? " " : "", kNames[i], ratio(i) < 0.0 ? "-" : fmtStr("%.3f", ratio(i)).c_str());
+        for (int i = 0; i < 5; ++i) t += fmtStr("%s%s %s", i ? " " : "", kNames[i], ratio(i) < 0.0 ? "-" : fmtStr("%.3f", ratio(i)).c_str());
         return t;
     }
 };
@@ -752,12 +755,13 @@ bool unpackReadOffset(uint32_t p, float& ox, float& oy) {
 // info: the synth's B info texture read back (R32G32_FLOAT, quarter grid; y the class); reads: that S's read offsets (render size, R32_UINT). Each S pixel is classed by the
 // B pixel it reads (so content a motion carried over the sky is not counted as the sky's).
 bool measureSharpness(const std::vector<uint8_t>& sRaw, const std::vector<uint8_t>& bRaw, const std::vector<uint8_t>& info, const std::vector<uint8_t>& reads, const Synth& sy,
-                      Sharpness& out) {
+                      Sharpness& out, const std::vector<uint8_t>* keys = nullptr) {
     std::vector<float> ls, lb;
     if (!lumaPlane(sRaw, sy.ow, sy.oh, sy.sFormat, ls) || !lumaPlane(bRaw, sy.ow, sy.oh, sy.sFormat, lb) || info.size() < static_cast<size_t>(sy.qw) * sy.qh * 8 ||
         reads.size() < static_cast<size_t>(sy.rw) * sy.rh * 4) return false;
     const float* cls = reinterpret_cast<const float*>(info.data());
     const uint32_t* rd = reinterpret_cast<const uint32_t*>(reads.data());
+    const uint32_t* key = keys && keys->size() >= static_cast<size_t>(sy.rw) * sy.rh * 4 ? reinterpret_cast<const uint32_t*>(keys->data()) : nullptr;
     const auto lap = [&](const std::vector<float>& l, size_t i) { return std::fabs(4.0f * l[i] - l[i - 1] - l[i + 1] - l[i - sy.ow] - l[i + sy.ow]); };
     for (uint32_t y = 1; y + 1 < sy.oh; ++y) {
         const double ry = (y + 0.5) * sy.rh / sy.oh - 0.5;
@@ -774,6 +778,37 @@ bool measureSharpness(const std::vector<uint8_t>& sRaw, const std::vector<uint8_
             const double a = lap(ls, i), b = lap(lb, i);
             if (c >= 0 && c < 3) { out.s[c] += a; out.b[c] += b; }
             out.s[3] += a; out.b[3] += b;
+            if (key && key[static_cast<size_t>(py) * sy.rw + px] == 0u) { out.s[4] += a; out.b[4] += b; }
+        }
+    }
+    return true;
+}
+
+// The hole region's error (2026-11-07, the disocclusion fill): over the output pixels whose render pixel (the resample's nearest) was a hole of the f = 1 S (its key 0: no B pixel
+// landed there, so its read is the fill's), the mean |luma| of S against the next real frame C, and of B against C (no warp) beside it.
+struct HoleError {
+    double sumS = 0.0, sumB = 0.0;
+    uint64_t pixels = 0;
+    void add(const HoleError& o) { sumS += o.sumS; sumB += o.sumB; pixels += o.pixels; }
+    double meanS() const { return pixels ? sumS / static_cast<double>(pixels) : 0.0; }
+    double meanB() const { return pixels ? sumB / static_cast<double>(pixels) : 0.0; }
+    std::string text() const { return fmtStr("%llu px, |S-C| %.2f |B-C| %.2f milli-luma", static_cast<unsigned long long>(pixels), 1000.0 * meanS(), 1000.0 * meanB()); }
+};
+
+bool measureHoles(const std::vector<uint8_t>& sRaw, const std::vector<uint8_t>& bRaw, const std::vector<uint8_t>& cRaw, const std::vector<uint8_t>& keys, const Synth& sy, HoleError& out) {
+    std::vector<float> ls, lb, lc;
+    if (!lumaPlane(sRaw, sy.ow, sy.oh, sy.sFormat, ls) || !lumaPlane(bRaw, sy.ow, sy.oh, sy.sFormat, lb) || !lumaPlane(cRaw, sy.ow, sy.oh, sy.sFormat, lc) ||
+        keys.size() < static_cast<size_t>(sy.rw) * sy.rh * 4) return false;
+    const uint32_t* key = reinterpret_cast<const uint32_t*>(keys.data());
+    for (uint32_t y = 0; y < sy.oh; ++y) {
+        const uint32_t py = std::min(static_cast<uint32_t>(std::max((y + 0.5) * sy.rh / sy.oh - 0.5, 0.0) + 0.5), sy.rh - 1);
+        for (uint32_t x = 0; x < sy.ow; ++x) {
+            const uint32_t px = std::min(static_cast<uint32_t>(std::max((x + 0.5) * sy.rw / sy.ow - 0.5, 0.0) + 0.5), sy.rw - 1);
+            if (key[static_cast<size_t>(py) * sy.rw + px] != 0u) continue;
+            const size_t i = static_cast<size_t>(y) * sy.ow + x;
+            out.sumS += std::fabs(ls[i] - lc[i]);
+            out.sumB += std::fabs(lb[i] - lc[i]);
+            ++out.pixels;
         }
     }
     return true;
@@ -782,6 +817,7 @@ bool measureSharpness(const std::vector<uint8_t>& sRaw, const std::vector<uint8_
 struct PairResult {
     int b = 0, c = 0;
     Sharpness sharp05, sharp1;   // the f = 0.5 S (the one shown) and the f = 1 S against B
+    HoleError holes;             // the f = 1 S's hole region against C
     bool scored = false;
     std::string note;
     float rotDeg = 0.0f;
@@ -799,6 +835,7 @@ struct ReplaySummary {
     std::vector<PairResult> pairs;
     FrameGenSynthWindow agg;
     Sharpness sharp05, sharp1;   // summed over the pairs
+    HoleError holes;             // summed over the scored pairs
     std::string aggLine;
     int frames = 0;
 };
@@ -845,7 +882,7 @@ bool replayFolder(Gpu& g, const std::string& dir, const ReplayOptions& opt, Repl
         g.setCb(fillCb(bm, 0.5f, nullptr, nullptr));
         runCall(g, sy, gb.in(), false, false, false, nullptr);
         png(stem + "_S05.png", sy.s.t.Get(), bm.outFmt);
-        const std::vector<uint8_t> s05 = g.readTex(sy.s.t.Get()), r05 = g.readTex(sy.read.t.Get());
+        const std::vector<uint8_t> s05 = g.readTex(sy.s.t.Get()), r05 = g.readTex(sy.read.t.Get()), key05 = g.readTex(sy.key.t.Get());
 
         // f = 1 from B, kept for C.
         const FrameGenSynthCb cbB = fillCb(bm, 1.0f, nullptr, nullptr);
@@ -854,9 +891,12 @@ bool replayFolder(Gpu& g, const std::string& dir, const ReplayOptions& opt, Repl
         uint32_t stB[kFrameGenSynthStatsUints] = {};
         sy.readStats(g, stB);
         png(stem + "_S1.png", sy.s.t.Get(), bm.outFmt);
+        std::vector<uint8_t> s1Kept, key1;
         {
             const std::vector<uint8_t> s1 = g.readTex(sy.s.t.Get()), r1 = g.readTex(sy.read.t.Get()), info = g.readTex(sy.bInfo.t.Get());
-            if (measureSharpness(s05, cur.out, info, r05, sy, pr.sharp05) && measureSharpness(s1, cur.out, info, r1, sy, pr.sharp1)) {
+            s1Kept = s1;
+            key1 = g.readTex(sy.key.t.Get());
+            if (measureSharpness(s05, cur.out, info, r05, sy, pr.sharp05, &key05) && measureSharpness(s1, cur.out, info, r1, sy, pr.sharp1, &key1)) {
                 sum.sharp05.add(pr.sharp05);
                 sum.sharp1.add(pr.sharp1);
             }
@@ -885,6 +925,7 @@ bool replayFolder(Gpu& g, const std::string& dir, const ReplayOptions& opt, Repl
             pr.w.rotSamples = 1; pr.w.rotMedian = pr.w.rotMax = pr.rotDeg;
             pr.scored = true;
             pr.line = formatFrameGenSynthReport(pr.w);
+            if (measureHoles(s1Kept, cur.out, next.out, key1, sy, pr.holes)) sum.holes.add(pr.holes);
             // the aggregate
             frameGenSynthMergeFrame(agg, 1, px, rb);
             frameGenSynthMergeScore(agg, rc);
@@ -893,6 +934,7 @@ bool replayFolder(Gpu& g, const std::string& dir, const ReplayOptions& opt, Repl
         }
         std::printf("pair B=%d C=%d: %s\n", k, k + 1, pr.line.c_str());
         std::printf("  sharpness S/B: f=0.5 %s | f=1 %s\n", pr.sharp05.text().c_str(), pr.sharp1.text().c_str());
+        if (pr.scored) std::printf("  hole region (f=1 S's holes): %s\n", pr.holes.text().c_str());
         sum.pairs.push_back(pr);
         cur = std::move(next);
     }
@@ -904,6 +946,8 @@ bool replayFolder(Gpu& g, const std::string& dir, const ReplayOptions& opt, Repl
     sum.aggLine = formatFrameGenSynthReport(agg);
     std::printf("aggregate (%u scored pairs, the |id: fields are the no-warp baseline): %s\n", agg.scored, sum.aggLine.c_str());
     std::printf("aggregate sharpness S/B (mean |Laplacian| of luma, all pairs): f=0.5 %s | f=1 %s\n", sum.sharp05.text().c_str(), sum.sharp1.text().c_str());
+    std::printf("aggregate sharpness S/B outside the holes: f=0.5 %.3f | f=1 %.3f\n", sum.sharp05.restRatio(), sum.sharp1.restRatio());
+    std::printf("aggregate hole region (the f=1 S's holes against C, scored pairs): %s\n", sum.holes.text().c_str());
     (void)pixels;
     return true;
 }
@@ -1437,10 +1481,13 @@ int main(int argc, char** argv) {
         std::string s = fmtStr("{\n  \"adapter\": \"%s\", \"frames\": %d, \"scored\": %u,\n  \"pairs\": [\n", g.adapterName.c_str(), sum.frames, sum.agg.scored);
         for (size_t i = 0; i < sum.pairs.size(); ++i) {
             const PairResult& p = sum.pairs[i];
-            s += fmtStr("    {\"b\": %d, \"c\": %d, \"scored\": %s, \"rot_res_deg\": %.4f, \"line\": \"%s\", \"sharpness_f05\": \"%s\", \"sharpness_f1\": \"%s\"}%s\n", p.b, p.c,
-                        p.scored ? "true" : "false", static_cast<double>(p.rotDeg), p.line.c_str(), p.sharp05.text().c_str(), p.sharp1.text().c_str(), i + 1 < sum.pairs.size() ? "," : "");
+            s += fmtStr("    {\"b\": %d, \"c\": %d, \"scored\": %s, \"rot_res_deg\": %.4f, \"line\": \"%s\", \"sharpness_f05\": \"%s\", \"sharpness_f1\": \"%s\", \"hole_px\": %llu, \"hole_err_s\": %.6f, \"hole_err_b\": %.6f}%s\n", p.b, p.c,
+                        p.scored ? "true" : "false", static_cast<double>(p.rotDeg), p.line.c_str(), p.sharp05.text().c_str(), p.sharp1.text().c_str(),
+                        static_cast<unsigned long long>(p.holes.pixels), p.holes.meanS(), p.holes.meanB(), i + 1 < sum.pairs.size() ? "," : "");
         }
-        s += fmtStr("  ],\n  \"aggregate\": \"%s\",\n  \"sharpness_f05\": \"%s\", \"sharpness_f1\": \"%s\"\n}\n", sum.aggLine.c_str(), sum.sharp05.text().c_str(), sum.sharp1.text().c_str());
+        s += fmtStr("  ],\n  \"aggregate\": \"%s\",\n  \"sharpness_f05\": \"%s\", \"sharpness_f1\": \"%s\",\n  \"sharpness_rest_f05\": %.4f, \"sharpness_rest_f1\": %.4f,\n  \"hole_px\": %llu, \"hole_err_s\": %.6f, \"hole_err_b\": %.6f\n}\n", sum.aggLine.c_str(),
+                    sum.sharp05.text().c_str(), sum.sharp1.text().c_str(), sum.sharp05.restRatio(), sum.sharp1.restRatio(), static_cast<unsigned long long>(sum.holes.pixels), sum.holes.meanS(),
+                    sum.holes.meanB());
         writeText(json, s);
     }
     return 0;

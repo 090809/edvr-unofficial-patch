@@ -10653,7 +10653,8 @@ H_FRAMEGEN_REPORT = (r"frame generation \(shadow\): frames=(?P<frames>\d+) skipp
 # one-second line, graphics-log lines with no build tag, read the way the scorer's are. The report is frames=<f=0.5 built>/<f=1 built> scored=<f=1 frames scored against the next real
 # frame> skipped=<calls that built nothing> gpu_ms=<f=0.5 median/max(n=)>/<f=1 ...> holes=<filled>%/<left>% guard=<%> clamp=<%>, then the scorer's three class fields (the f = 1 S against the
 # next frame), then ` turned:` and the same three fields with S turned by the residual head rotation (the compositor's step) before it is scored, rot_res_deg=<median>/<max> of that residual
-# and out=<%> of the cells outside S. clamp and the turned part are optional: a log from before them still parses.
+# and out=<%> of the cells outside S. clamp, the fill's kinds (fill_reproj=<%> fill_stretch=<%> of the filled, after clamp) and the turned part are optional: a log from before them
+# still parses.
 H_FRAMEGEN_SYNTH = "frame generation synth"
 H_FRAMEGEN_SYNTH_LABEL = "frame generation (synth):"
 H_FRAMEGEN_SYNTH_ARMED = (r"frame generation \(synth\): armed, render (?P<rw>\d+)x(?P<rh>\d+) output (?P<ow>\d+)x(?P<oh>\d+) per eye, S format (?P<fmt>\d+), "
@@ -10665,6 +10666,8 @@ H_FRAMEGEN_SYNTH_VRAM = (r"frame generation \(synth\): eye (?P<eye>\d+) VRAM (?P
                          r"); two eyes and the scratch (?P<two>\d+) B \((?P<two_mib>[\d.]+) MiB\)$")
 H_FRAMEGEN_SYNTH_REPORT = (r"frame generation \(synth\): frames=(?P<f05>\d+)/(?P<f1>\d+) scored=(?P<scored>\d+) skipped=(?P<skipped>\d+) gpu_ms=" + _HFGS_GPU.format(p="g05") + "/" +
                            _HFGS_GPU.format(p="g1") + r" holes=(?P<filled>[\d.]+)%/(?P<left>[\d.]+)% guard=(?P<guard>[\d.]+)%(?: clamp=(?P<clamp>[\d.]+)%)?" +
+                           # 2026-11-07 (kFrameGenSynthFillTailFmt): the fill's kinds as shares of the filled pixels; a line from before them goes from clamp= to the class fields.
+                           r"(?: fill_reproj=(?P<fill_reproj>[\d.]+)% fill_stretch=(?P<fill_stretch>[\d.]+)%)?" +
                            "".join(_HFG_CLASS.format(n=n) for n in ("far", "cockpit", "world")) +
                            r"(?: turned:" + "".join(_HFG_SET_CLASS.format(n=n, p="t_") for n in ("far", "cockpit", "world")) +
                            r" rot_res_deg=(?P<rot_med>[\d.]+|-)/(?P<rot_max>[\d.]+|-) out=(?P<t_out>[\d.]+)%)?"
@@ -25401,10 +25404,11 @@ def self_test_health():
             return RS("frame generation (synth): eye %u VRAM %llu B", eye, 53364996, 50.9, "s=49038336 luma=862920 class=3451680 stats=12060", 58616136, 55.9,
                       "key=27584064 read=27584064 holes=3448008", 165346128, 157.7)
 
-        def fg_synth_report(f05=40, f1=39, scored=38, skipped=2, timed=True, p95=20, filled=0.25, left=0.01, guard=1.5, turned=True, tp95=7, rot=(0.4, 1.2), clamp=0.0, slot=None, finish=None):
+        def fg_synth_report(f05=40, f1=39, scored=38, skipped=2, timed=True, p95=20, filled=0.25, left=0.01, guard=1.5, turned=True, tp95=7, rot=(0.4, 1.2), clamp=0.0, slot=None, finish=None, fill=None):
             cls = "".join(RF(" %s=%.1f%%,%u", n, 10.0, 12, 8, p95, 5.5, 1.5, 9, 30) for n in ("far", "cockpit", "world"))
             gpu = RF("%.2f/%.2f(n=%u)", 0.31, 0.8, 40) if timed else health_c_format(fgsrc, "-(n=0)")
-            line = RS("frame generation (synth): frames=%u/%u scored=%u skipped=%u", f05, f1, scored, skipped) + RS(" gpu_ms=%s/%s holes=%.2f%%/%.2f%% guard=%.2f%% clamp=%.3f%%", gpu, gpu, filled, left, guard, clamp) + cls
+            line = RS("frame generation (synth): frames=%u/%u scored=%u skipped=%u", f05, f1, scored, skipped) + RS(" gpu_ms=%s/%s holes=%.2f%%/%.2f%% guard=%.2f%% clamp=%.3f%%", gpu, gpu, filled, left, guard, clamp) + (
+                RS(" fill_reproj=%.1f%% fill_stretch=%.1f%%", *fill) if fill is not None else "") + cls
             if turned:
                 tcls = "".join(RF(" %s=%.1f%%,%u", n, 10.0, 12, 8, tp95, 5.5, 1.5, 9, 30) for n in ("far", "cockpit", "world"))
                 line += RS(" turned:") + tcls + RS(" rot_res_deg=%s/%s out=%.2f%%", "%.3f" % rot[0], "%.3f" % rot[1], 3.5)
@@ -25491,6 +25495,9 @@ def self_test_health():
               has=["turned by the residual head rotation: world p95 8 (raw 98) / cockpit 8 (raw 98) / far 8 (raw 98) milli-luma, residual 0.500 deg median (max 2.000)"], lacks=["UNPARSED"])
         check("frame generation synth: a report line from before the turned fields (and the clamp) is read as it was and says nothing of a turn",
               fg_off + [fg_armed(), fg_report(), fg_synth_armed(), fg_synth_report(turned=False)], 0, [("OK", FGS)], lacks=["UNPARSED", "turned by the residual"])
+        check("frame generation synth: a report line with the fill's kinds (fill_reproj, fill_stretch) parses beside one from before them",
+              fg_off + [fg_armed(), fg_report(), fg_synth_armed(), fg_synth_report(fill=(81.5, 12.0), slot=(45, 0, "uav", 0)), fg_synth_report(slot=(45, 0, "uav", 0))], 0, [("OK", FGS)],
+              lacks=["UNPARSED"])
         check("frame generation synth: the scorer armed and reporting and no synth line at all is NEVER APPLIED", fg_off + [fg_armed(), fg_report()], 3, [("NEVER APPLIED", FGS)],
               has=["the shadow scorer is armed or reporting (fix.frame_generation_shadow on) but there is no 'frame generation (synth):' line at all", "exit 3"])
         check("frame generation synth: armed and no report line is NEVER APPLIED", fg_off + [fg_armed(), fg_report(), fg_synth_armed()], 3, [("NEVER APPLIED", FGS)],

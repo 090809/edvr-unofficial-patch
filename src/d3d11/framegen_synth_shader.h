@@ -13,8 +13,10 @@
 //                  mark (synPackGuarded); a read past kMaxOffset is clamped and counted;
 //   fgSynResolve   every S pixel no key reached is a hole: kNoRead written, counted as left, its index listed in the hole list (u0, an eighth of the render pixels; the count in the
 //                  stats words); the S pixels whose stored offset carries the guard's mark are counted as guarded, one each;
-//   fgSynHoles     one thread per listed hole, in full 64-thread groups: the farthest key found within 8 px of it read 2 px further into its own surface (the background pull) becomes
-//                  its read offset, counted as filled and no longer left. The neighbour's read is taken in full precision, as fgSynSrc computed it before the store rounded it
+//   fgSynHoles     one thread per listed hole, in full 64-thread groups: the farthest key found within 8 px of it is the background, and the hole is carried back into B by that
+//                  key's read offset (its motion); B there the background: read there (reprojected); occluded there too: a stretch along the background's motion relative to the
+//                  occluder to the first background texel (stretched); neither: the neighbour's read 2 px further into its own surface (the background pull, the fill before
+//                  2026-11-07). That read becomes its offset, counted as filled and no longer left. The neighbour's read is taken in full precision, as fgSynSrc computed it before the store rounded it
 //                  (synWinnerRead finds the neighbour's source pixel again from the stored offset and recomputes its read), so the fill is the same as when every read was computed
 //                  in one pass; the counters (filled, left, guard, clamped) of the three passes add up in the stats words;
 //   fgSynResample  output size: each output pixel to its S pixel, its read offset, B's output there, Catmull-Rom with its ringing clamped (synSharp, FG_SHARP), into the S
@@ -34,7 +36,7 @@
 //
 // The key: 0 a hole, 4 the far plane, else (max(asuint(1 / metres), 8) & ~7) | 4 when the pixel is its own nearest | class (1 cockpit, 2 world). A larger key is a nearer surface.
 //
-// The nine #defines at the top of kFrameGenSynthCs are the rig's mutation points (tools\framegen_synth_test replaces one with 0 and the case it guards must fail); production
+// The ten #defines at the top of kFrameGenSynthCs are the rig's mutation points (tools\framegen_synth_test replaces one with 0 and the case it guards must fail); production
 // compiles them all 1.
 #include <cstring>
 #include <string>
@@ -48,6 +50,7 @@ inline constexpr char kFrameGenSynthCs[] = R"HLSL(
 #define FG_REMOVE_HEAD 1
 #define FG_GUARD 1
 #define FG_FILL_FAR 1
+#define FG_FILL_REPROJ 1   // a hole is carried back by the background's motion, stretched along it where B is occluded there too (0: the background pull alone)
 #define FG_DILATE_MV 1   // a pixel moves by the vector of the 3x3 pixel whose depth it took (0: its own)
 #define FG_SENTINEL 1   // a rejected-history vector (the size * 2 sentinel) borrows its background's (0: taken as motion)
 #define FG_TURN 1        // the score turns S by the residual head rotation (0: it scores it unturned)
@@ -86,10 +89,14 @@ static const uint  kBlockUints = 299;     // the score block: 3 classes, holes, 
 static const uint  kCountBase = 299;      // filled, left, guard, clamped
 static const uint  kTurnBase = 303;       // the turned score block
 static const uint  kHoleCount = 602;      // the holes listed in Holes (kFrameGenSynthStatsHoles)
-static const uint  kStatsUints = 603;     // src\common\framegen_synth_math.h kFrameGenSynthStatsUints
+static const uint  kFillReproj = 603;     // the holes filled reprojected, then stretched (kFrameGenSynthStatsFillReproj)
+static const uint  kStatsUints = 605;     // src\common\framegen_synth_math.h kFrameGenSynthStatsUints
 static const float kGuardMargin = 0.9;    // a 3x3 neighbour nearer by more than a tenth of the pixel's own distance
 static const int   kFillRadius = 8;
 static const float kFillShift = 2.0;
+static const int   kFillStretch = 32;     // the fill's steps along the background's motion, 1 px each
+static const float kFillBackFar = 4.0 / 3.0;   // the read is no farther than this many times the background's distance
+static const float kFillBackMargin = 0.75;   // B is the background's surface at a read when no texel of its 2x2 is nearer than this share of the background neighbour's distance
 static const float kNoRead = -4096.0;       // framegen_synth_math.h kFrameGenSynthNoRead
 static const float kMaxOffset = 2000.0;    // kFrameGenSynthMaxOffset
 static const uint  kGuardMark = 0x7C00u;      // a packed offset whose x half has this exponent field (a NaN's, never a clamped offset's) is a guarded read's: an integer pair, stored as such
@@ -415,9 +422,31 @@ bool synWinnerRead(int2 n, out float2 rd) {
     return true;
 }
 
-// The background pull for a hole at c: among the neighbours within kFillRadius that have a winner, the one with the farthest key (the smallest; the nearest of equals), read
-// kFillShift further into its own surface, away from the hole. false: nothing to pull from.
-bool fgSynFill(int2 c, out float2 rd) {
+// The metres a key says (the far plane's 1e9): the background neighbour's distance, for the fill's depth test.
+float synKeyMetres(uint k) { return (k & ~7u) == 0u ? 1.0e9 : 1.0 / asfloat(k & ~7u); }
+
+// Whether B at the read position p (render pixels, centres at integers) is the background's surface (the neighbour at mBg metres): every texel of the 2x2 the resample's
+// clamp takes there from kFillBackMargin of that distance to mFar (kFillBackFar times it; the far plane only for the far plane). A nearer texel is the occluder; a much
+// farther one another surface beyond a silhouette, not this one's texture (read for it, the hole region's error over 21 replays was 3 milli-luma worse). Outside B: false.
+bool synBackAt(float2 p, float mBg, float mFar) {
+    int2 i0 = int2(floor(p));
+    if (i0.x < 0 || i0.y < 0 || i0.x + 1 >= sz.x || i0.y + 1 >= sz.y) return false;
+    [unroll] for (int j = 0; j < 4; ++j) {
+        int2 q = i0 + int2(j & 1, j >> 1);
+        float m = synMetresOrFar(Depth.Load(int3(q.x, q.y, 0)));
+        if (m < mBg * kFillBackMargin || m > mFar) return false;
+    }
+    return true;
+}
+
+// The disocclusion fill for a hole at c (FG_FILL_REPROJ, 2026-11-07, eye dump 230157175005: terrain uncovered behind the own hull's strake in a ship turn showed as a sawtooth
+// of torn strips, each row pulled from a different neighbour). Among the neighbours within kFillRadius that have a winner, the one with the farthest key (the smallest; the
+// nearest of equals) is the background; its read offset is the background's motion there (the S pixel to the B position the synth gives that surface). The hole is carried
+// back by that motion: where B there is the background's surface (synBackAt), S reads it (kind 2, reprojected). Where the occluder covered that point in B too, the read steps
+// along the background's motion relative to the occluder (the occluder pixel's own landing taken out), away from it, up to kFillStretch px, to the first texel of the
+// background's surface, and reads kFillShift past it (kind 3, a stretch along the motion). Neither (no relative motion, nothing within the steps): the background pull, the
+// neighbour's read kFillShift further into its own surface, away from the hole (kind 1; the whole fill when FG_FILL_REPROJ is 0). 0: nothing to pull from.
+uint fgSynFill(int2 c, out float2 rd) {
     rd = float2(0.0, 0.0);
     uint bestKey = FG_FILL_FAR ? 0xFFFFFFFFu : 0u;
     float bestD = 1.0e9;
@@ -440,11 +469,51 @@ bool fgSynFill(int2 c, out float2 rd) {
             }
         }
     }
-    if (!found) return false;
+    if (!found) return 0u;
+#if FG_FILL_REPROJ
+    // The farthest key within kFillRadius may be the occluder's own side beside a hole wider than the search (the strake's in 230157175005, read for the hole it pasted the
+    // strake beside itself): a sparse ring further out (12 and 16 px, 8 directions) offers a farther key with a winner.
+    {
+        [unroll] for (int rr = 12; rr <= 16; rr += 4) {
+            [unroll] for (int j = 0; j < 8; ++j) {
+                int2 d = int2(j < 3 ? -1 : (j > 4 ? 1 : 0), (j == 0 || j == 3 || j == 5) ? -1 : ((j == 2 || j == 4 || j == 7) ? 1 : 0));
+                int2 n = c + d * rr;
+                if (n.x < 0 || n.y < 0 || n.x >= sz.x || n.y >= sz.y) continue;
+                uint kn = KeyT.Load(int3(n.x, n.y, 0));
+                if (kn != 0u && (FG_FILL_FAR ? kn < bestKey : kn > bestKey)) { bestKey = kn; bestN = n; }
+            }
+        }
+    }
+#endif
     float2 rn;
-    if (!synWinnerRead(bestN, rn)) return false;
+    if (!synWinnerRead(bestN, rn)) return 0u;
+#if FG_FILL_REPROJ
+    float2 o = rn - float2(bestN);   // the background's read offset: S pixel to B position
+    float mBg = synKeyMetres(bestKey);
+    float mFar = (bestKey & 3u) == 0u ? 2.0e9 : mBg * kFillBackFar;   // the far plane only for the far plane
+    float2 r = float2(c) + o;
+    if (synBackAt(r, mBg, mFar)) { rd = r; return 2u; }
+#if FG_FILL_REPROJ != 2   // the bench's comparison: 2 reprojects without the stretch
+    // The occluder at r: where it lands in S (its own motion), so the step follows the background's motion relative to it.
+    int2 q = clamp(int2(floor(r + 0.5)), int2(0, 0), int2(sz.x, sz.y) - 1);
+    float z9[9];
+    float zr = synDepth9(q, z9);
+    float2 pq;
+    uint kq;
+    float2 occ = float2(0.0, 0.0);
+    if (fgSynTargetZ(uint2(q), zr, (z9[4] == zr) ? 4u : 0u, synNearest9(q, z9, zr), pq, kq)) occ = pq - float2(q);
+    float2 rel = -o - occ;   // the background's step B to S, less the occluder's
+    if (dot(rel, rel) > 0.0625) {
+        float2 dir = normalize(rel);
+        [loop] for (int i = 1; i <= kFillStretch; ++i) {
+            float2 p = r + dir * float(i);
+            if (synBackAt(p, mBg, mFar)) { rd = p + dir * kFillShift; return 3u; }
+        }
+    }
+#endif
+#endif
     rd = rn + kFillShift * normalize(float2(bestN - c));
-    return true;
+    return 1u;
 }
 
 uint fgSynHoleCapacity() { return uint(sz.x) * uint(sz.y) / 8u; }   // src\common\framegen_synth_math.h frameGenSynthHoleCapacity
@@ -481,25 +550,27 @@ void fgSynResolve(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
     }
 }
 
-groupshared uint gFill[2];   // filled, clamped
+groupshared uint gFill[4];   // filled, clamped, reprojected, stretched
 
-// The background pull for the listed holes, one thread each in full groups: run by every lane of an 8x8 group that held one hole, fgSynFill's 289-neighbour search cost more than
-// the rest of the resolve. A filled hole takes its read offset (clamped and counted as the winners' are), is counted as filled and is no longer left; the groups past the count
-// return at once.
+// The fill for the listed holes, one thread each in full groups: run by every lane of an 8x8 group that held one hole, fgSynFill's 289-neighbour search cost more than the rest
+// of the resolve. A filled hole takes its read offset (clamped and counted as the winners' are), is counted as filled (and as reprojected or stretched, by its kind) and is no
+// longer left; the groups past the count return at once.
 [numthreads(64, 1, 1)]
 void fgSynHoles(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
-    if (gi < 2) gFill[gi] = 0u;
+    if (gi < 4) gFill[gi] = 0u;
     GroupMemoryBarrierWithGroupSync();
     uint count = min(Stats[kHoleCount], fgSynHoleCapacity());
     if (id.x < count) {
         uint p = Holes[id.x];
         int2 c = int2(int(p % uint(sz.x)), int(p / uint(sz.x)));
         float2 rd;
-        if (fgSynFill(c, rd)) {
+        uint kind = fgSynFill(c, rd);
+        if (kind != 0u) {
             float2 off = rd - float2(c);
             if (any(abs(off) > kMaxOffset)) InterlockedAdd(gFill[1], 1u);
             ReadOut[uint2(c)] = synPackOffset(clamp(off, -kMaxOffset, kMaxOffset));
             InterlockedAdd(gFill[0], 1u);
+            if (kind >= 2u) InterlockedAdd(gFill[kind], 1u);
         }
     }
     GroupMemoryBarrierWithGroupSync();
@@ -508,6 +579,8 @@ void fgSynHoles(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
         InterlockedAdd(Stats[kCountBase + 1], 0u - gFill[0]);   // the resolve counted every hole as left; the sum stays a count
     }
     if (gi == 1 && gFill[1] != 0u) InterlockedAdd(Stats[kCountBase + 3], gFill[1]);
+    if (gi == 2 && gFill[2] != 0u) InterlockedAdd(Stats[kFillReproj], gFill[2]);
+    if (gi == 3 && gFill[3] != 0u) InterlockedAdd(Stats[kFillReproj + 1], gFill[3]);
 }
 
 [numthreads(8, 8, 1)]

@@ -33,9 +33,11 @@
 //      producer texture's key back; a sharpening door's frame is the one finished over; the eye dump's sink sees the finished S
 //   14 S's resample (FG_SHARP): a still scene and an integer read return B's texels exactly; a 5 px period read a quarter pixel off keeps 0.95 of its high-frequency energy;
 //      a step read off a texel rings nowhere outside its two levels
+//   15 the disocclusion fill (FG_FILL_REPROJ): a world plane, farther up the image, uncovered beside a near bar carries on its texture row for row (the hole carried back by the
+//      plane's motion and stretched along it past the bar), where the background pull read each row from a different neighbour
 // Mutations (each replaces one of the shader's #define switches, or the host's f, and the case it guards must fail): f ignored, the head turn not taken out of the
 // vector, the guard off, the fill from the nearer side, the score's turn not applied, the score's turn applied the wrong way round, an edge pixel on its own vector, the
-// sentinel as a vector, S resampled bilinear, the cubic without its clamp (FG_SHARP=3).
+// sentinel as a vector, S resampled bilinear, the cubic without its clamp (FG_SHARP=3), the hole fill by the background pull alone (FG_FILL_REPROJ).
 #include <windows.h>
 #include <d3d11.h>
 #include <wrl/client.h>
@@ -583,7 +585,7 @@ Edge case5Edge(Gpu& g, Scope& sc, bool report) {
 // the outline the game draws just outside the hull (x = 63, on the background's depth) -100, the hull 1000. The background just uncovered beside the hull (x 56 to 63) carries
 // the temporal pass's rejection sentinel (size * 2), not a vector. Expected: the background moves as the background up to the hole the hull leaves (S reads x + 4 for x <= 58),
 // and the outline stays on the hull (S at 63 reads -100).
-struct HullEdge { bool ran = false; float bgWorst = 0.0f, outline = 0.0f; };
+struct HullEdge { bool ran = false; float bgWorst = 0.0f, outline = 0.0f; unsigned filled = 0; };
 
 HullEdge case13HullEdge(Gpu& g, Scope& sc, bool report) {
     HullEdge e;
@@ -615,7 +617,58 @@ HullEdge case13HullEdge(Gpu& g, Scope& sc, bool report) {
     sc.ok(e.bgWorst < 0.1f, label);
     std::snprintf(label, sizeof(label), "case 13: the outline just outside the hull stays on the hull (S at x 63 reads %.2f, the outline -100)", e.outline);
     sc.ok(e.outline < -99.0f, label);
-    if (g_verbose && report) std::printf("  case 13: background worst %.4f px, outline column %.2f\n", e.bgWorst, e.outline);
+    // Since the fill carries a hole back by the background's motion (FG_FILL_REPROJ), a sentinel pixel thrown off the image leaves a hole the fill reads right: the holes
+    // themselves say so. Only the strip the hull uncovers (4 px a row) is a hole.
+    e.filled = r.stats[kFrameGenSynthStatsFilled] + r.stats[kFrameGenSynthStatsLeft];
+    std::snprintf(label, sizeof(label), "case 13: only the strip the hull uncovers is a hole (%u holes, at most %d)", e.filled, 5 * RH);
+    sc.ok(e.filled <= 5u * RH, label);
+    if (g_verbose && report) std::printf("  case 13: background worst %.4f px, outline column %.2f, holes %u\n", e.bgWorst, e.outline, e.filled);
+    return e;
+}
+
+// Case 15 (2026-11-07, eye dump 230157175005: the terrain uncovered behind the hull's strake in a ship turn torn into a sawtooth of strips): a near bar (x 60 to 67, 5 m, the
+// cockpit: still with the head still) over a world plane whose distance falls down the image (200 m at the top to 105 m at the bottom, as terrain does) and whose vectors
+// (+8, 0) carry it 4 px left at f = 0.5. Red is the render x read, green the render y. The strip the plane leaves beside the bar's left edge is a hole whose farthest
+// neighbour within 8 px is up to 8 rows above it; the fill must carry on the plane's texture: every S pixel from x 50 to 59 reads B on the plane's row (green the row's own,
+// within 0.6) and on the plane's side of the bar (red under 59.5), and the hole pixels are stretched along the motion (counted so): none is read where it is (a read of B at
+// the hole itself, as a fill from the bar's side would take, is the plane 4 px off), since B has the bar where the plane's motion carries every hole back. The background pull alone read each row
+// from 8 rows up and 2 px beyond: a sawtooth of rows.
+struct UncoverFill { bool ran = false; float rowWorst = 0.0f, readMax = 0.0f; unsigned filled = 0, reproj = 0, stretch = 0, left = 0; };
+
+UncoverFill case15Uncover(Gpu& g, Scope& sc, bool report) {
+    UncoverFill e;
+    char label[300];
+    Scene S;
+    S.gradient();
+    for (int y = 0; y < RH; ++y)
+        for (int x = 0; x < RW; ++x) {
+            const size_t i = static_cast<size_t>(y) * RW + x;
+            const bool bar = x >= 60 && x < 68;
+            S.depth[i] = bar ? depthOf(5.0f) : depthOf(200.0f - static_cast<float>(y));
+            S.mv[i * 2] = bar ? 0.0f : 8.0f;
+        }
+    FrameGenSynthCb cb;
+    frameGenSynthFillCb(cb, RW, RH, RW, RH, kTan, 0.0f, kDepthB, 10.0f, 0.5f, Deltas(0.0f, 0.0f, 0.0f, 0.0f).d);
+    const Run r = runSynth(g, S, cb);
+    sc.ok(r.ok, "case 15: the synthesizer ran");
+    if (!r.ok) return e;
+    e.ran = true;
+    e.readMax = -1e9f;
+    for (int y = 12; y < RH - 12; ++y)
+        for (int x = 50; x < 59; ++x) {   // x 59, the plane's edge pixel that took the bar's depth, stays (and the guard's)
+            e.rowWorst = std::max(e.rowWorst, std::fabs(r.at(x, y, 1, RW) - static_cast<float>(y)));
+            e.readMax = std::max(e.readMax, r.at(x, y, 0, RW));
+        }
+    e.filled = r.stats[kFrameGenSynthStatsFilled];
+    e.reproj = r.stats[kFrameGenSynthStatsFillReproj];
+    e.stretch = r.stats[kFrameGenSynthStatsFillStretch];
+    e.left = r.stats[kFrameGenSynthStatsLeft];
+    std::snprintf(label, sizeof(label), "case 15: the plane uncovered beside the bar carries on its texture row for row (worst row error %.3f px) from the plane's side of the bar (largest x read %.2f)",
+                  e.rowWorst, e.readMax);
+    sc.ok(e.rowWorst < 0.6f && e.readMax < 59.5f, label);
+    std::snprintf(label, sizeof(label), "case 15: the strip's holes are stretched along the plane's motion (filled %u: reprojected %u, stretched %u; left %u)", e.filled, e.reproj, e.stretch, e.left);
+    sc.ok(e.stretch >= 3u * (RH - 2) && e.reproj == 0u && e.stretch <= e.filled && e.left == 0, label);
+    if (g_verbose && report) std::printf("  case 15: row worst %.4f px, largest x read %.2f, filled %u, reprojected %u, stretched %u, left %u\n", e.rowWorst, e.readMax, e.filled, e.reproj, e.stretch, e.left);
     return e;
 }
 
@@ -1695,7 +1748,8 @@ int run() {
     const Edge edge = case5Edge(g, sc, true);
     case13HullEdge(g, sc, true);
     case14Sharp(g, sc, true);
-    if (!alive("cases 1 to 5, 13 and 14")) return 1;
+    case15Uncover(g, sc, true);
+    if (!alive("cases 1 to 5 and 13 to 15")) return 1;
     case6Module(g, sc);
     if (!alive("case 6")) return 1;
     case7Check(g, sc);
@@ -1728,19 +1782,22 @@ int run() {
 
     // The mutations: each must break its case.
     struct Mutation { const char* define; const char* what; std::function<void(Scope&)> run; unsigned fails = 0; };
-    Mutation muts[10] = {
+    Mutation muts[11] = {
         {"FG_USE_F", "f ignored (the landing uses f = 1 whatever the block says)", [&](Scope& s) { case2World(g, s); }},
         {"FG_REMOVE_HEAD", "the head turn not taken out of the vector", [&](Scope& s) { case2World(g, s); }},
         // Since the edge pixels move by the vector of the pixel whose depth they took (FG_DILATE_MV), the guard has nothing to move in case 5: it is checked on the
         // edge it was built for, the sky pixel moving by its own vector.
         {"FG_GUARD,FG_DILATE_MV", "the guard off (an edge pixel on its own vector)", [&](Scope& s) { case5Edge(g, s, false); }},
-        {"FG_FILL_FAR", "the fill from the nearer side", [&](Scope& s) { case5Edge(g, s, false); }},
+        // Since the fill reads B where the chosen neighbour's motion carries the hole and tests the depth there, case 5's sky is found from the nearer side too; case 15's
+        // bar is still, so a fill from its side reads the plane where the hole is, not where the plane came from.
+        {"FG_FILL_FAR", "the fill from the nearer side", [&](Scope& s) { case5Edge(g, s, false); case15Uncover(g, s, false); }},
         {"FG_TURN", "the score's turn not applied (the residual ignored)", [&](Scope& s) { case7Check(g, s); }},
         {"FG_TURN_SIGN", "the score's turn applied the wrong way round (the residual transposed)", [&](Scope& s) { case7Check(g, s); }},
         {"FG_DILATE_MV", "an edge pixel moved by its own vector, not the one whose depth it took", [&](Scope& s) { case13HullEdge(g, s, false); }},
         {"FG_SENTINEL", "the rejection sentinel taken as a vector", [&](Scope& s) { case13HullEdge(g, s, false); }},
         {"FG_SHARP", "S resampled bilinear", [&](Scope& s) { case14Sharp(g, s, false); }},
         {"FG_SHARP=3", "S's cubic resample without its ringing clamp", [&](Scope& s) { case14Sharp(g, s, false); }},
+        {"FG_FILL_REPROJ", "the hole fill by the background pull alone (no reprojection, no stretch)", [&](Scope& s) { case15Uncover(g, s, false); }},
     };
     for (Mutation& m : muts) {
         ComPtr<ID3D11ComputeShader> mutated[kEntries], saved[kEntries];
@@ -1759,9 +1816,9 @@ int run() {
         if (ms.fails == 0) { ++g_failures; std::printf("FAIL: mutation: %s still passes\n", m.what); }
     }
     // Case 3 reads the head's part the same way as case 2: the head-turn mutation must break it too (a second look, not a second count).
-    std::printf("%s: %u checks, %u failures (mutations: f ignored broke %u checks, head turn not removed broke %u, guard off broke %u, fill from the nearer side broke %u, turn not applied broke %u, turn the wrong way round broke %u, own vector at an edge broke %u, sentinel as a vector broke %u, bilinear resample broke %u, unclamped cubic broke %u, slot pose ignored broke %u, slot step inverted broke %u)\n",
+    std::printf("%s: %u checks, %u failures (mutations: f ignored broke %u checks, head turn not removed broke %u, guard off broke %u, fill from the nearer side broke %u, turn not applied broke %u, turn the wrong way round broke %u, own vector at an edge broke %u, sentinel as a vector broke %u, bilinear resample broke %u, unclamped cubic broke %u, background pull alone broke %u, slot pose ignored broke %u, slot step inverted broke %u)\n",
                 g_failures ? "FAIL" : "PASS", g_checks, g_failures, muts[0].fails, muts[1].fails, muts[2].fails, muts[3].fails, muts[4].fails, muts[5].fails, muts[6].fails, muts[7].fails,
-                muts[8].fails, muts[9].fails, poseIgnored, poseInverted);
+                muts[8].fails, muts[9].fails, muts[10].fails, poseIgnored, poseInverted);
     return g_failures ? 1 : 0;
 }
 

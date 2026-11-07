@@ -21,6 +21,7 @@ struct FrameGenSynthEyeResult {
     uint64_t cells = 0;                                     // the cells scored
     uint64_t filled = 0, left = 0, guard = 0;               // the render pixels this frame's S filled from the background, left holes, and read by the guard
     uint64_t clamped = 0;                                   // the render pixels whose read offset was past the stored range and was clamped (framegen_synth_math.h kFrameGenSynthMaxOffset)
+    uint64_t fillReproj = 0, fillStretch = 0;               // of the filled: carried back by the background's motion onto B's background, stretched along it past the occluder
     FrameGenShadowClassStats tcls[kFrameGenShadowClasses];  // the same score with S turned by the head's residual rotation (the compositor's step), by B's class of the cell
     uint64_t tcells = 0, tout = 0;                          // the cells scored turned, and the cells whose turned position fell outside S (not scored)
 };
@@ -33,6 +34,7 @@ struct FrameGenSynthWindow {
     uint64_t cells = 0;
     uint64_t pixels = 0;          // render pixels of the built eye-frames
     uint64_t filled = 0, left = 0, guard = 0, clamped = 0;
+    uint64_t fillReproj = 0, fillStretch = 0;
     FrameGenShadowClassStats tcls[kFrameGenShadowClasses];   // the f = 1 S turned by the residual head rotation, scored against C: the raw fields above stay as they were
     uint64_t tcells = 0, tout = 0;
     float rotMedian = 0.0f, rotMax = 0.0f;                   // the residual rotation's angle (true B -> C head rotation against the one S was built for), degrees
@@ -67,6 +69,8 @@ inline void frameGenSynthMergeFrame(FrameGenSynthWindow& w, int kind, uint64_t r
     w.left += r.left;
     w.guard += r.guard;
     w.clamped += r.clamped;
+    w.fillReproj += r.fillReproj;
+    w.fillStretch += r.fillStretch;
 }
 
 inline void frameGenSynthMergeScore(FrameGenSynthWindow& w, const FrameGenSynthEyeResult& r) {
@@ -86,6 +90,9 @@ constexpr const char* kFrameGenSynthArmedFmt =
 // holes=<filled>%/<left>% of the render pixels guard=<read by the guard>% of them, then the scorer's three class fields: the f = 1 S against C by B's class.
 constexpr const char* kFrameGenSynthReportHeadFmt = "frame generation (synth): frames=%u/%u scored=%u skipped=%u";
 constexpr const char* kFrameGenSynthReportTailFmt = " gpu_ms=%s/%s holes=%.2f%%/%.2f%% guard=%.2f%% clamp=%.3f%%";
+// Then (2026-11-07) the fill's kinds as shares of the filled pixels: fill_reproj=<carried back by the background's motion onto B's background>% fill_stretch=<stretched along that
+// motion past the occluder>% (the rest is the background pull; 0 and 0 when nothing was filled). A line from before it goes from clamp= to the class fields.
+constexpr const char* kFrameGenSynthFillTailFmt = " fill_reproj=%.1f%% fill_stretch=%.1f%%";
 // Then the same three class fields with the f = 1 S turned by the residual head rotation before it is scored (what the compositor does to a submitted frame: the rotation between the
 // pose the frame was built for and the true head): " turned:" far=... cockpit=... world=..., then rot_res_deg=<median>/<max> of that residual and out=<share of the cells whose turned
 // position fell outside S, not scored>. One line: the widest it takes is far under Log::note's 1165 characters (framegen_synth_report_test holds it).
@@ -152,6 +159,10 @@ inline std::string formatFrameGenSynthReport(const FrameGenSynthWindow& w) {
     if (n > 0 && n < static_cast<int>(sizeof(buf)))
         n += std::snprintf(buf + n, sizeof(buf) - n, kFrameGenSynthReportTailFmt, g0.c_str(), g1.c_str(), 100.0 * static_cast<double>(w.filled) / px,
                            100.0 * static_cast<double>(w.left) / px, 100.0 * static_cast<double>(w.guard) / px, 100.0 * static_cast<double>(w.clamped) / px);
+    if (n > 0 && n < static_cast<int>(sizeof(buf))) {
+        const double fl = w.filled ? static_cast<double>(w.filled) : 1.0;
+        n += std::snprintf(buf + n, sizeof(buf) - n, kFrameGenSynthFillTailFmt, 100.0 * static_cast<double>(w.fillReproj) / fl, 100.0 * static_cast<double>(w.fillStretch) / fl);
+    }
     n = formatFrameGenShadowClasses(buf, sizeof(buf), n, w.cls, w.cells);
     if (n > 0 && n < static_cast<int>(sizeof(buf))) n += std::snprintf(buf + n, sizeof(buf) - n, "%s", kFrameGenSynthTurnedHeadFmt);
     n = formatFrameGenShadowClasses(buf, sizeof(buf), n, w.tcls, w.tcells);

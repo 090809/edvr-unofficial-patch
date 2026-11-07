@@ -42,7 +42,9 @@ constexpr uint32_t kFrameGenSynthStatsGuard = kFrameGenSynthStatsFilled + 2;
 constexpr uint32_t kFrameGenSynthStatsClamp = kFrameGenSynthStatsFilled + 3;
 constexpr uint32_t kFrameGenSynthStatsTurned = kFrameGenSynthStatsFilled + 4;   // 303
 constexpr uint32_t kFrameGenSynthStatsHoles = kFrameGenSynthStatsTurned + kFrameGenShadowStatsBlockUints;   // 602: the holes listed for the fill pass (GPU-side only)
-constexpr uint32_t kFrameGenSynthStatsUints = kFrameGenSynthStatsHoles + 1;   // 603
+constexpr uint32_t kFrameGenSynthStatsFillReproj = kFrameGenSynthStatsHoles + 1;    // 603: the filled holes that read B where the background's motion carried them back
+constexpr uint32_t kFrameGenSynthStatsFillStretch = kFrameGenSynthStatsHoles + 2;   // 604: the filled holes stretched along that motion past the occluder (the rest: the background pull)
+constexpr uint32_t kFrameGenSynthStatsUints = kFrameGenSynthStatsHoles + 3;   // 605
 
 // The hole list the resolve pass writes and the fill pass reads (one render pixel index per hole): an eighth of the render pixels; holes past it stay unfilled (counted as left).
 // The shader computes the same (fgSynHoleCapacity).
@@ -163,6 +165,8 @@ inline void frameGenSynthDecodeStats(const uint32_t* s, FrameGenSynthEyeResult& 
     out.left = s[kFrameGenSynthStatsLeft];
     out.guard = s[kFrameGenSynthStatsGuard];
     out.clamped = s[kFrameGenSynthStatsClamp];
+    out.fillReproj = s[kFrameGenSynthStatsFillReproj];
+    out.fillStretch = s[kFrameGenSynthStatsFillStretch];
     frameGenDecodeBlock(s + kFrameGenSynthStatsTurned, out.tcls, out.tout, out.tcells);
 }
 

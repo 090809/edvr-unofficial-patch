@@ -52,7 +52,8 @@
 - **Next: fly the flight 11 fix** (the game's frame sequences skip the S slots;
   `frame generation lock: replayed B:` names each replay). Lock 2:1 flown once.
   Built, not flown: S's edges in a ship turn (sentinel vectors, dilated vectors);
-  S resampled Catmull-Rom (`FG_SHARP`; S/B sharpness 0.82 -> 0.94). H1, H8, H9 and the surface classifier are still unbuilt; on foot unflown.
+  S resampled Catmull-Rom (`FG_SHARP`, 0.82 -> 0.94); hole fill along the motion (`FG_FILL_REPROJ`).
+  H1, H8, H9 and the surface classifier are still unbuilt; on foot unflown.
 - **Temporary keys (hidden):** `fix.frame_generation_shadow` (off | on), and
   `fix.frame_generation` (off | on; built 2.3: `on` forces Lock, for A/B
   flights; `auto` replaces it in 2.4).
@@ -1411,6 +1412,63 @@ held (251 of 263 s engaged).
   and 3 (unclamped) each fail it.
 - **Flight signature:** with Lock engaged, the eye dumps' S/SB Laplacian
   ratio about 0.9-1.0 in the cockpit, and no sharp/soft alternation felt.
+
+### 2026-11-08: torn terrain behind the hull in a ship turn: the disocclusion fill (built, not flown)
+
+The pilot circled it and the lead confirmed it in eye dump 230157175005
+(S02/S06 against SB02/SB06, crop x 950-1550, y 700-950): in a ship turn over
+terrain, the terrain uncovered behind the trailing edge of the own hull's raised
+strake shows in S as a sawtooth of torn strips, different in every S. Cause:
+the hole fill (`fgSynHoles`) took the farthest key within 8 px and read 2 px
+further into its source; each row picked a different neighbour.
+
+- **Built:** the fill carries the hole back into B by the background
+  neighbour's own read offset (its motion). Where B there is the background's
+  surface (every texel of the 2x2 from 0.75 to 4/3 of the neighbour's distance,
+  the far plane only for the far plane), S reads it (`fill_reproj`). Where the
+  occluder covered that point in B too, the read steps along the background's
+  motion relative to the occluder (the occluder pixel's own landing taken out),
+  up to 32 px, to the first such texel and reads 2 px past it
+  (`fill_stretch`). Otherwise the old pull. A sparse ring (12 and 16 px, 8
+  directions) offers a farther key than the 17x17 search, for holes wider than
+  it. `FG_FILL_REPROJ 0` is the old fill exactly (`2`: no stretch, bench only).
+  Stats words 603/604; the synth line gains `fill_reproj=% fill_stretch=%` of
+  the filled after `clamp=` (`edvr_log` reads lines without them).
+- **Bench:** `--replay` now prints the hole region's error (mean |luma| of the
+  f = 1 S against C over output pixels whose render pixel was a hole, B against
+  C beside it) and S/B sharpness for the holes and outside them. 21 scored
+  replays, medians, before -> after: hole region 34.3 -> 32.6 milli-luma
+  (B 11.5); the hull-turn replays gain most (222433569001 40.4 -> 32.2,
+  225459033001 51.0 -> 40.9, 225627723003 61.8 -> 52.4, 230157175005 30.5 ->
+  29.7); six surface replays of 15:30-20:28 lose 1.5-3.8, in the lens corners
+  where S itself is mispredicted. Raw and turned class means and p95 unchanged
+  (one world p95 162 -> 136). Sharpness S/B outside the holes 0.927 -> 0.926
+  (f = 0.5); over all pixels 0.937 -> 0.933, the sawtooth's false edges gone.
+  Fill shares (median): reprojected 4%, stretched 53% (hull-turn replays
+  22-56% reprojected). Cost (`--bench --frame fgreplay_230157175005:2`, f = 0.5,
+  three runs): holes 0.095 -> 0.102 ms, total 0.564 -> 0.573 ms per eye.
+- ruled out: an ungated reprojection with a one-sided depth test ("at least as
+  far"), because it read farther surfaces beyond a silhouette and made the
+  hole region worse in 15 of 21 replays (median +1.9 milli-luma).
+- ruled out: gating the read on its own texel landing on the hole (within 1.5 px,
+  also with a 4-step backward search), because almost no texel passes (0.1-3%
+  reprojected): the holes are true disocclusions, and the gains went with it.
+- ruled out: the two-sided test without the ring, because the strake's own
+  side (world class here, past the 10 m split) was the farthest key within
+  8 px of the deeper holes and was pasted beside the strake, though it scored
+  best (median 31.5).
+- **Rig:** case 15 (a world plane, farther up the image, uncovered beside a still
+  near bar: every row reads its own row, stretched); `FG_FILL_REPROJ 0` fails it,
+  `FG_FILL_FAR 0` now fails it too (case 5's sky is found from either side).
+  Case 13 also checks the hole count, since the sentinel mutation's holes are
+  now filled right. Case 5's guard counter flips 0/1 in about 1 run in 8 on
+  WARP before and after this change (a tie in `fgSynSrc`), not this fill.
+- **Crops:** before and after S (f = 0.5, frame 24124 = dump k02) of the
+  pilot's region in the agent's scratchpad; the after shows the terrain
+  continuing behind the strake, a faint seam left at the strip's top.
+- **Flight signature:** the eye dumps' S beside the hull's trailing edge in a
+  ship turn continues the terrain, the same in every S; the synth line's
+  `fill_stretch` 40-60% of the filled.
 
 ### 2026-11-07: Phase 2.3, flight 11, the first Lock flight (same build)
 
