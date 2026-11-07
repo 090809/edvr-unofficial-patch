@@ -179,8 +179,8 @@ void gateTable() {
   FrameGenLockConditions fin = allHold();
   fin.sFinished = false; fin.sDelivering = false;
   check(frameGenLockBlocker(fin) == FrameGenLockReason::Unfinished && std::strcmp(frameGenLockReasonName(FrameGenLockReason::Unfinished), "s_unfinished") == 0 &&
-            std::strcmp(frameGenLockReasonName(FrameGenLockReason::Menu), "menu") == 0,
-        "lock gate: an unfinished S is named before the missing delivery it causes; the reasons read menu and s_unfinished");
+            std::strcmp(frameGenLockReasonName(FrameGenLockReason::Menu), "menu_unfinished") == 0 && std::strcmp(frameGenFinishName(kFrameGenFinishMenu), "menu") == 0,
+        "lock gate: an unfinished S is named before the missing delivery it causes; the reasons read menu_unfinished and s_unfinished, the finish's why menu");
   // Which answers say an S was not finished: a produced S without the finish (an older d3d11.dll), or one held back with a reason; a busy or absent S says nothing.
   uint32_t why = 99;
   check(frameGenSUnfinished(1u, kFrameGenFinishOld, why) && why == kFrameGenFinishOld && frameGenSUnfinished(3u, kFrameGenFinishScope, why) && why == kFrameGenFinishScope &&

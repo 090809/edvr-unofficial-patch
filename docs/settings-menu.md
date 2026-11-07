@@ -984,7 +984,7 @@ they were there (flown 2026-09-07).
      text, `tools\framegen_synth_report_test` the exact lines):
      - `State:` `shadow (S is synthesized, nothing is shown)`, `Lock engaged`,
        `Lock waiting (<reason>)` with the lock's own reason name (`no_s`,
-       `menu`, `s_unfinished`, `deferred_pacing`, `period_halved`, `dwell`,
+       `menu_unfinished`, `s_unfinished`, `deferred_pacing`, `period_halved`, `dwell`,
        ...), or `Lock unknown (...)`: no slot from the runtime yet, a runtime
        older than the d3d11.dll (a slot of size 1 or 2), or no slot for more
        than 2 s;

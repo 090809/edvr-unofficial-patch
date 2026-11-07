@@ -93,6 +93,12 @@ struct FrameGenSynthFinishInputs {
     float layerUv[4] = {};
     ID3D11Texture2D* bFinished = nullptr;
     void (*dumpSink)(ID3D11DeviceContext* ctx, int dumpIndex, ID3D11Texture2D* finishedS, ID3D11Texture2D* finishedB) = nullptr;
+    // EDVR's menu on S (native_menu.cpp nativeMenuFrameGenDraw): called with the finished S, before the dump stages it and before it is handed over, to draw the menu B will get
+    // into it in place, placed for S's eye (B's eye carried by the head's step rot, t: x_S = rot x_B + t). menuBox: B's bounds as the runtime's menu receives them (the whole
+    // frame, B's flips). Returns kFrameGenFinishDone (drawn, or none shows on the eye) or why not (S is then left unfinished). Null: no menu is drawn and the answer's menu
+    // field says so (0).
+    uint32_t (*menuSink)(ID3D11DeviceContext* ctx, uint32_t eye, ID3D11Texture2D* finishedS, const float box[4], const float rot[9], const float t[3]) = nullptr;
+    float menuBox[4] = {0, 0, 1, 1};
 };
 // Finishes the waiting S (fgSynFinish: the layer over S, moved by the head's step S was built with, framegen_synth_math.h frameGenSynthFinishHomography) into the texture the
 // runtime takes it from, then hands it over (key 1) when the runtime consumes S; or leaves it unfinished. Its answer (edvrFrameGenTakeS) is stored either way. Returns the finished

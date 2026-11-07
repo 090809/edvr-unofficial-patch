@@ -49,6 +49,7 @@ constexpr uint32_t kFrameGenFinishRipple = 5;     // the shield ripple rewrote B
 constexpr uint32_t kFrameGenFinishCropped = 6;    // B's door works on a region of the frame, not the whole of it (S is the whole)
 constexpr uint32_t kFrameGenFinishSharpen = 7;    // B is sharpened and S could not be (or the reverse)
 constexpr uint32_t kFrameGenFinishFault = 8;      // the finish itself failed (a texture, a view, the parameter block, the producer texture's key)
+constexpr uint32_t kFrameGenFinishMenu = 9;       // EDVR's menu shows and could not be drawn on S as on B (no menu pose, another thread or device): S has no menu
 inline const char* frameGenFinishName(uint32_t why) {
     switch (why) {
         case kFrameGenFinishOld: return "old_d3d11";
@@ -60,6 +61,7 @@ inline const char* frameGenFinishName(uint32_t why) {
         case kFrameGenFinishCropped: return "cropped";
         case kFrameGenFinishSharpen: return "sharpen";
         case kFrameGenFinishFault: return "fault";
+        case kFrameGenFinishMenu: return "menu";
         default: return "unknown";
     }
 }

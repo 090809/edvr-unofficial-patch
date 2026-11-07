@@ -596,6 +596,7 @@ class NativeRuntimeHost : public SystemSource, public FrameSink, public Composit
     // Phase 2.3b: each eye's answer for pair finishFor[e]: whether its S was finished as B is (kFrameGenFinish*), and the state it came with.
     uint64_t finishFor[2]{};
     uint32_t finish[2]{},finishState[2]{};
+    bool menuOnS=false;           // the d3d11 half has finished an S with EDVR's menu drawn on it (an answer of size 2, menu 1): it draws the menu on S, so the menu does not stop Lock
   } framegenSlot;
   // Frame generation, Phase 2.3 (fix.frame_generation = on, TEMPORARY; framegen_lock.h, common/framegen_lock_report.h): Lock 2:1. At the head of each WaitGetPoses the gate
   // steps and, engaged, the S slot runs (its own wait, begin, layer and end) before the game's wait. Owner thread only. With the key off nothing here is touched, said or
@@ -2295,6 +2296,13 @@ class NativeRuntimeHost : public SystemSource, public FrameSink, public Composit
     const auto* sharpenBounds=temporalOutput?&temporalBounds:bounds;
     Microsoft::WRL::ComPtr<ID3D11Texture2D> sharpenOutput;
     vr::VRTextureBounds_t sharpenedBounds{};
+    // Frame generation's Lock (key on): B's door below finishes S and draws EDVR's menu on it from the menu's published pose, before this eye's own publish further down; the
+    // same publish is made first, so S's menu is placed by this frame's pose as B's is (eye 0 would otherwise get the previous frame's). The key off: not made, today's order.
+    if(framegenLock.was&&menu.acquired()&&frameGeometryAvailable) {
+      auto menuGeometry=frameGeometry;
+      menuGeometry.views[0]=frameContentViews[0];menuGeometry.views[1]=frameContentViews[1];
+      menu.publish(menuGeometry,poses.read().originGeneration);
+    }
     if(sharpen.acquired()) {
       const auto treatment=sharpen.treat(sequence,unsigned(eye),sharpenSource,sharpenBounds,sharpenOutput,sharpenedBounds);
       if(FAILED(treatment)) {
@@ -2427,7 +2435,7 @@ class NativeRuntimeHost : public SystemSource, public FrameSink, public Composit
     else if(!graphicsCalls.invoke([&]{r=captured.capture(eye,selected,region,flags,true);})) { timingInvalidate(); return vr::VRCompositorError_InvalidTexture; }
     const auto transferClockEnd=QueryPerformanceCounter(&transferEnded);
     if(transferClock&&transferClockEnd) timingFrame.transferMs[unsigned(eye)]=elapsedMs(transferBegan,transferEnded);
-    if(menuTreated)framegenLock.menuFor=sequence;   // frame generation 2.3b: the menu is in B (and not in S): Lock lets go (reason menu)
+    if(menuTreated)framegenLock.menuFor=sequence;   // frame generation: the menu is in B; Lock lets go (menu_unfinished) unless the d3d11 half draws it on S (framegenSlot.menuOnS)
     if(r==vr::VRCompositorError_None&&menuTreated&&menuEyes[unsigned(eye)]++==0)
       nativeTracePrintf("native_menu,first_captured_eye=%u\n",unsigned(eye));
     if(r==vr::VRCompositorError_None && copyPixels){
@@ -3060,6 +3068,7 @@ class NativeRuntimeHost : public SystemSource, public FrameSink, public Composit
     if(fs.channel.answer(e,fs.sequence,s)!=S_OK)return;
     fs.gameBytes[e]=s.gameBytes;
     fs.finishFor[e]=fs.sequence;fs.finish[e]=s.finish;fs.finishState[e]=s.state;   // 2.3b: whether this S was finished as B is
+    if(s.size>=EDVR_NATIVE_FRAMEGEN_S_SIZE_2&&s.menu==1u)fs.menuOnS=true;
     if(s.path==EDVR_NATIVE_FRAMEGEN_PATH_UAV)fs.window.pathUav=true;
     else if(s.path==EDVR_NATIVE_FRAMEGEN_PATH_COPY)fs.window.pathCopy=true;
     if(s.state==EDVR_NATIVE_FRAMEGEN_S_BUSY){++fs.window.busy;return;}
@@ -3163,9 +3172,10 @@ class NativeRuntimeHost : public SystemSource, public FrameSink, public Composit
     c.separate=separateGraphics();
     c.projection=fl.lastPairSequence!=0&&fl.lastPairSequence==activeFrameSequence&&!state.frameOpen()&&!frameWithheld;
     c.replay=featureFrameKnown&&featureFrame.resubmitEnabled&&previousPairValid&&previousSpace==frameSpace&&previousReference==poses.read().originGeneration;
-    // Phase 2.3b: EDVR's menu is drawn into B by this runtime and not into S, and an S left unfinished is not shown: either lets Lock go, named. The why of an unfinished S is
-    // said once per change.
-    c.noMenu=fl.menuFor==0||fl.menuFor!=fl.lastPairSequence;
+    // EDVR's menu is drawn into B by this runtime and into S by the d3d11 half (native_menu.h nativeMenuFrameGenDraw; a menu it cannot draw leaves that S unfinished, why=menu).
+    // A d3d11.dll that has never said it draws it (one from before) lets Lock go while the menu is in B (menu_unfinished). An S left unfinished is not shown: Lock lets go,
+    // named. The why of an unfinished S is said once per change.
+    c.noMenu=fl.menuFor==0||fl.menuFor!=fl.lastPairSequence||fs.menuOnS;
     {
       uint32_t why=0;bool unfinished=false;
       for(unsigned e=0;e<2&&fl.lastPairSequence;++e){uint32_t w=0;if(fs.finishFor[e]==fl.lastPairSequence&&frameGenSUnfinished(fs.finishState[e],fs.finish[e],w)){unfinished=true;why=w;}}

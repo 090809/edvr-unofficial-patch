@@ -1284,6 +1284,27 @@ int g_dumpK = -1;
 ID3D11Texture2D* g_dumpS = nullptr;
 ID3D11Texture2D* g_dumpB = nullptr;
 void dumpSink(ID3D11DeviceContext*, int k, ID3D11Texture2D* s, ID3D11Texture2D* b) { g_dumpK = k; g_dumpS = s; g_dumpB = b; }
+// EDVR's menu on S (native_menu.cpp nativeMenuFrameGenDraw stands here as a sink that marks S): writes zeros over the finished S in place and keeps what it was handed.
+int g_menuCalls = 0, g_menuDumpKAtCall = -2;
+float g_menuRot[9] = {}, g_menuT[3] = {}, g_menuBox[4] = {};
+uint32_t g_menuAnswer = kFrameGenFinishDone;
+uint32_t menuSink(ID3D11DeviceContext* ctx, uint32_t, ID3D11Texture2D* s, const float box[4], const float rot[9], const float t[3]) {
+    ++g_menuCalls;
+    g_menuDumpKAtCall = g_dumpK;
+    std::memcpy(g_menuRot, rot, sizeof(g_menuRot)); std::memcpy(g_menuT, t, sizeof(g_menuT)); std::memcpy(g_menuBox, box, sizeof(g_menuBox));
+    if (g_menuAnswer != kFrameGenFinishDone) return g_menuAnswer;
+    D3D11_TEXTURE2D_DESC d{};
+    s->GetDesc(&d);
+    d.BindFlags = D3D11_BIND_SHADER_RESOURCE; d.MiscFlags = 0; d.CPUAccessFlags = 0; d.Usage = D3D11_USAGE_DEFAULT;
+    std::vector<uint8_t> zeros(static_cast<size_t>(d.Width) * d.Height * 16, 0);
+    D3D11_SUBRESOURCE_DATA init{zeros.data(), d.Width * 16, 0};
+    ComPtr<ID3D11Device> dev;
+    ctx->GetDevice(&dev);
+    ComPtr<ID3D11Texture2D> z;
+    if (FAILED(dev->CreateTexture2D(&d, &init, &z))) return kFrameGenFinishFault;
+    ctx->CopyResource(s, z.Get());
+    return kFrameGenFinishDone;
+}
 
 void case12Finish(Gpu& g, Scope& sc) {
     char label[260];
@@ -1442,6 +1463,52 @@ void case12Finish(Gpu& g, Scope& sc) {
     if (last.state == EDVR_NATIVE_FRAMEGEN_S_PRODUCED && tr.open(xr.Get(), static_cast<HANDLE>(last.sharedHandle), last.textureSerial) == S_OK) {
         tr.markProduced(2, seq);
         tr.consume(0);
+    }
+    // 4b: EDVR's menu on S. The sink runs on the finished S before it is handed over and before the dump stages it (what crosses is what it wrote), with the head's step S was
+    // built with and the door's bounds; a size 2 answer says the menu is on S. A sink that cannot draw leaves S unfinished (menu), not handed over. Without a sink: menu 0.
+    {
+        const auto take2 = [&](EdvrNativeFrameGenS& r) {
+            r = EdvrNativeFrameGenS{};
+            r.size = EDVR_NATIVE_FRAMEGEN_S_SIZE_2; r.version = EDVR_NATIVE_FRAMEGEN_VERSION_1;
+            return edvrFrameGenTakeS(0, &r);
+        };
+        const auto consumeIt = [&](const EdvrNativeFrameGenS& r, int64_t slot) {
+            if (r.state == EDVR_NATIVE_FRAMEGEN_S_PRODUCED && tr.open(xr.Get(), static_cast<HANDLE>(r.sharedHandle), r.textureSerial) == S_OK) { tr.markProduced(slot, seq); tr.consume(0); }
+        };
+        in.menuSink = menuSink;
+        in.menuBox[0] = 1.0f; in.menuBox[2] = 0.0f;   // a B flipped across
+        rotY(5.0f, f.slotRot); f.slotT[0] = 0.02f;
+        g_menuCalls = 0; g_dumpK = -1;
+        f.wantShown = true; f.dumpIndex = 2;
+        got = finishOnce(uf, a);
+        f.wantShown = false; f.dumpIndex = -1;
+        bool zeros = !got.empty();
+        for (float v : got) zeros = zeros && v == 0.0f;
+        sc.ok(g_menuCalls == 1 && g_menuDumpKAtCall == -1 && g_dumpK == 2 && zeros && a.state == EDVR_NATIVE_FRAMEGEN_S_PRODUCED && a.finish == kFrameGenFinishDone,
+              "case 12: the menu sink runs on the finished S before the dump stages it and before it is handed over: what crosses is what it drew");
+        sc.ok(std::memcmp(g_menuRot, f.slotRot, sizeof(g_menuRot)) == 0 && std::memcmp(g_menuT, f.slotT, sizeof(g_menuT)) == 0 && g_menuBox[0] == 1.0f && g_menuBox[2] == 0.0f,
+              "case 12: ...handed the head's step S was built with and B's bounds");
+        sc.ok(a.size == EDVR_NATIVE_FRAMEGEN_S_SIZE_1, "case 12: ...a size 1 reader (a runtime from before) is written size 1's bytes only");
+        EdvrNativeFrameGenS a2{};
+        build();
+        take2(a2);
+        frameGenSynthFinish(g.ctx.Get(), 0, in);
+        take2(a2);
+        sc.ok(a2.size == EDVR_NATIVE_FRAMEGEN_S_SIZE_2 && a2.menu == 1u && a2.state == EDVR_NATIVE_FRAMEGEN_S_PRODUCED, "case 12: ...a size 2 reader is told the menu is on S (menu 1)");
+        consumeIt(a2, 3);
+        g_menuAnswer = kFrameGenFinishMenu;
+        build();
+        frameGenSynthFinish(g.ctx.Get(), 0, in);
+        take2(a2);
+        sc.ok(a2.state == EDVR_NATIVE_FRAMEGEN_S_KEPT && a2.finish == kFrameGenFinishMenu && a2.menu == 0u, "case 12: a menu that cannot be drawn on S leaves it unfinished (menu), not handed over");
+        g_menuAnswer = kFrameGenFinishDone;
+        in.menuSink = nullptr;
+        in.menuBox[0] = 0.0f; in.menuBox[2] = 1.0f;
+        build();
+        frameGenSynthFinish(g.ctx.Get(), 0, in);
+        take2(a2);
+        sc.ok(a2.state == EDVR_NATIVE_FRAMEGEN_S_PRODUCED && a2.finish == kFrameGenFinishDone && a2.menu == 0u, "case 12: ...with no sink S is finished and handed over, menu 0");
+        consumeIt(a2, 4);
     }
     // 5: the door sharpens: S is built in the producer texture and finished over the sharpened frame the door hands (a flat grey frame stands for it here).
     f.finishSharpen = true;

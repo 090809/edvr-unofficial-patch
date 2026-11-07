@@ -4,6 +4,7 @@
 #include "ui_layer_math.h"  // uiLayerUvFromRegion
 #include "temporal_pass.h"
 #include "framegen_synth.h"   // Phase 2.3b: S finished at B's door
+#include "native_menu.h"      // EDVR's menu on the finished S (nativeMenuFrameGenDraw)
 #include "../common/config.h"
 #include "../common/log.h"
 #include "../common/supersample_math.h"
@@ -157,6 +158,10 @@ void finishS(State* s,uint64_t seq,uint32_t eye,ID3D11Texture2D* source,const fl
         void* raw=edvr::sharpenPassFrameGen(sTex,int(eye),bounds,s->strength);
         if(raw)in.frame=static_cast<ID3D11Texture2D*>(raw); else in.why=edvr::kFrameGenFinishSharpen;
       }
+      // EDVR's menu, which the runtime draws on B after this door: drawn on the finished S too (native_menu.h), with the bounds B's menu gets (the whole frame, B's flips).
+      const bool flipU=bounds&&bounds[0]>bounds[2],flipV=bounds&&bounds[1]>bounds[3];
+      in.menuSink=nativeMenuFrameGenDraw;
+      in.menuBox[0]=flipU?1.f:0.f;in.menuBox[1]=flipV?1.f:0.f;in.menuBox[2]=flipU?0.f:1.f;in.menuBox[3]=flipV?0.f:1.f;
     }
     edvr::frameGenSynthFinish(ctx,eye,in);
   }

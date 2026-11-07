@@ -120,8 +120,12 @@ struct EdvrNativeFrameGenS {
   uint32_t finish;              // Phase 2.3b (framegen_slot_report.h kFrameGenFinish*): 1 S was finished as B is (B's sharpening, B's UI layer by the head's step); 0 from a d3d11.dll before
                                 // it (the field was reserved and zero); else why not, and S was not handed over. A runtime from before 2.3b does not read it.
   uint64_t gameBytes;           // the game-device bytes this eye's S set holds now (the producer texture, plus the private S on the copy path)
+  // Size 2 (EDVR's menu on S): a size 1 answer (a d3d11.dll from before it) has none, which reads as the menu not drawn on S; the version stays 1.
+  uint32_t menu;                // 1: S was finished with EDVR's menu drawn on it as the runtime draws it on B (or none showing on the eye); 0: the menu is not drawn on S
+  uint32_t reserved2;
 };
-#define EDVR_NATIVE_FRAMEGEN_S_SIZE_1 ((uint32_t)sizeof(EdvrNativeFrameGenS))
+#define EDVR_NATIVE_FRAMEGEN_S_SIZE_1 ((uint32_t)offsetof(EdvrNativeFrameGenS, menu))
+#define EDVR_NATIVE_FRAMEGEN_S_SIZE_2 ((uint32_t)sizeof(EdvrNativeFrameGenS))
 typedef HRESULT(WINAPI *EdvrNativeFrameGenNoteSlot)(const EdvrNativeFrameGenSlot*);
 typedef HRESULT(WINAPI *EdvrNativeFrameGenTakeS)(uint32_t, EdvrNativeFrameGenS*);
 extern "C" HRESULT WINAPI edvrFrameGenNoteSlot(const EdvrNativeFrameGenSlot*);

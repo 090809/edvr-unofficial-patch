@@ -25598,6 +25598,12 @@ def self_test_health():
               extra=["--runtime-file", runtime([fl_armed(), fl_engage(), fl_report(), RL(flsrc, "frame generation lock: S is not finished like B", "layer_only"), fl_disengage("s_unfinished"),
                                                 fl_report(engaged=0.3, real=13, s=13, from_s=13, disengages=1, reason="s_unfinished"), fl_disengage("menu")])],
               has=["reasons when off: s_unfinished 2, menu 1", "S left unfinished (not shown), why: layer_only"])
+        # EDVR's menu on S: a menu that cannot be drawn on one S leaves it unfinished (why=menu, s_unfinished); a d3d11.dll that does not draw it says menu_unfinished.
+        check("frame generation lock: the menu's reasons (an S unfinished why=menu, menu_unfinished) are read and named", fl_gfx, 0, [("OK", FL)], lacks=["UNPARSED"],
+              extra=["--runtime-file", runtime([fl_armed(), fl_engage(), fl_report(), RL(flsrc, "frame generation lock: S is not finished like B", "menu"), fl_disengage("s_unfinished"),
+                                                fl_report(engaged=0.3, real=13, s=13, from_s=13, disengages=1, reason="s_unfinished"), fl_disengage("menu_unfinished"),
+                                                fl_report(engaged=0.0, real=0, s=0, from_s=0, reason="menu_unfinished")])],
+              has=["reasons when off: s_unfinished 2, menu_unfinished 2", "S left unfinished (not shown), why: menu"])
         # A halved period no longer stops Lock engaging; engaged and halved for over 1 s it lets go (period_halved) and backs off 3 s, the one-second lines saying it.
         check("frame generation lock: a period_halved disengage and its backoff are read and named", fl_gfx, 0, [("OK", FL)], lacks=["UNPARSED"],
               extra=["--runtime-file", runtime([fl_armed(), fl_engage(), fl_report(), fl_disengage("period_halved"),

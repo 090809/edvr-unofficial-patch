@@ -57,7 +57,7 @@ struct FrameGenSlotChannel {
   // S_OK with `out` filled only when the d3d11 half answers for this very pair; S_FALSE otherwise (none built, another pair's, or no channel).
   HRESULT answer(uint32_t eye, uint64_t sequence, EdvrNativeFrameGenS& out) const noexcept {
     out = EdvrNativeFrameGenS{};
-    out.size = EDVR_NATIVE_FRAMEGEN_S_SIZE_1;
+    out.size = EDVR_NATIVE_FRAMEGEN_S_SIZE_2;   // a d3d11.dll from before size 2 writes size 1's bytes and says so: menu stays 0
     out.version = EDVR_NATIVE_FRAMEGEN_VERSION_1;
     if (!take || !sequence) return S_FALSE;
     const HRESULT hr = take(eye, &out);

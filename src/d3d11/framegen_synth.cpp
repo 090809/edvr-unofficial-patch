@@ -722,10 +722,13 @@ HRESULT frameGenSynthTakeS(uint32_t eye, EdvrNativeFrameGenS* out) {
         a = g.answer[eye];
         g.answer[eye] = EdvrNativeFrameGenS{};
     }
-    a.size = EDVR_NATIVE_FRAMEGEN_S_SIZE_1;   // only version 1's bytes are written: a reader with a longer struct keeps its own past them
+    // Only the bytes both sides know are written: a reader with a size 1 struct (a runtime from before the menu on S) gets size 1's, and one with a longer struct keeps its own
+    // past size 2's.
+    const uint32_t n = out->size < EDVR_NATIVE_FRAMEGEN_S_SIZE_2 ? EDVR_NATIVE_FRAMEGEN_S_SIZE_1 : EDVR_NATIVE_FRAMEGEN_S_SIZE_2;
+    a.size = n;
     a.version = EDVR_NATIVE_FRAMEGEN_VERSION_1;
     a.eye = eye;
-    std::memcpy(out, &a, sizeof(a));
+    std::memcpy(out, &a, n);
     return a.sequence ? S_OK : S_FALSE;
 }
 
@@ -1092,6 +1095,13 @@ ID3D11Texture2D* frameGenSynthFinish(ID3D11DeviceContext* ctx, uint32_t eye, con
         ctx->CSSetShaderResources(0, 11, nullSrv);
         ctx->CSSetUnorderedAccessViews(0, 7, nullUav, nullptr);
         save.restore(ctx);
+    }
+    // EDVR's menu over the finished S, as the runtime draws it over B after B's door, before anything stages or takes S. A menu showing that cannot be drawn leaves S
+    // unfinished (menu): the slot then replays B, which has it.
+    if (in.menuSink) {
+        const uint32_t menuWhy = in.menuSink(ctx, eye, dst->tex, in.menuBox, r.finRot, r.finT);
+        if (menuWhy != kFrameGenFinishDone) return unfinished(menuWhy);
+        answer.menu = 1u;
     }
     // The eye dump stages the finished S while the module still holds it.
     if (r.finDump >= 0 && in.dumpSink) in.dumpSink(ctx, r.finDump, dst->tex, in.bFinished);

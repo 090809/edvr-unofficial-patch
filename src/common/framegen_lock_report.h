@@ -22,7 +22,8 @@ enum class FrameGenLockReason : uint8_t {
     NotSeparate,     // the XR device is the game's: the transfer needs two
     NoProjection,    // the last frame was not a fresh pair the runtime composed (a menu, a load, a flat clear, a withheld or failed frame, a frame still open)
     NoReplay,        // B is not kept for a replay (resubmit off, or the exchange failed): a missing S would have nothing to show
-    Menu,            // Phase 2.3b: EDVR's own menu was drawn into the last pair (the runtime draws it into B only: S would blink it)
+    Menu,            // EDVR's own menu was drawn into the last pair's B and the d3d11.dll has not said it draws it into S (one from before the menu on S): S would blink it.
+                     // A d3d11.dll that draws it and cannot for one S leaves that S unfinished instead (s_unfinished, why=menu).
     Unfinished,      // Phase 2.3b: the last pair's S was not finished as B is (framegen_slot_report.h kFrameGenFinish*: the why is said on its own line)
     NoS,             // the synthesizer has not delivered an S for several pairs
     DeferredPacing,  // deferred pacing (turbo, fix.weapon_stability's on-foot deferral) is on this frame: Lock stands aside for it in 2.3
@@ -42,7 +43,7 @@ inline const char* frameGenLockReasonName(FrameGenLockReason r) {
         case FrameGenLockReason::NotSeparate: return "not_separate";
         case FrameGenLockReason::NoProjection: return "no_projection";
         case FrameGenLockReason::NoReplay: return "no_replay";
-        case FrameGenLockReason::Menu: return "menu";
+        case FrameGenLockReason::Menu: return "menu_unfinished";
         case FrameGenLockReason::Unfinished: return "s_unfinished";
         case FrameGenLockReason::NoS: return "no_s";
         case FrameGenLockReason::DeferredPacing: return "deferred_pacing";
@@ -61,7 +62,7 @@ struct FrameGenLockConditions {
     bool separate = false;
     bool projection = false;
     bool replay = false;
-    bool noMenu = true;       // Phase 2.3b: true unless EDVR's menu was drawn into the last pair (a host from before 2.3b never sets it)
+    bool noMenu = true;       // true unless EDVR's menu was drawn into the last pair's B and the d3d11 half does not draw it into S (a host from before 2.3b never sets it)
     bool sFinished = true;    // Phase 2.3b: true unless the last pair's S was left unfinished (frameGenSFinished)
     bool sDelivering = false;
     bool notDeferred = false;
