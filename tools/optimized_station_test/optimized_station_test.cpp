@@ -3916,11 +3916,36 @@ int main(int argc, char** argv) {
                     check(b.armed() && b.step(cc::kCamTestModeBake, false, true, 70100, &e) && b.active(), "the bake: a ride up arms it and the first sighting opens it, like the look");
                     check(std::strcmp(cc::camTestEndName(CamTestEnd::kDone), "the bake took its frames") == 0, "the bake: its end has its own name");
                     check(cc::bakeDirCount(cc::kBakeDirsAll) == 5 && cc::bakeDirCount(0x11u) == 2, "the bake: the directions it takes are counted");
-                    check(cc::bakeTicks(cc::kBakeDirsAll) == cc::kBakeSettleTicks + 5 + cc::kBakeTailTicks && cc::bakeTicks(0x10u) == cc::kBakeSettleTicks + 1 + cc::kBakeTailTicks, "the bake: its ticks follow the directions");
+                    check(cc::bakeTicks(cc::kBakeDirsAll) == 15 + cc::kBakeTailTicks && cc::bakeTicks(0x10u) == 3 + cc::kBakeTailTicks, "the bake: its limit follows the directions");
                     bool order = true;
-                    for (uint32_t t = 0; t < cc::kBakeSettleTicks; ++t) order = order && cc::bakeDirAt(t, cc::kBakeDirsAll) == 0;
-                    for (uint32_t d = 1; d < cc::kBakeDirs; ++d) order = order && cc::bakeDirAt(cc::kBakeSettleTicks + d, cc::kBakeDirsAll) == d;
-                    check(order, "the bake: each direction has one tick");
+                    uint32_t aimed = cc::kBakeDirs - 1;
+                    for (uint32_t d = 0; d < cc::kBakeDirs; ++d) {
+                        aimed = cc::bakeNextDir(cc::kBakeDirsAll, 0, aimed);
+                        order = order && aimed == d;
+                    }
+                    check(order, "the bake: each direction in turn, with none captured");
+                    check(cc::bakeNextDir(cc::kBakeDirsAll, 0, 4) == 0, "the bake: it goes round");
+                    check(cc::bakeNextDir(cc::kBakeDirsAll, 0x1Cu, 4) == 0 && cc::bakeNextDir(cc::kBakeDirsAll, 0x1Cu, 0) == 1 && cc::bakeNextDir(cc::kBakeDirsAll, 0x1Cu, 1) == 0, "the bake: only those not yet captured are asked for again");
+                    check(cc::bakeNextDir(cc::kBakeDirsAll, cc::kBakeDirsAll, 3) == 3, "the bake: with every direction captured it stays");
+                    // Flight 28: the first frames with the near plane raised never reach the resolve, and what is written reaches it some frames later. Every direction still arrives, inside the limit.
+                    {
+                        const auto simulate = [](uint32_t lost, uint32_t latency, uint32_t mask, uint32_t* ticksOut) {
+                            uint32_t queue[32] = {}, captured = 0, last = cc::kBakeDirs - 1, tick = 0;
+                            for (; tick < cc::bakeTicks(mask) && (captured & mask) != mask; ++tick) {
+                                last = cc::bakeNextDir(mask, captured, last);
+                                queue[tick] = last;
+                                if (tick >= latency && tick - latency >= lost) captured |= 1u << queue[tick - latency];
+                            }
+                            *ticksOut = tick;
+                            return (captured & mask) == mask;
+                        };
+                        uint32_t ticks = 0;
+                        check(simulate(2, 5, cc::kBakeDirsAll, &ticks) && ticks <= 13, "the bake: two lost frames at 5 frames' latency still take every direction, in about 12 frames");
+                        check(simulate(0, 5, cc::kBakeDirsAll, &ticks) && ticks <= 11, "the bake: with none lost it is no longer than the frames in flight");
+                        check(simulate(4, 8, cc::kBakeDirsAll, &ticks), "the bake: and it holds with more lost and a longer pipeline");
+                        check(simulate(2, 5, 0x10u, &ticks), "the bake: and with one direction");
+                        check(!simulate(40, 5, cc::kBakeDirsAll, &ticks), "the bake: when frames never arrive, the limit ends it uncaptured");
+                    }
                     bool round = true;
                     for (uint32_t f = 0; f < 6; ++f)
                         for (int a = 0; a < 5; ++a)
@@ -3933,8 +3958,7 @@ int main(int argc, char** argv) {
                             }
                     check(round, "the bake: a place on a face, to its direction and back");
                     check(std::strstr(cc::cubeDirHlsl(), "float3 cubeDir(uint face, float2 uv)") != nullptr, "the bake: the direction's HLSL twin is there");
-                    check(cc::bakeDirAt(cc::kBakeSettleTicks + 4 + cc::kBakeTailTicks, cc::kBakeDirsAll) == 4, "the bake: the last direction stays through the tail");
-                    check(cc::bakeDirAt(0, 0x14u) == 2 && cc::bakeDirAt(cc::kBakeSettleTicks, 0x14u) == 2 && cc::bakeDirAt(cc::kBakeSettleTicks + 1, 0x14u) == 4, "the bake: directions left out are skipped");
+                    check(cc::bakeNextDir(0x14u, 0, 4) == 2 && cc::bakeNextDir(0x14u, 0, 2) == 4 && cc::bakeNextDir(0x14u, 0x10u, 2) == 2, "the bake: directions left out are skipped");
                     check(cc::bakeParseDirs("11111") == cc::kBakeDirsAll && cc::bakeParseDirs("00001") == 0x10u && cc::bakeParseDirs("10100") == 0x5u, "the bake: the directions' key reads left to right");
                     check(cc::bakeParseDirs("") == cc::kBakeDirsAll && cc::bakeParseDirs("00000") == cc::kBakeDirsAll && cc::bakeParseDirs("1x111") == cc::kBakeDirsAll && cc::bakeParseDirs(nullptr) == cc::kBakeDirsAll,
                           "the bake: a key it cannot use takes all of them");

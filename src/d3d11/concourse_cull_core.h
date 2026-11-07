@@ -611,12 +611,13 @@ inline const char* camTestModeName(uint32_t m) noexcept {
         default: return "off";
     }
 }
-// The bake's plan (TEMPORARY): one tick a frame, one tick a direction, and the last is held while the frames already asked for arrive. A write takes about 4 frames to reach the
-// resolve (Flight 25: the first capture 51 ms after the first write), by which time the room's rigs have gone, so no frame waits for them. The bake ends when the last direction is
-// seen to arrive; kBakeTailTicks is only the limit on that.
+// The bake's plan (TEMPORARY): one tick a frame, each aiming at the next direction not yet captured, going round until every one has reached the resolve. A write takes about 4 frames to
+// reach it (Flight 25: the first capture 51 ms after the first write), by which time the room's rigs have gone, so no frame waits for them. It is the captures that end the bake, not the
+// count of frames: Flight 28's first two frames with the near plane raised took the flat copy route and never reached the resolve, and an open loop left those two directions out.
+// The limit is bakeTicks; past it the bake is given up, since a window with a whole direction missing is worse than the game's own.
 // The directions are the room's own axes (the anchor's: 0 is axes[2], 2 is axes[0], 4 is axes[1], up), so the same ones serve every visit to this room: 0 +a2, 1 -a2, 2 +a0, 3 -a0, 4 up.
 // Straight down is not one of them: Flight 24's look that way was stars through the floor, and no window faces it.
-constexpr uint32_t kBakeDirs = 5, kBakeSettleTicks = 0, kBakeTailTicks = 8, kBakeDirsAll = 0x1Fu;
+constexpr uint32_t kBakeDirs = 5, kBakeTailTicks = 8, kBakeDirsAll = 0x1Fu;
 constexpr float kBakeFovRad = 1.5707963f;      // camera+0x260, the vertical field of view in radians (READ, 0x4F30F0): 90 degrees, so about 121 across at 16:9, of which the capture keeps the middle 90
 constexpr float kBakeNearDefaultM = 50.0f, kBakeNearMinM = 5.0f, kBakeNearMaxM = 400.0f;   // diag.concourse_bake_near: the bake frames' near plane, and a captured point nearer the centre than this is the room's
 // What the bake does at each type of station, from the journal (journal_station.h). A row is added when its layout has been flown: the keep list's names and the anchor were read at one
@@ -637,17 +638,16 @@ inline uint32_t bakeDirCount(uint32_t mask) noexcept {
         if (mask & (1u << d)) ++n;
     return n;
 }
-inline uint32_t bakeTicks(uint32_t mask) noexcept { return kBakeSettleTicks + bakeDirCount(mask) + kBakeTailTicks; }
-// Which direction a tick asks for.
-inline uint32_t bakeDirAt(uint32_t tick, uint32_t mask) noexcept {
-    uint32_t order[kBakeDirs] = {};
-    uint32_t n = 0;
-    for (uint32_t d = 0; d < kBakeDirs; ++d)
-        if (mask & (1u << d)) order[n++] = d;
-    if (n == 0) return 0;
-    if (tick < kBakeSettleTicks) return order[0];
-    const uint32_t i = tick - kBakeSettleTicks;
-    return order[i < n ? i : n - 1];
+inline uint32_t bakeTicks(uint32_t mask) noexcept { return 3 * bakeDirCount(mask) + kBakeTailTicks; }
+// Which direction a tick asks for: the next one after `after`, in order, that is wanted and not yet captured. With none left it stays, for the frames still on their way.
+inline uint32_t bakeNextDir(uint32_t mask, uint32_t captured, uint32_t after) noexcept {
+    const uint32_t left = mask & ~captured;
+    if (left == 0) return after;
+    for (uint32_t k = 1; k <= kBakeDirs; ++k) {
+        const uint32_t d = (after + k) % kBakeDirs;
+        if (left & (1u << d)) return d;
+    }
+    return after;
 }
 // diag.concourse_bake_dirs: five characters, one for each direction above, 1 to take it. Anything else, or none taken, is all five.
 inline uint32_t bakeParseDirs(const char* text) noexcept {

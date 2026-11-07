@@ -3153,7 +3153,8 @@ uint64_t g_camLookTickMs = 0;
 uint16_t g_camLookTickDt[kCamLookTickCount] = {};
 float g_camLookCentre[3] = {};
 float g_camLookAxes[3][3] = {};        // the anchor's, when the window opened: [1] is its up
-uint32_t g_camBakeTick = 0;            // the bake: ticks since the window opened (cc::bakeDirAt)
+uint32_t g_camBakeTick = 0;            // the bake: ticks since the window opened
+uint32_t g_camBakeDir = 0;             // the bake: the direction last aimed at (cc::bakeNextDir)
 uint32_t g_camBakeMask = cc::kBakeDirsAll;   // diag.concourse_bake_dirs, read when a ride up arms it
 float g_camBakeNear = cc::kBakeNearDefaultM;   // diag.concourse_bake_near, the same
 uint64_t g_camLogMs = 0;               // the last status line (mode 1: once a second; acting: every cc::kCamTestLogMs)
@@ -4107,7 +4108,7 @@ void walkSurveyTick(uint64_t now, bool camIn) {
     }
 }
 
-// TEMPORARY (the bake): where direction d looks, along the room's axes (cc::bakeDirAt): 0 +a2, 1 -a2, 2 +a0, 3 -a0, 4 up.
+// TEMPORARY (the bake): where direction d looks, along the room's axes: 0 +a2, 1 -a2, 2 +a0, 3 -a0, 4 up.
 void bakeForward(const float axes[3][3], uint32_t d, float out[3]) noexcept {
     const float* a = axes[d < 2 ? 2 : d < 4 ? 0 : 1];
     const float sign = d == 1 || d == 3 ? -1.0f : 1.0f;
@@ -4218,10 +4219,15 @@ void concourseTick(uint64_t now, uint32_t frame) {
             g_camMode = 0;
         }
         const bool baking = g_camMode == cc::kCamTestModeBake;
-        // The bake ends when its last direction reaches the resolve, or by its frame count if that never comes; not by the clock.
-        if (g_camTimer.active() && baking && camWasActive && (concoursePaneBakeLastSeen() || g_camBakeTick >= cc::bakeTicks(g_camBakeMask))) {
-            g_camTimer.stop();
-            camEnd = cc::CamTestEnd::kDone;
+        // The bake ends when every direction has reached the resolve. Past its frame limit it is given up, and nothing is published: a window with a direction missing is worse than the game's own.
+        if (g_camTimer.active() && baking && camWasActive) {
+            if ((concoursePaneBakeCaptured() & g_camBakeMask) == g_camBakeMask) {
+                g_camTimer.stop();
+                camEnd = cc::CamTestEnd::kDone;
+            } else if (g_camBakeTick >= cc::bakeTicks(g_camBakeMask)) {
+                g_camTimer.stop();
+                camEnd = cc::CamTestEnd::kTime;
+            }
         }
         const bool acting = g_camTimer.active();
         if (g_camTimer.armed() && !camWasArmed && baking) {
@@ -4238,15 +4244,18 @@ void concourseTick(uint64_t now, uint32_t frame) {
             g_camBakeTick = 0;
             if (baking && g_camLookValid) {
                 concoursePaneBakeBegin(g_camLookCentre, g_camBakeNear);
-                float last[3] = {};
-                bakeForward(g_camLookAxes, cc::bakeDirAt(cc::bakeTicks(g_camBakeMask), g_camBakeMask), last);
-                concoursePaneBakeExpectLast(last);
+                float forwards[cc::kBakeDirs][3] = {};
+                for (uint32_t d = 0; d < cc::kBakeDirs; ++d) bakeForward(g_camLookAxes, d, forwards[d]);
+                concoursePaneBakeExpect(forwards, cc::kBakeDirs, g_camBakeMask);
+                g_camBakeDir = cc::kBakeDirs - 1;   // so that the first asked for is the first in order
             }
         }
         lookOn = acting && g_camLookValid;
         if (lookOn && baking) {
-            // The room's own axes, in the order cc::bakeDirAt names them. A view along the room's up takes the room's axes[2] as its own up.
-            const uint32_t d = cc::bakeDirAt(g_camBakeTick++, g_camBakeMask);
+            // The room's own axes, the next not yet captured. A view along the room's up takes the room's axes[2] as its own up.
+            const uint32_t d = cc::bakeNextDir(g_camBakeMask, concoursePaneBakeCaptured(), g_camBakeDir);
+            g_camBakeDir = d;
+            ++g_camBakeTick;
             float forward[3] = {};
             bakeForward(g_camLookAxes, d, forward);
             concourseCameraTestAim(g_camLookCentre, forward, g_camLookAxes[d == 4 ? 2 : 1], cc::kBakeFovRad, g_camBakeNear);

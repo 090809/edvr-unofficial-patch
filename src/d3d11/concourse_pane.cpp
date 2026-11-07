@@ -3151,15 +3151,15 @@ std::atomic<bool> g_bakeCapturing{false};
 std::atomic<bool> g_bakeWantPrepare{false};
 std::atomic<bool> g_bakeHoldSave{false};       // each Present keeps the back buffer
 std::atomic<bool> g_bakeHoldShow{false};       // each Present puts the kept image back
-bool g_bakeArmedNow = false, g_bakeReady = false, g_bakeReleasing = false, g_bakeHeldValid = false, g_bakeAtCentre = false, g_bakeSaidRefused = false, g_bakeLastSeen = false;
+bool g_bakeArmedNow = false, g_bakeReady = false, g_bakeReleasing = false, g_bakeHeldValid = false, g_bakeAtCentre = false, g_bakeSaidRefused = false;
 std::atomic<bool> g_bakeWantRelease{false};
 std::atomic<uint32_t> g_bakeFrameHeight{0};    // the render height of the frame last resolved
 uint32_t g_bakeCapHeight = 0;                  // the height the bake's frames had
 uint32_t g_bakeHeightSeen = 0;                 // for the settling of a change of g_bakeFrameHeight
 uint64_t g_bakeHeightMs = 0;
 float g_bakeCentre[3] = {};
-float g_bakeLastFwd[3] = {};                   // where the last direction looks: its arrival ends the bake
-float g_bakeCapFwd[3] = {};                    // the last frame captured: a frame looking the same way adds nothing
+float g_bakeDirFwd[cc::kBakeDirs][3] = {};     // where each direction looks
+uint32_t g_bakeWantMask = 0, g_bakeCapMask = 0;   // the directions wanted, and those captured: all of them is the end of the bake
 float g_bakeNearM = cc::kBakeNearDefaultM;
 uint32_t g_bakeCaps = 0, g_bakeSeenAtCentre = 0, g_bakeSeenAway = 0, g_bakeHoldPresents = 0, g_bakeReleaseTicks = 0, g_bakeHeldW = 0, g_bakeHeldH = 0;
 uint64_t g_bakeHoldStartMs = 0;
@@ -3328,8 +3328,7 @@ bool concoursePaneBakeBegin(const float centre[3], float nearM) noexcept {
     for (int k = 0; k < 3; ++k) g_bakeCentre[k] = centre[k];
     g_bakeNearM = nearM;
     g_bakeCaps = g_bakeSeenAtCentre = g_bakeSeenAway = g_bakeHoldPresents = g_bakeReleaseTicks = 0;
-    g_bakeLastSeen = false;
-    for (float& v : g_bakeCapFwd) v = 0.0f;
+    g_bakeWantMask = g_bakeCapMask = 0;
     g_bakeAtCentre = false;
     g_bakeReleasing = false;
     g_bakeSaidRefused = false;
@@ -3351,11 +3350,14 @@ bool concoursePaneBakeBegin(const float centre[3], float nearM) noexcept {
     return true;
 }
 
-void concoursePaneBakeExpectLast(const float forward[3]) noexcept {
-    for (int k = 0; k < 3; ++k) g_bakeLastFwd[k] = forward[k];
+void concoursePaneBakeExpect(const float (*forward)[3], uint32_t count, uint32_t mask) noexcept {
+    for (uint32_t d = 0; d < cc::kBakeDirs && d < count; ++d)
+        for (int k = 0; k < 3; ++k) g_bakeDirFwd[d][k] = forward[d][k];
+    g_bakeWantMask = mask;
+    g_bakeCapMask = 0;
 }
 
-bool concoursePaneBakeLastSeen() noexcept { return g_bakeLastSeen; }
+uint32_t concoursePaneBakeCaptured() noexcept { return g_bakeCapMask; }
 
 void concoursePaneBakeFinish() noexcept {
     g_bakeCapturing.store(false, std::memory_order_release);
@@ -3409,7 +3411,15 @@ void concoursePaneBakeFrame(ID3D11DeviceContext* ctx, ID3D11ShaderResourceView* 
     if (!g_bakeCapturing.load(std::memory_order_acquire)) return;
     // Clip w is the position along the view's forward axis, so these are where this frame looks.
     const float fw[3] = {camera[0][3], camera[1][3], camera[2][3]};
-    if (fw[0] * g_bakeCapFwd[0] + fw[1] * g_bakeCapFwd[1] + fw[2] * g_bakeCapFwd[2] > 0.9999f) return;   // the same direction as the last one captured
+    // Only a direction wanted and not yet taken: the frames aimed again while a capture was on its way go on arriving.
+    uint32_t dirBit = 0;
+    for (uint32_t d = 0; d < cc::kBakeDirs; ++d) {
+        if ((g_bakeWantMask & (1u << d)) != 0 && fw[0] * g_bakeDirFwd[d][0] + fw[1] * g_bakeDirFwd[d][1] + fw[2] * g_bakeDirFwd[d][2] > 0.999f) {
+            dirBit = 1u << d;
+            break;
+        }
+    }
+    if (dirBit == 0 || (g_bakeCapMask & dirBit) != 0) return;
     ID3D11UnorderedAccessView* uav[2] = {g_bdDistBackUav.load(std::memory_order_acquire), g_bdBackUav.load(std::memory_order_acquire)};
     ID3D11SamplerState* smp = g_bdSampler.load(std::memory_order_acquire);
     if (!ctx || !color || !depth || !g_csBake || !g_cbBake || !uav[0] || !uav[1] || !smp || width == 0 || height == 0) {
@@ -3473,9 +3483,8 @@ void concoursePaneBakeFrame(ID3D11DeviceContext* ctx, ID3D11ShaderResourceView* 
         for (auto* p : oldSrv) if (p) p->Release();
         for (auto* p : oldUav) if (p) p->Release();
     }
-    for (int i = 0; i < 3; ++i) g_bakeCapFwd[i] = fw[i];
     g_bakeCapHeight = height;
-    if (fw[0] * g_bakeLastFwd[0] + fw[1] * g_bakeLastFwd[1] + fw[2] * g_bakeLastFwd[2] > 0.999f) g_bakeLastSeen = true;
+    g_bakeCapMask |= dirBit;
     ++g_bakeCaps;
     if (g_bakeCaps <= 16) {
         const float sy = std::sqrt(camera[0][1] * camera[0][1] + camera[1][1] * camera[1][1] + camera[2][1] * camera[2][1]);

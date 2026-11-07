@@ -219,8 +219,8 @@ bool concoursePaneBakeWouldBeSharper(uint64_t nowMs) noexcept;              // t
 void concoursePaneBakeRelease() noexcept;                                   // leaving the station: the cube goes at the next tick, and the next arrival bakes afresh
 void concoursePaneBakeArm(bool on) noexcept;
 bool concoursePaneBakeBegin(const float centre[3], float nearM) noexcept;   // false when the cube was not ready: the frames still move, nothing is captured or held
-void concoursePaneBakeExpectLast(const float forward[3]) noexcept;          // where the last direction looks: its arrival at the resolve is the end of the bake
-bool concoursePaneBakeLastSeen() noexcept;
+void concoursePaneBakeExpect(const float (*forward)[3], uint32_t count, uint32_t mask) noexcept;   // where each direction looks, and which are wanted (cc::kBakeDirs of them)
+uint32_t concoursePaneBakeCaptured() noexcept;                              // the directions that have reached the resolve: all of the wanted ones are the end of the bake
 void concoursePaneBakeFinish() noexcept;
 void concoursePaneBakeCancel() noexcept;
 // From the flat runtime, with what the resolve is about to read: the scene's colour and depth before the visor and the HUD, and b1[270..275]. One relaxed load when no bake runs.
