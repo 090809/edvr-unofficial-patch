@@ -3870,6 +3870,47 @@ int main(int argc, char** argv) {
             check(!rearm, "lift gate: after a timeout the doors must be seen open again before it re-arms");
             to.stop();
             check(!to.on(), "lift gate: stop is off");
+
+            // The camera test's timer (TEMPORARY): starts with the gate, once per ride, ends by time, doors, cut, leaving the cabin or the mode.
+            {
+                using cc::CamTestEnd;
+                using cc::CamTestTimer;
+                const LiftReading shut = rd(0.9f, 1.49f, 1.37f);
+                const LiftReading open = rd(0.9f, 2.9f, 2.65f);
+                CamTestEnd e = CamTestEnd::kNone;
+                CamTestTimer c;
+                check(!c.step(cc::kCamTestModeOff, true, shut, false, 1000, &e) && !c.step(cc::kCamTestModeLog, true, shut, false, 1033, &e), "camera test: modes off and log only never open the window");
+                check(!c.step(cc::kCamTestModeLift, false, shut, false, 1066, &e) && !c.active(), "camera test: the gate off does not open it");
+                check(c.step(cc::kCamTestModeLift, true, shut, false, 2000, &e) && c.active() && c.startMs() == 2000 && e == CamTestEnd::kNone, "camera test: the gate on in mode 2 opens it, once");
+                check(c.step(cc::kCamTestModeLift, false, shut, false, 2000 + cc::kCamTestMs - 1, &e) && e == CamTestEnd::kNone, "camera test: open just under the limit (the gate's answer is not read)");
+                check(!c.step(cc::kCamTestModeLift, false, shut, false, 2000 + cc::kCamTestMs, &e) && e == CamTestEnd::kTime, "camera test: closes at exactly 3000 ms, for the time");
+                check(!c.step(cc::kCamTestModeLift, true, shut, false, 5100, &e) && e == CamTestEnd::kNone && c.usedThisRide(), "camera test: the gate still on after it: not again in the same ride");
+                check(!c.step(cc::kCamTestModeLift, false, shut, false, 5200, &e) && !c.usedThisRide(), "camera test: the gate off ends the ride");
+                check(c.step(cc::kCamTestModeTurn, true, shut, false, 9000, &e) && c.active(), "camera test: the next ride opens it again, in mode 3");
+                check(!c.step(cc::kCamTestModeTurn, false, open, false, 9100, &e) && e == CamTestEnd::kDoors, "camera test: the doors moving close it at once");
+                c.stop();
+                c.step(cc::kCamTestModeLift, true, shut, false, 10000, &e);
+                check(!c.step(cc::kCamTestModeLift, false, shut, true, 10100, &e) && e == CamTestEnd::kCut, "camera test: a cut closes it at once");
+                c.stop();
+                c.step(cc::kCamTestModeLift, true, shut, false, 11000, &e);
+                check(c.step(cc::kCamTestModeLift, false, rd(30.0f, 1.49f, 1.37f), false, 11100, &e) && e == CamTestEnd::kNone, "camera test: the camera 30 m from the cabin (it was moved) does not close it");
+                check(c.step(cc::kCamTestModeLift, false, none, false, 11200, &e) && e == CamTestEnd::kNone, "camera test: no cabin reading does not close it");
+                c.stop();
+                c.step(cc::kCamTestModeLift, true, shut, false, 13000, &e);
+                check(c.step(cc::kCamTestModeLift, false, LiftReading{true, 0.9f, false, 9.0f, 9.0f}, false, 13100, &e) && e == CamTestEnd::kNone, "camera test: unknown doors do not close it");
+                check(!c.step(cc::kCamTestModeOff, false, shut, false, 13200, &e) && e == CamTestEnd::kModeOff, "camera test: the mode turned off closes it");
+                check(c.stop() == false && !c.usedThisRide(), "camera test: stop when closed is a no-op and forgets the ride");
+                check(cc::camTestNextMode(0) == 1 && cc::camTestNextMode(1) == 2 && cc::camTestNextMode(2) == 3 && cc::camTestNextMode(3) == 4 && cc::camTestNextMode(4) == 5 && cc::camTestNextMode(5) == 0,
+                      "camera test: the key steps off, log only, lift, turn, lift held, turn held, off");
+                {
+                    CamTestTimer held;
+                    check(held.step(cc::kCamTestModeLiftHeld, true, shut, false, 20000, &e) && held.active(), "camera test: mode 4 (lift, held) opens the window");
+                    check(!held.step(cc::kCamTestModeLiftHeld, false, shut, false, 20000 + cc::kCamTestMs, &e) && e == CamTestEnd::kTime, "camera test: mode 4 closes at the limit");
+                    check(!held.step(cc::kCamTestModeLiftHeld, false, shut, false, 20000 + cc::kCamTestMs + 100, &e), "camera test: the gate off ends the ride in mode 4");
+                    check(held.step(cc::kCamTestModeTurnHeld, true, shut, false, 30000, &e) && held.active(), "camera test: mode 5 (turn, held) opens the window");
+                    check(!held.step(cc::kCamTestModes, false, shut, false, 30100, &e) && e == CamTestEnd::kModeOff, "camera test: a mode past the last does not act");
+                }
+            }
         }
 
         // The backdrop cube's face mapping (PROTOTYPE): D3D TextureCube addressing, faces +X -X +Y -Y +Z -Z.

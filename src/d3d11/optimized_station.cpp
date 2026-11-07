@@ -24,6 +24,7 @@
 #include "concourse_pane.h"
 #include "journal_watch.h"
 #include "kinematic_eval_hook.h"
+#include "concourse_camera_test.h"   // TEMPORARY (docs\concourse-cull-2026-11-05.md): the camera test
 #include "optimized_station_core.h"
 #include "station_gather_core.h"
 #include "station_lockfree_core.h"
@@ -3124,6 +3125,16 @@ Hotkey* g_concHotkey = nullptr;
 Hotkey* g_viewHotkey = nullptr;
 std::string g_viewHotkeyText;
 bool g_viewHotkeyBound = false;
+// TEMPORARY (docs\concourse-cull-2026-11-05.md): the camera test. hotkey.concourse_camera_test steps g_camMode (cc::kCamTestMode*); the hook is on 0x1EA9C0 in
+// concourse_camera_test.cpp and is installed only when the key is bound, in the flat profile, on build 334925. Modes 2 to 5 act in a window the tick opens (g_camTimer).
+Hotkey* g_camHotkey = nullptr;
+std::string g_camHotkeyText;
+bool g_camHotkeyBound = false;
+uint32_t g_camMode = 0;
+bool g_camHooked = false;
+cc::CamTestTimer g_camTimer;
+uint64_t g_camLogMs = 0;               // the last status line (mode 1: once a second; acting: every cc::kCamTestLogMs)
+ConcourseCameraTestSnap g_camLast;     // the snapshot at that line, for the counts since
 // PROTOTYPE (the backdrop capture, hotkey.concourse_view_test = F6; docs\concourse-cull-2026-11-05.md "The window plan"): Lifting (the cull is off for cc::kBackdropLiftMs, the
 // outside effects still withheld), then Armed (the pane module is told to capture in the next frame, and its status is read each tick until it says what happened).
 enum class BackdropPhase : uint8_t { kIdle, kLifting, kArmed };
@@ -3178,6 +3189,54 @@ const char* concourseKeyText() noexcept {
         case ConcOverride::kOff: return "override-off";
         default: return g_concKeyOn ? "on" : "off";
     }
+}
+
+// TEMPORARY (docs\concourse-cull-2026-11-05.md): the camera test's hook, installed when it is wanted. One line says why not.
+bool camTestInstall(const char* wher) {
+    if (g_camHooked) return true;
+    if (!runtimeFlatProfile()) {
+        Log::get().note("concourse camera test: %s: not installed: flat only for now, and this is the VR profile", wher);
+        return false;
+    }
+    const char* why = nullptr;
+    if (concourseCameraTestInstall(&why)) {
+        g_camHooked = true;
+        Log::get().note("concourse camera test: %s: the hook on 0x1EA9C0 is installed (build 334925, TEMPORARY)", wher);
+        return true;
+    }
+    Log::get().note("concourse camera test: %s: not installed: %s", wher, why ? why : "no reason given");
+    return false;
+}
+
+// One status line from the hook snapshot. The first part is the fixed form; what follows tells the cases apart: never hooked (no line at all, or "hook calls 0"),
+// hooked and never acting ("camera written on 0"), acting with no effect (the slot minus written is not 0 when the camera did not take).
+void camTestLine(const char* tag, uint32_t mode) {
+    ConcourseCameraTestSnap s;
+    concourseCameraTestSnapshot(&s);
+    const unsigned long long dCalls = s.calls - g_camLast.calls, dActed = s.acted - g_camLast.acted;
+    Log::get().note("concourse camera test: mode %u: RV cam before %.2f %.2f %.2f, written %.2f %.2f %.2f; view slot +0x540 %.2f %.2f %.2f after the fill; rv count %u"
+                    " (%s: hook calls %llu since the last line%s, camera written on %llu of them, view 0 not found %llu total, several %llu total, faults %llu total; "
+                    "entries with flags&3 %u, view 0 flags 0x%X, slot %u flags 0x%X, slot %s, slot minus written %.2f %.2f %.2f; held writes put back %llu, overwritten by the game %llu total)",
+                    mode, static_cast<double>(s.before[0]), static_cast<double>(s.before[1]), static_cast<double>(s.before[2]), static_cast<double>(s.written[0]),
+                    static_cast<double>(s.written[1]), static_cast<double>(s.written[2]), static_cast<double>(s.slot[0]), static_cast<double>(s.slot[1]), static_cast<double>(s.slot[2]),
+                    s.rvCount, tag, dCalls, dCalls == 0 ? " (THE HOOK WAS NOT CALLED)" : "", dActed, static_cast<unsigned long long>(s.noView0),
+                    static_cast<unsigned long long>(s.multiView), static_cast<unsigned long long>(s.faults), s.mainCount, s.flags, s.slotIndex, s.slotFlags,
+                    s.slotKnown ? "read" : "NOT read", static_cast<double>(s.slot[0] - s.written[0]), static_cast<double>(s.slot[1] - s.written[1]),
+                    static_cast<double>(s.slot[2] - s.written[2]), static_cast<unsigned long long>(s.heldPutBack), static_cast<unsigned long long>(s.heldRewritten));
+    g_camLast = s;
+}
+
+// A press of hotkey.concourse_camera_test: the next mode, said in the log and in a toast.
+void camTestPress() {
+    if (!camTestInstall("press")) {
+        concoursePaneQueueToast("Camera test: not available");
+        return;
+    }
+    g_camMode = cc::camTestNextMode(g_camMode);
+    Log::get().note("concourse camera test: mode %u (%s) by hotkey.concourse_camera_test", g_camMode, cc::camTestModeName(g_camMode));
+    char text[64];
+    std::snprintf(text, sizeof(text), "Camera test: %s", cc::camTestModeName(g_camMode));
+    concoursePaneQueueToast(text);
 }
 
 void concoursePoll(uint64_t now) {
@@ -3238,6 +3297,23 @@ void concoursePoll(uint64_t now) {
         if (g_viewHotkey->bound()) Log::get().note("concourse view test: hotkey.concourse_view_test = \"%s\" bound (TEMPORARY, a prototype: a press lifts the cull for %llu ms and captures the view through the windows, see concourse_pane.h)", viewKey.c_str(), static_cast<unsigned long long>(cc::kBackdropLiftMs));
         else if (!viewKey.empty()) Log::get().note("concourse view test: hotkey.concourse_view_test = \"%s\" bound nothing, so the capture cannot be used this session", viewKey.c_str());
         else if (!first) Log::get().note("concourse view test: hotkey.concourse_view_test cleared");
+    }
+    const std::string camKey = cfg.getString("hotkey.concourse_camera_test", "");
+    if (!g_camHotkeyBound || camKey != g_camHotkeyText) {
+        const bool first = !g_camHotkeyBound;
+        if (!g_camHotkey) g_camHotkey = new Hotkey();
+        g_camHotkeyBound = true;
+        g_camHotkeyText = camKey;
+        g_camHotkey->setBinding(camKey.c_str());
+        if (g_camHotkey->bound()) {
+            Log::get().note("concourse camera test: hotkey.concourse_camera_test = \"%s\" bound (TEMPORARY, flat only: each press steps off, log only, lift 30 m, turn 90 degrees; the last two act for %llu ms from the lift gate going on, once per ride)",
+                            camKey.c_str(), static_cast<unsigned long long>(cc::kCamTestMs));
+            camTestInstall("bind");
+        } else {
+            g_camMode = 0;
+            if (!camKey.empty()) Log::get().note("concourse camera test: hotkey.concourse_camera_test = \"%s\" bound nothing, so nothing is hooked", camKey.c_str());
+            else if (!first) Log::get().note("concourse camera test: hotkey.concourse_camera_test cleared (the mode is off; an installed hook stays, shut)");
+        }
     }
 }
 
@@ -3331,6 +3407,12 @@ void concourseSettingOffTick(uint64_t now) {
     }
     g_backdropGate.reset();
     g_liftGate.reset();
+    g_camTimer.stop();
+    if (g_camHooked && g_camMode != 0) {
+        g_camMode = 0;
+        concourseCameraTestControl(0, false);
+        Log::get().note("concourse camera test: fix.optimized_stations is off: the mode is off");
+    }
     g_liftWasOn = false;
     g_concWasCull = false;
     g_concActive.store(false, std::memory_order_release);
@@ -3960,11 +4042,49 @@ void concourseTick(uint64_t now, uint32_t frame) {
     const bool onFoot = (g_statusFlags2Now & sealed::kFlags2OnFoot) != 0;
     cc::LiftReading liftRead;
     bool liftOn = false;
+    // TEMPORARY (the camera test): while its window is open the gate is held (not stepped: the moved camera would drop it, it reads the camera distance to the cabin) and
+    // the lift cull rule is not applied. The window opens on the tick the gate first goes on in a ride, and closes by time, doors, a cut or the conditions ending.
+    if (g_camHotkey && g_camHotkey->pressed()) camTestPress();
+    cc::CamTestEnd camEnd = cc::CamTestEnd::kNone;
+    const bool camWasActive = g_camTimer.active();
     if (armed && effective && onFoot && !sealedNow && g_frameCamValid) {
         liftRead = liftReadNow();
-        liftOn = g_liftGate.step(liftRead, cutNow, now);
+        if (camWasActive) {
+            g_camTimer.step(g_camMode, false, liftRead, cutNow, now, &camEnd);
+            liftOn = g_camTimer.active() ? false : g_liftGate.step(liftRead, cutNow, now);
+        } else {
+            liftOn = g_liftGate.step(liftRead, cutNow, now);
+            if (g_camTimer.step(g_camMode, liftOn, liftRead, cutNow, now, &camEnd)) liftOn = false;
+        }
     } else {
         g_liftGate.stop();
+        if (g_camTimer.stop()) camEnd = cc::CamTestEnd::kModeOff;
+    }
+    if (g_camHooked) {
+        if (g_camMode != 0 && !runtimeFlatProfile()) {
+            Log::get().note("concourse camera test: the profile is not flat any more: the mode is off");
+            g_camMode = 0;
+        }
+        const bool acting = g_camTimer.active();
+        concourseCameraTestControl(g_camMode, acting);   // every tick: it also closes the gate once a held write has gone back
+        if (acting && !camWasActive) {
+            Log::get().note("concourse camera test: mode %u: the window opens with the lift gate (cabin %.2f m, gaps %.2f %.2f): %llu ms, the gate is held and the lift cull rule is off",
+                            g_camMode, static_cast<double>(liftRead.cabinDistM), static_cast<double>(liftRead.gap1), static_cast<double>(liftRead.gap2),
+                            static_cast<unsigned long long>(cc::kCamTestMs));
+            camTestLine("start", g_camMode);
+            g_camLogMs = now;
+        } else if (acting && now - g_camLogMs >= cc::kCamTestLogMs) {
+            camTestLine("acting", g_camMode);
+            g_camLogMs = now;
+        }
+        if (camEnd != cc::CamTestEnd::kNone) {
+            Log::get().note("concourse camera test: mode %u: the window ends after %llu ms: %s", g_camMode, static_cast<unsigned long long>(now - g_camTimer.startMs()), cc::camTestEndName(camEnd));
+            camTestLine("end", g_camMode);
+            g_camLogMs = now;
+        } else if (!acting && g_camMode == cc::kCamTestModeLog && armed && onFoot && now - g_camLogMs >= 1000) {
+            camTestLine("log only", g_camMode);
+            g_camLogMs = now;
+        }
     }
     if (liftOn && !g_liftWasOn) {
         g_liftStartMs = now;

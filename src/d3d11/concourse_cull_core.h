@@ -577,6 +577,80 @@ private:
     LiftEnd end_ = LiftEnd::kNone;
 };
 
+// ---- The camera test (TEMPORARY, docs\concourse-cull-2026-11-05.md): does moving view 0's camera before 0x1EA9C0 reach cull, draws, constants and image? -----------
+// Modes 2 to 5 act for kCamTestMs from the tick the lift gate first goes on in a ride, once per ride. The window has its own timer and the gate is not stepped
+// meanwhile (a moved camera would drop it at once: it reads the camera's distance to the cabin). The decision is here so a table can pin it.
+constexpr uint64_t kCamTestMs = 3000;      // how long modes 2 to 5 act
+constexpr uint64_t kCamTestLogMs = 250;    // the acting lines' spacing
+// Modes 4 and 5 are 2 and 3 with the write held for the whole frame, put back only at the next call: whatever reads the camera after the view builder returns (the constant
+// buffers' source is not known) then sees the moved camera too, so a picture that does not follow in 2 and 3 can be told from one that cannot follow at all.
+constexpr uint32_t kCamTestModeOff = 0, kCamTestModeLog = 1, kCamTestModeLift = 2, kCamTestModeTurn = 3, kCamTestModeLiftHeld = 4, kCamTestModeTurnHeld = 5, kCamTestModes = 6;
+inline uint32_t camTestNextMode(uint32_t m) noexcept { return (m + 1) % kCamTestModes; }
+inline const char* camTestModeName(uint32_t m) noexcept {
+    switch (m) {
+        case kCamTestModeLog: return "log only";
+        case kCamTestModeLift: return "lift 30 m";
+        case kCamTestModeTurn: return "turn 90 degrees";
+        case kCamTestModeLiftHeld: return "lift 30 m, held";
+        case kCamTestModeTurnHeld: return "turn 90 degrees, held";
+        default: return "off";
+    }
+}
+enum class CamTestEnd : uint8_t { kNone, kTime, kDoors, kCut, kModeOff };
+inline const char* camTestEndName(CamTestEnd e) noexcept {
+    switch (e) {
+        case CamTestEnd::kTime: return "time ran out";
+        case CamTestEnd::kDoors: return "the doors moved";
+        case CamTestEnd::kCut: return "a camera cut";
+        case CamTestEnd::kModeOff: return "the mode or the cull's conditions ended";
+        default: return "none";
+    }
+}
+class CamTestTimer {
+public:
+    // One tick. `gateOn`: the lift gate's own answer this tick (read only while the window is not open). `r`: the lift reading this tick. `cut`: the camera cut to
+    // another room. Returns whether the window is open after this tick; `*ended` is set only on the tick it closes.
+    bool step(uint32_t mode, bool gateOn, const LiftReading& r, bool cut, uint64_t nowMs, CamTestEnd* ended) noexcept {
+        if (ended) *ended = CamTestEnd::kNone;
+        const bool acts = mode >= kCamTestModeLift && mode < kCamTestModes;
+        if (active_) {
+            CamTestEnd why = CamTestEnd::kNone;
+            if (!acts) why = CamTestEnd::kModeOff;
+            else if (cut) why = CamTestEnd::kCut;
+            // The camera's own distance to the cabin is not read while the window is open: the test moves the camera, and that distance is what would drop the gate.
+            else if (r.doors && (!(r.gap1 <= kLiftGap1ShutM) || !(r.gap2 <= kLiftGap2ShutM))) why = CamTestEnd::kDoors;
+            else if (nowMs - startMs_ >= kCamTestMs) why = CamTestEnd::kTime;
+            if (why != CamTestEnd::kNone) {
+                active_ = false;
+                if (ended) *ended = why;
+            }
+            return active_;
+        }
+        if (!gateOn) {
+            usedThisRide_ = false;   // the ride is over: the next one may be tested
+        } else if (acts && !usedThisRide_) {
+            active_ = true;
+            usedThisRide_ = true;
+            startMs_ = nowMs;
+        }
+        return active_;
+    }
+    // The cull's own conditions are gone (key off, not on foot, hangar sealed): the window closes, nothing is remembered.
+    bool stop() noexcept {
+        const bool was = active_;
+        active_ = false;
+        usedThisRide_ = false;
+        return was;
+    }
+    bool active() const noexcept { return active_; }
+    uint64_t startMs() const noexcept { return startMs_; }
+    bool usedThisRide() const noexcept { return usedThisRide_; }
+
+private:
+    bool active_ = false, usedThisRide_ = false;
+    uint64_t startMs_ = 0;
+};
+
 // ---- The backdrop cube (PROTOTYPE on the concourse arc, docs\concourse-cull-2026-11-05.md "The window plan") -----------------------------------------------
 // One capture, on a key press, of the view through the exterior panes, kept in a cube of view directions (6 slices, D3D TextureCube addressing, faces +X -X +Y -Y +Z -Z).
 // The capture shader writes the texel of normalize(v2); the display shader samples the cube with the same direction. The helper below is the C++ twin of the HLSL text

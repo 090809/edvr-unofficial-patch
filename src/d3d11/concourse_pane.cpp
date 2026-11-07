@@ -3273,6 +3273,10 @@ ConcourseBackdropMissing concoursePaneBackdropMissing() noexcept {
     return m;
 }
 
+void concoursePaneQueueToast(const char* text) noexcept {
+    if (text) queueToast(text);
+}
+
 bool concoursePaneTakeToast(char* out, size_t size) noexcept {
     if (!out || size == 0) return false;
     std::lock_guard<std::mutex> lock(g_toastMutex);

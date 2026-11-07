@@ -208,5 +208,6 @@ ConcourseBackdropMissing concoursePaneBackdropMissing() noexcept;
 void concoursePaneBackdropEnd() noexcept;                      // the cull's tick has read the result (or gives up): back to idle, and an open capture is closed
 // A toast text, once per hotkey change of the mode and per capture result ("Windows: ..."); false when none is waiting. The tick hands it to menuShowNotice.
 bool concoursePaneTakeToast(char* out, size_t size) noexcept;
+void concoursePaneQueueToast(const char* text) noexcept;   // TEMPORARY: the camera test's key (optimized_station.cpp) shows its mode through the same toast
 
 }  // namespace edvr
