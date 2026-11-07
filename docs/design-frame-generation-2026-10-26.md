@@ -609,6 +609,23 @@ luma error, against the floor.
 3. **Phase 2, Lock on surfaces (`fix.frame_generation = auto | on`).**
    - Build the presenter, the S publication, the ABI extension and the
      gate.
+   - **Slices (2026-11-07, after Phase 1's flights; H1, H8, H9 not
+     measured, H1 moves to 2.4):**
+     - 2.1 the synthesizer on the game device, nothing shown: far and world
+       by ex2dh from B's own vectors, the cockpit by the head alone; splat
+       at render size with dilation and the winner's guard, background
+       pull; resample of B's upscaled output. S's head is extrapolated
+       from the head's own motion (no ABI yet). Scored, timed, dumped.
+     - 2.2 the slot's pose at Submit (ABI v13) and S's own transfer set;
+       nothing shown.
+     - 2.3 Lock in the runtime, `fix.frame_generation = off | on`
+       (on forced, temporary for A/B), `late_real`, `late_s`, the slot
+       schedule tests. Vendor smoothing off first.
+     - 2.4 the gate and `auto`, with H1 and vendor halving.
+   - **World class, changed by Phase 1:** the ship rig is not the world's
+     image motion in flight (flights 2-4); the world rides B's own vectors
+     less B's head turn, carried one period, plus the slot's head turn
+     (ex2dh, flights 5-6).
    - **Flight:** an A/B at one settlement, off (vendor smoothing at its
      default) against `auto`. Log slots synthesized, `late_real`, `late_s`,
      engage and disengage with reasons, and vendor halving.
