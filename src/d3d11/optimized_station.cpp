@@ -3146,7 +3146,10 @@ int g_camLookTicks = 0;
 uint64_t g_camLookTickMs = 0;
 uint16_t g_camLookTickDt[kCamLookTickCount] = {};
 float g_camLookCentre[3] = {};
-float g_camLookUp[3] = {};
+float g_camLookAxes[3][3] = {};        // the anchor's, when the window opened: [1] is its up
+uint32_t g_camBakeTick = 0;            // the bake: ticks since the window opened (cc::bakeDirAt)
+uint32_t g_camBakeMask = cc::kBakeDirsAll;   // diag.concourse_bake_dirs, read when a ride up arms it
+float g_camBakeNear = cc::kBakeNearDefaultM;   // diag.concourse_bake_near, the same
 uint64_t g_camLogMs = 0;               // the last status line (mode 1: once a second; acting: every cc::kCamTestLogMs)
 ConcourseCameraTestSnap g_camLast;     // the snapshot at that line, for the counts since
 // PROTOTYPE (the backdrop capture, hotkey.concourse_view_test = F6; docs\concourse-cull-2026-11-05.md "The window plan"): Lifting (the cull is off for cc::kBackdropLiftMs, the
@@ -3333,7 +3336,7 @@ void concoursePoll(uint64_t now) {
         g_camHotkeyText = camKey;
         g_camHotkey->setBinding(camKey.c_str());
         if (g_camHotkey->bound()) {
-            Log::get().note("concourse camera test: hotkey.concourse_camera_test = \"%s\" bound (TEMPORARY, flat only: each press steps off, log only, look; the look acts for %llu ms from the anchor's first sighting on a ride up)",
+            Log::get().note("concourse camera test: hotkey.concourse_camera_test = \"%s\" bound (TEMPORARY, flat only: each press steps off, log only, look, bake; on a ride up, from the anchor's first sighting, the look acts for %llu ms and the bake for a few frames)",
                             camKey.c_str(), static_cast<unsigned long long>(cc::kCamTestMs));
             camTestInstall("bind");
         } else {
@@ -3636,14 +3639,24 @@ bool concourseAnchorUp(float out[3]) {
     return true;
 }
 
-// TEMPORARY (the camera test): the anchor's centre (the frame the camera's position is in: `concourse frame` lines, checked by hand against its cam_local) and its up axis. False when
-// either cannot be read now.
-bool concourseAnchorCentreUp(float centre[3], float up[3]) {
-    if (!concourseAnchorUp(up)) return false;
+// TEMPORARY (the camera test): the anchor's centre (the frame the camera's position is in: `concourse frame` lines, checked by hand against its cam_local) and its three unit axes;
+// axes[1] is its up. False when any cannot be read now.
+bool concourseAnchorFrame(float centre[3], float axes[3][3]) {
     const uintptr_t anchor = g_concAnchorAddr.load(std::memory_order_relaxed);
     if (!anchor) return false;
+    char nm[64] = {};
+    if (!cachedName(anchor, nm, sizeof(nm)) || std::strcmp(nm, cc::kAnchorName) != 0) return false;
     const WorldRead aw = worldOfRecord(anchor);
-    if (aw.source == 4 || !std::isfinite(aw.world[0]) || !std::isfinite(aw.world[1]) || !std::isfinite(aw.world[2])) return false;
+    float ext[3] = {};
+    bool extOk = false;
+    uint8_t osrc = 4;
+    if (aw.source == 4 || !poseOrientOf(anchor, axes, ext, &extOk, &osrc)) return false;
+    if (!std::isfinite(aw.world[0]) || !std::isfinite(aw.world[1]) || !std::isfinite(aw.world[2])) return false;
+    for (int a = 0; a < 3; ++a) {
+        const float len = std::sqrt(axes[a][0] * axes[a][0] + axes[a][1] * axes[a][1] + axes[a][2] * axes[a][2]);
+        if (!std::isfinite(len) || len < 0.5f) return false;
+        for (int k = 0; k < 3; ++k) axes[a][k] /= len;
+    }
     for (int k = 0; k < 3; ++k) centre[k] = aw.world[k];
     return true;
 }
@@ -4112,17 +4125,46 @@ void concourseTick(uint64_t now, uint32_t frame) {
             Log::get().note("concourse camera test: the profile is not flat any more: the mode is off");
             g_camMode = 0;
         }
+        const bool baking = g_camMode == cc::kCamTestModeBake;
+        // The bake ends by its frame count, not the clock: one tick a frame.
+        if (g_camTimer.active() && baking && camWasActive && g_camBakeTick >= cc::bakeTicks(g_camBakeMask)) {
+            g_camTimer.stop();
+            camEnd = cc::CamTestEnd::kDone;
+        }
         const bool acting = g_camTimer.active();
+        if (g_camTimer.armed() && !camWasArmed && baking) {
+            const std::string dirsT = Config::get().getString("diag.concourse_bake_dirs", "");
+            g_camBakeMask = cc::bakeParseDirs(dirsT.c_str());
+            const std::string nearT = Config::get().getString("diag.concourse_bake_near", "");
+            const float nearM = nearT.empty() ? cc::kBakeNearDefaultM : static_cast<float>(std::atof(nearT.c_str()));
+            g_camBakeNear = nearM >= cc::kBakeNearMinM && nearM <= cc::kBakeNearMaxM ? nearM : cc::kBakeNearDefaultM;
+        }
+        concoursePaneBakeArm(g_camTimer.armed() && baking);
         if (!acting) g_camLookValid = false;
-        else if (!camWasActive) g_camLookValid = anchor && concourseAnchorCentreUp(g_camLookCentre, g_camLookUp);
-        lookOn = acting && g_camMode == cc::kCamTestModeLook && g_camLookValid;
-        if (lookOn) concourseCameraTestLook(g_camLookCentre, g_camLookUp, cc::camTestLookDir(now - g_camTimer.startMs()));
+        else if (!camWasActive) {
+            g_camLookValid = anchor && concourseAnchorFrame(g_camLookCentre, g_camLookAxes);
+            g_camBakeTick = 0;
+            if (baking && g_camLookValid) concoursePaneBakeBegin(g_camLookCentre, g_camBakeNear);
+        }
+        lookOn = acting && g_camLookValid;
+        if (lookOn && baking) {
+            // The room's own axes, in the order cc::bakeDirAt names them. A view along the room's up takes the room's axes[2] as its own up.
+            const uint32_t d = cc::bakeDirAt(g_camBakeTick++, g_camBakeMask);
+            const float* a = g_camLookAxes[d < 2 ? 2 : d < 4 ? 0 : 1];
+            const float sign = d == 1 || d == 3 ? -1.0f : 1.0f;
+            const float forward[3] = {a[0] * sign, a[1] * sign, a[2] * sign};
+            concourseCameraTestAim(g_camLookCentre, forward, g_camLookAxes[d == 4 ? 2 : 1], cc::kBakeFovRad);
+        } else if (lookOn) {
+            concourseCameraTestLook(g_camLookCentre, g_camLookAxes[1], cc::camTestLookDir(now - g_camTimer.startMs()));
+        }
         concourseCameraTestControl(g_camMode, lookOn);
+        if (camEnd == cc::CamTestEnd::kDone) concoursePaneBakeFinish();
+        else if (camEnd != cc::CamTestEnd::kNone && baking) concoursePaneBakeCancel();
         if (g_camTimer.armed() && !camWasArmed)
-            Log::get().note("concourse camera test: armed: a ride up, the lift gate on with no room seen (cabin %.2f m, gaps %.2f %.2f, camera %.2f %.2f %.2f); waiting for the anchor",
+            Log::get().note("concourse camera test: armed: a ride up, the lift gate on with no room seen (cabin %.2f m, gaps %.2f %.2f, camera %.2f %.2f %.2f); waiting for the anchor; bake directions 0x%X, near %.0f m",
                             static_cast<double>(liftRead.cabinDistM), static_cast<double>(liftRead.gap1), static_cast<double>(liftRead.gap2), static_cast<double>(g_frameCam[0]),
-                            static_cast<double>(g_frameCam[1]), static_cast<double>(g_frameCam[2]));
-        if (camWasArmed && !g_camTimer.armed() && !acting && g_camMode == cc::kCamTestModeLook)
+                            static_cast<double>(g_frameCam[1]), static_cast<double>(g_frameCam[2]), g_camBakeMask, static_cast<double>(g_camBakeNear));
+        if (camWasArmed && !g_camTimer.armed() && !acting && g_camTimer.startMs() < g_camTimer.armedMs())
             Log::get().note("concourse camera test: armed for %llu ms and the anchor was not seen: it lets go", static_cast<unsigned long long>(now - g_camTimer.armedMs()));
         if (acting && !camWasActive) {
             g_camLookTicks = 0;
@@ -4132,7 +4174,7 @@ void concourseTick(uint64_t now, uint32_t frame) {
                             g_camMode, static_cast<unsigned long long>(now - g_camTimer.armedMs()), static_cast<double>(liftRead.cabinDistM), static_cast<double>(liftRead.gap1),
                             static_cast<double>(liftRead.gap2), static_cast<unsigned long long>(cc::kCamTestMs), g_camLookValid ? "the look is on" : "THE ANCHOR COULD NOT BE READ, nothing is written",
                             static_cast<double>(g_camLookCentre[0]), static_cast<double>(g_camLookCentre[1]), static_cast<double>(g_camLookCentre[2]),
-                            static_cast<double>(g_camLookUp[0]), static_cast<double>(g_camLookUp[1]), static_cast<double>(g_camLookUp[2]));
+                            static_cast<double>(g_camLookAxes[1][0]), static_cast<double>(g_camLookAxes[1][1]), static_cast<double>(g_camLookAxes[1][2]));
             camTestLine("start", g_camMode);
             g_camLogMs = now;
         } else if (acting && now - g_camLogMs >= cc::kCamTestLogMs) {

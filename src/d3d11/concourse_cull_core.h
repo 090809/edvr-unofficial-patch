@@ -595,23 +595,93 @@ constexpr uint32_t kCamTestDirs = 6;       // the heading, a quarter turn three 
 constexpr uint64_t kCamTestMs = kCamTestDirMs * kCamTestDirs;   // long enough to see; a bake would need a few frames of it
 constexpr uint64_t kCamTestArmMs = 15000;  // armed this long with no sighting, and it lets go: the doors shut about 6 s before the cut
 constexpr uint64_t kCamTestLogMs = 250;    // the acting lines' spacing
-constexpr uint32_t kCamTestModeOff = 0, kCamTestModeLog = 1, kCamTestModeLook = 2, kCamTestModes = 3;
+constexpr uint32_t kCamTestModeOff = 0, kCamTestModeLog = 1, kCamTestModeLook = 2, kCamTestModeBake = 3, kCamTestModes = 4;
 inline uint32_t camTestNextMode(uint32_t m) noexcept { return (m + 1) % kCamTestModes; }
 inline const char* camTestModeName(uint32_t m) noexcept {
     switch (m) {
         case kCamTestModeLog: return "log only";
         case kCamTestModeLook: return "look from the room's centre";
+        case kCamTestModeBake: return "bake on arrival";
         default: return "off";
     }
+}
+// The bake's plan (TEMPORARY): one tick a frame. The first direction is repeated while the room's rigs go (a later frame overwrites an earlier one, so a frame that still held them
+// does no harm), each other direction has one tick, and the last is held while the frames already asked for arrive: a write takes about 3 frames to reach the resolve (Flight 24).
+// The directions are the room's own axes (the anchor's: 0 is axes[2], 2 is axes[0], 4 is axes[1], up), so the same ones serve every visit to this room: 0 +a2, 1 -a2, 2 +a0, 3 -a0, 4 up.
+// Straight down is not one of them: Flight 24's look that way was stars through the floor, and no window faces it.
+constexpr uint32_t kBakeDirs = 5, kBakeSettleTicks = 3, kBakeTailTicks = 4, kBakeDirsAll = 0x1Fu;
+constexpr float kBakeFovRad = 1.5707963f;      // camera+0x260, the vertical field of view in radians (READ, 0x4F30F0): 90 degrees, so about 121 across at 16:9, and these directions overlap
+constexpr float kBakeNearDefaultM = 50.0f, kBakeNearMinM = 5.0f, kBakeNearMaxM = 400.0f;   // diag.concourse_bake_near: a captured point nearer the centre than this is the room's
+inline uint32_t bakeDirCount(uint32_t mask) noexcept {
+    uint32_t n = 0;
+    for (uint32_t d = 0; d < kBakeDirs; ++d)
+        if (mask & (1u << d)) ++n;
+    return n;
+}
+inline uint32_t bakeTicks(uint32_t mask) noexcept { return kBakeSettleTicks + bakeDirCount(mask) + kBakeTailTicks; }
+// Which direction a tick asks for.
+inline uint32_t bakeDirAt(uint32_t tick, uint32_t mask) noexcept {
+    uint32_t order[kBakeDirs] = {};
+    uint32_t n = 0;
+    for (uint32_t d = 0; d < kBakeDirs; ++d)
+        if (mask & (1u << d)) order[n++] = d;
+    if (n == 0) return 0;
+    if (tick < kBakeSettleTicks) return order[0];
+    const uint32_t i = tick - kBakeSettleTicks;
+    return order[i < n ? i : n - 1];
+}
+// diag.concourse_bake_dirs: five characters, one for each direction above, 1 to take it. Anything else, or none taken, is all five.
+inline uint32_t bakeParseDirs(const char* text) noexcept {
+    if (!text || std::strlen(text) != kBakeDirs) return kBakeDirsAll;
+    uint32_t mask = 0;
+    for (uint32_t d = 0; d < kBakeDirs; ++d) {
+        if (text[d] == '1') mask |= 1u << d;
+        else if (text[d] != '0') return kBakeDirsAll;
+    }
+    return mask != 0 ? mask : kBakeDirsAll;
+}
+// The inverse of a 4x4 (row-major). False when it is singular or not finite.
+inline bool invert4(const double m[16], double out[16]) noexcept {
+    double a[4][8] = {};
+    for (int r = 0; r < 4; ++r) {
+        for (int c = 0; c < 4; ++c) a[r][c] = m[r * 4 + c];
+        a[r][4 + r] = 1.0;
+    }
+    for (int col = 0; col < 4; ++col) {
+        int piv = col;
+        for (int r = col + 1; r < 4; ++r)
+            if (std::fabs(a[r][col]) > std::fabs(a[piv][col])) piv = r;
+        const double p = a[piv][col];
+        if (!(std::fabs(p) > 1e-30) || !std::isfinite(p)) return false;
+        if (piv != col)
+            for (int c = 0; c < 8; ++c) {
+                const double t = a[col][c];
+                a[col][c] = a[piv][c];
+                a[piv][c] = t;
+            }
+        for (int c = 0; c < 8; ++c) a[col][c] /= p;
+        for (int r = 0; r < 4; ++r) {
+            if (r == col) continue;
+            const double f = a[r][col];
+            for (int c = 0; c < 8; ++c) a[r][c] -= f * a[col][c];
+        }
+    }
+    for (int r = 0; r < 4; ++r)
+        for (int c = 0; c < 4; ++c) {
+            out[r * 4 + c] = a[r][4 + c];
+            if (!std::isfinite(out[r * 4 + c])) return false;
+        }
+    return true;
 }
 inline uint32_t camTestLookDir(uint64_t elapsedMs) noexcept {
     const uint64_t d = elapsedMs / kCamTestDirMs;
     return d >= kCamTestDirs ? kCamTestDirs - 1 : static_cast<uint32_t>(d);
 }
-enum class CamTestEnd : uint8_t { kNone, kTime, kModeOff };
+enum class CamTestEnd : uint8_t { kNone, kTime, kModeOff, kDone };
 inline const char* camTestEndName(CamTestEnd e) noexcept {
     switch (e) {
         case CamTestEnd::kTime: return "time ran out";
+        case CamTestEnd::kDone: return "the bake took its frames";
         case CamTestEnd::kModeOff: return "the mode or the cull's conditions ended";
         default: return "none";
     }
@@ -623,7 +693,7 @@ public:
     // it ends by time or the mode alone: the doors and the cut go on behind it. A ride down never arms it, since the room is already seen when its gate comes on.
     bool step(uint32_t mode, bool gateOn, bool anchorFresh, uint64_t nowMs, CamTestEnd* ended) noexcept {
         if (ended) *ended = CamTestEnd::kNone;
-        const bool acts = mode == kCamTestModeLook;
+        const bool acts = mode == kCamTestModeLook || mode == kCamTestModeBake;
         if (active_) {
             CamTestEnd why = CamTestEnd::kNone;
             if (!acts) why = CamTestEnd::kModeOff;
@@ -671,7 +741,7 @@ private:
 // One capture, on a key press, of the view through the exterior panes, kept in a cube of view directions (6 slices, D3D TextureCube addressing, faces +X -X +Y -Y +Z -Z).
 // The capture shader writes the texel of normalize(v2); the display shader samples the cube with the same direction. The helper below is the C++ twin of the HLSL text
 // beside it (the tests pin the C++; the two are written to be read side by side).
-constexpr uint32_t kBackdropCubeSize = 3072;     // about 27 texels a degree at a face's centre, against about 38 pixels on a 4K screen; 2 textures of 432 MB. Set high to judge the look, and to come down once it is judged
+constexpr uint32_t kBackdropCubeSize = 2048;     // about 23 texels a degree at a face's centre (a bake's frame at 90 degrees is 12 pixels a degree at 1080p, 24 at 4K); 2 textures of 192 MB, the distance pair a quarter of that. Still far more than the windows use: most of a cube is never looked at
 constexpr uint64_t kBackdropLiftMs = 200;       // the cull is lifted this long before the capture frame is armed
 constexpr uint32_t kBackdropWaitFrames = 3;     // armed frames with no pane captured before the capture is given up
 

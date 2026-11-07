@@ -3898,7 +3898,46 @@ int main(int argc, char** argv) {
                 c.step(look, false, true, 60100, &e);
                 check(c.stop() && !c.active() && !c.armed(), "camera test: stop closes an open window and says so");
                 check(c.stop() == false, "camera test: stop when closed is a no-op");
-                check(cc::camTestNextMode(0) == 1 && cc::camTestNextMode(1) == 2 && cc::camTestNextMode(2) == 0, "camera test: the key steps off, log only, look, off");
+                check(cc::camTestNextMode(0) == 1 && cc::camTestNextMode(1) == 2 && cc::camTestNextMode(2) == 3 && cc::camTestNextMode(3) == 0, "camera test: the key steps off, log only, look, bake, off");
+                {
+                    CamTestTimer b;
+                    b.step(cc::kCamTestModeBake, true, false, 70000, &e);
+                    check(b.armed() && b.step(cc::kCamTestModeBake, false, true, 70100, &e) && b.active(), "the bake: a ride up arms it and the first sighting opens it, like the look");
+                    check(std::strcmp(cc::camTestEndName(CamTestEnd::kDone), "the bake took its frames") == 0, "the bake: its end has its own name");
+                    check(cc::bakeDirCount(cc::kBakeDirsAll) == 5 && cc::bakeDirCount(0x11u) == 2, "the bake: the directions it takes are counted");
+                    check(cc::bakeTicks(cc::kBakeDirsAll) == cc::kBakeSettleTicks + 5 + cc::kBakeTailTicks && cc::bakeTicks(0x10u) == cc::kBakeSettleTicks + 1 + cc::kBakeTailTicks, "the bake: its ticks follow the directions");
+                    bool order = true;
+                    for (uint32_t t = 0; t < cc::kBakeSettleTicks; ++t) order = order && cc::bakeDirAt(t, cc::kBakeDirsAll) == 0;
+                    for (uint32_t d = 1; d < cc::kBakeDirs; ++d) order = order && cc::bakeDirAt(cc::kBakeSettleTicks + d, cc::kBakeDirsAll) == d;
+                    check(order, "the bake: the first direction waits for the room to go, then each has one tick");
+                    check(cc::bakeDirAt(cc::kBakeSettleTicks + 4 + cc::kBakeTailTicks, cc::kBakeDirsAll) == 4, "the bake: the last direction stays through the tail");
+                    check(cc::bakeDirAt(0, 0x14u) == 2 && cc::bakeDirAt(cc::kBakeSettleTicks, 0x14u) == 2 && cc::bakeDirAt(cc::kBakeSettleTicks + 1, 0x14u) == 4, "the bake: directions left out are skipped");
+                    check(cc::bakeParseDirs("11111") == cc::kBakeDirsAll && cc::bakeParseDirs("00001") == 0x10u && cc::bakeParseDirs("10100") == 0x5u, "the bake: the directions' key reads left to right");
+                    check(cc::bakeParseDirs("") == cc::kBakeDirsAll && cc::bakeParseDirs("00000") == cc::kBakeDirsAll && cc::bakeParseDirs("1x111") == cc::kBakeDirsAll && cc::bakeParseDirs(nullptr) == cc::kBakeDirsAll,
+                          "the bake: a key it cannot use takes all of them");
+                    // A camera like the game's: reversed infinite depth, turned, relative to the camera. A point goes to clip through the columns, and the inverse brings it back.
+                    const double sx = 0.5625, sy = 1.0, nearP = 0.025;
+                    const double right[3] = {0.5, 0.866025404, 0.0}, up[3] = {0.866025404, -0.5, 0.0}, fwd[3] = {0.0, 0.0, -1.0};
+                    double m[16] = {};
+                    for (int i = 0; i < 3; ++i) {
+                        m[0 + i] = sx * right[i];
+                        m[4 + i] = sy * up[i];
+                        m[12 + i] = fwd[i];
+                    }
+                    m[8 + 3] = nearP;
+                    double inv[16] = {};
+                    check(cc::invert4(m, inv), "the bake: a reversed infinite camera inverts");
+                    const double pt[4] = {12.0, -40.0, -90.0, 1.0};
+                    double clip[4] = {}, back[4] = {};
+                    for (int r = 0; r < 4; ++r)
+                        for (int k = 0; k < 4; ++k) clip[r] += m[r * 4 + k] * pt[k];
+                    const double ndc[4] = {clip[0] / clip[3], clip[1] / clip[3], clip[2] / clip[3], 1.0};
+                    for (int r = 0; r < 4; ++r)
+                        for (int k = 0; k < 4; ++k) back[r] += inv[r * 4 + k] * ndc[k];
+                    check(std::fabs(back[0] / back[3] - pt[0]) < 1e-6 && std::fabs(back[1] / back[3] - pt[1]) < 1e-6 && std::fabs(back[2] / back[3] - pt[2]) < 1e-6, "the bake: the inverse brings a pixel and its depth back to the point");
+                    const double flat[16] = {1, 0, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1};
+                    check(!cc::invert4(flat, inv), "the bake: a singular matrix is refused");
+                }
                 check(cc::camTestLookDir(0) == 0 && cc::camTestLookDir(cc::kCamTestDirMs - 1) == 0 && cc::camTestLookDir(cc::kCamTestDirMs) == 1 && cc::camTestLookDir(cc::kCamTestMs - 1) == cc::kCamTestDirs - 1 &&
                           cc::camTestLookDir(cc::kCamTestMs * 10) == cc::kCamTestDirs - 1, "camera test: the direction steps, and stays on the last past the end");
                 {
@@ -3952,7 +3991,7 @@ int main(int argc, char** argv) {
             const bool lowEdge = tx == 0 && ty == 0;
             cc::cubeTexelOf(CT{0, 0.5f, 0.25f}, 1536, &tx, &ty);
             check(clampHigh && lowEdge && tx == 768 && ty == 384, "backdrop cube: u or v of 1.0 clamps to the last texel, 0.0 is the first, the middle is half the size");
-            check(std::strstr(cc::cubeTexelHlsl(), "uint3 cubeTexel(float3 d, uint size)") != nullptr && cc::kBackdropCubeSize == 3072 && cc::kBackdropLiftMs == 200 && cc::kBackdropWaitFrames == 3,
+            check(std::strstr(cc::cubeTexelHlsl(), "uint3 cubeTexel(float3 d, uint size)") != nullptr && cc::kBackdropCubeSize == 2048 && cc::kBackdropLiftMs == 200 && cc::kBackdropWaitFrames == 3,
                   "backdrop cube: the HLSL twin is present, the cube is 1536 square, the lift 200 ms and the wait 3 frames");
             // The distance modes: the sphere solve, and the cycle.
             {

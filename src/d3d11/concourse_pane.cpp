@@ -184,6 +184,7 @@ std::atomic<bool> g_bdOriginSet{false};             // g_bdOrigin holds this vis
 std::atomic<bool> g_bdOriginSetNow{false};          // the origin was set during the current capture (the capture line says set or kept)
 std::atomic<uint32_t> g_bdCaptures{0};              // captures that went into this cube
 std::atomic<bool> g_bdResetPending{false};          // a new visit (treat rose): the tick empties the cube and forgets the origin
+std::atomic<bool> g_bakeBaked{false};               // TEMPORARY: the cube is the bake's: a new visit does not empty it (treat rises just after the bake, on arrival)
 std::atomic<uint32_t> g_bdParallax{cc::kParallaxDepth};   // the distance mode (hotkey.concourse_backdrop_parallax)
 std::atomic<float> g_bdRadius{cc::kBackdropRadiusDefaultM};   // diag.concourse_backdrop_radius
 std::atomic<ID3D11PixelShader*> g_psBdShow{nullptr}, g_psBdCapture{nullptr};
@@ -3051,7 +3052,7 @@ void concoursePaneSetFeed(const ConcoursePaneFeed& feed) noexcept {
     if (!treatBefore && feed.treat) {   // a new visit to a concourse: what was learned about the panes is forgotten
         std::lock_guard<std::mutex> lock(g_sideMutex);
         g_sides.reset();
-        g_bdResetPending.store(true, std::memory_order_release);   // and the backdrop cube and its origin (the tick does it)
+        if (!g_bakeBaked.load(std::memory_order_acquire)) g_bdResetPending.store(true, std::memory_order_release);   // and the backdrop cube and its origin (the tick does it)
     }
     if (!g_feedWithhold.exchange(feed.withhold, std::memory_order_relaxed) && feed.withhold) {
         g_plainFrom.store(g_frameNow.load(std::memory_order_relaxed), std::memory_order_relaxed);
@@ -3133,7 +3134,331 @@ void backdropTick(ID3D11Device* device, uint32_t frame) noexcept {
         if (g_bdToast.load(std::memory_order_relaxed)) queueToast("Windows: nothing captured");
     }
 }
+
+// ---- The bake (TEMPORARY, concourse_pane.h) ------------------------------------------------------------------------------------------------------------------
+// All of this runs on the render thread: the tick, the resolve's call and Present.
+std::atomic<bool> g_bakeWatch{false};          // the resolve's call has work: a bake is between begin and the hold's end
+std::atomic<bool> g_bakeCapturing{false};
+std::atomic<bool> g_bakeWantPrepare{false};
+std::atomic<bool> g_bakeHoldSave{false};       // each Present keeps the back buffer
+std::atomic<bool> g_bakeHoldShow{false};       // each Present puts the kept image back
+bool g_bakeArmedNow = false, g_bakeReady = false, g_bakeReleasing = false, g_bakeHeldValid = false, g_bakeAtCentre = false, g_bakeSaidRefused = false;
+float g_bakeCentre[3] = {};
+float g_bakeNearM = cc::kBakeNearDefaultM;
+uint32_t g_bakeCaps = 0, g_bakeSeenAtCentre = 0, g_bakeSeenAway = 0, g_bakeHoldPresents = 0, g_bakeReleaseTicks = 0, g_bakeHeldW = 0, g_bakeHeldH = 0;
+uint64_t g_bakeHoldStartMs = 0;
+DXGI_FORMAT g_bakeHeldFmt = DXGI_FORMAT_UNKNOWN;
+ID3D11Device* g_bakeDevice = nullptr;          // not held: compared only
+ID3D11ComputeShader* g_csBake = nullptr;
+ID3D11Buffer* g_cbBake = nullptr;
+ID3D11Texture2D* g_bakeHeld = nullptr;
+struct BakeConstants {
+    float inv[16];     // clip over w to the position relative to the camera
+    float rel[4];      // the camera less the origin
+    float size[4];     // width, height, the near limit, the far limit
+};
+
+// One pixel a thread: its ray and its hit from the inverse of the frame's own camera rows, whatever the camera is, into the texel of the cube that direction from the origin names.
+bool bakeMakeCompute(ID3D11Device* device) noexcept {
+    if (g_bakeDevice != device) {
+        if (g_csBake) g_csBake->Release();
+        if (g_cbBake) g_cbBake->Release();
+        if (g_bakeHeld) g_bakeHeld->Release();
+        g_csBake = nullptr;
+        g_cbBake = nullptr;
+        g_bakeHeld = nullptr;
+        g_bakeHeldValid = false;
+        g_bakeDevice = device;
+    }
+    if (!g_csBake) {
+        typedef HRESULT(WINAPI * PfnCompile)(LPCVOID, SIZE_T, LPCSTR, const void*, void*, LPCSTR, LPCSTR, UINT, UINT, ID3DBlob**, ID3DBlob**);
+        static PfnCompile compile = nullptr;
+        if (!compile) {
+            HMODULE mod = LoadLibraryW(L"d3dcompiler_47.dll");   // never freed: a blob's vtable lives in it (depth_writer_probe.cpp)
+            if (mod) compile = reinterpret_cast<PfnCompile>(GetProcAddress(mod, "D3DCompile"));
+        }
+        if (!compile) return bdRefuse("the bake: d3dcompiler_47.dll was not found");
+        const std::string hlsl = std::string(cc::cubeTexelHlsl()) +
+            "cbuffer C : register(b0) { row_major float4x4 inv; float4 rel; float4 size; };\n"
+            "Texture2D<float4> scene : register(t0);\n"
+            "Texture2D<float> sceneDepth : register(t1);\n"
+            "RWTexture2DArray<float> distCube : register(u0);\n"
+            "RWTexture2DArray<float4> cube : register(u1);\n"
+            "[numthreads(16, 16, 1)]\n"
+            "void main(uint3 id : SV_DispatchThreadID) {\n"
+            "    if (id.x >= (uint)size.x || id.y >= (uint)size.y) return;\n"
+            "    float2 ndc = float2((id.x + 0.5) / size.x * 2.0 - 1.0, 1.0 - (id.y + 0.5) / size.y * 2.0);\n"
+            "    float4 a = mul(inv, float4(ndc, 1.0, 1.0));\n"
+            "    float3 p = a.xyz / a.w;\n"
+            "    float dl = dot(p, p);\n"
+            "    if (dl < 1e-12) return;\n"
+            "    float3 dir = p * rsqrt(dl);\n"
+            "    float z = sceneDepth.Load(int3(id.xy, 0));\n"
+            "    float t = size.w;\n"
+            "    if (z > 0.0) { float4 b = mul(inv, float4(ndc, z, 1.0)); t = min(length(b.xyz / b.w), size.w); }\n"
+            "    float3 r = rel.xyz + dir * t;\n"
+            "    float rl = length(r);\n"
+            "    if (!(rl > size.z)) return;\n"
+            "    uint3 tx = cubeTexel(r, " + std::to_string(cc::kBackdropCubeSize) + "u);\n"
+            "    cube[tx] = float4(clamp(scene.Load(int3(id.xy, 0)).rgb, 0.0, 60000.0), 1.0);\n"
+            "    distCube[tx] = clamp(rl, 1.0, size.w);\n"
+            "}\n";
+        ID3DBlob* code = nullptr;
+        ID3DBlob* errors = nullptr;
+        const HRESULT hr = compile(hlsl.c_str(), hlsl.size(), "concourse_bake", nullptr, nullptr, "main", "cs_5_0", 0, 0, &code, &errors);
+        if (errors) {
+            if (FAILED(hr)) Log::get().note("concourse bake: the shader: %.400s", static_cast<const char*>(errors->GetBufferPointer()));
+            errors->Release();
+        }
+        if (FAILED(hr) || !code) {
+            if (code) code->Release();
+            return bdRefuse("the bake: the shader did not compile");
+        }
+        const HRESULT hc = device->CreateComputeShader(code->GetBufferPointer(), code->GetBufferSize(), nullptr, &g_csBake);
+        code->Release();
+        if (FAILED(hc) || !g_csBake) return bdRefuse("the bake: the shader did not create");
+    }
+    if (!g_cbBake) {
+        D3D11_BUFFER_DESC bd{};
+        bd.ByteWidth = sizeof(BakeConstants);
+        bd.Usage = D3D11_USAGE_DEFAULT;
+        bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+        if (FAILED(device->CreateBuffer(&bd, nullptr, &g_cbBake)) || !g_cbBake) return bdRefuse("the bake: the constant buffer could not be made");
+    }
+    return true;
+}
+
+// The hold's end. A frame with the real camera has been resolved, or it has waited long enough: the screen is never left frozen by a resolve that stopped.
+void bakeEndHold(const char* why, uint64_t nowMs) noexcept {
+    g_bakeHoldShow.store(false, std::memory_order_release);
+    g_bakeWatch.store(false, std::memory_order_release);
+    g_bakeReleasing = false;
+    Log::get().note("concourse bake: the hold ends (%s): %u Presents over %llu ms; %u frames at the centre, %u captured", why, g_bakeHoldPresents,
+                    static_cast<unsigned long long>(nowMs - g_bakeHoldStartMs), g_bakeSeenAtCentre, g_bakeCaps);
+}
+
+void bakeTick(ID3D11Device* device, uint64_t nowMs) noexcept {
+    if (g_bakeWantPrepare.exchange(false, std::memory_order_acq_rel)) {
+        const uint64_t t0 = GetTickCount64();
+        g_bakeReady = device && makeBackdropResources(device) && bakeMakeCompute(device);
+        if (g_bakeReady) {
+            ID3D11UnorderedAccessView* u1 = g_bdBackUav.load(std::memory_order_acquire);
+            ID3D11UnorderedAccessView* u2 = g_bdDistBackUav.load(std::memory_order_acquire);
+            ID3D11DeviceContext* imm = nullptr;
+            device->GetImmediateContext(&imm);
+            if (imm && u1 && u2) {
+                FlatComputeInternalScope internal;
+                const FLOAT zero[4] = {};
+                imm->ClearUnorderedAccessViewFloat(u1, zero);
+                imm->ClearUnorderedAccessViewFloat(u2, zero);
+            } else {
+                g_bakeReady = false;
+            }
+            if (imm) imm->Release();
+        }
+        Log::get().note("concourse bake: armed: the cube is %s after %llu ms", g_bakeReady ? "ready and empty" : "NOT READY", static_cast<unsigned long long>(GetTickCount64() - t0));
+    }
+    if (!g_bakeHoldShow.load(std::memory_order_acquire)) return;
+    if (nowMs - g_bakeHoldStartMs > 1000) {
+        bakeEndHold("a second has passed", nowMs);
+    } else if (g_bakeReleasing) {
+        if (!g_bakeAtCentre && g_bakeSeenAway > 0) bakeEndHold("the camera is back", nowMs);
+        else if (++g_bakeReleaseTicks >= 12) bakeEndHold("12 ticks after the last frame, and the resolve did not see the camera back", nowMs);
+    }
+}
 }  // namespace
+
+void concoursePaneBakeArm(bool on) noexcept {
+    if (on && !g_bakeArmedNow) {
+        g_bakeWantPrepare.store(true, std::memory_order_release);
+        g_bakeHeldValid = false;
+        g_bakeHoldSave.store(true, std::memory_order_release);
+    } else if (!on && g_bakeArmedNow) {
+        g_bakeHoldSave.store(false, std::memory_order_release);
+    }
+    g_bakeArmedNow = on;
+}
+
+bool concoursePaneBakeBegin(const float centre[3], float nearM) noexcept {
+    g_bakeHoldSave.store(false, std::memory_order_release);
+    if (!g_bakeReady || !g_bakeDevice) {
+        Log::get().note("concourse bake: begin: the cube is not ready: nothing is captured or held");
+        return false;
+    }
+    for (int k = 0; k < 3; ++k) g_bakeCentre[k] = centre[k];
+    g_bakeNearM = nearM;
+    g_bakeCaps = g_bakeSeenAtCentre = g_bakeSeenAway = g_bakeHoldPresents = g_bakeReleaseTicks = 0;
+    g_bakeAtCentre = false;
+    g_bakeReleasing = false;
+    g_bakeSaidRefused = false;
+    g_bakeHoldStartMs = GetTickCount64();
+    ID3D11Buffer* origin = g_bdOrigin.load(std::memory_order_acquire);
+    ID3D11DeviceContext* imm = nullptr;
+    g_bakeDevice->GetImmediateContext(&imm);
+    if (imm && origin) {
+        const float o[4] = {centre[0], centre[1], centre[2], 0.0f};
+        imm->UpdateSubresource(origin, 0, nullptr, o, 0, 0);
+        g_bdOriginSet.store(true, std::memory_order_release);
+    }
+    if (imm) imm->Release();
+    g_bakeCapturing.store(true, std::memory_order_release);
+    g_bakeWatch.store(true, std::memory_order_release);
+    if (g_bakeHeldValid) g_bakeHoldShow.store(true, std::memory_order_release);
+    Log::get().note("concourse bake: begin: centre %.2f %.2f %.2f, near %.0f m, the kept image %s", static_cast<double>(centre[0]), static_cast<double>(centre[1]), static_cast<double>(centre[2]),
+                    static_cast<double>(nearM), g_bakeHeldValid ? "is held" : "IS NOT THERE: no hold");
+    return true;
+}
+
+void concoursePaneBakeFinish() noexcept {
+    g_bakeCapturing.store(false, std::memory_order_release);
+    if (!g_bakeWatch.load(std::memory_order_acquire)) return;
+    const uint64_t now = GetTickCount64();
+    ID3D11DeviceContext* imm = nullptr;
+    if (g_bakeDevice) g_bakeDevice->GetImmediateContext(&imm);
+    if (g_bakeCaps > 0 && imm) {
+        backdropPublishFront(imm);
+        g_bdCaptures.store(1, std::memory_order_release);
+        g_bdCubeValid.store(true, std::memory_order_release);
+        g_bakeBaked.store(true, std::memory_order_release);
+        g_bdAutoOn.store(false, std::memory_order_relaxed);
+        setMode(kModeBackdrop, "the bake", false);
+    }
+    if (imm) imm->Release();
+    Log::get().note("concourse bake: finished after %llu ms: %u frames captured, of %u seen at the centre; %s", static_cast<unsigned long long>(now - g_bakeHoldStartMs), g_bakeCaps, g_bakeSeenAtCentre,
+                    g_bakeCaps > 0 ? "the windows show it now" : "NOTHING CAPTURED, the cube is as it was (is an anti-aliasing mode on? the capture sits in its path)");
+    g_bakeReleaseTicks = 0;
+    g_bakeSeenAway = 0;
+    g_bakeReleasing = true;
+    if (!g_bakeHoldShow.load(std::memory_order_acquire)) g_bakeWatch.store(false, std::memory_order_release);
+}
+
+void concoursePaneBakeCancel() noexcept {
+    g_bakeHoldSave.store(false, std::memory_order_release);
+    g_bakeCapturing.store(false, std::memory_order_release);
+    g_bakeArmedNow = false;
+    if (g_bakeHoldShow.load(std::memory_order_acquire)) {
+        g_bakeReleaseTicks = 0;
+        g_bakeSeenAway = 0;
+        g_bakeReleasing = true;
+    } else {
+        g_bakeWatch.store(false, std::memory_order_release);
+    }
+    Log::get().note("concourse bake: cancelled: nothing is published");
+}
+
+void concoursePaneBakeFrame(ID3D11DeviceContext* ctx, ID3D11ShaderResourceView* color, ID3D11ShaderResourceView* depth, const float camera[6][4], uint32_t width, uint32_t height) noexcept {
+    if (!g_bakeWatch.load(std::memory_order_acquire)) return;
+    const float dx = camera[5][0] - g_bakeCentre[0], dy = camera[5][1] - g_bakeCentre[1], dz = camera[5][2] - g_bakeCentre[2];
+    g_bakeAtCentre = dx * dx + dy * dy + dz * dz < 4.0f;
+    if (!g_bakeAtCentre) {
+        ++g_bakeSeenAway;
+        return;
+    }
+    ++g_bakeSeenAtCentre;
+    if (!g_bakeCapturing.load(std::memory_order_acquire)) return;
+    ID3D11UnorderedAccessView* uav[2] = {g_bdDistBackUav.load(std::memory_order_acquire), g_bdBackUav.load(std::memory_order_acquire)};
+    if (!ctx || !color || !depth || !g_csBake || !g_cbBake || !uav[0] || !uav[1] || width == 0 || height == 0) {
+        if (!g_bakeSaidRefused) {
+            g_bakeSaidRefused = true;
+            Log::get().note("concourse bake: a frame refused: colour %d depth %d shader %d cubes %d, %ux%u", color ? 1 : 0, depth ? 1 : 0, g_csBake ? 1 : 0, uav[0] && uav[1] ? 1 : 0, width, height);
+        }
+        return;
+    }
+    // b1[270..273] are the clip columns over the position relative to the camera (flat_projection_recipes.h), so the matrix's column c, row r is camera[c][r].
+    double m[16], inv[16];
+    for (int r = 0; r < 4; ++r)
+        for (int c = 0; c < 4; ++c) m[r * 4 + c] = camera[c][r];
+    if (!cc::invert4(m, inv)) {
+        if (!g_bakeSaidRefused) {
+            g_bakeSaidRefused = true;
+            Log::get().note("concourse bake: a frame refused: its camera rows do not invert");
+        }
+        return;
+    }
+    BakeConstants k{};
+    for (int i = 0; i < 16; ++i) k.inv[i] = static_cast<float>(inv[i]);
+    k.rel[0] = dx;
+    k.rel[1] = dy;
+    k.rel[2] = dz;
+    k.size[0] = static_cast<float>(width);
+    k.size[1] = static_cast<float>(height);
+    k.size[2] = g_bakeNearM;
+    k.size[3] = cc::kBackdropFarM;
+    {
+        FlatComputeInternalScope internal;
+        ID3D11ComputeShader* oldCs = nullptr;
+        ID3D11ShaderResourceView* oldSrv[2] = {};
+        ID3D11UnorderedAccessView* oldUav[2] = {};
+        ID3D11Buffer* oldCb = nullptr;
+        ctx->CSGetShader(&oldCs, nullptr, nullptr);
+        ctx->CSGetShaderResources(0, 2, oldSrv);
+        ctx->CSGetUnorderedAccessViews(0, 2, oldUav);
+        ctx->CSGetConstantBuffers(0, 1, &oldCb);
+        ctx->UpdateSubresource(g_cbBake, 0, nullptr, &k, 0, 0);
+        ID3D11ShaderResourceView* srv[2] = {color, depth};
+        ctx->CSSetShader(g_csBake, nullptr, 0);
+        ctx->CSSetConstantBuffers(0, 1, &g_cbBake);
+        ctx->CSSetShaderResources(0, 2, srv);
+        ctx->CSSetUnorderedAccessViews(0, 2, uav, nullptr);
+        ctx->Dispatch((width + 15u) / 16u, (height + 15u) / 16u, 1);
+        ctx->CSSetShader(oldCs, nullptr, 0);
+        ctx->CSSetConstantBuffers(0, 1, &oldCb);
+        ctx->CSSetShaderResources(0, 2, oldSrv);
+        ctx->CSSetUnorderedAccessViews(0, 2, oldUav, nullptr);
+        if (oldCs) oldCs->Release();
+        if (oldCb) oldCb->Release();
+        for (auto* p : oldSrv) if (p) p->Release();
+        for (auto* p : oldUav) if (p) p->Release();
+    }
+    ++g_bakeCaps;
+    if (g_bakeCaps <= 16) {
+        const float sy = std::sqrt(camera[0][1] * camera[0][1] + camera[1][1] * camera[1][1] + camera[2][1] * camera[2][1]);
+        Log::get().note("concourse bake: capture %u: %ux%u, forward %.2f %.2f %.2f, vertical field of view %.1f degrees", g_bakeCaps, width, height, static_cast<double>(camera[0][3]), static_cast<double>(camera[1][3]),
+                        static_cast<double>(camera[2][3]), sy > 0.0f ? 2.0 * std::atan(1.0 / static_cast<double>(sy)) * 57.29578 : 0.0);
+    }
+}
+
+void concoursePaneBakePresent(IDXGISwapChain* swap) noexcept {
+    const bool save = g_bakeHoldSave.load(std::memory_order_acquire), show = g_bakeHoldShow.load(std::memory_order_acquire);
+    if ((!save && !show) || !swap || !g_bakeDevice) return;
+    ID3D11Texture2D* back = nullptr;
+    if (FAILED(swap->GetBuffer(0, IID_PPV_ARGS(&back))) || !back) return;
+    ID3D11DeviceContext* imm = nullptr;
+    g_bakeDevice->GetImmediateContext(&imm);
+    if (imm) {
+        FlatComputeInternalScope internal;
+        if (show) {
+            ++g_bakeHoldPresents;
+            if (g_bakeHeld && g_bakeHeldValid) imm->CopyResource(back, g_bakeHeld);
+        } else {
+            D3D11_TEXTURE2D_DESC bd{};
+            back->GetDesc(&bd);
+            if (!g_bakeHeld || g_bakeHeldW != bd.Width || g_bakeHeldH != bd.Height || g_bakeHeldFmt != bd.Format) {
+                if (g_bakeHeld) g_bakeHeld->Release();
+                g_bakeHeld = nullptr;
+                g_bakeHeldValid = false;
+                D3D11_TEXTURE2D_DESC td = bd;
+                td.Usage = D3D11_USAGE_DEFAULT;
+                td.BindFlags = 0;
+                td.CPUAccessFlags = 0;
+                td.MiscFlags = 0;
+                td.MipLevels = 1;
+                td.ArraySize = 1;
+                if (bd.SampleDesc.Count == 1 && SUCCEEDED(g_bakeDevice->CreateTexture2D(&td, nullptr, &g_bakeHeld)) && g_bakeHeld) {
+                    g_bakeHeldW = bd.Width;
+                    g_bakeHeldH = bd.Height;
+                    g_bakeHeldFmt = bd.Format;
+                }
+            }
+            if (g_bakeHeld) {
+                imm->CopyResource(g_bakeHeld, back);
+                g_bakeHeldValid = true;
+            }
+        }
+        imm->Release();
+    }
+    back->Release();
+}
 
 void concoursePaneTick(ID3D11Device* device, uint32_t frame, uint64_t nowMs) noexcept {
     g_lastTickMs = nowMs;
@@ -3227,6 +3552,7 @@ void concoursePaneTick(ID3D11Device* device, uint32_t frame, uint64_t nowMs) noe
         readMaterials(device, frame);
     }
     backdropTick(device, frame);
+    bakeTick(device, nowMs);
     updateArmed();
 }
 

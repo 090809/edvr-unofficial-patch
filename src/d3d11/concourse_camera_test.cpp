@@ -119,6 +119,8 @@ std::atomic<uint32_t> g_ctRvCount{0}, g_ctMain{0}, g_ctFlags{0}, g_ctSlotIdx{0},
 std::atomic<bool> g_ctSlotKnown{false};
 std::atomic<float> g_ctRvPos[3], g_ctSlot[3], g_ctCamBefore[3], g_ctCamAfter[3], g_ctFwdBefore[3], g_ctFwdAfter[3], g_ctLookCentre[3], g_ctLookUp[3];
 std::atomic<uint32_t> g_ctLookDir{0};
+std::atomic<bool> g_ctAimOn{false};          // the bake: the rows are aimed outright, not the player's turned
+std::atomic<float> g_ctAimFwd[3], g_ctAimUp[3], g_ctAimFov{0.0f};
 uintptr_t g_ctBase=0;
 
 __declspec(noinline) uintptr_t __fastcall viewsObserved(uintptr_t,uintptr_t,uintptr_t) noexcept;
@@ -194,18 +196,39 @@ void ctCameraEdit(uintptr_t cam,uint32_t mode) noexcept {
             g_ctCamBefore[i].store(pos[i],std::memory_order_relaxed);
             g_ctFwdBefore[i].store(fwd[i],std::memory_order_relaxed);
         }
-        if(g_ctActing.load(std::memory_order_relaxed)&&mode==2) {
-            // The player's own axes turned: directions 0 to 3 a quarter turn at a time about the room's up, 4 and 5 straight up and down, about the camera's right row.
-            float up[3];
-            for(int i=0;i<3;++i)up[i]=g_ctLookUp[i].load(std::memory_order_relaxed);
-            const uint32_t dir=g_ctLookDir.load(std::memory_order_relaxed);
+        if(g_ctActing.load(std::memory_order_relaxed)&&(mode==2||mode==3)) {
             float* rows[3]={reinterpret_cast<float*>(cam),reinterpret_cast<float*>(cam+0x10u),reinterpret_cast<float*>(cam+0x20u)};
-            for(uint32_t k=0;k<(dir<4u?dir:0u);++k)for(int r=0;r<3;++r)ctTurn90(rows[r],up);
-            if(dir==4u||dir==5u) {
-                const float sign=dir==4u?1.0f:-1.0f;
-                const float axis[3]={rows[0][0]*sign,rows[0][1]*sign,rows[0][2]*sign};
-                ctTurn90(rows[1],axis);
-                ctTurn90(rows[2],axis);
+            if(g_ctAimOn.load(std::memory_order_relaxed)) {
+                // The bake: the forward row is where the view looks (Flight 24: the row at the room's up looked up). The right row keeps the game's handedness, read off its own rows: with
+                // h = (R x U) . F, R' = h (U' x F') gives (R' x U') . F' = h.
+                const float* R=rows[0];const float* U=rows[1];const float* F=rows[2];
+                const float h=(R[1]*U[2]-R[2]*U[1])*F[0]+(R[2]*U[0]-R[0]*U[2])*F[1]+(R[0]*U[1]-R[1]*U[0])*F[2]<0.0f?-1.0f:1.0f;
+                float fw[3],up[3];
+                for(int i=0;i<3;++i) {
+                    fw[i]=g_ctAimFwd[i].load(std::memory_order_relaxed);
+                    up[i]=g_ctAimUp[i].load(std::memory_order_relaxed);
+                }
+                rows[0][0]=h*(up[1]*fw[2]-up[2]*fw[1]);
+                rows[0][1]=h*(up[2]*fw[0]-up[0]*fw[2]);
+                rows[0][2]=h*(up[0]*fw[1]-up[1]*fw[0]);
+                for(int i=0;i<3;++i) {
+                    rows[1][i]=up[i];
+                    rows[2][i]=fw[i];
+                }
+                const float fov=g_ctAimFov.load(std::memory_order_relaxed);
+                if(fov>0.0f)*reinterpret_cast<float*>(cam+0x260u)=fov;   // the vertical field of view (READ, 0x4F30F0); the producer leaves the camera dirty, so the projection is built from it
+            } else {
+                // The look: the player's own axes turned: directions 0 to 3 a quarter turn at a time about the room's up, 4 and 5 straight up and down, about the camera's right row.
+                float up[3];
+                for(int i=0;i<3;++i)up[i]=g_ctLookUp[i].load(std::memory_order_relaxed);
+                const uint32_t dir=g_ctLookDir.load(std::memory_order_relaxed);
+                for(uint32_t k=0;k<(dir<4u?dir:0u);++k)for(int r=0;r<3;++r)ctTurn90(rows[r],up);
+                if(dir==4u||dir==5u) {
+                    const float sign=dir==4u?1.0f:-1.0f;
+                    const float axis[3]={rows[0][0]*sign,rows[0][1]*sign,rows[0][2]*sign};
+                    ctTurn90(rows[1],axis);
+                    ctTurn90(rows[2],axis);
+                }
             }
             for(int i=0;i<3;++i)pos[i]=g_ctLookCentre[i].load(std::memory_order_relaxed);
             g_ctWritten.fetch_add(1,std::memory_order_relaxed);
@@ -287,10 +310,10 @@ bool concourseCameraTestInstall(const char** why) noexcept {
     } catch(...) {*why="an exception during the install";return false;}
 }
 
-// The mode (0 off, 1 log only, 2 the look) and whether the camera may be written now. The relay gate is open while the mode is not 0.
+// The mode (0 off, 1 log only, 2 the look, 3 the bake) and whether the camera may be written now. The relay gate is open while the mode is not 0.
 void concourseCameraTestControl(uint32_t mode,bool acting) noexcept {
     g_ctMode.store(mode,std::memory_order_relaxed);
-    g_ctActing.store(acting&&mode==2,std::memory_order_relaxed);
+    g_ctActing.store(acting&&(mode==2||mode==3),std::memory_order_relaxed);
     camTestGate.store(mode!=0?uintptr_t(1):uintptr_t(0),std::memory_order_release);
 }
 
@@ -301,6 +324,18 @@ void concourseCameraTestLook(const float centre[3],const float up[3],uint32_t di
         g_ctLookUp[i].store(up[i],std::memory_order_relaxed);
     }
     g_ctLookDir.store(dir,std::memory_order_relaxed);
+    g_ctAimOn.store(false,std::memory_order_relaxed);
+}
+
+// The bake's frame: where it stands, the unit axes it looks along, and its vertical field of view in radians.
+void concourseCameraTestAim(const float centre[3],const float forward[3],const float up[3],float fovRad) noexcept {
+    for(int i=0;i<3;++i) {
+        g_ctLookCentre[i].store(centre[i],std::memory_order_relaxed);
+        g_ctAimFwd[i].store(forward[i],std::memory_order_relaxed);
+        g_ctAimUp[i].store(up[i],std::memory_order_relaxed);
+    }
+    g_ctAimFov.store(fovRad,std::memory_order_relaxed);
+    g_ctAimOn.store(true,std::memory_order_relaxed);
 }
 
 bool concourseCameraTestHooked() noexcept {return g_ctHooked.load(std::memory_order_acquire)!=0;}

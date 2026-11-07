@@ -1851,6 +1851,7 @@ HRESULT STDMETHODCALLTYPE hookedPresent(IDXGISwapChain* self, UINT syncInterval,
         formatDesktopVsync(line, sizeof(line), flatProfileNow, syncInterval);
         Log::get().note("%s", line);
     }
+    if (flatProfileNow && !(flags & DXGI_PRESENT_TEST)) concoursePaneBakePresent(self);   // TEMPORARY (the concourse bake): keeps the back buffer, or puts the kept image back. One load otherwise
     const int64_t presentT0 = qpcNow();
     const HRESULT hr = g_state->realPresent(self, presentSync, flags);
     const int64_t presentT1 = qpcNow();

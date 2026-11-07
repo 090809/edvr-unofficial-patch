@@ -210,4 +210,17 @@ void concoursePaneBackdropEnd() noexcept;                      // the cull's tic
 bool concoursePaneTakeToast(char* out, size_t size) noexcept;
 void concoursePaneQueueToast(const char* text) noexcept;   // TEMPORARY: the camera test's key (optimized_station.cpp) shows its mode through the same toast
 
+// ---- The bake (TEMPORARY, docs\concourse-cull-2026-11-05.md "Flight 24 results"): the cube filled at arrival from the room's centre, in the frames the camera is moved for ------
+// Arm when a ride up is armed: the cubes and the shader are made and cleared in the tick, while the cabin is shut, and the back buffer is kept each Present. Begin when the anchor is first
+// seen: the kept image is shown from then on, and each frame the resolve sees at the centre goes into the cube. Finish when the frames are taken: the cube is published and the pane
+// mode becomes the captured view; the hold ends when the resolve sees the camera back. Cancel ends it with nothing published.
+void concoursePaneBakeArm(bool on) noexcept;
+bool concoursePaneBakeBegin(const float centre[3], float nearM) noexcept;   // false when the cube was not ready: the frames still move, nothing is captured or held
+void concoursePaneBakeFinish() noexcept;
+void concoursePaneBakeCancel() noexcept;
+// From the flat runtime, with what the resolve is about to read: the scene's colour and depth before the visor and the HUD, and b1[270..275]. One relaxed load when no bake runs.
+void concoursePaneBakeFrame(ID3D11DeviceContext* ctx, ID3D11ShaderResourceView* color, ID3D11ShaderResourceView* depth, const float camera[6][4], uint32_t width, uint32_t height) noexcept;
+// From Present, just before the real one: keeps the back buffer, or puts the kept image back. One relaxed load when no bake runs.
+void concoursePaneBakePresent(IDXGISwapChain* swap) noexcept;
+
 }  // namespace edvr

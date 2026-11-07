@@ -1,3 +1,4 @@
+#include "concourse_pane.h"   // TEMPORARY: the bake's frames (docs\concourse-cull-2026-11-05.md)
 #include "flat_light_payload_capture.h"
 #include <sstream>
 #include "flat_origin_capture.h"
@@ -7522,6 +7523,7 @@ FlatRuntimeDrawScope::FlatRuntimeDrawScope(ID3D11DeviceContext* context, uint32_
         return;
     }
     fetchCelestialRecords(ctx, f);   // planet patch motion: this frame's records for the resolve's t18
+    concoursePaneBakeFrame(ctx, f.color, f.depth, f.camera, f.renderWidth, f.renderHeight);   // TEMPORARY (docs\concourse-cull-2026-11-05.md): one relaxed load when no bake runs
     if (!flatMonoResolve(s.device.Get(), ctx, f, &outputView, &s.reason)) {
         const char* temporalReason=s.reason;
         const char* fallbackReason=nullptr;
@@ -7876,6 +7878,7 @@ void FlatRuntimeDrawScope::treatHdr(const FlatMonoFrame& selected, uint32_t srvS
     }
     reach("resolve");   // the frame is the resolver's from here
     fetchCelestialRecords(ctx, f);   // planet patch motion: this frame's records for the resolve's t18
+    concoursePaneBakeFrame(ctx, f.color, f.depth, f.camera, f.renderWidth, f.renderHeight);   // TEMPORARY (docs\concourse-cull-2026-11-05.md): one relaxed load when no bake runs
     if (!flatMonoResolve(s.device.Get(), ctx, f, &outputView, &s.reason)) {
         const char* temporalReason = s.reason;
         // The backend (or the route's own guard) refused before H was written. Recover the jitter into H, or decline.
