@@ -12,6 +12,7 @@
 
 #include <cstdint>
 
+#include "../common/framegen_replay_math.h"
 #include "../common/framegen_synth_math.h"
 
 namespace edvr {
@@ -33,6 +34,12 @@ struct FrameGenSynthFrame {
     bool depthWritten = false;                      // this frame wrote a depth copy (zcWritten)
     bool cameraJump = false;                        // the camera gate dropped or carried this frame's rows, or the origin jumped: built, not scored
     bool wantShown = false;                         // the eye dump is open: build the f = 0.5 S on this frame whatever the alternation says
+    // Replay capture (.agents/framegen-replay-format.md): the eye dump is open on the left eye and this is its frame replayIndex (0..5). The module copies B's output, depth and
+    // vectors into staging textures and keeps what the constant block was built from; nothing is written until frameGenReplayFinish. Needs wantShown (the f = 0.5 variant).
+    bool replay = false;
+    uint32_t replayIndex = 0;
+    const float* tanPrev = nullptr;                 // the previous frame's tangents when the pass has them (null otherwise); recorded only
+    bool worldValid = false;                        // the pass's world path was on (deltas.W / deltas.tv are real); recorded only
 };
 
 // Once per treated eye-frame (usedDlaa, key on). `frame` is the pass's frame counter: the f = 1 S is scored only against the frame right after it.
@@ -43,6 +50,14 @@ ID3D11Texture2D* frameGenSynthShown(uint32_t eye, uint32_t frame);
 
 // Once a frame: the one-second report when the key is on, the release of the resources when it went off.
 void frameGenSynthFrameBoundary();
+
+// Replay capture, the writer. frameGenReplayFinish(eyesDir, stamp) is called when the eye dump writes its files: it makes <eyesDir>\fgreplay_<stamp>\ and hands the frames captured by
+// the run to the pump, which writes them one file at a time on a worker thread. frameGenReplayPump (once a frame, from frameGenSynthFrameBoundary) maps a finished copy with
+// DO_NOT_WAIT only (a copy the GPU has not finished is tried again next frame), starts the worker, and joins a finished one. Returns false when there was nothing to write.
+bool frameGenReplayFinish(const wchar_t* eyesDir, const wchar_t* stamp);
+void frameGenReplayPump();
+bool frameGenReplayIdle();            // nothing captured and nothing being written
+uint32_t frameGenReplayCaptured();    // frames held (captured, not yet written out)
 
 // For the WARP rig (tools/framegen_synth_test): whether any shader, buffer or texture exists, and a copy of the open one-second window.
 bool frameGenSynthResident();

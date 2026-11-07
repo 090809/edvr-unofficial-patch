@@ -861,6 +861,131 @@ void case8Offsets(Scope& sc) {
           kFrameGenSynthNoRead < -kFrameGenSynthMaxOffset * 1.5f, label);
 }
 
+// ---- case 9: the replay capture's writer (.agents/framegen-replay-format.md) ----------------------------------------------------------------------------------
+
+std::string readWholeFile(const std::wstring& path) {
+    std::string out;
+    FILE* fp = nullptr;
+    if (_wfopen_s(&fp, path.c_str(), L"rb") || !fp) return out;
+    char buf[65536];
+    size_t n;
+    while ((n = std::fread(buf, 1, sizeof(buf), fp)) > 0) out.append(buf, n);
+    std::fclose(fp);
+    return out;
+}
+
+bool pumpUntilIdle() {
+    for (int i = 0; i < 4000 && !frameGenReplayIdle(); ++i) { frameGenReplayPump(); Sleep(5); }
+    return frameGenReplayIdle();
+}
+
+std::wstring widen(const char* s) { return std::wstring(s, s + std::strlen(s)); }
+
+void case9Replay(Gpu& g, Scope& sc) {
+    char label[260];
+    {   // the hash is a real SHA-256
+        Sha256 a; a.update("abc", 3);
+        sc.ok(a.hex() == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad", "case 9: SHA-256 of \"abc\" is the published value");
+        Sha256 e;
+        sc.ok(e.hex() == "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", "case 9: SHA-256 of nothing is the published value");
+        Sha256 m; const std::string block(1000, 'a'); for (int i = 0; i < 1000; ++i) m.update(block.data(), block.size());
+        sc.ok(m.hex() == "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0", "case 9: SHA-256 of a million a's (fed in pieces) is the published value");
+    }
+    wchar_t tmp[MAX_PATH];
+    GetTempPathW(MAX_PATH, tmp);
+    const std::wstring root = std::wstring(tmp) + L"edvr_replay_test_" + std::to_wstring(GetCurrentProcessId());
+    CreateDirectoryW(root.c_str(), nullptr);
+    Scene s;
+    s.gradient();
+    for (size_t i = 0; i < s.depth.size(); ++i) s.depth[i] = 0.001f * static_cast<float>(i % 97);
+    for (size_t i = 0; i < s.mv.size(); ++i) s.mv[i] = 0.25f * static_cast<float>(i % 13);
+    ModuleFrame m;
+    if (!makeInputs(g, s, m.out, m.depth, m.mv)) { sc.ok(false, "case 9: inputs were made"); return; }
+    FrameGenSynthFrame f;
+    f.renderW = RW; f.renderH = RH; f.outW = RW; f.outH = RH;
+    f.tanNow = kTan;
+    f.depthA = 0.0f; f.depthB = kDepthB; f.splitMetres = 10.0f;
+    f.depthWritten = true;
+    f.outSrv = m.out.srv.Get(); f.depthSrv = m.depth.srv.Get(); f.mvSrv = m.mv.srv.Get();
+    f.wantShown = true;
+    f.worldValid = true;
+    f.deltas = Deltas(1.0f, 0.5f, 0.25f, -0.125f).d;
+    f.deltas.W[1] = 0.5f; f.deltas.tv[2] = 3.0f;
+    const wchar_t* stamp = L"20260101-000000";
+    uint32_t frame = 9000;
+
+    // The trigger off (replay never set): nothing is captured, nothing is written, not even the folder.
+    frameGenSynthConfigure(true);
+    for (uint32_t k = 0; k < 8; ++k) frameGenSynthEyeFrame(g.dev.Get(), g.ctx.Get(), 0, frame++, f);
+    sc.ok(!frameGenReplayFinish(root.c_str(), stamp) && frameGenReplayIdle() && GetFileAttributesW((root + L"\\fgreplay_" + stamp).c_str()) == INVALID_FILE_ATTRIBUTES,
+          "case 9: without the dump trigger nothing is captured and nothing is written");
+
+    // A full run of six frames (a seventh asked for is ignored).
+    f.replay = true;
+    for (uint32_t k = 0; k < 7; ++k) { f.replayIndex = k; f.deltas.Hd[0] = 1.0f - 0.001f * k; frameGenSynthEyeFrame(g.dev.Get(), g.ctx.Get(), 0, frame++, f); }
+    sc.ok(frameGenReplayCaptured() == 6, "case 9: six consecutive frames were captured (not seven)");
+    sc.ok(frameGenReplayFinish(root.c_str(), stamp), "case 9: the capture was handed to the writer");
+    const std::wstring dir = root + L"\\fgreplay_" + stamp;
+    sc.ok(GetFileAttributesW((dir + L"\\f0_out.bin").c_str()) == INVALID_FILE_ATTRIBUTES, "case 9: nothing is written on the frame it was handed over (the writer is the pump's)");
+    sc.ok(pumpUntilIdle(), "case 9: the pump wrote everything and went idle");
+    const std::string manifest = readWholeFile(dir + L"\\manifest.json");
+    sc.ok(manifest.find("\"frames\": 6") != std::string::npos && manifest.find("\"stopped_reason\": null") != std::string::npos && manifest.find("\"eye\": \"left\"") != std::string::npos &&
+              manifest.find("\"stamp\": \"20260101-000000\"") != std::string::npos && manifest.find("\"build\": \"") != std::string::npos,
+          "case 9: the manifest names the stamp, the build, the eye, six frames and no early stop");
+    int goodFiles = 0, files = 0;
+    const size_t want[3] = {static_cast<size_t>(RW) * RH * 16, static_cast<size_t>(RW) * RH * 4, static_cast<size_t>(RW) * RH * 4};
+    const char* part[3] = {"out", "depth", "mv"};
+    std::vector<uint16_t> mvHalf(s.mv.size());
+    for (size_t i = 0; i < s.mv.size(); ++i) mvHalf[i] = floatToHalf(s.mv[i]);
+    const void* ref[3] = {s.rgba.data(), s.depth.data(), mvHalf.data()};
+    for (uint32_t k = 0; k < 6; ++k)
+        for (int i = 0; i < 3; ++i) {
+            char name[40];
+            std::snprintf(name, sizeof(name), "f%u_%s.bin", k, part[i]);
+            ++files;
+            const std::string body = readWholeFile(dir + L"\\" + widen(name));
+            Sha256 h; h.update(body.data(), body.size());
+            char probe[200];
+            std::snprintf(probe, sizeof(probe), "{\"name\": \"%s\", \"bytes\": %zu, \"sha256\": \"%s\"}", name, want[i], h.hex().c_str());
+            if (body.size() == want[i] && std::memcmp(body.data(), ref[i], want[i]) == 0 && manifest.find(probe) != std::string::npos) ++goodFiles;
+        }
+    std::snprintf(label, sizeof(label), "case 9: all 18 bins have the right byte size, the exact texels and a manifest entry with their SHA-256 (%d of %d)", goodFiles, files);
+    sc.ok(goodFiles == 18, label);
+    const std::string j3 = readWholeFile(dir + L"\\f3.json");
+    if (g_verbose) std::printf("%s", j3.c_str());
+    sc.ok(j3.find("\"render_w\": 128") != std::string::npos && j3.find("\"out_format_name\": \"R32G32B32A32_FLOAT\"") != std::string::npos && j3.find("\"depth_format_name\": \"R32_FLOAT\"") != std::string::npos &&
+              j3.find("\"mv_format_name\": \"R16G16_FLOAT\"") != std::string::npos && j3.find("\"variant\": 0") != std::string::npos && j3.find("\"world_valid\": true") != std::string::npos &&
+              j3.find("\"tan_prev\": null") != std::string::npos && j3.find("\"hd\": [0.99699") != std::string::npos && j3.find("\"tv_cam\": [0, 0, 3]") != std::string::npos && j3.find("\"frame\": 9011") != std::string::npos &&
+              j3.find("\"qpc_freq\"") != std::string::npos && j3.find("\"world_w\": [1, 0.5, 0,") != std::string::npos && j3.find("\"split_metres\": 10") != std::string::npos,
+          "case 9: f3.json carries the frame's sizes, formats, variant, head and world deltas, pass frame and clock");
+
+    // A broken run (frame 2 never came): the capture stops at 2 frames and the manifest says why.
+    const std::wstring dir2 = root + L"\\fgreplay_20260101-000001";
+    for (uint32_t k : {0u, 1u, 3u, 4u}) { f.replayIndex = k; frameGenSynthEyeFrame(g.dev.Get(), g.ctx.Get(), 0, frame++, f); }
+    sc.ok(frameGenReplayFinish(root.c_str(), L"20260101-000001") && pumpUntilIdle(), "case 9: a run with a missing frame was written");
+    const std::string manifest2 = readWholeFile(dir2 + L"\\manifest.json");
+    sc.ok(manifest2.find("\"frames\": 2") != std::string::npos && manifest2.find("was not captured") != std::string::npos && GetFileAttributesW((dir2 + L"\\f2_out.bin").c_str()) == INVALID_FILE_ATTRIBUTES,
+          "case 9: the broken run stops at the missing frame and the manifest says why");
+
+    // The key off: a run in progress is dropped at the next boundary and nothing more is captured.
+    f.replayIndex = 0; frameGenSynthEyeFrame(g.dev.Get(), g.ctx.Get(), 0, frame++, f);
+    frameGenSynthConfigure(false);
+    frameGenSynthFrameBoundary();
+    f.replayIndex = 1; frameGenSynthEyeFrame(g.dev.Get(), g.ctx.Get(), 0, frame++, f);
+    sc.ok(frameGenReplayCaptured() == 0 && !frameGenReplayFinish(root.c_str(), L"20260101-000002") && frameGenReplayIdle(), "case 9: with the key off nothing is captured and a run in progress is dropped");
+
+    for (const std::wstring& d : {dir, dir2}) {   // clean up
+        WIN32_FIND_DATAW fd;
+        HANDLE h = FindFirstFileW((d + L"\\*").c_str(), &fd);
+        if (h != INVALID_HANDLE_VALUE) {
+            do { if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) DeleteFileW((d + L"\\" + fd.cFileName).c_str()); } while (FindNextFileW(h, &fd));
+            FindClose(h);
+        }
+        RemoveDirectoryW(d.c_str());
+    }
+    RemoveDirectoryW(root.c_str());
+}
+
 // ---- the run ---------------------------------------------------------------------------------------------------------------------------------------------
 
 void swapIn(Gpu& g, ComPtr<ID3D11ComputeShader> saved[kEntries], const ComPtr<ID3D11ComputeShader> mutated[kEntries]) {
@@ -894,7 +1019,8 @@ int run() {
     if (!alive("case 6")) return 1;
     case7Check(g, sc);
     case8Offsets(sc);
-    if (!alive("cases 7 and 8")) return 1;
+    case9Replay(g, sc);
+    if (!alive("cases 7 to 9")) return 1;
     (void)edge;
 
     // The mutations: each must break its case.

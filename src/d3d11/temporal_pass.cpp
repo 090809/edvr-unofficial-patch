@@ -2640,6 +2640,7 @@ void writeEyeRun(ID3D11DeviceContext* ctx, uint32_t cw, uint32_t ch) {
                         wrote,g_eyeRunTaken-1,cw,ch,g_eyeRunStamp);
     } else {
         writeEyeDecisionArtifacts(ctx, dir);
+        frameGenReplayFinish(dir.c_str(), g_eyeRunStamp);   // the synthesizer's replay capture of the run (nothing unless the key was on and the run's frames were taken), written over the next frames
         writeEyeMotionTrace(dir);
         Log::get().note("temporal aa: paired eye run %ls: %d treated crops T00..%02d (%ux%u), "
                         "%d raw crops plus overview written. C and T share scene-frame IDs in "
@@ -5219,6 +5220,13 @@ void* temporalInner(void* srcTex, int eye, const float* bounds,
                             sy.depthWritten = zcWritten;
                             sy.cameraJump = gateJump || jumpedNow;
                             sy.wantShown = dumpFrame;
+                            // Replay capture (.agents/framegen-replay-format.md): the dump's first six left-eye frames, with what the constant block and the bench need beside the Hd and th above.
+                            memcpy(sy.deltas.W, fg.deltas.W, sizeof(sy.deltas.W));
+                            memcpy(sy.deltas.tv, fg.deltas.tv, sizeof(sy.deltas.tv));
+                            sy.worldValid = worldOn;
+                            sy.tanPrev = fg.tanPrev;
+                            sy.replay = dumpFrame && g_eyeRunTaken < static_cast<int>(kFrameGenReplayFrames);
+                            sy.replayIndex = static_cast<uint32_t>(g_eyeRunTaken);
                             gpuCensusBegin(ctx, GpuCensusSection::DoorFrameGenSynth);
                             frameGenSynthEyeFrame(dev, ctx, static_cast<uint32_t>(eye), g_rowsFrame, sy);
                             gpuCensusEnd(ctx, GpuCensusSection::DoorFrameGenSynth);
