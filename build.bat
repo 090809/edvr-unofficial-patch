@@ -721,6 +721,7 @@ python tools\compile_cache.py --prune --keep thunks.obj --keep weapon_ui_getter_
     "src\d3d11\luma_probe.cpp" ^
     "src\d3d11\sky_ring.cpp" ^
     "src\d3d11\framegen_shadow.cpp" ^
+    "src\d3d11\framegen_synth.cpp" ^
     "src\d3d11\terrain_cull_cover_hook.cpp" ^
     "src\d3d11\dlaa.cpp" ^
     "src\d3d11\fsr3_engine.cpp" ^
@@ -2137,6 +2138,27 @@ if not exist "%OBJ%\framegensynthreport" mkdir "%OBJ%\framegensynthreport"
 if errorlevel 1 ( echo [edvr] ERROR: framegen_synth_report_test build failed & exit /b 1 )
 "%OBJ%\framegensynthreport\framegen_synth_report_test.exe" --dry-run || exit /b 1
 "%OBJ%\framegensynthreport\framegen_synth_report_test.exe" --self-test || exit /b 1
+exit /b 0
+
+:rig_framegen_synth_test
+echo [edvr] === framegen_synth_test.exe ===
+REM The frame-generation synthesizer (fix.frame_generation_shadow, TEMPORARY): the production bytecode (kFrameGenSynth*Bytecode, from tools\temporal_shader_build) run on WARP
+REM against the CPU reference of src\common\framegen_synth_math.h -- a cockpit plane under a head translation and turn, a world plane at a constant ship screen velocity under a
+REM changing head turn, the far plane, the on-foot 1 mm split, 2:1 output -- then the guard (a near object's edge over the sky takes no near colour into a sky pixel), the
+REM background fill (a hole behind a moving near object is filled from the far side), and the module itself (framegen_synth.cpp) driven on the same device: the key off creates
+REM nothing, the key on builds the two variants in turn and scores the f = 1 one against the next frame. Four mutations (f ignored, the head turn not taken out, the guard off,
+REM the fill from the nearer side) must each fail their case. Needs no real GPU.
+if not exist "%OBJ%\framegensynth" mkdir "%OBJ%\framegensynth"
+%CC% /nologo /O2 /MT /std:c++17 /EHsc /W4 /DWIN32_LEAN_AND_MEAN /DNOMINMAX ^
+    /D_CRT_SECURE_NO_WARNINGS /I"%GEN%" /I"src\d3d11" ^
+    /Fo"%OBJ%\framegensynth"\ /Fe"%OBJ%\framegensynth\framegen_synth_test.exe" ^
+    "tools\framegen_synth_test\framegen_synth_test.cpp" "src\d3d11\framegen_synth.cpp" "src\d3d11\shader_swap.cpp" ^
+    "src\d3d11\gpu_timing.cpp" "src\d3d11\gpu_frame_timing.cpp" "src\d3d11\gpu_span_d3d11.cpp" ^
+    "src\common\log.cpp" "src\common\config.cpp" "src\common\proxy.cpp" "src\common\guard.cpp" ^
+    /link /INCREMENTAL:NO d3d11.lib dxguid.lib user32.lib version.lib
+if errorlevel 1 ( echo [edvr] ERROR: framegen_synth_test build failed & exit /b 1 )
+"%OBJ%\framegensynth\framegen_synth_test.exe" --dry-run || exit /b 1
+"%OBJ%\framegensynth\framegen_synth_test.exe" --self-test || exit /b 1
 exit /b 0
 
 :rig_ui_depth
