@@ -253,6 +253,13 @@ struct EyeState {
     bool                       headNoted = false;
     uint32_t                   headNotedFrame = UINT32_MAX;
     uint32_t                   eyesNotedFrame = UINT32_MAX;
+    // Frame generation, Phase 2.2: the head step B -> S from the runtime's slot pose, and whether the runtime takes S, noted before the treat (temporalPassNoteFrameGenSlot).
+    float                      fgSlotRot[9] = {};
+    float                      fgSlotT[3] = {};
+    bool                       fgSlotPose = false;
+    bool                       fgSlotConsumer = false;
+    uint64_t                   fgSlotSequence = 0;
+    uint32_t                   fgSlotFrame = UINT32_MAX;
     float                      rasterJitter[2] = {};
     uint32_t                   jitterFrame = UINT32_MAX;
 
@@ -5227,16 +5234,28 @@ void* temporalInner(void* srcTex, int eye, const float* bounds,
                             sy.tanPrev = fg.tanPrev;
                             sy.replay = dumpFrame && g_eyeRunTaken < static_cast<int>(kFrameGenReplayFrames);
                             sy.replayIndex = static_cast<uint32_t>(g_eyeRunTaken);
+                            // Phase 2.2: the runtime's slot pose for this treat (noted on this frame only), and whether it takes S.
+                            const bool slotNow = e.fgSlotFrame == g_rowsFrame;
+                            sy.slotPose = slotNow && e.fgSlotPose;
+                            if (sy.slotPose) {
+                                memcpy(sy.slotRot, e.fgSlotRot, sizeof(sy.slotRot));
+                                memcpy(sy.slotT, e.fgSlotT, sizeof(sy.slotT));
+                            }
+                            sy.consumer = slotNow && e.fgSlotConsumer;
+                            sy.slotSequence = slotNow ? e.fgSlotSequence : 0;
+                            // The dump stages the f = 0.5 S while the module still holds it (on the transfer's path S is the runtime's once it is handed over).
+                            if (dumpFrame) {
+                                sy.shownSink = [](void* ctxp, ID3D11DeviceContext* c, ID3D11Texture2D* shown) {
+                                    const EyeState& es = *static_cast<const EyeState*>(ctxp);
+                                    uint32_t wantW = 0, wantH = 0, cw = 0, ch = 0;
+                                    eyeOutputCropSize(g_eyeRunTaken, es.dlOut, &wantW, &wantH);
+                                    stageEyeCrop(c, shown, &g_eyeSynthStaging[g_eyeRunTaken], &cw, &ch, nullptr, wantW, wantH);
+                                };
+                                sy.shownSinkContext = &e;
+                            }
                             gpuCensusBegin(ctx, GpuCensusSection::DoorFrameGenSynth);
                             frameGenSynthEyeFrame(dev, ctx, static_cast<uint32_t>(eye), g_rowsFrame, sy);
                             gpuCensusEnd(ctx, GpuCensusSection::DoorFrameGenSynth);
-                            if (dumpFrame) {
-                                if (ID3D11Texture2D* shown = frameGenSynthShown(0, g_rowsFrame)) {
-                                    uint32_t wantW = 0, wantH = 0, cw = 0, ch = 0;
-                                    eyeOutputCropSize(g_eyeRunTaken, e.dlOut, &wantW, &wantH);
-                                    stageEyeCrop(ctx, shown, &g_eyeSynthStaging[g_eyeRunTaken], &cw, &ch, nullptr, wantW, wantH);
-                                }
-                            }
                         }
                     }
                 }
@@ -6355,6 +6374,18 @@ void temporalPassNoteHead(int eye, const float* prevPose, const float* nowPose,
     memcpy(e.eyeOff, eyeOffset, sizeof(e.eyeOff));
     e.headNoted = true;
     e.headNotedFrame = g_rowsFrame;
+}
+void temporalPassNoteFrameGenSlot(int eye, const float* rot, const float* t, bool consumer, uint64_t sequence) {
+    if (eye < 0 || eye > 1) return;
+    EyeState& e = g_eye[eye];
+    e.fgSlotPose = rot && t;
+    if (e.fgSlotPose) {
+        memcpy(e.fgSlotRot, rot, sizeof(e.fgSlotRot));
+        memcpy(e.fgSlotT, t, sizeof(e.fgSlotT));
+    }
+    e.fgSlotConsumer = consumer;
+    e.fgSlotSequence = sequence;
+    e.fgSlotFrame = g_rowsFrame;
 }
 
 void temporalPassLogMap() {

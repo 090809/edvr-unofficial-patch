@@ -22,6 +22,11 @@
 //      scored against the next frame raw and turned by the residual rotation (the true head against the predicted): the turned score is near zero where the raw one is
 //      clearly not, and the residual's angle is the sequence's own
 //   8  the read offsets' storage (two halves in a uint, rounded toward zero): exact to 1/4 px up to 512 px, and the clamp's bounds
+//   10 Phase 2.2: the head step from the runtime's slot pose (frameGenSlotStep from B's and S's heads and the eye): a cockpit plane at 1 m and the far plane land where S's
+//      own head sees them, by a reference that does not use the step (to under 0.1 px); the slot's pose ignored, or the step taken the wrong way round, must fail it
+//   11 Phase 2.2, S's transfer on two WARP devices: the module writes the f = 0.5 S into the producer texture and publishes it, the runtime's side (framegen_slot_transfer.h)
+//      opens and consumes it and holds the picture; the f = 1 S is kept; an unconsumed S makes the next one busy; a consume before a release times out at 0 ms; a run of
+//      busy builds remakes the producer texture; no consumer lets it go; the key off releases everything
 // Mutations (each replaces one of the shader's six #define switches, or the host's f, and the case it guards must fail): f ignored, the head turn not taken out of the
 // vector, the guard off, the fill from the nearer side, the score's turn not applied, the score's turn applied the wrong way round.
 #include <windows.h>
@@ -44,6 +49,7 @@
 #include "../../src/common/framegen_synth_math.h"
 #include "framegen_synth.h"
 #include "temporal_shader_bytecode.h"
+#include "../../src/openxr/framegen_slot_transfer.h"   // case 11: the runtime's side of S's transfer
 
 using Microsoft::WRL::ComPtr;
 using namespace edvr;
@@ -972,6 +978,239 @@ void case9Replay(Gpu& g, Scope& sc) {
     RemoveDirectoryW(root.c_str());
 }
 
+// ---- case 10: the head step from the runtime's slot pose (Phase 2.2) --------------------------------------------------------------------------------------------
+// B's head and S's head are given as the runtime hands them (rigid row-major 3x4, head to the seated space) with the eye's eye-to-head; the module's step is frameGenSlotStep.
+// The reference here does not use it: a B pixel at depth z is put in the seated space through B's head and eye, brought back through S's, and projected.
+struct SlotPoses {
+    float headB[12], headS[12], eye[12];
+};
+SlotPoses slotPoses() {
+    SlotPoses p{};
+    const float a = 1.5f * kPi / 180.0f, b = 0.5f * kPi / 180.0f;
+    // B: turned 10 degrees about y, at (0.1, 1.2, -0.3); S: B turned a further 1.5 degrees about y and 0.5 about x (case 1's size of step), and moved (2, 1, -1) cm. The eye 32 mm left of the head.
+    float ry[9], rb[9];
+    rotY(10.0f, rb);
+    const float ra[9] = {std::cos(a), 0, std::sin(a), 0, 1, 0, -std::sin(a), 0, std::cos(a)};
+    const float rx[9] = {1, 0, 0, 0, std::cos(b), -std::sin(b), 0, std::sin(b), std::cos(b)};
+    float rab[9];
+    for (int r = 0; r < 3; ++r)
+        for (int c = 0; c < 3; ++c) {
+            rab[r * 3 + c] = 0.0f;
+            for (int k = 0; k < 3; ++k) rab[r * 3 + c] += ra[r * 3 + k] * rx[k * 3 + c];
+        }
+    for (int r = 0; r < 3; ++r)
+        for (int c = 0; c < 3; ++c) {
+            ry[r * 3 + c] = 0.0f;
+            for (int k = 0; k < 3; ++k) ry[r * 3 + c] += rb[r * 3 + k] * rab[k * 3 + c];
+        }
+    const float tB[3] = {0.1f, 1.2f, -0.3f}, tS[3] = {0.12f, 1.21f, -0.31f};
+    for (int r = 0; r < 3; ++r) {
+        for (int c = 0; c < 3; ++c) {
+            p.headB[r * 4 + c] = rb[r * 3 + c];
+            p.headS[r * 4 + c] = ry[r * 3 + c];
+            p.eye[r * 4 + c] = r == c ? 1.0f : 0.0f;
+        }
+        p.headB[r * 4 + 3] = tB[r];
+        p.headS[r * 4 + 3] = tS[r];
+        p.eye[r * 4 + 3] = r == 0 ? -0.032f : 0.0f;
+    }
+    return p;
+}
+// Where a B pixel at depth z (farPlane: a direction only) lands in S, from the poses alone.
+bool slotLanding(const SlotPoses& p, float px, float py, float z, bool farPlane, float out[2]) {
+    float d[3];
+    temporalPixelToDir(px, py, kTan, RW, RH, d);
+    const auto world = [](const float head[12], const float eye[12], const float v[3], bool point, float w[3]) {
+        float e[3];
+        for (int r = 0; r < 3; ++r) e[r] = eye[r * 4 + 0] * v[0] + eye[r * 4 + 1] * v[1] + eye[r * 4 + 2] * v[2] + (point ? eye[r * 4 + 3] : 0.0f);
+        for (int r = 0; r < 3; ++r) w[r] = head[r * 4 + 0] * e[0] + head[r * 4 + 1] * e[1] + head[r * 4 + 2] * e[2] + (point ? head[r * 4 + 3] : 0.0f);
+    };
+    const auto local = [](const float head[12], const float eye[12], const float w[3], bool point, float v[3]) {
+        float h[3], e[3];
+        for (int r = 0; r < 3; ++r) h[r] = w[r] - (point ? head[r * 4 + 3] : 0.0f);
+        for (int c = 0; c < 3; ++c) e[c] = head[0 * 4 + c] * h[0] + head[1 * 4 + c] * h[1] + head[2 * 4 + c] * h[2];   // the transpose
+        for (int r = 0; r < 3; ++r) e[r] -= point ? eye[r * 4 + 3] : 0.0f;
+        for (int c = 0; c < 3; ++c) v[c] = eye[0 * 4 + c] * e[0] + eye[1 * 4 + c] * e[1] + eye[2 * 4 + c] * e[2];
+    };
+    float v[3] = {d[0] * z, d[1] * z, d[2] * z};
+    if (farPlane) { v[0] = d[0]; v[1] = d[1]; v[2] = d[2]; }
+    float w[3], s[3];
+    world(p.headB, p.eye, v, !farPlane, w);
+    local(p.headS, p.eye, w, !farPlane, s);
+    return temporalDirToPixel(s, kTan, RW, RH, &out[0], &out[1]);
+}
+// How the host builds the block: 0 the step from the poses (the module's), 1 the pose ignored (the extrapolation of a different head delta), 2 the step the wrong way round.
+FrameGenSynthCb slotCb(const SlotPoses& p, const FrameGenDeltas& d, int how) {
+    float rot[9], t[3];
+    if (how == 2) frameGenSlotStep(p.headB, p.headS, p.eye, rot, t);
+    else frameGenSlotStep(p.headS, p.headB, p.eye, rot, t);
+    FrameGenSynthCb cb;
+    frameGenSynthFillCb(cb, RW, RH, RW, RH, kTan, 0.0f, kDepthB, 10.0f, 0.5f, d, nullptr, nullptr, how == 1 ? nullptr : rot, how == 1 ? nullptr : t);
+    return cb;
+}
+void case10Slot(Gpu& g, Scope& sc, int how) {
+    char label[220];
+    const SlotPoses p = slotPoses();
+    const Deltas d(1.0f, -0.01f, 0.0f, 0.0f);   // the pass's own head delta: what the extrapolation would carry (not S's pose)
+    {   // a cockpit plane at 1 m: rotation and translation
+        Scene S;
+        S.gradient();
+        std::fill(S.depth.begin(), S.depth.end(), depthOf(1.0f));
+        const FrameGenSynthCb cb = slotCb(p, d.d, how);
+        float cpu = 0.0f;   // the block's own CPU landing (frameGenSynthTarget) against the poses' at every render pixel
+        for (int y = 0; y < RH; ++y)
+            for (int x = 0; x < RW; ++x) {
+                float a[2], b[2];
+                if (frameGenSynthTarget(cb, static_cast<float>(x), static_cast<float>(y), 1.0f, false, 0.0f, 0.0f, a) && slotLanding(p, static_cast<float>(x), static_cast<float>(y), 1.0f, false, b))
+                    cpu = std::max(cpu, std::hypot(a[0] - b[0], a[1] - b[1]));
+            }
+        std::snprintf(label, sizeof(label), "case 10: the block's step lands every pixel where the poses do (CPU, worst %.5f px)", cpu);
+        sc.ok(cpu < 0.01f, label);
+        const Run r = runSynth(g, S, cb);
+        sc.ok(r.ok, "case 10: the synthesizer ran");
+        if (!r.ok) return;
+        const Worst w = mappingError(r, S, 12, [&](float x, float y, float pp[2]) { return slotLanding(p, x, y, 1.0f, false, pp); });
+        std::snprintf(label, sizeof(label), "case 10: a cockpit plane at 1 m lands where S's own head (the runtime's pose) sees it (worst %.4f px over %d pixels)", w.err, w.n);
+        sc.ok(w.n > 1000 && w.err < 0.1f, label);
+        if (g_verbose && !sc.quiet) std::printf("  case 10 (cockpit): worst %.4f px over %d pixels\n", w.err, w.n);
+    }
+    {   // the far plane: the rotation alone; the vectors are the head's own (hp), so the ship's motion is nothing
+        Scene S;
+        S.gradient();
+        const FrameGenSynthCb cb = slotCb(p, d.d, how);
+        fillVectors(S, cb, 0.0f, 0.0f, [](int, int) { return true; });
+        const Run r = runSynth(g, S, cb);
+        sc.ok(r.ok, "case 10: the synthesizer ran (far)");
+        if (!r.ok) return;
+        const Worst w = mappingError(r, S, 12, [&](float x, float y, float pp[2]) { return slotLanding(p, x, y, 1.0f, true, pp); });
+        std::snprintf(label, sizeof(label), "case 10: the far plane turns by S's own head's rotation (worst %.4f px over %d pixels)", w.err, w.n);
+        sc.ok(w.n > 1000 && w.err < 0.1f, label);
+        if (g_verbose && !sc.quiet) std::printf("  case 10 (far): worst %.4f px over %d pixels\n", w.err, w.n);
+    }
+}
+
+// ---- case 11: S's transfer, the module and the runtime's side on two WARP devices (Phase 2.2) ------------------------------------------------------------------
+bool readRgba32(ID3D11Device* dev, ID3D11DeviceContext* ctx, ID3D11Texture2D* src, std::vector<float>& out) {
+    D3D11_TEXTURE2D_DESC td{};
+    src->GetDesc(&td);
+    td.Usage = D3D11_USAGE_STAGING; td.BindFlags = 0; td.CPUAccessFlags = D3D11_CPU_ACCESS_READ; td.MiscFlags = 0;
+    ComPtr<ID3D11Texture2D> st;
+    if (FAILED(dev->CreateTexture2D(&td, nullptr, &st))) return false;
+    ctx->CopyResource(st.Get(), src);
+    D3D11_MAPPED_SUBRESOURCE m{};
+    if (FAILED(ctx->Map(st.Get(), 0, D3D11_MAP_READ, 0, &m))) return false;
+    out.resize(static_cast<size_t>(td.Width) * td.Height * 4);
+    for (UINT y = 0; y < td.Height; ++y) std::memcpy(&out[static_cast<size_t>(y) * td.Width * 4], static_cast<const char*>(m.pData) + static_cast<size_t>(y) * m.RowPitch, td.Width * 16u);
+    ctx->Unmap(st.Get(), 0);
+    return true;
+}
+void case11Transfer(Gpu& g, Scope& sc) {
+    char label[240];
+    ComPtr<ID3D11Device> xr;
+    ComPtr<ID3D11DeviceContext> xrCtx;
+    D3D_FEATURE_LEVEL level{};
+    if (FAILED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, 0, nullptr, 0, D3D11_SDK_VERSION, &xr, &level, &xrCtx))) { sc.ok(false, "case 11: a second WARP device (the XR side)"); return; }
+    frameGenSynthConfigure(false);
+    frameGenSynthFrameBoundary();   // a fresh arm: the eyes' alternation starts on f = 0.5
+    Scene s;
+    s.gradient();
+    std::fill(s.depth.begin(), s.depth.end(), depthOf(1.0f));
+    ModuleFrame m;
+    if (!makeInputs(g, s, m.out, m.depth, m.mv)) { sc.ok(false, "case 11: inputs were made"); return; }
+    FrameGenSynthFrame f;
+    f.renderW = RW; f.renderH = RH; f.outW = RW; f.outH = RH;
+    f.tanNow = kTan;
+    f.depthA = 0.0f; f.depthB = kDepthB; f.splitMetres = 10.0f;
+    f.depthWritten = true;
+    f.outSrv = m.out.srv.Get(); f.depthSrv = m.depth.srv.Get(); f.mvSrv = m.mv.srv.Get();
+    for (int i = 0; i < 9; ++i) f.slotRot[i] = (i % 4 == 0) ? 1.0f : 0.0f;   // S's head is B's: S is B
+    f.slotPose = true;
+    f.consumer = true;
+    frameGenSynthConfigure(true);
+    edvr::openxr::FrameGenSlotTransfer tr;
+    uint64_t seq = 500;
+    uint32_t frame = 9000;
+    const auto build = [&](EdvrNativeFrameGenS& a) {
+        f.slotSequence = ++seq;
+        frameGenSynthEyeFrame(g.dev.Get(), g.ctx.Get(), 0, ++frame, f);
+        a = EdvrNativeFrameGenS{};
+        a.size = EDVR_NATIVE_FRAMEGEN_S_SIZE_1; a.version = EDVR_NATIVE_FRAMEGEN_VERSION_1;
+        return edvrFrameGenTakeS(0, &a);
+    };
+    EdvrNativeFrameGenS a{};
+    // 1: the f = 0.5 S is written into the producer texture and published; the runtime opens it, consumes it, and holds B's picture (S is B here).
+    sc.ok(build(a) == S_OK && a.sequence == seq && a.eye == 0 && a.state == EDVR_NATIVE_FRAMEGEN_S_PRODUCED && a.sharedHandle && a.textureSerial && a.poseRuntime == 1 &&
+              a.width == RW && a.height == RH && a.gameBytes == static_cast<uint64_t>(RW) * RH * 16u * (a.path == EDVR_NATIVE_FRAMEGEN_PATH_COPY ? 2u : 1u),
+          "case 11: the f = 0.5 S is produced for the slot's sequence, with its handle, serial, size, the runtime's pose, and its game-device bytes");
+    const uint32_t path = a.path;
+    std::snprintf(label, sizeof(label), "case 11: the path is uav or copy (here %s)", path == 1 ? "uav" : path == 2 ? "copy" : "none");
+    sc.ok(path == EDVR_NATIVE_FRAMEGEN_PATH_UAV || path == EDVR_NATIVE_FRAMEGEN_PATH_COPY, label);
+    if (g_verbose) std::printf("  case 11: the transfer's path on this device is %s (game-device bytes %llu)\n", path == 1 ? "uav" : path == 2 ? "copy" : "none", static_cast<unsigned long long>(a.gameBytes));
+    EdvrNativeFrameGenS again{};
+    again.size = EDVR_NATIVE_FRAMEGEN_S_SIZE_1; again.version = EDVR_NATIVE_FRAMEGEN_VERSION_1;
+    sc.ok(edvrFrameGenTakeS(0, &again) == S_FALSE && again.sequence == 0, "case 11: an answer is taken once");
+    sc.ok(path == 2 || frameGenSynthShown(0, frame) == nullptr, "case 11: on the uav path no private S is handed out");
+    sc.ok(tr.open(xr.Get(), static_cast<HANDLE>(a.sharedHandle), a.textureSerial) == S_OK && tr.xrBytes() == static_cast<uint64_t>(RW) * RH * 16u, "case 11: the runtime opens the producer texture and makes its private copy");
+    tr.markProduced(123);
+    sc.ok(tr.pending() && tr.consume(0) == S_OK && !tr.pending(), "case 11: the runtime consumes the produced S at once (AcquireSync(1, 0))");
+    std::vector<float> px;
+    float worst = 0.0f;
+    if (readRgba32(xr.Get(), xrCtx.Get(), tr.privateTexture(), px))
+        for (int y = 12; y < RH - 12; ++y)
+            for (int x = 12; x < RW - 12; ++x)
+                for (int c = 0; c < 2; ++c) worst = std::max(worst, std::fabs(px[(static_cast<size_t>(y) * RW + x) * 4 + c] - s.rgba[(static_cast<size_t>(y) * RW + x) * 4 + c]));
+    std::snprintf(label, sizeof(label), "case 11: the runtime's copy holds S (B itself under an identity step; worst %.4f px)", worst);
+    sc.ok(!px.empty() && worst < 0.05f, label);
+    // 2: the f = 1 S stays on the game device.
+    sc.ok(build(a) == S_OK && a.state == EDVR_NATIVE_FRAMEGEN_S_KEPT && a.poseRuntime == 0, "case 11: the f = 1 S is kept (not handed over) and takes no slot pose");
+    // 3: an S the runtime does not consume holds the next one back: busy, counted, not handed over.
+    const uint32_t busy0 = frameGenSynthOpenWindow().busy;
+    sc.ok(build(a) == S_OK && a.state == EDVR_NATIVE_FRAMEGEN_S_PRODUCED, "case 11: the next f = 0.5 S is produced");
+    tr.markProduced(124);
+    build(a);   // f = 1: on the uav path it cannot write the producer texture either (busy); on the copy path it builds privately
+    sc.ok(build(a) == S_OK && a.state == EDVR_NATIVE_FRAMEGEN_S_BUSY && frameGenSynthOpenWindow().busy > busy0, "case 11: with the last S unconsumed the next f = 0.5 S is busy, counted, and not handed over");
+    sc.ok(tr.consume(0) == S_OK, "case 11: the held S is consumed late");
+    build(a);   // f = 1
+    sc.ok(build(a) == S_OK && a.state == EDVR_NATIVE_FRAMEGEN_S_PRODUCED, "case 11: after it, S is produced again");
+    tr.markProduced(125);
+    sc.ok(tr.consume(0) == S_OK, "case 11: and consumed");
+    // 4: a consume with nothing released times out at 0 ms and stays pending; let go, it gives nothing back.
+    tr.markProduced(126);
+    sc.ok(tr.consume(0) == static_cast<HRESULT>(WAIT_TIMEOUT) && tr.pending(), "case 11: a consume before the producer released times out (0 ms) and stays pending");
+    tr.release();
+    sc.ok(!tr.pending() && tr.xrBytes() == 0 && !tr.privateTexture(), "case 11: the runtime's side lets go of everything");
+    // 5: the runtime gone (nothing consumes): after kBusyRemake builds held back the producer texture is made again, with a new serial the runtime would open.
+    const uint64_t serialWas = a.textureSerial;
+    bool remade = false;
+    for (int k = 0; k < 24 && !remade; ++k) {
+        build(a);
+        if (a.state == EDVR_NATIVE_FRAMEGEN_S_PRODUCED && a.textureSerial != serialWas) remade = true;
+    }
+    sc.ok(remade, "case 11: an S never consumed is let go after its run of busy builds and the producer texture is made again (a new serial)");
+    // 6: the runtime stops consuming (no consumer): the producer texture goes and S is built privately; the slot's pose counts as the runtime's or the fallback's.
+    FrameGenSynthWindow w0 = frameGenSynthOpenWindow();
+    f.consumer = false;
+    build(a);
+    build(a);
+    sc.ok(a.state == EDVR_NATIVE_FRAMEGEN_S_KEPT && a.path == EDVR_NATIVE_FRAMEGEN_PATH_NONE && !a.sharedHandle && a.gameBytes == static_cast<uint64_t>(RW) * RH * 16u,
+          "case 11: with no consumer the producer texture is let go and S is the private texture alone");
+    f.slotPose = false;
+    build(a);
+    build(a);
+    FrameGenSynthWindow w1 = frameGenSynthOpenWindow();
+    sc.ok(w1.poseRuntime > w0.poseRuntime && w1.poseFallback > w0.poseFallback, "case 11: the f = 0.5 builds are counted by their head step: the slot's pose, or the extrapolation");
+    sc.ok((w1.pathBits & 1u) && (w1.pathBits & (path == 1 ? 2u : 4u)), "case 11: the window says where S was written (private, and the transfer's path)");
+    // 7: the key off: everything goes, and nothing is answered.
+    frameGenSynthConfigure(false);
+    frameGenSynthFrameBoundary();
+    sc.ok(!frameGenSynthResident() && edvrFrameGenTakeS(0, &again) == S_FALSE, "case 11: the key off releases the producer texture with the rest, and nothing is answered");
+    frameGenSynthConfigure(true);
+    f.slotPose = true;
+    f.consumer = true;
+    frameGenSynthConfigure(false);
+    frameGenSynthFrameBoundary();
+}
+
 // ---- the run ---------------------------------------------------------------------------------------------------------------------------------------------
 
 void swapIn(Gpu& g, ComPtr<ID3D11ComputeShader> saved[kEntries], const ComPtr<ID3D11ComputeShader> mutated[kEntries]) {
@@ -1007,7 +1246,28 @@ int run() {
     case8Offsets(sc);
     case9Replay(g, sc);
     if (!alive("cases 7 to 9")) return 1;
+    case10Slot(g, sc, 0);
+    case11Transfer(g, sc);
+    if (!alive("cases 10 and 11")) return 1;
     (void)edge;
+    // The host's mutations of case 10 (the block, not the shader): the slot's pose ignored (the extrapolation built instead), and the step taken the wrong way round (S to B).
+    unsigned poseIgnored = 0, poseInverted = 0;
+    {
+        Scope ms;
+        ms.quiet = true;
+        case10Slot(g, ms, 1);
+        poseIgnored = ms.fails;
+        ++g_checks;
+        if (!ms.fails) { ++g_failures; std::printf("FAIL: mutation: the slot's pose ignored still passes case 10\n"); }
+    }
+    {
+        Scope ms;
+        ms.quiet = true;
+        case10Slot(g, ms, 2);
+        poseInverted = ms.fails;
+        ++g_checks;
+        if (!ms.fails) { ++g_failures; std::printf("FAIL: mutation: the slot's step the wrong way round still passes case 10\n"); }
+    }
 
     // The mutations: each must break its case.
     struct Mutation { const char* define; const char* what; std::function<void(Scope&)> run; unsigned fails = 0; };
@@ -1036,8 +1296,8 @@ int run() {
         if (ms.fails == 0) { ++g_failures; std::printf("FAIL: mutation: %s still passes\n", m.what); }
     }
     // Case 3 reads the head's part the same way as case 2: the head-turn mutation must break it too (a second look, not a second count).
-    std::printf("%s: %u checks, %u failures (mutations: f ignored broke %u checks, head turn not removed broke %u, guard off broke %u, fill from the nearer side broke %u, turn not applied broke %u, turn the wrong way round broke %u)\n",
-                g_failures ? "FAIL" : "PASS", g_checks, g_failures, muts[0].fails, muts[1].fails, muts[2].fails, muts[3].fails, muts[4].fails, muts[5].fails);
+    std::printf("%s: %u checks, %u failures (mutations: f ignored broke %u checks, head turn not removed broke %u, guard off broke %u, fill from the nearer side broke %u, turn not applied broke %u, turn the wrong way round broke %u, slot pose ignored broke %u, slot step inverted broke %u)\n",
+                g_failures ? "FAIL" : "PASS", g_checks, g_failures, muts[0].fails, muts[1].fails, muts[2].fails, muts[3].fails, muts[4].fails, muts[5].fails, poseIgnored, poseInverted);
     return g_failures ? 1 : 0;
 }
 

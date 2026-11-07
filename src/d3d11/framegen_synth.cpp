@@ -13,7 +13,10 @@
 #include <windows.h>
 #include <d3d11.h>
 
+#include <dxgi1_2.h>
+
 #include <atomic>
+#include <mutex>
 #include <cstdio>
 #include <string>
 #include <thread>
@@ -58,7 +61,17 @@ struct EyeRes {
     float keptTan[4] = {};        // the tangents it was built with
     bool shownValid = false;      // the latest call built the f = 0.5 S into `s`
     uint32_t shownFrame = 0;
+    // Phase 2.2, S's transfer: the producer texture the runtime opens by its NT handle (keyed mutex: 0 the game device's, 1 the runtime's), made while the runtime consumes S.
+    // Path 1 (uav): the resample pass writes it and `s` is not made; path 2 (copy): it refused UAV binding, so S is built in `s` and copied in. Made again (a new serial)
+    // when the eye's size or format changes, or when kBusyRemake builds in a row found it still unconsumed (the runtime let go of it).
+    Tex shared;
+    IDXGIKeyedMutex* mutex = nullptr;
+    HANDLE handle = nullptr;
+    uint32_t sharedPath = 0;
+    uint64_t serial = 0;
+    uint32_t busyRun = 0;
 };
+constexpr uint32_t kBusyRemake = 8;
 
 // The render-size scratch of one call (the key grid, the read offsets and the hole list): rebuilt from nothing by every call, so both eyes share one set (they run one after the
 // other on the same context). 8.5 bytes per render pixel in all; recreated when a call's render size differs from the last's.
@@ -88,7 +101,14 @@ struct State {
     std::vector<float> gpuMs[2];
     std::vector<float> rotRes;     // the residual rotation's angle of each scored frame in the window, degrees
     int64_t windowTicks = 0;
+    // Phase 2.2: the runtime's answer per eye (frameGenSynthTakeS), the serial the next producer texture takes, whether any slot reached the module since the key went on (and
+    // whether its absence was said), and whether the shared texture was refused outright on this device (S then stays private, said once).
+    EdvrNativeFrameGenS answer[2] = {};
+    uint64_t nextSerial = 1;
+    bool slotSeen = false, slotAbsenceSaid = false, sharedRefused = false, remakeSaid = false;
+    uint32_t pathSaid = 0;
 };
+std::mutex g_answerMu;   // the answers: written by the render thread inside a treat, taken by the runtime's owner after it
 // Never destroyed: the process teardown can run under the loader lock, where releasing D3D objects is not safe (see temporalPassShutdown).
 State* const g_statePtr = new State();
 State& g = *g_statePtr;
@@ -104,7 +124,17 @@ void releaseTex(Tex& t) {
     releaseCom(t.tex);
 }
 
+// The producer texture and its handle. Nothing waits: a handoff the runtime has not consumed is simply let go (its opened copy stays valid on its side).
+void releaseShared(EyeRes& r) {
+    releaseCom(r.mutex);
+    releaseTex(r.shared);
+    if (r.handle) { CloseHandle(r.handle); r.handle = nullptr; }
+    r.sharedPath = 0;
+    r.busyRun = 0;
+}
+
 void releaseEye(EyeRes& r) {
+    releaseShared(r);
     releaseTex(r.s);
     releaseTex(r.sLuma);
     releaseTex(r.bInfo);
@@ -322,6 +352,10 @@ void releaseAll() {
     releaseCom(g.cb);
     g.dev = nullptr;
     g.failed = false;
+    g.slotSeen = g.slotAbsenceSaid = g.sharedRefused = g.remakeSaid = false;
+    g.pathSaid = 0;
+    std::lock_guard<std::mutex> l(g_answerMu);
+    for (EdvrNativeFrameGenS& a : g.answer) a = EdvrNativeFrameGenS{};
 }
 
 bool uavStoreOk(ID3D11Device* dev, DXGI_FORMAT fmt) {
@@ -400,7 +434,8 @@ bool createEye(ID3D11Device* dev, EyeRes& r, uint32_t rw, uint32_t rh, uint32_t 
     r.qh = (rh + 3u) / 4u;
     r.sFormat = sFormat;
     if (r.qw == 0 || r.qh == 0 || !uavStoreOk(dev, sFormat)) return false;
-    bool ok = makeTex(dev, ow, oh, sFormat, r.s) && makeTex(dev, r.qw, r.qh, g.lumaFormat, r.sLuma) && makeTex(dev, r.qw, r.qh, DXGI_FORMAT_R32G32_FLOAT, r.bInfo);
+    // S itself is made by ensureTarget: in the private texture `s`, or (Phase 2.2) in the producer texture the runtime takes it from.
+    bool ok = makeTex(dev, r.qw, r.qh, g.lumaFormat, r.sLuma) && makeTex(dev, r.qw, r.qh, DXGI_FORMAT_R32G32_FLOAT, r.bInfo);
     if (ok) {
         D3D11_BUFFER_DESC bd{};
         bd.ByteWidth = kFrameGenSynthStatsUints * 4u;
@@ -472,6 +507,7 @@ uint64_t bufBytes(ID3D11Buffer* b) {
 FrameGenSynthVram vramOf(const EyeRes& r, const Scratch& sc) {
     FrameGenSynthVram v;
     v.s = texBytes(r.s);
+    v.shared = texBytes(r.shared);
     v.luma = texBytes(r.sLuma);
     v.cls = texBytes(r.bInfo);
     v.stats = bufBytes(r.stats);
@@ -525,7 +561,111 @@ TimerSlot* beginTimer(ID3D11Device* dev, ID3D11DeviceContext* ctx, int kind) {
     return nullptr;
 }
 
+// ---- Phase 2.2, S's transfer ----
+// The producer texture S crosses in: output size, S's format, a keyed mutex and an NT handle the runtime opens on its own device. Made with UAV binding first (the resample pass
+// then writes it, and no private S is needed); a texture that refuses that is made for copies only. False when neither could be made shared on this device.
+bool makeShared(ID3D11Device* dev, EyeRes& r) {
+    for (uint32_t path = 1; path <= 2; ++path) {
+        D3D11_TEXTURE2D_DESC td{};
+        td.Width = r.ow; td.Height = r.oh; td.MipLevels = 1; td.ArraySize = 1; td.Format = r.sFormat; td.SampleDesc.Count = 1;
+        td.Usage = D3D11_USAGE_DEFAULT;
+        td.BindFlags = D3D11_BIND_SHADER_RESOURCE | (path == 1 ? D3D11_BIND_UNORDERED_ACCESS : 0u);
+        td.MiscFlags = D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX;
+        Tex t;
+        IDXGIKeyedMutex* km = nullptr;
+        IDXGIResource1* res = nullptr;
+        HANDLE h = nullptr;
+        const bool ok = SUCCEEDED(dev->CreateTexture2D(&td, nullptr, &t.tex)) && t.tex &&
+                        SUCCEEDED(t.tex->QueryInterface(__uuidof(IDXGIKeyedMutex), reinterpret_cast<void**>(&km))) && km &&
+                        SUCCEEDED(t.tex->QueryInterface(__uuidof(IDXGIResource1), reinterpret_cast<void**>(&res))) && res &&
+                        SUCCEEDED(res->CreateSharedHandle(nullptr, DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE, nullptr, &h)) && h &&
+                        SUCCEEDED(dev->CreateShaderResourceView(t.tex, nullptr, &t.srv)) &&
+                        (path != 1 || SUCCEEDED(dev->CreateUnorderedAccessView(t.tex, nullptr, &t.uav)));
+        releaseCom(res);
+        if (ok) {
+            r.shared = t;
+            r.mutex = km;
+            r.handle = h;
+            r.sharedPath = path;
+            r.serial = g.nextSerial++;
+            r.busyRun = 0;
+            return true;
+        }
+        releaseCom(km);
+        releaseTex(t);
+        if (h) CloseHandle(h);
+    }
+    return false;
+}
+
+// Where this call's S goes: the producer texture while the runtime consumes S (made here when first needed, let go when it stops), else the private `s`; on the copy path both.
+// `changed` says the eye's set was made or let go (its VRAM line is due). False only when the private texture could not be made.
+bool ensureTarget(ID3D11Device* dev, EyeRes& r, uint32_t eye, bool consumer, bool& changed) {
+    if (consumer && !r.shared.tex && !g.sharedRefused) {
+        if (makeShared(dev, r)) {
+            changed = true;
+        } else {
+            g.sharedRefused = true;
+            Log::get().note("frame generation (synth): eye %u: the producer texture S would cross in could not be made shared (format %u, %ux%u, keyed mutex and NT handle); S stays on "
+                            "the game device and nothing crosses.", static_cast<unsigned>(eye), static_cast<unsigned>(r.sFormat), static_cast<unsigned>(r.ow), static_cast<unsigned>(r.oh));
+        }
+    }
+    if (!consumer && r.shared.tex) {
+        releaseShared(r);
+        changed = true;
+    }
+    const bool wantPrivate = r.sharedPath != 1;
+    if (wantPrivate && !r.s.tex) {
+        if (!makeTex(dev, r.ow, r.oh, r.sFormat, r.s)) return false;
+        changed = true;
+    }
+    if (!wantPrivate && r.s.tex) {
+        releaseTex(r.s);
+        changed = true;
+    }
+    if (changed && r.sharedPath && g.pathSaid != r.sharedPath) {
+        g.pathSaid = r.sharedPath;
+        Log::get().note(r.sharedPath == 1 ? "frame generation (synth): S crosses to the runtime, path uav: the resample pass writes the producer texture (no private S on the game device)."
+                                          : "frame generation (synth): S crosses to the runtime, path copy: the producer texture refused UAV binding, so S is built privately and copied in.");
+    }
+    return true;
+}
+
+// A producer texture the runtime has not consumed for kBusyRemake builds in a row is made again (a new serial): the runtime let go of its side, and the key would stay 1.
+void noteBusy(EyeRes& r, uint32_t eye) {
+    ++g.win.busy;
+    if (++r.busyRun < kBusyRemake) return;
+    releaseShared(r);
+    if (!g.remakeSaid) {
+        g.remakeSaid = true;
+        Log::get().note("frame generation (synth): eye %u: the runtime has not consumed S for %u builds; the producer texture is made again.", static_cast<unsigned>(eye), kBusyRemake);
+    }
+}
+
+// The keyed mutex failed in a way that is not a timeout (abandoned, or the device): S stays private for the rest of the arm.
+void sharedFault(EyeRes& r, uint32_t eye, HRESULT hr) {
+    releaseShared(r);
+    g.sharedRefused = true;
+    Log::get().note("frame generation (synth): eye %u: the producer texture's keyed mutex failed (0x%08X); S stays on the game device for the rest of the arm.", static_cast<unsigned>(eye),
+                    static_cast<unsigned>(hr));
+}
+
 }  // namespace
+
+HRESULT frameGenSynthTakeS(uint32_t eye, EdvrNativeFrameGenS* out) {
+    if (!out || eye > 1 || out->size < EDVR_NATIVE_FRAMEGEN_S_SIZE_1 || out->version < EDVR_NATIVE_FRAMEGEN_VERSION_1) return E_INVALIDARG;
+    EdvrNativeFrameGenS a;
+    {
+        std::lock_guard<std::mutex> l(g_answerMu);
+        a = g.answer[eye];
+        g.answer[eye] = EdvrNativeFrameGenS{};
+    }
+    a.size = EDVR_NATIVE_FRAMEGEN_S_SIZE_1;   // only version 1's bytes are written: a reader with a longer struct keeps its own past them
+    a.version = EDVR_NATIVE_FRAMEGEN_VERSION_1;
+    a.eye = eye;
+    std::memcpy(out, &a, sizeof(a));
+    return a.sequence ? S_OK : S_FALSE;
+}
 
 void frameGenSynthConfigure(bool on) {
     g_on.store(on);
@@ -545,7 +685,7 @@ FrameGenSynthWindow frameGenSynthOpenWindow() {
 ID3D11Texture2D* frameGenSynthShown(uint32_t eye, uint32_t frame) {
     if (!g_on.load() || eye > 1) return nullptr;
     const EyeRes& r = g.eye[eye];
-    return (r.created && r.shownValid && r.shownFrame == frame) ? r.s.tex : nullptr;
+    return (r.created && r.shownValid && r.shownFrame == frame) ? r.s.tex : nullptr;   // shownValid: built in the private texture (frameGenSynthEyeFrame)
 }
 
 void frameGenSynthEyeFrame(ID3D11Device* dev, ID3D11DeviceContext* ctx, uint32_t eye, uint32_t frame, const FrameGenSynthFrame& f) {
@@ -563,12 +703,32 @@ void frameGenSynthEyeFrame(ID3D11Device* dev, ID3D11DeviceContext* ctx, uint32_t
     }
     EyeRes& r = g.eye[eye];
     r.shownValid = false;
+    if (f.slotSequence) g.slotSeen = true;
+    // This call's answer to the runtime (frameGenSynthTakeS), stored on every way out below.
+    EdvrNativeFrameGenS answer{};
+    answer.size = EDVR_NATIVE_FRAMEGEN_S_SIZE_1;
+    answer.version = EDVR_NATIVE_FRAMEGEN_VERSION_1;
+    answer.sequence = f.slotSequence;
+    answer.eye = eye;
+    answer.state = EDVR_NATIVE_FRAMEGEN_S_NONE;
+    const auto storeAnswer = [&] {
+        answer.path = r.sharedPath;
+        answer.sharedHandle = r.handle;
+        answer.textureSerial = r.shared.tex ? r.serial : 0;
+        answer.width = r.ow;
+        answer.height = r.oh;
+        answer.format = static_cast<uint32_t>(r.sFormat);
+        answer.gameBytes = texBytes(r.s) + texBytes(r.shared);
+        std::lock_guard<std::mutex> l(g_answerMu);
+        g.answer[eye] = answer;
+    };
     if (f.replay && f.replayIndex == 0 && !rp.writing) { replayRelease(); rp.open = true; }   // the eye dump's first frame: a new capture (one still being written is not disturbed)
     if (!f.outSrv || !f.depthSrv || !f.mvSrv || !f.depthWritten || f.renderW == 0 || f.renderH == 0 || f.outW == 0 || f.outH == 0) {
         // Nothing to build from: counted, so a window in which the module was called and built nothing says so.
         ++g.win.skipped;
         r.havePending = false;
         if (f.replay) replayStop("frame " + std::to_string(f.replayIndex) + " of the run: the synthesizer had no inputs for it");
+        storeAnswer();
         return;
     }
     const DXGI_FORMAT sFormat = viewFormat(f.outSrv);
@@ -593,7 +753,14 @@ void frameGenSynthEyeFrame(ID3D11Device* dev, ID3D11DeviceContext* ctx, uint32_t
         Log::get().note("frame generation (synth): the scratch textures could not be created (%ux%u render); it stands down.", static_cast<unsigned>(f.renderW), static_cast<unsigned>(f.renderH));
         return;
     }
-    if (made) {
+    bool changed = false;
+    if (!ensureTarget(dev, r, eye, f.consumer, changed)) {
+        g.failed = true;
+        Log::get().note("frame generation (synth): the S texture could not be created (%ux%u output, format %u); it stands down.", static_cast<unsigned>(f.outW), static_cast<unsigned>(f.outH),
+                        static_cast<unsigned>(sFormat));
+        return;
+    }
+    if (made || changed) {
         const std::string vram = formatFrameGenSynthVram(eye, vramOf(r, g.scratch));
         Log::get().note("%s", vram.c_str());
     }
@@ -604,6 +771,38 @@ void frameGenSynthEyeFrame(ID3D11Device* dev, ID3D11DeviceContext* ctx, uint32_t
     const bool score = r.havePending && r.bFrame + 1u == frame && !f.cameraJump;
     const bool keep = !half && !f.cameraJump;
 
+    // Phase 2.2: on the uav path S is written into the producer texture, which the game device must hold (key 0). Still the runtime's (key 1, not consumed): this call builds
+    // nothing and is counted busy.
+    bool held = false;
+    if (r.sharedPath == 1) {
+        const HRESULT a = r.mutex->AcquireSync(0, 0);
+        if (a == static_cast<HRESULT>(WAIT_TIMEOUT)) {
+            noteBusy(r, eye);
+            r.havePending = false;
+            if (half) answer.state = EDVR_NATIVE_FRAMEGEN_S_BUSY;
+            storeAnswer();
+            return;
+        }
+        if (a != S_OK) {
+            sharedFault(r, eye, a);
+            bool again = false;
+            if (!ensureTarget(dev, r, eye, false, again)) {
+                g.failed = true;
+                return;
+            }
+        } else {
+            held = true;
+            r.busyRun = 0;
+        }
+    }
+    // The head step: the runtime's pose for S's slot when it handed one (the f = 0.5 S only; a replay-capture frame keeps the extrapolation the bench rebuilds), else the extrapolation.
+    const bool usePose = half && f.slotPose && !f.replay;
+    if (half) {
+        if (usePose) ++g.win.poseRuntime;
+        else ++g.win.poseFallback;
+    }
+    answer.poseRuntime = usePose ? 1u : 0u;
+
     // On a score, the residual head rotation: the rotation the kept f = 1 S was built for against C's true one (this frame's backward head delta), and the tangents S was built with.
     float residual[9];
     if (score) {
@@ -611,11 +810,14 @@ void frameGenSynthEyeFrame(ID3D11Device* dev, ID3D11DeviceContext* ctx, uint32_t
         g.rotRes.push_back(temporalRotationAngleDeg(residual));
     }
     FrameGenSynthCb cb;
-    frameGenSynthFillCb(cb, f.renderW, f.renderH, f.outW, f.outH, f.tanNow, f.depthA, f.depthB, f.splitMetres, half ? 0.5f : 1.0f, f.deltas, score ? residual : nullptr, score ? r.keptTan : nullptr);
+    frameGenSynthFillCb(cb, f.renderW, f.renderH, f.outW, f.outH, f.tanNow, f.depthA, f.depthB, f.splitMetres, half ? 0.5f : 1.0f, f.deltas, score ? residual : nullptr, score ? r.keptTan : nullptr,
+                        usePose ? f.slotRot : nullptr, usePose ? f.slotT : nullptr);
     D3D11_MAPPED_SUBRESOURCE m{};
     if (FAILED(ctx->Map(g.cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {
         ++g.win.skipped;
         r.havePending = false;
+        if (held) r.mutex->ReleaseSync(0);
+        storeAnswer();
         return;
     }
     std::memcpy(m.pData, &cb, sizeof(cb));
@@ -637,7 +839,8 @@ void frameGenSynthEyeFrame(ID3D11Device* dev, ID3D11DeviceContext* ctx, uint32_t
     v.keySrv = sc.key.srv; v.keyUav = sc.key.uav;
     v.readSrv = sc.read.srv; v.readUav = sc.read.uav;
     v.holesUav = sc.holesUav;
-    v.sSrv = r.s.srv; v.sUav = r.s.uav;
+    const Tex& target = held ? r.shared : r.s;
+    v.sSrv = target.srv; v.sUav = target.uav;
     v.sLumaSrv = r.sLuma.srv; v.sLumaUav = r.sLuma.uav;
     v.bInfoSrv = r.bInfo.srv; v.bInfoUav = r.bInfo.uav;
     v.statsUav = r.statsUav;
@@ -651,6 +854,52 @@ void frameGenSynthEyeFrame(ID3D11Device* dev, ID3D11DeviceContext* ctx, uint32_t
     if (timer) timer->timer.end(ctx);
     save.restore(ctx);
 
+    // The dump stages the f = 0.5 S while the module still holds it.
+    if (half && f.wantShown && f.shownSink) f.shownSink(f.shownSinkContext, ctx, target.tex);
+    // Phase 2.2: hand the f = 0.5 S to the runtime (key 1) when it consumes S; everything else stays on the game device (key 0). The flush is the transfer's own discipline
+    // (shared_texture_transfer.cpp): the runtime's copy must not wait on work the game's context has not submitted.
+    if (held) {
+        HRESULT rel;
+        if (half && f.consumer) {
+            ctx->Flush();
+            rel = r.mutex->ReleaseSync(1);
+            if (rel == S_OK) answer.state = EDVR_NATIVE_FRAMEGEN_S_PRODUCED;
+        } else {
+            rel = r.mutex->ReleaseSync(0);
+            answer.state = EDVR_NATIVE_FRAMEGEN_S_KEPT;
+        }
+        g.win.pathBits |= 2u;
+        if (rel != S_OK) {
+            answer.state = EDVR_NATIVE_FRAMEGEN_S_KEPT;
+            sharedFault(r, eye, rel);
+        }
+    } else if (half && f.consumer && r.sharedPath == 2) {
+        const HRESULT a = r.mutex->AcquireSync(0, 0);
+        if (a == static_cast<HRESULT>(WAIT_TIMEOUT)) {
+            noteBusy(r, eye);
+            answer.state = EDVR_NATIVE_FRAMEGEN_S_BUSY;
+        } else if (a == S_OK) {
+            ctx->CopyResource(r.shared.tex, r.s.tex);
+            ctx->Flush();
+            const HRESULT rel = r.mutex->ReleaseSync(1);
+            if (rel == S_OK) {
+                answer.state = EDVR_NATIVE_FRAMEGEN_S_PRODUCED;
+                r.busyRun = 0;
+            } else {
+                answer.state = EDVR_NATIVE_FRAMEGEN_S_KEPT;
+                sharedFault(r, eye, rel);
+            }
+        } else {
+            answer.state = EDVR_NATIVE_FRAMEGEN_S_KEPT;
+            sharedFault(r, eye, a);
+        }
+        g.win.pathBits |= 4u;
+    } else {
+        answer.state = EDVR_NATIVE_FRAMEGEN_S_KEPT;
+        g.win.pathBits |= r.sharedPath == 2 ? 4u : 1u;   // the copy path's other builds are its own; private means no producer texture at all
+    }
+    storeAnswer();
+
     r.havePending = keep;
     if (keep) {
         for (int i = 0; i < 3; ++i)
@@ -658,7 +907,7 @@ void frameGenSynthEyeFrame(ID3D11Device* dev, ID3D11DeviceContext* ctx, uint32_t
         for (int i = 0; i < 4; ++i) r.keptTan[i] = f.tanNow[i];
     }
     r.bFrame = frame;
-    r.shownValid = half;
+    r.shownValid = half && !held;   // frameGenSynthShown hands out the private S only
     r.shownFrame = frame;
     if (f.replay) replayCapture(dev, ctx, f, frame, cb);
 }
@@ -766,7 +1015,16 @@ void frameGenSynthFrameBoundary() {
     fillRotation(g.win);
     const std::string line = formatFrameGenSynthReport(g.win);
     Log::get().note("%s", line.c_str());
+    // Phase 2.2: a window that built S and was never handed a slot since the key went on: the runtime does not have the channel (an older openvr_api.dll). Said once per arm.
+    if (!g.slotSeen && !g.slotAbsenceSaid && g.win.frames[0] > 0) {
+        g.slotAbsenceSaid = true;
+        Log::get().note("frame generation (synth): no slot from the runtime (an older openvr_api.dll, or a runtime that is not EDVR's): S's head stays on the synthesizer's extrapolation "
+                        "and S on the game device.");
+    }
     windowReset();
 }
 
 }  // namespace edvr
+
+// Phase 2.2: the runtime's read of one eye's S after its treat (common/native_temporal.h).
+extern "C" HRESULT WINAPI edvrFrameGenTakeS(uint32_t eye, EdvrNativeFrameGenS* out) { return edvr::frameGenSynthTakeS(eye, out); }

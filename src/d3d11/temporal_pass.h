@@ -291,6 +291,11 @@ void temporalPassLogMap();
 void temporalPassNoteEyes(int eye, const float (*prevEyes)[12],
                           const float (*nowEyes)[12]);
 
+// Frame generation, Phase 2.2 (fix.frame_generation_shadow): before each native treat, the eye's head step from this frame (B) to the synthetic slot S, from the runtime's pose for
+// S (framegen_synth_math.h frameGenSlotStep; rot row-major 3x3, t metres, B's eye space to S's), null when the runtime handed none; and whether the runtime consumes this frame's S
+// (edvrFrameGenNoteSlot's consumer), with the treat's sequence the module stamps its answer with. Good for the treat that follows on the same frame only. Internal to d3d11.dll.
+void temporalPassNoteFrameGenSlot(int eye, const float* rot, const float* t, bool consumer, uint64_t sequence);
+
 // probe.w bits 64 and 256 of the temporal shader: t6 (the smoke's depth) / t7
 // (the private UI depth) NOT bound, so zSceneAt skips the fetch and uses the
 // +0.0 a null view returns. Read off the very SRV array a dispatch binds from

@@ -18,6 +18,7 @@
 #include "../common/config.h"
 #include "../common/frame_flag.h"
 #include "../common/temporal_math.h"
+#include "../common/framegen_synth_math.h"   // frameGenSlotStep: the head step to the synthetic slot (Phase 2.2)
 #include "../common/temporal_mode.h"
 #include "../common/supersample_math.h"
 #include "../common/log.h"
@@ -192,6 +193,19 @@ constexpr uint32_t kSeparationNotes=8;
 void eyeDelta(const History& h,const State& s,const float* eyePrev,const float* eyeNow,float d[9],float t[3]) {
   float rp[9],rn[9],tp[3],tn[3],rt[9];eyeWorld(h.head,eyePrev,rp,tp);eyeWorld(s.head,eyeNow,rn,tn);
   edvr::temporalTranspose3(rp,rt);edvr::temporalMul3(rt,rn,d);float dt[3]={tn[0]-tp[0],tn[1]-tp[1],tn[2]-tp[2]};edvr::temporalApply3(rt,dt,t);
+}
+// Frame generation, Phase 2.2 (fix.frame_generation_shadow): the runtime's slot for the pair, as edvrFrameGenNoteSlot last took it. Its own lock: the owner notes it before the
+// pair's treats, and treat() reads it under `mutex`, which the note never takes.
+struct FrameGenSlot { bool have=false,pose=false,consumer=false; uint64_t sequence=0; float head[12]{}; };
+FrameGenSlot g_fgSlot; std::mutex g_fgMu;
+// Before the eye's pass: the head step from this frame's head (B) to the slot's (S) through this eye's own eye-to-head, for the treat of the slot's sequence only. Nothing is noted
+// for any other treat (the key off: the runtime notes nothing), so the pass reads no slot there.
+void noteFrameGenSlot(const State& s,uint64_t seq,unsigned eye){
+  FrameGenSlot slot;{std::lock_guard<std::mutex> l(g_fgMu);slot=g_fgSlot;}
+  if(!slot.have||slot.sequence!=seq)return;
+  if(!slot.pose){edvr::temporalPassNoteFrameGenSlot(int(eye),nullptr,nullptr,slot.consumer,seq);return;}
+  float rot[9],t[3];edvr::frameGenSlotStep(slot.head,s.head,s.eyes[eye],rot,t);
+  edvr::temporalPassNoteFrameGenSlot(int(eye),rot,t,slot.consumer,seq);
 }
 bool sameDevice(ID3D11Device* expected, ID3D11Texture2D* source) {
   if (!expected || !source) return false;
@@ -615,6 +629,7 @@ HRESULT WINAPI treat(void* p,uint64_t seq,uint32_t eye,ID3D11Texture2D* source,c
   }
   edvrTemporalAaNoteHead(int(eye),pd?s->history[eye].head:nullptr,pd?s->head:nullptr,pd?eyeOffset:nullptr);
   edvr::temporalPassNoteEyes(int(eye),pd?previousEyes:nullptr,pd?s->eyes:nullptr);
+  noteFrameGenSlot(*s,seq,eye);
   void* raw=edvrTemporalAa(source,int(eye),b,s->frusta[eye],prev,px,py,pd,pt,pto,s->nearZ[eye],s->farZ[eye],headDegrees,s->currentSettings.motion,s->currentSettings.blend,s->currentSettings.clamp,outW,outH,flags);
   s->treated[eye]=true;
   if(!raw){s->standDown=true;edvr::Log::get().note("native temporal: pass refused eye %u; future jitter disabled, current raw image retains its rendered FOV.",eye);return S_FALSE;}
@@ -844,6 +859,16 @@ bool nativeTemporalTrueVerticalTangents(float* up, float* down) {
 }
 }
 
+// Frame generation, Phase 2.2: the runtime's slot for the next pair's treats (common/native_temporal.h). Any size at or above version 1's; fields past it are not read. A pose
+// that is not rigid is taken as no pose. CPU only, its own lock.
+extern "C" HRESULT WINAPI edvrFrameGenNoteSlot(const EdvrNativeFrameGenSlot* slot){
+  if(!slot||slot->size<EDVR_NATIVE_FRAMEGEN_SLOT_SIZE_1||slot->version<EDVR_NATIVE_FRAMEGEN_VERSION_1||!slot->sequence)return E_INVALIDARG;
+  FrameGenSlot next;next.have=true;next.sequence=slot->sequence;next.consumer=slot->consumer==1u;
+  next.pose=slot->poseValid==1u&&rigid(slot->head);
+  if(next.pose)std::memcpy(next.head,slot->head,sizeof(next.head));
+  std::lock_guard<std::mutex> l(g_fgMu);g_fgSlot=next;
+  return next.pose||slot->poseValid!=1u?S_OK:S_FALSE;   // S_FALSE: a pose was given and refused
+}
 extern "C" HRESULT WINAPI edvrAcquireNativeTemporal(const EdvrNativeTemporalRequest* r,EdvrNativeTemporalTable* t){
   if(!t||t->size!=sizeof(*t)||t->version!=EDVR_NATIVE_TEMPORAL_VERSION_1)return E_INVALIDARG;*t={sizeof(*t),EDVR_NATIVE_TEMPORAL_VERSION_1};
   if(!r||r->size!=sizeof(*r)||r->version!=EDVR_NATIVE_TEMPORAL_VERSION_1||!r->gameDevice||!r->generation)return E_INVALIDARG;

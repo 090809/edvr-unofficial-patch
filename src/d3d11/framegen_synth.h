@@ -14,6 +14,7 @@
 
 #include "../common/framegen_replay_math.h"
 #include "../common/framegen_synth_math.h"
+#include "../common/native_temporal.h"
 
 namespace edvr {
 
@@ -40,13 +41,29 @@ struct FrameGenSynthFrame {
     uint32_t replayIndex = 0;
     const float* tanPrev = nullptr;                 // the previous frame's tangents when the pass has them (null otherwise); recorded only
     bool worldValid = false;                        // the pass's world path was on (deltas.W / deltas.tv are real); recorded only
+    // Phase 2.2 (the runtime's half, edvrFrameGenNoteSlot): the head step B -> S from the runtime's pose for S's slot (frameGenSlotStep), taken by the f = 0.5 S instead of the
+    // extrapolation (a replay-capture frame keeps the extrapolation, which the bench rebuilds); and whether the runtime consumes this frame's S, which puts S in the producer
+    // texture it crosses in (edvrFrameGenTakeS).
+    bool slotPose = false;
+    float slotRot[9] = {};
+    float slotT[3] = {};
+    bool consumer = false;
+    uint64_t slotSequence = 0;                      // the treat's sequence, which the answer to edvrFrameGenTakeS carries (0: no slot this frame)
+    // Called with the f = 0.5 S on a wantShown frame while the module still holds it (on the transfer's path it is the runtime's once handed over): the eye dump stages it here.
+    void (*shownSink)(void* context, ID3D11DeviceContext* ctx, ID3D11Texture2D* shown) = nullptr;
+    void* shownSinkContext = nullptr;
 };
 
 // Once per treated eye-frame (usedDlaa, key on). `frame` is the pass's frame counter: the f = 1 S is scored only against the frame right after it.
 void frameGenSynthEyeFrame(ID3D11Device* dev, ID3D11DeviceContext* ctx, uint32_t eye, uint32_t frame, const FrameGenSynthFrame& f);
 
-// The output-size S texture (the upscaler's format) the call for `frame` just built at f = 0.5, else null: valid until the next call for the eye.
+// The output-size S texture (the upscaler's format) the call for `frame` just built at f = 0.5 in the module's private texture, else null (also null when S went to the runtime
+// through the producer texture: shownSink sees it there): valid until the next call for the eye.
 ID3D11Texture2D* frameGenSynthShown(uint32_t eye, uint32_t frame);
+
+// Phase 2.2, the runtime's read of one eye's S after its treat (edvrFrameGenTakeS is this, exported). Fills `out` (its size and version set by the caller) and clears the eye's
+// answer: a second take before the next build answers sequence 0. The answer carries the slot sequence its build was handed (slotSequence).
+HRESULT frameGenSynthTakeS(uint32_t eye, EdvrNativeFrameGenS* out);
 
 // Once a frame: the one-second report when the key is on, the release of the resources when it went off.
 void frameGenSynthFrameBoundary();
