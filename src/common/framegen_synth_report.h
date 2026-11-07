@@ -38,7 +38,22 @@ struct FrameGenSynthWindow {
     uint32_t rotSamples = 0;
     float gpuMedian[2] = {}, gpuMax[2] = {};
     uint32_t gpuSamples[2] = {};  // the timed frames behind each pair; 0 reads "-(n=0)"
+    // Phase 2.2: the f = 0.5 builds by the head step they took (the runtime's slot pose / the synthesizer's own extrapolation), where S was written (bits: 1 the game-device private
+    // texture, 2 the producer texture directly (uav), 4 a private S copied into it), and the f = 0.5 S not built or not handed over because the previous one was still unconsumed.
+    uint32_t poseRuntime = 0, poseFallback = 0;
+    uint32_t pathBits = 0;
+    uint32_t busy = 0;
 };
+
+inline const char* frameGenSynthPathName(uint32_t bits) {
+    switch (bits) {
+        case 0: return "none";
+        case 1: return "private";
+        case 2: return "uav";
+        case 4: return "copy";
+        default: return "mixed";
+    }
+}
 
 // Adds one eye-frame's decoded counters (`built` of the kind 0 or 1, `renderPixels` of its render size); `r.cells` is non-zero only on a scored frame.
 inline void frameGenSynthMergeFrame(FrameGenSynthWindow& w, int kind, uint64_t renderPixels, const FrameGenSynthEyeResult& r) {
@@ -72,6 +87,9 @@ constexpr const char* kFrameGenSynthReportTailFmt = " gpu_ms=%s/%s holes=%.2f%%/
 // position fell outside S, not scored>. One line: the widest it takes is far under Log::note's 1165 characters (framegen_synth_report_test holds it).
 constexpr const char* kFrameGenSynthTurnedHeadFmt = " turned:";
 constexpr const char* kFrameGenSynthTurnedTailFmt = " rot_res_deg=%s/%s out=%.2f%%";
+// Phase 2.2, last on the line: pose=<f=0.5 builds on the runtime's slot pose>/<on the extrapolation> s=<where S was written: private, uav, copy, mixed, none> busy=<f=0.5 S held
+// back because the previous one was not consumed>. A line from before it ends at out=.
+constexpr const char* kFrameGenSynthSlotTailFmt = " pose=%u/%u s=%s busy=%u";
 constexpr const char* kFrameGenSynthRotNumFmt = "%.3f";
 constexpr const char* kFrameGenSynthRotNoneFmt = "-";
 
@@ -87,10 +105,12 @@ inline std::string formatFrameGenSynthArmed(uint32_t rw, uint32_t rh, uint32_t o
 // (framegen_shadow_report.h FrameGenShadowVram); tools\framegen_synth_bench prints the same line from its own textures. The eye's groups: S (output size, the upscaler's format),
 // the kept S luma, B's luma and class (both the quarter grid), the stats words with their staging copies. The scratch, shared by the eyes: the key grid, the read offsets (render
 // size, both R32_UINT) and the hole list.
+// Phase 2.2: `shared` is the producer texture S crosses to the runtime in (output size, S's format); on the uav path it replaces S (s is then 0), on the copy path it is beside it.
+// The line is said again for an eye whenever that texture is made or let go.
 struct FrameGenSynthVram {
-    uint64_t s = 0, luma = 0, cls = 0, stats = 0;
+    uint64_t s = 0, luma = 0, cls = 0, stats = 0, shared = 0;
     uint64_t key = 0, read = 0, holes = 0;
-    uint64_t eye() const { return s + luma + cls + stats; }
+    uint64_t eye() const { return s + luma + cls + stats + shared; }
     uint64_t scratch() const { return key + read + holes; }
     uint64_t total() const { return 2u * eye() + scratch(); }
 };
@@ -99,9 +119,9 @@ constexpr const char* kFrameGenSynthVramFmt =
     "frame generation (synth): eye %u VRAM %llu B (%.1f MiB): %s; shared scratch %llu B (%.1f MiB): %s; two eyes and the scratch %llu B (%.1f MiB)";
 
 inline std::string formatFrameGenSynthVram(uint32_t eye, const FrameGenSynthVram& v) {
-    const FrameGenVramGroup eg[] = {{"s", v.s}, {"luma", v.luma}, {"class", v.cls}, {"stats", v.stats}};
+    const FrameGenVramGroup eg[] = {{"s", v.s}, {"luma", v.luma}, {"class", v.cls}, {"stats", v.stats}, {"shared", v.shared}};
     const FrameGenVramGroup sg[] = {{"key", v.key}, {"read", v.read}, {"holes", v.holes}};
-    const std::string e = formatFrameGenVramGroups(eg, 4), s = formatFrameGenVramGroups(sg, 3);
+    const std::string e = formatFrameGenVramGroups(eg, 5), s = formatFrameGenVramGroups(sg, 3);
     char buf[400];
     std::snprintf(buf, sizeof(buf), kFrameGenSynthVramFmt, static_cast<unsigned>(eye), static_cast<unsigned long long>(v.eye()), frameGenMiB(v.eye()), e.c_str(),
                   static_cast<unsigned long long>(v.scratch()), frameGenMiB(v.scratch()), s.c_str(), static_cast<unsigned long long>(v.total()), frameGenMiB(v.total()));
@@ -138,8 +158,11 @@ inline std::string formatFrameGenSynthReport(const FrameGenSynthWindow& w) {
             std::snprintf(hi, sizeof(hi), "%s", kFrameGenSynthRotNoneFmt);
         }
         const double all = static_cast<double>(w.tcells + w.tout);
-        std::snprintf(buf + n, sizeof(buf) - n, kFrameGenSynthTurnedTailFmt, lo, hi, 100.0 * static_cast<double>(w.tout) / (all > 0.0 ? all : 1.0));
+        n += std::snprintf(buf + n, sizeof(buf) - n, kFrameGenSynthTurnedTailFmt, lo, hi, 100.0 * static_cast<double>(w.tout) / (all > 0.0 ? all : 1.0));
     }
+    if (n > 0 && n < static_cast<int>(sizeof(buf)))
+        std::snprintf(buf + n, sizeof(buf) - n, kFrameGenSynthSlotTailFmt, static_cast<unsigned>(w.poseRuntime), static_cast<unsigned>(w.poseFallback), frameGenSynthPathName(w.pathBits),
+                      static_cast<unsigned>(w.busy));
     return buf;
 }
 

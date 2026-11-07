@@ -94,6 +94,7 @@ template<class Check> void runWorldScaleCases(Check&& check) {
         "world scale wiring: the temporal frame's eye transforms are the snapshot's, made from the geometry it is handed (the scaled one)");
   // ---- the readers of eyeToHead are the classified ones ----
   const std::vector<std::string> want={
+    "src\\common\\framegen_synth_math.h",      // (a) frame generation 2.2: the head step to the slot (frameGenSlotStep) composes the eye as Elite is given it, the pass's own
     "src\\common\\native_temporal.h",          // (a) the temporal frame struct: the eye transforms as given to Elite
     "src\\d3d11\\native_temporal.cpp",         // (a) the temporal pass's eyes: motion, the ADS eye offsets, the history reset on a moved separation
     "src\\d3d11\\srv_turret.cpp",              // (a) the SRV turret HUD's anchored move: the eyes as Elite is given them (the head and the eye matrices of the frame)

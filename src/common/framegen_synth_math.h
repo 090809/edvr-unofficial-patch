@@ -94,6 +94,25 @@ inline void frameGenSynthHeadStep(const FrameGenDeltas& head, float f, float rot
     for (int i = 0; i < 3; ++i) t[i] = -f * tf[i];
 }
 
+// Phase 2.2: the head's step from B to S from the runtime's pose for S's slot (EdvrNativeFrameGenSlot::head) instead of the extrapolation. headS and headB are rigid row-major 3x4
+// head-to-space poses (the temporal frame's convention), eyeToHead the eye's (the same one the pass composes B's eye with). The eye's world transform is head * eye for each; the
+// step is the temporal pass's eyeDelta with S as the earlier frame: x_S = R_S^T R_B x_B + R_S^T (t_B - t_S).
+inline void frameGenSlotEyeWorld(const float head[12], const float eye[12], float r[9], float t[3]) {
+    for (int i = 0; i < 3; ++i)
+        for (int j = 0; j < 3; ++j) r[i * 3 + j] = head[i * 4 + 0] * eye[0 * 4 + j] + head[i * 4 + 1] * eye[1 * 4 + j] + head[i * 4 + 2] * eye[2 * 4 + j];
+    for (int i = 0; i < 3; ++i) t[i] = head[i * 4 + 3] + head[i * 4 + 0] * eye[3] + head[i * 4 + 1] * eye[7] + head[i * 4 + 2] * eye[11];
+}
+inline void frameGenSlotStep(const float headS[12], const float headB[12], const float eyeToHead[12], float rot[9], float t[3]) {
+    float rs[9], ts[3], rb[9], tb[3], rst[9];
+    frameGenSlotEyeWorld(headS, eyeToHead, rs, ts);
+    frameGenSlotEyeWorld(headB, eyeToHead, rb, tb);
+    temporalTranspose3(rs, rst);
+    for (int r = 0; r < 3; ++r)
+        for (int c = 0; c < 3; ++c) rot[r * 3 + c] = rst[r * 3 + 0] * rb[0 * 3 + c] + rst[r * 3 + 1] * rb[1 * 3 + c] + rst[r * 3 + 2] * rb[2 * 3 + c];
+    const float d[3] = {tb[0] - ts[0], tb[1] - ts[1], tb[2] - ts[2]};
+    temporalApply3(rst, d, t);
+}
+
 // The residual head rotation of a scored frame, rotation only: the f = 1 S kept from B was built for the head step `kept` (B's eye space to S's, the cb's rs rotation); C's true head
 // rotation is its backward delta `hdC` (C's eye space to B's: x_B = Hd_C x_C + th). A direction in C's eye space is d_B = Hd_C d_C in B's, d_S = kept d_B in the S eye: out =
 // kept * Hd_C, the identity when the head did exactly what S was built for. The compositor turns a submitted frame by this much on display.
@@ -103,7 +122,8 @@ inline void frameGenSynthResidual(const float kept[9], const float hdC[9], float
 }
 
 inline void frameGenSynthFillCb(FrameGenSynthCb& cb, uint32_t renderW, uint32_t renderH, uint32_t outW, uint32_t outH, const float tanB[4], float depthA, float depthB,
-                                float splitMetres, float f, const FrameGenDeltas& head, const float* residual = nullptr, const float* tanKept = nullptr) {
+                                float splitMetres, float f, const FrameGenDeltas& head, const float* residual = nullptr, const float* tanKept = nullptr,
+                                const float* slotRot = nullptr, const float* slotT = nullptr) {
     cb = FrameGenSynthCb{};
     cb.sz[0] = static_cast<int32_t>(renderW);
     cb.sz[1] = static_cast<int32_t>(renderH);
@@ -117,7 +137,12 @@ inline void frameGenSynthFillCb(FrameGenSynthCb& cb, uint32_t renderW, uint32_t 
     cb.dk[2] = splitMetres;
     cb.dk[3] = f;
     float rot[9], t[3];
-    frameGenSynthHeadStep(head, f, rot, t);
+    if (slotRot && slotT) {   // Phase 2.2: the runtime's pose for S's slot (frameGenSlotStep); f still carries the ship's share of the step
+        for (int i = 0; i < 9; ++i) rot[i] = slotRot[i];
+        for (int i = 0; i < 3; ++i) t[i] = slotT[i];
+    } else {
+        frameGenSynthHeadStep(head, f, rot, t);
+    }
     for (int r = 0; r < 3; ++r) {
         for (int k = 0; k < 3; ++k) {
             cb.rs[r][k] = rot[r * 3 + k];

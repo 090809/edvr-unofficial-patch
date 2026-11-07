@@ -67,3 +67,46 @@ struct EdvrNativeTemporalTable {
   EdvrNativeTemporalSkip skipEye;
 };
 extern "C" HRESULT WINAPI edvrAcquireNativeTemporal(const EdvrNativeTemporalRequest*, EdvrNativeTemporalTable*);
+
+// Frame generation, Phase 2.2 (fix.frame_generation_shadow, TEMPORARY; docs/design-frame-generation-2026-10-26.md): the synthetic slot's channel. Two exports of their own
+// beside the table above, so either DLL may be the older one: a runtime that finds no edvrFrameGenNoteSlot says so once and hands nothing; a d3d11.dll that is never handed a
+// slot keeps S on the game device and its head on the synthesizer's own extrapolation, and its synth line says so. Each struct is versioned by its size and version, and only
+// ever extended at the end: a reader takes any size at or above its own version's, and reads no field past the size it was given.
+#define EDVR_NATIVE_FRAMEGEN_VERSION_1 1u
+// Runtime -> d3d11, once per real pair on the XR owner, before the pair's first treat. CPU only.
+struct EdvrNativeFrameGenSlot {
+  uint32_t size, version;
+  uint64_t sequence;            // the temporal frame (beginFrame's sequence) this slot follows
+  int64_t displayTime;          // T, the pair's predicted display time (XrTime, ns)
+  int64_t slotTime;             // T_S = T + (T - T_A) / 2, the slot S is made for; 0 when there is none
+  uint32_t poseValid;           // 1: head is the head located at slotTime
+  uint32_t consumer;            // 1: the runtime takes this pair's S through edvrFrameGenTakeS and consumes it
+  float head[12];               // the head at T_S: EdvrNativeTemporalFrame::head's space and convention (rigid row-major 3x4)
+};
+#define EDVR_NATIVE_FRAMEGEN_SLOT_SIZE_1 ((uint32_t)sizeof(EdvrNativeFrameGenSlot))
+// The state of one eye's S after its treat.
+#define EDVR_NATIVE_FRAMEGEN_S_NONE 0u       // no S built for this sequence
+#define EDVR_NATIVE_FRAMEGEN_S_PRODUCED 1u   // S written and published (the producer texture's key released to 1): the runtime consumes it
+#define EDVR_NATIVE_FRAMEGEN_S_BUSY 2u       // the previous S was not consumed (key 1 still held): this S was not handed over
+#define EDVR_NATIVE_FRAMEGEN_S_KEPT 3u       // built and not handed over (the f = 1 variant, a replay frame, or no consumer)
+#define EDVR_NATIVE_FRAMEGEN_PATH_NONE 0u
+#define EDVR_NATIVE_FRAMEGEN_PATH_UAV 1u     // the resample pass writes S straight into the producer texture
+#define EDVR_NATIVE_FRAMEGEN_PATH_COPY 2u    // S is built in a private texture and copied into the producer texture
+// d3d11 -> runtime, per eye after its treat (the owner, once the treat's callback has returned).
+struct EdvrNativeFrameGenS {
+  uint32_t size, version;
+  uint64_t sequence;            // the sequence of the treat this answers; 0 when the eye had none since the last slot
+  uint32_t eye, state;          // EDVR_NATIVE_FRAMEGEN_S_*
+  uint32_t path;                // EDVR_NATIVE_FRAMEGEN_PATH_*
+  uint32_t poseRuntime;         // 1: S's head step was the handed slot pose; 0: the synthesizer's extrapolation
+  void* sharedHandle;           // the producer texture's NT handle (keyed mutex), owned by the d3d11 half: valid while textureSerial stands; never closed by the reader
+  uint64_t textureSerial;       // changes whenever the producer texture is made again
+  uint32_t width, height, format;
+  uint32_t reserved;
+  uint64_t gameBytes;           // the game-device bytes this eye's S set holds now (the producer texture, plus the private S on the copy path)
+};
+#define EDVR_NATIVE_FRAMEGEN_S_SIZE_1 ((uint32_t)sizeof(EdvrNativeFrameGenS))
+typedef HRESULT(WINAPI *EdvrNativeFrameGenNoteSlot)(const EdvrNativeFrameGenSlot*);
+typedef HRESULT(WINAPI *EdvrNativeFrameGenTakeS)(uint32_t, EdvrNativeFrameGenS*);
+extern "C" HRESULT WINAPI edvrFrameGenNoteSlot(const EdvrNativeFrameGenSlot*);
+extern "C" HRESULT WINAPI edvrFrameGenTakeS(uint32_t, EdvrNativeFrameGenS*);
