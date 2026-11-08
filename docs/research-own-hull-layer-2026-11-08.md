@@ -19,9 +19,13 @@ The smear is terrain that is newly uncovered at the hull edge every frame
 * **Step 2 built (compile-only, not flown):** section "Step 2 build".
   `separate` discards the own records in the main pass with an own-discard
   variant of the engine-motion patched hull and decal PS (mask at t127),
-  proven on WARP. It hides the ship until Step 3 (tonemap, composite after
-  DLSS, AA) lands. **Open:** the 6 own forward draws are not engine-motion
+  proven on WARP. **Open:** the 6 own forward draws are not engine-motion
   families, so they still draw over the terrain.
+* **Step 3 built (compile-only, not flown):** section "Step 3 build". The
+  game's tonemap re-issued on the private HDR, the layer's own TAA (head
+  motion), composited over the upscaled eye before the UI door. Falls back
+  (ship in the main pass) on FG, flat/on foot, mask >400, a recent miss.
+  **Next flight:** FG off, `separate`, a turn over terrain; verdicts there.
 * **Temporary keys of this arc:** `diag.hull_layer` (off | dump | separate).
 * **Option (e), the hull hole-fill, fails** for the case the pilot reported
   (section "Result"): in dump 132100543006 only 5.8% of the band was visible
@@ -55,6 +59,9 @@ The smear is terrain that is newly uncovered at the hull edge every frame
   * ruled out: a separate DLSS feature for the hull alone (b) as a fix,
     because it gives the world behind the hull no history. It is useful only
     on top of a world-only input.
+  * ruled out (Step 3 design, not flown): a second DLSS evaluation as the
+    layer's AA, because DLSS carries no coverage channel and its three NGX
+    slots are shared with FSR, XeSS and the world route.
   * ruled out: skipping the hull at draw level by shader pair, because
     those pairs also draw other ships and stations in the same instanced
     calls.
@@ -610,6 +617,100 @@ ledgers and census; the clear values are the game's as the clear hook sees
 them; that the shell and the block draw with four targets bound; and that no
 third pass draws the shell into a G-buffer of its own (`eye_frames` would be
 more than twice `frames`).
+
+## Step 3 build (2026-11-08, compile-only, not flown)
+
+The hull put back after the upscaler, in `diag.hull_layer = separate` only (`off` and `dump`
+unchanged). Source: `hull_layer.cpp` (hull_layer.h items 9-11), the call in
+`temporal_pass.cpp` right after the upscaler's evaluation, the tonemap hook in `vscreen.cpp`
+(`hullLayerAfterDraw` now passes the draw's kind and count).
+
+1. *The tonemap re-issue.* After the game's own issue of a 3-vertex, one-instance draw that
+   `tonemap_admit.h` admits by structure (one RT, no depth, blend off, b2 >= 256, exposure
+   and a 3D LUT bound) and whose PS slot 0-3 reads an eye's HDR (the G-buffer's RT3) after that
+   eye's private lighting: the same draw again, with that slot bound to the private HDR and RT0
+   to a private R8G8B8A8 target T (the game's output size, the game's RTV format) cleared to
+   transparent black. Once an eye a frame. No hash table.
+2. *The cover.* A compute pass right after it: where the private depth is set (nearer than its
+   clear) and at least as near as the game's main depth (reversed Z; the main depth holds the
+   cockpit shell and no longer the hull), the cover C = T's bytes with alpha 1, else 0; the
+   private depth beside it. The main depth is the game's eye depth, read in place (a
+   reference held from the seed to the frame's end).
+3. *The composite point.* Inside `temporalInner`, right after the upscaler (DLSS, FSR or XeSS)
+   wrote `dlOut` at output size and before anything reads it: the eye run's captures, the UI
+   resolve, the copy into `dlSubmit`, the frame-generation synthesizer, and later the UI layer's
+   door (`native_sharpen.cpp`, `uiLayerComposite`), so the HUD stays on top. The hull eye is the
+   one whose tonemap wrote the submitted texture (identity), else the same index
+   (`matched_by_index`). Render size against output size: each output pixel is mapped to the
+   render grid by `(o + 0.5) * render / output - 0.5`, inside the eye's region of C.
+4. *The AA: (c), a small TAA of the layer's own.* Not (a): DLSS has no coverage channel (the
+   layer over black would fringe dark), and the NGX wrapper's three slots are the eyes' and the
+   world route's, shared with FSR and XeSS. Not (b): the pass's own TAA shader is bound to the
+   whole pass (its constant block, depth pair, UI and engine inputs). The new one, at output
+   size: this frame's cover in a 3x3 around the pixel's unjittered position, each sample at
+   q - jitter weighted exp(-2.29 d^2) (the pass's own filter); the history (R16G16B16A16F,
+   premultiplied colour and coverage) carried by the head's motion alone, the pass's head delta
+   and translation term at the cover's nearest depth (the pass's own carry, transcribed), fetched
+   bilinearly and clamped to the 3x3's range; current weight 0.1. Then
+   `eye = eye * (1 - a) + colour` (premultiplied), copied into `dlOut`. The hull is rigid with
+   the cockpit, so the head's motion is its motion.
+5. *Safety.* Decided at the frame boundary before the frame's first draw. The main pass
+   discards the own ship only with: the VR profile and not on foot; frame generation off
+   (`fix.frame_generation` and `fix.frame_generation_shadow`; said once); an own mask read
+   back and of at most 400 records (else a line with the count, once a window); and no miss
+   in the last 16 frames. A miss: an eye that seeded and drew the own ship but was not lit,
+   tonemapped or composited this frame. On a fallback frame the layer, tonemap, cover and TAA
+   still run and the composite is made but not copied, so the history stays warm and a miss is
+   seen without the ship being lost. A failed seed is counted but holds nothing (that eye's
+   ship stayed in the main pass).
+6. *Cost.* D3D11 timestamps around the tonemap re-issue with its cover, and around the TAA
+   with its copy; read back a few frames later; the mean a call in the 30 s line. The composite
+   also lies inside the GPU census's temporal whole.
+
+**Known differences, not re-issued in this step:** atmosphere and fog over the hull layer;
+bloom from the hull's lights; the 6 own forward draws (they still draw into the main pass, over
+the terrain, and the hull covers them). The canopy glass stays over the hull only where the UI
+layer takes it (the legacy glass route into the weapons layer, composited at the door after
+this point); a glass drawn in the main pass lies under the composited hull.
+
+**The log lines** (separate only):
+
+```
+hull layer: composite: separate_frames=N composited_eyes=N ready_eyes=N
+  fallback=framegen:N,outside:N,mask_pending:N,mask_large:N,streak:N
+  failed=seed:N,lit:N,tone:N,composite:N declined=stale:N,size:N,gpu:N toned=N
+  tone_declined=N history_resets=N matched_by_index=N own_max=N aa=hull_taa
+  gpu_ms=tone:X,composite:X (...)                                    every 30 s
+hull layer: separate mode stands aside while frame generation is on   once
+hull layer: separate mode falls back: the own mask holds N records    once a window
+hull layer: tonemap re-issue declined: <why>                          once
+hull layer: composite declined for eye N: <why>                       once a reason
+hull layer: dump <stamp> eye N: HullTone ..., HullComposite ... (the composite applied
+  | made, not applied)                                                per eye, per dump
+```
+
+The dump adds `eye_<stamp>_HullTone.bin` (C, render size) and `_HullComposite.bin` (the
+composited eye, output size, after the composite and before the UI). `--health`: PARTIAL in
+separate mode with no composite line, or with no eye-frame composited.
+
+**What the pilot should see:** the own ship as before, its edges clean in a turn: the terrain
+behind the wing edge drawn and upscaled like the rest, the hull on top with its own TAA. The
+HUD and the cockpit in front of the hull.
+
+**What to fly:** FG off (`fix.frame_generation = off`, `fix.frame_generation_shadow = off`),
+`fix.temporal_aa` on, `diag.hull_layer = separate`; a turn over terrain with the wing edge
+in view; one eye dump in the turn. Then `edvr_log.py --health` (`hull layer` OK,
+`composited_eyes` near two a frame, `failed` and `streak` near 0).
+
+- **Confirmed** if: no wing-edge smear in turns; the ship looks the same as the game's.
+- **Refuted** if: the ship missing, flickering, sliding against the cockpit, or with jaggy edges.
+
+**Not verified before the flight:** that the treat runs before the frame boundary (else every
+composite is `stale` and the mode falls back for good); that the submitted texture is the
+tonemap's output (else `matched_by_index`); that the HDR the tonemap reads is the G-buffer's RT3
+(the binding map says so); that the atmosphere's depth writes never land nearer than the hull;
+the TAA's head-motion sign conventions on a real head (transcribed, not run); the alpha the
+game's tonemap writes (unused: coverage comes from depth).
 
 ## Step 2 build (2026-11-08, compile-only, not flown)
 

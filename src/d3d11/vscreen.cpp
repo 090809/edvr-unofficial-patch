@@ -4114,11 +4114,12 @@ __declspec(noinline) void starGlowAfterDraw(ID3D11DeviceContext* self, char kind
 // layer seeds its own mask (from the draw's instance window), recognises the hull-family G-buffer draws and the lighting stages, binds its private
 // targets and resources over the game's, and the draw is issued once more here with the game's own arguments (the star glow's shape); End puts the
 // game's bindings back. A draw EDVR withheld is not repeated. The layer's own clears, copies, dispatches and passes step past the game-facing hooks
-// (VrWorldInternalScope). NOINLINE: the draw path pays one bool load while the key is off.
+// (VrWorldInternalScope). In separate mode the game's tonemap is re-issued here too, into the layer's own 8-bit target (Step 3).
+// NOINLINE: the draw path pays one bool load while the key is off.
 __declspec(noinline) void hullLayerAfterDraw(ID3D11DeviceContext* self, char kind, UINT count, UINT instances, const DrawArgs& args, DrawVerdict v) {
     if (v == DrawVerdict::kSkip || v == DrawVerdict::kQuadSkip || uiLayerIssueBlocked()) return;
     VrWorldInternalScope internal;
-    if (hullLayerBegin(self, instances, args.startInstance)) {
+    if (hullLayerBegin(self, kind, count, instances, args.startInstance)) {
         pureDrawReissue(ReissueCaller::HullLayer, self, kind, count, instances, args);
         hullLayerEnd(self);
     }

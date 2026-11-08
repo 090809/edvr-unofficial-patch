@@ -42,7 +42,7 @@
 #include "object_probe.h"   // objectProbeArmLedger: the armed frame's draw ledger
 #include "pixel_probe.h"    // pixelProbeArm: who drew this pixel, the same armed frame
 #include "depth_writer_probe.h"   // depthWriterArm: who wrote each pixel's depth, the same armed frame
-#include "hull_layer.h"           // hullLayerArmDump: the private hull layer, the same armed frame (diag.hull_layer, TEMPORARY)
+#include "hull_layer.h"           // hullLayerArmDump: the private hull layer, the same armed frame; hullLayerCompositeEye (diag.hull_layer, TEMPORARY)
 #include "ui_depth.h"   // the interface's coverage mask and resolve tuning
 #include "blend_probe.h"   // TEMPORARY blend probe: asks for eye 0's per-pixel decisions, one relaxed load a frame unarmed
 #include "ui_resolve.h"
@@ -5161,6 +5161,31 @@ void* temporalInner(void* srcTex, int eye, const float* bounds,
                                         : "");
                             }
                         }
+                    }
+                    // diag.hull_layer = separate (TEMPORARY, hull_layer.h Step 3): the own hull, taken out of the
+                    // main pass, composited back over the upscaled eye with the layer's own TAA, before anything reads
+                    // dlOut (the eye run's captures, the UI resolve, frame generation) and before the UI layer's door.
+                    if (usedDlaa && hullLayerCompositeWanted()) {
+                        HullLayerCompositeInputs hc;
+                        hc.source = src;
+                        hc.regionX = region[0];
+                        hc.regionY = region[1];
+                        hc.renderW = w;
+                        hc.renderH = h;
+                        hc.outW = oW;
+                        hc.outH = oH;
+                        hc.output = e.dlOut;
+                        hc.outputSrv = e.dlOutSrv;
+                        hc.tanNow = tanNow;
+                        hc.tanPrev = useTanPrev ? tanPrev : nullptr;
+                        hc.headDelta = deltaHead;
+                        hc.headTrans = p.tvUsed;
+                        hc.useTrans = p.tvUsed[3] != 0.0f;
+                        hc.depthA = p.knobs[0];
+                        hc.depthB = p.knobs[2];
+                        hc.jitterX = jxNow;
+                        hc.jitterY = jyNow;
+                        hullLayerCompositeEye(ctx, eye, hc);
                     }
                     // One requested first-eye capture, after NGX and before
                     // UI bounds. Separates model artifacts from retained UI

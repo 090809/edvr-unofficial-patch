@@ -10636,13 +10636,23 @@ H_HULL_UNKNOWN = r"hull layer: unknown lighting pair vs (?P<vs>[0-9A-F]{16}) ps 
 # Separate mode (diag.hull_layer = separate, Step 2): the main pass's 30 s line, after the report line.
 H_HULL_MAIN = (r"hull layer: main pass: own_draws=(?P<own>\d+) decal_draws=(?P<decals>\d+) no_variant_draws=(?P<no_variant>\d+) "
                r"fallback_frames=(?P<fallback>\d+) decals_reissued=(?P<reissued>\d+) decal_no_slot=(?P<no_slot>\d+)")
+# Separate mode, Step 3: the composite's 30 s line, after the main pass line.
+H_HULL_COMPOSITE = (r"hull layer: composite: separate_frames=(?P<sep>\d+) composited_eyes=(?P<comp>\d+) ready_eyes=(?P<ready>\d+) "
+                    r"fallback=framegen:(?P<fb_fg>\d+),outside:(?P<fb_out>\d+),mask_pending:(?P<fb_pend>\d+),mask_large:(?P<fb_large>\d+),"
+                    r"streak:(?P<fb_streak>\d+) failed=seed:(?P<f_seed>\d+),lit:(?P<f_lit>\d+),tone:(?P<f_tone>\d+),composite:(?P<f_comp>\d+) "
+                    r"declined=stale:(?P<d_stale>\d+),size:(?P<d_size>\d+),gpu:(?P<d_gpu>\d+) toned=(?P<toned>\d+) tone_declined=(?P<tone_declined>\d+) "
+                    r"history_resets=(?P<resets>\d+) matched_by_index=(?P<by_index>\d+) own_max=(?P<own_max>\d+) aa=(?P<aa>\w+) "
+                    r"gpu_ms=tone:(?P<tone_ms>-?[\d.]+),composite:(?P<comp_ms>-?[\d.]+)")
 # The rest of its lines (the dump armed, a private copy made or dropped, a cap or a create failure said once, an unknown key value, the seed's facts and
 # refusals, the shaders): matched, not judged.
 H_HULL_OTHER = (r"hull layer: (?:dump \S+ armed|private copy (?:made|of a)|\d+ private (?:copies|views) held|a \d+x\d+ format \d+ target is multisampled|"
                 r"the private copy of|a private view|diag\.hull_layer=\S+ is not off or dump|no-slot-target:|a seed was refused|the seed reads the pool|"
                 r"the \w+ shader|the seed, filter and count shaders|the passes' states|\d+ unknown lighting pairs said|a stats readback|" +
                 r"diag\.hull_layer=\S+ is not off, dump or separate|separate mode hides the own ship|own-discard variant (?:made|declined)|"
-                r"a \w+ draw in the window got no own-discard variant|dump \S+ eye \d: GameGbuf0)")
+                r"a \w+ draw in the window got no own-discard variant|dump \S+ eye \d: GameGbuf0|"
+                # Step 3 (separate): the mode's note, its fallbacks said once, the tonemap re-issue's and the composite's facts and refusals.
+                r"separate mode (?:takes the own ship out|stands aside|falls back)|tonemap re-issue declined|composite declined for eye|"
+                r"the tone cover and composite shaders|the composite's sampler|(?:tone|composite) targets made|dump \S+ eye \d: HullTone)")
 # Frame generation, Phase 1 (fix.frame_generation_shadow, TEMPORARY; src\common\framegen_shadow_report.h): two lines of the graphics log with no build tag, read the way the desktop
 # window's are. The armed line is said once per change to on (so health_scan keeps it whatever --since says); the report line every second.
 H_FRAMEGEN = "frame generation shadow"
@@ -17013,8 +17023,25 @@ def _hj_hull_layer(rows, ctx=None):
         text += ("; main pass (separate): the own discard on %d hull and %d decal draw(s), %d window draw(s) without it, %d eye-frame(s) fell back "
                  "(no mask), %d own decal(s) re-issued (%d without the slot)"
                  % (m["own"], m["decals"], m["no_variant"], m["fallback"], m["reissued"], m["no_slot"]))
+        # Step 3: the hull put back after the upscaler. OK only when eye-frames were composited.
+        comps = rows.get("composite", [])
+        if not comps:
+            return ("PARTIAL", text + ": separate mode, but no 'hull layer: composite:' line follows (a build before Step 3, or the composite's report is dead)")
+        c = {k: sum(int(r[k]) for r in comps) for k in ("sep", "comp", "ready", "fb_fg", "fb_out", "fb_pend", "fb_large", "fb_streak", "f_seed", "f_lit",
+                                                         "f_tone", "f_comp", "d_stale", "d_size", "d_gpu", "toned", "tone_declined", "by_index")}
+        lc = comps[-1]
+        text += ("; composite (separate): %d eye-frame(s) composited, %d made ready on fallback frames; %d frame(s) with the discard on, fell back for "
+                 "frame generation %d, outside the eye pass %d, mask pending %d, mask large %d (own max %s), a recent miss %d; misses seed %d, lit %d, "
+                 "tone %d, composite %d; declined stale %d, size %d, gpu %d; %d tonemap re-issue(s) (%d declined), %d eye(s) matched by index; AA %s, "
+                 "GPU tone %s ms, composite %s ms a call (last line)"
+                 % (c["comp"], c["ready"], c["sep"], c["fb_fg"], c["fb_out"], c["fb_pend"], c["fb_large"], max(int(r["own_max"]) for r in comps),
+                    c["fb_streak"], c["f_seed"], c["f_lit"], c["f_tone"], c["f_comp"], c["d_stale"], c["d_size"], c["d_gpu"], c["toned"], c["tone_declined"],
+                    c["by_index"], lc["aa"], lc["tone_ms"], lc["comp_ms"]))
         if m["own"] == 0:
             return ("PARTIAL", text + ": separate mode, but no main-pass hull draw took the own discard (the ship was never taken out)")
+        if c["comp"] == 0:
+            return ("PARTIAL", text + ": separate mode, but no eye-frame was composited (the ship was taken out and never put back; the misses and fallbacks "
+                                      "say why)")
     return ("OK", text)
 
 def _hj_framegen_shadow(rows, ctx=None):
@@ -18462,6 +18489,7 @@ HEALTH_RULES = (
         ("auto", H_HULL_AUTO),
         ("unknown", H_HULL_UNKNOWN),
         ("main", H_HULL_MAIN),
+        ("composite", H_HULL_COMPOSITE),
         ("_", H_HULL_OTHER),
     ), _hj_hull_layer),
     # The SRV turret view (issue 140): lines of the graphics log that carry no build tag (health_scan reads them, as it reads the desktop window's, before it drops the untagged lines).
@@ -25923,15 +25951,33 @@ def self_test_health():
         def hl_main(own=5400, decals=1800, no_variant=0, fallback=0, reissued=1800, no_slot=0):
             return RH("hull layer: main pass: own_draws=%u", own, decals, no_variant, fallback, reissued, no_slot)
 
-        check("hull layer: separate, the own discard taken, is OK and says so",
-              hl_base + [hl_key("separate"), RH("hull layer: separate mode hides the own ship"), hl_report(), hl_main(),
-                         RH("hull layer: dump %ls eye %d: GameGbuf0", "123456789001", 0, "written", "written", 40, 22, 22)], 0, [("OK", HL)],
-              has=["main pass (separate): the own discard on 5400 hull and 1800 decal draw(s), 0 window draw(s) without it, 0 eye-frame(s) fell back"],
+        def hl_comp(sep=2700, comp=5300, ready=60, fb=(0, 0, 0, 0, 30), fail=(16, 0, 0, 2), declined=(0, 0, 0), toned=5400, own_max=0, ms=(0.042, 0.181)):
+            return RH("hull layer: composite: separate_frames=%u", sep, comp, ready, fb[0], fb[1], fb[2], fb[3], fb[4], fail[0], fail[1], fail[2], fail[3],
+                      declined[0], declined[1], declined[2], toned, 0, 4, 0, own_max, ms[0], ms[1], 16)
+
+        check("hull layer: separate, the own discard taken and composited, is OK and says so",
+              hl_base + [hl_key("separate"), RH("hull layer: separate mode takes the own ship out"), hl_report(), hl_main(),
+                         RH("hull layer: the tone cover and composite shaders", 0.1), RH("hull layer: tone targets made", 0, 2816, 2448, 28),
+                         RH("hull layer: composite targets made", 0, 3520, 3060),
+                         RH("hull layer: separate mode falls back: the own mask holds", 612, 400, 120.0),
+                         RH("hull layer: separate mode stands aside"), RH("hull layer: tonemap re-issue declined:", "x"),
+                         RH("hull layer: composite declined for eye", 1, "x"),
+                         RH("hull layer: dump %ls eye %d: GameGbuf0", "123456789001", 0, "written", "written", 40, 22, 22),
+                         RH("hull layer: dump %ls eye %d: HullTone", "123456789001", 0, "written", "written", "applied"), hl_comp()], 0, [("OK", HL)],
+              has=["main pass (separate): the own discard on 5400 hull and 1800 decal draw(s), 0 window draw(s) without it, 0 eye-frame(s) fell back",
+                   "composite (separate): 5300 eye-frame(s) composited, 60 made ready on fallback frames; 2700 frame(s) with the discard on",
+                   "a recent miss 30; misses seed 16, lit 0, tone 0, composite 2", "AA hull_taa, GPU tone 0.042 ms, composite 0.181 ms a call"],
               lacks=["UNPARSED", "do not match"])
         check("hull layer: separate with no main-pass line is PARTIAL", hl_base + [hl_key("separate"), hl_report()], 0, [("PARTIAL", HL)],
               has=["no 'hull layer: main pass:' line follows"])
-        check("hull layer: separate, nothing discarded, is PARTIAL", hl_base + [hl_key("separate"), hl_report(), hl_main(own=0, decals=0, no_variant=5400)], 0,
-              [("PARTIAL", HL)], has=["no main-pass hull draw took the own discard"])
+        check("hull layer: separate with no composite line is PARTIAL (a Step 2 build)", hl_base + [hl_key("separate"), hl_report(), hl_main()], 0,
+              [("PARTIAL", HL)], has=["no 'hull layer: composite:' line follows"])
+        check("hull layer: separate, nothing discarded, is PARTIAL", hl_base + [hl_key("separate"), hl_report(), hl_main(own=0, decals=0, no_variant=5400),
+                                                                       hl_comp(sep=0, comp=0, ready=0, fb=(2700, 0, 0, 0, 0))], 0,
+              [("PARTIAL", HL)], has=["no main-pass hull draw took the own discard", "fell back for frame generation 2700"])
+        check("hull layer: separate, discarded and never composited, is PARTIAL", hl_base + [hl_key("separate"), hl_report(), hl_main(),
+                                                                                         hl_comp(comp=0, ready=0, fail=(0, 0, 0, 5400), declined=(5400, 0, 0))],
+              0, [("PARTIAL", HL)], has=["no eye-frame was composited", "misses seed 0, lit 0, tone 0, composite 5400; declined stale 5400"])
         # ---- the SRV turret view: the graphics log's untagged lines, rendered from the C format strings in src\d3d11\srv_turret.cpp and (the geometry shader's creation line) shader_swap.cpp ----
         stsrc = read_text(os.path.join(repo_root(), "src", "d3d11", "srv_turret.cpp"))
 

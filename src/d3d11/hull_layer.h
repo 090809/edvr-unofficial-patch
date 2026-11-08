@@ -37,6 +37,21 @@
 //   The own forward draws after the lighting (VS 88DCF116, 025B4B9F, 0B5981F2, F464E27C, 6DB587D2, 2B3F53DD) are not
 //   engine-motion families: they still draw into the main pass (an open item of the doc).
 //
+// Step 3 (separate; "Step 3 build"): the hull put back after the upscaler.
+//   9. Right after the game's tonemap of an eye (admitted by structure, tonemap_admit.h, and by the identity of the HDR it
+//      reads: the eye's G-buffer RT3), the same draw is issued once more with that HDR slot bound to the private HDR and RT0
+//      to a private 8-bit target cleared to transparent black. A compute pass then keeps it where the hull is shown (the
+//      private depth set and at least as near as the game's main depth, reversed Z, so the cockpit stays in front) into the
+//      eye's cover (alpha 1 there, 0 elsewhere) and the private depth beside it.
+//  10. In the temporal pass, right after the upscaler wrote the eye (hullLayerCompositeEye), the hull layer's own TAA at
+//      output size: this frame's jittered cover (a 3x3 Gaussian at the output pixel's unjittered position), the history
+//      reprojected by the head's motion alone (the pass's head delta and translation, at the cover's depth) and clamped to
+//      the 3x3's range, blended 0.1; then composited over the upscaled eye (premultiplied), before the UI layer's door.
+//  11. Safety: the main pass discards the own ship only on a frame decided at the frame boundary before it: the VR profile
+//      and not on foot, frame generation off, an own mask read back and of at most 400 records, and no miss (an eye that
+//      seeded but was not lit, tonemapped and composited) in the last 16 frames. On every other frame the layer still runs
+//      and its composite is made but not applied, so a miss is seen without the ship being lost.
+//
 // Cost with the key off: one bool load per draw (hullLayerWanted). VR owner context only.
 #pragma once
 
@@ -68,11 +83,12 @@ void hullLayerConfigure(Config& cfg);
 bool hullLayerBeforeMainDraw(ID3D11DeviceContext* ctx, UINT instances, UINT startInstance);
 void hullLayerAfterMainDraw(ID3D11DeviceContext* ctx);
 
-// Right after the game's own issue of an owner-context draw, with the draw's bindings still bound, and the draw's
-// instance count and StartInstanceLocation (1 and 0 for a draw that is not instanced). True: the private targets and
-// resources are bound and the caller issues the same draw once more (raw), then calls hullLayerEnd, which puts the
-// game's bindings back. False: nothing was bound (the layer may have run its own passes, with the game's state put back).
-bool hullLayerBegin(ID3D11DeviceContext* ctx, UINT instances, UINT startInstance);
+// Right after the game's own issue of an owner-context draw, with the draw's bindings still bound, its kind ('D', 'I',
+// 'N', 'X'), vertex or index count, and instance count and StartInstanceLocation (1 and 0 for a draw that is not
+// instanced). True: the private targets and resources are bound and the caller issues the same draw once more (raw),
+// then calls hullLayerEnd, which puts the game's bindings back. False: nothing was bound (the layer may have run its own
+// passes, with the game's state put back).
+bool hullLayerBegin(ID3D11DeviceContext* ctx, char kind, UINT count, UINT instances, UINT startInstance);
 void hullLayerEnd(ID3D11DeviceContext* ctx);
 
 // From the clear hooks (owner context, the game's own clears): a clear of a target that has a private counterpart is
@@ -82,6 +98,27 @@ void hullLayerNoteClearDsv(ID3D11DeviceContext* ctx, ID3D11DepthStencilView* dsv
 
 // The eye dump's arming (temporal_pass.cpp beginEyeRun): the next whole frame is captured. A no-op with the key off.
 void hullLayerArmDump(const wchar_t* stamp);
+
+// Step 3 (separate): what the temporal pass hands the composite, right after the upscaler wrote the eye.
+struct HullLayerCompositeInputs {
+    const void* source = nullptr;          // the submitted eye texture (identity): the tonemap output it should be
+    uint32_t regionX = 0, regionY = 0;     // the eye's region in it
+    uint32_t renderW = 0, renderH = 0;     // the region's size: the render size
+    uint32_t outW = 0, outH = 0;           // the upscaler's output size
+    ID3D11Texture2D* output = nullptr;     // the upscaler's output (R8G8B8A8_UNORM, outW x outH): the composite lands here
+    ID3D11ShaderResourceView* outputSrv = nullptr;
+    const float* tanNow = nullptr;         // l r t b, jitter excluded
+    const float* tanPrev = nullptr;        // last frame's, or null when the pass has no continuity (the layer's history restarts)
+    const float* headDelta = nullptr;      // the head's rotation from this frame's view to last frame's, 3x3 row-major; null: none
+    const float* headTrans = nullptr;      // its translation term (metres), used when useTrans
+    bool useTrans = false;
+    float depthA = 0.0f, depthB = 0.0f;    // the scene depth's encoding: written = A + B / metres
+    float jitterX = 0.0f, jitterY = 0.0f;  // this frame's jitter, render pixels
+};
+
+// Step 3: right after the upscaler wrote VR eye `eye` (temporal_pass.cpp). A no-op unless diag.hull_layer = separate.
+inline bool hullLayerCompositeWanted() { return detail::g_hullLayerSeparate; }
+void hullLayerCompositeEye(ID3D11DeviceContext* ctx, int eye, const HullLayerCompositeInputs& in);
 
 // Once per frame on the owner thread: the per-eye bookkeeping, the readbacks, the dump's write, the auto dump, the 30 s line.
 void hullLayerFrameBoundary(ID3D11DeviceContext* ctx);

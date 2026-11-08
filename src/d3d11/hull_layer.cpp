@@ -1,5 +1,6 @@
-// diag.hull_layer (TEMPORARY): the own hull as a private, lit layer, Step 1 v2 -- in the eye dump only. hull_layer.h says
-// what it does; docs\research-own-hull-layer-2026-11-08.md ("Step 1 v2 build") says what the dump must show.
+// diag.hull_layer (TEMPORARY): the own hull as a private, lit layer -- Step 1 v2 in the eye dump, Steps 2-3 (separate) out of
+// the main pass and composited back after the upscaler. hull_layer.h says what it does; docs\research-own-hull-layer-2026-11-08.md
+// ("Step 1 v2 build", "Step 2 build", "Step 3 build") says what each must show.
 #include "hull_layer.h"
 
 #include <windows.h>
@@ -14,9 +15,14 @@
 
 #include "../common/config.h"
 #include "../common/log.h"
+#include "../common/runtime_profile.h"   // runtimeVrProfile: Step 3's discard is the VR eye pass's only
 #include "binding_shadow.h"
+#include "cs_stage_save.h"    // Step 3's dispatches: the compute stage put back as the game (or the temporal pass) left it
 #include "engine_velocity.h"  // engineVelocityLiveNow, engineVelocityOwnDiscardPs and its mask slot (kEngineVelocityOwnMaskPsSlot)
-#include "temporal_pass.h"    // temporalPassArmEyeDump: the auto dump arms the eye dump the hotkey arms
+#include "framegen_shadow.h"  // frameGenShadowOn: Step 3 stands aside while any frame generation key is on
+#include "native_on_foot.h"   // nativeOnFootActive: no discard on foot
+#include "temporal_pass.h"    // temporalPassArmEyeDump: the auto dump arms the eye dump the hotkey arms; temporalPassFrameGenMode
+#include "tonemap_admit.h"    // Step 3: the game's tonemap, admitted by structure
 #include "vr_world_route.h"   // VrWorldInternalScope: the layer's own clears, copies and passes step past the game-facing hooks
 #include "vscreen.h"          // the raw setters: the binding shadow keeps describing the game's bindings
 
@@ -57,6 +63,14 @@ constexpr uint32_t kMaxUnknownPairs = 16;
 constexpr uint32_t kAutoFrames = 600, kAutoMax = 3, kAutoOwnLo = 20, kAutoOwnHi = 200;
 constexpr ULONGLONG kAutoGapMs = 60000;
 constexpr ULONGLONG kReportMs = 30000;
+// Step 3 (separate): the discard's safety. A mask past kOwnMaskMax records holds a station's or another ship's records
+// within the radius (docking): the frame falls back. A miss (an eye seeded but not lit, tonemapped and composited) holds
+// the discard off for kHoldFrames frames.
+constexpr uint32_t kOwnMaskMax = 400;
+constexpr uint32_t kHoldFrames = 16;
+constexpr float kTaaCurrent = 0.1f;       // the hull layer's TAA: this frame's weight against the clamped history
+constexpr UINT kTimerRing = 8;            // timestamp sets a timer keeps in flight
+constexpr int kToneStage = 10;            // Pending::stage of the tonemap re-issue (not a Stage)
 
 enum Stage : int { kCopy = 0, kMask = 1, kLight = 2, kStages = 3 };
 struct StagePair {
@@ -180,6 +194,96 @@ constexpr char kCountHlsl[] = HULL_LAYER_PASS_HLSL
     "}\n";
 #undef HULL_LAYER_PASS_HLSL
 
+// Step 3 (separate), compiled at the first tonemap re-issue; the build compiles them too:
+// hlsl-check: kCoverHlsl hull_layer_cover_cs cs_5_0
+// hlsl-check: kTaaHlsl hull_layer_taa_cs cs_5_0
+//
+// The cover: the re-issued tonemap's pixel where the hull is shown -- the private depth set (nearer than its clear, reversed
+// Z) and at least as near as the game's main depth, which holds the cockpit shell and no longer the hull -- with alpha 1,
+// else 0 (premultiplied); and the private depth wherever the hull is, for the TAA's reprojection. The tonemap is read through
+// a UNORM view: the bytes the game's tonemap would have written, the encoding the upscaler's input and output carry.
+constexpr char kCoverHlsl[] =
+    "cbuffer HullLayerCoverCb : register(b0) { float clearDepth; uint width; uint height; uint coverPad; };\n"
+    "Texture2D<float4> tone : register(t0);\n"
+    "Texture2D<float> hullDepth : register(t1);\n"
+    "Texture2D<float> mainDepth : register(t2);\n"
+    "RWTexture2D<float4> cover : register(u0);\n"
+    "RWTexture2D<float> coverDepth : register(u1);\n"
+    "[numthreads(8, 8, 1)] void hull_layer_cover_cs(uint3 id : SV_DispatchThreadID) {\n"
+    "    if (id.x >= width || id.y >= height) return;\n"
+    "    float hz = hullDepth.Load(int3(id.xy, 0));\n"
+    "    float mz = mainDepth.Load(int3(id.xy, 0));\n"
+    "    bool hull = hz > clearDepth;\n"
+    "    bool shown = hull && hz >= mz;\n"
+    "    cover[id.xy] = shown ? float4(tone.Load(int3(id.xy, 0)).rgb, 1.0) : float4(0.0, 0.0, 0.0, 0.0);\n"
+    "    coverDepth[id.xy] = hull ? hz : 0.0;\n"
+    "}\n";
+
+// The hull layer's TAA and composite, one thread an output pixel. This frame: the cover's 3x3 around the pixel's unjittered
+// position, each render sample q at q - jitter weighted exp(-2.29 d^2) (the temporal pass's own filter), and its range. The
+// history: the pixel carried to last frame's view by the head's delta (and its translation at the cover's nearest depth of
+// the 3x3, when the pass carries it) -- temporal_shader_source.h's temporalPixelDir, temporalCarry and temporalProjectPixel,
+// transcribed -- then fetched bilinearly and clamped to the range. The result (premultiplied colour, coverage in alpha) is the
+// next history and goes over the upscaled eye.
+constexpr char kTaaHlsl[] =
+    "cbuffer HullLayerTaaCb : register(b0) {\n"
+    "    float4 tanNow; float4 tanPrev; float4 dRow0; float4 dRow1; float4 dRow2;\n"
+    "    float4 headT; float4 jit; float4 depthAB; int4 sizes; int4 origin;\n"
+    "};\n"
+    "Texture2D<float4> cover : register(t0);\n"
+    "Texture2D<float> coverDepth : register(t1);\n"
+    "Texture2D<float4> histIn : register(t2);\n"
+    "Texture2D<float4> world : register(t3);\n"
+    "SamplerState lin : register(s0);\n"
+    "RWTexture2D<float4> histOut : register(u0);\n"
+    "RWTexture2D<float4> compOut : register(u1);\n"
+    "[numthreads(8, 8, 1)] void hull_layer_taa_cs(uint3 id : SV_DispatchThreadID) {\n"
+    "    int2 rsz = sizes.xy;\n"
+    "    int2 osz = sizes.zw;\n"
+    "    if (id.x >= (uint)osz.x || id.y >= (uint)osz.y) return;\n"
+    "    float2 pr = (float2(id.xy) + 0.5) * float2(rsz) / float2(osz) - 0.5;\n"
+    "    int2 c = int2(round(pr + jit.xy));\n"
+    "    float4 cur = 0.0;\n"
+    "    float wsum = 0.0;\n"
+    "    float4 lo = 1e9;\n"
+    "    float4 hi = -1e9;\n"
+    "    float zr = 0.0;\n"
+    "    [unroll] for (int dy = -1; dy <= 1; ++dy) {\n"
+    "        [unroll] for (int dx = -1; dx <= 1; ++dx) {\n"
+    "            int2 q = clamp(c + int2(dx, dy), int2(0, 0), rsz - 1);\n"
+    "            float4 s = cover.Load(int3(origin.xy + q, 0));\n"
+    "            float2 dd = float2(q) - jit.xy - pr;\n"
+    "            float wt = exp(-2.29 * dot(dd, dd));\n"
+    "            cur += s * wt;\n"
+    "            wsum += wt;\n"
+    "            lo = min(lo, s);\n"
+    "            hi = max(hi, s);\n"
+    "            zr = max(zr, coverDepth.Load(int3(origin.xy + q, 0)));\n"
+    "        }\n"
+    "    }\n"
+    "    cur /= max(wsum, 1e-6);\n"
+    "    float4 res = cur;\n"
+    "    if (jit.z != 0.0) {\n"
+    "        float3 d;\n"
+    "        d.x = tanNow.x + (pr.x + 0.5) / float(rsz.x) * (tanNow.y - tanNow.x);\n"
+    "        d.y = tanNow.w - (pr.y + 0.5) / float(rsz.y) * (tanNow.w - tanNow.z);\n"
+    "        d.z = -1.0;\n"
+    "        float3 dp = float3(dot(dRow0.xyz, d), dot(dRow1.xyz, d), dot(dRow2.xyz, d));\n"
+    "        float den = zr - depthAB.x;\n"
+    "        if (headT.w != 0.0 && zr > 0.0 && den > 0.0) dp = dp * (depthAB.y / den) + headT.xyz;\n"
+    "        if (dp.z < -1e-6) {\n"
+    "            float2 pp;\n"
+    "            pp.x = (dp.x / -dp.z - tanPrev.x) / (tanPrev.y - tanPrev.x) * float(rsz.x) - 0.5;\n"
+    "            pp.y = (tanPrev.w - dp.y / -dp.z) / (tanPrev.w - tanPrev.z) * float(rsz.y) - 0.5;\n"
+    "            float2 uv = (pp + 0.5) / float2(rsz);\n"
+    "            if (all(uv >= 0.0) && all(uv <= 1.0)) res = lerp(clamp(histIn.SampleLevel(lin, uv, 0), lo, hi), cur, jit.w);\n"
+    "        }\n"
+    "    }\n"
+    "    histOut[id.xy] = res;\n"
+    "    float4 w = world[id.xy];\n"
+    "    compOut[id.xy] = float4(w.rgb * (1.0 - res.a) + res.rgb, w.a);\n"
+    "}\n";
+
 // A private copy of one game texture: the same desc, default usage, nothing shared. `game` is an identity only.
 struct Mirror {
     const void* game = nullptr;
@@ -258,7 +362,66 @@ struct Eye {
     ID3D11Texture2D* gameDepth = nullptr;
     ID3D11Texture2D* stageGbuf0 = nullptr;
     ID3D11Texture2D* stageMainDepth = nullptr;
+    // Step 3 (separate). Kept across frames (remade on a size or format change): the tonemap re-issue's target T (R8G8B8A8
+    // typeless: an RTV in the game's own view format, a UNORM SRV), the cover C and the private depth beside it Z.
+    ID3D11Texture2D* tone = nullptr;
+    ID3D11RenderTargetView* toneRtv = nullptr;
+    ID3D11ShaderResourceView* toneSrv = nullptr;
+    DXGI_FORMAT toneRtvFmt = DXGI_FORMAT_UNKNOWN;
+    uint32_t toneW = 0, toneH = 0;
+    ID3D11Texture2D* cover = nullptr;
+    ID3D11ShaderResourceView* coverSrv = nullptr;
+    ID3D11UnorderedAccessView* coverUav = nullptr;
+    ID3D11Texture2D* coverZ = nullptr;
+    ID3D11ShaderResourceView* coverZSrv = nullptr;
+    ID3D11UnorderedAccessView* coverZUav = nullptr;
+    // Shader views over the private depth and the game's eye depth, kept while the texture is the same (a view holds its texture).
+    ID3D11ShaderResourceView* privZSrv = nullptr;
+    const void* privZOf = nullptr;
+    ID3D11ShaderResourceView* mainZSrv = nullptr;
+    const void* mainZOf = nullptr;
+    // This frame: the game's eye depth (a reference from the seed to the frame's end). Across: the layer frame the tonemap
+    // re-issue and the composite last ran on, the game's tonemap output then (identity), and whether the composite was applied.
+    ID3D11Texture2D* mainDepth = nullptr;
+    uint32_t toneFrame = ~0u, compFrame = ~0u;
+    const void* toneOut = nullptr;
+    bool compApplied = false;
+    // The capture frame only: C and the composited output eye.
+    ID3D11Texture2D* stageTone = nullptr;
+    ID3D11Texture2D* stageComp = nullptr;
+    bool dumpApplied = false;
 };
+
+// Step 3: the TAA's history and the composited eye, per VR eye (the temporal pass's index), at the upscaler's output size.
+struct Comp {
+    ID3D11Texture2D* hist[2] = {};
+    ID3D11ShaderResourceView* histSrv[2] = {};
+    ID3D11UnorderedAccessView* histUav[2] = {};
+    ID3D11Texture2D* out = nullptr;
+    ID3D11UnorderedAccessView* outUav = nullptr;
+    uint32_t outW = 0, outH = 0, renderW = 0, renderH = 0;
+    uint32_t read = 0;            // hist[read] holds last frame's
+    uint32_t lastFrame = ~0u;
+    bool have = false;
+};
+
+// Step 3: a GPU time by D3D11 timestamps, read back a few frames later (never a stall); kTimerRing sets in flight.
+struct GpuTimer {
+    struct Set {
+        ID3D11Query* disjoint = nullptr;
+        ID3D11Query* t0 = nullptr;
+        ID3D11Query* t1 = nullptr;
+        bool pending = false;
+    };
+    Set set[kTimerRing];
+    int open = -1;
+    double sumMs = 0.0;
+    uint32_t samples = 0;
+};
+
+// Step 3: why a frame in separate mode kept the own ship in the main pass, and why an eye's composite declined.
+enum Fallback : int { kFbFrameGen = 0, kFbOutside, kFbMaskPending, kFbMaskLarge, kFbStreak, kFallbacks };
+enum Declined : int { kDcStale = 0, kDcSize, kDcGpu, kDeclines };
 
 struct Window {
     ULONGLONG startMs = 0;
@@ -272,6 +435,14 @@ struct Window {
     // refused, or had no slot target or shader), and the own decals re-issued into the private layer (and those declined:
     // no slot exported).
     uint32_t ownDraws = 0, ownDecals = 0, noVariant = 0, fallbackFrames = 0, decalsReissued = 0, decalNoSlot = 0;
+    // Step 3 (the "composite" line): frames decided with the discard on, and kept by reason; eye-frames composited (the
+    // discard on) or made ready (a fallback frame); misses by stage (an eye-frame whose seed failed is counted, not held);
+    // composites declined; tonemap re-issues made and declined; history restarts; eyes matched by index, not identity;
+    // the largest own mask a large-mask fallback saw.
+    uint32_t separateFrames = 0, fallback[kFallbacks] = {};
+    uint32_t compositedEyes = 0, readyEyes = 0, failSeed = 0, failLit = 0, failTone = 0, failComposite = 0;
+    uint32_t declined[kDeclines] = {};
+    uint32_t toned = 0, toneDeclined = 0, historyResets = 0, byIndex = 0, ownMax = 0;
 };
 
 // Separate mode: what hullLayerBeforeMainDraw bound over the game's issue, which hullLayerAfterMainDraw puts back.
@@ -291,6 +462,7 @@ struct Pending {
     ID3D11ShaderResourceView* srv[kSrvSlots] = {};
     bool srvSwapped = false;
     const void* hdrGame = nullptr;   // a lighting draw's RT0 (the game's HDR), for the dump
+    const void* toneOut = nullptr;   // the tonemap re-issue (stage kToneStage): the game's tonemap output (identity)
 };
 
 // The device objects the passes need, made once at the first seed.
@@ -309,6 +481,16 @@ struct Gpu {
     ID3D11Buffer* pool = nullptr;   // the pool's copy at the seed, raw
     ID3D11ShaderResourceView* poolSrv = nullptr;
     uint32_t poolBytes = 0;
+};
+
+// Step 3's device objects, made once at the first tonemap re-issue (apart from Gpu, so a failure here leaves Steps 1-2 running).
+struct CompGpu {
+    bool tried = false, ok = false;
+    ID3D11ComputeShader* coverCs = nullptr;
+    ID3D11ComputeShader* taaCs = nullptr;
+    ID3D11SamplerState* linear = nullptr;
+    ID3D11Buffer* coverCb = nullptr;
+    ID3D11Buffer* taaCb = nullptr;
 };
 
 std::string g_mode = "off";
@@ -341,6 +523,13 @@ uint32_t g_dumpFrame = 0;
 // The auto dump (session-wide).
 uint32_t g_autoStreak = 0, g_autoDumps = 0;
 ULONGLONG g_lastAutoMs = 0;
+// Step 3 (separate): this frame's decision (made at the boundary before it), the hold after a miss, and the GPU objects.
+bool g_discard = false;
+uint32_t g_hold = 0;
+Comp g_comp[2];
+CompGpu g_cgpu;
+GpuTimer g_toneTimer, g_compTimer;
+bool g_saidFrameGen = false, g_saidMaskLarge = false, g_saidToneDecline = false, g_saidDecline[kDeclines] = {};
 
 template <class T>
 void releaseRef(T*& p) {
@@ -374,7 +563,10 @@ void releaseStaging(Eye& e) {
     releaseRef(e.stageStats);
     releaseRef(e.stageGbuf0);
     releaseRef(e.stageMainDepth);
+    releaseRef(e.stageTone);
+    releaseRef(e.stageComp);
     e.dumpHull = e.dumpLight = 0;
+    e.dumpApplied = false;
 }
 
 void releaseSeedViews(Eye& e) {
@@ -383,6 +575,46 @@ void releaseSeedViews(Eye& e) {
     releaseRef(e.privDsv);
     releaseRef(e.gameRt0);
     releaseRef(e.gameDepth);
+    releaseRef(e.mainDepth);
+}
+
+// Step 3: the eye's tonemap target, cover and depth views.
+void releaseTone(Eye& e) {
+    releaseRef(e.toneRtv);
+    releaseRef(e.toneSrv);
+    releaseRef(e.tone);
+    releaseRef(e.coverSrv);
+    releaseRef(e.coverUav);
+    releaseRef(e.cover);
+    releaseRef(e.coverZSrv);
+    releaseRef(e.coverZUav);
+    releaseRef(e.coverZ);
+    releaseRef(e.privZSrv);
+    releaseRef(e.mainZSrv);
+    e.privZOf = e.mainZOf = nullptr;
+    e.toneRtvFmt = DXGI_FORMAT_UNKNOWN;
+    e.toneW = e.toneH = 0;
+}
+
+void releaseComp(Comp& c) {
+    for (int i = 0; i < 2; ++i) {
+        releaseRef(c.histSrv[i]);
+        releaseRef(c.histUav[i]);
+        releaseRef(c.hist[i]);
+    }
+    releaseRef(c.outUav);
+    releaseRef(c.out);
+    c = Comp{};
+}
+
+void releaseTimer(GpuTimer& t) {
+    for (auto& s : t.set) {
+        releaseRef(s.disjoint);
+        releaseRef(s.t0);
+        releaseRef(s.t1);
+        s.pending = false;
+    }
+    t = GpuTimer{};
 }
 
 void releaseEyeGpu(Eye& e) {
@@ -399,6 +631,7 @@ void releaseEyeGpu(Eye& e) {
     }
     releaseRef(e.slotSrv);
     e.slotSrvOf = nullptr;
+    releaseTone(e);
     releaseStaging(e);
 }
 
@@ -431,6 +664,15 @@ void releaseGpu() {
     releaseRef(g_gpu.poolSrv);
     releaseRef(g_gpu.pool);
     g_gpu = Gpu{};
+    releaseRef(g_cgpu.coverCs);
+    releaseRef(g_cgpu.taaCs);
+    releaseRef(g_cgpu.linear);
+    releaseRef(g_cgpu.coverCb);
+    releaseRef(g_cgpu.taaCb);
+    g_cgpu = CompGpu{};
+    for (auto& c : g_comp) releaseComp(c);
+    releaseTimer(g_toneTimer);
+    releaseTimer(g_compTimer);
 }
 
 void dropViewsOf(const void* game) {
@@ -461,6 +703,8 @@ void releaseAll() {
     g_dump = Dump::Idle;
     g_autoStreak = 0;
     g_haveOwn = false;
+    g_discard = false;
+    g_hold = 0;
 }
 
 bool ensureDevice(ID3D11DeviceContext* ctx) {
@@ -706,9 +950,9 @@ bool makeRawBuffer(uint32_t bytes, bool uav, ID3D11Buffer** buf, ID3D11ShaderRes
     return true;
 }
 
-ID3D11Buffer* makeConstantBuffer() {
+ID3D11Buffer* makeConstantBuffer(UINT bytes = 16) {
     D3D11_BUFFER_DESC bd{};
-    bd.ByteWidth = 16;
+    bd.ByteWidth = bytes;
     bd.Usage = D3D11_USAGE_DEFAULT;
     bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
     ID3D11Buffer* b = nullptr;
@@ -1116,6 +1360,13 @@ bool seedEye(ID3D11DeviceContext* ctx, ID3D11RenderTargetView* const* rtv, ID3D1
         ++g_win.clears;
         e.hdrGame = resourceOf(rtv[3]);
         e.slotGame = resourceOf(rtv[kSlotTarget]);
+        // Step 3: the game's eye depth, which the cover pass reads after the tonemap (the cockpit in front of the hull).
+        if (detail::g_hullLayerSeparate) {
+            ID3D11Resource* res = nullptr;
+            dsv->GetResource(&res);
+            if (res && FAILED(res->QueryInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&e.mainDepth)))) e.mainDepth = nullptr;
+            releaseRef(res);
+        }
         // Separate mode's dump: the game's G-buffer RT0 and eye depth, copied after the eye's G-buffer (finishGbuffer).
         if (detail::g_hullLayerSeparate && g_dump == Dump::Capturing) {
             ID3D11Resource* res = nullptr;
@@ -1437,6 +1688,410 @@ void noteInLightWindow(ID3D11DeviceContext* ctx, uint64_t vs) {
                     static_cast<unsigned long long>(vs), static_cast<unsigned long long>(ps), g_stageEye, g_frame, g_unknownCount);
 }
 
+// ---- Step 3: the tonemap re-issue, the cover, the composite -----------------------------------------------------------
+
+void sayToneDeclined(const char* why) {
+    ++g_win.toneDeclined;
+    if (g_saidToneDecline) return;
+    g_saidToneDecline = true;
+    Log::get().note("hull layer: tonemap re-issue declined: %s (said once; such an eye-frame has no hull to composite, and separate mode falls back after it)",
+                    why);
+}
+
+void sayDeclined(Declined why, int eye, const char* detail) {
+    ++g_win.declined[why];
+    if (g_saidDecline[why]) return;
+    g_saidDecline[why] = true;
+    Log::get().note("hull layer: composite declined for eye %d: %s (said once a reason)", eye, detail);
+}
+
+void timerBegin(GpuTimer& t, ID3D11DeviceContext* ctx) {
+    t.open = -1;
+    for (UINT i = 0; i < kTimerRing; ++i) {
+        GpuTimer::Set& s = t.set[i];
+        if (s.pending) continue;
+        if (!s.disjoint) {
+            D3D11_QUERY_DESC qd{};
+            qd.Query = D3D11_QUERY_TIMESTAMP_DISJOINT;
+            D3D11_QUERY_DESC qt{};
+            qt.Query = D3D11_QUERY_TIMESTAMP;
+            if (FAILED(g_device->CreateQuery(&qd, &s.disjoint)) || FAILED(g_device->CreateQuery(&qt, &s.t0)) || FAILED(g_device->CreateQuery(&qt, &s.t1))) {
+                releaseRef(s.disjoint);
+                releaseRef(s.t0);
+                releaseRef(s.t1);
+                return;
+            }
+        }
+        ctx->Begin(s.disjoint);
+        ctx->End(s.t0);
+        t.open = static_cast<int>(i);
+        return;
+    }
+}
+
+void timerEnd(GpuTimer& t, ID3D11DeviceContext* ctx) {
+    if (t.open < 0) return;
+    GpuTimer::Set& s = t.set[t.open];
+    ctx->End(s.t1);
+    ctx->End(s.disjoint);
+    s.pending = true;
+    t.open = -1;
+}
+
+void timerCollect(GpuTimer& t, ID3D11DeviceContext* ctx) {
+    for (auto& s : t.set) {
+        if (!s.pending) continue;
+        D3D11_QUERY_DATA_TIMESTAMP_DISJOINT dj{};
+        UINT64 a = 0, b = 0;
+        if (ctx->GetData(s.disjoint, &dj, sizeof dj, D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK ||
+            ctx->GetData(s.t0, &a, sizeof a, D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK || ctx->GetData(s.t1, &b, sizeof b, D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK)
+            continue;
+        s.pending = false;
+        if (dj.Disjoint || dj.Frequency == 0 || b < a) continue;
+        t.sumMs += static_cast<double>(b - a) * 1000.0 / static_cast<double>(dj.Frequency);
+        ++t.samples;
+    }
+}
+
+// The window's mean ms a timed call (-1: none timed), and the window's sums back to zero.
+double timerTake(GpuTimer& t) {
+    const double ms = t.samples ? t.sumMs / static_cast<double>(t.samples) : -1.0;
+    t.sumMs = 0.0;
+    t.samples = 0;
+    return ms;
+}
+
+// The cover and TAA shaders, the sampler and their constant buffers, once.
+bool ensureCompGpu() {
+    if (g_cgpu.tried) return g_cgpu.ok;
+    g_cgpu.tried = true;
+    struct Item {
+        const char* src;
+        size_t len;
+        const char* entry;
+        ID3D11ComputeShader** out;
+    };
+    const Item items[2] = {{kCoverHlsl, sizeof(kCoverHlsl) - 1, "hull_layer_cover_cs", &g_cgpu.coverCs},
+                           {kTaaHlsl, sizeof(kTaaHlsl) - 1, "hull_layer_taa_cs", &g_cgpu.taaCs}};
+    for (const Item& it : items) {
+        ID3DBlob* code = nullptr;
+        std::string why;
+        if (!compileShader(it.src, it.len, it.entry, "cs_5_0", &code, &why)) {
+            Log::get().note("hull layer: the %s shader did not compile (%s); separate mode keeps the own ship in the main pass this session", it.entry, why.c_str());
+            if (code) code->Release();
+            return false;
+        }
+        const HRESULT hr = g_device->CreateComputeShader(code->GetBufferPointer(), code->GetBufferSize(), nullptr, it.out);
+        code->Release();
+        if (FAILED(hr)) {
+            Log::get().note("hull layer: the %s shader compiled but could not be created (hr 0x%08lX); separate mode keeps the own ship in the main pass this "
+                            "session",
+                            it.entry, static_cast<unsigned long>(hr));
+            return false;
+        }
+    }
+    D3D11_SAMPLER_DESC sd{};
+    sd.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+    sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+    sd.ComparisonFunc = D3D11_COMPARISON_NEVER;
+    sd.MaxLOD = D3D11_FLOAT32_MAX;
+    g_cgpu.coverCb = makeConstantBuffer(16);
+    g_cgpu.taaCb = makeConstantBuffer(160);
+    if (FAILED(g_device->CreateSamplerState(&sd, &g_cgpu.linear)) || !g_cgpu.coverCb || !g_cgpu.taaCb) {
+        Log::get().note("hull layer: the composite's sampler or constant buffers could not be made; separate mode keeps the own ship in the main pass this session");
+        return false;
+    }
+    Log::get().note("hull layer: the tone cover and composite shaders compiled and made (the hull layer's own TAA, head motion, current weight %.2f)",
+                    static_cast<double>(kTaaCurrent));
+    g_cgpu.ok = true;
+    return true;
+}
+
+bool rgba8Family(DXGI_FORMAT f) {
+    return f == DXGI_FORMAT_R8G8B8A8_TYPELESS || f == DXGI_FORMAT_R8G8B8A8_UNORM || f == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+}
+
+// A 2D texture with a default SRV and, when `uav`, a default UAV (both in the texture's own format).
+bool makeTexture(uint32_t w, uint32_t h, DXGI_FORMAT fmt, bool uav, ID3D11Texture2D** tex, ID3D11ShaderResourceView** srv, ID3D11UnorderedAccessView** uavOut) {
+    D3D11_TEXTURE2D_DESC td{};
+    td.Width = w;
+    td.Height = h;
+    td.MipLevels = 1;
+    td.ArraySize = 1;
+    td.Format = fmt;
+    td.SampleDesc.Count = 1;
+    td.Usage = D3D11_USAGE_DEFAULT;
+    td.BindFlags = (srv ? D3D11_BIND_SHADER_RESOURCE : 0u) | (uav ? D3D11_BIND_UNORDERED_ACCESS : 0u);
+    if (FAILED(g_device->CreateTexture2D(&td, nullptr, tex)) || !*tex) return false;
+    if (srv && (FAILED(g_device->CreateShaderResourceView(*tex, nullptr, srv)) || !*srv)) return false;
+    if (uav && uavOut && (FAILED(g_device->CreateUnorderedAccessView(*tex, nullptr, uavOut)) || !*uavOut)) return false;
+    return true;
+}
+
+// The eye's tone target T (the game's tonemap output's size, its view format for the RTV), cover C and depth Z.
+bool ensureTone(int ei, uint32_t w, uint32_t h, DXGI_FORMAT rtvFmt) {
+    Eye& e = g_eyes[ei];
+    if (e.tone && e.toneW == w && e.toneH == h && e.toneRtvFmt == rtvFmt) return true;
+    releaseTone(e);
+    D3D11_TEXTURE2D_DESC td{};
+    td.Width = w;
+    td.Height = h;
+    td.MipLevels = 1;
+    td.ArraySize = 1;
+    td.Format = DXGI_FORMAT_R8G8B8A8_TYPELESS;
+    td.SampleDesc.Count = 1;
+    td.Usage = D3D11_USAGE_DEFAULT;
+    td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+    D3D11_RENDER_TARGET_VIEW_DESC rd{};
+    rd.Format = rtvFmt;
+    rd.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+    D3D11_SHADER_RESOURCE_VIEW_DESC sd{};
+    sd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    sd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+    sd.Texture2D.MipLevels = 1;
+    const bool ok = SUCCEEDED(g_device->CreateTexture2D(&td, nullptr, &e.tone)) && e.tone &&
+                    SUCCEEDED(g_device->CreateRenderTargetView(e.tone, &rd, &e.toneRtv)) && e.toneRtv &&
+                    SUCCEEDED(g_device->CreateShaderResourceView(e.tone, &sd, &e.toneSrv)) && e.toneSrv &&
+                    makeTexture(w, h, DXGI_FORMAT_R8G8B8A8_UNORM, true, &e.cover, &e.coverSrv, &e.coverUav) &&
+                    makeTexture(w, h, DXGI_FORMAT_R32_FLOAT, true, &e.coverZ, &e.coverZSrv, &e.coverZUav);
+    if (!ok) {
+        releaseTone(e);
+        return false;
+    }
+    e.toneW = w;
+    e.toneH = h;
+    e.toneRtvFmt = rtvFmt;
+    Log::get().note("hull layer: tone targets made for eye %d: %ux%u, the tonemap's view format %u (T R8G8B8A8, cover R8G8B8A8_UNORM, depth R32_FLOAT)", ei, w,
+                    h, static_cast<unsigned>(rtvFmt));
+    return true;
+}
+
+// A shader view over a depth texture (its depth plane), kept while the texture is the same. False when the texture refuses one.
+bool depthView(ID3D11Resource* res, ID3D11ShaderResourceView*& srv, const void*& of) {
+    if (!res) return false;
+    if (of == res && srv) return true;
+    releaseRef(srv);
+    of = nullptr;
+    D3D11_RESOURCE_DIMENSION dim = D3D11_RESOURCE_DIMENSION_UNKNOWN;
+    res->GetType(&dim);
+    if (dim != D3D11_RESOURCE_DIMENSION_TEXTURE2D) return false;
+    D3D11_TEXTURE2D_DESC d{};
+    static_cast<ID3D11Texture2D*>(res)->GetDesc(&d);
+    if (!(d.BindFlags & D3D11_BIND_SHADER_RESOURCE) || d.SampleDesc.Count != 1) return false;
+    DXGI_FORMAT f = DXGI_FORMAT_UNKNOWN;
+    switch (d.Format) {
+    case DXGI_FORMAT_R32G8X24_TYPELESS: f = DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS; break;
+    case DXGI_FORMAT_R32_TYPELESS: f = DXGI_FORMAT_R32_FLOAT; break;
+    case DXGI_FORMAT_R24G8_TYPELESS: f = DXGI_FORMAT_R24_UNORM_X8_TYPELESS; break;
+    case DXGI_FORMAT_R16_TYPELESS: f = DXGI_FORMAT_R16_UNORM; break;
+    default: return false;
+    }
+    D3D11_SHADER_RESOURCE_VIEW_DESC sd{};
+    sd.Format = f;
+    sd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+    sd.Texture2D.MipLevels = 1;
+    if (FAILED(g_device->CreateShaderResourceView(res, &sd, &srv)) || !srv) {
+        srv = nullptr;
+        return false;
+    }
+    of = res;
+    return true;
+}
+
+// Right after the game's own issue of a 3-vertex draw: is it an eye's tonemap (the structure, and a PS slot 0-3 over the
+// HDR an eye's lighting just lit)? True: T is cleared and bound as RT0, the private HDR at that slot; the caller re-issues
+// the draw and hullLayerEnd puts the game's bindings back and runs the cover pass.
+bool beginTone(ID3D11DeviceContext* ctx) {
+    const uint64_t vs = bindingShaderHash(BindSlot::Vs);
+    const uint64_t ps = bindingShaderHash(BindSlot::Ps);
+    ToneAdmit ta;
+    if (!tonemapAdmitStructure(ctx, ps, ta) || !tonemapAdmitFull(ta, vs)) return false;
+    int ei = -1;
+    UINT slot = 0;
+    ID3D11ShaderResourceView* hdrView = nullptr;
+    for (UINT s = 0; s < 4 && ei < 0; ++s) {
+        ID3D11ShaderResourceView* v = nullptr;
+        ctx->PSGetShaderResources(s, 1, &v);
+        if (!v) continue;
+        D3D11_SHADER_RESOURCE_VIEW_DESC vd{};
+        v->GetDesc(&vd);
+        const void* res = vd.ViewDimension == D3D11_SRV_DIMENSION_TEXTURE2D ? resourceOf(v) : nullptr;
+        for (int i = 0; i < 2 && res; ++i)
+            if (g_eyes[i].hdrGame == res && g_eyes[i].gb == Gb::Done) {
+                ei = i;
+                slot = s;
+                break;
+            }
+        if (ei >= 0)
+            hdrView = v;   // the reference is kept until the private view is found
+        else
+            v->Release();
+    }
+    if (ei < 0) return false;
+    Eye& e = g_eyes[ei];
+    const auto decline = [&](const char* why) {
+        if (why) sayToneDeclined(why);
+        releaseRef(hdrView);
+        return false;
+    };
+    if (e.toneFrame == g_frame) return decline(nullptr);   // once an eye a frame: the first tonemap of its HDR
+    if (e.lightDraws == 0) return decline("the eye's private HDR was not lit this frame");
+    ID3D11Texture2D* out = nullptr;
+    D3D11_TEXTURE2D_DESC od{};
+    if (ta.rtvRes && SUCCEEDED(static_cast<ID3D11Resource*>(ta.rtvRes)->QueryInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&out))) && out) {
+        out->GetDesc(&od);
+        out->Release();
+    }
+    if (!out || !rgba8Family(od.Format) || !rgba8Family(ta.rtvFmt)) return decline("the tonemap's output is not an R8G8B8A8 texture");
+    if (!ensureCompGpu()) return decline("the composite's shaders are missing");
+    auto* privHdr = static_cast<ID3D11ShaderResourceView*>(privateView(ViewKind::Srv, hdrView, false));
+    if (!privHdr) return decline("the private HDR has no shader view");
+    if (!ensureTone(ei, od.Width, od.Height, ta.rtvFmt)) return decline("a private tone target could not be made");
+    releaseRef(hdrView);
+    timerBegin(g_toneTimer, ctx);
+    g_pending = Pending{};
+    ctx->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, g_pending.rtv, &g_pending.dsv);
+    ctx->PSGetShaderResources(0, kSrvSlots, g_pending.srv);
+    ID3D11ShaderResourceView* bindSrv[kSrvSlots];
+    for (UINT i = 0; i < kSrvSlots; ++i) bindSrv[i] = g_pending.srv[i];
+    bindSrv[slot] = privHdr;
+    static const float clear[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    vScreenClearRenderTargetViewRaw(ctx, e.toneRtv, clear);
+    vScreenPSSetShaderResourcesRaw(ctx, 0, kSrvSlots, bindSrv);
+    vScreenSetRenderTargetsRaw(ctx, 1, &e.toneRtv, nullptr);
+    g_pending.active = true;
+    g_pending.eye = ei;
+    g_pending.stage = kToneStage;
+    g_pending.srvSwapped = true;
+    g_pending.toneOut = ta.rtvRes;
+    return true;
+}
+
+// After the tonemap re-issue, the game's bindings back: the cover pass into C and Z. The eye-frame is toned when it ran.
+void coverPass(ID3D11DeviceContext* ctx, int ei, const void* toneOut) {
+    Eye& e = g_eyes[ei];
+    ID3D11Resource* privZ = nullptr;
+    if (e.privDsv) e.privDsv->GetResource(&privZ);
+    const bool views = privZ && e.mainDepth && depthView(privZ, e.privZSrv, e.privZOf) && depthView(e.mainDepth, e.mainZSrv, e.mainZOf);
+    releaseRef(privZ);
+    if (!views) {
+        sayToneDeclined("the private or the game's eye depth refuses a shader view");
+        return;
+    }
+    D3D11_TEXTURE2D_DESC md{};
+    e.mainDepth->GetDesc(&md);
+    if (md.Width != e.toneW || md.Height != e.toneH) {
+        sayToneDeclined("the eye depth and the tonemap's output differ in size");
+        return;
+    }
+    uint32_t cb[4] = {0u, e.toneW, e.toneH, 0u};
+    std::memcpy(&cb[0], &e.clearDepth, sizeof e.clearDepth);
+    vScreenUpdateSubresourceRaw(ctx, g_cgpu.coverCb, 0, nullptr, cb, 0, 0);
+    {
+        CsStageSave save;
+        save.save(ctx);
+        ID3D11ShaderResourceView* srvs[3] = {e.toneSrv, e.privZSrv, e.mainZSrv};
+        ID3D11UnorderedAccessView* uavs[CsStageSave::kUavs] = {e.coverUav, e.coverZUav};
+        ctx->CSSetUnorderedAccessViews(0, CsStageSave::kUavs, uavs, nullptr);
+        ctx->CSSetShader(g_cgpu.coverCs, nullptr, 0);
+        ctx->CSSetShaderResources(0, 3, srvs);
+        ctx->CSSetConstantBuffers(0, 1, &g_cgpu.coverCb);
+        ctx->Dispatch((e.toneW + 7u) / 8u, (e.toneH + 7u) / 8u, 1);
+        ID3D11UnorderedAccessView* none[CsStageSave::kUavs] = {};
+        ctx->CSSetUnorderedAccessViews(0, CsStageSave::kUavs, none, nullptr);   // C and Z off before the game's views come back
+        save.restore(ctx);
+    }
+    e.toneFrame = g_frame;
+    e.toneOut = toneOut;
+    ++g_win.toned;
+}
+
+// The TAA's history pair and the composited eye at the output size, for VR eye `eye`.
+bool ensureCompTargets(int eye, uint32_t w, uint32_t h) {
+    Comp& c = g_comp[eye];
+    if (c.out && c.outW == w && c.outH == h) return true;
+    releaseComp(c);
+    bool ok = true;
+    for (int i = 0; i < 2 && ok; ++i) ok = makeTexture(w, h, DXGI_FORMAT_R16G16B16A16_FLOAT, true, &c.hist[i], &c.histSrv[i], &c.histUav[i]);
+    ok = ok && makeTexture(w, h, DXGI_FORMAT_R8G8B8A8_UNORM, true, &c.out, nullptr, &c.outUav);
+    if (!ok) {
+        releaseComp(c);
+        return false;
+    }
+    c.outW = w;
+    c.outH = h;
+    Log::get().note("hull layer: composite targets made for eye %d: %ux%u (history R16G16B16A16_FLOAT x2, out R8G8B8A8_UNORM)", eye, w, h);
+    return true;
+}
+
+// The frame that just ended (g_frame not yet advanced), separate mode: an eye that seeded and drew the own ship must have
+// been lit, tonemapped and composited (or made ready, on a fallback frame). A miss holds the discard off.
+void judgeFrame() {
+    bool miss = false;
+    for (auto& e : g_eyes) {
+        if (!e.seen || !e.shell || e.gb == Gb::Before) continue;   // no own ship drawn into this eye: nothing to put back
+        if (e.gb == Gb::Off) {
+            ++g_win.failSeed;   // no mask: nothing was discarded on this eye-frame (Step 2's fallback), so no hold
+            continue;
+        }
+        if (e.lightDraws == 0) {
+            ++g_win.failLit;
+            miss = true;
+        } else if (e.toneFrame != g_frame) {
+            ++g_win.failTone;
+            miss = true;
+        } else if (e.compFrame != g_frame) {
+            ++g_win.failComposite;
+            miss = true;
+        } else if (e.compApplied) {
+            ++g_win.compositedEyes;
+        } else {
+            ++g_win.readyEyes;
+        }
+    }
+    if (miss)
+        g_hold = kHoldFrames;
+    else if (g_hold)
+        --g_hold;
+}
+
+bool frameGenOn() { return temporalPassFrameGenMode() != 0 || frameGenShadowOn(); }
+
+// The next frame's decision, made before any of its draws.
+void decideNext() {
+    g_discard = false;
+    Fallback why = kFallbacks;
+    if (!runtimeVrProfile() || nativeOnFootActive()) {
+        why = kFbOutside;
+    } else if (frameGenOn()) {
+        why = kFbFrameGen;
+        if (!g_saidFrameGen) {
+            g_saidFrameGen = true;
+            Log::get().note("hull layer: separate mode stands aside while frame generation is on (fix.frame_generation or fix.frame_generation_shadow): the own "
+                            "ship stays in the main pass (said once)");
+        }
+    } else if (!g_haveOwn) {
+        why = kFbMaskPending;
+    } else if (g_lastOwn > kOwnMaskMax) {
+        why = kFbMaskLarge;
+        g_win.ownMax = std::max(g_win.ownMax, g_lastOwn);
+        if (!g_saidMaskLarge) {
+            g_saidMaskLarge = true;
+            Log::get().note("hull layer: separate mode falls back: the own mask holds %u records (over %u: docking, or a station or ship within %.0f m); the own "
+                            "ship stays in the main pass while it does (said once a window)",
+                            g_lastOwn, kOwnMaskMax, static_cast<double>(kOwnRadius));
+        }
+    } else if (g_hold) {
+        why = kFbStreak;
+    } else {
+        g_discard = true;
+    }
+    if (g_discard)
+        ++g_win.separateFrames;
+    else
+        ++g_win.fallback[why];
+}
+
 // ---- the readbacks, the dump ------------------------------------------------------------------------------------------
 
 void readBacks(ID3D11DeviceContext* ctx) {
@@ -1507,7 +2162,7 @@ void writeDump(ID3D11DeviceContext* ctx) {
     bool any = false;
     for (int i = 0; i < 2; ++i) {
         Eye& e = g_eyes[i];
-        if (!e.stageHull && !e.stageGame && !e.stageDepth && !e.stageGbuf0 && !e.stageMainDepth) continue;
+        if (!e.stageHull && !e.stageGame && !e.stageDepth && !e.stageGbuf0 && !e.stageMainDepth && !e.stageTone && !e.stageComp) continue;
         any = true;
         uint32_t w = 0, h = 0, fmt = 0;
         if (e.stageHull) {
@@ -1542,6 +2197,12 @@ void writeDump(ID3D11DeviceContext* ctx) {
             Log::get().note("hull layer: dump %ls eye %d: GameGbuf0 %s, GameDepth %s (separate mode: the game's G-buffer RT0 and main depth after the "
                             "eye's G-buffer; own_draws=%u decal_draws=%u decals_reissued=%u)",
                             g_dumpStamp, i, gbuf, mainDepth, e.ownDraws, e.ownDecals, e.decals);
+            // Step 3: the cover at render size (the tonemapped hull where shown, alpha 1) and the composited eye at output size, after the
+            // composite and before the UI layer's door; on a fallback frame it is the composite that was made and not applied.
+            const char* tone = writeTexture(ctx, e.stageTone, dir, L"HullTone", i);
+            const char* comp = writeTexture(ctx, e.stageComp, dir, L"HullComposite", i);
+            Log::get().note("hull layer: dump %ls eye %d: HullTone %s, HullComposite %s (separate mode, Step 3: the composite %s)", g_dumpStamp, i, tone, comp,
+                            !e.stageComp ? "did not run" : e.dumpApplied ? "applied" : "made, not applied (a fallback frame)");
         }
         releaseStaging(e);
     }
@@ -1588,6 +2249,19 @@ void report() {
                         "(separate mode: draws issued with the own discard; window draws that could not take it; eye-frames whose main pass kept the own "
                         "ship, no mask)",
                         g_win.ownDraws, g_win.ownDecals, g_win.noVariant, g_win.fallbackFrames, g_win.decalsReissued, g_win.decalNoSlot);
+    if (detail::g_hullLayerSeparate) {
+        const double toneMs = timerTake(g_toneTimer), compMs = timerTake(g_compTimer);
+        Log::get().note("hull layer: composite: separate_frames=%u composited_eyes=%u ready_eyes=%u fallback=framegen:%u,outside:%u,mask_pending:%u,"
+                        "mask_large:%u,streak:%u failed=seed:%u,lit:%u,tone:%u,composite:%u declined=stale:%u,size:%u,gpu:%u toned=%u tone_declined=%u "
+                        "history_resets=%u matched_by_index=%u own_max=%u aa=hull_taa gpu_ms=tone:%.3f,composite:%.3f (separate mode, Step 3: frames whose "
+                        "main pass may discard the own ship, and those kept by reason; eye-frames composited after the upscaler, or made ready on a fallback "
+                        "frame; misses by stage hold the discard off %u frames; gpu_ms a call, -1 when none was timed)",
+                        g_win.separateFrames, g_win.compositedEyes, g_win.readyEyes, g_win.fallback[kFbFrameGen], g_win.fallback[kFbOutside],
+                        g_win.fallback[kFbMaskPending], g_win.fallback[kFbMaskLarge], g_win.fallback[kFbStreak], g_win.failSeed, g_win.failLit,
+                        g_win.failTone, g_win.failComposite, g_win.declined[kDcStale], g_win.declined[kDcSize], g_win.declined[kDcGpu], g_win.toned,
+                        g_win.toneDeclined, g_win.historyResets, g_win.byIndex, g_win.ownMax, toneMs, compMs, kHoldFrames);
+        g_saidMaskLarge = false;   // the large-mask line once a window
+    }
 }
 
 }  // namespace
@@ -1600,13 +2274,14 @@ void hullLayerConfigure(Config& cfg) {
     }
     if (mode != g_mode) {
         g_mode = mode;
-        Log::get().note("hull layer: diag.hull_layer=%s (TEMPORARY; docs\\research-own-hull-layer-2026-11-08.md, Steps 1-2: the own hull, picked per "
+        Log::get().note("hull layer: diag.hull_layer=%s (TEMPORARY; docs\\research-own-hull-layer-2026-11-08.md, Steps 1-3: the own hull, picked per "
                         "record by a GPU own mask, re-lit into private targets and written into the eye dump, with auto dumps; dump changes nothing the game "
-                        "draws, separate also takes the own ship out of the game's main G-buffer)",
+                        "draws, separate also takes the own ship out of the game's main G-buffer and composites it back after the upscaler)",
                         mode.c_str());
         if (mode == "separate")
-            Log::get().note("hull layer: separate mode hides the own ship: it is discarded from the game's main pass, and nothing composites it back "
-                            "until Step 3 (a build with the composite)");
+            Log::get().note("hull layer: separate mode takes the own ship out of the game's main pass and puts it back after the upscaler (Step 3: the "
+                            "game's tonemap re-issued on the private HDR, the layer's own TAA, the composite before the UI layer); a frame that cannot "
+                            "compose keeps the ship in the main pass");
     }
     detail::g_hullLayerOn = mode == "dump" || mode == "separate";
     detail::g_hullLayerSeparate = mode == "separate";
@@ -1630,6 +2305,8 @@ bool hullLayerBeforeMainDraw(ID3D11DeviceContext* ctx, UINT instances, UINT star
     Eye& e = g_eyes[ei];
     // The seed draw is the own ship's: its mask is made before it is issued, so the seed draw is discarded too.
     if (hull && e.gb == Gb::Before && e.shell && !seedEye(ctx, rtv, dsv, ei, instances, startInstance)) return decline();
+    // Step 3's safety: on a frame decided as a fallback (decideNext) the layer is still made, and the ship stays in the main pass.
+    if (!g_discard) return decline();
     if (e.gb != Gb::In || g_inEye != ei || !e.maskSrv) return decline();   // no mask this eye-frame: the draw is the game's
     // The draw must be engine motion's substitute: its slot target at RT6, and its patched pixel shader bound.
     if (!(rtv[kSlotTarget] && resourceOf(rtv[kSlotTarget]) == e.slotGame)) {
@@ -1677,8 +2354,12 @@ void hullLayerAfterMainDraw(ID3D11DeviceContext* ctx) {
     g_main = MainPending{};
 }
 
-bool hullLayerBegin(ID3D11DeviceContext* ctx, UINT instances, UINT startInstance) {
+bool hullLayerBegin(ID3D11DeviceContext* ctx, char kind, UINT count, UINT instances, UINT startInstance) {
     if (!detail::g_hullLayerOn || !ctx || g_pending.active) return false;
+    // Step 3: the game's tonemap (a 3-vertex, one-instance draw, then admitted by structure and by the HDR it reads).
+    if (detail::g_hullLayerSeparate && (kind == 'D' || kind == 'N') && count == 3 && instances == 1 && startInstance == 0 && g_device &&
+        (g_eyes[0].gb == Gb::Done || g_eyes[1].gb == Gb::Done) && beginTone(ctx))
+        return true;
     const uint64_t vs = bindingShaderHash(BindSlot::Vs);
     if (isTerrainVs(vs)) g_terrainFrame = true;
     if (vs == kShellVs) {
@@ -1702,6 +2383,11 @@ void hullLayerEnd(ID3D11DeviceContext* ctx) {
     if (p.srvSwapped) vScreenPSSetShaderResourcesRaw(ctx, 0, kSrvSlots, p.srv);
     vScreenSetRenderTargetsRaw(ctx, boundCount(p.rtv), p.rtv, p.dsv);
     if (p.stage < 0) ++g_win.reissued;
+    if (p.stage == kToneStage && p.eye >= 0) {
+        // Step 3: T is off the output merger now; the cover pass reads it.
+        coverPass(ctx, p.eye, p.toneOut);
+        timerEnd(g_toneTimer, ctx);
+    }
     if (p.stage == kLight && p.eye >= 0 && g_dump == Dump::Capturing) {
         // The private HDR right after this private lighting draw: the last one is the comparison.
         Eye& e = g_eyes[p.eye];
@@ -1749,6 +2435,103 @@ void hullLayerArmDump(const wchar_t* stamp) {
     Log::get().note("hull layer: dump %ls armed for the next whole frame", g_dumpStamp);
 }
 
+void hullLayerCompositeEye(ID3D11DeviceContext* ctx, int eye, const HullLayerCompositeInputs& in) {
+    if (!detail::g_hullLayerSeparate || !ctx || eye < 0 || eye > 1 || !g_device || !in.output || !in.outputSrv || !in.source || !in.tanNow) return;
+    VrWorldInternalScope internal;   // the layer's own dispatch and copy
+    // The hull eye: the one whose tonemap wrote the submitted texture this frame; else the eye of the same index, toned this frame.
+    int hi = -1;
+    for (int i = 0; i < 2; ++i)
+        if (g_eyes[i].toneFrame == g_frame && g_eyes[i].toneOut == in.source) hi = i;
+    const bool byIndex = hi < 0 && g_eyes[eye].toneFrame == g_frame;
+    if (byIndex) hi = eye;
+    if (hi < 0) {
+        // Nothing toned this frame: the judge counts the miss. Toned on the frame before: the treat came after the frame boundary.
+        for (const auto& e : g_eyes)
+            if (e.toneFrame != ~0u && e.toneFrame + 1 == g_frame) {
+                sayDeclined(kDcStale, eye, "the eye's tonemap re-issue is a frame old (the submit came after the frame boundary)");
+                break;
+            }
+        return;
+    }
+    Eye& e = g_eyes[hi];
+    if (!e.coverSrv || !e.coverZSrv || !in.renderW || !in.renderH || !in.outW || !in.outH || in.regionX + in.renderW > e.toneW ||
+        in.regionY + in.renderH > e.toneH) {
+        sayDeclined(kDcSize, eye, "the eye's region does not fit the tonemap's output");
+        return;
+    }
+    if (!ensureCompGpu() || !ensureCompTargets(eye, in.outW, in.outH)) {
+        sayDeclined(kDcGpu, eye, "the composite's shaders or targets are missing");
+        return;
+    }
+    Comp& c = g_comp[eye];
+    const bool history = c.have && c.lastFrame != ~0u && c.lastFrame + 1 == g_frame && c.renderW == in.renderW && c.renderH == in.renderH &&
+                         in.tanPrev && in.headDelta;
+    if (!history) ++g_win.historyResets;
+    struct TaaCb {
+        float tanNow[4], tanPrev[4], dRow0[4], dRow1[4], dRow2[4], headT[4], jit[4], depthAB[4];
+        int32_t sizes[4], origin[4];
+    };
+    static_assert(sizeof(TaaCb) == 160, "the TAA constant buffer is HullLayerTaaCb's 160 bytes");
+    TaaCb cb{};
+    std::memcpy(cb.tanNow, in.tanNow, sizeof cb.tanNow);
+    std::memcpy(cb.tanPrev, in.tanPrev ? in.tanPrev : in.tanNow, sizeof cb.tanPrev);
+    float* rows[3] = {cb.dRow0, cb.dRow1, cb.dRow2};
+    for (int r = 0; r < 3; ++r)
+        for (int k = 0; k < 3; ++k) rows[r][k] = in.headDelta ? in.headDelta[r * 3 + k] : (r == k ? 1.0f : 0.0f);
+    if (in.headTrans && in.useTrans) {
+        for (int k = 0; k < 3; ++k) cb.headT[k] = in.headTrans[k];
+        cb.headT[3] = 1.0f;
+    }
+    cb.jit[0] = in.jitterX;
+    cb.jit[1] = in.jitterY;
+    cb.jit[2] = history ? 1.0f : 0.0f;
+    cb.jit[3] = kTaaCurrent;
+    cb.depthAB[0] = in.depthA;
+    cb.depthAB[1] = in.depthB;
+    cb.sizes[0] = static_cast<int32_t>(in.renderW);
+    cb.sizes[1] = static_cast<int32_t>(in.renderH);
+    cb.sizes[2] = static_cast<int32_t>(in.outW);
+    cb.sizes[3] = static_cast<int32_t>(in.outH);
+    cb.origin[0] = static_cast<int32_t>(in.regionX);
+    cb.origin[1] = static_cast<int32_t>(in.regionY);
+    timerBegin(g_compTimer, ctx);
+    vScreenUpdateSubresourceRaw(ctx, g_cgpu.taaCb, 0, nullptr, &cb, 0, 0);
+    {
+        CsStageSave save;
+        save.save(ctx);
+        ID3D11ShaderResourceView* srvs[4] = {e.coverSrv, e.coverZSrv, c.histSrv[c.read], in.outputSrv};
+        // Every saved UAV slot is set: one the caller left bound over the upscaler's output would null its view at t3.
+        ID3D11UnorderedAccessView* uavs[CsStageSave::kUavs] = {c.histUav[c.read ^ 1u], c.outUav};
+        ctx->CSSetUnorderedAccessViews(0, CsStageSave::kUavs, uavs, nullptr);
+        ctx->CSSetShader(g_cgpu.taaCs, nullptr, 0);
+        ctx->CSSetShaderResources(0, 4, srvs);
+        ctx->CSSetConstantBuffers(0, 1, &g_cgpu.taaCb);
+        ctx->CSSetSamplers(0, 1, &g_cgpu.linear);
+        ctx->Dispatch((in.outW + 7u) / 8u, (in.outH + 7u) / 8u, 1);
+        ID3D11UnorderedAccessView* none[CsStageSave::kUavs] = {};
+        ctx->CSSetUnorderedAccessViews(0, CsStageSave::kUavs, none, nullptr);   // the history and the out off before the caller's views come back
+        save.restore(ctx);
+    }
+    // Applied only when this frame's main pass discarded the own ship on this eye; otherwise it is made (the history stays warm,
+    // and a miss is seen) and the upscaled eye keeps the game's own ship.
+    const bool apply = g_discard && (e.ownDraws + e.ownDecals) > 0;
+    if (apply) vScreenCopyResourceRaw(ctx, in.output, c.out);
+    timerEnd(g_compTimer, ctx);
+    if (g_dump == Dump::Capturing) {
+        copyToStaging(ctx, e.cover, e.stageTone);
+        copyToStaging(ctx, c.out, e.stageComp);
+        e.dumpApplied = apply;
+    }
+    c.read ^= 1u;
+    c.lastFrame = g_frame;
+    c.renderW = in.renderW;
+    c.renderH = in.renderH;
+    c.have = true;
+    e.compFrame = g_frame;
+    e.compApplied = apply;
+    if (byIndex) ++g_win.byIndex;
+}
+
 void hullLayerFrameBoundary(ID3D11DeviceContext* ctx) {
     if (g_main.active) hullLayerAfterMainDraw(ctx);   // never: Before and After are one call chain
     if (!detail::g_hullLayerOn) {
@@ -1763,8 +2546,13 @@ void hullLayerFrameBoundary(ID3D11DeviceContext* ctx) {
         if (ctx)
             for (int i = 0; i < 2; ++i)
                 if (g_eyes[i].gb == Gb::In) finishGbuffer(ctx, i, kEndFrame);
+        if (detail::g_hullLayerSeparate) judgeFrame();   // Step 3: before the frame number moves on (the tone and composite marks name it)
         ++g_frame;
-        if (ctx) readBacks(ctx);
+        if (ctx) {
+            readBacks(ctx);
+            timerCollect(g_toneTimer, ctx);
+            timerCollect(g_compTimer, ctx);
+        }
         if (g_dump == Dump::Capturing && ctx) writeDump(ctx);
     }
     for (auto& e : g_eyes) {
@@ -1808,6 +2596,11 @@ void hullLayerFrameBoundary(ID3D11DeviceContext* ctx) {
     for (auto& e : g_eyes) resetFrame(e);
     g_inEye = g_stageEye = -1;
     g_terrainFrame = g_seededFrame = false;
+    // Step 3: whether the next frame's main pass may discard the own ship, from what is known before its first draw.
+    if (detail::g_hullLayerSeparate)
+        decideNext();
+    else
+        g_discard = false;
     evictStale();
     if (!g_win.startMs) g_win.startMs = now;
     if (now - g_win.startMs >= kReportMs) {
