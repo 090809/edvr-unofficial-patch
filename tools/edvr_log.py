@@ -26800,7 +26800,7 @@ def self_test_perf_windows():
     mask = ("draw mask: 1800-frame window ending 1800; 14000 draws through the full path; calls skipped by the vertex shader's may-want byte: "
             "ui_family 0, screen_motion_ui 7, screen_motion 0, weapon_motion 3.")
     qry = ("gpu timing queries: 1800-frame window ending 1800; 6.500 EDVR timing-query Ends a frame over 1800 frames (11700 in all); by owner a frame: "
-           "other 0.500, screen_motion 2.000, weapon_motion 0.000, gpu_census 4.000, particle_copy 0.000, ui_depth 0.000, ui_content 0.000.")
+           "other 0.500, screen_motion 2.000, weapon_motion 0.000, gpu_census 4.000, particle_copy 0.000, ui_depth 0.000, ui_content 0.000, ui_route 0.000.")
     gate = "draw gate holders: 2 of 28 terms hold the gate open: ui_depth, footprint."
     cp0 = ("marker fix (F87c) eye 0: windows 2 (F85 1, history 1, escalated 0), named 40, outside 2 (nearest 12); Unmap copy 600 copies, 4800000 bytes, 120.500 ms; "
            "eye-1 first/last ring -; over 10 s")
@@ -26812,7 +26812,7 @@ def self_test_perf_windows():
         rc = print_perf_windows(mtext)
     mo = buf.getvalue()
     for want in ("draw mask: 14000 draws through the full path, skipped ui_family 0, screen_motion_ui 7, screen_motion 0, weapon_motion 3",
-                 "timing queries a frame: 6.500 (other 0.500, screen_motion 2.000, weapon_motion 0.000, gpu_census 4.000, particle_copy 0.000, ui_depth 0.000, ui_content 0.000)",
+                 "timing queries a frame: 6.500 (other 0.500, screen_motion 2.000, weapon_motion 0.000, gpu_census 4.000, particle_copy 0.000, ui_depth 0.000, ui_content 0.000, ui_route 0.000)",
                  "gate held by 2 of 28: ui_depth, footprint", "marker copy (F87c lines in window): eye 0 600 copies 4800000 bytes 120.500 ms, eye 1 300 copies 4800000 bytes 120.500 ms"):
         if want not in mo:
             fail("--perf-windows with the build-2 lines lacks %r:\n%s" % (want, mo))
@@ -26847,7 +26847,8 @@ def self_test_perf_windows():
     # The formatters' own text: the fragments the parser reads are held to the sources, so a formatter that drifts fails here.
     srcdir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src", "d3d11")
     for name, frags in (("draw_mask_line.h", ("draw mask: 1800-frame window ending %u; %u draws through the full path; calls skipped by the vertex shader's may-want byte: ",)),
-                        ("gpu_query_count.h", ("gpu timing queries: 1800-frame window ending %u; %.3f EDVR timing-query Ends a frame over %u frames (%llu in all); by owner a frame: ",)),
+                        ("gpu_query_count.h", ("gpu timing queries: 1800-frame window ending %u; %.3f EDVR timing-query Ends a frame over %u frames (%llu in all); by owner a frame: ",
+                                             '"ui_depth", "ui_content", "ui_route"};')),
                         ("draw_gate_holders.h", ("draw gate holders: %u of %u terms hold the gate open: ",)),
                         ("native_on_foot.cpp", ("Unmap copy %llu copies, requested %llu bytes; eye-%d first/last ring %s; over %u s",
                                                 "marker fix (F87c) Unmap copy: %llu Unmaps, requested %llu bytes, copied %llu bytes in %llu ranges (%llu windows joined), "

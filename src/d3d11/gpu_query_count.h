@@ -10,11 +10,11 @@
 
 namespace edvr {
 
-enum class GpuQueryOwner : uint8_t { Other, ScreenMotion, WeaponMotion, GpuCensus, ParticleCopy, UiDepth, UiContent, Count };
+enum class GpuQueryOwner : uint8_t { Other, ScreenMotion, WeaponMotion, GpuCensus, ParticleCopy, UiDepth, UiContent, UiRoute, Count };
 constexpr size_t kGpuQueryOwners = static_cast<size_t>(GpuQueryOwner::Count);
 
 inline const char* gpuQueryOwnerName(size_t o) {
-    static const char* const names[kGpuQueryOwners] = {"other", "screen_motion", "weapon_motion", "gpu_census", "particle_copy", "ui_depth", "ui_content"};
+    static const char* const names[kGpuQueryOwners] = {"other", "screen_motion", "weapon_motion", "gpu_census", "particle_copy", "ui_depth", "ui_content", "ui_route"};
     return o < kGpuQueryOwners ? names[o] : "unknown";
 }
 
