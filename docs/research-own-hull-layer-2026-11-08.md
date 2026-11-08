@@ -741,6 +741,33 @@ should read `per_eye_frame=3.00`, `applied` equal to `eye_frames`, and
   occluder beyond the hull: no contact darkening from the cockpit or the
   terrain. This is intended for a layer composited over the world.
 
+## Optimisation debt (recorded 2026-11-08 at the pilot's request)
+
+The layer was built to work first. Before it ships as anything but a
+diagnostic, measure it, then cut. Ordered by expected size:
+
+1. **Measure first.** Only the tonemap and composite carry GPU time today
+   (`gpu_ms=tone,composite`). Add one GPU census scope over everything the
+   layer issues per eye: re-issued G-buffer draws, filter, depth copy, AO
+   chain, shadow mask, lighting, night vision, tonemap, TAA, sharpen,
+   composite. Compare a frame with `separate` against `off`.
+2. **Video memory.** 16-48 full-size private mirrors over two eyes (about
+   0.5-1 GB). Drop mirrors whose content is not needed after the frame,
+   share the scratch R16 and per-stage targets between eyes, and evict
+   what a stage no longer uses.
+3. **Full-screen passes for a partial-screen object.** The re-issued
+   lighting volumes, shadow mask, AO dispatches, TAA, sharpen and composite
+   all cover the whole eye, while the hull covers part of it. Bound them to
+   the hull's screen rectangle (scissor for draws, a dispatch region for
+   compute) from the private depth's extent, or from the previous frame's.
+4. **CPU per draw with the key on:** shader-hash lookups and stage
+   matching on every draw. Short-circuit by pass: nothing to match outside
+   the G-buffer, lighting and post windows.
+5. **The neighbour filter pass** runs every eye-frame even with no
+   neighbour. Skip it when the seed's pool region has no foreign hull draws.
+6. **Frame generation** is not integrated: separate mode stands aside while
+   FG is on. FG needs the hull composited into generated frames too.
+
 ## Night vision on the hull (2026-11-08 ~22:15, build 1a1b6c60)
 
 The pilot: night vision now reaches the own ship, but "the ship's outline
