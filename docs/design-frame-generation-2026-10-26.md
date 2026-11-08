@@ -52,6 +52,8 @@
 - **Next:** fly the 2026-11-08 S fixes (sharp resample, hole fill along the
   motion, hull outline vs space) with `hotkey.frame_generation` for an
   on/off A/B. H1, H8, H9 and the surface classifier are unbuilt.
+- **Base frame (FG off), 2026-11-08:** the wing-gap smear is terrain
+  disoccluded at the hull edge each frame; hull vectors are right (journal).
 - **Temporary keys (hidden):** `fix.frame_generation_shadow` (off | on), and
   `fix.frame_generation` (off | on; built 2.3: `on` forces Lock, for A/B
   flights; `auto` replaces it in 2.4).
@@ -1675,6 +1677,51 @@ alone.
   space, the eye dumps' S keeps the outline on the silhouette, nothing cyan
   in the sky beside it, no white patch on the hull; the synth line's `guard=`
   slightly lower.
+
+### 2026-11-08: EDVR's base frame, not frame generation: the wing gap smears with FG off (eye dumps 131530778003, 132027190004, 132100543006, 132115012007; analysis only)
+
+Pilot, Anaconda, Pimax Dream Air at 90 Hz on SteamVR, Elite at 45-50 fps,
+frame generation off (F6 at 13:14:49; dump 131530778003 at 13:15:30; the
+three later dumps are FG on, which does not touch B). The front V wings
+(40-80 m) look smeared in motion; he circled the terrain in the gap between
+the wing tips and the central block, and the wings' inner faces.
+
+Environment: OpenXR (EDVR's runtime), left eye, render 2817x2448, output
+3756x3264 (DLSS), split 10 m. 131530778003: ship turn 1.3-2.6 deg/frame
+(the camera rows), head 0.02-0.22; terrain 25-52 render px/frame.
+
+| Hypothesis | Signature | Measured | Verdict |
+|---|---|---|---|
+| H1 hull vectors carry the ship's motion | hull MV against the image's motion and the head-only motion | hull (zPred 20-120 m) is 98% path 11, engine record kind 1 (exact), in all four dumps; its MV equals the cockpit's (k2: hull 2.1, cockpit 2.3, terrain 52.5 px); a block search about the MV finds the best match within 1 px (the jitter) on all 15 pairs of each dump | ruled out |
+| H2 DLSS unstable on the hull | P(k) against P(k-1) warped by MV, hull against the console | P residual over raw residual 0.2-0.4 on the hull, 0.25-0.3 on the console (luma 1.2-2.9 against raw 6-9). 132100543006 k6-15: hull P 8-21, but raw C 13-26 as well: the game's own lighting | ruled out |
+| H5 terrain revealed at the hull edge has no history | the hidden sentinel (decision bit 16) along the silhouette; DLSS output there | a band along the hull's edge, as wide as the terrain's motion across it (20-30 render px), every frame: 131530778003 2-5% of the gap's terrain (the terrain slid away from the wing faces), 132100543006 25-37% (3200-5000 of 13000 px; 31-45k in the eye; terrain moving into the edge). The sentinel is right: last frame's footprint is the hull. P there is raw-like (Laplacian P/C 1.15-1.26 at the edge against 0.81-0.92 on open terrain). Terrain vectors in the gap are right to 1 px | confirmed: the smear |
+| H5' the bright smudge right of the left wing tip | it in the raw input | it is in C00/C01 as in P00/P01: a terrain feature as the game drew it | not EDVR |
+| H6 (new) terrain vectors zero for two frames | rows unchanged, then a 2-frame delta refused | k3-4 of 131530778003 and 132027190004, k2-3 of 132100543006: rows 0.00/0.05 deg, then 5.4-7.7 deg refused as another camera's (over 3 deg) and the gate carries the last good delta, the zero; terrain MV 0 while the image moved 44-54 px, 179k hidden, P residual 40-63. Each sits 2-3 frames after the dump started, with the dump's long frame (87 ms 13:15:30.865, 253 ms 13:20:27.555) | real mechanism; here a dump artefact, not shown in flight |
+| H3 45 fps held two refreshes | runtime period and cadence | predicted period alternates 11.1/22.2 ms (13:14:34-13:15:19), 54-63 fps windows, 22-50 ms LONG FRAMEs every ~5 s; terrain moves 1.3-2.9 deg per game frame past a still hull | plausible, not measurable in a dump |
+| H4 compositor smoothing warps the edge | the runtime's smoothing state | SteamVR global `motionSmoothing` false, Elite's `motionSmoothingOverride` 2; rotation-only reprojection moves hull and terrain together. Pimax Play's own smoothing is unknown | open; ask the pilot |
+
+- ruled out: the hull's vectors (H1), because 98% of its pixels take the
+  engine record's exact motion (`temporal_shader_source.h` 1059-1062, after
+  the 10 m split at 984-1001) and match the image to 1 px in four dumps.
+- ruled out: DLSS instability on the hull (H2), because its frame-to-frame
+  residual is the raw input's in the same proportion as the console's.
+- **The smear is a disocclusion, not a wrong vector.** Each frame the terrain
+  that was behind the hull is new; `backgroundHistoryHidden`
+  (`temporal_shader_source.h` 684-729, written at 1082-1085) correctly
+  tells DLSS so, and DLSS shows one jittered sample there. The gap is edged
+  by hull on three sides, so a large share of it is that band; at 45 fps the
+  band is twice as wide as it would be at 90. Frame generation cannot widen
+  or narrow it (B is the same). No sharpening or threshold change: the band
+  is the content DLSS has not seen yet.
+- H6's mechanism (`temporal_math.h` 515-547): a twin of last frame's rows is
+  accepted as the view's own while the reference is own (the parked test
+  runs only otherwise; the chooser's twin fallback, `temporal_pass.cpp`
+  3146), then the catch-up delta is refused and the carried "last good" is
+  that zero. Flight signature: the registration line's "nothing followed
+  last frame's on N" and "dropped ... as another camera's" in a window with
+  no dump; every window in this log that printed them held a dump.
+- Crops: scratchpad `gap_P_grid.png`, `gap_C_grid.png`,
+  `gap_flags_grid.png`, `path_132100543006_08.png` (white = hidden).
 
 ### 2026-11-07: Phase 2.3, flight 11, the first Lock flight (same build)
 
