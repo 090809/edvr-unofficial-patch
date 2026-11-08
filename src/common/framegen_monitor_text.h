@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <cstdio>
 
+#include "framegen_gate.h"   // the gate's line (auto)
 #include "framegen_lock_report.h"
 
 namespace edvr {
@@ -23,6 +24,7 @@ struct FrameGenMonitorRuntime {
     uint32_t sSlots = 0, fromS = 0, lateS = 0, lateReal = 0;
     float slotDegMedian = -1.0f;
     uint64_t xrBytes = 0;
+    bool autoKnown = false;             // a size 4 slot: the runtime reads fix.frame_generation = auto (Phase 2.4)
 };
 // The synthesizer's last closed one-second window (src\d3d11\framegen_synth.cpp, its log line's gpu_ms and finish_ms) and the game device's bytes the synthesizer and the scorer
 // hold (their VRAM lines' groups).
@@ -36,13 +38,16 @@ struct FrameGenMonitorSynth {
     uint64_t gameBytes = 0;
 };
 struct FrameGenMonitorInput {
-    bool lockKey = false, shadowKey = false;
+    bool lockKey = false, shadowKey = false;   // lockKey: fix.frame_generation is auto or on
+    bool autoMode = false;                      // fix.frame_generation = auto: the gate's line is drawn (Phase 2.4)
+    FrameGenGateState gateState = FrameGenGateState::Off;
+    FrameGenGateReason gateReason = FrameGenGateReason::KeyOff;
     FrameGenMonitorRuntime runtime;
     FrameGenMonitorSynth synth;
 };
 
 constexpr const char* kFrameGenMonitorHeading = "FRAME GENERATION";
-constexpr int kFrameGenMonitorMaxLines = 4;
+constexpr int kFrameGenMonitorMaxLines = 5;
 constexpr size_t kFrameGenMonitorLineChars = 96;   // MenuLine::left
 
 inline double frameGenMonitorMiB(uint64_t b) { return static_cast<double>(b) / (1024.0 * 1024.0); }
@@ -69,6 +74,11 @@ inline int formatFrameGenMonitor(const FrameGenMonitorInput& in, char (*lines)[k
         put("%s", "State: Lock engaged");
     } else {
         put("State: Lock waiting (%s)", frameGenLockReasonName(static_cast<FrameGenLockReason>(r.reason < static_cast<uint32_t>(FrameGenLockReason::Count) ? r.reason : 0xFFu)));
+    }
+    // The performance gate (auto only): whether it allows Lock now and, if not, why.
+    if (in.lockKey && in.autoMode && n < max) {
+        formatFrameGenGateMonitor(in.gateState, in.gateReason, lines[n], kFrameGenMonitorLineChars);
+        ++n;
     }
     // Lock's last second, as its log line counted it.
     if (in.lockKey && rtKnown) {

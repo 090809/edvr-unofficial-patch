@@ -32,6 +32,8 @@ enum class FrameGenLockReason : uint8_t {
     FinishPending,   // the previous pair's overlapped finish has not run (the owner FIFO says it cannot be; a guard)
     SlotFailed,      // the S slot itself was refused or failed (no frame was begun, or the runtime returned an error)
     Dwell,           // every condition holds, for less than kFrameGenLockDwellUs so far
+    Gate,            // Phase 2.4, fix.frame_generation = auto: every condition of Lock's own holds, but the d3d11 half's performance gate does not admit Lock now (framegen_gate.h:
+                     // its line says why). Last in the table so an older d3d11.dll reads any other reason as before.
     Count
 };
 
@@ -51,6 +53,7 @@ inline const char* frameGenLockReasonName(FrameGenLockReason r) {
         case FrameGenLockReason::FinishPending: return "finish_pending";
         case FrameGenLockReason::SlotFailed: return "slot_failed";
         case FrameGenLockReason::Dwell: return "dwell";
+        case FrameGenLockReason::Gate: return "auto_gate";
         default: return "unknown";
     }
 }
@@ -68,6 +71,7 @@ struct FrameGenLockConditions {
     bool notDeferred = false;
     bool periodDisplay = false;   // not a blocker: the gate reads it itself (a halved period while engaged, and the backoff after it)
     bool finishDone = false;
+    bool admitted = true;     // Phase 2.4: word 17 admits Lock (on, or auto with the gate engaged: framegen_gate.h frameGenWordAdmits); tested last
 };
 
 inline FrameGenLockReason frameGenLockBlocker(const FrameGenLockConditions& c) {
@@ -79,7 +83,9 @@ inline FrameGenLockReason frameGenLockBlocker(const FrameGenLockConditions& c) {
     if (!c.noMenu) return FrameGenLockReason::Menu;
     if (!c.sFinished) return FrameGenLockReason::Unfinished;
     if (!c.sDelivering) return FrameGenLockReason::NoS;
-    if (!c.notDeferred) return FrameGenLockReason::DeferredPacing;    if (!c.finishDone) return FrameGenLockReason::FinishPending;
+    if (!c.notDeferred) return FrameGenLockReason::DeferredPacing;
+    if (!c.finishDone) return FrameGenLockReason::FinishPending;
+    if (!c.admitted) return FrameGenLockReason::Gate;
     return FrameGenLockReason::None;
 }
 
@@ -271,6 +277,9 @@ inline FrameGenReplayWhy frameGenReplayWhy(uint64_t pair, const FrameGenSEyeFact
 // Said once when the runtime first reads the key on (and again after it was off).
 constexpr const char* kFrameGenLockArmedFmt =
     "frame generation lock: armed (fix.frame_generation = on: Lock 2:1, forced; it engages once its conditions have held for 1 s and says each engage and disengage)";
+// Phase 2.4: the same, for fix.frame_generation = auto (said again when the key moves between on and auto).
+constexpr const char* kFrameGenLockArmedAutoFmt =
+    "frame generation lock: armed (fix.frame_generation = auto: Lock 2:1 while the d3d11 half's performance gate admits it; it engages once its conditions have held for 1 s and says each engage and disengage)";
 // Each edge, at the pair boundary it happens at. period_ms: the runtime's last predicted period.
 constexpr const char* kFrameGenLockEngageFmt = "frame generation lock: engage reason=held_1s period_ms=%.2f";
 constexpr const char* kFrameGenLockDisengageFmt = "frame generation lock: disengage reason=%s period_ms=%.2f%s";

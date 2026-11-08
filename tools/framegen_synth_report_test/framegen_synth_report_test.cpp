@@ -7,6 +7,7 @@
 #include "framegen_synth_math.h"
 #include "framegen_slot_report.h"
 #include "framegen_monitor_text.h"   // the Monitor page's FRAME GENERATION block
+#include "framegen_gate.h"           // Phase 2.4: the performance gate (fix.frame_generation = auto)
 
 #include <cmath>
 #include <cstdio>
@@ -484,6 +485,278 @@ void caseMonitor() {
     bool fits = n == 4;
     for (int i = 0; i < n; ++i) fits = fits && std::strlen(l[i]) < 90;
     check(fits, "monitor: the widest lines fit the page");
+
+    // Phase 2.4, auto: the gate's line under the state, its reason named; on draws none.
+    FrameGenMonitorInput autoIn = lock;
+    autoIn.autoMode = true;
+    autoIn.gateState = FrameGenGateState::Waiting;
+    autoIn.gateReason = FrameGenGateReason::FullRate;
+    autoIn.runtime.reason = static_cast<uint32_t>(FrameGenLockReason::Gate);
+    checkText(lines(autoIn),
+              "State: Lock waiting (auto_gate)\n"
+              "Gate: waiting (full_rate)\n"
+              "Last second: S shown 44/45, B replayed 1, late real 0\n"
+              "Synth 1.23 ms/eye, finish 0.21 ms/eye, slot pose miss 0.42 deg\n"
+              "VRAM: game 182.0 MiB, XR 63.0 MiB\n",
+              "monitor: auto, the gate waiting (full_rate) and Lock waiting on it (auto_gate)");
+    autoIn.gateState = FrameGenGateState::Engaged;
+    autoIn.gateReason = FrameGenGateReason::None;
+    autoIn.runtime.reason = static_cast<uint32_t>(FrameGenLockReason::None);
+    check(lines(autoIn).rfind("State: Lock engaged\nGate: engaged (Lock allowed)\n", 0) == 0, "monitor: auto, the gate engaged");
+    autoIn.gateState = FrameGenGateState::Waiting;
+    autoIn.gateReason = FrameGenGateReason::NoRuntime;
+    autoIn.runtime = FrameGenMonitorRuntime{};
+    check(lines(autoIn).rfind("State: Lock unknown (no slot from the runtime yet)\nGate: waiting (no_runtime: openvr_api.dll older than auto?)\n", 0) == 0,
+          "monitor: auto with no slot names the runtime");
+    FrameGenMonitorInput wideAuto = wide;
+    wideAuto.autoMode = true;
+    wideAuto.gateState = FrameGenGateState::Waiting;
+    wideAuto.gateReason = FrameGenGateReason::OverGpu;
+    const int na = formatFrameGenMonitor(wideAuto, l, kFrameGenMonitorMaxLines);
+    bool fitsAuto = na == 5;
+    for (int i = 0; i < na; ++i) fitsAuto = fitsAuto && std::strlen(l[i]) < 90;
+    check(fitsAuto, "monitor: auto, five lines, the widest fit the page");
+}
+
+// ---- Phase 2.4: the performance gate (framegen_gate.h), table-driven ----
+// A 90 Hz display (11.11 ms), Elite at 60 fps with a GPU frame of 12 ms and a CPU frame of 9 ms, the synthesizer 1.2 ms a pair, in a ship: every engage term holds.
+FrameGenGateInputs gateBase() {
+    FrameGenGateInputs in;
+    in.mode = FrameGenMode::Auto;
+    in.runtime = true;
+    in.displayMs = 11.111;
+    in.predictedMs = 11.111;
+    in.realFps = 60.0;
+    in.gpuN = 120; in.gpuMedMs = 12.0; in.gpuMaxMs = 14.0;
+    in.cpuN = 120; in.cpuMedMs = 9.0; in.cpuMaxMs = 10.5;
+    in.synthKnown = true; in.synthMs = 1.2;
+    in.context = FrameGenGateContext::Vehicle;
+    return in;
+}
+
+void caseGateTerms() {
+    struct Row { const char* what; void (*edit)(FrameGenGateInputs&); bool engaged; FrameGenGateReason want; };
+    const Row rows[] = {
+        {"all terms hold", [](FrameGenGateInputs&) {}, false, FrameGenGateReason::None},
+        {"no runtime slot of 2.4 (fail-open)", [](FrameGenGateInputs& i) { i.runtime = false; }, false, FrameGenGateReason::NoRuntime},
+        {"display period unknown (fail-open)", [](FrameGenGateInputs& i) { i.displayMs = 0; }, false, FrameGenGateReason::NoDisplay},
+        {"no GPU time (fail-open)", [](FrameGenGateInputs& i) { i.gpuN = 0; }, false, FrameGenGateReason::NoGpu},
+        {"no CPU time (fail-open)", [](FrameGenGateInputs& i) { i.cpuN = 0; }, false, FrameGenGateReason::NoCpu},
+        {"no synthesizer cost (fail-open)", [](FrameGenGateInputs& i) { i.synthKnown = false; }, false, FrameGenGateReason::NoSynth},
+        {"on foot", [](FrameGenGateInputs& i) { i.context = FrameGenGateContext::OnFoot; }, false, FrameGenGateReason::OnFoot},
+        {"context unknown", [](FrameGenGateInputs& i) { i.context = FrameGenGateContext::Unknown; }, false, FrameGenGateReason::Context},
+        {"full rate: 85 fps of 90 is not under 0.9", [](FrameGenGateInputs& i) { i.realFps = 85.0; }, false, FrameGenGateReason::FullRate},
+        {"80 fps of 90 is under 0.9", [](FrameGenGateInputs& i) { i.realFps = 80.0; }, false, FrameGenGateReason::None},
+        {"full rate, but the runtime halved its period", [](FrameGenGateInputs& i) { i.realFps = 90.0; i.predictedMs = 22.222; }, false, FrameGenGateReason::None},
+        {"GPU + synth over 0.85 x 2P (18.89 ms)", [](FrameGenGateInputs& i) { i.gpuMedMs = 17.8; }, false, FrameGenGateReason::OverGpu},
+        {"GPU alone under, synth puts it over", [](FrameGenGateInputs& i) { i.gpuMedMs = 17.7; i.synthMs = 1.3; }, false, FrameGenGateReason::OverGpu},
+        {"GPU + synth just under", [](FrameGenGateInputs& i) { i.gpuMedMs = 17.6; }, false, FrameGenGateReason::None},
+        {"CPU over 0.85 x 2P", [](FrameGenGateInputs& i) { i.cpuMedMs = 19.0; }, false, FrameGenGateReason::OverCpu},
+        {"engaged: the rate term is not the engaged test", [](FrameGenGateInputs& i) { i.realFps = 45.0; i.gpuMedMs = 30.0; }, true, FrameGenGateReason::None},
+        {"engaged: a missing measurement still blocks", [](FrameGenGateInputs& i) { i.cpuN = 0; }, true, FrameGenGateReason::NoCpu},
+        {"engaged: on foot still blocks", [](FrameGenGateInputs& i) { i.context = FrameGenGateContext::OnFoot; }, true, FrameGenGateReason::OnFoot},
+    };
+    for (const Row& r : rows) {
+        FrameGenGateInputs in = gateBase();
+        r.edit(in);
+        const FrameGenGateTerms t = frameGenGateTerms(in, r.engaged);
+        char what[160];
+        std::snprintf(what, sizeof(what), "gate terms: %s -> %s (got %s)", r.what, frameGenGateReasonName(r.want), frameGenGateReasonName(t.blocker));
+        check(t.blocker == r.want, what);
+    }
+    const FrameGenGateTerms t = frameGenGateTerms(gateBase(), false);
+    check(std::fabs(t.budgetMs - 18.8887) < 0.001 && std::fabs(t.workMs - 13.2) < 1e-9 && std::fabs(t.marginMs - (t.budgetMs - 13.2)) < 1e-9,
+          "gate terms: budget 0.85 x 2P, work the larger of GPU + synth and CPU, margin their difference");
+    FrameGenGateInputs fit = gateBase();
+    fit.gpuMedMs = 8.0; fit.cpuMedMs = 8.2;
+    check(frameGenGateTerms(fit, true).fitsFull, "gate terms: GPU 8.0 and CPU 8.2 are under 0.75 of 11.11 ms");
+    fit.cpuMedMs = 8.4;
+    check(!frameGenGateTerms(fit, true).fitsFull, "gate terms: CPU 8.4 is not under 0.75 of 11.11 ms");
+    FrameGenGateInputs slow = gateBase();
+    slow.pairs = 90; slow.lateReal = 5;
+    check(frameGenGateTerms(slow, true).tooSlow, "gate terms: 5 late of 90 pairs is over 5%");
+    slow.lateReal = 4;
+    check(!frameGenGateTerms(slow, true).tooSlow, "gate terms: 4 late of 90 pairs is not over 5%");
+    slow.pairs = 9; slow.lateReal = 9;
+    check(!frameGenGateTerms(slow, true).tooSlow, "gate terms: under 10 pairs is not judged");
+}
+
+// Steps the gate every 100 ms from t0 to t1 (exclusive) with `in`; returns the last step.
+FrameGenGateStep gateRun(FrameGenGate& g, const FrameGenGateInputs& in, uint64_t t0, uint64_t t1, unsigned* edges = nullptr) {
+    FrameGenGateStep s;
+    for (uint64_t t = t0; t < t1; t += 100) {
+        s = g.step(in, t);
+        if (edges && s.edge) ++*edges;
+    }
+    return s;
+}
+
+void caseGateDwell() {
+    const FrameGenGateInputs in = gateBase();
+    // Engage after 2 s, not before; a single edge.
+    {
+        FrameGenGate g;
+        unsigned edges = 0;
+        FrameGenGateStep s = gateRun(g, in, 1000, 2900, &edges);
+        check(s.state == FrameGenGateState::Waiting && s.reason == FrameGenGateReason::Dwell && edges == 0, "gate: waiting (dwell) before 2 s");
+        s = g.step(in, 3000);
+        check(s.state == FrameGenGateState::Engaged && s.reason == FrameGenGateReason::None && s.edge, "gate: engaged at 2 s, an edge");
+        s = g.step(in, 3100);
+        check(s.state == FrameGenGateState::Engaged && !s.edge, "gate: stays engaged, no second edge");
+    }
+    // off is never engaged; on is engaged (forced) at once, whatever the performance terms say; both start the dwell over.
+    {
+        FrameGenGate g;
+        FrameGenGateInputs off = in;
+        off.mode = FrameGenMode::Off;
+        const FrameGenGateStep s = gateRun(g, off, 0, 10000);
+        check(s.state == FrameGenGateState::Off && s.reason == FrameGenGateReason::KeyOff && !g.engaged(), "gate: off is never engaged");
+        FrameGenGateInputs on = in;
+        on.mode = FrameGenMode::On;
+        on.runtime = false; on.gpuN = 0; on.context = FrameGenGateContext::OnFoot; on.realFps = 90.0;
+        const FrameGenGateStep o = g.step(on, 10000);
+        check(o.state == FrameGenGateState::Engaged && o.reason == FrameGenGateReason::Forced && !o.edge, "gate: on bypasses every term (forced), at once");
+        FrameGenGateStep a = g.step(in, 10100);
+        check(a.state == FrameGenGateState::Waiting && a.reason == FrameGenGateReason::Dwell, "gate: on -> auto starts the dwell over");
+        a = gateRun(g, in, 10200, 12200);
+        check(a.state == FrameGenGateState::Engaged, "gate: ... and engages 2 s later");
+    }
+    // Fail-open: a measurement missing engages nothing, and lets an engaged gate go at once, named.
+    {
+        FrameGenGate g;
+        FrameGenGateInputs miss = in;
+        miss.gpuN = 0;
+        FrameGenGateStep s = gateRun(g, miss, 0, 10000);
+        check(s.state == FrameGenGateState::Waiting && s.reason == FrameGenGateReason::NoGpu, "gate: fail-open, no GPU time never engages (no_gpu_time)");
+        gateRun(g, in, 10000, 12100);
+        check(g.engaged(), "gate: engages once the measurement is back for 2 s");
+        s = g.step(miss, 12100);
+        check(s.edge && s.state == FrameGenGateState::Waiting && s.reason == FrameGenGateReason::NoGpu, "gate: a measurement lost while engaged lets go at once, named");
+    }
+    // A cut: lets go at once; then 2 s with none and 5 s since the disengage before it engages again; a cut while waiting resets the hold.
+    {
+        FrameGenGate g;
+        gateRun(g, in, 0, 2100);
+        check(g.engaged(), "gate: engaged before the cut");
+        FrameGenGateInputs cut = in;
+        cut.cut = FrameGenGateCut::Screen;
+        FrameGenGateStep s = g.step(cut, 3000);
+        check(s.edge && s.state == FrameGenGateState::Waiting && s.reason == FrameGenGateReason::Cut && s.cut == FrameGenGateCut::Screen, "gate: a cut lets go at once (cut=screen)");
+        s = gateRun(g, in, 3100, 5000);
+        check(s.reason == FrameGenGateReason::Cut, "gate: within 2 s of the cut the reason stays cut");
+        s = gateRun(g, in, 5000, 7100);
+        check(s.state == FrameGenGateState::Waiting && s.reason == FrameGenGateReason::Rearm, "gate: held 2 s after the cut, but within 5 s of the disengage: rearm");
+        s = g.step(in, 8000);
+        check(s.state == FrameGenGateState::Engaged && s.edge, "gate: engages 5 s after the disengage (held 3 s)");
+        // While waiting: a cut resets the hold.
+        FrameGenGate w;
+        gateRun(w, in, 0, 1900);
+        FrameGenGateInputs cam = in;
+        cam.cut = FrameGenGateCut::Camera;
+        s = w.step(cam, 1900);
+        check(s.reason == FrameGenGateReason::Cut && s.cut == FrameGenGateCut::Camera, "gate: a cut while waiting is named");
+        s = gateRun(w, in, 2000, 3900);
+        check(s.state == FrameGenGateState::Waiting, "gate: the hold starts over after a cut (not engaged 2 s after the start)");
+        s = gateRun(w, in, 3900, 6000);
+        check(s.state == FrameGenGateState::Engaged, "gate: engages 2 s after the cut cleared, never having let go (no rearm)");
+    }
+    // fits_full_rate: Elite's work under 0.75 of one period for 3 s lets go; a break in it starts the 3 s over.
+    {
+        FrameGenGate g;
+        gateRun(g, in, 0, 2100);
+        FrameGenGateInputs fit = in;
+        fit.gpuMedMs = 7.0; fit.cpuMedMs = 6.0; fit.realFps = 45.0;
+        FrameGenGateStep s = gateRun(g, fit, 2100, 4000);
+        FrameGenGateInputs busy = fit;
+        busy.gpuMedMs = 9.0;
+        s = g.step(busy, 4000);
+        check(s.state == FrameGenGateState::Engaged, "gate: work not under 0.75 P breaks the fits run");
+        unsigned edges = 0;
+        s = gateRun(g, fit, 4100, 7100, &edges);
+        check(s.state == FrameGenGateState::Engaged && edges == 0, "gate: 2.9 s of fitting after the break: still engaged");
+        s = g.step(fit, 7100);
+        check(s.edge && s.reason == FrameGenGateReason::FitsFullRate, "gate: 3 s of fitting lets go (fits_full_rate)");
+    }
+    // too_slow: Lock's late_real over 5% of its pairs lets go at once.
+    {
+        FrameGenGate g;
+        gateRun(g, in, 0, 2100);
+        FrameGenGateInputs slow = in;
+        slow.pairs = 88; slow.lateReal = 6;
+        const FrameGenGateStep s = g.step(slow, 2200);
+        check(s.edge && s.reason == FrameGenGateReason::TooSlow, "gate: late_real 6 of 88 pairs lets go (too_slow)");
+    }
+    // on_foot while engaged lets go at once; it is never admitted.
+    {
+        FrameGenGate g;
+        gateRun(g, in, 0, 2100);
+        FrameGenGateInputs foot = in;
+        foot.context = FrameGenGateContext::OnFoot;
+        FrameGenGateStep s = g.step(foot, 2200);
+        check(s.edge && s.reason == FrameGenGateReason::OnFoot, "gate: on foot lets go at once (on_foot)");
+        s = gateRun(g, foot, 2300, 20000);
+        check(s.state == FrameGenGateState::Waiting && s.reason == FrameGenGateReason::OnFoot, "gate: on foot is never admitted");
+    }
+    // full_rate while waiting holds it off; the rate is not judged once engaged (Lock halves it).
+    {
+        FrameGenGate g;
+        FrameGenGateInputs full = in;
+        full.realFps = 89.0;
+        FrameGenGateStep s = gateRun(g, full, 0, 10000);
+        check(s.state == FrameGenGateState::Waiting && s.reason == FrameGenGateReason::FullRate, "gate: Elite at full rate never engages (full_rate)");
+        FrameGenGateInputs over = in;
+        over.cpuMedMs = 20.0;
+        s = gateRun(g, over, 10000, 20000);
+        check(s.reason == FrameGenGateReason::OverCpu, "gate: over the CPU budget never engages (over_budget_cpu)");
+    }
+}
+
+void caseGateWordAndToggle() {
+    check(frameGenModeParse("off") == FrameGenMode::Off && frameGenModeParse("auto") == FrameGenMode::Auto && frameGenModeParse("on") == FrameGenMode::On &&
+              frameGenModeParse("yes") == FrameGenMode::Off && frameGenModeParse(nullptr) == FrameGenMode::Off,
+          "mode: off, auto, on; anything else off");
+    check(frameGenLockWord(FrameGenMode::Off, true) == 0u && frameGenLockWord(FrameGenMode::On, false) == 1u && frameGenLockWord(FrameGenMode::Auto, false) == 2u &&
+              frameGenLockWord(FrameGenMode::Auto, true) == 3u,
+          "word 17: off 0, on 1, auto closed 2, auto open 3");
+    // A 2.3 runtime reads only 1 as on: both auto words read off there. The 2.4 runtime: armed 1..3, admits 1 and 3.
+    check(!frameGenWordArmed(0) && frameGenWordArmed(1) && frameGenWordArmed(2) && frameGenWordArmed(3) && !frameGenWordArmed(4), "word 17: armed 1..3");
+    check(!frameGenWordAdmits(0) && frameGenWordAdmits(1) && !frameGenWordAdmits(2) && frameGenWordAdmits(3), "word 17: admits on and auto open only");
+    check(frameGenWordMode(2) == FrameGenMode::Auto && frameGenWordMode(3) == FrameGenMode::Auto && frameGenWordMode(1) == FrameGenMode::On && frameGenWordMode(7) == FrameGenMode::Off,
+          "word 17: the mode it says");
+    FrameGenMode last = FrameGenMode::Off;
+    check(frameGenToggle(FrameGenMode::Off, last) == FrameGenMode::Auto, "toggle: off goes to auto by default");
+    check(frameGenToggle(FrameGenMode::On, last) == FrameGenMode::Off && last == FrameGenMode::On, "toggle: on goes off, remembered");
+    check(frameGenToggle(FrameGenMode::Off, last) == FrameGenMode::On, "toggle: off goes back to on");
+    check(frameGenToggle(FrameGenMode::Auto, last) == FrameGenMode::Off && frameGenToggle(FrameGenMode::Off, last) == FrameGenMode::Auto, "toggle: auto remembered");
+}
+
+void caseGateLines() {
+    FrameGenGate g;
+    FrameGenGateInputs in = gateBase();
+    in.pairs = 0;
+    const FrameGenGateStep w = g.step(in, 0);
+    checkText(formatFrameGenGateReport(w, in, FrameGenMode::Auto, "auto_gate"),
+              "frame generation gate: state=waiting reason=dwell mode=auto real_fps=60.00/90.00 period_ms=11.11/11.11 gpu_ms=12.00/14.00 cpu_ms=9.00/10.50 synth_ms=1.20 "
+              "budget_ms=18.89 margin_ms=5.69 late_real=0/0 context=vehicle cut=none lock=auto_gate",
+              "gate line: waiting, every field");
+    FrameGenGateInputs none;
+    none.mode = FrameGenMode::Auto;
+    const FrameGenGateStep n = FrameGenGate{}.step(none, 0);
+    checkText(formatFrameGenGateReport(n, none, FrameGenMode::Auto, nullptr),
+              "frame generation gate: state=waiting reason=no_runtime mode=auto real_fps=-/- period_ms=-/- gpu_ms=-/- cpu_ms=-/- synth_ms=- budget_ms=- margin_ms=- "
+              "late_real=0/0 context=unknown cut=none lock=unknown",
+              "gate line: nothing measured reads '-' and names no_runtime");
+    const FrameGenGateStep e = gateRun(g, in, 100, 2100);
+    check(e.edge, "gate line: the run ends on the engage edge");
+    checkText(formatFrameGenGateEdge(e), "frame generation gate: engage reason=held_2s margin_ms=5.69", "gate line: the engage edge");
+    FrameGenGateInputs cut = in;
+    cut.cut = FrameGenGateCut::Tunnel;
+    checkText(formatFrameGenGateEdge(g.step(cut, 2200)), "frame generation gate: disengage reason=cut cut=tunnel", "gate line: the disengage edge names the cut");
+    FrameGenGateInputs on = in;
+    on.mode = FrameGenMode::On;
+    const FrameGenGateStep o = FrameGenGate{}.step(on, 0);
+    check(formatFrameGenGateReport(o, on, FrameGenMode::On, "none").rfind("frame generation gate: state=engaged reason=forced mode=on ", 0) == 0, "gate line: on reads engaged, forced");
+    check(std::strlen(formatFrameGenGateReport(w, in, FrameGenMode::Auto, "finish_pending").c_str()) < 480, "gate line: fits its buffer");
 }
 
 }  // namespace
@@ -511,6 +784,10 @@ int main(int argc, char** argv) {
     caseCb();
     caseTarget();
     caseMonitor();
+    caseGateTerms();
+    caseGateDwell();
+    caseGateWordAndToggle();
+    caseGateLines();
     if (g_fail) {
         std::printf("framegen_synth_report_test: %d check(s) FAILED\n", g_fail);
         return 1;
