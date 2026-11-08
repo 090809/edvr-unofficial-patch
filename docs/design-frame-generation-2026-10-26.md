@@ -55,7 +55,9 @@
   S resampled Catmull-Rom (`FG_SHARP`, 0.82 -> 0.94); hole fill along the motion (`FG_FILL_REPROJ`);
   `fgSynSrc`'s tie deterministic (2026-11-08: second time pass, the passes near their bounds);
   the resample in 8 fetches instead of 16 (2026-11-08 third time pass: it was fetch-bound, not
-  memory-bound; 0.57 -> 0.54 ms per eye, replays unchanged).
+  memory-bound; 0.57 -> 0.54 ms per eye, replays unchanged); the hull's
+  outline against space (2026-11-08: `FG_HALO`, `FG_SENTINEL_SURFACE`;
+  +0.07 ms per eye).
   H1, H8, H9 and the surface classifier are still unbuilt; on foot unflown.
 - **Temporary keys (hidden):** `fix.frame_generation_shadow` (off | on), and
   `fix.frame_generation` (off | on; built 2.3: `on` forces Lock, for A/B
@@ -1598,6 +1600,88 @@ shader's own switches, not inferred from the byte count.
   input. Two small things in the bench, not the synth: `--png-dir` makes one
   directory level only (a missing parent writes nothing and says so per
   PNG), and without `--png-dir` it writes `bench_out` into the capture.
+
+### 2026-11-08: the own hull's outline torn against space in a ship turn (eye dump and replay 120812713001; built, not flown)
+
+Pilot, Lock on: the own ship's hull still shows torn edges where it is seen
+against space (the 2026-11-07 fix covered the hull over terrain). Lead's crop
+of the dump (x 550-1550, y 560-900 of S03 and S14): the thin cyan outline
+along the silhouette breaks off in stair steps (top-left strake), and a white
+blotch on the central block's top. Replay f3 = dump k03 (frame 20409; the
+replay has six frames, so S14 is not replayed). The bench's f = 0.5 S of f3
+reproduces both in place: the outline is drawn a second time 4-5 render px
+up-left of the hull, in the sky, and the hull's own edge loses it in steps.
+
+Environment: OpenXR, left eye, render 2817x2448, output 3756x3264 (DLSS, 8-bit
+`dlOut`), the hull world class at 43-80 m (the canopy frame, 2-3.5 m, is the
+cockpit class). Ship turn 1.8 degrees a frame (`world_w`), head 0.06: the
+sky's vector (8.6, 14.9) render px median, the hull's (1.26, 0.51), the head's
+alone.
+
+| Hypothesis | Signature | Observed (replay f3, render x 1120-1870, y 943-1198) | Verdict |
+|---|---|---|---|
+| H-o (lead) the outline is drawn without depth, so it moves with the sky | the outline's pixels far-plane depth, beyond the 3x3's reach | the outline is the far plane (1178 of its 2083 cyan render pixels; the rest on the hull's own edge). In render pixels it sits 1 px out, but in B's output it and its glow reach 2 render px from the hull (Chebyshev 2: 12% of the cyan output pixels over the sky, mean luma 23 against the sky's 0.1), none at 3. The 3x3 dilation (aede0bf4) reaches 1 | confirmed, R = 2 (not 3-4) |
+| H-o' the fill reads the outline back | hole pixels beside the hull read B on the outline | the S pixels the sky leaves beside the hull are holes; the fill carries them back by the sky's motion onto the 2 px ring, whose depth is the far plane, so `synBackAt` takes it for sky: with the halo alone the detached outline stays (1036 of its output pixels were fill kind 2, reprojected) | confirmed |
+| H-o'' the footprint reads into the ring | far-key winners whose read is 1 px from their source, on the ring | a sky pixel 3 px out offers its footprint neighbour a read 1 px toward the hull, inside the ring: 93 detached cyan output pixels after the two fixes above (rig: S 4 px into the sky reads the outline exactly) | confirmed |
+| H-c the outline has its own (holo or screen) vectors | outline vectors unlike the sky's or the hull's | 85% of the 1 px ring carries the rejection sentinel, the rest the sky's vector; nothing of its own | ruled out |
+| H-g the guard moves it | guarded reads at the outline | 13 of the 1260 detached outline output pixels are guarded reads | ruled out |
+| H-w the white blotch: a rejected patch borrows the sky's vector | sentinel vectors on the block top, read offsets the sky's | a 1 m nearer feature on the block top (57.9 m on a 58.7 m hull) carries the sentinel; `FG_SENTINEL`'s ring takes the FARTHEST non-sentinel pixel within 32 px, which is the sky past the silhouette: those pixels read (4.65, 4.0) px, the sky's motion, against the hull's (0.63, 0.25) | confirmed |
+
+- ruled out: the outline on a holo or screen path of its own (H-c), because
+  its pixels carry the sky's vector or the sentinel, nothing else.
+- ruled out: the guard (H-g), because 13 of 1260 detached outline pixels
+  are guarded reads; the rest are winners or fills.
+- ruled out: an outline 3-4 px wide (the lead's estimate), because no cyan
+  output pixel lies over a sky render pixel 3 px from the hull: R = 2.
+- **Fix (framegen_synth_shader.h, `FG_HALO`, `FG_SENTINEL_SURFACE`):**
+  - a far-plane pixel whose 3x3 is all the far plane but whose 5x5 ring holds
+    a nearer surface takes the nearest of that ring's depths and that pixel's
+    vector (`synHalo`, in every place the dilated depth is taken); stars
+    further out are untouched;
+  - the fill's test that B is the far plane at a read also requires no nearer
+    surface within 2 px of its 2x2 (`synBackAt`), so a hole is not filled
+    from the outline;
+  - a far-plane source with a nearer surface 3 px away marks that direction
+    for the guard (`synHaloMetres`), so its footprint read does not reach into
+    the ring;
+  - a sentinel vector borrows from the farthest ring pixel on its own surface
+    (within 0.75 to 4/3 of its distance; the far plane only for the far
+    plane) before the farthest of any surface.
+- An early-return form of the fill's 6x6 test (`return false` inside the
+  loops) had no effect in the bench on the RTX 5080; written as a maximum
+  over the block it works. Noted in case the pattern is reused.
+- **Measured, replay f3 (f = 0.5 S, lead's crop):** cyan output pixels in
+  the sky 3 px or more from the hull 1260 -> 123 with the halo, the fill
+  test and the surface rule (counted before the guard part was added; the
+  rig shows that part's case exactly, a read of the outline 4 px out);
+  the outline sits on the hull as in B, the block top matches B.
+- **Measured, the 23 replays in the eyes folder (`--replay`, before = the
+  three switches 0, which reproduces HEAD's output):** turned class means and
+  p95 unchanged but four one-step moves (far mean -1 on 222433569001 and
+  225627723003, cockpit +1 on 202815590002, world p95 20 -> 24 on
+  153002735006); raw world p95 unchanged on all. Hole region error median
+  32.6 -> 31.1 milli-luma (sum 880 -> 851; better in 15, worse in 3 by at
+  most 0.6); the hull-turn replays gain most: 120812713001 32.6 -> 26.5,
+  225459033001 40.9 -> 28.0, 222433569001 32.2 -> 26.7. Holes filled +0.01
+  points (median 1.16 -> 1.17%), left +0.01, guard 0.27 -> 0.24%. S/B
+  sharpness outside the holes median 0.931 -> 0.926; the drop is on the
+  hull-in-space replays where the stray outline added edges (120812713001
+  0.974 -> 0.926, 225459033001 0.970 -> 0.937), elsewhere within 0.002.
+- **Cost** (`--bench --frame`, f = 0.5, ms per eye): 120812713001:3 0.533 ->
+  0.612, 230157175005:2 0.532 -> 0.603: src 0.133 -> 0.18 (the halo in the
+  source pass; the 7x7 guard ring is not the cost: one load in place of 24
+  times the same), holes 0.095 -> 0.12, splat +0.001.
+- **Rig:** case 17 (a still hull at 60 m over the far plane moving 8 px, a
+  2 px outline at far depth with the sky's vectors, a 58 m patch on the hull
+  with the sentinel): the outline stays on the hull and nowhere in the sky,
+  the sky moves as the sky, the patch with the hull. `FG_HALO 0` and
+  `FG_SENTINEL_SURFACE 0` each fail it. Case 5's guard check now allows one
+  read a row (the sky pixel 3 px out keeps its footprint read on itself).
+  151 of 151.
+- **Not flown.** Flight signature: in a ship turn with the hull against
+  space, the eye dumps' S keeps the outline on the silhouette, nothing cyan
+  in the sky beside it, no white patch on the hull; the synth line's `guard=`
+  slightly lower.
 
 ### 2026-11-07: Phase 2.3, flight 11, the first Lock flight (same build)
 
