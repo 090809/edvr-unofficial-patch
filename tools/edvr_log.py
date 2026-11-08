@@ -10673,6 +10673,27 @@ H_HULL_OTHER = (r"hull layer: (?:dump \S+ armed|private copy (?:made|of a)|\d+ p
                 # the slot target's private copy dropped, a stage draw not at the eye's render size.
                 r"keep-own vertex shader (?:made|declined)|a \w+ re-issue could not take the keep-own|busy(?: over)?:|"
                 r"the private copy of eye \d's slot target dropped|a [\w ]+ stage draw into a)")
+# The hull layer's rig probe (diag.hull_layer, TEMPORARY; src\d3d11\hull_rig_probe.cpp, docs "Rig probe"): a diagnostic with a row of its own. Its lines start
+# "hull layer: rig_probe" and health_scan routes them here before the hull layer's rule sees them. Ran is the armed line (state, kept whatever --since says);
+# applied is a comparison line with state=ok.
+H_HULL_PROBE = "hull layer rig probe"
+H_HULL_PROBE_LABEL = "hull layer: rig_probe"
+H_HULL_PROBE_ARMED = r"hull layer: rig_probe (?P<to>armed|off)\b"
+H_HULL_PROBE_LINE = (r"hull layer: rig_probe frame=(?P<frame>\d+) present=(?P<present>\d+) eye=(?P<eye>-?\d+) target=(?P<ship>\S+?)/(?P<cockpit>\S+) "
+                     r"ship_recs=(?P<ship_recs>\d+) cockpit_recs=(?P<cockpit_recs>\d+) own_emits=(?P<emits_s>\d+),(?P<emits_c>\d+) "
+                     r"appending=(?P<app_s>\d+),(?P<app_c>\d+) claimed=(?P<claimed_s>\d+),(?P<claimed_c>\d+) copier_hits=(?P<hits_s>\d+),(?P<hits_c>\d+) "
+                     r"merges_moved=(?P<moved>\d+) spliced=(?P<spliced>\d+) merge_failed=(?P<merge_failed>\d+) unwound=(?P<unwound>\d+) "
+                     r"unconsumed=(?P<unconsumed>\d+) stale=(?P<stale>\d+) pose_mismatch=(?P<pose_mismatch>\d+) locate_failed=(?P<lf_s>\d+),(?P<lf_c>\d+) "
+                     r"hits_no_pool=(?P<hits_no_pool>\d+) emit_calls=(?P<emit_calls>\d+) copier_calls=(?P<copier_calls>\d+) copier_refused=(?P<refused>\d+) "
+                     r"copier_no_pool=(?P<copier_no_pool>\d+) maps=(?P<m_discard>\d+),(?P<m_noov>\d+),(?P<m_other>\d+) pool=(?P<pool>\w+) records=(?P<records>\d+) "
+                     r"written=(?P<written>-?\d+) cpu=(?P<cpu>-?\d+) cpu_fresh=(?P<fresh>-?\d+) cpu_retained=(?P<retained>-?\d+) gpu=(?P<gpu>-?\d+) "
+                     r"both=(?P<both>-?\d+) cpu_only=(?P<cpu_only>-?\d+) gpu_only=(?P<gpu_only>-?\d+) gpu_only_written=(?P<go_written>-?\d+) "
+                     r"gpu_only_held=(?P<go_held>-?\d+) state=(?P<state>\w+)")
+H_HULL_PROBE_TARGET = (r"hull layer: rig_probe target ship=\"(?P<ship>[^\"]*)\" ship_recs=(?P<ship_recs>\d+) cockpit=\"(?P<cockpit>[^\"]*)\" "
+                       r"cockpit_recs=(?P<cockpit_recs>\d+)")
+H_HULL_PROBE_GAP = r"hull layer: rig_probe own emits (?P<what>stopped|resumed)\b"
+H_HULL_PROBE_DUMP = r"hull layer: rig_probe dump (?P<stamp>\S+): HullRigProbe (?P<status>written|write failed)"
+H_HULL_PROBE_OTHER = r"hull layer: rig_probe: a staging buffer"
 # Frame generation, Phase 1 (fix.frame_generation_shadow, TEMPORARY; src\common\framegen_shadow_report.h): two lines of the graphics log with no build tag, read the way the desktop
 # window's are. The armed line is said once per change to on (so health_scan keeps it whatever --since says); the report line every second.
 H_FRAMEGEN = "frame generation shadow"
@@ -10849,7 +10870,7 @@ H_F125_LABEL = "native on foot log (F125)"
 H_F125_RE = re.compile(r"native on foot log \(F125\): detail (?P<detail>on|off), summary window (?P<wl>\d+) s")
 # Rules whose absence says nothing about a feature, so a log without their lines does not list them as not present: every log written before F125 has no F125
 # line, and its report stays as it was.
-HEALTH_QUIET_WHEN_ABSENT = frozenset((H_F125, H_WORLD, H_DESKTOP, H_SRV_TURRET, H_FRAMEGEN, H_FRAMEGEN_SYNTH, H_FRAMEGEN_LOCK, H_HULL))   # the frame generation shadow is off by default and says nothing then; world scale writes nothing while the value stays 100; the desktop window nothing while the setting is game; the SRV turret view nothing in a log with no VR profile
+HEALTH_QUIET_WHEN_ABSENT = frozenset((H_F125, H_WORLD, H_DESKTOP, H_SRV_TURRET, H_FRAMEGEN, H_FRAMEGEN_SYNTH, H_FRAMEGEN_LOCK, H_HULL, H_HULL_PROBE))   # the frame generation shadow is off by default and says nothing then; world scale writes nothing while the value stays 100; the desktop window nothing while the setting is game; the SRV turret view nothing in a log with no VR profile
 
 # ---- F125: summary windows (the on-foot log diet) ----
 # By default an on-foot summary line covers a window of 10 s, 1 s with log.on_foot_detail = on, and 1 to 10 s when a window is flushed early (a held-item change,
@@ -17114,6 +17135,50 @@ def _hj_hull_layer(rows, ctx=None):
                                   "missed counts say at which step)")
     return ("OK", text)
 
+
+def _hj_hull_rig_probe(rows, ctx=None):
+    """The hull layer's rig probe (diag.hull_layer, TEMPORARY; src\\d3d11\\hull_rig_probe.cpp): ran is the armed line, applied is a comparison line with state=ok.
+    OK when a comparison read the GPU mask against a known pool and the copier set own bits (copier_hits > 0); PARTIAL when comparisons came but none was ok
+    (the states say why: no_target, no_emits, no_seed, no_pool, readback_late), or ok with no copier hit (the chain breaks between the emit and the copier); NEVER
+    APPLIED when armed (the last armed/off line says armed) and no comparison line follows; None with no line, or the last line saying off and no comparison."""
+    armed = rows.get("armed", [])
+    lines = rows.get("line", [])
+    on = bool(armed) and armed[-1]["to"] == "armed"
+    if not lines and not on:
+        return None
+    if not lines:
+        return ("NEVER APPLIED", "the rig probe was armed but no 'hull layer: rig_probe frame=' line follows in the window (no 30 s window closed, or its "
+                                 "frame-end path is dead)")
+    n = lambda k: sum(int(r[k]) for r in lines)
+    states = {}
+    for r in lines:
+        states[r["state"]] = states.get(r["state"], 0) + 1
+    text = ("%d comparison line(s) (%s); emit calls %d, own emits ship %d cockpit %d (appending %d/%d), claimed %d/%d, copier hits %d/%d, merges moved %d "
+            "(spliced %d, failed %d), unconsumed %d, stale %d, pose mismatch %d"
+            % (len(lines), ", ".join("%s %d" % (k, v) for k, v in sorted(states.items())), n("emit_calls"), n("emits_s"), n("emits_c"), n("app_s"),
+               n("app_c"), n("claimed_s"), n("claimed_c"), n("hits_s"), n("hits_c"), n("moved"), n("spliced"), n("merge_failed"), n("unconsumed"),
+               n("stale"), n("pose_mismatch")))
+    targets = rows.get("target", [])
+    if targets:
+        t = targets[-1]
+        text += "; target %s (%s records) / %s (%s)" % (t["ship"], t["ship_recs"], t["cockpit"], t["cockpit_recs"])
+    gaps = rows.get("gap", [])
+    if gaps:
+        text += "; own emits stopped %d time(s)" % sum(1 for g in gaps if g["what"] == "stopped")
+    for d in rows.get("dump", []):
+        text += "; dump %s HullRigProbe %s" % (d["stamp"], d["status"])
+    ok = [r for r in lines if r["state"] == "ok"]
+    if not ok:
+        return ("PARTIAL", text + ": no comparison was ok (the last state %s)" % lines[-1]["state"])
+    last = ok[-1]
+    text += ("; last ok (frame %s, pool %s, %s records): cpu %s (fresh %s, retained %s), gpu %s, both %s, cpu only %s, gpu only %s (written this frame %s, held %s)"
+             % (last["frame"], last["pool"], last["records"], last["cpu"], last["fresh"], last["retained"], last["gpu"], last["both"], last["cpu_only"],
+                last["gpu_only"], last["go_written"], last["go_held"]))
+    if sum(int(r["hits_s"]) + int(r["hits_c"]) for r in ok) == 0:
+        return ("PARTIAL", text + ": compared, but the copier never copied a claimed item (the chain breaks between the emit and the copier)")
+    return ("OK", text)
+
+
 def _hj_framegen_shadow(rows, ctx=None):
     """Frame generation, Phase 1 (fix.frame_generation_shadow, TEMPORARY): ran is the armed line (the first treated eye with the key on), applied is a report line (the
     scorer's one-second line). OK when at least one report line is in the window; NEVER APPLIED when the armed line is there and no report line is (the scorer armed and
@@ -18566,6 +18631,15 @@ HEALTH_RULES = (
         ("seq", H_HULL_SEQ),
         ("_", H_HULL_OTHER),
     ), _hj_hull_layer),
+    # The hull layer's rig probe (diag.hull_layer, TEMPORARY): its own row, from the "hull layer: rig_probe" lines health_scan routes here.
+    _hrule(H_HULL_PROBE, (), (H_HULL_PROBE_LABEL,), (
+        ("armed", H_HULL_PROBE_ARMED),
+        ("line", H_HULL_PROBE_LINE),
+        ("target", H_HULL_PROBE_TARGET),
+        ("gap", H_HULL_PROBE_GAP),
+        ("dump", H_HULL_PROBE_DUMP),
+        ("_", H_HULL_PROBE_OTHER),
+    ), _hj_hull_rig_probe),
     # The SRV turret view (issue 140): lines of the graphics log that carry no build tag (health_scan reads them, as it reads the desktop window's, before it drops the untagged lines).
     _hrule(H_SRV_TURRET, (), H_SRV_TURRET_LABELS, (
         ("setting", H_SRV_TURRET_SETTING),
@@ -18642,7 +18716,24 @@ def health_scan(text, since=None, until=None):
     lock = next(r for r in HEALTH_RULES if r.name == H_FRAMEGEN_LOCK)
     turret =next(r for r in HEALTH_RULES if r.name == H_SRV_TURRET)
     hull = next(r for r in HEALTH_RULES if r.name == H_HULL)
+    probe = next(r for r in HEALTH_RULES if r.name == H_HULL_PROBE)
     for raw in text.splitlines():
+        if H_HULL_PROBE_LABEL in raw:
+            # The hull layer's rig probe: untagged like the layer's lines, its own row. The armed line is state, kept whatever --since says.
+            sm = HEALTH_STAMP_RE.match(raw)
+            tod = int(sm.group(1)) * 3600 + int(sm.group(2)) * 60 + int(sm.group(3)) + int(sm.group(4)) / 1000.0 if sm else None
+            body = raw[sm.end():] if sm else raw
+            for kind, rx in probe.kinds:
+                g = rx.search(body)
+                if g:
+                    if kind != "_" and (kind in ("armed", "target") or _health_in_window(tod, since, until)):
+                        rows[H_HULL_PROBE].setdefault(kind, []).append(dict(g.groupdict(), _t=tod))
+                    break
+            else:
+                u = unparsed[H_HULL_PROBE]
+                u[0] += 1
+                u[1] = u[1] or raw.strip()[:160]
+            continue
         if H_HULL_LABEL in raw:
             # The hull layer's lines carry no build tag. The key line is state, kept whatever --since says; the rest are events and are cut by the window.
             sm = HEALTH_STAMP_RE.match(raw)
@@ -26105,6 +26196,45 @@ def self_test_health():
         check("hull layer: separate, discarded and never composited, is PARTIAL", hl_base + [hl_key("separate"), hl_report(), hl_main(),
                                                                                          hl_comp(comp=0, ready=0, fail=(0, 0, 0, 5400), declined=(5400, 0, 0))],
               0, [("PARTIAL", HL)], has=["no eye-frame was composited", "misses seed 0, lit 0, tone 0, composite 5400; declined stale 5400"])
+        # ---- the hull layer's rig probe (diag.hull_layer, TEMPORARY): its own row, from the C format strings in src\d3d11\hull_rig_probe.cpp ----
+        rpsrc = read_text(os.path.join(repo_root(), "src", "d3d11", "hull_rig_probe.cpp"))
+
+        def RP(needle, *vals):
+            key = "rp:" + needle
+            if key not in fmts:
+                fmts[key] = health_c_format(rpsrc, needle)
+            if fmts[key] is None:
+                raise AssertionError("hull layer rig probe: no log format holds %r: the --health rule that reads it is out of date" % needle)
+            return health_render(fmts[key], vals)
+
+        def rp_line(state="ok", hits=(1700, 470), cpu=76, gpu=80, both=74, held=2, pool="known", target=("AnacondaMkII", "AnacondaMkII_Cockpit")):
+            return RP("hull layer: rig_probe frame=%u", 1234, 5678, 0, target[0], target[1], 60, 16, 1800, 480, 1750, 480, 1750, 480, hits[0], hits[1],
+                      30, 900, 0, 0, 5, 0, 0, 0, 0, 0, 90000, 150000, 0, 0, 1800, 0, 0, pool, 1056, 900, cpu, 70, 6, gpu, both, cpu - both, gpu - both,
+                      gpu - both - held, held, state)
+
+        RPN, rp_armed = H_HULL_PROBE, RP("hull layer: rig_probe armed")
+        rp_target = RP("hull layer: rig_probe target ship=", "AnacondaMkII", 60, "AnacondaMkII_Cockpit", 16, 1)
+        check("hull layer rig probe: armed, compared with copier hits, is OK and says the sets",
+              hl_base + [hl_key(), rp_armed, rp_target, RP("hull layer: rig_probe own emits stopped", 2100, "known", 77),
+                         RP("hull layer: rig_probe own emits resumed", 9000, 600), rp_line(), RP("hull layer: rig_probe dump %ls", "123456789001", "written",
+                                                                                                  1234, 0, "ok", 4096, "read"), hl_report()],
+              0, [("OK", RPN), ("OK", HL)],
+              has=["1 comparison line(s) (ok 1); emit calls 90000, own emits ship 1800 cockpit 480", "copier hits 1700/470, merges moved 30",
+                   "target AnacondaMkII (60 records) / AnacondaMkII_Cockpit (16)", "own emits stopped 1 time(s)", "dump 123456789001 HullRigProbe written",
+                   "cpu 76 (fresh 70, retained 6), gpu 80, both 74, cpu only 2, gpu only 6 (written this frame 4, held 2)"],
+              lacks=["UNPARSED", "do not match"])
+        check("hull layer rig probe: armed and never compared is NEVER APPLIED", hl_base + [hl_key(), rp_armed, hl_report()], 3, [("NEVER APPLIED", RPN), ("OK", HL)],
+              has=["the rig probe was armed but no 'hull layer: rig_probe frame=' line follows"])
+        check("hull layer rig probe: comparisons with no target are PARTIAL and say the state",
+              hl_base + [hl_key(), rp_armed, rp_line(state="no_target", hits=(0, 0), target=("-", "-")), hl_report()], 0, [("PARTIAL", RPN)],
+              has=["no comparison was ok (the last state no_target)"], lacks=["UNPARSED", "do not match"])
+        check("hull layer rig probe: ok with no copier hit is PARTIAL", hl_base + [hl_key(), rp_armed, rp_line(hits=(0, 0), cpu=0, both=0), hl_report()], 0,
+              [("PARTIAL", RPN)], has=["the copier never copied a claimed item"])
+        check("hull layer rig probe: the probe off with no comparison says nothing", hl_base + [hl_key("off"), RP("hull layer: rig_probe off")], 0, [("OK", F90S)],
+              lacks=[row("NEVER APPLIED", RPN), row("OK", RPN), "do not match"])
+        check("hull layer rig probe: a drifted comparison line is counted as unparsed",
+              hl_base + [hl_key(), rp_armed, rp_line().replace(" spliced=", " splice="), hl_report()], 3, [("NEVER APPLIED", RPN)],
+              has=["line(s) the rule's patterns do not match"])
         # ---- the SRV turret view: the graphics log's untagged lines, rendered from the C format strings in src\d3d11\srv_turret.cpp and (the geometry shader's creation line) shader_swap.cpp ----
         stsrc = read_text(os.path.join(repo_root(), "src", "d3d11", "srv_turret.cpp"))
 
