@@ -1065,6 +1065,14 @@ static void noteSourceFreeContent(State& s, const FlatMonoFrame& sel) {
     if(!n.draws) { ++s.sourceFreeEmptyWindow; return; }
     if(blankScene(sel)) ++s.sourceFreeHoloOnlyWindow; else ++s.sourceFreeOtherWindow;   // "filter-only" in the line
 }
+// A refusal for no supported motion source, on either route (the copy route's selector or the HDR route's): the stock draws its verdict
+// counted, as the frame's prefix holds them now (the same draws the selector was given), for `flat source veto 5s`.
+static void noteVetoNames(State& s, const FlatMonoFrame& sel) {
+    if (sel.reason != FlatMonoReason::NoSupportedSource) return;
+    for (uint32_t i = 0; i < kFlatFamilyVetoKinds; ++i) s.vetoLast[i] = s.prefix.familyVetoes[i];
+    s.vetoLastKinds = s.prefix.familyVetoKinds; s.vetoLastOverflowDraws = s.prefix.familyVetoOverflowDraws;
+    s.frameVetoByFamily = sel.sourceless.vetoFamilyDraws != 0;
+}
 static void reportSourceSpell(State& s) {
     const FlatSourceSpellWindow w=s.sourceSpell.take();
     if(s.sourceFreeSeenWindow) {
@@ -4176,6 +4184,10 @@ static void hdrSelectAtTrigger(State& s) {
     const bool autoKey = s.hdrKey == FlatHdrKey::Auto;
     s.hdrWindow.lastVerdict = sel.selected() ? "selected" : flatMonoReasonName(sel.reason);
     s.hdrWindow.noteSelection(s.hdrWindow.lastVerdict);   // the key off's answer: what the selector says at each trigger
+    // 2026-11-08 (Sean's Frontier flight at 11:03, render at the output): a view the HDR route refuses for no source is named on the
+    // source lines as the copy route's is; the copy route's selector never sees it.
+    if (sel.reason == FlatMonoReason::NoSupportedSource) { s.sourcelessLast = sel.sourceless; s.sourcelessLastFrame = s.prefix.frame; }
+    noteVetoNames(s, sel);
     if (!s.hdrFirstTriggerLogged) {
         s.hdrFirstTriggerLogged = true;
         char text[700];
@@ -4191,6 +4203,11 @@ static void hdrSelectAtTrigger(State& s) {
         const FlatFrameSeen routeSeen = flatHdrTriggerSeen(sel,
             s.engine);
         if (routeSeen == FlatFrameSeen::Treatable) { s.frameSeen = FlatFrameSeen::Treatable; s.frameReason = sel.reason; }
+        // Where the route itself resolves the frame, its refusal for no source is the view's and passes: it speaks as Transient, above the
+        // copy stage's structural no-known-tone-pass, so neither the stand-down nor the F8 warning blames the post chain (flat_hdr_route.h).
+        const FlatFrameSeen refusalSeen = flatHdrTriggerRefusalSeen(sel, s.engine, s.hdr.trigger.hdrWidth, s.hdr.trigger.hdrHeight,
+                                                                    s.prefix.width, s.prefix.height);
+        if (refusalSeen > s.frameSeen) { s.frameSeen = refusalSeen; s.frameReason = sel.reason; }
     }
     {
         flatcpu::Scope trace(flatcpu::kTrace);
@@ -6698,12 +6715,7 @@ FlatRuntimeDrawScope::FlatRuntimeDrawScope(ID3D11DeviceContext* context, uint32_
         if (verdictConflicting) reportConflict(s);
         // What the view held when it had no motion source (section 104); the line names it.
         if (selected.reason == FlatMonoReason::NoSupportedSource) { s.sourcelessLast = selected.sourceless; s.sourcelessLastFrame = s.prefix.frame; }
-        if (selected.reason == FlatMonoReason::NoSupportedSource) {
-            // The stock draws the verdict counted, as the frame's prefix holds them now (the same draws the selector was given).
-            for (uint32_t i = 0; i < kFlatFamilyVetoKinds; ++i) s.vetoLast[i] = s.prefix.familyVetoes[i];
-            s.vetoLastKinds = s.prefix.familyVetoKinds; s.vetoLastOverflowDraws = s.prefix.familyVetoOverflowDraws;
-            s.frameVetoByFamily = selected.sourceless.vetoFamilyDraws != 0;
-        }
+        noteVetoNames(s, selected);
         noteSourceFreeContent(s, selected);
         // What the selector made of a frame whose glow pass the first-person path admitted (2026-10-29): selected or why not, whether it
         // took a source, and whether the camera it took is the world's. Six lines at most, ten seconds apart.

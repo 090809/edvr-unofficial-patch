@@ -235,6 +235,9 @@ void corpus(ID3D11Device* device, ID3D11DeviceContext* context, const std::wstri
         {L"vs_01DA82F8D0EA0C99", L"ps_2C3ADCD2FCD47298", false},
         // 2026-11-05 (Frontier 14:37, a bartender): an NPC's eyes, keyed for VR with the second skin.
         {L"vs_33A5025C48FC8259", L"ps_7AA0441EE0E88667", false},
+        // 2026-11-08 (Frontier 11:03, on foot beside the SRV at a planet; a flat user's report of the same view): the
+        // family's stock G-buffer materials that refused the view for want of a source. Keyed in both profiles.
+        {L"vs_DE545DC8EE4FBB87", L"ps_60D69AB6C65C549A", false}, {L"vs_DE545DC8EE4FBB87", L"ps_E364F5637AB0261C", false},
     };
     for (const auto& p : pairs) onePair(device, context, root, p, &check);
     // Candidates: pairs seen drawing stock that are not keyed. Each is tried

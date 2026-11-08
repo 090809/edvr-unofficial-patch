@@ -30,7 +30,11 @@ constexpr Family kFamilies[] = {
     // The captured pair is draw-qualified on WARP; VR remains unqualified.
     // 054658: 03B17 draws the station's moving rig; its survivors and discard
     // branch are qualified against the original on WARP.
-    {0xDE545DC8EE4FBB87ull, "vs_DE545DC8EE4FBB87", {0xE46E3E4832B2FDB0ull, 0xCB429E043DBB2506ull, 0x03B17F89B31C4788ull, 0}, false, 0x91F8937EDA723663ull},
+    // 2026-11-08 (a flat report of DLSS dropping on a planet once the SRV left the view; Sean's Frontier 11:03 trace):
+    // 60D69AB6 and E364F563 are stock G-buffer materials of this family (four targets, normal-mapped PBR). Unkeyed, a
+    // view holding one and no keyed draw was refused no-supported-motion-source-pair. Both profiles. Hashes recomputed
+    // from the dumped bytecode (log.cpp fnv1a64); each passes the corpus harness whole on WARP.
+    {0xDE545DC8EE4FBB87ull, "vs_DE545DC8EE4FBB87", {0xE46E3E4832B2FDB0ull, 0xCB429E043DBB2506ull, 0x03B17F89B31C4788ull, 0x60D69AB6C65C549Aull, 0xE364F5637AB0261Cull}, false, 0x91F8937EDA723663ull},
     {0xAACFDCF2FB9AD809ull, "vs_AACFDCF2FB9AD809", {0xCF534B32F491561Aull, 0, 0, 0}},
     // 2026-09-29, the Krait's main-menu F10 capture: 235567BE is the stock pixel
     // shader of the hull PLATING (5 draws, ~70k vertices). Unkeyed, its draws wrote

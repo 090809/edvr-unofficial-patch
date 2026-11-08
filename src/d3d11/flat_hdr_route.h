@@ -467,6 +467,18 @@ inline FlatFrameSeen flatHdrTriggerSeen(const FlatMonoFrame& selection, FlatMono
                                                                  selection.outputWidth, selection.outputHeight)
         ? FlatFrameSeen::Treatable : FlatFrameSeen::None;
 }
+// The one refusal the route does speak for (2026-11-08, Sean's Frontier flight: DLAA at 3840x2160, on foot beside the SRV): no supported
+// motion source, where the route itself resolves the frame (H at a render size the mode evaluates at, at least the output). The chain was
+// recognised (the selector reached the source stage past H, its camera and its depth) and the view decides, so it is Transient, as the copy
+// route's own refusal is: the work stays Full and the selector is asked every frame. Merged as nothing, the copy stage's structural
+// no-known-tone-pass stood the work down and the F8 warning blamed Elite's post-processing. Below the output nothing changes: the copy
+// route serves that frame and says for itself why it refused. Sizes are passed in, since a refusal carries none.
+inline FlatFrameSeen flatHdrTriggerRefusalSeen(const FlatMonoFrame& selection, FlatMonoResolveMode mode, uint32_t hdrWidth,
+                                               uint32_t hdrHeight, uint32_t outputWidth, uint32_t outputHeight) {
+    return selection.reason == FlatMonoReason::NoSupportedSource &&
+               flatHdrRouteEvaluatesAtRender(mode, hdrWidth, hdrHeight, outputWidth, outputHeight)
+        ? FlatFrameSeen::Transient : FlatFrameSeen::None;
+}
 
 // ---- the scene's and the output's sizes, for the panel ------------------------------------------------------
 // (The F8 warning once advised raising Elite's supersampling to 1.0 when the game rendered below the output. Below 1.0

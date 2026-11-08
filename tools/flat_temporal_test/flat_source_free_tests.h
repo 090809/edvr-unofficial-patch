@@ -111,6 +111,23 @@ inline int flatSourceFreeTests() {
                "a window with nothing to name prints its zeros and `none`, so it reads differently from a build that has no line");
     }
 
+    // -- 2026-11-08, flight 11:03: the HDR route speaks for its no-source refusal where it resolves the frame itself --
+    {
+        Stream view; view.sceneDraws(0, 4); view.stockFamilyDraw(); view.toneTrigger();
+        const FlatMonoFrame refused = view.select();
+        expect(refused.reason == FlatMonoReason::NoSupportedSource &&
+                   flatHdrTriggerRefusalSeen(refused, FlatMonoResolveMode::Dlaa, 3840, 2160, 3840, 2160) == FlatFrameSeen::Transient,
+               "DLAA with H at the output: the route's no-source refusal is Transient, above the copy stage's structural verdict");
+        expect(flatHdrTriggerRefusalSeen(refused, FlatMonoResolveMode::Dlss, 1664, 702, 2560, 1080) == FlatFrameSeen::None,
+               "below the output the copy route serves the frame and its own verdict stands, as before");
+        Stream sourced; sourced.sceneDraws(2, 2); sourced.toneTrigger();
+        expect(flatHdrTriggerRefusalSeen(sourced.select(), FlatMonoResolveMode::Dlaa, 3840, 2160, 3840, 2160) == FlatFrameSeen::None,
+               "a selected frame is flatHdrTriggerSeen's, not this one's");
+        FlatMonoFrame other = refused; other.reason = FlatMonoReason::ConflictingHdr;
+        expect(flatHdrTriggerRefusalSeen(other, FlatMonoResolveMode::Dlaa, 3840, 2160, 3840, 2160) == FlatFrameSeen::None,
+               "every other refusal still adds nothing");
+    }
+
     // -- the trace carries the flag, and an older trace has none --
     {
         Stream s;
@@ -372,12 +389,25 @@ inline int flatSourceFreeWiringTests() {
                ordered(text, {"flatSourceSpellLine(line,sizeof(line),w,s.sourcelessLast,s.sourcelessLastFrame,notes,part);",
                               "flatSourceVetoLine(line,sizeof(line),s.vetoWindow,s.sourcelessLast,s.sourcelessLastFrame,s.vetoLast,s.vetoLastKinds,"
                               "s.vetoLastOverflowDraws);Log::get().note(\"%s\",line);", "s.vetoWindow=FlatSourceVetoWindow{};"}) &&
-               ordered(text, {"s.vetoLastKinds=s.prefix.familyVetoKinds;", "s.frameVetoByFamily=selected.sourceless.vetoFamilyDraws!=0;",
-                              "noteSourceFreeContent(s,selected);"});
+               ordered(text, {"staticvoidnoteVetoNames(State&s,constFlatMonoFrame&sel){if(sel.reason!=FlatMonoReason::NoSupportedSource)return;",
+                              "s.vetoLastKinds=s.prefix.familyVetoKinds;", "s.frameVetoByFamily=sel.sourceless.vetoFamilyDraws!=0;"}) &&
+               count(text, "noteVetoNames(s,selected);noteSourceFreeContent(s,selected);") == 1 &&
+               count(text, "if(sel.reason==FlatMonoReason::NoSupportedSource){s.sourcelessLast=sel.sourceless;s.sourcelessLastFrame=s.prefix.frame;}"
+                           "noteVetoNames(s,sel);") == 1;
     };
-    expect(vetoRuntimeValid(runtime), "the runtime keeps the refusal's names, counts each frame by cause, clears the flag, and prints the line every window");
+    expect(vetoRuntimeValid(runtime), "both routes keep the refusal's names; the frame is counted by cause, the flag cleared, the line printed every window");
     expect(!vetoRuntimeValid(without(runtime, "s.vetoWindow=FlatSourceVetoWindow{};")), "mutation control: a window never taken fails the wiring");
     expect(!vetoRuntimeValid(without(runtime, "s.frameVetoByFamily=false;")), "mutation control: a verdict flag that outlives its frame fails the wiring");
+    expect(!vetoRuntimeValid(without(runtime, "noteVetoNames(s,sel);")), "mutation control: an HDR-route refusal left unnamed fails the wiring");
+    // -- flight 11:03: where the HDR route resolves the frame, its no-source refusal is the frame's verdict --
+    const auto refusalValid = [&](const std::string& text) {
+        return ordered(text, {"if(routeSeen==FlatFrameSeen::Treatable){s.frameSeen=FlatFrameSeen::Treatable;s.frameReason=sel.reason;}",
+                              "constFlatFrameSeenrefusalSeen=flatHdrTriggerRefusalSeen(sel,s.engine,s.hdr.trigger.hdrWidth,s.hdr.trigger.hdrHeight,"
+                              "s.prefix.width,s.prefix.height);if(refusalSeen>s.frameSeen){s.frameSeen=refusalSeen;s.frameReason=sel.reason;}"});
+    };
+    expect(refusalValid(runtime), "the HDR route merges its no-source refusal into the frame's verdict beside its selection");
+    expect(!refusalValid(without(runtime, "if(refusalSeen>s.frameSeen){s.frameSeen=refusalSeen;s.frameReason=sel.reason;}")),
+           "mutation control: a refusal computed and never merged fails the wiring");
 
     // -- the engine's views from nothing --
     const std::string views = compact(body(engineSource, "bool engineVelocityPrepareSourceFree("));
