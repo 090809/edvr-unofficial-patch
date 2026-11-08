@@ -378,7 +378,10 @@ struct State {
     const char* foregroundHRefusal=nullptr;
     const char* foregroundHRefusalWindow=nullptr;   // the most recent H refusal since the last 5 s line (survives the frame starts)
     uint32_t pendingNullMismatchLogged=0;           // "flat foreground pending-null mismatch" lines said this session (12 at most)
-    struct DomainProofEntry { FlatDomainShaderProof proof;uint64_t attemptedFrame=0; };
+    struct DomainProofEntry {
+        FlatDomainShaderProof proof;uint64_t attemptedFrame=0;
+        bool bytesHit=false;const uint8_t* vsData=nullptr;const uint8_t* psData=nullptr;size_t vsLen=0,psLen=0;
+    };
     std::map<std::pair<uint64_t,uint64_t>,DomainProofEntry> foregroundProofs;
     struct DomainCounts {
         uint64_t foreignSeen=0,captured=0,worldMarkers=0,nullMarkers=0,markerRefused=0;
@@ -1208,18 +1211,30 @@ static void reportForegroundDomain(State& s) {
             cf.budget.pending,cf.budget.current,cf.budget.prior,cf.budget.older,cf.budget.reclaimedRecords,cf.budget.reclaimedBytes,
             cf.budget.currentDraws,cf.budget.previousDraws);
 }
-static const FlatDomainShaderProof& domainShaderProof(State& s,uint64_t vs,uint64_t ps) {
+// entryOut (optional) receives the memo entry, or null when the memo is capped. The entry's bytesHit says the proof-time lookups found the
+// vs (and the ps, when there is one); its pointers are into flatProbeShaders, whose entries are never mutated or erased and whose map lives in
+// g_state, which is never freed, so they outlive the memo (cleared at resize-or-stop). A miss is never cached as a result: the caller looks up again.
+static const FlatDomainShaderProof& domainShaderProofEntry(State& s,uint64_t vs,uint64_t ps,const State::DomainProofEntry** entryOut) {
+    if(entryOut)*entryOut=nullptr;
     const auto key=std::make_pair(vs,ps);auto found=s.foregroundProofs.find(key);
-    if(found!=s.foregroundProofs.end() && (found->second.proof.present || found->second.attemptedFrame==s.prefix.frame))
+    if(found!=s.foregroundProofs.end() && (found->second.proof.present || found->second.attemptedFrame==s.prefix.frame)) {
+        if(entryOut)*entryOut=&found->second;
         return found->second.proof;
+    }
     if(found==s.foregroundProofs.end() && s.foregroundProofs.size()==1024) {
         static const auto capped=[](){FlatDomainShaderProof p;p.refusal="foreground-shader-proof-cap";return p;}();
         return capped;
     }
     const uint8_t *v=nullptr,*p=nullptr;size_t vn=0,pn=0;
-    flatProbeShaderLookup('v',vs,&v,&vn);if(ps)flatProbeShaderLookup('p',ps,&p,&pn);
+    const bool vHit=flatProbeShaderLookup('v',vs,&v,&vn);bool pHit=true;if(ps)pHit=flatProbeShaderLookup('p',ps,&p,&pn);
     auto& entry=s.foregroundProofs[key];entry.proof=flatDomainShaderProof(vs,ps,v,vn,p,pn);entry.attemptedFrame=s.prefix.frame;
+    entry.bytesHit=vHit&&pHit;
+    if(entry.bytesHit){entry.vsData=v;entry.vsLen=vn;entry.psData=p;entry.psLen=pn;}
+    if(entryOut)*entryOut=&entry;
     return entry.proof;
+}
+static const FlatDomainShaderProof& domainShaderProof(State& s,uint64_t vs,uint64_t ps) {
+    return domainShaderProofEntry(s,vs,ps,nullptr);
 }
 template<class Key>static void domainFail(State& s,const char* stage,const char* reason,const Key& k,
     const EdvrFlatForegroundStateReceipt* stateReceipt=nullptr,
@@ -8024,7 +8039,8 @@ void FlatRuntimeDrawScope::beginActualDraw(ID3D11Buffer* indirectArgs,UINT indir
         if(!candidate)return;
         FlatContractObservation failureKey{};failureKey.vs=domainVs;failureKey.ps=domainPs;
         failureKey.cameraHash=domainCameraHash;failureKey.format=domainFormat;failureKey.depth=domainDepth;
-        const auto& projection=domainShaderProof(s,domainVs,domainPs);
+        const State::DomainProofEntry* proofEntry=nullptr;
+        const auto& projection=domainShaderProofEntry(s,domainVs,domainPs,&proofEntry);
         Ptr<ID3D11BlendState> blend;FLOAT factors[4]{};UINT sampleMask=0;
         ctx->OMGetBlendState(&blend,factors,&sampleMask);D3D11_BLEND_DESC bd{};
         if(blend)blend->GetDesc(&bd);else for(auto& rt:bd.RenderTarget)rt.RenderTargetWriteMask=15;
@@ -8038,8 +8054,14 @@ void FlatRuntimeDrawScope::beginActualDraw(ID3D11Buffer* indirectArgs,UINT indir
             originalColors[i].Attach(colors[i]);
         }
         const uint8_t* vsBytes=nullptr;const uint8_t* psBytes=nullptr;size_t vsSize=0,psSize=0;
-        const bool bytes=flatProbeShaderLookup('v',domainVs,&vsBytes,&vsSize) &&
-            (!domainPs || flatProbeShaderLookup('p',domainPs,&psBytes,&psSize));
+        // The proof memo already holds both shaders' bytes when its lookups hit; only a miss goes back to the map.
+        bool bytes=false;
+        if(proofEntry && proofEntry->bytesHit) {
+            vsBytes=proofEntry->vsData;vsSize=proofEntry->vsLen;psBytes=proofEntry->psData;psSize=proofEntry->psLen;bytes=true;
+        } else {
+            bytes=flatProbeShaderLookup('v',domainVs,&vsBytes,&vsSize) &&
+                (!domainPs || flatProbeShaderLookup('p',domainPs,&psBytes,&psSize));
+        }
         Ptr<ID3D11DepthStencilState> depthState;UINT stencilRef=0;
         ctx->OMGetDepthStencilState(&depthState,&stencilRef);D3D11_DEPTH_STENCIL_DESC dd{};
         dd.DepthEnable=TRUE;dd.DepthWriteMask=D3D11_DEPTH_WRITE_MASK_ALL;
