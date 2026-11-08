@@ -78,6 +78,9 @@ inline bool flatProfileReadsKey(const char* key) {
         std::strcmp(key, "hotkey.concourse_camera_test") == 0 ||
         std::strcmp(key, "hotkey.concourse_light_test") == 0 ||
         std::strcmp(key, "hotkey.concourse_room_test") == 0 ||
+        // TEMPORARY (the VR proving build): flat reads them only to log that a press is not in VR.
+        std::strcmp(key, "hotkey.concourse_vr_hold_probe") == 0 ||
+        std::strcmp(key, "hotkey.concourse_vr_camera_probe") == 0 ||
         // The flat jitter cycle's length (flat_runtime.cpp, FlatLivePhase::phaseCount; temporal_math.h). Developer tier, no flat panel
         // row. Unlisted, getInt answers 0 here whatever the file says, which the reader takes for out of range and reads as 8.
         std::strcmp(key, "advanced.temporal_aa_jitter_phases") == 0 ||

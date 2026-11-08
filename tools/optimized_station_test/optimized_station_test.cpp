@@ -4418,6 +4418,14 @@ int main(int argc, char** argv) {
                     check(cc::bakePlanFor(T::kFleetCarrier).run && cc::bakePlanFor(T::kFleetCarrier).dirs == cc::kBakeDirsAll, "bake plan: and a fleet carrier, flown");
                     check(cc::bakePlanFor(T::kCraterPort).run && cc::bakePlanFor(T::kCraterPort).dirs == cc::kBakeDirsAll, "bake plan: and a large surface port, flown");
                     check(cc::bakePlanFor(T::kAsteroidBase).run && cc::bakePlanFor(T::kAsteroidBase).dirs == cc::kBakeDirsAll, "bake plan: and an asteroid base, flown");
+                    check(cc::bakePlanFor(T::kDodec).run && cc::bakePlanFor(T::kDodec).dirs == cc::kBakeDirsAll, "bake plan: and a dodec, flown");
+                    check(edvr::journal_station::kindOf("Dodec", 5) == T::kDodec && std::strcmp(edvr::journal_station::kindName(T::kDodec), "Dodec") == 0 &&
+                              edvr::journal_station::kindOf("Dodecahedron", 12) == T::kOther,
+                          "journal: \"Dodec\" is a dodec, and a longer name is not");
+                    check(cc::runsWithoutBake(T::kFleetCarrier) && !cc::runsWithoutBake(T::kOrbis) && !cc::runsWithoutBake(T::kCoriolis) && !cc::runsWithoutBake(T::kOcellus) &&
+                              !cc::runsWithoutBake(T::kCraterOutpost) && !cc::runsWithoutBake(T::kOutpost) && !cc::runsWithoutBake(T::kCraterPort) && !cc::runsWithoutBake(T::kAsteroidBase) &&
+                              !cc::runsWithoutBake(T::kUnknown) && !cc::runsWithoutBake(T::kOther),
+                          "runs without a bake: a fleet carrier only");
                     // H57: the frames at 5 m, so the sky, stars and sunlight are drawn; the room's cut at 50 m, as the near plane was.
                     check(cc::kBakeNearDefaultM == 5.0f && cc::kBakeRoomCutM == 50.0f && cc::kBakeNearMinM <= cc::kBakeNearDefaultM, "bake: frames at 5 m, the room cut at 50 m");
                     bool people = cc::bakePeopleVs(cc::kBakeHairPrepassVs);

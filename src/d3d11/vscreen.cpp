@@ -2628,6 +2628,10 @@ DrawVerdict beginPanelOverride(ID3D11DeviceContext* self, char kind, UINT count,
     if (uiLayerCrispOn() && self == g_state->ownerCtx) {
         uiLayerCrispNoteEyeDraw(self, kind, count, instances, args.startInstance);
     }
+    // TEMPORARY (the concourse cull's VR proving build, optimized_station.cpp): the camera probe's tone-draw lines. One atomic load while idle.
+    if (concourseVrProbeToneArmed() && self == g_state->ownerCtx) {
+        concourseVrProbeToneDraw(self, kind, count, instances, args.startInstance);
+    }
     // The pool probe (object_probe.h): one bool while off; a few t33 reads a
     // frame until the pool is known, then one a second. The bool is now read
     // HERE: objectProbeWantsDraws() is the callee's own first test, inline,

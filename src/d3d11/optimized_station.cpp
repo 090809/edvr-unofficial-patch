@@ -17,6 +17,8 @@
 #include <vector>
 
 #include "../common/config.h"
+#include "../common/frame_flag.h"      // TEMPORARY (the concourse VR probe): requestSubmitHold
+#include "../common/native_frame.h"    // nativeFrameHeldLatches
 #include "../common/hotkey.h"
 #include "../common/log.h"
 #include "../common/runtime_profile.h"
@@ -33,10 +35,18 @@
 #include "pad_state_probe.h"
 #include "store_hook.h"
 #include "view_source.h"
+#include "binding_shadow.h"        // TEMPORARY (the concourse VR probe): the tone draw's bound shaders and targets
+#include "depth_probe.h"
+#include "engine_velocity.h"
+#include "native_preview_camera.h"
+#include "temporal_pass.h"
+#include "tonemap_admit.h"
+#include "ui_depth.h"
 
 namespace edvr {
 namespace detail {
 std::atomic<bool> g_sunOff{false};   // the sun skip is on; optimized_station.h reads it inline
+std::atomic<bool> g_vrProbeToneArmed{false};   // TEMPORARY (the concourse VR probe): the camera probe's tone-draw lines are wanted; optimized_station.h reads it inline
 }  // namespace detail
 namespace {
 
@@ -3251,8 +3261,16 @@ bool g_camHotkeyBound = false;
 Hotkey* g_roomHotkey = nullptr;
 std::string g_roomHotkeyText;
 bool g_roomHotkeyBound = false;
+// TEMPORARY (the VR proving build, docs\concourse-cull-2026-11-05.md "VR, next"): two probe hotkeys, VR only, log only: hotkey.concourse_vr_hold_probe (the frame hold) and
+// hotkey.concourse_vr_camera_probe (the eye camera, and the tone draw's lines on its frames). Bound by concoursePoll like the room key; read by concourseVrProbeTick.
+struct VrProbeKey {
+    Hotkey* hk = nullptr;
+    std::string text;
+    bool bound = false;
+};
+VrProbeKey g_vrHoldKey, g_vrCameraKey;
 cc::DoorRuleMode g_doorMode = cc::DoorRuleMode::kRecords;
-bool g_doorsSetting = true;       // fix.skip_rooms_behind_doors, read in concoursePoll
+bool g_doorsSetting = true;      // fix.skip_rooms_behind_doors, read in concoursePoll
 bool g_doorsSettingSeen = false;
 cc::DoorWatch g_doorWatch[2];
 uint64_t g_roomSumMs = 0;
@@ -3340,7 +3358,11 @@ ConcoursePaneShares g_concShareLast;
 bool g_concAuto = false;
 journal_station::Kind g_concKind = journal_station::Kind::kUnknown;
 bool g_concKindSeen = false;
-bool concourseStationOk() noexcept { return !g_concAuto || g_concOverride != ConcOverride::kNone || cc::bakePlanFor(g_concKind).run; }
+// In VR, by auto, a type must also need no bake (VR has no bake yet: cc::runsWithoutBake, the carrier). Flat: unchanged.
+bool concourseStationOk() noexcept {
+    if (!g_concAuto || g_concOverride != ConcOverride::kNone) return true;
+    return cc::bakePlanFor(g_concKind).run && (runtimeFlatProfile() || cc::runsWithoutBake(g_concKind));
+}
 bool concourseEffective() noexcept {
     if (!concourseStationOk()) return false;
     return g_concOverride == ConcOverride::kNone ? g_concKeyOn : g_concOverride == ConcOverride::kOn;
@@ -3417,9 +3439,11 @@ void camTestPress() {
 }
 
 // diag.concourse_cull = auto, the default: on with fix.optimized_stations, in flat, once the camera hooks are in. The windows need the bake and the bake needs the hooks, so with no
-// hooks (another game build) there is no cull and the station stays the game's own. VR's camera route is not built, so VR stays off.
+// hooks (another game build) there is no cull and the station stays the game's own. In VR (no bake, so no camera hooks) it is on with the setting, and concourseStationOk
+// then lets only a type that needs no bake run (a carrier).
 bool concourseAutoOn() {
-    if (!g_setting.load(std::memory_order_acquire) || !runtimeFlatProfile()) return false;
+    if (!g_setting.load(std::memory_order_acquire)) return false;
+    if (!runtimeFlatProfile()) return true;
     if (!g_camHooked && !g_camAutoTried) {
         g_camAutoTried = true;
         camTestInstall("automatic");
@@ -3522,6 +3546,22 @@ void concoursePoll(uint64_t now) {
             if (!camKey.empty()) Log::get().note("concourse camera test: hotkey.concourse_camera_test = \"%s\" bound nothing", camKey.c_str());
             else if (!first) Log::get().note("concourse camera test: hotkey.concourse_camera_test cleared (the mode is off; an installed hook stays, shut)");
         }
+    }
+    {   // TEMPORARY (the VR proving build): the two probe keys.
+        const auto bindProbe = [](VrProbeKey& key, const char* name, const std::string& text, const char* what) {
+            if (key.bound && text == key.text) return;
+            const bool first = !key.bound;
+            if (!key.hk) key.hk = new Hotkey();
+            key.bound = true;
+            key.text = text;
+            key.hk->setBinding(text.c_str());
+            if (key.hk->bound()) Log::get().note("concourse vr probe: %s = \"%s\" bound (TEMPORARY, VR only, log only: %s)", name, text.c_str(), what);
+            else if (!text.empty()) Log::get().note("concourse vr probe: %s = \"%s\" bound nothing", name, text.c_str());
+            else if (!first) Log::get().note("concourse vr probe: %s cleared", name);
+        };
+        bindProbe(g_vrHoldKey, "hotkey.concourse_vr_hold_probe", cfg.getString("hotkey.concourse_vr_hold_probe", ""), "each press asks the runtime to hold 10 frames");
+        bindProbe(g_vrCameraKey, "hotkey.concourse_vr_camera_probe", cfg.getString("hotkey.concourse_vr_camera_probe", ""),
+                  "each press raises the rendered head 30 m for 5 frames and logs the tone draws");
     }
     const std::string roomKey = cfg.getString("hotkey.concourse_room_test", "");
     if (!g_roomHotkeyBound || roomKey != g_roomHotkeyText) {
@@ -4300,6 +4340,133 @@ void walkSurveyTick(uint64_t now, bool camIn) {
     }
 }
 
+// TEMPORARY (the VR proving build, docs\concourse-cull-2026-11-05.md "VR, next"): the two probes. VR only, log only. Every line starts "concourse vr probe:".
+// What the log shows if the code never ran: no "bound" line at the poll (the key is empty), no "requested" line at a press (the press was not seen: the tick did not run, or fix.optimized_stations
+// is off); a "requested" line with no later lines means the follow-ups never ran. A probe that ran says what it found in its last line.
+std::atomic<uint32_t> g_vrProbeFrame{0};          // the tick's frame, for the tone draw's lines
+std::atomic<uint32_t> g_vrProbeToneLines{0};
+constexpr uint32_t kVrProbeToneCap = 40;
+uint32_t g_vrHoldFrame = 0;                       // the frame of the hold press (0: none)
+uint64_t g_vrHoldBase = 0;                        // nativeFrameHeldLatches() at the press
+uint32_t g_vrHoldStep = 0;                        // follow-ups written
+constexpr uint32_t kVrHoldFrames = 10;
+constexpr uint32_t kVrCameraFrames = 5;
+constexpr float kVrCameraRaiseM = 30.0f;
+constexpr uint32_t kVrHoldFollow[] = {3, 12, 30};
+
+void concourseVrProbeTick(uint32_t frame) {
+    g_vrProbeFrame.store(frame, std::memory_order_relaxed);
+    nativeCameraProbeTick(frame);
+    if (detail::g_vrProbeToneArmed.load(std::memory_order_relaxed) && !nativeCameraProbeRunning()) {
+        detail::g_vrProbeToneArmed.store(false, std::memory_order_release);
+        Log::get().note("concourse vr probe: tone: %u line(s) written for the probe's frames (zero means no tonemap draw was admitted: the lines of the camera probe say whether the stub ran)",
+                        g_vrProbeToneLines.load(std::memory_order_relaxed));
+    }
+    if (g_vrHoldFrame && g_vrHoldStep < sizeof(kVrHoldFollow) / sizeof(kVrHoldFollow[0]) && frame - g_vrHoldFrame >= kVrHoldFollow[g_vrHoldStep]) {
+        const unsigned long long taken = static_cast<unsigned long long>(nativeFrameHeldLatches() - g_vrHoldBase);
+        Log::get().note("concourse vr probe: hold: frame %u (%u after the request): the runtime's latch took %llu held frame(s) of the %u requested%s", frame, frame - g_vrHoldFrame, taken,
+                        kVrHoldFrames, ++g_vrHoldStep == sizeof(kVrHoldFollow) / sizeof(kVrHoldFollow[0])
+                            ? (taken ? "; last report (the runtime's withheld, replayed and empty counts are in the trace at the session's close)" : "; last report: NONE taken, so the request never reached the runtime's latch")
+                            : "");
+    }
+    const bool holdPressed = g_vrHoldKey.hk && g_vrHoldKey.hk->pressed();
+    const bool cameraPressed = g_vrCameraKey.hk && g_vrCameraKey.hk->pressed();
+    if (holdPressed) {
+        if (runtimeFlatProfile()) {
+            Log::get().note("concourse vr probe: hold: not in VR (this is the flat profile); nothing done");
+        } else {
+            g_vrHoldFrame = frame;
+            g_vrHoldStep = 0;
+            g_vrHoldBase = nativeFrameHeldLatches();
+            requestSubmitHold(kVrHoldFrames);
+            Log::get().note("concourse vr probe: hold: requested %u frames at frame %u (the runtime's latch has taken %llu held frame(s) so far; follow-ups at +%u, +%u and +%u frames say how many it took now)",
+                            kVrHoldFrames, frame, static_cast<unsigned long long>(g_vrHoldBase), kVrHoldFollow[0], kVrHoldFollow[1], kVrHoldFollow[2]);
+        }
+    }
+    if (cameraPressed) {
+        if (runtimeFlatProfile()) {
+            Log::get().note("concourse vr probe: camera: not in VR (this is the flat profile); nothing done");
+        } else if (nativeCameraProbeRunning()) {
+            Log::get().note("concourse vr probe: camera: refused at frame %u: the last probe is still running", frame);
+        } else {
+            float centre[3] = {}, axes[3][3] = {};
+            const bool anchored = concourseAnchorFrame(centre, axes);
+            const float up[3] = {anchored ? axes[1][0] : 0.0f, anchored ? axes[1][1] : 1.0f, anchored ? axes[1][2] : 0.0f};
+            const float offset[3] = {up[0] * kVrCameraRaiseM, up[1] * kVrCameraRaiseM, up[2] * kVrCameraRaiseM};
+            const char* why = nullptr;
+            if (nativeCameraProbeArm(offset, kVrCameraFrames, frame, &why)) {
+                g_vrProbeToneLines.store(0, std::memory_order_relaxed);
+                detail::g_vrProbeToneArmed.store(true, std::memory_order_release);
+                Log::get().note("concourse vr probe: camera: requested at frame %u: the head pose raised %.0f m along %s up (%.3f %.3f %.3f) for the %u frames after it, then one more is watched; "
+                                "the press's own frame is the one before",
+                                frame, static_cast<double>(kVrCameraRaiseM), anchored ? "the concourse anchor's" : "world +Y (no anchor read)", static_cast<double>(up[0]),
+                                static_cast<double>(up[1]), static_cast<double>(up[2]), kVrCameraFrames);
+            } else {
+                Log::get().note("concourse vr probe: camera: refused at frame %u: %s", frame, why ? why : "no reason given");
+            }
+        }
+    }
+}
+
+// The camera each eye was drawn with, for the tone line: the temporal pass's per-eye rows (the eye's first recognised scene draw this frame; view->world [R | c], three float4
+// rows: the position is the fourth column, the view's z axis the third), else the engine-velocity watch's one source camera (no eye). Text into `out`.
+void vrProbeCameraText(int eye, char* out, size_t n) {
+    float r[12] = {};
+    const void* res = nullptr;
+    uint64_t vs = 0;
+    if (eye >= 0 && temporalPassEyeRows(eye, r, &res, &vs)) {
+        std::snprintf(out, n, "temporal eye rows: pos (%.3f %.3f %.3f) view z axis (%.4f %.4f %.4f) view x axis (%.4f %.4f %.4f)", static_cast<double>(r[3]), static_cast<double>(r[7]),
+                      static_cast<double>(r[11]), static_cast<double>(r[2]), static_cast<double>(r[6]), static_cast<double>(r[10]), static_cast<double>(r[0]), static_cast<double>(r[4]),
+                      static_cast<double>(r[8]));
+        return;
+    }
+    float rows[6][4] = {};
+    uint32_t rf = 0, now = 0;
+    if (engineVelocityLastSourceCameraRows(rows, &rf, &now)) {
+        std::snprintf(out, n, "no per-eye rows (the temporal pass is not wanted, or the eye has no scene draw yet); engine-velocity source camera (one, not per eye; frame %u, now %u): "
+                              "row 275 (%.3f %.3f %.3f), row 270 (%.4f %.4f %.4f)",
+                      rf, now, static_cast<double>(rows[5][0]), static_cast<double>(rows[5][1]), static_cast<double>(rows[5][2]), static_cast<double>(rows[0][0]),
+                      static_cast<double>(rows[0][1]), static_cast<double>(rows[0][2]));
+        return;
+    }
+    std::snprintf(out, n, "no camera reader answered (no temporal rows for this eye, no engine-velocity source camera)");
+}
+
+}  // namespace
+
+// The VR eye draw path hands over each draw while the camera probe runs: the game's tonemap, once per eye per frame of the probe (the frame before, the frames that write, the one after).
+void concourseVrProbeToneDraw(ID3D11DeviceContext* ctx, char kind, uint32_t count, uint32_t instances, uint32_t startInstance) {
+    if (!ctx || (kind != 'D' && kind != 'N') || count != 3 || instances != 1 || startInstance != 0) return;
+    const uint32_t frame = g_vrProbeFrame.load(std::memory_order_relaxed);
+    const uint32_t phase = nativeCameraProbePhase(frame);
+    if (!phase || g_vrProbeToneLines.load(std::memory_order_relaxed) >= kVrProbeToneCap) return;
+    ToneAdmit ta;
+    if (!tonemapAdmitStructure(ctx, bindingShaderHash(BindSlot::Ps), ta) || !tonemapAdmitFull(ta, bindingShaderHash(BindSlot::Vs))) return;
+    int eye = -1;
+    ResourceInfo ri;
+    if (ta.rtvRes && bindingResolveResourceProbe(ta.rtvRes, &ri) && ri.isTexture2D) eye = uiDepthEyeOfTargetReadOnly(ri.resource);
+    static uint32_t doneFrame[2] = {~0u, ~0u};   // one line per eye per frame (the render thread only)
+    if (eye >= 0 && eye < 2) {
+        if (doneFrame[eye] == frame) return;
+        doneFrame[eye] = frame;
+    }
+    ID3D11Texture2D* depth = nullptr;
+    D3D11_TEXTURE2D_DESC dd{};
+    const bool depthOk = eye >= 0 && depthProbeSceneDepth(ta.hdrW, ta.hdrH, eye, &depth) && depth;
+    if (depthOk) depth->GetDesc(&dd);
+    char depthText[96];
+    if (depthOk) std::snprintf(depthText, sizeof(depthText), "available (format %u, %ux%u)", static_cast<unsigned>(dd.Format), dd.Width, dd.Height);
+    else std::snprintf(depthText, sizeof(depthText), "NOT available (%s)", eye < 0 ? "the eye is unknown" : "the depth probe has no scene pair of H's size, or is not watching");
+    char cam[300];
+    vrProbeCameraText(eye, cam, sizeof(cam));
+    g_vrProbeToneLines.fetch_add(1, std::memory_order_relaxed);
+    Log::get().note("concourse vr probe: tone: frame %u [%s%s] eye %d: H (PS t1) format %u %ux%u; depth %s; %s",
+                    frame, phase == 1 ? "before" : phase == 2 ? "probe frame" : "after", phase == 2 ? (nativeCameraProbeWrote(frame) ? ", the stub wrote" : ", the stub did NOT write") : "", eye,
+                    static_cast<unsigned>(ta.hdrFmt), ta.hdrW, ta.hdrH, depthText, cam);
+}
+
+namespace {
+
 // TEMPORARY (the bake): where direction d looks, along the room's axes: 0 +a2, 1 -a2, 2 +a0, 3 -a0, 4 up.
 void bakeForward(const float axes[3][3], uint32_t d, float out[3]) noexcept {
     const float* a = axes[d < 2 ? 2 : d < 4 ? 0 : 1];
@@ -4311,6 +4478,7 @@ void bakeForward(const float axes[3][3], uint32_t d, float out[3]) noexcept {
 void concourseTick(uint64_t now, uint32_t frame) {
     g_concSettingOffLogged = false;
     concoursePoll(now);
+    concourseVrProbeTick(frame);   // TEMPORARY (the VR proving build): the two probe keys and the camera probe's windows
     // A load on foot aboard a carrier names no carrier in the journal; Status.json says it (journal_station::atCarrier, under the state lock as the sun's reading is).
     journal_station::Kind stationKind = journalStationKind();
     const bool carrierByStatus = stationKind == journal_station::Kind::kUnknown && journal_station::atCarrier(stationKind, g_statusFlagsNow, g_statusFlags2Now);
@@ -4318,10 +4486,14 @@ void concourseTick(uint64_t now, uint32_t frame) {
     if (!g_concKindSeen || stationKind != g_concKind) {
         g_concKindSeen = true;
         g_concKind = stationKind;
-        if (g_concAuto && g_concKeyOn && stationKind != journal_station::Kind::kUnknown)
+        if (g_concAuto && g_concKeyOn && stationKind != journal_station::Kind::kUnknown) {
+            const bool vrNoBake = !runtimeFlatProfile() && cc::bakePlanFor(stationKind).run && !cc::runsWithoutBake(stationKind);
             Log::get().note("concourse cull: a station of type %s%s: %s", journal_station::kindName(stationKind),
                             carrierByStatus ? " (Status.json: docked and on foot, neither in a station nor on a planet)" : "",
-                            cc::bakePlanFor(stationKind).run ? "the cull and its bake run" : "its layout has not been flown, so it stays the game's own");
+                            vrNoBake ? "VR has no bake yet, so it stays the game's own"
+                            : !cc::bakePlanFor(stationKind).run ? "its layout has not been flown, so it stays the game's own"
+                            : runtimeFlatProfile() ? "the cull and its bake run" : "the cull runs (a carrier needs no bake)");
+        }
     }
     // A carrier's jump with the commander aboard: the bake is of the system left. It goes, and the next waits for the arrival to pass. A bake running then is cancelled, and the
     // release is asked for each tick until the old one is gone: the pane drops a release that comes while a bake is armed or its hold is ending (concourse_pane.cpp, bakeTick).
@@ -4858,7 +5030,9 @@ void concourseTick(uint64_t now, uint32_t frame) {
     const bool active = cullActive || roomOnlyOn;
     ConcoursePaneFeed feed;   // the look wants the game's own picture: no pane treatment, nothing withheld; nor does the live room's slab
     feed.measure = gateWanted && !lookOn && !bakeHolds;
-    feed.treat = wantCull && !lookOn && !realSky;   // a real-sky room's glass is the game's own, never treated; it is still measured, so a window clears
+    // A real-sky room's glass is the game's own, never treated; it is still measured, so a window clears. In VR there is never a bake, and the steady treatment without one
+    // shows as a grey haze, so the glass is not treated there (the shares are still measured).
+    feed.treat = wantCull && !lookOn && !realSky && runtimeFlatProfile();
     feed.realSky = realSky;
     feed.withhold = cullActive && !lookOn;
     feed.effects = (cullActive || backdropLift) && !lookOn;

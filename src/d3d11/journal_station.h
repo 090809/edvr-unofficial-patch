@@ -22,7 +22,8 @@
 namespace edvr {
 namespace journal_station {
 
-enum class Kind : uint8_t { kUnknown = 0, kCoriolis, kOrbis, kOcellus, kOutpost, kCraterPort, kCraterOutpost, kSurfaceStation, kAsteroidBase, kFleetCarrier, kMegaShip, kOnFootSettlement, kOther };
+// kDodec (2026-11-08): "StationType":"Dodec" in Sean's journal (HIP 44728, "Megastructure"); read as kOther before. Saved by name (kindName), so its place in the list is free.
+enum class Kind : uint8_t { kUnknown = 0, kCoriolis, kOrbis, kOcellus, kOutpost, kCraterPort, kCraterOutpost, kSurfaceStation, kAsteroidBase, kFleetCarrier, kMegaShip, kOnFootSettlement, kDodec, kOther };
 
 inline const char* kindName(Kind k) noexcept {
     switch (k) {
@@ -37,6 +38,7 @@ inline const char* kindName(Kind k) noexcept {
         case Kind::kFleetCarrier: return "FleetCarrier";
         case Kind::kMegaShip: return "MegaShip";
         case Kind::kOnFootSettlement: return "OnFootSettlement";
+        case Kind::kDodec: return "Dodec";
         case Kind::kOther: return "another type";
         default: return "unknown";
     }

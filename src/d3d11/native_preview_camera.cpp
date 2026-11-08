@@ -1,6 +1,8 @@
 #include "native_preview_camera.h"
 #include "native_preview_camera_core.h"
 #include <windows.h>
+#include <atomic>
+#include <cstdio>
 #include <iterator>
 #include "../common/code_hook.h"
 #include "../common/game_build.h"
@@ -101,6 +103,65 @@ uint8_t* previewRelay(uintptr_t target,void* callback) noexcept {
     }
     return relay;
 }
+// TEMPORARY (the concourse cull's VR proving build, docs\concourse-cull-2026-11-05.md): a second, separate client of the eye stub. The ship preview above is untouched: with the
+// probe idle (the default) eyeApply reads one atomic and goes on as before. While the probe is armed, a window of frames each lets the FIRST call of 0x283FA20 in that
+// window raise the head pose's translation by g_probe.offset (visible on purpose); every other call is only counted and described. A "window" is the span between two
+// present-thread ticks (nativeCameraProbeTick), so a frame's calls are the ones the game's threads made since the last tick.
+// The first-call rule: the call that takes index 0 of the window's atomic counter AND whose pose pointer is not an address on the calling thread's stack. 0x2845730's second
+// call per frame hands a stack address (the RE pass of 2026-11-07); the ship preview's own guard is different (eyeCommit refuses a pose more than 0.5 m from the published
+// head), which the probe cannot use, having no published head. A first call that is itself at a stack address is logged and not written.
+struct ProbeRecord {
+    std::atomic<uint32_t> ready{0};
+    uintptr_t at=0;
+    bool stack=false,readable=false,wrote=false;
+    float before[12]{},after[12]{};
+};
+struct Probe {
+    std::atomic<bool> armed{false};      // the stub's one test while the probe is idle
+    std::atomic<bool> writing{false};    // this window may write its first call
+    std::atomic<uint32_t> calls{0};      // calls since the last tick (the index of the next call)
+    std::atomic<uint32_t> stackCalls{0};
+    ProbeRecord rec[2];                  // the first call, and the first other call, of the window
+    float offset[3]{};
+    uint32_t frames=0,left=0,wroteWindows=0,startFrame=0,lastWindowFrame=0;
+    std::atomic<uint32_t> wroteMask{0};  // bit i: the window at startFrame+i wrote
+    uint64_t totalCalls=0;
+} g_probe;
+void probeFloats(const float* v,char (&out)[160]) noexcept {
+    std::snprintf(out,sizeof(out),"x(%.3f %.3f %.3f) y(%.3f %.3f %.3f) z(%.3f %.3f %.3f) t(%.3f %.3f %.3f)",
+        double(v[0]),double(v[1]),double(v[2]),double(v[3]),double(v[4]),double(v[5]),
+        double(v[6]),double(v[7]),double(v[8]),double(v[9]),double(v[10]),double(v[11]));
+}
+// The pose's twelve floats (three per row, four rows; the lanes the game does not interpret are left out). False when the memory cannot be read.
+bool probeReadPose(uintptr_t at,float (&out)[12]) noexcept {
+    previewcam::Pose p;
+    if(!previewcam::get(g_previewMemory,at,p))return false;
+    for(unsigned r=0;r<4;++r)for(unsigned c=0;c<3;++c)out[r*3+c]=p.v[r*4+c];
+    return true;
+}
+// Called on the game's threads from eyeApply, after the null test. Wait-free: no log, no allocation. True when it wrote.
+__declspec(noinline) bool probeEye(uintptr_t pose) noexcept {
+    const uint32_t n=g_probe.calls.fetch_add(1,std::memory_order_acq_rel);
+    const auto* tib=reinterpret_cast<const NT_TIB*>(NtCurrentTeb());
+    const bool stack=pose>=reinterpret_cast<uintptr_t>(tib->StackLimit)&&pose<reinterpret_cast<uintptr_t>(tib->StackBase);
+    if(stack)g_probe.stackCalls.fetch_add(1,std::memory_order_relaxed);
+    ProbeRecord* r=n<2?&g_probe.rec[n]:nullptr;
+    if(r){r->at=pose;r->stack=stack;r->wrote=false;r->readable=probeReadPose(pose,r->before);for(float& f:r->after)f=0.0f;}
+    bool wrote=false;
+    if(n==0&&!stack&&r&&r->readable&&g_probe.writing.load(std::memory_order_acquire)) {
+        previewcam::Pose p;
+        if(previewcam::get(g_previewMemory,pose,p)&&previewcam::finite(p)) {
+            for(unsigned c=0;c<3;++c)p.v[12+c]+=g_probe.offset[c];
+            wrote=g_previewMemory.write(g_previewMemory.context,pose,&p,sizeof(p));
+        }
+    }
+    if(r){
+        r->wrote=wrote;
+        if(!probeReadPose(pose,r->after))for(float& f:r->after)f=0.0f;
+        r->ready.store(1,std::memory_order_release);
+    }
+    return wrote;
+}
 __declspec(noinline) bool eyeCommit(uintptr_t pose,const previewcam::EyeSnapshot& snapshot) noexcept {
     previewcam::Pose current;
     if(!previewcam::get(g_previewMemory,pose,current)||!previewcam::finite(current))return false;
@@ -113,6 +174,8 @@ void eyeApply(uintptr_t pose) noexcept {
     // The builder is entered with whatever rdx the caller left. Do not read
     // that pointer unless this evaluation published a head.
     if(!pose)return;
+    // TEMPORARY (the concourse VR probe): while it is armed it takes the call first; a pose it wrote is not the ship preview's to overwrite.
+    if(g_probe.armed.load(std::memory_order_acquire)&&probeEye(pose))return;
     previewcam::EyeSnapshot snapshot;
     if(!g_previewEngine.loadEye(snapshot))return;
     eyeCommit(pose,snapshot);
@@ -234,5 +297,81 @@ void nativePreviewCameraBoundary(bool wanted,bool active) {
     }
     g_previewLastActive=enabled;g_previewLastApplied=applied;
 }
-void nativePreviewCameraStop() noexcept {g_previewEngine.enable(false);}
+void nativePreviewCameraStop() noexcept {
+    g_previewEngine.enable(false);
+    g_probe.writing.store(false,std::memory_order_release);
+    g_probe.armed.store(false,std::memory_order_release);
+}
+
+bool nativeCameraProbeArm(const float offset[3],uint32_t frames,uint32_t frame,const char** why) {
+    const char* ignored=nullptr;
+    if(!why)why=&ignored;
+    *why=nullptr;
+    if(g_probe.armed.load(std::memory_order_acquire)){*why="a probe is already running";return false;}
+    if(!frames||frames>16){*why="a bad frame count";return false;}
+    // On demand, as nativePreviewCameraBoundary does when the preview is wanted. The five hooks stay passive forwarders until the engine is enabled; the stub only calls eyeApply.
+    if(!g_previewAttempted){g_previewAttempted=true;g_previewInstalled=previewInstall();}
+    if(!g_previewInstalled){*why="the eye stub is not installed (the \"native preview camera:\" line says why)";return false;}
+    g_probe.offset[0]=offset[0];g_probe.offset[1]=offset[1];g_probe.offset[2]=offset[2];
+    g_probe.frames=frames;g_probe.left=frames;g_probe.wroteWindows=0;g_probe.totalCalls=0;
+    g_probe.startFrame=frame;g_probe.lastWindowFrame=frame;
+    g_probe.wroteMask.store(0,std::memory_order_relaxed);
+    g_probe.calls.store(0,std::memory_order_relaxed);
+    g_probe.stackCalls.store(0,std::memory_order_relaxed);
+    for(auto& r:g_probe.rec)r.ready.store(0,std::memory_order_relaxed);
+    g_probe.writing.store(false,std::memory_order_release);   // the press's own window, the frame before, is not written
+    g_probe.armed.store(true,std::memory_order_release);
+    return true;
+}
+bool nativeCameraProbeRunning() noexcept {return g_probe.armed.load(std::memory_order_acquire);}
+uint32_t nativeCameraProbePhase(uint32_t frame) noexcept {
+    if(!g_probe.armed.load(std::memory_order_acquire)||frame<g_probe.startFrame)return 0;
+    const uint32_t i=frame-g_probe.startFrame;
+    if(i==0)return 1;
+    if(i<=g_probe.frames)return 2;
+    return i==g_probe.frames+1?3:0;
+}
+bool nativeCameraProbeWrote(uint32_t frame) noexcept {
+    if(frame<g_probe.startFrame)return false;
+    const uint32_t i=frame-g_probe.startFrame;
+    return i>=1&&i<=g_probe.frames&&(g_probe.wroteMask.load(std::memory_order_acquire)>>i&1u)!=0;
+}
+// Present thread, once a frame: logs the window that has just ended, then opens the next.
+void nativeCameraProbeTick(uint32_t frame) {
+    if(!g_probe.armed.load(std::memory_order_acquire))return;
+    g_probe.writing.store(false,std::memory_order_release);
+    const uint32_t wf=g_probe.lastWindowFrame,idx=wf-g_probe.startFrame;
+    const char* phase=idx==0?"before: the press's own frame, nothing written":idx<=g_probe.frames?"probe: the first call is written":"after: nothing written";
+    bool wroteAny=false;
+    char b[160],a[160];
+    for(unsigned k=0;k<2;++k){
+        ProbeRecord& r=g_probe.rec[k];
+        if(!r.ready.load(std::memory_order_acquire))continue;
+        wroteAny=wroteAny||r.wrote;
+        if(!r.readable){
+            Log::get().note("concourse vr probe: camera frame %u: %s call at 0x%llX: pose unreadable",wf,k?"first other":"first",(unsigned long long)r.at);
+        } else {
+            probeFloats(r.before,b);probeFloats(r.after,a);
+            Log::get().note("concourse vr probe: camera frame %u: %s call at 0x%llX%s, wrote %s; pose before %s; after %s",
+                wf,k?"first other":"first",(unsigned long long)r.at,r.stack?" (a stack address)":"",r.wrote?"yes":"no",b,a);
+        }
+        r.ready.store(0,std::memory_order_release);
+    }
+    const uint32_t calls=g_probe.calls.exchange(0,std::memory_order_acq_rel);
+    const uint32_t stackCalls=g_probe.stackCalls.exchange(0,std::memory_order_relaxed);
+    if(wroteAny){g_probe.wroteMask.fetch_or(1u<<idx,std::memory_order_acq_rel);++g_probe.wroteWindows;}
+    g_probe.totalCalls+=calls;
+    Log::get().note("concourse vr probe: camera frame %u [%s]: stub calls %u (first %u, other %u, %u of them at a stack address); wrote %s",
+        wf,phase,calls,calls?1u:0u,calls?calls-1u:0u,stackCalls,wroteAny?"yes":"no");
+    if(idx>g_probe.frames){
+        Log::get().note("concourse vr probe: camera done: %u of %u frames wrote a pose; the stub ran %llu calls in %u frames (zero calls means the stub never ran, not that nothing moved)",
+            g_probe.wroteWindows,g_probe.frames,(unsigned long long)g_probe.totalCalls,g_probe.frames+2);
+        g_probe.armed.store(false,std::memory_order_release);
+        return;
+    }
+    g_probe.lastWindowFrame=frame;
+    const bool w=g_probe.left>0;
+    if(w)--g_probe.left;
+    g_probe.writing.store(w,std::memory_order_release);
+}
 } // namespace edvr

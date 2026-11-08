@@ -40,9 +40,9 @@ inline constexpr FlatPageRow kFlatPageRows[] = {
     // menu builds none of, so the row is on this tab and not on VR's Performance page; the generator fails the build for a `flat_performance` row not listed here.
     {"fix", "hud_antialiasing",  FlatRowRead::Allowlist},
     {"fix", "optimized_stations", FlatRowRead::Allowlist},
-    // Directly under Optimized stations, and dimmed while that is off (menu.cpp): flat only for now, since the concourse cull and its bake are.
+    // Directly under Optimized stations, and dimmed while that is off (menu.cpp): `menu performance`, so VR's Performance page shows it too (VR culls a carrier only for now).
     {"fix", "station_window_distance", FlatRowRead::Allowlist},
-    // Under it, and dimmed while Optimized stations is off (menu.cpp): the rooms behind a carrier's shut doors, flat only as the concourse cull is.
+    // Under it, and dimmed while Optimized stations is off (menu.cpp): the rooms behind a carrier's shut doors; also `menu performance`, on VR's page.
     {"fix", "skip_rooms_behind_doors", FlatRowRead::Allowlist},
 };
 inline constexpr size_t kFlatPageRowCount = sizeof(kFlatPageRows) / sizeof(kFlatPageRows[0]);
