@@ -2438,10 +2438,13 @@ void hullLayerArmDump(const wchar_t* stamp) {
 void hullLayerCompositeEye(ID3D11DeviceContext* ctx, int eye, const HullLayerCompositeInputs& in) {
     if (!detail::g_hullLayerSeparate || !ctx || eye < 0 || eye > 1 || !g_device || !in.output || !in.outputSrv || !in.source || !in.tanNow) return;
     VrWorldInternalScope internal;   // the layer's own dispatch and copy
-    // The hull eye: the one whose tonemap wrote the submitted texture this frame; else the eye of the same index, toned this frame.
+    // The hull eye: the one whose tonemap wrote the submitted texture this frame (the same index first, should both eyes share one
+    // texture); else the eye of the same index, toned this frame.
     int hi = -1;
-    for (int i = 0; i < 2; ++i)
+    for (int k = 0; k < 2 && hi < 0; ++k) {
+        const int i = k == 0 ? eye : 1 - eye;
         if (g_eyes[i].toneFrame == g_frame && g_eyes[i].toneOut == in.source) hi = i;
+    }
     const bool byIndex = hi < 0 && g_eyes[eye].toneFrame == g_frame;
     if (byIndex) hi = eye;
     if (hi < 0) {
