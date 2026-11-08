@@ -1296,6 +1296,12 @@ std::atomic<bool> g_frameGenAutoHeld{false};  // Phase 2.4: auto with a runtime 
 std::atomic<uint32_t> g_frameGenCameraJumps{0};   // Phase 2.4: the gate's camera cut (temporalPassFrameGenCameraJumps)
 // The synthesizer runs for Lock: auto or on, unless auto is held for an older runtime.
 inline bool frameGenLockSynth() { return g_frameGenLockKey.load(std::memory_order_relaxed) && !g_frameGenAutoHeld.load(std::memory_order_relaxed); }
+// Phase 2.4: S is built on every frame under the shadow key, under on, and in auto while the gate admits Lock. Auto with the gate closed shows S nowhere: one sample per eye a
+// second keeps the cost the gate reads measured (frameGenSynthSampleDue), and the other eye-frames dispatch nothing (frameGenSynthIdle).
+inline bool frameGenSynthEveryFrame() {
+    return frameGenShadowOn() || g_frameGenMode.load(std::memory_order_relaxed) != static_cast<uint8_t>(FrameGenMode::Auto) ||
+           g_frameGenAdmit.load(std::memory_order_relaxed);
+}
 ID3D11Texture2D* g_eyeSynthStaging[kEyeRun] = {};   // the frame-generation synthesizer's f = 0.5 S of frame k (fix.frame_generation_shadow on; S<k> beside the P<k> pre-interface output and the next frame's P<k+1>)
 ID3D11Texture2D* g_eyeSynthBStaging[kEyeRun] = {};  // Phase 2.3b: B of frame k as its door finished it, in S<k>'s crop (SB<k>), staged with the finished S
 int              g_eyeRunLeft = 0;    // captures still to take
@@ -5233,7 +5239,11 @@ void* temporalInner(void* srcTex, int eye, const float* bounds,
                         }
                         // Phase 2.1, the synthesizer: S one display period after this frame, built beside the scorer and shown nowhere. Its own census section, "frame generation synth".
                         // The eye dump (a run of the left eye, beginEyeRun) asks for the f = 0.5 S on every frame of the run and stages it in the crop the pre-interface output has.
-                        {
+                        // Phase 2.4: auto with the gate closed builds once per eye a second (frameGenSynthEveryFrame), and the eye dump's run builds on every frame as before.
+                        if (eye == 0 && (gateJump || jumpedNow)) g_frameGenCameraJumps.fetch_add(1, std::memory_order_relaxed);   // 2.4: the gate's camera cut, built or not
+                        if (!frameGenSynthEveryFrame() && g_eyeRunLeft <= 0 && !frameGenSynthSampleDue(static_cast<uint32_t>(eye))) {
+                            frameGenSynthIdle(ctx, static_cast<uint32_t>(eye));
+                        } else {
                             const bool dumpFrame = eye == 0 && g_eyeRunLeft > 0 && g_eyeRunTaken < kEyeRun && g_eyeRawTaken[g_eyeRunTaken] && !g_eyeRunUntreated;
                             FrameGenSynthFrame sy;
                             sy.renderW = w; sy.renderH = h; sy.outW = oW; sy.outH = oH;
@@ -5263,7 +5273,6 @@ void* temporalInner(void* srcTex, int eye, const float* bounds,
                             for (int i = 0; i < 3; ++i) sy.deltas.th[i] = p.tvUsed[i];
                             sy.depthWritten = zcWritten;
                             sy.cameraJump = gateJump || jumpedNow;
-                            if (eye == 0 && sy.cameraJump) g_frameGenCameraJumps.fetch_add(1, std::memory_order_relaxed);   // 2.4: the gate's camera cut
                             sy.wantShown = dumpFrame;
                             // Replay capture (.agents/framegen-replay-format.md): the dump's first six left-eye frames, with what the constant block and the bench need beside the Hd and th above.
                             memcpy(sy.deltas.W, fg.deltas.W, sizeof(sy.deltas.W));
@@ -5856,7 +5865,8 @@ void temporalPassConfigure(Config& cfg) {
                 lockTold = true;
                 Log::get().note("frame generation: fix.frame_generation=%s (%s).", frameGenModeName(fgMode),
                                 fgMode == FrameGenMode::On ? "Lock 2:1 forced: the synthesizer builds S on every frame and the runtime shows it between Elite's frames once Lock engages"
-                                : fgMode == FrameGenMode::Auto ? "Lock 2:1 only while the performance gate admits it: the synthesizer builds S on every frame, and the "
+                                : fgMode == FrameGenMode::Auto ? "Lock 2:1 only while the performance gate admits it: the synthesizer builds S on every frame while the gate admits Lock and "
+                                                               "once per eye a second while it does not (to keep its cost measured), and the "
                                                                "\"frame generation gate:\" line says each second whether Lock is allowed and why not"
                                                              : "no Lock: the frame loop is today's");
             }
@@ -6460,8 +6470,7 @@ void temporalPassFrameGenGate(bool admit, bool hold) {
     g_frameGenAutoHeld.store(hold, std::memory_order_relaxed);
     nativeFrameSetFrameGenLockWord(frameGenLockWord(FrameGenMode::Auto, admit && !hold));
 }
-uint32_t temporalPassFrameGenCameraJumps() { return g_frameGenCameraJumps.load(std::memory_order_relaxed); }
-void temporalPassStageFrameGenDump(ID3D11DeviceContext* ctx, int k, ID3D11Texture2D* finishedS, ID3D11Texture2D* finishedB) {
+uint32_t temporalPassFrameGenCameraJumps() { return g_frameGenCameraJumps.load(std::memory_order_relaxed); }void temporalPassStageFrameGenDump(ID3D11DeviceContext* ctx, int k, ID3D11Texture2D* finishedS, ID3D11Texture2D* finishedB) {
     if (!ctx || k < 0 || k >= kEyeRun) return;
     uint32_t wantW = 0, wantH = 0, cw = 0, ch = 0;
     if (finishedS) {

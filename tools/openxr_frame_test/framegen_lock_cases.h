@@ -119,9 +119,13 @@ void gateTable() {
   check(frameGenLockBlocker(two) == FrameGenLockReason::NoProjection, "lock gate: two failing: the first in order is said");
   FrameGenLockConditions closed = allHold();
   closed.admitted = false; closed.sDelivering = false;
-  check(frameGenLockBlocker(closed) == FrameGenLockReason::NoS && std::strcmp(frameGenLockReasonName(FrameGenLockReason::Gate), "auto_gate") == 0 &&
+  check(frameGenLockBlocker(closed) == FrameGenLockReason::Gate && std::strcmp(frameGenLockReasonName(FrameGenLockReason::Gate), "auto_gate") == 0 &&
             static_cast<int>(FrameGenLockReason::Gate) + 1 == static_cast<int>(FrameGenLockReason::Count),
-        "lock gate: 2.4's auto_gate is tested last (Lock's own blocker is said first) and is last in the table (an older d3d11.dll reads the others as before)");
+        "lock gate: 2.4's auto_gate is last in the table (an older d3d11.dll reads the others as before); with it closed, S's delivery is not a blocker (S is sampled 1/s)");
+  closed.notDeferred = false;
+  check(frameGenLockBlocker(closed) == FrameGenLockReason::DeferredPacing, "lock gate: the gate closed and S not delivering: a later blocker of Lock's own is still said first");
+  closed = allHold(); closed.sFinished = false; closed.admitted = false;
+  check(frameGenLockBlocker(closed) == FrameGenLockReason::Unfinished, "lock gate: the gate closed: a blocker before S's delivery is said first, as before");
   // The runtime's period (flight 11, 18:12-18:15: disengaged, SteamVR flipped its period between 11.1 and 22.2 ms and the old blocker restarted the dwell every second).
   {
     FrameGenLockConditions halved = allHold();

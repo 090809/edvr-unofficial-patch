@@ -82,7 +82,9 @@ inline FrameGenLockReason frameGenLockBlocker(const FrameGenLockConditions& c) {
     if (!c.replay) return FrameGenLockReason::NoReplay;
     if (!c.noMenu) return FrameGenLockReason::Menu;
     if (!c.sFinished) return FrameGenLockReason::Unfinished;
-    if (!c.sDelivering) return FrameGenLockReason::NoS;
+    // 2.4: auto with the gate closed builds S once per eye a second only (temporal_pass.cpp frameGenSynthEveryFrame), so S's delivery is a blocker only once the gate admits
+    // Lock; until then the reason is auto_gate, or a later blocker of Lock's own.
+    if (!c.sDelivering && c.admitted) return FrameGenLockReason::NoS;
     if (!c.notDeferred) return FrameGenLockReason::DeferredPacing;
     if (!c.finishDone) return FrameGenLockReason::FinishPending;
     if (!c.admitted) return FrameGenLockReason::Gate;

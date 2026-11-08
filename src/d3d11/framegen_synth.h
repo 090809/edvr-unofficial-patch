@@ -68,6 +68,13 @@ struct FrameGenSynthFrame {
 // Once per treated eye-frame (usedDlaa, key on). `frame` is the pass's frame counter: the f = 1 S is scored only against the frame right after it.
 void frameGenSynthEyeFrame(ID3D11Device* dev, ID3D11DeviceContext* ctx, uint32_t eye, uint32_t frame, const FrameGenSynthFrame& f);
 
+// Phase 2.4, auto with the performance gate closed: S is shown nowhere, so the caller builds it only to keep the cost measured that the gate reads (frameGenSynthMonitor):
+// once per eye per one-second window. SampleDue: the eye has not been called in the open window (the first call after each report is the sample, so its timers and stats
+// come back inside the same window). Idle, on every other eye-frame: nothing is dispatched and nothing is created or released; it only collects what earlier builds left
+// (readbacks, GPU timers, a finish whose door never came). No answer is stored, so the runtime's take reads no S for that slot (S_FALSE), as with the key off.
+bool frameGenSynthSampleDue(uint32_t eye);
+void frameGenSynthIdle(ID3D11DeviceContext* ctx, uint32_t eye);
+
 // The output-size S texture (the upscaler's format) the call for `frame` just built at f = 0.5 in the module's private texture, else null (also null when S went to the runtime
 // through the producer texture: shownSink sees it there): valid until the next call for the eye.
 ID3D11Texture2D* frameGenSynthShown(uint32_t eye, uint32_t frame);

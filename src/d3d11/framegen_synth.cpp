@@ -121,6 +121,7 @@ struct State {
     uint64_t nextSerial = 1;
     bool slotSeen = false, slotAbsenceSaid = false, sharedRefused = false, remakeSaid = false;
     uint32_t pathSaid = 0;
+    bool sampled[2] = {};   // Phase 2.4: the eye was called (built) in the open window (frameGenSynthSampleDue)
 };
 std::mutex g_answerMu;   // the answers: written by the render thread inside a treat, taken by the runtime's owner after it
 // Never destroyed: the process teardown can run under the loader lock, where releasing D3D objects is not safe (see temporalPassShutdown).
@@ -179,6 +180,7 @@ void windowReset() {
     g.win = FrameGenSynthWindow{};
     for (auto& v : g.gpuMs) v.clear();
     g.rotRes.clear();
+    g.sampled[0] = g.sampled[1] = false;
 }
 
 // The residual rotation's median and maximum over the scored frames of the window.
@@ -756,9 +758,23 @@ ID3D11Texture2D* frameGenSynthShown(uint32_t eye, uint32_t frame) {
     return (r.created && r.shownValid && r.shownFrame == frame) ? r.s.tex : nullptr;   // shownValid: built in the private texture (frameGenSynthEyeFrame)
 }
 
+bool frameGenSynthSampleDue(uint32_t eye) { return g_on.load() && eye <= 1 && !g.sampled[eye]; }
+
+void frameGenSynthIdle(ID3D11DeviceContext* ctx, uint32_t eye) {
+    if (!g_on.load() || !ctx || eye > 1 || !g.dev || g.failed) return;
+    EyeRes& r = g.eye[eye];
+    if (!r.created) return;
+    r.shownValid = false;
+    r.havePending = false;        // no f = 1 S is kept across a frame that built nothing
+    abandonFinish(ctx, r, eye);   // a sample's S whose door never came
+    pollReadbacks(ctx, r, r.writes);
+    pollTimers(ctx);
+}
+
 void frameGenSynthEyeFrame(ID3D11Device* dev, ID3D11DeviceContext* ctx, uint32_t eye, uint32_t frame, const FrameGenSynthFrame& f) {
     if (!g_on.load()) return;
     if (!dev || !ctx || eye > 1 || !f.tanNow) return;
+    g.sampled[eye] = true;
     if (g.dev && g.dev != dev) releaseAll();   // a new device: everything starts over
     if (g.failed) return;
     if (!g.dev) {
