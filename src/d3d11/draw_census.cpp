@@ -935,6 +935,30 @@ static void recordDraw(ID3D11DeviceContext* ctx, char kind, uint32_t count,
         }
     }
 
+    // Render targets 1-3 (2026-11-08, docs/research-own-hull-layer-2026-11-08.md). r= has only ever been slot 0, so the
+    // G-buffer's other three targets and the lighting pass's second target were invisible; the hull layer's re-issue needs
+    // them to join each lighting draw's t1-3 to the G-buffer it reads, through the id table's res=. Omitted when all three
+    // are empty, as vt= is.
+    char mt[96] = "";
+    if (st.ok) {
+        ID3D11RenderTargetView* rtv[4] = {};
+        bool got = false;
+        guardedBudget(g_iaBudget, [&] {
+            ctx->OMGetRenderTargets(4, rtv, nullptr);
+            got = true;
+        });
+        if (got && (rtv[1] || rtv[2] || rtv[3])) {
+            char mb[3][24];
+            _snprintf_s(mt, sizeof(mt), _TRUNCATE, " mt=%s,%s,%s",
+                        bindingToken(rtv[1], Kind::kView, mb[0], sizeof(mb[0])),
+                        bindingToken(rtv[2], Kind::kView, mb[1], sizeof(mb[1])),
+                        bindingToken(rtv[3], Kind::kView, mb[2], sizeof(mb[2])));
+        }
+        for (ID3D11RenderTargetView* v : rtv) {
+            if (v) v->Release();
+        }
+    }
+
     // WHERE THE DRAW LANDS, which this has never recorded (2026-08-30).
     //
     // The black-planet hunt reached a draw that is ISSUED for both eyes,
@@ -1132,9 +1156,9 @@ static void recordDraw(ID3D11DeviceContext* ctx, char kind, uint32_t count,
     }
 
     Log::get().note(
-        "%s %u #%u %c n=%u i=%u r=%s d=%s c=%s s=%s,%s,%s,%s%s%s%s%s%s%s q=%u",
+        "%s %u #%u %c n=%u i=%u r=%s d=%s c=%s s=%s,%s,%s,%s%s%s%s%s%s%s%s q=%u",
         tag, g_frameOrdinal, index, kind, count, instances, r, d, c, s0, s1,
-        s2, s3, tail, xt, pt, vsr, vt, sv, q);
+        s2, s3, tail, xt, pt, vsr, mt, vt, sv, q);
 
     // The CB watch, after the draw's own line so a DCW dump always follows
     // the draw it belongs to. Any recorded draw can match -- DC for the FSS
