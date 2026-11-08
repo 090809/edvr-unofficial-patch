@@ -18,7 +18,8 @@
 namespace edvr::installer {
 namespace {
 
-constexpr const char* kPlanVersion = "1";
+// 2: the file names no paths; the copy derives them (planPathsFor).
+constexpr const char* kPlanVersion = "2";
 
 bool setError(std::string* error, const std::string& text) {
     if (error) *error = text;
@@ -78,28 +79,51 @@ const char* statusName(ApplyOutcome::Status s) {
     }
 }
 
-// The plan's work, as outcome. Everything the elevated copy does after reading the file.
-ApplyOutcome runPlan(const PlanFile& file, const char* const* keys) {
+bool isDigits(const std::wstring& text) {
+    if (text.empty()) return false;
+    for (wchar_t c : text) {
+        if (c < L'0' || c > L'9') return false;
+    }
+    return true;
+}
+
+// "plan-<digits>-<digits>.txt": the stamp between "plan-" and ".txt", or false.
+bool planStampOf(const std::wstring& leaf, std::wstring* stamp) {
+    const std::wstring head = L"plan-", tail = L".txt";
+    if (leaf.size() <= head.size() + tail.size() || leaf.compare(0, head.size(), head) != 0 ||
+        leaf.compare(leaf.size() - tail.size(), tail.size(), tail) != 0)
+        return false;
+    const std::wstring middle = leaf.substr(head.size(), leaf.size() - head.size() - tail.size());
+    const size_t dash = middle.find(L'-');
+    if (dash == std::wstring::npos || !isDigits(middle.substr(0, dash)) || !isDigits(middle.substr(dash + 1))) return false;
+    *stamp = middle;
+    return true;
+}
+
+// True for a path that is missing or is a reparse point (a junction or a symbolic link).
+bool missingOrLink(const std::wstring& path) {
+    const DWORD attributes = GetFileAttributesW(path.c_str());
+    return attributes == INVALID_FILE_ATTRIBUTES || (attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+}
+
+// The plan's work, as outcome. Everything the elevated copy does after reading the file. Every
+// path comes from `paths`, which planPathsFor worked out from where the file is.
+ApplyOutcome runPlan(const PlanFile& file, const PlanPaths& paths, const char* const* keys) {
     if (file.action != "install" && file.action != "repair" && file.action != "uninstall")
         return failed("the plan names an action this launcher does not know");
     if (file.dir.empty()) return failed("the plan names no game folder");
 
-    // The payload: re-verified here, not trusted from the file.
+    // The payload: the signed manifest the plan names by its hash, re-verified here with every file it lists.
     std::string error;
-    if (!file.payloadDir.empty()) {
-        std::vector<PayloadFile> files;
-        std::string version;
-        if (!listPayloadFolder(file.payloadDir, &files, &version, &error) || !usePayloadFiles(files, version, &error))
-            return failed("the payload folder cannot be used: " + error);
-    } else if (!file.manifestPath.empty()) {
+    if (!file.manifestSha.empty()) {
         OfflineClient offline;
         UpdaterSettings settings;
-        settings.cacheDir = file.cacheDir;
+        settings.cacheDir = paths.cacheDir;
         settings.keys = keys;
         Updater updater(offline, settings);
         Manifest manifest;
         std::vector<PayloadFile> files;
-        if (!updater.loadManifestFile(file.manifestPath, &manifest, &files, &error) ||
+        if (!updater.loadManifestFile(joinPath(paths.manifestsDir, widenUtf8(file.manifestSha)) + L".json", &manifest, &files, &error) ||
             !usePayloadFiles(files, manifest.build, &error))
             return failed("the downloaded files cannot be used: " + error);
     } else if (file.action != "uninstall") {
@@ -109,6 +133,7 @@ ApplyOutcome runPlan(const PlanFile& file, const char* const* keys) {
     GameInstall game;
     if (!describeDir(file.dir, file.source.empty() ? L"Folder you chose" : file.source, &game))
         return failed("there is no EliteDangerous64.exe in the game folder the plan names");
+    const std::wstring mirrorDir = mirrorDirFor(game, paths.dataRoot);
 
     Survey survey = surveyTarget(game);
     const bool uninstall = file.action == "uninstall";
@@ -117,7 +142,7 @@ ApplyOutcome runPlan(const PlanFile& file, const char* const* keys) {
     // The restore the user agreed to in the window; it writes into the game folder, so it
     // is done here, with the rights the rest of the work has.
     if (file.restoreMirror && file.keepSettings && !uninstall) {
-        const MirrorInfo mirror = readMirror(file.mirrorDir);
+        const MirrorInfo mirror = readMirror(mirrorDir);
         const std::string scope = file.scope.empty() ? defaultScope(survey) : file.scope;
         if (!settingsToRestore(survey.game.dir, mirror, scope).empty()) {
             std::vector<std::string> notes;
@@ -145,7 +170,7 @@ ApplyOutcome runPlan(const PlanFile& file, const char* const* keys) {
         return blocked;
     }
     if (plan.nothingToDo) {
-        if (!uninstall) updateMirror(survey.game.dir, plan.backupDir, file.mirrorDir);
+        if (!uninstall) updateMirror(survey.game.dir, plan.backupDir, mirrorDir);
         outcome.status = ApplyOutcome::Status::NothingToDo;
         outcome.lines.push_back(planSummary(plan));
         return outcome;
@@ -160,11 +185,11 @@ ApplyOutcome runPlan(const PlanFile& file, const char* const* keys) {
         return outcome;
     }
     if (!uninstall) {
-        const MirrorResult m = updateMirror(survey.game.dir, plan.backupDir, file.mirrorDir);
+        const MirrorResult m = updateMirror(survey.game.dir, plan.backupDir, mirrorDir);
         if (m.ok) {
             std::string saved;
             for (size_t i = 0; i < m.saved.size(); ++i) saved += (i ? ", " : "") + m.saved[i];
-            outcome.lines.push_back("Mirrored " + saved + " to " + narrowUtf8(file.mirrorDir) + ".");
+            outcome.lines.push_back("Mirrored " + saved + " to " + narrowUtf8(mirrorDir) + ".");
         }
     }
     outcome.status = ApplyOutcome::Status::Done;
@@ -174,10 +199,8 @@ ApplyOutcome runPlan(const PlanFile& file, const char* const* keys) {
 }  // namespace
 
 bool writePlanFile(const std::wstring& path, const PlanFile& p, std::string* error) {
-    const std::string dir = narrowUtf8(p.dir), source = narrowUtf8(p.source), payloadDir = narrowUtf8(p.payloadDir),
-                      manifest = narrowUtf8(p.manifestPath), cache = narrowUtf8(p.cacheDir),
-                      mirror = narrowUtf8(p.mirrorDir), result = narrowUtf8(p.resultPath);
-    for (const std::string* v : {&p.action, &p.scope, &dir, &source, &payloadDir, &manifest, &cache, &mirror, &result}) {
+    const std::string dir = narrowUtf8(p.dir), source = narrowUtf8(p.source);
+    for (const std::string* v : {&p.action, &p.scope, &dir, &source, &p.manifestSha}) {
         if (hasBreak(*v)) return setError(error, "a value in the plan has a line break in it");
     }
     std::string text;
@@ -189,11 +212,7 @@ bool writePlanFile(const std::wstring& path, const PlanFile& p, std::string* err
     text += "keep_settings=" + yesNo(p.keepSettings) + "\n";
     text += "remove_settings=" + yesNo(p.removeSettings) + "\n";
     text += "restore_mirror=" + yesNo(p.restoreMirror) + "\n";
-    text += "payload_dir=" + payloadDir + "\n";
-    text += "manifest=" + manifest + "\n";
-    text += "cache_dir=" + cache + "\n";
-    text += "mirror_dir=" + mirror + "\n";
-    text += "result=" + result + "\n";
+    text += "manifest=" + p.manifestSha + "\n";
     std::wstring why;
     if (!writeFileAtomic(path, text, &why)) return setError(error, "the plan file cannot be written");
     return true;
@@ -204,10 +223,8 @@ bool readPlanFile(const std::wstring& path, PlanFile* plan, std::string* error) 
     if (!readFileBytes(path, &text, 1u << 16, error)) return false;
     std::map<std::string, std::string> m;
     if (!parseLines(text, &m, error)) return false;
-    static const std::set<std::string> known = {"version",     "action",         "dir",        "source",
-                                                "scope",       "keep_settings",  "remove_settings",
-                                                "restore_mirror", "payload_dir", "manifest",   "cache_dir",
-                                                "mirror_dir",  "result"};
+    static const std::set<std::string> known = {"version",        "action",          "dir",            "source", "scope",
+                                                "keep_settings",  "remove_settings", "restore_mirror", "manifest"};
     for (const auto& entry : m) {
         if (!known.count(entry.first)) return setError(error, "the plan has a key this launcher does not know: " + entry.first);
     }
@@ -217,15 +234,12 @@ bool readPlanFile(const std::wstring& path, PlanFile* plan, std::string* error) 
     p.dir = widenUtf8(textOf(m, "dir"));
     p.source = widenUtf8(textOf(m, "source"));
     p.scope = textOf(m, "scope");
-    p.payloadDir = widenUtf8(textOf(m, "payload_dir"));
-    p.manifestPath = widenUtf8(textOf(m, "manifest"));
-    p.cacheDir = widenUtf8(textOf(m, "cache_dir"));
-    p.mirrorDir = widenUtf8(textOf(m, "mirror_dir"));
-    p.resultPath = widenUtf8(textOf(m, "result"));
+    p.manifestSha = textOf(m, "manifest");
     if (!boolOf(m, "keep_settings", &p.keepSettings, error) || !boolOf(m, "remove_settings", &p.removeSettings, error) ||
         !boolOf(m, "restore_mirror", &p.restoreMirror, error))
         return false;
-    if (p.action.empty() || p.dir.empty() || p.resultPath.empty()) return setError(error, "the plan lacks an action, a folder or a result path");
+    if (p.action.empty() || p.dir.empty()) return setError(error, "the plan lacks an action or a folder");
+    if (!p.manifestSha.empty() && !isLowerHex(p.manifestSha, 64)) return setError(error, "the plan's manifest is not a 64-character hash");
     if (!p.scope.empty() && p.scope != "both" && p.scope != "vr" && p.scope != "flat") return setError(error, "the plan names an unknown scope");
     *plan = std::move(p);
     return true;
@@ -285,13 +299,46 @@ std::string outcomeReport(const ApplyOutcome& outcome) {
     return text;
 }
 
+bool planPathsFor(const std::wstring& planPath, PlanPaths* out, std::string* error) {
+    const size_t slash = planPath.find_last_of(L"\\/");
+    if (slash == std::wstring::npos) return setError(error, "the plan file's path names no folder");
+    const std::wstring folder = planPath.substr(0, slash);
+    std::wstring stamp;
+    if (!planStampOf(planPath.substr(slash + 1), &stamp)) return setError(error, "the plan file is not named plan-<number>-<number>.txt");
+    const size_t up = folder.find_last_of(L"\\/");
+    if (up == std::wstring::npos || up == 0 || _wcsicmp(folder.substr(up + 1).c_str(), L"launcher") != 0)
+        return setError(error, "the plan file is not in a launcher folder");
+    const std::wstring root = folder.substr(0, up);
+    // A link anywhere in the three would let the result, the cache or the mirror resolve somewhere else.
+    for (const std::wstring* path : {&root, &folder, &planPath}) {
+        if (missingOrLink(*path)) return setError(error, "the plan file, its folder or the folder above is missing or is a link");
+    }
+    PlanPaths p;
+    p.dataRoot = root;
+    p.resultPath = joinPath(folder, L"result-" + stamp + L".txt");
+    p.manifestsDir = joinPath(folder, L"manifests");
+    p.cacheDir = joinPath(root, L"payload");
+    *out = std::move(p);
+    return true;
+}
+
+std::string manifestShaOf(const std::wstring& manifestPath) {
+    const size_t slash = manifestPath.find_last_of(L"\\/");
+    const std::string leaf = narrowUtf8(slash == std::wstring::npos ? manifestPath : manifestPath.substr(slash + 1));
+    if (leaf.size() != 64 + 5 || leaf.compare(64, 5, ".json") != 0 || !isLowerHex(leaf.substr(0, 64), 64)) return std::string();
+    return leaf.substr(0, 64);
+}
+
 int applyPlanFile(const std::wstring& planPath, const char* const* keys) {
-    PlanFile plan;
+    // A plan that is not where the launcher writes plans, or cannot be read, has no result path to
+    // report to, so the parent sees no result file.
+    PlanPaths paths;
     std::string error;
-    // An unreadable plan has no result path to report to, so the parent sees no result file.
+    if (!planPathsFor(planPath, &paths, &error)) return 2;
+    PlanFile plan;
     if (!readPlanFile(planPath, &plan, &error)) return 2;
-    const ApplyOutcome outcome = runPlan(plan, keys);
-    writeResultFile(plan.resultPath, outcome, nullptr);
+    const ApplyOutcome outcome = runPlan(plan, paths, keys);
+    writeResultFile(paths.resultPath, outcome, nullptr);
     return outcome.status == ApplyOutcome::Status::Done || outcome.status == ApplyOutcome::Status::NothingToDo ? 0 : 1;
 }
 
@@ -326,16 +373,22 @@ ElevatedResult applyElevated(const std::wstring& exePath, const std::wstring& la
     ElevatedResult result;
     const std::wstring stamp = std::to_wstring(GetCurrentProcessId()) + L"-" + std::to_wstring(GetTickCount64());
     const std::wstring planPath = joinPath(launcherDir, L"plan-" + stamp + L".txt");
-    plan.resultPath = joinPath(launcherDir, L"result-" + stamp + L".txt");
+    PlanPaths paths;
     auto cleanup = [&]() {
         DeleteFileW(planPath.c_str());
-        DeleteFileW(plan.resultPath.c_str());
+        if (!paths.resultPath.empty()) DeleteFileW(paths.resultPath.c_str());
     };
     if (!createDirectories(launcherDir) || !writePlanFile(planPath, plan, &result.error)) {
         if (result.error.empty()) result.error = "the launcher folder cannot be written";
         cleanup();
         return result;
     }
+    // The result is read from where the copy will put it, which the copy works out the same way.
+    if (!planPathsFor(planPath, &paths, &result.error)) {
+        cleanup();
+        return result;
+    }
+    DeleteFileW(paths.resultPath.c_str());  // never read a stale one
     const ElevatedLaunch launch = runner(exePath, L"--apply-plan " + quoteArg(planPath));
     if (!launch.started) {
         result.declined = launch.declined;
@@ -344,7 +397,7 @@ ElevatedResult applyElevated(const std::wstring& exePath, const std::wstring& la
         return result;
     }
     std::string readError;
-    if (!readResultFile(plan.resultPath, &result.outcome, &readError)) {
+    if (!readResultFile(paths.resultPath, &result.outcome, &readError)) {
         result.error = "the elevated copy finished without reporting (exit code " + std::to_string(launch.exitCode) + "); nothing is known to have changed";
         result.outcome = failed(result.error);
     }

@@ -10,6 +10,14 @@
 // records. It re-verifies the manifest's signature and every payload file's hash itself,
 // surveys the folder again, plans again and applies that plan.
 //
+// The file names no path the copy writes to or installs from. Any program running as the
+// user could write a plan and start the copy, and the permission prompt would name this
+// launcher, so a path in the file would let that program write anywhere as administrator.
+// The copy works every path out from where the plan file is (planPathsFor): the result
+// beside it, the manifest and the payload cache under the same data root, and the settings
+// mirror from the game folder and that root. It installs only a signed download, never a
+// --payload folder.
+//
 // Both files are one `key=value` per line in UTF-8, written atomically. A line it does not
 // know, a value with a line break in it, or a missing key makes the reader refuse the file.
 #pragma once
@@ -30,15 +38,25 @@ struct PlanFile {
     bool         keepSettings = true;
     bool         removeSettings = false;
     bool         restoreMirror = false;  // restore settings from the mirror first, as the user agreed
-    std::wstring payloadDir;             // a --payload folder, or empty
-    std::wstring manifestPath;           // the stored manifest (<sha>.json), or empty
-    std::wstring cacheDir;               // the payload cache, with manifestPath
-    std::wstring mirrorDir;              // this install's settings mirror folder
-    std::wstring resultPath;             // where the copy writes its result
+    std::string  manifestSha;            // the adopted manifest, 64 lower-case hex; empty only to uninstall
 };
 
 bool writePlanFile(const std::wstring& path, const PlanFile& plan, std::string* error);
 bool readPlanFile(const std::wstring& path, PlanFile* plan, std::string* error);
+
+// The paths the elevated copy uses, from where the plan file is. The plan must be
+// <data root>\launcher\plan-<digits>-<digits>.txt, and neither it, its folder nor the data
+// root may be a link (a junction or a symbolic link).
+struct PlanPaths {
+    std::wstring dataRoot;      // the folder that holds the launcher and payload folders
+    std::wstring resultPath;   // <data root>\launcher\result-<the same digits>.txt
+    std::wstring manifestsDir;  // <data root>\launcher\manifests
+    std::wstring cacheDir;      // <data root>\payload
+};
+bool planPathsFor(const std::wstring& planPath, PlanPaths* out, std::string* error);
+
+// The 64-hex name of a stored manifest (<sha>.json), or empty when the path is not one.
+std::string manifestShaOf(const std::wstring& manifestPath);
 
 struct ApplyOutcome {
     enum class Status { Done, NothingToDo, Blocked, Failed };
@@ -54,7 +72,8 @@ std::string outcomeReport(const ApplyOutcome& outcome);
 
 // What the elevated copy does. `keys` null means the release keys; the rig passes its own.
 // Never throws, never shows anything: every failure is an outcome. Returns the process
-// exit code for --apply-plan: 0 done or nothing to do, 1 blocked or failed, 2 unreadable plan.
+// exit code for --apply-plan: 0 done or nothing to do, 1 blocked or failed, 2 a plan that
+// cannot be read or is not where planPathsFor accepts it (no result is written for either).
 int applyPlanFile(const std::wstring& planPath, const char* const* keys);
 
 // How the elevated copy is started and waited for. The real one is ShellExecuteEx with
@@ -74,8 +93,9 @@ struct ElevatedResult {
     std::string error;      // when the copy never reported
 };
 
-// The unelevated half: writes the plan (with its result path set) into `launcherDir`, runs
-// `runner`, reads the result, and deletes both files whatever happened.
+// The unelevated half: writes the plan into `launcherDir` (which must be <data root>\launcher),
+// runs `runner`, reads the result from where planPathsFor puts it, and deletes both files
+// whatever happened.
 ElevatedResult applyElevated(const std::wstring& exePath, const std::wstring& launcherDir, PlanFile plan,
                              const ElevatedRunner& runner);
 

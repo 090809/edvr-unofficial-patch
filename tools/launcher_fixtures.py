@@ -2,6 +2,7 @@
 """Write the fixture folder tools\\launcher_test reads.
 
   python tools\\launcher_fixtures.py --out DIR     write the fixtures into DIR
+  python tools\\launcher_fixtures.py --out DIR --dry-run   say what it would do; write nothing
   python tools\\launcher_fixtures.py --self-test   write them to a temp folder and check them
 
 Everything is signed with the RFC 6979 test key from sign_manifest.py, whose
@@ -22,13 +23,18 @@ What the rig gets:
   inflate\\bomb.zip              an entry that records 1000 bytes and inflates to 100 MB
   releases\\<name>\\              release folders (manifest, signature, assets, launcher)
 
-Writes only inside --out, which it empties first.
+Writes only inside --out, which it empties first. It empties only a folder it wrote
+itself (the .launcher-fixtures marker in it, or, from before the marker, all of
+test_key.txt, other_key.txt, signing.txt and shapes.txt), an empty folder, or a
+path that does not exist yet. Any other folder, a link, or a file is refused and
+left exactly as it was.
 """
 import argparse
 import copy
 import hashlib
 import io
 import json
+import os
 import random
 import shutil
 import struct
@@ -350,11 +356,36 @@ def write_releases(out):
             launcher_version="0.3.0")
 
 
+MARKER = ".launcher-fixtures"
+# What a folder written before the marker existed always holds.
+EARLIER_OUTPUTS = ("test_key.txt", "other_key.txt", "signing.txt", "shapes.txt")
+
+
+def out_problem(out):
+    """Why --out may not be emptied and written, or None."""
+    out = Path(out)
+    if os.path.islink(out) or (hasattr(out, "is_junction") and out.is_junction()):
+        return "%s is a link; it is not followed or emptied" % out
+    if not out.exists():
+        return None
+    if not out.is_dir():
+        return "%s is not a folder" % out
+    if (out / MARKER).is_file() or all((out / name).is_file() for name in EARLIER_OUTPUTS):
+        return None
+    if any(out.iterdir()):
+        return "%s holds files this tool did not write (no %s in it), so it is not emptied" % (out, MARKER)
+    return None
+
+
 def generate(out):
     out = Path(out)
+    problem = out_problem(out)
+    if problem:
+        raise ValueError(problem)
     if out.exists():
         shutil.rmtree(out)
     out.mkdir(parents=True)
+    write(out / MARKER, "Written by tools\\launcher_fixtures.py, which empties this folder on its next run.\n")
     write(out / "test_key.txt", TEST_PUBLIC)
     write(out / "other_key.txt", OTHER_PUBLIC)
     write_signing(out)
@@ -436,13 +467,40 @@ def self_test():
         again = Path(temp) / "again"
         generate(again)
         assert (again / "releases" / "relA" / sm.MANIFEST_NAME).read_bytes() == (folders["relA"] / sm.MANIFEST_NAME).read_bytes(), "not deterministic"
+
+        # --out: a folder this tool did not write is refused and left as it was, with or without --dry-run.
+        stranger = Path(temp) / "stranger"
+        stranger.mkdir()
+        (stranger / "keep.txt").write_text("mine")
+        assert main(["--out", str(stranger)]) == 2 and (stranger / "keep.txt").read_text() == "mine"
+        assert main(["--out", str(stranger), "--dry-run"]) == 2 and sorted(p.name for p in stranger.iterdir()) == ["keep.txt"]
+        not_a_folder = Path(temp) / "a-file"
+        not_a_folder.write_text("file")
+        assert main(["--out", str(not_a_folder)]) == 2 and not_a_folder.read_text() == "file"
+        # --dry-run writes nothing at all: not for a new folder, not for one of its own.
+        fresh = Path(temp) / "fresh"
+        assert main(["--out", str(fresh), "--dry-run"]) == 0 and not fresh.exists()
+        before = sorted((str(p.relative_to(again)), p.stat().st_size) for p in again.rglob("*"))
+        assert main(["--out", str(again), "--dry-run"]) == 0
+        assert sorted((str(p.relative_to(again)), p.stat().st_size) for p in again.rglob("*")) == before
+        # Its own folder is emptied and written again; so is one from before the marker, and an empty one.
+        (again / "leftover.txt").write_text("old")
+        assert main(["--out", str(again)]) == 0 and not (again / "leftover.txt").exists() and (again / MARKER).is_file()
+        (again / MARKER).unlink()
+        assert out_problem(again) is None, "a folder from before the marker is the tool's own"
+        (again / "signing.txt").unlink()
+        assert out_problem(again) is not None, "without the marker and the earlier outputs it is not"
+        empty = Path(temp) / "empty"
+        empty.mkdir()
+        assert out_problem(empty) is None
     print("launcher_fixtures: self-test passed")
     return 0
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--out", type=Path, help="folder to write the fixtures into (emptied first)")
+    parser.add_argument("--out", type=Path, help="folder to write the fixtures into (emptied first, if it is the tool's own)")
+    parser.add_argument("--dry-run", action="store_true", help="say what would be emptied and written; write and delete nothing")
     parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args(argv)
     if args.self_test:
@@ -450,6 +508,14 @@ def main(argv=None):
     if not args.out:
         parser.print_help()
         return 2
+    problem = out_problem(args.out)
+    if problem:
+        print("launcher_fixtures: refused: " + problem)
+        return 2
+    if args.dry_run:
+        print("launcher_fixtures: dry run: would %s %s and write the fixtures into it; nothing was written"
+              % ("empty" if args.out.exists() else "create", args.out))
+        return 0
     generate(args.out)
     print("launcher_fixtures: wrote %s" % args.out)
     return 0

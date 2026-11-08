@@ -92,6 +92,9 @@ struct DirectPlan {
     std::wstring exe;
     std::wstring args;         // after the exe name; holds the tokens
     std::wstring workDir;
+    // A Steam install's game is started with SteamAppId=359320 in its environment, set for that start
+    // alone (ScopedEnvironmentVariable); a Frontier-store game never gets it.
+    bool steamAppId = false;
     std::string reason;        // when !start: why, as a fragment with no full stop
     std::string detail;        // lines that help a person compare with min-ed-launcher; no token
     std::vector<std::string> secrets;  // every value maskSecrets must remove: the tokens and the machine ID

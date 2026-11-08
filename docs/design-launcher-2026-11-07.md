@@ -239,6 +239,9 @@ more for Frontier, so roughly 1,500 lines of C++.
      install, then `SteamAPI_Init`, `SteamUser019`, `GetSteamID` (must be non-zero)
      and `GetAuthSessionTicket`. Send the ticket as hex to `/3.0/user/steam/auth`.
      Cancel the ticket and call `SteamAPI_Shutdown` before starting the game.
+     `SteamAppId` is put back as it was once Steam is released, and set again only
+     for the Steam game's own start. Left set, it reached every later start from the
+     same window, a Frontier-store game included (review of 2026-11-08).
    - **Frontier:** POST to `/3.0/user/frontier/auth`. A first login returns a 2FA
      challenge, and `/3.0/user/frontier/token` turns the typed code into a machine
      token.
@@ -335,6 +338,18 @@ Default Frontier and Epic folders are under Program Files, and the game must nev
 start from an elevated process. Today `relaunchElevated` reruns the whole app
 elevated. The launcher instead stays unelevated, writes its plan to a file, and
 starts a short-lived elevated copy that applies that plan and exits.
+
+The plan file names no path that the copy writes to or installs from. It holds only the
+choices and the adopted manifest's hash. Any program running as the user could write a
+plan and start the copy, and the permission prompt would name this launcher. So a path in
+the file, as the first version had, would have let that program write anywhere as
+administrator and install an unsigned folder. The copy works every path out from where the
+plan sits, `<data root>\launcher\plan-<n>-<n>.txt`, and refuses a plan anywhere else or
+reached through a link. The result goes beside the plan. The manifest and the payload come
+from the same root, and the settings mirror from the game folder and that root. It
+installs only a signed download, so a `--payload` folder for a game under Program Files is
+refused, with a line saying so (review of 2026-11-08). One race remains: a link swapped in
+between the check and the write.
 
 ## VR or flat
 

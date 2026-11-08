@@ -367,6 +367,15 @@ void launcherBeginAction() {
 
 // Asks, then hands the confirmed install to the elevated copy and reports what it says.
 void launcherApplyElevated(const AppArgs& args, const Plan& plan) {
+    // The copy with administrator rights installs only a signed download (launcher_plan.h says why).
+    const PayloadLoad& payload = lg.session->payload();
+    if (payload.kind != PayloadKind::Manifest && args.action != AppArgs::Act::Uninstall) {
+        setReport(planReport(plan) +
+                  "\r\n----\r\nNothing was changed. This game folder needs administrator rights, and the copy of the launcher "
+                  "that has them installs only a signed download, never a --payload folder. Start the launcher without "
+                  "--payload and press Download, or run it as administrator.\r\n");
+        return;
+    }
     const int answer = MessageBoxW(
         g.window,
         L"This game folder can only be written to by an administrator (it is usually under Program Files).\n\n"
@@ -383,11 +392,8 @@ void launcherApplyElevated(const AppArgs& args, const Plan& plan) {
     file.keepSettings = args.keepSettings;
     file.removeSettings = args.removeSettings;
     file.restoreMirror = lg.restoreViaPlan;
-    const PayloadLoad& payload = lg.session->payload();
-    if (payload.kind == PayloadKind::Folder) file.payloadDir = g.args.payloadDir;
-    if (payload.kind == PayloadKind::Manifest) file.manifestPath = payload.manifestPath;
-    file.cacheDir = launcherRootsFor(g.args).cacheDir();
-    file.mirrorDir = mirrorDirOfGame(g.survey.game);
+    // The copy finds the manifest, the cache and the mirror under the data root the plan file sits in.
+    if (payload.kind == PayloadKind::Manifest) file.manifestSha = manifestShaOf(payload.manifestPath);
     lg.restoreViaPlan = false;
 
     const std::string shown = planReport(plan);

@@ -433,6 +433,7 @@ DirectPlan planDirectLaunch(const DirectEnv& env, const DirectRequest& request) 
     if (!product->serverArgs.empty()) serverArgs += (serverArgs.empty() ? "" : " ") + product->serverArgs;
     plan.exe = exe;
     plan.workDir = request.productDir;
+    plan.steamAppId = !request.frontier;
     plan.args = widenUtf8(directCommandLine(!info.offline, session.machineToken, session.authToken, serverArgs, info.steamAware && !request.frontier,
                                             request.vr, product->gameArgs));
     plan.start = true;

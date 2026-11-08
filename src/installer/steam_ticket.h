@@ -7,8 +7,11 @@
 // SteamSession is the interface direct_launch.cpp uses, so tools\launcher_test can put a fake in its
 // place, and makeSteamSession is the real one. The real one:
 //
-//   * sets SteamAppId=359320 in this process, which the game then inherits from the launcher
-//     (T3 of the design relied on it) and which is what makes the Steam client see Elite;
+//   * sets SteamAppId=359320 in this process while Steam is loaded, which is what makes the Steam
+//     client see Elite, and puts back what was there on release(). The game needs it too (T3 of the
+//     design relied on it), so a Steam install's start sets it again for that start alone
+//     (DirectPlan::steamAppId). Left set, every later start from the same window inherited it: a
+//     Frontier-store game, EDLaunch, a restarted launcher;
 //   * loads steam_api64.dll by the absolute path it is given, from the game's install, with
 //     LOAD_WITH_ALTERED_SEARCH_PATH, so a copy beside some other program is never picked up;
 //   * calls SteamAPI_Init, then the client, pipe, global user and user interface, the Steam ID
@@ -34,5 +37,20 @@ public:
 
 // The real session over the steam_api64.dll at `dllPath` (absolute).
 std::unique_ptr<SteamSession> makeSteamSession(const std::wstring& dllPath);
+
+// One variable of this process's environment set for the object's lifetime, then put back as it was:
+// the old value, or no variable at all. A child process inherits the environment as it is when it is
+// started, so this gives one start a variable without giving it to the next.
+class ScopedEnvironmentVariable {
+public:
+    ScopedEnvironmentVariable(const wchar_t* name, const wchar_t* value);
+    ~ScopedEnvironmentVariable();
+    ScopedEnvironmentVariable(const ScopedEnvironmentVariable&) = delete;
+    ScopedEnvironmentVariable& operator=(const ScopedEnvironmentVariable&) = delete;
+
+private:
+    std::wstring name_, old_;
+    bool hadOld_ = false;
+};
 
 }  // namespace edvr::installer

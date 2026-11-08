@@ -34,8 +34,8 @@ public:
             return false;
         };
         if (released_) return fail("the Steam session was already closed");
-        // The game inherits this and so does the Steam client's idea of which game this is.
-        SetEnvironmentVariableW(L"SteamAppId", kSteamAppId);
+        // The Steam client's idea of which game this is, for as long as Steam is loaded here.
+        if (!appId_) appId_.reset(new ScopedEnvironmentVariable(L"SteamAppId", kSteamAppId));
         if (dllPath_.empty() || dllPath_.find_first_of(L"\\/") == std::wstring::npos)
             return fail("steam_api64.dll was not found beside Elite's launcher");
         library_ = LoadLibraryExW(dllPath_.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
@@ -95,10 +95,12 @@ public:
         user_ = nullptr;
         ticketHandle_ = 0;
         initialised_ = false;
+        appId_.reset();  // SteamAppId as it was before getTicket
     }
 
 private:
     std::wstring dllPath_;
+    std::unique_ptr<ScopedEnvironmentVariable> appId_;
     HMODULE library_ = nullptr;
     bool released_ = false;
     bool initialised_ = false;
@@ -120,5 +122,24 @@ private:
 std::unique_ptr<SteamSession> makeSteamSession(const std::wstring& dllPath) {
     return std::unique_ptr<SteamSession>(new RealSteamSession(dllPath));
 }
+
+ScopedEnvironmentVariable::ScopedEnvironmentVariable(const wchar_t* name, const wchar_t* value) : name_(name) {
+    const DWORD needed = GetEnvironmentVariableW(name, nullptr, 0);
+    if (needed > 0) {
+        std::wstring old(needed, L'\0');
+        SetLastError(ERROR_SUCCESS);  // an empty value reads as 0 characters with no error
+        const DWORD got = GetEnvironmentVariableW(name, &old[0], needed);
+        if (got > 0 && got < needed) {
+            old.resize(got);
+            old_ = old;
+            hadOld_ = true;
+        } else if (got == 0 && GetLastError() == ERROR_SUCCESS) {
+            hadOld_ = true;  // set, and empty
+        }
+    }
+    SetEnvironmentVariableW(name, value);
+}
+
+ScopedEnvironmentVariable::~ScopedEnvironmentVariable() { SetEnvironmentVariableW(name_.c_str(), hadOld_ ? old_.c_str() : nullptr); }
 
 }  // namespace edvr::installer

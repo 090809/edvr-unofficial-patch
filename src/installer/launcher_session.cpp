@@ -450,7 +450,14 @@ void LauncherSession::beginDirectPlay(const std::wstring& source, const std::wst
             return;
         }
         const GameStarter start = env_.startGame ? env_.startGame : GameStarter(startGameProcess);
-        HANDLE process = start(plan.exe, plan.args, plan.workDir);
+        HANDLE process = nullptr;
+        {
+            // Only a Steam install's game gets Steam's app id, and only for its own start: the process's
+            // environment is put back straight after, so the next start from this window does not inherit it.
+            std::unique_ptr<ScopedEnvironmentVariable> appId;
+            if (plan.steamAppId) appId.reset(new ScopedEnvironmentVariable(L"SteamAppId", kSteamAppId));
+            process = start(plan.exe, plan.args, plan.workDir);
+        }
         plan = DirectPlan();  // the tokens are not needed again
         if (!process) {
             fallBack("Elite could not be started directly");

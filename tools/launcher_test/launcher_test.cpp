@@ -81,6 +81,7 @@
 #include "../../src/installer/layout_dpi.h"
 #include "../../src/installer/logbundle.h"
 #include "../../src/installer/machine_id.h"
+#include "../../src/installer/mirror.h"
 #include "../../src/installer/selfupdate.h"
 #include "../../src/installer/payload.h"
 #include "../../src/installer/probe.h"
@@ -2335,22 +2336,21 @@ void testPlanFile() {
     p.keepSettings = false;
     p.removeSettings = true;
     p.restoreMirror = true;
-    p.payloadDir = L"D:\\unpacked\\ed-up-0.22.0 \xe9";
-    p.manifestPath = L"C:\\Users\\a\\AppData\\Local\\EDVR\\launcher\\manifests\\" + widenUtf8(std::string(64, 'a')) + L".json";
-    p.cacheDir = L"C:\\Users\\a\\AppData\\Local\\EDVR\\payload";
-    p.mirrorDir = L"C:\\Users\\a\\AppData\\Local\\EDVR\\elite-steam";
-    p.resultPath = P(base, L"result.txt");
+    p.manifestSha = std::string(64, 'a');
+    p.dir += L" \xe9";
     const std::wstring file = P(base, L"plan.txt");
     std::string err;
     check(writePlanFile(file, p, &err), "a plan file is written: " + err);
     PlanFile q;
     check(readPlanFile(file, &q, &err), "and read: " + err);
     check(q.action == p.action && q.dir == p.dir && q.source == p.source && q.scope == p.scope && q.keepSettings == p.keepSettings && q.removeSettings == p.removeSettings &&
-              q.restoreMirror == p.restoreMirror && q.payloadDir == p.payloadDir && q.manifestPath == p.manifestPath && q.cacheDir == p.cacheDir && q.mirrorDir == p.mirrorDir &&
-              q.resultPath == p.resultPath,
+              q.restoreMirror == p.restoreMirror && q.manifestSha == p.manifestSha,
           "every field round-trips, a non-ASCII path included");
     const std::string text = readAll(file);
-    check(contains(text, "version=1\n") && contains(text, "restore_mirror=1\n") && !contains(text, "\r"), "the file is plain key=value lines with a version first: " + text.substr(0, 40));
+    check(contains(text, "version=2\n") && contains(text, "restore_mirror=1\n") && !contains(text, "\r"), "the file is plain key=value lines with a version first: " + text.substr(0, 40));
+    // No path the elevated copy writes to or installs from is in the file at all.
+    for (const char* gone : {"payload_dir=", "cache_dir=", "mirror_dir=", "result="})
+        check(!contains(text, gone), std::string("the file names no ") + gone);
 
     PlanFile bad;
     p.dir = L"C:\\game\nrm";
@@ -2362,8 +2362,11 @@ void testPlanFile() {
     };
     const std::string good = text;
     check(!reads(good + "extra=1\n") && contains(err, "extra"), "a key the reader does not know is refused: " + err);
+    // The keys that once named paths are refused outright: an old or forged plan cannot steer the copy.
+    for (const char* old : {"payload_dir=D:\\x\n", "result=C:\\Windows\\x.txt\n", "mirror_dir=C:\\x\n", "cache_dir=C:\\x\n"})
+        check(!reads(good + old) && contains(err, "does not know"), std::string("a plan with ") + old + " is refused: " + err);
     check(!reads(good + "action=uninstall\n") && contains(err, "twice"), "a repeated key is refused: " + err);
-    check(!reads("version=2\n" + good.substr(good.find('\n') + 1)) && contains(err, "version"), "another plan version is refused: " + err);
+    check(!reads("version=1\n" + good.substr(good.find('\n') + 1)) && contains(err, "version"), "another plan version is refused: " + err);
     {
         std::string s = good;
         s.replace(s.find("keep_settings=0"), 15, "keep_settings=7");
@@ -2372,9 +2375,49 @@ void testPlanFile() {
         s.replace(s.find("scope=flat"), 10, "scope=nonsense");
         check(!reads(s) && contains(err, "scope"), "an unknown scope is refused: " + err);
         s = good;
-        s.erase(s.find("result="), good.size());
-        check(!reads(s), "a plan with no result path is refused: " + err);
+        s.replace(s.find("manifest=") + 9, 64, "..\\..\\evil");
+        check(!reads(s) && contains(err, "manifest"), "a manifest that is not a 64-character hash is refused: " + err);
         check(!reads("not a plan at all\n"), "a file that is not key=value is refused: " + err);
+    }
+
+    // Where the copy works its paths out from: <data root>\launcher\plan-<n>-<n>.txt, and nothing else.
+    {
+        const std::wstring root = fresh("plan-root");
+        const std::wstring launcher = P(root, L"launcher");
+        createDirectories(launcher);
+        const std::wstring planAt = P(launcher, L"plan-12-345.txt");
+        writeAll(planAt, "x");
+        PlanPaths paths;
+        check(planPathsFor(planAt, &paths, &err) && paths.dataRoot == root && paths.resultPath == P(launcher, L"result-12-345.txt") &&
+                  paths.manifestsDir == P(launcher, L"manifests") && paths.cacheDir == P(root, L"payload"),
+              "the result goes beside the plan, and the manifest and the cache are under the same root: " + err);
+        writeAll(P(root, L"plan-12-345.txt"), "x");
+        check(!planPathsFor(P(root, L"plan-12-345.txt"), &paths, &err) && contains(err, "launcher folder"), "a plan outside a launcher folder is refused: " + err);
+        for (const wchar_t* leaf : {L"plan.txt", L"plan-12.txt", L"plan-1a-2.txt", L"result-12-345.txt", L"plan-12-345.txt.exe"}) {
+            writeAll(P(launcher, leaf), "x");
+            check(!planPathsFor(P(launcher, leaf), &paths, &err), "a plan file named " + narrowUtf8(leaf) + " is refused");
+        }
+        check(!planPathsFor(P(launcher, L"plan-1-2.txt"), &paths, &err), "a plan file that is not there is refused");
+        // A junction standing in for the launcher folder is refused, though everything behind it is in order.
+        const std::wstring real = fresh("plan-real");
+        createDirectories(P(real, L"launcher"));
+        writeAll(P(P(real, L"launcher"), L"plan-1-2.txt"), "x");
+        const std::wstring linkRoot = fresh("plan-link");
+        wchar_t systemDir[MAX_PATH]{};
+        GetSystemDirectoryW(systemDir, MAX_PATH);
+        HANDLE mklink = startProgram(P(systemDir, L"cmd.exe"), L"/c mklink /J \"" + P(linkRoot, L"launcher") + L"\" \"" + P(real, L"launcher") + L"\"");
+        if (mklink) {
+            WaitForSingleObject(mklink, 15000);
+            CloseHandle(mklink);
+        }
+        const DWORD linkAttributes = GetFileAttributesW(P(linkRoot, L"launcher").c_str());
+        check(linkAttributes != INVALID_FILE_ATTRIBUTES && (linkAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0, "the rig made a junction to test with");
+        check(!planPathsFor(P(P(linkRoot, L"launcher"), L"plan-1-2.txt"), &paths, &err) && contains(err, "link"),
+              "a plan reached through a junction is refused: " + err);
+        check(planPathsFor(P(P(real, L"launcher"), L"plan-1-2.txt"), &paths, &err), "and the same plan reached directly is accepted: " + err);
+        check(manifestShaOf(P(P(launcher, L"manifests"), widenUtf8(std::string(64, 'b')) + L".json")) == std::string(64, 'b') &&
+                  manifestShaOf(L"C:\\x\\notahash.json").empty(),
+              "manifestShaOf takes the hash from a stored manifest's name, and nothing else");
     }
 
     // Result files.
@@ -2426,18 +2469,21 @@ void testElevatedApply() {
     plan.action = "install";
     plan.dir = game;
     plan.source = L"Folder you chose";
-    plan.manifestPath = manifestPath;
-    plan.cacheDir = roots.cacheDir();
-    plan.mirrorDir = P(base, L"mirror");
-    plan.resultPath = P(base, L"result.txt");
-    const std::wstring planPath = P(base, L"plan.txt");
+    plan.manifestSha = manifestShaOf(manifestPath);
+    check(plan.manifestSha == sha(a.manifestBytes), "the plan names the adopted manifest by its hash");
+    // Where the launcher puts a plan, and so where the copy puts its result and finds everything else.
+    const std::wstring planPath = P(roots.launcherDir(), L"plan-7-8.txt");
+    const std::wstring resultPath = P(roots.launcherDir(), L"result-7-8.txt");
+    GameInstall described;
+    describeDir(game, plan.source, &described);
+    const std::wstring mirrorDir = mirrorDirFor(described, base);
     auto run = [&](const PlanFile& p, const char* const* keys, ApplyOutcome* out) {
-        DeleteFileW(p.resultPath.c_str());
+        DeleteFileW(resultPath.c_str());
         std::string e;
         writePlanFile(planPath, p, &e);
         const int code = applyPlanFile(planPath, keys);
         std::string readError;
-        const bool have = readResultFile(p.resultPath, out, &readError);
+        const bool have = readResultFile(resultPath, out, &readError);
         return std::make_pair(code, have);
     };
 
@@ -2468,7 +2514,7 @@ void testElevatedApply() {
     // A plan naming a payload that is not there, and a folder that is not a game.
     {
         PlanFile p2 = plan;
-        p2.manifestPath.clear();
+        p2.manifestSha.clear();
         ApplyOutcome out;
         auto r = run(p2, g_testKeys, &out);
         check(r.second && out.status == ApplyOutcome::Status::Failed && contains(out.lines[0], "no payload"), "an install with no payload is refused: " + out.lines[0]);
@@ -2486,15 +2532,26 @@ void testElevatedApply() {
         ApplyOutcome out;
         const auto r = run(plan, g_testKeys, &out);
         check(r.second && r.first == 1 && out.status == ApplyOutcome::Status::Blocked && !out.lines.empty(), "a verified payload gets as far as the planner, which blocks a folder whose exe is not Elite");
-        check(!exists(P(game, L"d3d11.dll")) && !exists(P(game, L"edvr_install")) && !exists(plan.mirrorDir), "and the folder holds nothing new");
+        check(!exists(P(game, L"d3d11.dll")) && !exists(P(game, L"edvr_install")) && !exists(mirrorDir), "and the folder holds nothing new");
         std::string said;
         for (const std::string& l : out.lines) said += l + " | ";
         check(contains(outcomeReport(out), "blocked"), "the report says the plan is blocked: " + said);
     }
     // An unreadable plan has nowhere to report, and says so by its exit code.
     writeAll(planPath, "garbage");
-    DeleteFileW(plan.resultPath.c_str());
-    check(applyPlanFile(planPath, g_testKeys) == 2 && !exists(plan.resultPath), "an unreadable plan exits 2 and writes no result");
+    DeleteFileW(resultPath.c_str());
+    check(applyPlanFile(planPath, g_testKeys) == 2 && !exists(resultPath), "an unreadable plan exits 2 and writes no result");
+    // A good plan outside a launcher folder is not run, and writes no result anywhere.
+    {
+        const std::wstring stray = P(base, L"plan-7-8.txt");
+        std::string e;
+        writePlanFile(stray, plan, &e);
+        check(applyPlanFile(stray, g_testKeys) == 2 && !exists(P(base, L"result-7-8.txt")) && !exists(resultPath) && !exists(P(game, L"edvr_install")),
+              "a plan outside a launcher folder exits 2, writes no result and touches no game folder");
+    }
+    // The cases above leave their own plan in the launcher folder; applyElevated's leftover check below starts clean.
+    DeleteFileW(planPath.c_str());
+    DeleteFileW(resultPath.c_str());
 
     // The unelevated half, with this rig standing in for the elevated copy (started as itself, unelevated).
     {
@@ -3640,8 +3697,8 @@ void testDirectPlan() {
         check(loadedFromGame, "steam_api64.dll was loaded by its absolute path, from beside EDLaunch.exe");
         check(appId && version && cancelled, "SteamAppId was 359320 when Steam started, the user interface asked for is SteamUser019, and the ticket handle is the one cancelled");
         wchar_t appIdNow[32]{};
-        GetEnvironmentVariableW(L"SteamAppId", appIdNow, 32);
-        check(std::wstring(appIdNow) == L"359320", "and SteamAppId is still set in this process, for the game to inherit");
+        check(GetEnvironmentVariableW(L"SteamAppId", appIdNow, 32) == 0 && plan.steamAppId,
+              "once Steam is released SteamAppId is gone from this process again, and the plan says the game's start sets it");
         check(!leaks(plan.reason) && !leaks(plan.detail), "the reason and the detail hold no token");
         bool progressLeaks = false;
         for (const std::string& line : progress) progressLeaks = progressLeaks || leaks(line);
@@ -3858,6 +3915,7 @@ struct DirectRig {
     std::vector<std::string> seen;  // the line at every change
     struct Start {
         std::wstring exe, args, dir;
+        std::wstring appId;  // SteamAppId as the game would have inherited it, or "(none)"
     };
     std::vector<Start> started;
     std::vector<HANDLE> processes;
@@ -3936,7 +3994,9 @@ struct DirectRig {
             return true;
         };
         e.startGame = [this](const std::wstring& exe, const std::wstring& args, const std::wstring& dir) -> HANDLE {
-            started.push_back({exe, args, dir});
+            wchar_t appId[32]{};
+            const std::wstring inherited = GetEnvironmentVariableW(L"SteamAppId", appId, 32) ? std::wstring(appId) : std::wstring(L"(none)");
+            started.push_back({exe, args, dir, inherited});
             eventLog("START");
             return startProgram(P(g_fakes, kFakeGame), L"--run-ms 700");
         };
@@ -4023,6 +4083,39 @@ void testDirectSession() {
         DirectRig rig("direct-vr", "direct_launch=on\n");
         rig.play(L"Steam", true, false);
         check(rig.ui.pump([&]() { return rig.restored == 1; }) && rig.started.size() == 1 && contains(narrowUtf8(rig.started[0].args), " /steam /vr /edo --foo"), "Play VR starts the game with /vr");
+    }
+
+    // One window, a Steam launch and then a Frontier-store one (the window stays open after a game now):
+    // only the Steam game gets Steam's app id, and the process's environment is as it was in between.
+    {
+        SetEnvironmentVariableW(L"SteamAppId", nullptr);
+        {
+            DirectRig rig("appid-steam", "direct_launch=on\n");
+            rig.play(L"Steam", true, false);
+            check(rig.ui.pump([&]() { return rig.restored == 1; }) && rig.started.size() == 1 && rig.started[0].appId == L"359320",
+                  "the Steam game was started with SteamAppId=359320: " + (rig.started.empty() ? std::string("(not started)") : narrowUtf8(rig.started[0].appId)));
+        }
+        wchar_t between[32]{};
+        check(GetEnvironmentVariableW(L"SteamAppId", between, 32) == 0, "after it, the launcher's own environment has no SteamAppId: " + narrowUtf8(between));
+        {
+            DirectRig rig("appid-store", "direct_launch=on\n", true);
+            scriptStore(&rig.http, false);
+            saveLogin(rig.loginPath, kPassword, kMachineToken);
+            rig.play(L"Frontier launcher", true, false);
+            check(rig.ui.pump([&]() { return rig.restored == 1; }) && rig.started.size() == 1 && rig.started[0].appId == L"(none)",
+                  "the Frontier-store game started next inherits no SteamAppId: " + (rig.started.empty() ? std::string("(not started)") : narrowUtf8(rig.started[0].appId)));
+        }
+        // A value the user's own environment had is put back as it was, not removed.
+        SetEnvironmentVariableW(L"SteamAppId", L"12345");
+        {
+            DirectRig rig("appid-kept", "direct_launch=on\n");
+            rig.play(L"Steam", true, false);
+            check(rig.ui.pump([&]() { return rig.restored == 1; }) && rig.started.size() == 1 && rig.started[0].appId == L"359320", "a Steam start still gets 359320 for itself");
+        }
+        wchar_t kept[32]{};
+        GetEnvironmentVariableW(L"SteamAppId", kept, 32);
+        check(std::wstring(kept) == L"12345", "and the value that was there before is back afterwards: " + narrowUtf8(kept));
+        SetEnvironmentVariableW(L"SteamAppId", nullptr);
     }
 
     // Elevated: refused before anything is contacted.
