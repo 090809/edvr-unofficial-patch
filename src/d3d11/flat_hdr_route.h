@@ -358,6 +358,7 @@ inline FlatMonoFrame flatSelectHdrFrame(const FlatMonoFrameInput& in, const void
     if (!out.supportedDraws) {
         // Section 104, as flatSelectMonoFrame: no pool family in the scene is source-free; a family draw left stock stays refused.
         summarizeSourceless(in, count, hdr->key.depth, *hdrCamera, out.sourceless);
+        out.sourceless.vetoFamilyDraws = in.unsupportedFamilyDraws; out.sourceless.vetoPoolDraws = out.unsupportedDraws;
         if (in.unsupportedFamilyDraws || out.unsupportedDraws) return refuse(FlatMonoReason::NoSupportedSource);
         out.sourceFree = true;
     }

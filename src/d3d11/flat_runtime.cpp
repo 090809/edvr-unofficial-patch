@@ -350,6 +350,12 @@ struct State {
     FlatSourceSpell sourceSpell;
     FlatMonoSourceless sourcelessLast;
     uint64_t sourcelessLastFrame=0;
+    // 2026-11-08 (DLSS to spatial in ground-and-sky views): the stock pool-family draws behind the last no-source refusal, the 5 s window's
+    // tally of them (flat_source_spell.h flatSourceVetoLine), and whether this frame's refusing verdict counted one.
+    FlatFamilyVeto vetoLast[kFlatFamilyVetoKinds];
+    uint32_t vetoLastKinds=0, vetoLastOverflowDraws=0;
+    FlatSourceVetoWindow vetoWindow;
+    bool frameVetoByFamily=false;
     // What a SOURCE-FREE frame (selected, no pool draw: section 104) held on the scene's depth, and the 5 s window's tally of how many of
     // those frames held nothing but hologram-family draws (the loading screen's hologram ghost, docs\design-flat-ui-quality-2026-10-05.md).
     FlatMonoSourceless sourceFreeLast;
@@ -1089,6 +1095,11 @@ static void reportSourceSpell(State& s) {
         flatSourceSpellLine(line,sizeof(line),w,s.sourcelessLast,s.sourcelessLastFrame,notes,part);
         Log::get().note("%s",line);
     }
+    // The stock pool-family draws that veto a no-source view's admission, every window (a zero is printed, so a build without this line and a
+    // window with nothing to name read differently).
+    flatSourceVetoLine(line,sizeof(line),s.vetoWindow,s.sourcelessLast,s.sourcelessLastFrame,s.vetoLast,s.vetoLastKinds,s.vetoLastOverflowDraws);
+    Log::get().note("%s",line);
+    s.vetoWindow=FlatSourceVetoWindow{};
 }
 static void reportForegroundDomain(State& s) {
     const auto& n=s.foregroundCounts;
@@ -4511,8 +4522,12 @@ void flatRuntimePresent(IDXGISwapChain* swap, uint64_t frame, HRESULT hr, UINT f
     // frame the fallback must count.
     flatCameraInjectClose(s.frameHadPhase,s.phase.applied!=0,s.phase.previousAcceptedValid,s.namedDepth!=nullptr);
     // A frame with a verdict feeds the spell tracker (flat_source_spell.h): refused for no source, treated, and whether it carried a phase.
-    if(endedSeen!=FlatFrameSeen::None)
+    if(endedSeen!=FlatFrameSeen::None) {
         s.sourceSpell.frame(endedReason==FlatMonoReason::NoSupportedSource,endedSeen==FlatFrameSeen::Treatable,s.frameHadPhase);
+        s.vetoWindow.frame(endedReason==FlatMonoReason::NoSupportedSource,endedSeen==FlatFrameSeen::Treatable,
+            s.prefix.unsupportedFamilyDraws!=0,s.frameVetoByFamily);
+    }
+    s.frameVetoByFamily=false;
     // The jitter cycle's length, read live (advanced.temporal_aa_jitter_phases: a whole number from 8 to 64, default 8).
     // A value the cycle cannot use reads as 8: one Config could not parse says so itself (once), and one outside the range is said here, once
     // per value. A change starts a new cycle, so the phase and the resolver's history restart as the jitter toggle's do, and the log names it.
@@ -6683,6 +6698,12 @@ FlatRuntimeDrawScope::FlatRuntimeDrawScope(ID3D11DeviceContext* context, uint32_
         if (verdictConflicting) reportConflict(s);
         // What the view held when it had no motion source (section 104); the line names it.
         if (selected.reason == FlatMonoReason::NoSupportedSource) { s.sourcelessLast = selected.sourceless; s.sourcelessLastFrame = s.prefix.frame; }
+        if (selected.reason == FlatMonoReason::NoSupportedSource) {
+            // The stock draws the verdict counted, as the frame's prefix holds them now (the same draws the selector was given).
+            for (uint32_t i = 0; i < kFlatFamilyVetoKinds; ++i) s.vetoLast[i] = s.prefix.familyVetoes[i];
+            s.vetoLastKinds = s.prefix.familyVetoKinds; s.vetoLastOverflowDraws = s.prefix.familyVetoOverflowDraws;
+            s.frameVetoByFamily = selected.sourceless.vetoFamilyDraws != 0;
+        }
         noteSourceFreeContent(s, selected);
         // What the selector made of a frame whose glow pass the first-person path admitted (2026-10-29): selected or why not, whether it
         // took a source, and whether the camera it took is the world's. Six lines at most, ten seconds apart.

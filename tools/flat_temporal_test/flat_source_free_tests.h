@@ -59,6 +59,58 @@ inline int flatSourceFreeTests() {
         expect(plain.prefix->unsupportedFamilyDraws == 0, "a frame whose draws carry no flag counts none (every recorded trace of an older build)");
     }
 
+    // -- 2026-11-08: the draws behind a veto are named (a flat report of DLSS dropping to spatial in ground-and-sky views) --
+    {
+        Stream stock; stock.sceneDraws(0, 4); stock.stockFamilyDraw(); stock.toneTrigger();
+        const FlatMonoFrame c = stock.select();
+        expect(c.reason == FlatMonoReason::NoSupportedSource && c.sourceless.vetoFamilyDraws == 1 && c.sourceless.vetoPoolDraws == 0 &&
+                   c.sourceless.depth == stock.sc.hDepth,
+               "a refusal says which cause made it: one stock family draw, no unsupported pool record, and the depth its summary is about");
+        const FlatFamilyVeto& named = stock.prefix->familyVetoes[0];
+        expect(stock.prefix->familyVetoKinds == 1 && named.draws == 1 && named.vs == 0xA1 && named.ps == 0xB9 && named.depth == stock.sc.hDepth && named.color,
+               "the stock draw is named by its shaders, its depth and the colour target it wrote");
+        Stream plainView; plainView.sceneDraws(0, 4); plainView.toneTrigger();
+        const FlatMonoFrame f = plainView.select();
+        expect(f.selected() && f.sourceFree && f.sourceless.vetoFamilyDraws == 0 && f.sourceless.vetoPoolDraws == 0 && plainView.prefix->familyVetoKinds == 0,
+               "a scene taken source-free names no veto");
+
+        Stream table; table.sceneDraws(0, 1);
+        const auto stockOf = [&](uint64_t vs) {
+            FlatRuntimeDraw d = table.make(nullptr, table.sc.hDepth, table.sc.hW, table.sc.hH, 26, vs, 0xB9, true, false);
+            d.poolFamilyVs = true;
+            return d;
+        };
+        table.draw(stockOf(1)); table.draw(stockOf(1)); table.draw(stockOf(2));
+        expect(table.prefix->familyVetoKinds == 2 && table.prefix->familyVetoes[0].draws == 2 && table.prefix->familyVetoes[1].draws == 1 &&
+                   table.prefix->familyVetoOverflowDraws == 0 && !table.prefix->familyVetoes[0].color,
+               "draws of one (vs, ps, depth) share an entry and another key is its own; a depth-only draw names no colour target");
+        for (uint64_t vs = 3; vs <= 7; ++vs) table.draw(stockOf(vs));
+        expect(table.prefix->familyVetoKinds == kFlatFamilyVetoKinds && table.prefix->familyVetoOverflowDraws == 3 && table.prefix->unsupportedFamilyDraws == 8,
+               "past the table's kinds the draws are counted and not kept, and the verdict's own count is untouched");
+
+        FlatSourceVetoWindow w;
+        w.frame(true, false, true, true); w.frame(true, false, false, false); w.frame(false, true, true, false); w.frame(false, true, false, false);
+        expect(w.frames == 4 && w.withFamily == 2 && w.withFamilySelected == 1 && w.refusedByFamily == 1 && w.refusedByPool == 1,
+               "the window counts frames with a stock draw, those selected anyway, and the refusals by cause");
+        char line[3072]{};
+        FlatMonoSourceless last{};
+        int hdrDepth = 0, otherDepth = 0;
+        last.depth = &hdrDepth; last.vetoFamilyDraws = 2;
+        FlatFamilyVeto v[kFlatFamilyVetoKinds]{};
+        v[0].vs = 0x11; v[0].ps = 0x22; v[0].depth = &hdrDepth; v[0].draws = 3; v[0].count = 600; v[0].width = 1664; v[0].height = 702; v[0].color = true; v[0].camera = true;
+        v[1].vs = 0x33; v[1].ps = 0x44; v[1].depth = &otherDepth; v[1].draws = 1; v[1].count = 6;
+        flatSourceVetoLine(line, sizeof(line), w, last, 4305, v, 2, 0);
+        expect(std::strstr(line, "flat source veto 5s: frames=4 with-stock-family=2 of-those-selected=1 refused-by-family=1 refused-by-pool=1; "
+                                 "last refused frame=4305: stock-family-draws=2 unsupported-pool-draws=0 kinds=2 past-the-kinds=0; stock draws: ") == line,
+               "the veto line keeps its key and prints the window and the last refusal's causes");
+        expect(std::strstr(line, "[VS=0000000000000011 PS=0000000000000022 draws=3 index-count=600 depth=hdr target=1664x702 color=1 camera=1]") != nullptr &&
+                   std::strstr(line, "[VS=0000000000000033 PS=0000000000000044 draws=1 index-count=6 depth=other target=0x0 color=0 camera=0]") != nullptr,
+               "each stock draw says whether it wrote the HDR's own depth or another");
+        flatSourceVetoLine(line, sizeof(line), FlatSourceVetoWindow{}, FlatMonoSourceless{}, 0, v, 0, 0);
+        expect(std::strstr(line, "frames=0 with-stock-family=0") != nullptr && std::strstr(line, "stock draws: none") != nullptr,
+               "a window with nothing to name prints its zeros and `none`, so it reads differently from a build that has no line");
+    }
+
     // -- the trace carries the flag, and an older trace has none --
     {
         Stream s;
@@ -302,6 +354,30 @@ inline int flatSourceFreeWiringTests() {
                     {"if(s.frameSourceFree)s.sourceSpell.sourceFreeFrame(s.treated&&SUCCEEDED(hr));", "if(!s.treated||FAILED(hr))reset();"}),
            "mutation control: a frame nobody counts fails the wiring");
     expect(count(runtime, "s.treated=false;s.frameSourceFree=false;") == 1, "the flag is cleared with the frame's other naming state");
+
+    // -- 2026-11-08: the veto's names are kept where the count is made, handed over at the refusal, counted at the frame's end, printed --
+    const auto vetoModelValid = [&](const std::string& text) {
+        return ordered(text, {"if(d.poolFamilyVs)flatRuntimeNoteFamilyVeto(p,d.key);", "if(d.poolFamilyVs)++p.unsupportedFamilyDraws;", "if(!k.color)returnout;"});
+    };
+    expect(vetoModelValid(model), "the model names each stock family draw beside its count, before the return for a draw with no colour target");
+    expect(!vetoModelValid(without(model, "if(d.poolFamilyVs)flatRuntimeNoteFamilyVeto(p,d.key);")),
+           "mutation control: a count with no names fails the wiring");
+    const std::string vetoCauses = "out.sourceless.vetoFamilyDraws=in.unsupportedFamilyDraws;out.sourceless.vetoPoolDraws=out.unsupportedDraws;";
+    expect(count(mono, vetoCauses + refuseOrFree) == 1 && count(hdr, vetoCauses + refuseOrFree) == 1,
+           "both selectors write the refusal's two causes into its summary immediately before they decide");
+    expect(count(without(hdr, vetoCauses.c_str()), vetoCauses + refuseOrFree) == 0, "mutation control: a selector that never says why fails the wiring");
+    const auto vetoRuntimeValid = [&](const std::string& text) {
+        return ordered(text, {"s.vetoWindow.frame(endedReason==FlatMonoReason::NoSupportedSource,endedSeen==FlatFrameSeen::Treatable,"
+                              "s.prefix.unsupportedFamilyDraws!=0,s.frameVetoByFamily);", "s.frameVetoByFamily=false;"}) &&
+               ordered(text, {"flatSourceSpellLine(line,sizeof(line),w,s.sourcelessLast,s.sourcelessLastFrame,notes,part);",
+                              "flatSourceVetoLine(line,sizeof(line),s.vetoWindow,s.sourcelessLast,s.sourcelessLastFrame,s.vetoLast,s.vetoLastKinds,"
+                              "s.vetoLastOverflowDraws);Log::get().note(\"%s\",line);", "s.vetoWindow=FlatSourceVetoWindow{};"}) &&
+               ordered(text, {"s.vetoLastKinds=s.prefix.familyVetoKinds;", "s.frameVetoByFamily=selected.sourceless.vetoFamilyDraws!=0;",
+                              "noteSourceFreeContent(s,selected);"});
+    };
+    expect(vetoRuntimeValid(runtime), "the runtime keeps the refusal's names, counts each frame by cause, clears the flag, and prints the line every window");
+    expect(!vetoRuntimeValid(without(runtime, "s.vetoWindow=FlatSourceVetoWindow{};")), "mutation control: a window never taken fails the wiring");
+    expect(!vetoRuntimeValid(without(runtime, "s.frameVetoByFamily=false;")), "mutation control: a verdict flag that outlives its frame fails the wiring");
 
     // -- the engine's views from nothing --
     const std::string views = compact(body(engineSource, "bool engineVelocityPrepareSourceFree("));
