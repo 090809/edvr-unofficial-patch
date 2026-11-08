@@ -24,6 +24,7 @@
 #include "flat_compute_readback.h"
 #include "journal_watch.h"
 #include "shader_swap.h"
+#include "temporal_shader_bytecode.h"   // kConcourse*Bytecode: the bake, backdrop and pane shaders, compiled at build time (tools/temporal_shader_build, concourse_pane_shaders.h)
 #include "tonemap_admit.h"            // TEMPORARY (the VR bake): the game's tonemap draw, recognised structurally
 
 namespace edvr {
@@ -257,6 +258,8 @@ void queueToast(const char* text) noexcept {
     g_toastDue = true;
 }
 void releaseBackdrop() noexcept;
+void releaseBackdropShaders() noexcept;
+std::atomic<ID3D11Device*> g_bdShaderDevice{nullptr};   // the device the three backdrop pixel shaders were made on: compared only, never held (they outlive releaseBackdrop, like g_csBake)
 
 constexpr UINT kPaneSrvFirst = 8;
 constexpr UINT kPaneSrvCount = 3;
@@ -452,6 +455,7 @@ void shaderHashes(ID3D11DeviceContext* ctx, uint64_t* vs, uint64_t* ps) noexcept
 void releaseStates() noexcept {
     // The draw threads may hold the pointers for one more draw, and the old device owns the objects: not released (a device change is rare).
     releaseBackdrop();   // the exception: the cube is about 230 MB
+    releaseBackdropShaders();   // the device is gone or going: the shaders belong to it
     g_statesReady.store(false, std::memory_order_release);
     g_bsFactor.store(nullptr, std::memory_order_release);
     g_bsMirror.store(nullptr, std::memory_order_release);
@@ -509,8 +513,7 @@ void makeWhitePs(ID3D11Device* device) noexcept {
     ID3D11DeviceContext* imm = nullptr;
     device->GetImmediateContext(&imm);
     if (!imm) return;
-    static const char kWhite[] = "float4 main() : SV_Target { return float4(1.0, 1.0, 1.0, 1.0); }\n";
-    ID3D11PixelShader* ps = shaderSwapCompilePs(imm, kWhite, sizeof(kWhite) - 1, "main", "concourse_pane_white", nullptr, "concourse pane");
+    ID3D11PixelShader* ps = shaderSwapCreatePs(imm, kConcourseWhiteBytecode, sizeof(kConcourseWhiteBytecode), "concourse_pane_white", "concourse pane");
     imm->Release();
     g_psWhite.store(ps, std::memory_order_release);
     if (!ps) Log::get().note("concourse pane: the white pixel shader did not compile; tint multiplies the game's own colour, so a dark pane stays dark");
@@ -519,30 +522,14 @@ void makeWhitePs(ID3D11Device* device) noexcept {
 // The steady pane's pixel shader: it replaces the glass shader for the whole pane (one flat opaque draw, so the glass shader's reflection of a horizon cannot show).
 // Its inputs are the first two outputs of the glass vertex shader (matched by name and order). The level is told by how much the pane faces the anchor's up axis:
 // overhead (sky), angled, other. A zero `up` gives `other`. A failed compile is logged once and the steady mode falls back to the plain mirror.
-// The steady colour of a pane from its lighting normal and b2 (up, the levels, the colour): shared by the steady shader and the backdrop's fallback, so the two are the same text.
-static const char kSkyCommon[] =
-    "cbuffer GlowCb : register(b2) { float4 up; float4 lv; float4 colour; float4 par; float4 glassA; float4 glassB; };\n"
-    "float3 fallbackColour(float3 n) {\n"
-    "    float ul = length(up.xyz);\n"
-    "    float3 nn = n * rsqrt(max(dot(n, n), 1e-12));\n"
-    "    float d = ul > 0.5 ? abs(dot(nn, up.xyz / ul)) : 0.0;\n"
-    "    float lvl = lerp(lv.z, lv.y, smoothstep(0.35, 0.6, d));\n"
-    "    lvl = lerp(lvl, lv.x, smoothstep(0.92, 0.98, d));\n"
-    "    return colour.rgb * lvl;\n"
-    "}\n";
-
+// The pane's shader texts (the steady pixel shader's, the backdrop's, the bake's) are in concourse_pane_shaders.h and compiled at build time (kConcourse*Bytecode).
 void makeSkyPs(ID3D11Device* device) noexcept {
     if (g_psSkyTried) return;
     g_psSkyTried = true;
     ID3D11DeviceContext* imm = nullptr;
     device->GetImmediateContext(&imm);
     if (!imm) return;
-    static const std::string kSky = std::string(kSkyCommon) +
-        "struct PsIn { nointerpolation uint face : __USER_VERTEX_FACEINVARIANT0; float3 n : __USER_VERTEX_M_LIGHTINGNORMAL0; };\n"
-        "float4 main(PsIn i) : SV_Target {\n"
-        "    return float4(fallbackColour(i.n), 1.0);\n"
-        "}\n";
-    ID3D11PixelShader* ps = shaderSwapCompilePs(imm, kSky.c_str(), kSky.size(), "main", "concourse_pane_sky", nullptr, "concourse pane");
+    ID3D11PixelShader* ps = shaderSwapCreatePs(imm, kConcourseSkyBytecode, sizeof(kConcourseSkyBytecode), "concourse_pane_sky", "concourse pane");
     imm->Release();
     g_psSky.store(ps, std::memory_order_release);
     if (!ps) Log::get().note("concourse pane: the steady pixel shader did not compile; mirror-steady draws the plain mirror");
@@ -1464,9 +1451,8 @@ void releaseBackdrop() noexcept {
     releaseAtomic(g_bdFront);
     releaseAtomic(g_bdDistBack);
     releaseAtomic(g_bdDistFront);
-    releaseAtomic(g_psBdShow);
-    releaseAtomic(g_psBdCapture);
-    releaseAtomic(g_psBdProbe);
+    // The three backdrop pixel shaders are not released here: they are made per device, like g_csBake, and kept across the cube's release so a concourse entry does not
+    // create them again (releaseBackdropShaders, from releaseStates, and makeBackdropShaders on a device change).
     releaseAtomic(g_bdSampler);
     std::lock_guard<std::mutex> lock(g_bdMutex);
     g_bdSceneW = g_bdSceneH = 0;
@@ -1474,6 +1460,13 @@ void releaseBackdrop() noexcept {
     g_bdDepthW = g_bdDepthH = 0;
     g_bdDepthFmt = DXGI_FORMAT_UNKNOWN;
     g_bdSceneFmtText[0] = '\0';
+}
+
+void releaseBackdropShaders() noexcept {
+    releaseAtomic(g_psBdShow);
+    releaseAtomic(g_psBdCapture);
+    releaseAtomic(g_psBdProbe);
+    g_bdShaderDevice.store(nullptr, std::memory_order_release);
 }
 const char* bdFormatName(DXGI_FORMAT f, char* fb, size_t cap) noexcept {
     switch (f) {
@@ -1563,12 +1556,6 @@ void backdropReset(ID3D11Device* device) noexcept {
     if (had) Log::get().note("concourse backdrop: the cube is emptied and the origin forgotten (a new visit; it held %u capture%s)", n, n == 1 ? "" : "s");
 }
 
-static std::string bdFloatText(double v) {
-    char b[40];
-    std::snprintf(b, sizeof(b), "%.9g", v);
-    return b;
-}
-
 // The capture shader (an exterior pane's pixel) and the display shader. Both declare the glass vertex shader's outputs in order (v0 face, v1 lighting normal, v2 lighting
 // position = the world position relative to the camera, INFERRED); the capture shader also declares what lies before SV_POSITION in the game's own pixel shader (v3 tangent,
 // v4 texcoord). Both read cb1[275].xyz as the camera in the game's world frame (the glass constant buffer, bound at b1 by the game and left alone) and an origin O from a
@@ -1579,138 +1566,32 @@ static std::string bdFloatText(double v) {
 //   Display, per pixel: the constant-buffer rows and 1 buffer load; None: 6 cube samples (lods 0 1 2 3 5 7). Sphere: the same, with the direction moved. Depth: a march of the distance
 //   cube, cc::kBackdropMarchSteps at lod 1 and cc::kBackdropMarchBisections at lod 0 at most, and the final 6. Mips fill the holes the splat leaves: the lookup composites lod 0 over the
 //   premultiplied coarser lods front to back.
+// Made once per device and kept across releaseBackdrop (the cube's release when the station is left behind): a concourse entry used to compile all three here, 150-220 ms of
+// the render thread together with the bake shader. They are precompiled (kConcourse*Bytecode, texts in concourse_pane_shaders.h) and created from bytes; a different device
+// makes them again. One log line each from shaderSwapCreatePs, on the first entry only.
 bool makeBackdropShaders(ID3D11Device* device) noexcept {
+    if (g_bdShaderDevice.load(std::memory_order_acquire) != device) {
+        releaseBackdropShaders();
+        g_bdShaderDevice.store(device, std::memory_order_release);
+    }
+    if (g_psBdShow.load(std::memory_order_acquire) && g_psBdCapture.load(std::memory_order_acquire) && g_psBdProbe.load(std::memory_order_acquire)) return true;
     ID3D11DeviceContext* imm = nullptr;
     device->GetImmediateContext(&imm);
     if (!imm) return false;
-    const std::string cb1 = "cbuffer Cb1 : register(b1) { float4 cb1[327]; };\n";
-    // The display and the probe share everything up to main: the inputs, the resources, the look-up and the direction `s` (what the pane looks up).
-    const std::string head = std::string(kSkyCommon) + cb1 +
-        "struct PsIn { nointerpolation uint face : __USER_VERTEX_FACEINVARIANT0; float3 n : __USER_VERTEX_M_LIGHTINGNORMAL0; float3 wp : __USER_VERTEX_M_LIGHTINGPOSITION0; };\n"
-        "TextureCube<float4> backdrop : register(t8);\n"
-        "TextureCube<float> distMap : register(t9);\n"
-        "Buffer<float4> originBuf : register(t10);\n"
-        "SamplerState backdropSmp : register(s7);\n"
-        // The composite of lods 0 1 2 3 5 7 (up to lastLod), each plus the glass's blur, front to back over premultiplied colour.
-        "float4 lookup(float3 s, float blur, float lastLod) {\n"
-        "    float4 acc = float4(0, 0, 0, 0);\n"
-        "    static const float L[6] = {0.0, 1.0, 2.0, 3.0, 5.0, 7.0};\n"
-        "    [unroll] for (int k = 0; k < 6; ++k) {\n"
-        "        if (L[k] <= lastLod) {\n"
-        "            float4 c = backdrop.SampleLevel(backdropSmp, s, L[k] + blur);\n"
-        "            acc.rgb += (1.0 - acc.a) * c.rgb;\n"
-        "            acc.a += (1.0 - acc.a) * c.a;\n"
-        "        }\n"
-        "    }\n"
-        "    return acc;\n"
-        "}\n"
-        // `t` is how far along the view's ray the picture lies. In the depth mode it is a march along the ray against the distance cube: even steps in 1 / t, which are even steps of
-        // parallax, until the ray passes behind what the cube holds, then a bisection. Flight 29's look-up repeated t = the distance at the last guess's direction: it does not settle at an
-        // edge, so edges rippled and swam as the camera moved. A texel with no distance is not a surface.
-        "float3 backdropS(PsIn i, out float3 dir, out float t) {\n"
-        "    dir = i.wp * rsqrt(max(dot(i.wp, i.wp), 1e-12));\n"
-        "    float3 off = cb1[275].xyz - originBuf[0].xyz;\n"
-        "    float3 s = dir;\n"
-        "    float mode = par.x;\n"
-        "    float R = max(par.y, 1.0);\n"
-        "    t = " + bdFloatText(cc::kBackdropFarM) + ";\n"
-        "    if (mode > 0.5) {\n"
-        "        float b = dot(off, dir);\n"
-        "        float cq = dot(off, off) - R * R;\n"
-        "        t = -b + sqrt(max(b * b - cq, 0.0));\n"
-        "        if (mode > 1.5) {\n"
-        "            const float uFar = 1.0 / " + bdFloatText(cc::kBackdropFarM) + ";\n"
-        "            const float uNear = 1.0 / " + bdFloatText(cc::kBackdropMarchNearM) + ";\n"
-        "            const float du = (uNear - uFar) / " + std::to_string(cc::kBackdropMarchSteps) + ".0;\n"
-        "            float outside = uNear, inside = uFar;\n"
-        "            bool hit = false;\n"
-        "            [loop] for (int k = 1; k <= " + std::to_string(cc::kBackdropMarchSteps) + "; ++k) {\n"
-        "                float u = uNear - du * k;\n"
-        "                float3 rel = off + dir / u;\n"
-        "                float r = distMap.SampleLevel(backdropSmp, rel, 1.0);\n"
-        "                if (r >= 1.0 && dot(rel, rel) >= r * r) { inside = u; hit = true; break; }\n"
-        "                outside = u;\n"
-        "            }\n"
-        "            t = 1.0 / uFar;\n"
-        "            if (hit) {\n"
-        "                [loop] for (int k = 0; k < " + std::to_string(cc::kBackdropMarchBisections) + "; ++k) {\n"
-        "                    float u = 0.5 * (outside + inside);\n"
-        "                    float3 rel = off + dir / u;\n"
-        "                    float r = distMap.SampleLevel(backdropSmp, rel, 0.0);\n"
-        "                    if (r >= 1.0 && dot(rel, rel) >= r * r) inside = u; else outside = u;\n"
-        "                }\n"
-        "                t = 2.0 / (outside + inside);\n"
-        "            }\n"
-        "        }\n"
-        "        s = off + dir * t;\n"
-        "    }\n"
-        "    return s;\n"
-        "}\n";
-    // Display: glass after the composite. Tint on the captured colour (premultiplied, so only where captured), the level colour under what is not captured (the fallback,
-    // unchanged), then the glass's own sheen: haze plus a Fresnel term at grazing angles, mixing toward the level colour. Samples: the look-up's 6 (blur is a bias, not
-    // extra samples) plus, in the depth mode, the march's steps and bisections at most, 1 buffer load, the constant-buffer rows.
-    // The depth is the picture's, not the glass's: the camera's motion is worked out from depth for DLAA and the other temporal resolves, so at the glass's depth a far picture moves as
-    // if it were on the glass, and its history lands in the wrong place whenever the camera moves. cb1[270..272].w are the view's forward axis, and cb1[273].z the near plane: reversed
-    // infinite depth is near / view depth. The game's depth test stays, so what stands in front of the glass stays in front.
-    const std::string show = head +
-        "float4 main(PsIn i, out float pictureDepth : SV_Depth) : SV_Target {\n"
-        "    float3 fb = fallbackColour(i.n);\n"
-        "    float3 dir;\n"
-        "    float t;\n"
-        "    float3 s = backdropS(i, dir, t);\n"
-        "    pictureDepth = cb1[273].z / max(t * dot(dir, float3(cb1[270].w, cb1[271].w, cb1[272].w)), 1.0);\n"
-        "    float4 acc = lookup(s, glassB.x, 7.0);\n"
-        // Flight 25: a hole took the window's level, and that is 4 on a skylight: white shapes where the bake left the room's things out. Colour over coverage takes the neighbours'
-        // colour instead, and only a direction with nothing near it falls back. The sheen is the level's colour at no more than 1, so a bright window is not a washed-out one.
-        "    float3 base = (acc.a > 0.02 ? acc.rgb / acc.a : fb) * glassA.rgb;\n"
-        "    float3 sheen = fb / max(max(fb.r, max(fb.g, fb.b)), 1.0);\n"
-        "    float f = glassB.y * pow(saturate(1.0 - abs(dot(i.n * rsqrt(max(dot(i.n, i.n), 1e-12)), dir))), 5.0);\n"
-        "    return float4(lerp(base, sheen, saturate(glassA.w + f)), 1.0);\n"
-        "}\n";
-    // Probe: the same direction and the same blur; a pixel whose composite coverage through lod 3 is under one half survives, and the occlusion count is those pixels.
-    const std::string probe = head +
-        "float4 main(PsIn i) : SV_Target {\n"
-        "    float3 dir;\n"
-        "    float t;\n"
-        "    float3 s = backdropS(i, dir, t);\n"
-        "    float4 acc = lookup(s, glassB.x, 3.0);\n"
-        "    clip(0.5 - acc.a);\n"
-        "    return float4(0, 0, 0, 0);\n"
-        "}\n";    const std::string capture = std::string(cc::cubeTexelHlsl()) + cb1 +
-        "struct PsIn { nointerpolation uint face : __USER_VERTEX_FACEINVARIANT0; float3 n : __USER_VERTEX_M_LIGHTINGNORMAL0; float3 wp : __USER_VERTEX_M_LIGHTINGPOSITION0;\n"
-        "              float3 tg : __USER_VERTEX_M_LIGHTINGTANGENT0; float2 uv : __USER_VERTEX_M_TEXCOORD0; float4 p : SV_POSITION; };\n"
-        "Texture2D<float4> scene : register(t8);\n"
-        "Texture2D<float> sceneDepth : register(t9);\n"
-        "Buffer<float4> originBuf : register(t10);\n"
-        "RWTexture2DArray<float> distCube : register(u6);\n"
-        "RWTexture2DArray<float4> cube : register(u7);\n"
-        "[earlydepthstencil]\n"
-        "void main(PsIn i) {\n"
-        "    float3 keep = (i.face == 0xDEADBEEFu) ? float3(i.tg.x, i.n.y + i.uv.x, i.n.z) : float3(0, 0, 0);\n"   // never true: keeps v3 and v4 in the signature
-        "    float3 dir = i.wp + keep;\n"
-        "    float dl = dot(dir, dir);\n"
-        "    if (dl < 1e-12) return;\n"
-        "    dir *= rsqrt(dl);\n"
-        "    float z = sceneDepth.Load(int3(i.p.xy, 0));\n"
-        "    float vd = z > 0.0 ? " + bdFloatText(cc::kBackdropNearZ) + " / z : " + bdFloatText(cc::kBackdropFarM) + ";\n"
-        "    float t = min(vd / max(abs(dot(cb1[279].xyz, dir)), 1e-3), " + bdFloatText(cc::kBackdropFarM) + ");\n"
-        "    if (t < " + bdFloatText(cc::kBackdropMinDistM) + ") return;\n"
-        "    float3 rel = cb1[275].xyz + dir * t - originBuf[0].xyz;\n"
-        "    float rl = length(rel);\n"
-        "    if (!(rl > 1e-3)) return;\n"
-        "    uint3 tx = cubeTexel(rel, " + std::to_string(cc::kBackdropCubeSize) + "u);\n"
-        "    float3 c = clamp(scene.Load(int3(i.p.xy, 0)).rgb, 0.0, 60000.0);\n"
-        "    cube[tx] = float4(c, 1.0);\n"
-        "    distCube[tx] = clamp(rl, 1.0, " + bdFloatText(cc::kBackdropFarM) + ");\n"
-        "}\n";
-    ID3D11PixelShader* psShow = shaderSwapCompilePs(imm, show.c_str(), show.size(), "main", "concourse_backdrop_show", nullptr, "concourse backdrop");
-    ID3D11PixelShader* psCap = shaderSwapCompilePs(imm, capture.c_str(), capture.size(), "main", "concourse_backdrop_capture", nullptr, "concourse backdrop");
-    ID3D11PixelShader* psProbe = shaderSwapCompilePs(imm, probe.c_str(), probe.size(), "main", "concourse_backdrop_probe", nullptr, "concourse backdrop");
+    ID3D11PixelShader* psShow = g_psBdShow.load(std::memory_order_acquire);
+    ID3D11PixelShader* psCap = g_psBdCapture.load(std::memory_order_acquire);
+    ID3D11PixelShader* psProbe = g_psBdProbe.load(std::memory_order_acquire);
+    ID3D11PixelShader* madeShow = nullptr;
+    ID3D11PixelShader* madeCap = nullptr;
+    ID3D11PixelShader* madeProbe = nullptr;
+    if (!psShow) psShow = madeShow = shaderSwapCreatePs(imm, kConcourseBackdropShowBytecode, sizeof(kConcourseBackdropShowBytecode), "concourse_backdrop_show", "concourse backdrop");
+    if (!psCap) psCap = madeCap = shaderSwapCreatePs(imm, kConcourseBackdropCaptureBytecode, sizeof(kConcourseBackdropCaptureBytecode), "concourse_backdrop_capture", "concourse backdrop");
+    if (!psProbe) psProbe = madeProbe = shaderSwapCreatePs(imm, kConcourseBackdropProbeBytecode, sizeof(kConcourseBackdropProbeBytecode), "concourse_backdrop_probe", "concourse backdrop");
     imm->Release();
     if (!psShow || !psCap || !psProbe) {
-        if (psShow) psShow->Release();
-        if (psCap) psCap->Release();
-        if (psProbe) psProbe->Release();
+        if (madeShow) madeShow->Release();
+        if (madeCap) madeCap->Release();
+        if (madeProbe) madeProbe->Release();
         return bdRefuse(!psShow ? "the display pixel shader did not compile" : !psCap ? "the capture pixel shader did not compile" : "the probe pixel shader did not compile");
     }
     g_psBdShow.store(psShow, std::memory_order_release);
@@ -1748,16 +1629,8 @@ bool makeBackdropResources(ID3D11Device* device) noexcept {
     if (!bdFormatOk(device, cfmt, "R16G16B16A16_FLOAT") || !bdFormatOk(device, dfmt, "R16_FLOAT")) return false;
     const UINT size = cc::kBackdropCubeSize;
     const UINT mips = bdMipCount();
-    std::vector<uint8_t> zero(static_cast<size_t>(size) * size * 8u, 0);   // zero everywhere (alpha 0: nothing captured); the distance cube uses its first two bytes a texel
-    D3D11_SUBRESOURCE_DATA cinit[6], dinit[6];
-    for (int k = 0; k < 6; ++k) {
-        cinit[k].pSysMem = zero.data();
-        cinit[k].SysMemPitch = size * 8u;
-        cinit[k].SysMemSlicePitch = size * 8u * size;
-        dinit[k].pSysMem = zero.data();
-        dinit[k].SysMemPitch = size * 2u;
-        dinit[k].SysMemSlicePitch = size * 2u * size;
-    }
+    // No initial data: the back pair used to be uploaded as 12 subresources of zeros (a 33.5 MB vector, about 240 MB of copies, on every entry). They are cleared on the GPU below instead,
+    // before the first read of either (backdropPublishFront reads the back pair; the front pair, never given data, is wholly written by it).
     ID3D11Texture2D* tex[4] = {};   // colour back, colour front, distance back, distance front
     HRESULT h[4] = {};
     for (int k = 0; k < 4; ++k) {
@@ -1771,7 +1644,7 @@ bool makeBackdropResources(ID3D11Device* device) noexcept {
         td.Usage = D3D11_USAGE_DEFAULT;
         td.BindFlags = isBack ? D3D11_BIND_UNORDERED_ACCESS : (D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE);
         td.MiscFlags = D3D11_RESOURCE_MISC_TEXTURECUBE | (isBack ? 0u : D3D11_RESOURCE_MISC_GENERATE_MIPS);
-        h[k] = device->CreateTexture2D(&td, isBack ? (k < 2 ? cinit : dinit) : nullptr, &tex[k]);
+        h[k] = device->CreateTexture2D(&td, nullptr, &tex[k]);
     }
     ID3D11UnorderedAccessView* uav[2] = {};
     ID3D11ShaderResourceView* srv[2] = {};
@@ -1852,8 +1725,20 @@ bool makeBackdropResources(ID3D11Device* device) noexcept {
     }
     ID3D11DeviceContext* imm = nullptr;
     device->GetImmediateContext(&imm);
-    backdropPublishFront(imm);   // the front mips start as zero too
-    if (imm) imm->Release();
+    if (!imm) {
+        releaseBackdrop();
+        return bdRefuse("the cubes could not be cleared (no immediate context)");
+    }
+    {
+        // Both back cubes (one mip, six faces: the UAVs cover all of each) start as zero everywhere (alpha 0: nothing captured), as the uploaded zeros were. Their first reader is
+        // backdropPublishFront just below, in this call; no capture or bake pass can come earlier, as the cube is not published until this returns.
+        FlatComputeInternalScope internal;
+        const FLOAT zero[4] = {};
+        imm->ClearUnorderedAccessViewFloat(uav[0], zero);
+        imm->ClearUnorderedAccessViewFloat(uav[1], zero);
+    }
+    backdropPublishFront(imm);   // the front mips start as zero too: this copies the cleared back mip 0 into front mip 0 and builds the rest
+    imm->Release();
     uint64_t texels = static_cast<uint64_t>(size) * size * 6u;
     const uint64_t mb = (texels * (8u + 2u) + texels * (8u + 2u) * 4u / 3u) >> 20;
     Log::get().note("concourse backdrop: cubes made: %u square x 6, colour R16G16B16A16_FLOAT and distance R16_FLOAT, %u mips on the front pair, about %u MB", static_cast<unsigned>(size),
@@ -2238,56 +2123,7 @@ void vrDrawDiffLog(DiffGroup& g) noexcept {
     std::vector<DiffKey> all;
     uint32_t distinct[kDiffFrames] = {}, dropped = 0;
     for (uint32_t f = 0; f < kDiffFrames; ++f) {
-// The members the constructor leaves alone when nothing is armed (concourse_pane.h), each to the value it was given as a default member initialiser.
-void ConcoursePaneScope::initCold() noexcept {
-    ctx_ = nullptr;
-    calls_ = nullptr;
-    planMirror_ = false;
-    planMark_ = false;
-    planOpaque_ = true;
-    planTint_ = false;
-    planSoft_ = false;
-    planGlow_ = 0.0f;
-    planSteady_ = false;
-    mirrorBound_ = false;
-    planBackdrop_ = false;
-    planCapture_ = false;
-    capDone_ = false;
-    capBound_ = false;
-    planProbe_ = false;
-    probeDone_ = false;
-    probeBound_ = false;
-    probePrevSampler_ = nullptr;
-    capPrevBs_ = nullptr;
-    capPrevFactor0_ = capPrevFactor1_ = capPrevFactor2_ = capPrevFactor3_ = 0.0f;
-    capPrevMask_ = 0;
-    capPrevPs_ = nullptr;
-    for (auto*& s : capPrevSrv_) s = nullptr;
-    capPrevDs_ = nullptr;
-    capPrevRef_ = 0;
-    prevSampler_ = nullptr;
-    planFactor0_ = planFactor1_ = planFactor2_ = planFactor3_ = 1.0f;
-    keyN_ = 0;
-    keyStart_ = 0;
-    keyBase_ = 0;
-    query_ = -1;
-    capQuery_ = -1;
-    testSlot_ = -1;
-    prevBs_ = nullptr;
-    prevFactor0_ = prevFactor1_ = prevFactor2_ = prevFactor3_ = 0.0f;
-    prevMask_ = 0;
-    prevPs_ = nullptr;
-    for (auto*& s : prevSrv_) s = nullptr;
-    prevDs_ = nullptr;
-    prevStencilRef_ = 0;
-    ctx1_ = nullptr;
-    prevCb_ = nullptr;
-    prevCbFirst_ = 0;
-    prevCbNum_ = 0;
-}
-
         std::sort(g.fr[f].keys.begin(), g.fr[f].keys.end(), diffLess);
-    initCold();   // first: nothing reads a cold member before this
         dropped += g.fr[f].dropped;
         for (size_t i = 0; i < g.fr[f].keys.size(); ++i) {
             if (i == 0 || !diffSame(g.fr[f].keys[i], g.fr[f].keys[i - 1])) {
@@ -2402,7 +2238,56 @@ void vrDrawDiffNote(ID3D11DeviceContext* ctx, UINT indexCount, UINT startIndex, 
 
 // begin() changes no state. It runs the capture path, the withheld check, the family match, the one-shot material read and the share query, then only DECIDES the
 // plan (a mirror draw or none, marked or not, opaque or fading) and opens the side test's first query when one is due.
+// The members the constructor leaves alone when nothing is armed (concourse_pane.h), each to the value it was given as a default member initialiser.
+void ConcoursePaneScope::initCold() noexcept {
+    ctx_ = nullptr;
+    calls_ = nullptr;
+    planMirror_ = false;
+    planMark_ = false;
+    planOpaque_ = true;
+    planTint_ = false;
+    planSoft_ = false;
+    planGlow_ = 0.0f;
+    planSteady_ = false;
+    mirrorBound_ = false;
+    planBackdrop_ = false;
+    planCapture_ = false;
+    capDone_ = false;
+    capBound_ = false;
+    planProbe_ = false;
+    probeDone_ = false;
+    probeBound_ = false;
+    probePrevSampler_ = nullptr;
+    capPrevBs_ = nullptr;
+    capPrevFactor0_ = capPrevFactor1_ = capPrevFactor2_ = capPrevFactor3_ = 0.0f;
+    capPrevMask_ = 0;
+    capPrevPs_ = nullptr;
+    for (auto*& s : capPrevSrv_) s = nullptr;
+    capPrevDs_ = nullptr;
+    capPrevRef_ = 0;
+    prevSampler_ = nullptr;
+    planFactor0_ = planFactor1_ = planFactor2_ = planFactor3_ = 1.0f;
+    keyN_ = 0;
+    keyStart_ = 0;
+    keyBase_ = 0;
+    query_ = -1;
+    capQuery_ = -1;
+    testSlot_ = -1;
+    prevBs_ = nullptr;
+    prevFactor0_ = prevFactor1_ = prevFactor2_ = prevFactor3_ = 0.0f;
+    prevMask_ = 0;
+    prevPs_ = nullptr;
+    for (auto*& s : prevSrv_) s = nullptr;
+    prevDs_ = nullptr;
+    prevStencilRef_ = 0;
+    ctx1_ = nullptr;
+    prevCb_ = nullptr;
+    prevCbFirst_ = 0;
+    prevCbNum_ = 0;
+}
+
 void ConcoursePaneScope::begin(ID3D11DeviceContext* ctx, UINT indexCount, UINT startIndex, INT baseVertex, char kind, const ConcoursePaneCalls& calls) noexcept {
+    initCold();   // first: nothing reads a cold member before this
     beginBody(ctx, indexCount, startIndex, baseVertex, calls);
     // TEMPORARY (H62 instrument, Flight 53): the VR bake's draw diff sees every draw of the scene pass, after the decisions above (a draw withheld here is not drawn).
     if (ctx && !withheld_ && g_vrDiffOn.load(std::memory_order_relaxed)) vrDrawDiffNote(ctx, indexCount, startIndex, baseVertex, kind);
@@ -3519,53 +3404,13 @@ bool bakeMakeCompute(ID3D11Device* device) noexcept {
         g_bakeDevice = device;
     }
     if (!g_csBake) {
-        typedef HRESULT(WINAPI * PfnCompile)(LPCVOID, SIZE_T, LPCSTR, const void*, void*, LPCSTR, LPCSTR, UINT, UINT, ID3DBlob**, ID3DBlob**);
-        static PfnCompile compile = nullptr;
-        if (!compile) {
-            HMODULE mod = LoadLibraryW(L"d3dcompiler_47.dll");   // never freed: a blob's vtable lives in it (depth_writer_probe.cpp)
-            if (mod) compile = reinterpret_cast<PfnCompile>(GetProcAddress(mod, "D3DCompile"));
-        }
-        if (!compile) return bdRefuse("the bake: d3dcompiler_47.dll was not found");
-        const std::string hlsl = std::string(cc::cubeDirHlsl()) +
-            "cbuffer C : register(b0) { row_major float4x4 m; row_major float4x4 inv; float4 rel; float4 size; };\n"
-            "Texture2D<float4> scene : register(t0);\n"
-            "Texture2D<float> sceneDepth : register(t1);\n"
-            "SamplerState smp : register(s0);\n"
-            "RWTexture2DArray<float> distCube : register(u0);\n"
-            "RWTexture2DArray<float4> cube : register(u1);\n"
-            "[numthreads(32, 32, 1)]\n"
-            "void main(uint3 id : SV_DispatchThreadID) {\n"
-            "    float3 d = normalize(cubeDir(id.z, (float2(id.xy) + 0.5) / " + std::to_string(cc::kBackdropCubeSize) + ".0));\n"
-            "    float4 c = mul(m, float4(d, 0.0));\n"
-            "    if (c.w <= 1e-4) return;\n"
-            "    float2 ndc = c.xy / c.w;\n"
-            "    if (abs(ndc.x) >= 1.0 || abs(ndc.y) >= 1.0) return;\n"
-            // Only this frame's own 90 degrees across, not all of its 121. The near plane clips a box around the centre only if each direction is taken from the frame looking along it: an
-            // overlap would let a frame that clips a point overwrite the one that kept it, and draw a seam along the frame's edge.
-            "    if (abs(ndc.x) * size.x / size.y > 1.002) return;\n"
-            "    float2 uv = float2(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);\n"
-            "    float z = sceneDepth.Load(int3(uv * size.xy, 0));\n"
-            "    float t = size.w;\n"
-            "    if (z > 0.0) { float4 b = mul(inv, float4(ndc, z, 1.0)); t = min(length(b.xyz / b.w), size.w); }\n"
-            "    float rl = length(rel.xyz + d * t);\n"
-            "    if (!(rl > size.z)) return;\n"
-            "    cube[id] = float4(clamp(scene.SampleLevel(smp, uv, 0.0).rgb, 0.0, 60000.0), 1.0);\n"
-            "    distCube[id] = clamp(rl, 1.0, size.w);\n"
-            "}\n";
-        ID3DBlob* code = nullptr;
-        ID3DBlob* errors = nullptr;
-        const HRESULT hr = compile(hlsl.c_str(), hlsl.size(), "concourse_bake", nullptr, nullptr, "main", "cs_5_0", 0, 0, &code, &errors);
-        if (errors) {
-            if (FAILED(hr)) Log::get().note("concourse bake: the shader: %.400s", static_cast<const char*>(errors->GetBufferPointer()));
-            errors->Release();
-        }
-        if (FAILED(hr) || !code) {
-            if (code) code->Release();
-            return bdRefuse("the bake: the shader did not compile");
-        }
-        const HRESULT hc = device->CreateComputeShader(code->GetBufferPointer(), code->GetBufferSize(), nullptr, &g_csBake);
-        code->Release();
-        if (FAILED(hc) || !g_csBake) return bdRefuse("the bake: the shader did not create");
+        // Precompiled (kConcourseBakeBytecode, text in concourse_pane_shaders.h): the compile used to run here on the render thread at every concourse entry.
+        ID3D11DeviceContext* imm = nullptr;
+        device->GetImmediateContext(&imm);
+        if (!imm) return bdRefuse("the bake: the shader did not create");
+        g_csBake = shaderSwapCreateCs(imm, kConcourseBakeBytecode, sizeof(kConcourseBakeBytecode), "concourse_bake", "concourse bake");
+        imm->Release();
+        if (!g_csBake) return bdRefuse("the bake: the shader did not create");
     }
     if (!g_cbBake) {
         D3D11_BUFFER_DESC bd{};
@@ -3990,150 +3835,17 @@ void vrReleaseAll() noexcept {
 // be written), 7 nothing drawn (z == 0), 8..11 cut by the eye's distance t (<5, 5-20, 20-50, >=50), 12..16 drawn (z > 0) by t (<50, 50-200, 200-1000, 1000-4000, >=4000); the words
 // 6..16 count the texels on the face and in this eye's view.
 bool vrMakeShader(ID3D11Device* device) noexcept {
-    typedef HRESULT(WINAPI * PfnCompile)(LPCVOID, SIZE_T, LPCSTR, const void*, void*, LPCSTR, LPCSTR, UINT, UINT, ID3DBlob**, ID3DBlob**);
-    static PfnCompile compile = nullptr;
-    if (!compile) {
-        HMODULE mod = LoadLibraryW(L"d3dcompiler_47.dll");   // never freed: a blob's vtable lives in it
-        if (mod) compile = reinterpret_cast<PfnCompile>(GetProcAddress(mod, "D3DCompile"));
-    }
-    if (!compile) {
-        Log::get().note("concourse bake: vr: d3dcompiler_47.dll was not found: no VR capture shader");
+    // Precompiled (kConcourseVrBakeBytecode, text in concourse_pane_shaders.h): the compile used to cost most of the VR prepare's 62-94 ms on the render thread.
+    ID3D11DeviceContext* imm = nullptr;
+    device->GetImmediateContext(&imm);
+    if (!imm) {
+        Log::get().note("concourse bake: vr: the capture shader did not create (no immediate context)");
         return false;
     }
-    const std::string n = std::to_string(cc::kBackdropCubeSize) + ".0";
-    const std::string hlsl = std::string(cc::cubeDirHlsl()) + cv::inverse4Hlsl() +
-        "cbuffer C : register(b0) { float4 faceR[5]; float4 faceU[5]; float4 faceF[5]; float4 origin; float4 size; float4 lim; uint4 ctl; };\n"
-        "Texture2D<float4> scene : register(t0);\n"
-        "Texture2D<float> sceneDepth : register(t1);\n"
-        "Buffer<float4> rowsA : register(t2);\n"
-        "Buffer<float4> rowsB : register(t3);\n"
-        "SamplerState smp : register(s0);\n"
-        "RWTexture2DArray<float> distCube : register(u0);\n"
-        "RWTexture2DArray<float4> cube : register(u1);\n"
-        "RWByteAddressBuffer counts : register(u2);\n"
-        "groupshared float gInv[16];\n"
-        "groupshared int gFace;\n"
-        "groupshared uint gStatus;\n"
-        "groupshared uint gCount[15];\n"
-        "bool inClip(float3 d, float4 a, float4 b, float4 c, out float2 ndc) {\n"
-        "    float4 h = d.x * a + d.y * b + d.z * c;\n"
-        "    ndc = float2(2.0, 2.0);\n"
-        "    if (h.w <= 1e-4) return false;\n"
-        "    ndc = h.xy / h.w;\n"
-        "    return abs(ndc.x) < 1.0 && abs(ndc.y) < 1.0;\n"
-        "}\n"
-        "[numthreads(32, 32, 1)]\n"
-        "void main(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupID, uint gi : SV_GroupIndex) {\n"
-        "    float4 r0 = rowsA[0], r1 = rowsA[1], r2 = rowsA[2], r3 = rowsA[3];\n"
-        "    float3 off = rowsA[5].xyz - origin.xyz;\n"
-        "    if (gi == 0) {\n"
-        "        [unroll] for (int c0 = 0; c0 < 15; ++c0) gCount[c0] = 0u;\n"
-        "        float3 fw = float3(r0.w, r1.w, r2.w);\n"
-        "        float fl = length(fw);\n"
-        "        int best = -1;\n"
-        "        float bestDot = lim.z;\n"
-        "        if (fl > 1e-6) {\n"
-        "            fw /= fl;\n"
-        "            [unroll] for (int f = 0; f < 5; ++f) {\n"
-        "                float k = dot(fw, faceF[f].xyz);\n"
-        "                if ((ctl.x & (1u << (uint)f)) != 0u && k > bestDot) { bestDot = k; best = f; }\n"
-        "            }\n"
-        "        }\n"
-        "        uint st = 1u;\n"
-        "        if (!(dot(off, off) < lim.x * lim.x)) st = 2u;\n"
-        "        else if (best < 0) st = 3u;\n"
-        "        float m[16];\n"
-        "        m[0] = r0.x; m[1] = r1.x; m[2] = r2.x; m[3] = r3.x;\n"
-        "        m[4] = r0.y; m[5] = r1.y; m[6] = r2.y; m[7] = r3.y;\n"
-        "        m[8] = r0.z; m[9] = r1.z; m[10] = r2.z; m[11] = r3.z;\n"
-        "        m[12] = r0.w; m[13] = r1.w; m[14] = r2.w; m[15] = r3.w;\n"
-        "        float inv[16];\n"
-        "        [unroll] for (int z0 = 0; z0 < 16; ++z0) inv[z0] = 0.0;\n"
-        "        if (st == 1u && !invert4(m, inv)) st = 4u;\n"
-        "        [unroll] for (int k2 = 0; k2 < 16; ++k2) gInv[k2] = inv[k2];\n"
-        "        gFace = best;\n"
-        "        gStatus = st;\n"
-        "    }\n"
-        "    GroupMemoryBarrierWithGroupSync();\n"
-        "    if (gStatus == 1u) {\n"
-        "        int f = gFace;\n"
-        "        float3 d = normalize(cubeDir(id.z, (float2(id.xy) + 0.5) / " + n + "));\n"
-        "        float dF = dot(d, faceF[f].xyz);\n"
-        "        if (dF > 0.0 && abs(dot(d, faceR[f].xyz)) <= lim.y * dF && abs(dot(d, faceU[f].xyz)) <= lim.y * dF) {\n"
-        "            uint o;\n"
-        "            InterlockedAdd(gCount[0], 1u, o);\n"
-        "            float2 ndc, ndcB;\n"
-        "            bool inA = inClip(d, r0, r1, r2, ndc);\n"
-        "            bool inB = false;\n"
-        "            if (ctl.y != 0u) inB = inClip(d, rowsB[0], rowsB[1], rowsB[2], ndcB);\n"
-        "            if (inA || inB) InterlockedAdd(gCount[3], 1u, o);\n"
-        "            if (inA) {\n"
-        "                InterlockedAdd(gCount[1], 1u, o);\n"
-        "                float2 uv = float2(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);\n"
-        "                float z = sceneDepth.Load(int3(uv * size.xy, 0));\n"
-        "                float t = size.w;\n"
-        "                if (z <= 0.0) InterlockedAdd(gCount[5], 1u, o);\n"
-        "                if (z > 0.0) {\n"
-        "                    float4 v = float4(ndc, z, 1.0);\n"
-        "                    float4 b;\n"
-        "                    b.x = gInv[0] * v.x + gInv[1] * v.y + gInv[2] * v.z + gInv[3] * v.w;\n"
-        "                    b.y = gInv[4] * v.x + gInv[5] * v.y + gInv[6] * v.z + gInv[7] * v.w;\n"
-        "                    b.z = gInv[8] * v.x + gInv[9] * v.y + gInv[10] * v.z + gInv[11] * v.w;\n"
-        "                    b.w = gInv[12] * v.x + gInv[13] * v.y + gInv[14] * v.z + gInv[15] * v.w;\n"
-        "                    if (abs(b.w) > 1e-20) { float l = length(b.xyz / b.w); if (l < t) t = l; }\n"
-        "                }\n"
-        "                float rl = length(off + d * t);\n"
-        "                if (z > 0.0) {\n"
-        "                    uint bd = t < 50.0 ? 0u : t < 200.0 ? 1u : t < 1000.0 ? 2u : t < 4000.0 ? 3u : 4u;\n"
-        "                    InterlockedAdd(gCount[10u + bd], 1u, o);\n"
-        "                }\n"
-        "                if (rl > size.z) {\n"
-        "                    InterlockedAdd(gCount[4], 1u, o);\n"
-        "                    if (ctl.w != 0u) {\n"
-        "                        cube[id] = float4(clamp(scene.SampleLevel(smp, uv, 0.0).rgb, 0.0, 60000.0), 1.0);\n"
-        "                        distCube[id] = clamp(rl, 1.0, size.w);\n"
-        "                        InterlockedAdd(gCount[2], 1u, o);\n"
-        "                    }\n"
-        "                } else {\n"
-        "                    uint cb = t < 5.0 ? 0u : t < 20.0 ? 1u : t < 50.0 ? 2u : 3u;\n"
-        "                    InterlockedAdd(gCount[6u + cb], 1u, o);\n"
-        "                }\n"
-        "            }\n"
-        "        }\n"
-        "    }\n"
-        "    GroupMemoryBarrierWithGroupSync();\n"
-        "    if (gi == 0) {\n"
-        "        uint base = ctl.z * 128u;\n"
-        "        uint o2;\n"
-        "        if (gStatus == 1u) {\n"
-        "            [unroll] for (uint ci = 0u; ci < 15u; ++ci) {\n"
-        "                uint wi = ci < 4u ? ci : ci + 2u;\n"
-        "                if (gCount[ci] != 0u) counts.InterlockedAdd(base + wi * 4u, gCount[ci], o2);\n"
-        "            }\n"
-        "        }\n"
-        "        if (gid.x == 0u && gid.y == 0u && gid.z == 0u) {\n"
-        "            counts.Store(base + 16u, (uint)(gFace + 1));\n"
-        "            counts.Store(base + 20u, gStatus);\n"
-        "        }\n"
-        "    }\n"
-        "}\n";
-    ID3DBlob* code = nullptr;
-    ID3DBlob* errors = nullptr;
-    const HRESULT hr = compile(hlsl.c_str(), hlsl.size(), "concourse_bake_vr", nullptr, nullptr, "main", "cs_5_0", 0, 0, &code, &errors);
-    if (errors) {
-        if (FAILED(hr)) Log::get().note("concourse bake: vr: the shader: %.600s", static_cast<const char*>(errors->GetBufferPointer()));
-        errors->Release();
-    }
-    if (FAILED(hr) || !code) {
-        if (code) code->Release();
-        Log::get().note("concourse bake: vr: the capture shader did not compile");
-        return false;
-    }
-    const HRESULT hc = device->CreateComputeShader(code->GetBufferPointer(), code->GetBufferSize(), nullptr, &g_csVr);
-    code->Release();
-    if (FAILED(hc) || !g_csVr) {
-        g_csVr = nullptr;
-        Log::get().note("concourse bake: vr: the capture shader did not create (hr %08X)", static_cast<unsigned>(hc));
+    g_csVr = shaderSwapCreateCs(imm, kConcourseVrBakeBytecode, sizeof(kConcourseVrBakeBytecode), "concourse_bake_vr", "concourse bake");
+    imm->Release();
+    if (!g_csVr) {
+        Log::get().note("concourse bake: vr: the capture shader did not create");
         return false;
     }
     return true;
