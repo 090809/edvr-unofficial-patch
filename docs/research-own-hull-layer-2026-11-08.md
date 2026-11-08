@@ -45,10 +45,11 @@ The smear is terrain that is newly uncovered at the hull edge every frame
   own ship is one block of hull draws seeded after the cockpit shell, but
   neighbours interleave, so ownership is per record on the GPU (sections
   "The eye pass's draw order", "Step 1 flight", "The binding map").
-* **Open questions for Sean (need `analysis\`):** where the own ship's rig is
-  reachable each frame outside a station, and whether its records carry a
-  stable "player ship" flag (`optimized_station_core.h:787-809` finds it by
-  camera containment or by name prefix at a station engage).
+* **Rig probe** (section "Rig probe", compile-only, not flown): the own
+  ship's t33 slots from vehicle_rig's arrays, the emit, merges and the
+  copier, against the GPU own mask. **Next flight:** `hull layer:
+  rig_probe` lines with `state=ok`, `cpu_only`/`gpu_only` near 0, and one
+  dump's `HullRigProbe.json`; then hyperspace, SRV, on foot. No new key.
 * **Ruled out (this study):**
   * ruled out: isolating the hull by stencil, because hull pixels carry
     stencil 0/4 like the world (kinematic doc, 2026-11-02 entry).
@@ -1068,6 +1069,95 @@ an ordinary capture (the warm-up frame is the only preparation); that the
 eye dump's census still covers the capture frame, which is now one frame
 later when the layer slept (the census keeps at least two frames); that
 4,096 pairs is enough at the densest station (`overflow=` says).
+
+## Rig probe (2026-11-09, compile-only, not flown)
+
+The question: can EDVR know the own ship's pool (t33) slots exactly on the
+CPU, from the engine's rig data, instead of the GPU mask's 120 m sphere?
+`src\d3d11\hull_rig_probe.cpp` answers it with a diagnostic only: nothing
+drawn changes. It runs while `diag.hull_layer` is `dump` or `separate`; it
+has no key of its own.
+
+The chain, per frame:
+1. vehicle_rig's refresh publishes the ship's and the cockpit's record
+   arrays, `[lo, hi)` at stride 0x2F0 (`g_vehicleRigOwn`).
+2. At the emit (FUN_144315A20, job threads), a rig record inside either
+   array claims the 0x150 items the call appended, by address, for the
+   present frame. The lookup is engine motion's (`collectItems`).
+3. A list merge (0x43513A0) moves the claims with their items, by the rule
+   primaryCopy's plans use (full nodes keep their addresses, a partial
+   node's items move into the destination tail or shift down).
+4. At the pool copier (0x4C846A0), a claimed item copied to slot
+   `firstSlot + i` sets that slot's own bit, if its pose is still its rig
+   record's bit for bit (else `pose_mismatch`: a recycled address). Every
+   other copy clears the slot's bit. A DISCARD map clears the buffer's bits.
+   So the CPU set is "own records the buffer holds now", per watched
+   336-byte pool buffer.
+5. At an eye's seed, every ~30 s and on the eye dump's frame, the GPU mask
+   goes to staging with that moment's CPU sets. A few frames later it is
+   read back without a wait and compared.
+
+Lines (all `hull layer: rig_probe ...`, graphics log, no build tag):
+- `rig_probe armed (...)` / `rig_probe off`: the probe follows the layer.
+- `rig_probe target ship="AnacondaMkII" ship_recs=60 cockpit="..."
+  cockpit_recs=16 frame=F`: the own rigs changed (`-`: none).
+- `rig_probe own emits stopped: none for N ms, target known|none` and
+  `... resumed after N ms`: a 2 s gap in own emits.
+- `rig_probe frame=F present=P eye=E target=S/C ship_recs= cockpit_recs=
+  own_emits=s,c appending=s,c claimed=s,c copier_hits=s,c merges_moved=
+  spliced= merge_failed= unwound= unconsumed= stale= pose_mismatch=
+  locate_failed=s,c hits_no_pool= emit_calls= copier_calls= copier_refused=
+  copier_no_pool= maps=discard,no_overwrite,other pool=known|partial|none
+  records= written= cpu= cpu_fresh= cpu_retained= gpu= both= cpu_only=
+  gpu_only= gpu_only_written= gpu_only_held= state=S`. The counters cover
+  the window since the last such line; the sets are the seed's frame.
+  `state`: `ok`, `no_target`, `no_emits`, `no_seed` (no seed in 30 s,
+  `gpu=-1`), `no_pool` (the t33 buffer is not one engine motion watches),
+  `readback_late`, `readback_failed`.
+- `rig_probe dump S: HullRigProbe written`: `eye_S_HullRigProbe.json`
+  beside the dump. It holds the CPU, CPU-fresh and GPU slot lists and the
+  counters. Each `cpu_only`/`gpu_only` slot has its position, from the
+  layer's pool copy at the seed (record +16, the seed's own read), and
+  whether this frame wrote it. Lists are capped at 4,096.
+
+"Never ran" and "ran, found 0" differ: no `armed` line, no probe at all;
+`emit_calls=0`, the emit tap never ran (engine motion not live);
+`own_emits=0,0` with a target, no own record emitted; `claimed>0` and
+`copier_hits=0,0`, the chain breaks between the emit and the copier.
+`edvr_log --health` gives the probe its own row, `hull layer rig probe`:
+OK with an ok comparison and copier hits.
+
+What each open question (study `own-ship-from-engine-rigs.md`, "Missing")
+reads from:
+1. **Do all hull records go through FUN_144315A20?** `gpu_only_written`:
+   slots the GPU calls own that this frame's copier filled from unclaimed
+   items. With `copier_hits` ≈ `claimed` and `gpu_only_written` 0 (or only
+   at neighbour positions in the JSON), yes. Own-looking positions among
+   `gpu_only` slots mean another producer (the builder 0x42B7040, the
+   primary path) writes own records.
+2. **Unchanged records.** `own_emits` against `appending` (an own call
+   that appended nothing), `cpu_retained` (own slots held from an earlier
+   frame, not rewritten), `gpu_only_held` (slots the GPU calls own that no
+   copy touched this frame) and `maps=` (DISCARD against NO_OVERWRITE). If
+   the pool is DISCARD-mapped and `cpu_retained` is 0, every own record is
+   re-emitted each frame.
+3. **Merge relocation for secondary items.** `merges_moved` > 0 with
+   `copier_hits` near `claimed` says claims survive the merge;
+   `unconsumed` high with `merges_moved` 0 says they do not (or the merge
+   never moves them); `merge_failed` counts lists the walk refused.
+4. **Hyperspace, multicrew, fighters, on foot.** The stopped/resumed lines
+   and `state=no_emits` (hyperspace), the `target` lines (a fighter or SRV
+   names other rigs; on foot `-`), `state=no_target`.
+
+**Unverified (not flown):** the merge carry-over (written from primaryCopy's
+rule, untested here); that the copier's `frame` equals the emit's for these
+items (primaryCopy assumes it; `stale` counts the others); that the t33
+buffer is one of engine motion's watched pools (`pool=none` says not);
+that a view whose first element is not on a record boundary never occurs
+(it gets `pool=none`). The readback is tried 2 layer frames after the copy
+and given up after 30. On job threads the copier takes the probe's own
+mutex for every span while the layer is on (about 5k a second), and an own
+emit takes it once; the emit tap is four atomic loads for any other record.
 
 ## Optimisation debt (recorded 2026-11-08 at the pilot's request)
 
