@@ -10,65 +10,40 @@ The smear is terrain that is newly uncovered at the hull edge every frame
 
 ## Status
 
-* **State (updated same day):** the deciding offline test ran (section
-  "Result" at the end). **Option (e) fails for the case the pilot reported:**
-  in dump 132100543006 only 5.8% of the band was visible in the previous 8
-  frames; 88% was still behind the ship after 8 frames. The terrain that
-  emerges at the wing edge was never in any recent frame, so no fill, layer
-  or DLSS trick can supply it. What is left is game frame rate (the band is
-  terrain motion per frame), as the FG doc's 2026-11-08 entry concluded.
-  Layering may still help frame generation (see Result). The text below is
-  the study as written before the test.
-* **Update, draw order (section "The eye pass's draw order"):** option (a)
-  is cheaper than Finding 3 says. The own ship is one contiguous block of
-  37-40 G-buffer draws (54-57 records) in all six captures. The terrain is
-  drawn after it and fills its pixels once the block is left out. The
-  lighting is 4-12 draws an eye. A hull layer costs ~80 re-issues an eye
-  and about one lighting pass on the GPU. The five offline checks passed.
-  100% of the keyed hull pixels at 10-150 m are the block's records, and
-  the ship has 6 forward draws an eye. Atmosphere and sky are in the forward
-  pass. The composite needs a re-issued tonemap, since DLSS runs after it.
-  The binding map comes from the 13:14 flight's census 7 (section "The
-  binding map"). Every input except AO (a compute chain) and the tonemap's
-  exposure is made inside the eye pass. The `mt=` flight closed the map:
-  G-buffer RT3 is the HDR target itself (emissive), and the lighting's
-  second output is an R16 target nothing reads in-frame. Open design
-  items: the AO re-dispatch and the hull layer's anti-aliasing.
-* **Finding 1, the hull is a deferred G-buffer object.** It is drawn by the
-  pool families vs_66DE/ps_864F, 61AE/FC43, AACF/CF53 and DE54/E46E, plus the
-  BBE5/DB3E decal overlay (depth writes off), into the same four-target
-  G-buffer and D32 depth as the world. The shared deferred resolve lights
-  it. The cockpit shell is a different pair (vs_BFE5 / ps_DB79) with
-  stencil 144/148. The hull's stencil is the world's (0, 4), so stencil
-  cannot isolate it.
-* **Finding 2, EDVR already knows which pixels are hull.** The engine motion
-  path patches exactly these pixel shaders to write the pool slot and depth
-  to MRT6. The hull is one or a few pool records (record 2114 in run
-  193124490001). What is missing is a per-frame list of the own ship's
-  records. Per draw call EDVR does not know it: the pool draws are instanced
-  across records.
-* **Finding 3, re-rendering is the wrong lever.** Options (a) and (c), which
-  remove the hull from the game's frame, would need the deferred lighting,
-  fog, transparents and post re-run for one of the layers. No precedent in
-  EDVR does that: every re-issue in the codebase is immediate and in place,
-  and the one deferred replay (UI, 2026-09-23) was retired. The cost is
-  several GPU ms, and every ms lost to frame rate widens the band.
-* **Recommendation:** prototype option (e), the *hull hole-fill*. Before
-  DLSS, replace the hull pixels with the world behind them, reprojected
-  from earlier frames. Give DLSS that world-only image, then composite the
-  hull (static in view) on top after DLSS. Frame generation gets the same
-  two layers for free. This is untested; decide it offline first (below).
-* **Smallest experiment (no flight, no build):** an offline script on the
-  existing dumps 131530778003 and 132100543006. It measures what share of
-  the band pixels (hidden bit 16 along the silhouette) a fill could cover
-  from frames k-1..k-8, and how far that fill is from the raw C(k). Details
-  are in "The deciding experiment".
-* **Open questions for Sean (need `analysis\`, not in this fork):** where the
-  own ship's rig is reachable each frame outside a station, and whether its
-  records carry a stable "player ship" flag. Today
-  `optimized_station_core.h:787-809` finds it by camera containment
-  (radius < 40 m, too small for an Anaconda) or by name prefix taken at a
-  station engage.
+* **State (Step 1 built, not flown):** the hull layer prototype's Step 1 is
+  built (section "Step 1 build" at the end): behind `diag.hull_layer = dump`
+  (TEMPORARY, default off) the own-ship block and three lighting stages are
+  re-issued into private targets, and an eye dump writes the private HDR
+  beside the game's. **Next flight:** one eye dump over terrain, in flight,
+  with the key on; then `python tools\hull_layer_compare.py
+  <edvr_logs>\eyes\eye_<stamp>`.
+* **Temporary keys of this arc:** `diag.hull_layer` (off | dump).
+* **Option (e), the hull hole-fill, fails** for the case the pilot reported
+  (section "Result"): in dump 132100543006 only 5.8% of the band was visible
+  in the previous 8 frames; 88% was still behind the ship after 8. Layering
+  may still help frame generation and DLSS.
+* **Draw order (section "The eye pass's draw order"):** option (a) is
+  cheaper than Finding 3 says. The own ship is one contiguous block of 37-40
+  G-buffer draws (54-57 records) in all six captures; the terrain is drawn
+  after it and fills its pixels once the block is left out. The five offline
+  checks passed: 100% of the keyed hull pixels at 10-150 m are the block's
+  records, and the ship has 6 forward draws an eye. The composite needs a
+  re-issued tonemap, since DLSS runs after it.
+* **Binding map (section "The binding map"):** G-buffer RT3 is the HDR target
+  itself (emissive); the lighting's second output is an R16 target nothing
+  reads in-frame. Every input except AO (a compute chain) and the tonemap's
+  exposure is made inside the eye pass. Open design items: the AO
+  re-dispatch and the hull layer's anti-aliasing.
+* **Findings 1-2:** the hull is a deferred G-buffer object (pool families
+  vs_66DE, 61AE, AACF, DE54, plus the BBE5/DB3E decals) in the world's
+  four-target G-buffer and D32 depth; the cockpit shell is vs_BFE5 / ps_DB79.
+  EDVR's engine motion path already marks these pixels (MRT6).
+* **Finding 3** (re-rendering costs several GPU ms) was wrong for (a): ~80
+  immediate re-issues an eye and about one lighting pass.
+* **Open questions for Sean (need `analysis\`):** where the own ship's rig is
+  reachable each frame outside a station, and whether its records carry a
+  stable "player ship" flag (`optimized_station_core.h:787-809` finds it by
+  camera containment or by name prefix at a station engage).
 * **Ruled out (this study):**
   * ruled out: isolating the hull by stencil, because hull pixels carry
     stencil 0/4 like the world (kinematic doc, 2026-11-02 entry).
@@ -78,6 +53,8 @@ The smear is terrain that is newly uncovered at the hull edge every frame
   * ruled out: skipping the hull at draw level by shader pair, because
     those pairs also draw other ships and stations in the same instanced
     calls.
+  * ruled out: option (e), the hull hole-fill, for the pilot's case, because
+    the band was not in any recent frame (section "Result").
 
 ## 1. How Elite draws the own hull
 
@@ -444,3 +421,95 @@ link`). Commit 6727f7ff adds `mt=` to the census, and it compiles (compile-only,
 terrain names G-buffer RT1-3 and the lighting's second target. Read the dump
 with `census_hull.py <log> --census N`. The open design items are then the
 AO re-dispatch and the hull layer's anti-aliasing.
+
+## Step 1 build (2026-11-08, compile-only, not flown)
+
+The hull layer in the eye dump only: a private, lit copy of the own ship's
+G-buffer, sun and ambient only. Nothing the game draws or presents changes.
+Source: `src\d3d11\hull_layer.cpp` (hull_layer.h says what it does), called
+from the four draw thunks in `vscreen.cpp` right after the game's own issue.
+
+**The key:** `diag.hull_layer = off | dump` in `[diag]`, TEMPORARY, default
+off, live, VR only (not in the flat profile's list). With `dump` it runs every
+frame; an eye dump (`hotkey.dump_eyes`) arms the capture for the next whole
+frame. With it off the draw path pays one bool load.
+
+**What runs, per eye:**
+
+1. *The block.* The run starts at the first hull-family draw (VS 66DE, 61AE,
+   AACF, DE54) after the cockpit shell (VS BFE5) into the same eye depth, both
+   drawn with four render targets and a depth bound. It holds up to 6 non-hull
+   pool draws (VS t33 bound) in a row and ends at a non-pool draw, the terrain
+   (`72BDD292...` or `6C320453...`) or a longer gap. The eye is known by the
+   depth texture's identity; frames by vScreen's frame boundary. Each block
+   draw is issued again into private RT0-3 and a private depth made from the
+   game's own descs (RT3 is the private HDR). At the block's first draw they
+   are cleared: colour to 0, depth and stencil to the values the game last
+   cleared that eye depth to (0 and 0 if no clear was seen). Only RT0-3 are
+   bound: engine velocity's slot target at RT6 is not written twice.
+2. *The stages,* each once per eye after its block: the depth copy
+   (`DEF19B03`/`CB95394B`), the shadow mask (`53211E8C` with `7EAC7196`, then
+   `B403F48C`) and the sun and ambient (`7E38A6AA`/`7CECABDE`). Every bound
+   target gets a private copy (the f39 copy, the f60 mask, the R16 scratch are
+   made at their first use); the depth target must be the eye's private depth;
+   every PS resource (t0-15) whose texture has a private copy is swapped for
+   it, by texture identity. The game's clears of a texture with a private copy
+   are made on the copy too.
+3. *Left out, known differences:* the hull decals (`BBE5`/`DB3E`: their depth
+   test would pass for other ships' decals against a cleared private depth),
+   the AO apply (`DEF19B03`/`06CD42A9`: the private RT2 has no AO), the point
+   and spot volumes (Step 1b), the six own forward draws and the atmosphere.
+
+**The files** (edvr_logs\eyes, EDVRTEX1, read by `tools\eye_inputs.py`):
+`eye_<stamp>_HullHdr.bin` (the private HDR right after the private sun draw,
+R11G11B10, DXGI 26), `eye_<stamp>_GameHdrSun.bin` (the game's HDR right after
+its own sun draw: emissive plus sun, the same stage) and
+`eye_<stamp>_HullDepth.bin` (the private depth, DXGI 19). Eye 1's names end
+in `_e1`. The header's frame is the layer's own frame count.
+
+**The log lines** (graphics log, untagged; `edvr_log.py --health` reads them
+as "hull layer"):
+
+```
+hull layer: diag.hull_layer=dump (TEMPORARY; ...)          at each change
+hull layer: state=applied frames=2700 eye_frames=5400 blocks=5400 not_found=0
+  hull_draws=37/39/40 gap_draws=120 reissued=232200 clears=5400
+  subst=copy:10800,mask:32400,sun:21600 no_counterpart=copy:0,mask:0,sun:0
+  ended=terrain:0,non_pool:5400,gap:0,frame:0                every 30 s (one line)
+hull layer: dump <stamp> eye 0 frame N: HullHdr WxH format 26 written,
+  GameHdrSun written, HullDepth written; block 39 draws     per eye, per dump
+```
+
+`state` is `no-eye-pass` (no eye drew the shell: never ran on an eye),
+`no-block` (it ran and found nothing), `partial` (the block was re-issued but
+no sun draw was substituted) or `applied`. `eye_frames` counts eye-frames that
+drew the shell, `blocks` those with a block, `not_found` frames with no block
+in either eye; `hull_draws` is min/median/max of the block's hull draws an
+eye (the ledgers say 37-40); `subst` counts targets and resources swapped a
+stage, `no_counterpart` frames where a stage's pair ran with no private eye
+behind it (a use of the same pair before the block also counts there);
+`ended` says how each run ended. No GPU time yet: the CPU time is the
+`hull_layer` caller of the `draw reissue CPU:` line.
+
+**Flight plan:** fly over terrain with `diag.hull_layer = dump`, take one eye
+dump, land. First `python tools\edvr_log.py --target steam --expect-build
+<commit> --health`: "hull layer" must be OK, with hull draws 37-40 an eye.
+
+**Offline comparison:**
+`python tools\hull_layer_compare.py <edvr_logs>\eyes\eye_<stamp>` (add
+`--eye 1` for the right eye). Hull pixels are where the private depth is not 0.
+
+- **Confirms Step 1:** HullHdr equals GameHdrSun on the hull pixels within a
+  small tolerance (the tool: median luma ratio 0.95-1.35 and at least half the
+  hull pixels within 5%), except where the decals or the game's AO differ
+  (the layer has neither; where the game's AO darkens, the layer reads
+  brighter).
+- **Refutes it:** the layer is black or unlit on the hull (the lighting or
+  shadow-mask bindings are wrong), offset (a whole-pixel shift matches better
+  than none), or the private depth is empty (the block rule found nothing).
+
+Not verified before the flight: the hash constants are from the 2026-11-08
+ledgers and census; the clear values are the game's as the clear hook sees
+them; that the shell and the block draw with four targets bound; and that no
+third pass draws the shell into a G-buffer of its own (`eye_frames` would be
+more than twice `frames`).
