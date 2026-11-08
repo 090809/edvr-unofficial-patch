@@ -65,8 +65,9 @@ constexpr ULONGLONG kAutoGapMs = 60000;
 constexpr ULONGLONG kReportMs = 30000;
 // Step 3 (separate): the discard's safety. A mask past kOwnMaskMax records holds a station's or another ship's records
 // within the radius (docking): the frame falls back. A miss (an eye seeded but not lit, tonemapped and composited) holds
-// the discard off for kHoldFrames frames.
-constexpr uint32_t kOwnMaskMax = 400;
+// the discard off for kHoldFrames frames. 1500, not 400: the own ship's undrawn records near it (interior, LODs) put
+// 260-700 records in the mask over terrain with no neighbour (ledgers 193029413006, 214124277001; 2026-11-08 21:40).
+constexpr uint32_t kOwnMaskMax = 1500;
 constexpr uint32_t kHoldFrames = 16;
 constexpr float kTaaCurrent = 0.1f;       // the hull layer's TAA: this frame's weight against the clamped history
 constexpr UINT kTimerRing = 8;            // timestamp sets a timer keeps in flight
@@ -144,7 +145,9 @@ constexpr char kSeedHlsl[] =
     "    for (uint q = t; q < recordCount; q += 256) {\n"
     "        float3 p = asfloat(pool.Load3(q * 336 + 16));\n"
     "        float3 d = p - c;\n"
-    "        uint own = (valid > 0 && all(isfinite(p)) && dot(d, d) <= radius2) ? 1u : 0u;\n"
+    // An unused pool record sits at exactly (0,0,0); with the own ship near the origin they flooded the mask (dump
+    // 214124277001: 936 of 1056, never drawn), and the 400-record guard then held separate mode off all flight.
+    "        uint own = (valid > 0 && all(isfinite(p)) && any(p != 0) && dot(d, d) <= radius2) ? 1u : 0u;\n"
     "        ownMask.Store(q * 4, own);\n"
     "        mine += own;\n"
     "    }\n"

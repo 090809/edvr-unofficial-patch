@@ -618,6 +618,30 @@ them; that the shell and the block draw with four targets bound; and that no
 third pass draws the shell into a G-buffer of its own (`eye_frames` would be
 more than twice `frames`).
 
+## Step 3 flight (2026-11-08 21:39, build 8386287e): separate barely engaged
+
+Log `edvr_gfx_20261108_213914.log`, build verified. FG was switched off
+with F6. In the first two windows separate was active on 1 frame;
+`fallback=mask_large` on 578 and 1,230 eye-frames, with the own mask at
+804-7,168 records. The pilot saw no change (the ship stayed in the main
+pass), and "the night-vision smear is still there". Dump 214124277001:
+- the composite was made but not applied (a fallback frame);
+- the own-discard variants were made for all six hull pixel shaders seen,
+  including 61AE and DE54 (two DE54 variants and two 66DE);
+- one composite was declined as `stale` (the submit after the frame
+  boundary), twice in 30 s.
+
+Cause (`mask_check.py` on 214124277001): 936 of the 1,056 records in the
+mask are unused pool records at exactly (0,0,0). This frame the own ship
+was near the origin. With them excluded, the mask is 260-697 records on
+four ledgers: the 54 hull records, the ~66 the own ship draws with other
+families, and its records not drawn that frame. None was a neighbour.
+- ruled out: the 400-record own-mask guard, because the own ship alone
+  puts 260-700 records in the mask over terrain.
+- Fix: the seed skips records at (0,0,0), and the guard is raised to 1,500.
+  A guard that counts the own records actually drawn by hull draws (from
+  the private slot target) is the proper one, if docking needs it.
+
 ## Step 3 build (2026-11-08, compile-only, not flown)
 
 The hull put back after the upscaler, in `diag.hull_layer = separate` only (`off` and `dump`
