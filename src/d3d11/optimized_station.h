@@ -3,6 +3,8 @@
 #include <atomic>
 #include <cstdint>
 
+struct ID3D11DeviceContext;
+
 namespace edvr {
 
 // Once, at install: reads fix.optimized_stations (on in VR; off in the flat profile unless set) and attaches the hooks when it is on.
@@ -30,5 +32,13 @@ void optimizedStationNoteSunDraw(SunDrawPath path) noexcept;
 void optimizedStationAfterStore(uintptr_t bucket, uintptr_t record) noexcept;
 // The render thread's frame tick: the setting, the seal and release rules, the 30 s summary.
 void optimizedStationFrame(uint32_t frame);
+
+// TEMPORARY (the concourse cull's VR proving build, hotkey.concourse_vr_camera_probe; docs\concourse-cull-2026-11-05.md): the tone-draw lines of the camera probe. The VR eye draw
+// path asks the armed flag (one atomic load) and, while it is set, hands over each 3-vertex draw; the function logs the game's tonemap once per eye per probe frame.
+namespace detail {
+extern std::atomic<bool> g_vrProbeToneArmed;
+}
+inline bool concourseVrProbeToneArmed() noexcept { return detail::g_vrProbeToneArmed.load(std::memory_order_acquire); }
+void concourseVrProbeToneDraw(ID3D11DeviceContext* ctx, char kind, uint32_t count, uint32_t instances, uint32_t startInstance);
 
 }  // namespace edvr

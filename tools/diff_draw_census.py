@@ -130,6 +130,10 @@ DRAW_RE = re.compile(r'^DCO? (\d+) #(\d+) ([A-Z]) n=(\d+) i=(\d+) '
                      # comment above says must still fail here. Optional and
                      # out of the signature like the three tails before it.
                      r'(?: so=\S+)?'
+                     # The rasteriser (2026-11-06): cull mode and winding, the
+                     # depth biases, depth clip. Optional and out of the
+                     # signature like the tails above.
+                     r'(?: rs=\S+)?'
                      r'(?: q=\d+)?$')
 FRAME_RE = re.compile(r'^DC frame (\d+) draws=(\d+)(?: \S+=\d+)*$')
 # res= is the underlying resource's identity -- what connects an SRV @id to
@@ -542,7 +546,7 @@ def self_test():
               'DC %d #%d I n=6 i=1 r=@1 d=- c=@9 s=@4,-,-,- '
               'vp=0,0+1832x1920 z=0.000-1.000 sc=off '
               'ds=17wZ st=14 bm=F pr=- bl=1,5,6,1/2,1,1 sm=FFFFFFFF '
-              'so=rFF/wFF/f8/1,1,2 q=1' % (f, 2),
+              'so=rFF/wFF/f8/1,1,2 rs=Fw/-100/1.50/1 q=1' % (f, 2),
               # The two-faced form of so=, on one half of the overlay pair
               # below. Its twin at #611 carries no tail at all, so this also
               # proves a tail does not stop the two from merging into one

@@ -61,7 +61,7 @@ void drawCensusRequest();
 // not needed: a draw outside the eye textures takes the offscreen record, and an eye draw takes the eye record. A press while armed is
 // refused with a note, as drawCensusRequest does. VR never calls this, and drawCensusRequest's behaviour is unchanged.
 constexpr uint32_t kFlatCensusFrames = 2;
-constexpr uint32_t kFlatCensusLines = 16384;
+constexpr uint32_t kFlatCensusLines = 32768;   // 16384 ran out in a station's shadow and probe passes (log 063641, 16251 lines of frame 0), before the main view
 void drawCensusFlatRequest();
 
 // The automatic arm, for builds too brief to catch by hand (2026-08-25, the
