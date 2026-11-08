@@ -643,7 +643,17 @@ VR, Steam, 4b74d75c, log `edvr_gfx_20261108_065519` (06:55 to 06:57), runtime lo
 - **The hold works again.** 10 of 10 latched; the runtime trace has `withheld=14,replayed=14,empty=0`.
 - **The per-eye camera reader is not usable for this.** `temporal eye rows` gave the two eyes identical positions and axes on every line (an IPD should part them), switched between a camera near the head pose and an axis-aligned one at (11.6 6.0 -45.5), and never showed the 30 m raise that was seen. So the VR bake cannot read each eye's camera back. It has to build each eye's matrices from what EDVR tells the game: the head pose it writes, and the runtime's eye-to-head transforms and projections.
 - `ruled out: temporalPassEyeRows as the VR bake's per-eye camera, because in Flight 51 both eyes read the same rows, switching between two cameras, and missed a 30 m move that was drawn.`
-- **Still open for the VR bake:** how the pose's space maps to the store's world, so the room's centre can be written as a pose; where the d3d11 half can read each eye's eye-to-head transform and projection for the frame; whether the headsets' fields of view cover the bake's directions, or a square 90 is needed after all; and the display shader's `cb1` rows in VR. A carrier in VR is still unflown.
+- **The hold by eye:** Sean, "Didn't see any issues with *".
+- **Research after it (2026-11-08, from the decompiler and a disassembly of 0x287B330, 0x8D2610 and 0x4E2640, build 334925):**
+  - **W+0x3330 is not the head; it is the base.** That is the transform placing the runtime's seated tracking space in the render world. Each eye's camera is `eye_i = E_i · H · B` in row vectors, with E the eye-to-head transform and H the tracked head. 0x287B330 builds the camera from that alone: no origin or avatar term, and the runtime's projection copied verbatim. So the +30 m write moved the tracking origin, and both eyes with it.
+  - **Aiming:** `B = H_g^-1 · D`, where D is the face's axes at the room's centre and H_g is the head in the game's z-negated convention. The game fetches H inside 0x283FA20, after the stub, so the latest head EDVR knows is a frame old. That error moves the aim, not the capture.
+  - **Each eye's matrices:** the runtime publishes the head, both eye-to-head transforms (with the true cant) and the unjittered frusta every native frame (`native_temporal.h`; `nativeTemporalHeadPose`, `nativeTemporalEyeGeometry`). The near and far planes are stored but have no accessor. The exact matrices, with the jitter, the IPD and the world scale, are each eye's own b1 rows 270 to 279.
+  - **The display's rows** (275, 270 to 273, 279) are the same layout in VR's per-eye draws (INFERRED from the shared writer 0x596830). Row 275 is each eye's own origin (READ: 6.06 cm apart), so the windows' march is true stereo.
+  - **Coverage with no field-of-view change** (|tan| ≤ 1 on both axes per face):
+    - Pimax Crystal Super (Pimax OpenXR): eye 0 L -51.4, R +41.2, U/D ±46.8 degrees. The union covers a face with about 1.5 degrees spare, and there is no hidden-area mesh.
+    - Quest 3 (VDXR): U 42.0, under the 45 needed, so the head is pitched up 5.5 degrees, leaving about 2.5 spare. It has a hidden-area mesh that likely blacks the face's corners.
+  - Not verified: that B's world is the store's world in VR. The bake's first frame compares the store's camera with each eye's row 275, and can take the offset.
+- `ruled out: writing the head pose for the VR bake, because the stub's pose is the base B and the game multiplies the tracked head in after it (0x4E2640 returns eyeToHead x head).`
 
 ## Flight 51, the list as written
 
