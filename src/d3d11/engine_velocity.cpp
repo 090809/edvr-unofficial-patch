@@ -32,6 +32,7 @@
 #include "engine_velocity_families.h"
 #include "engine_velocity_unkeyed.h"
 #include "engine_velocity_state.h"
+#include "hull_rig_probe.h"   // diag.hull_layer (TEMPORARY): the rig probe's taps (g_hullRigProbeTaps); links to nothing
 #include "engine_motion_cpu.h"   // the CPU instrument: the draw side, apply, the tees and the lazy patches are timed here
 #include "exposure_fix.h"   // lookupShaderHash: the PS shadow probe reads the registry
 #include "flat_compute_readback.h"
@@ -704,6 +705,9 @@ void observeEmit(uintptr_t record, uintptr_t owner, int32_t before, int32_t afte
         g_emitSampled.fetch_add(1, std::memory_order_relaxed);
         g_emitSampledTicks.fetch_add(static_cast<uint64_t>(qpcNow() - t0), std::memory_order_relaxed);
     }
+    // diag.hull_layer (TEMPORARY): the rig probe, outside the sampled cost above; one load while the layer is off.
+    if (const HullRigProbeTaps* probe = g_hullRigProbeTaps.load(std::memory_order_acquire))
+        probe->emit(record, owner, before, after, reinterpret_cast<void*>(g_lookup.load(std::memory_order_acquire)), frameNow());
 }
 
 void observePrimaryEmit(const emit::PrimaryIdentity& identity, uintptr_t owner, uintptr_t key,
@@ -741,14 +745,21 @@ void observePrimaryEmit(const emit::PrimaryIdentity& identity, uintptr_t owner, 
 void observePoolCopy(uintptr_t mapped,uint32_t stride,uintptr_t source,uint64_t slot,uint32_t count) noexcept {
     if(!live.load(std::memory_order_acquire))return;
     g_primaryCopyCalls.fetch_add(1,std::memory_order_relaxed);
+    // diag.hull_layer (TEMPORARY): the rig probe sees every span, the refused ones too (it forgets that pool's bits).
+    if(const HullRigProbeTaps* probe=g_hullRigProbeTaps.load(std::memory_order_acquire))probe->copy(mapped,stride,source,slot,count,frameNow());
     if(count==UINT32_MAX || slot>UINT32_MAX){primaryCopy::invalidateMapped(mapped);return;}
     primaryCopy::copier(mapped,stride,source,static_cast<uint32_t>(slot),count,frameNow());
 }
 void* observeMergeBegin(uintptr_t destination,uintptr_t source) noexcept {
     if(!live.load(std::memory_order_acquire))return nullptr;
+    if(const HullRigProbeTaps* probe=g_hullRigProbeTaps.load(std::memory_order_acquire))probe->mergeBegin(destination,source);
     return primaryCopy::beginMergeOpaque(destination,source,frameNow());
 }
-void observeMergeEnd(void* plan,bool completed) noexcept {primaryCopy::endMergeOpaque(plan,completed);}
+void observeMergeEnd(void* plan,bool completed) noexcept {
+    // The probe's end holds its own plan (thread-local); a begin it never saw leaves it nothing to do.
+    if(const HullRigProbeTaps* probe=g_hullRigProbeTaps.load(std::memory_order_acquire))probe->mergeEnd(completed);
+    primaryCopy::endMergeOpaque(plan,completed);
+}
 void observeDictionaryClear(uintptr_t dictionary) noexcept {
     if(live.load(std::memory_order_acquire))primaryCopy::invalidateDictionary(dictionary);
 }
@@ -3263,6 +3274,8 @@ void notePrimaryResourceMapped(const ID3D11Resource* resource,void* data,int map
         slot.sequence=++g_primaryMapSequence;slot.lastFrame=frameNow();
         slot.mapped=primaryCopy::beginMap(slot.buffer.Get(),data,desc.ByteWidth,desc.StructureByteStride,
                                         static_cast<D3D11_MAP>(mapType),slot.sequence,frameNow());
+        if(const HullRigProbeTaps* probe=g_hullRigProbeTaps.load(std::memory_order_acquire))   // diag.hull_layer (TEMPORARY): the rig probe
+            probe->map(slot.buffer.Get(),data,desc.ByteWidth,mapType,frameNow());
         return;
     }
 }

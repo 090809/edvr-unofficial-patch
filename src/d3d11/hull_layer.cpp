@@ -20,6 +20,7 @@
 #include "cs_stage_save.h"    // Step 3's dispatches: the compute stage put back as the game (or the temporal pass) left it
 #include "engine_velocity.h"  // engineVelocityLiveNow, engineVelocityOwnDiscardPs and its mask slot (kEngineVelocityOwnMaskPsSlot)
 #include "framegen_shadow.h"  // frameGenShadowOn: Step 3 stands aside while any frame generation key is on
+#include "hull_rig_probe.h"   // the rig probe: the own ship's pool slots from the engine's rigs, against the own mask (diagnostic only)
 #include "native_on_foot.h"   // nativeOnFootActive: no discard on foot
 #include "temporal_pass.h"    // temporalPassArmEyeDump: the auto dump arms the eye dump the hotkey arms; temporalPassFrameGenMode
 #include "tonemap_admit.h"    // Step 3: the game's tonemap, admitted by structure
@@ -979,6 +980,7 @@ void dropViewsOf(const void* game) {
 }
 
 void releaseAll() {
+    hullRigProbeRelease();   // its staging is made on this device
     for (auto& v : g_views)
         if (v.priv) v.priv->Release();
     g_views.clear();
@@ -1823,6 +1825,10 @@ bool seedOwnMask(ID3D11DeviceContext* ctx, Eye& e, UINT instances, UINT startIns
     ctx->CSSetConstantBuffers(0, 1, &g_gpu.seedCb);
     ctx->Dispatch(1, 1, 1);
     save.restore(ctx);
+    // The rig probe (diagnostic): on its ~30 s cadence and on the dump's frame it copies this mask, and the pool copy for the dump, to staging.
+    // The mask's record q is the game buffer's record base/336 + q only when the view starts on a record; otherwise it gets no buffer (no_pool).
+    hullRigProbeAtSeed(ctx, g_device, g_frame, static_cast<int>(&e - g_eyes), e.mask, g_gpu.pool, base % kRecordBytes == 0 ? poolBuf : nullptr,
+                       static_cast<uint32_t>(base / kRecordBytes), records, g_dump == Dump::Capturing ? g_dumpStamp : nullptr);
     e.records = records;
     e.seedInstances = seeds;
     releaseRef(instBuf);
@@ -3615,6 +3621,7 @@ void hullLayerConfigure(Config& cfg) {
     }
     detail::g_hullLayerOn = mode == "dump" || mode == "separate";
     detail::g_hullLayerSeparate = mode == "separate";
+    hullRigProbeConfigure(detail::g_hullLayerOn);   // the rig probe runs while the layer does (no key of its own)
 }
 
 bool hullLayerBeforeMainDraw(ID3D11DeviceContext* ctx, UINT instances, UINT startInstance) {
@@ -3991,6 +3998,7 @@ void hullLayerFrameBoundary(ID3D11DeviceContext* ctx) {
         stageFrameEnd(ctx);   // dump v2: after the last item of the frame (the filter above)
         if (detail::g_hullLayerSeparate) judgeFrame();   // Step 3: before the frame number moves on (the tone and composite marks name it)
         ++g_frame;
+        hullRigProbeFrameEnd(ctx, g_frame);   // the rig probe's readbacks and lines (ctx null: no readback this frame)
         if (ctx) {
             readBacks(ctx);
             timerCollect(g_toneTimer, ctx);
