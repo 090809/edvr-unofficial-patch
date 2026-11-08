@@ -17063,9 +17063,19 @@ def _hj_hull_layer(rows, ctx=None):
     # Dump v2: the stage times (the last line), the dump's lighting windows and TAA sequence. Said, not judged.
     gpus = rows.get("gpu", [])
     if gpus:
-        g = gpus[-1]
-        text += ("; GPU ms a timed frame (median, last line, %s timed): gbuffer %s, mask/filter %s, screen %s, light %s, tone %s, taa %s, total %s; "
-                 "CPU ms a frame %s" % (g["timed"], g["g_gbuf"], g["g_mask"], g["g_screen"], g["g_light"], g["g_tone"], g["g_taa"], g["g_total"], g["c_total"]))
+        # Every line of the window: the median of the lines' medians by stage (a line with none timed, -1, left out), and the timestamp
+        # pairs the timed frames had no room for (overflow > 0: the stages after the cap are missing and the times read low).
+        def _med(key, src):
+            vals = sorted(float(r[key]) for r in src if float(r[key]) >= 0.0)
+            return "%.3f" % vals[(len(vals) - 1) // 2] if vals else "-"
+        timed = [r for r in gpus if int(r["timed"]) > 0]
+        overflow = sum(int(r["overflow"]) for r in gpus)
+        text += ("; GPU ms a timed frame (median of %d line(s) with %d timed frame(s)): gbuffer %s, mask/filter %s, screen %s, light %s, tone %s, taa %s, "
+                 "total %s; CPU ms a frame %s; overflow=%d"
+                 % (len(timed), sum(int(r["timed"]) for r in gpus), _med("g_gbuf", timed), _med("g_mask", timed), _med("g_screen", timed),
+                    _med("g_light", timed), _med("g_tone", timed), _med("g_taa", timed), _med("g_total", timed), _med("c_total", gpus), overflow))
+        if overflow:
+            text += " (WARNING: timed frames ran out of timestamp pairs; the later stages are missing and gpu_ms reads low)"
     for l in rows.get("lights", []):
         text += ("; dump %s lighting windows: %s draw(s), %s re-issued, %s unknown writing the HDR, %s stencil-only (HullLights %s)"
                  % (l["stamp"], l["draws"], l["reissued"], l["unknown"], l["stencil"], l["status"]))
@@ -26049,19 +26059,25 @@ def self_test_health():
               [("PARTIAL", HL)], has=["no eye-frame had it re-issued in full", "missed deinterleave 5400, hbao 5400"])
 
         # Dump v2: the stage times' line, the dump's lighting windows and TAA sequence, the reference frame: parsed and said, never judged.
-        def hl_gpu(total=1.58):
-            return RH("hull layer: gpu_ms gbuffer=%.3f", 0.41, 0.05, 0.3, 0.6, 0.04, 0.18, total, 168, 168.0, 2.0, 12.0, 22.0, 2.0, 2.0, 0.3, 0.02, 0.05, 0.08,
-                      0.01, 0.02, 0.48, 0, 0, 0, 8)
+        def hl_gpu(total=1.58, timed=168, overflow=0, gbuf=0.41):
+            return RH("hull layer: gpu_ms gbuffer=%.3f", gbuf, 0.05, 0.3, 0.6, 0.04, 0.18, total, timed, 168.0, 2.0, 12.0, 22.0, 2.0, 2.0, 0.3, 0.02, 0.05, 0.08,
+                      0.01, 0.02, 0.48, overflow, 0, 0, 8)
 
         hl_v2 = [hl_gpu(), RH("hull layer: dump %ls: HullLights", "123456789001", "written", 40, 30, 28, 2, 6, ""),
                  RH("hull layer: dump %ls: HullSeq", "123456789001", 16, 16, 1234, 412.5, "written", "complete"),
                  RH("hull layer: dump %ls eye %d: reference frame", "123456789001", 0, "yes", "written", "written", 22),
                  RH("hull layer: dump %ls: no HullSeq", "123456789002", "123456789001")]
         check("hull layer: dump v2's lines are parsed and said, the verdict unchanged", hl_base + [hl_key(), hl_report(), hl_ao()] + hl_v2, 0, [("OK", HL)],
-              has=["GPU ms a timed frame (median, last line, 168 timed): gbuffer 0.410, mask/filter 0.050, screen 0.300, light 0.600, tone 0.040, taa 0.180, "
-                   "total 1.580; CPU ms a frame 0.480",
+              has=["GPU ms a timed frame (median of 1 line(s) with 168 timed frame(s)): gbuffer 0.410, mask/filter 0.050, screen 0.300, light 0.600, "
+                   "tone 0.040, taa 0.180, total 1.580; CPU ms a frame 0.480; overflow=0",
                    "dump 123456789001 lighting windows: 40 draw(s), 28 re-issued, 2 unknown writing the HDR, 6 stencil-only (HullLights written)",
                    "dump 123456789001 TAA sequence: 16 of 16 frame(s), 412.5 MB, history written, end complete"],
+              lacks=["UNPARSED", "do not match", "WARNING"])
+        check("hull layer: every stage-times line is summarised (median by stage, a line with none timed left out) and overflow warns",
+              hl_base + [hl_key(), hl_report(), hl_ao(), hl_gpu(gbuf=0.2, total=1.0), hl_gpu(gbuf=0.9, total=3.0, overflow=37),
+                         hl_gpu(gbuf=0.5, total=2.0), RH("hull layer: gpu_ms gbuffer=%.3f", -1.0, -1.0, -1.0, -1.0, -1.0, -1.0, -1.0, 0, 0.0, 0.0, 0.0, 0.0,
+                                                         0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0, 0, 0, 8)], 0, [("OK", HL)],
+              has=["median of 3 line(s) with 504 timed frame(s)): gbuffer 0.500,", "total 2.000;", "overflow=37 (WARNING: timed frames ran out"],
               lacks=["UNPARSED", "do not match"])
         check("hull layer: a drifted stage-times line is counted as unparsed", hl_base + [hl_key(), hl_report(), hl_gpu().replace(" timed_frames=", " timed=")],
               0, [("OK", HL)], has=["+1 line(s) the rule's patterns do not match: [10:00:04.000] hull layer: gpu_ms"], lacks=["GPU ms a timed frame"])

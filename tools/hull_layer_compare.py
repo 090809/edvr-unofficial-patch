@@ -2,6 +2,7 @@
 """Does the private hull layer light like the game? (diag.hull_layer, Step 1; docs/research-own-hull-layer-2026-11-08.md "Step 1 build")
 
 Usage: python tools/hull_layer_compare.py <edvr_logs\\eyes\\eye_<stamp>> [--eye 1] [--tol 0.05] [--clear-depth 0] [--log <edvr_gfx_*.log>]
+       python tools/hull_layer_compare.py <edvr_logs\\eyes\\eye_<stamp>> --lights
        python tools/hull_layer_compare.py --self-test
 
 Reads eye_<stamp>_HullHdr.bin (the private HDR after the eye's last private lighting draw), eye_<stamp>_GameHdrLit.bin
@@ -29,6 +30,10 @@ and the share nearer (the cockpit or a neighbour in front). Verdict: TAKEN OUT 0
 Since dump v2 ("Dump v2") a separate-mode dump's frame is a reference frame: the main pass kept the own ship, the files are
 eye_<stamp>_RefGbuf0.bin and _RefDepth.bin instead of GameGbuf0 and GameDepth, and the tool runs the lighting comparison
 above, with RefDepth (the same frame's main depth, both eyes) in place of the eye run's Z as the mask.
+
+--lights reads eye_<stamp>_HullLights.json instead (dump v2: the draws of the dump frame's lighting windows) and lists the
+draws that write the eye's HDR, by eye and vertex shader: how many, how many the layer re-issued and how many were unknown
+(an HDR writer in no known lighting or stage pair), and their instances. Exit 0, or 2 on bad input.
 """
 import argparse
 import glob
@@ -224,6 +229,42 @@ def pack_r11g11b10(rgb):
     return words
 
 
+def lights(prefix):
+    """HullLights.json's HDR writers grouped by (eye, VS): [(eye, vs, draws, reissued, unknown, instances, ps set)], and the file's head."""
+    import json
+    path = prefix + '_HullLights.json'
+    try:
+        with open(path, encoding='utf-8') as f:
+            doc = json.load(f)
+        draws = doc['draws']
+    except (OSError, ValueError, KeyError, TypeError) as e:
+        raise ValueError('%s: %s' % (path, e))
+    groups = {}
+    for d in draws:
+        if not d.get('writes_hdr'):
+            continue
+        g = groups.setdefault((d['eye'], d['vs']), [0, 0, 0, 0, set()])
+        g[0] += 1
+        g[1] += bool(d.get('reissued'))
+        g[2] += bool(d.get('unknown'))
+        g[3] += int(d.get('instances', 0))
+        g[4].add(d.get('ps', '?'))
+    rows = [(eye, vs, g[0], g[1], g[2], g[3], sorted(g[4])) for (eye, vs), g in sorted(groups.items())]
+    return {'stamp': doc.get('stamp'), 'frame': doc.get('frame'), 'reference_frame': doc.get('reference_frame'), 'capped': doc.get('capped'),
+            'draws': len(draws), 'rows': rows}
+
+
+def lights_report(r):
+    out = ['HullLights %s frame %s (reference frame %s%s): %d draw(s) in the lighting windows; the HDR writers by eye and VS:'
+           % (r['stamp'], r['frame'], r['reference_frame'], ', CAPPED' if r['capped'] else '', r['draws'])]
+    out.append('  eye  vs                draws  reissued  unknown  instances  ps')
+    for eye, vs, n, re_, unk, inst, ps in r['rows']:
+        out.append('  %3s  %-16s  %5d  %8d  %7d  %9d  %s' % (eye, vs, n, re_, unk, inst, ','.join(p[:8] for p in ps)))
+    if not r['rows']:
+        out.append('  (none: the layer was asleep or no lighting window opened on the dump frame)')
+    return '\n'.join(out)
+
+
 def self_test():
     import tempfile
     try:
@@ -325,10 +366,38 @@ def self_test():
             failures.append('a missing file was accepted')
         except ValueError:
             pass
+    # --lights: HullLights.json in the layout writeLights prints; the HDR writers grouped by eye and VS, stencil-only draws left out.
+    with tempfile.TemporaryDirectory() as temp:
+        prefix = os.path.join(temp, 'eye_123456789001')
+
+        def rec(eye, vs, ps, inst, hdr, reissued, unknown, stencil=False):
+            return ('{"eye": %d, "seq": 1, "vs": "%s", "ps": "%s", "kind": "I", "count": 36, "instances": %d, "start_instance": 0, "writes_hdr": %s, '
+                    '"stencil_only": %s, "stencil_ref": 0, "known_light": %s, "stage_pair": false, "reissued": %s, "unknown": %s}'
+                    % (eye, vs, ps, inst, 'true' if hdr else 'false', 'true' if stencil else 'false', 'false' if unknown else 'true',
+                       'true' if reissued else 'false', 'true' if unknown else 'false'))
+        with open(prefix + '_HullLights.json', 'w', encoding='utf-8') as f:
+            f.write('{"version": 1, "stamp": "123456789001", "frame": 42, "reference_frame": true, "capped": false, "cap": 4096,\n "draws": [\n  '
+                    + ',\n  '.join([rec(0, 'A1B7CFCD0BE7493E', '2DB678B6B558B604', 200, True, True, False),
+                                    rec(0, 'A1B7CFCD0BE7493E', '2DB678B6B558B604', 26, True, True, False),
+                                    rec(0, '2CECEC3000000000', '1111111111111111', 1, True, False, True),
+                                    rec(0, 'A1B7CFCD0BE7493E', '0000000000000000', 200, False, False, False, stencil=True),
+                                    rec(1, 'A1B7CFCD0BE7493E', '2DB678B6B558B604', 198, True, False, False)]) + '\n ]\n}\n')
+        got = lights(prefix)['rows']
+        want = [(0, '2CECEC3000000000', 1, 0, 1, 1, ['1111111111111111']), (0, 'A1B7CFCD0BE7493E', 2, 2, 0, 226, ['2DB678B6B558B604']),
+                (1, 'A1B7CFCD0BE7493E', 1, 0, 0, 198, ['2DB678B6B558B604'])]
+        if got != want:
+            failures.append('--lights rows %r, wanted %r' % (got, want))
+        if 'A1B7CFCD0BE7493E      2         2        0        226' not in lights_report(lights(prefix)):
+            failures.append('--lights report: %s' % lights_report(lights(prefix)))
+        try:
+            lights(os.path.join(temp, 'eye_x'))
+            failures.append('--lights accepted a missing file')
+        except ValueError:
+            pass
     for f in failures:
         print('hull layer compare self-test FAILED: ' + f)
     if not failures:
-        print('hull layer compare self-test passed (17 cases)')
+        print('hull layer compare self-test passed (20 cases)')
     return 1 if failures else 0
 
 
@@ -339,12 +408,20 @@ def main(argv=None):
     p.add_argument('--tol', type=float, default=0.05, help='relative luma tolerance (default 0.05: R11G11B10 rounds to about 1.6%%)')
     p.add_argument('--clear-depth', type=float, default=0.0, help='the private depth\'s clear value (reversed Z: 0)')
     p.add_argument('--log', help='the graphics log holding the dump\'s line (default: the newest edvr_gfx_*.log beside the eyes folder)')
+    p.add_argument('--lights', action='store_true', help='list HullLights.json\'s HDR writers by eye and VS instead of comparing')
     p.add_argument('--self-test', action='store_true')
     a = p.parse_args(argv)
     if a.self_test:
         return self_test()
     if not a.prefix:
         p.error('give the eye run prefix, or --self-test')
+    if a.lights:
+        try:
+            print(lights_report(lights(a.prefix)))
+        except ValueError as e:
+            print('hull layer compare: %s' % e)
+            return 2
+        return 0
     try:
         separate = os.path.exists('%s_GameDepth%s.bin' % (a.prefix, '_e1' if a.eye else ''))
         r = main_pass(a.prefix, eye=a.eye, clear_depth=a.clear_depth) if separate else compare(a.prefix, eye=a.eye, tol=a.tol, clear_depth=a.clear_depth)

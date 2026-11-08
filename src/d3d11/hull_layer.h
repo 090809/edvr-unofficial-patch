@@ -73,7 +73,8 @@
 //      with a re-issue that could not take the variant (from that draw on); its private copy goes after 120 eye-frames unused.
 //  16. The busy governor (temporary): an eye drawing more hull-family G-buffer draws than kBusyDraws (kBusyDrawsCulled when every
 //      re-issue was culled in the VS) puts the layer to sleep for the scene -- only the count runs, the game draws the ship -- until
-//      120 calm frames; decided at the frame boundary.
+//      120 calm frames; decided at the frame boundary. A dump wakes it (a warm-up frame, the capture frame, separate mode's TAA
+//      sequence) and it sleeps again after.
 //  17. Two station light volumes join the lighting (A1B7CFCD, CE24A739). An HDR writer in the lighting window is said as an
 //      unknown lighting pair only when a later lighting draw follows it; a forward draw (depth writes on) closes that window.
 //  18. Stages and their private copies only at the eye's render size; the lighting re-issue leaves the scratch R16 at RT1 unbound.

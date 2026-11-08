@@ -7277,7 +7277,10 @@ bool temporalPassUpscale(float* x, float* y) {
 void temporalPassArmEyeDump() {
     // The key takes a RUN of the left eye (kEyeRun says why); a run already
     // under way is left alone.
-    if (g_eyeRunLeft > 0 || g_eyeRunReady) return;
+    if (g_eyeRunLeft > 0 || g_eyeRunReady) {
+        Log::get().note("eye dump: press refused, the previous run is still writing");   // a press is the pilot's: one line each
+        return;
+    }
     beginEyeRun();
 }
 

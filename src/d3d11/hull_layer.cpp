@@ -708,6 +708,9 @@ bool g_saidFrameGen = false, g_saidMaskLarge = false, g_saidToneDecline = false,
 // sleeps and the limit it slept at; the keep-own VS's refusals said once.
 bool g_busy = false;
 uint32_t g_calm = 0, g_busyLimit = kBusyDraws;
+// A dump armed while asleep wakes the layer (governBusy): one warm-up frame (the private copies, aged out while asleep, are made
+// again and see the game's clears), then the capture frame and, in separate mode, the TAA sequence; then it sleeps again.
+bool g_dumpWoke = false;
 bool g_saidKeepOwn = false, g_saidOffscreen[kStages] = {};
 
 // ---- dump v2 (docs "Dump v2"): the stage times, the lighting window's draws, the reference frame, the TAA sequence -----------
@@ -718,7 +721,10 @@ bool g_saidKeepOwn = false, g_saidOffscreen[kStages] = {};
 // The CPU time (bracketing each item, from the hook's entry) and the item counts are kept on every frame.
 enum TStage : int { kTsGbuf = 0, kTsMask, kTsScreen, kTsLight, kTsTone, kTsTaa, kTStages };   // the line's gbuffer, mask_filter, screen, light, tone, taa
 constexpr uint32_t kStageEvery = 8;      // one frame in eight is timed on the GPU
-constexpr uint32_t kStagePairCap = 1024;   // timestamp pairs a timed frame may use (a pair an item; two eyes of ~300 G-buffer draws fit)
+// Timestamp pairs a timed frame may use: a pair an item. 4096, not 1024: a station re-issues 1,200-3,400 items a frame over both eyes
+// (the culled draws are still re-issued), and a pair per run of one stage would also time the game's draws between the items.
+// The queries are made on first use, so a frame that needs fewer makes fewer.
+constexpr uint32_t kStagePairCap = 4096;
 constexpr uint32_t kStageSets = 3;       // timed frames in flight
 struct StageSet {
     ID3D11Query* disjoint = nullptr;
@@ -1581,7 +1587,7 @@ void stageWindowReset() {
     g_st.timed = g_st.overflow = g_st.busy = g_st.disjoint = 0;
 }
 
-// Field by field, not by assignment: a StageTimes is ~50 KB (its query pointers), too much for a temporary on the render thread.
+// Field by field, not by assignment: a StageTimes is ~200 KB (its query pointers), too much for a temporary on the render thread.
 void releaseStageTimes() {
     for (auto& s : g_st.set) {
         releaseRef(s.disjoint);
@@ -2918,6 +2924,27 @@ bool frameGenOn() { return temporalPassFrameGenMode() != 0 || frameGenShadowOn()
 // the game draws the ship. Asleep: kCalmFrames frames in a row at or under the limit it slept at wake it; separate mode's hold
 // (kHoldFrames, re-armed by decideNext while asleep) then runs as after any fallback.
 void governBusy() {
+    // A dump holds the layer awake from its arming to its capture frame and, in separate mode, to the TAA sequence's last staged
+    // frame: asleep, it would capture nothing. A dump that woke it puts it back to sleep after, at the limit it slept at.
+    const bool dumpAwake = g_dump != Dump::Idle || (g_seq.active && !g_seq.end && g_seq.staged < kSeqFrames);
+    if (dumpAwake) {
+        if (g_busy) {
+            g_busy = false;
+            g_dumpWoke = true;
+            g_calm = 0;
+            Log::get().note("hull layer: busy: woken for dump %ls (one warm-up frame, then the capture frame%s; the layer sleeps again after)",
+                            g_dumpStamp, detail::g_hullLayerSeparate ? " and the TAA sequence, its composites made and not applied while the hold runs" : "");
+        }
+        return;
+    }
+    if (g_dumpWoke) {
+        g_dumpWoke = false;
+        g_busy = true;
+        g_calm = 0;
+        ++g_win.busyFrames;
+        Log::get().note("hull layer: busy: dump %ls done; the layer sleeps again (limit %u, until %u calm frames)", g_dumpStamp, g_busyLimit, kCalmFrames);
+        return;
+    }
     uint32_t busiest = 0;
     int eye = -1;
     bool filtered = false;
@@ -4001,6 +4028,8 @@ void hullLayerFrameBoundary(ID3D11DeviceContext* ctx) {
     g_autoStreak = good ? g_autoStreak + 1 : 0;
     if (g_dump == Dump::Capturing) {
         g_dump = Dump::Idle;   // written above
+    } else if (g_dump == Dump::Armed && g_busy) {
+        // Asleep: governBusy below wakes the layer, the next frame warms it up (its private copies made again), the one after is captured.
     } else if (g_dump == Dump::Armed) {
         g_dump = Dump::Capturing;
         g_dumpFrame = g_frame;
