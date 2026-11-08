@@ -2,20 +2,24 @@
 
 ## Status
 
-- **State:** build order steps 2, 3 and 4 are built on branch
+- **State:** build order steps 2, 3, 4 and 6 are built on branch
   `claude/hungry-heyrovsky-000d7b`, and the full build passes. No release carries the
   launcher yet. Step 5 has not started.
 - **Proven, 2026-11-07 (see Test results):** CI builds the split assets, the signing
   tool's signature verifies through BCrypt, and a test release on GitHub was refused
   or accepted correctly over real HTTPS. The launcher downloaded it, verified every
   file and installed it into a scratch folder with no write to the real folders.
-- **Flown, 2026-11-08:** direct launch on Steam, VR and flat, from the launcher's window
-  (see Test results).
+- **Flown, 2026-11-08:** direct launch on Steam, VR and flat, and on the Frontier store,
+  flat, with a first sign-in and its emailed code. A dry run then signed in from the
+  saved login with no prompt (see Test results).
+- **Found in that flight:** the window picks the first install with EDVR in it on
+  every start, not the one played last, so a second Play went to Steam.
 - **Rig-tested only, not yet run for real:** the first run's copy and registration, a
-  self-update, a real UAC prompt and the elevated copy, and the EDLaunch route on any
-  store, including closing EDLaunch.
-- **Next flight:** with direct launch off, Play on each store, watching EDLaunch close
-  after the game exits. Self-update and the first run need the next real release.
+  self-update, a real UAC prompt and the elevated copy, a Frontier-store launch in VR
+  (dry run only), and the EDLaunch route on any store, including closing EDLaunch.
+- **Next flight:** Play VR on the Frontier store. Then, with direct launch off, Play on
+  each store, watching EDLaunch close after the game exits. Self-update and the first
+  run need the next real release.
 - **Frontier's terms** were read on 2026-11-07 before step 4. None of them names a
   third-party launcher. The maintainer chose to make direct launch opt-in.
 - **Waiting on others:** SignPath had not replied on 2026-11-07. A launcher-only
@@ -42,8 +46,8 @@
   did not start gets a ticket with `SteamAppId=359320`, and the game then runs
   in VR and flat with no EDLaunch or WatchDog64 above it. The Frontier store works
   from its separate folders with a saved login.
-- **Not yet shown on Windows:** a first Frontier login with 2FA, playtime counting,
-  the overlay working on screen, and rendering in a headset.
+- **Not yet shown on Windows:** playtime counting, the overlay working on screen, and
+  rendering in a headset.
 - **Open hypotheses, for Linux and Mac:**
   - T5: the installer's window, network access and signature checks work under
     Proton on the Deck.
@@ -372,9 +376,11 @@ window writes through `mergeIni` and the mirror. Two changes:
 ## Credentials and tokens
 
 - Steam and Epic store nothing. Only Frontier-store users enter a password.
-- The login is stored encrypted with DPAPI, current user. Whether the machine token
-  alone is enough for later logins is an open question for the port; if it is, the
-  password is not kept.
+- The login file, `frontier-login.dat` in the launcher folder, holds the email in the
+  clear and the machine token encrypted with DPAPI for the current user. Frontier's
+  sign-in takes the password every time, so the password is kept the same way only
+  when "Remember my password on this PC" is ticked, and is asked for otherwise.
+  Unticking direct launch deletes the file.
 - Tokens are on the game's command line, as they are from EDLaunch. EDVR already
   redacts that line in its logs (`runtime_profile.h`). The launcher never logs it,
   and any dry-run option masks tokens. min-ed-launcher's `/dryrun` does not mask them.
@@ -463,6 +469,17 @@ Not shown yet: whether Steam counts playtime and the overlay works on screen, wh
 the game's language is right without the `/language` EDLaunch passes, and what each
 fallback looks like for real.
 
+Direct launch on the Frontier store (step 6), 2026-11-08, from `24925c52` with
+`--data-root` on the same scratch folder, which held no Frontier login before. The
+Frontier install held DLL build `v0.22.0-rc.7-57-g5432fd63` from another branch, which is
+not under test here.
+
+| Test | Result | Evidence |
+|---|---|---|
+| Play flat, first sign-in, 09:32 | Pass | The email, password and emailed code went into the launcher's two windows. `frontier-login.dat` was written at 09:32:44 with the email, the password and a machine token, the last two as DPAPI blobs; the launcher stores a machine token only after Frontier accepts a code. The game started at 09:32:49 with `<redacted> /novr`, no `/steam` and no `/language`, and `command line /novr applied` |
+| Dry run from the saved login, VR, 09:36 | Pass | No window and no code. Signed in, six purchases, the game version matched Frontier's (`2026.10.23.334925`), and the command line would be `"ServerToken <masked> <masked> " /vr`. Nothing was started |
+| Play VR | Not flown | The second Play went to the Steam install, which the window picks on every start (see Status). That run, at 09:35, is a second Steam VR pass: `<redacted> /steam /vr`, `command line /vr applied` |
+
 ## Build order
 
 1. T1 to T4 (done).
@@ -473,7 +490,8 @@ fallback looks like for real.
    installer. (Built, update path proven, not flown.)
 4. Direct launch on Steam, opt-in. (Built, flown VR and flat.)
 5. Pre-launch check and `--wrap`.
-6. Direct launch on the Frontier store, with its login window.
+6. Direct launch on the Frontier store, with its login window. (Built, flown flat
+   with a first sign-in, VR by dry run only.)
 7. The per-eye field, the headset record and the settings table as data.
 8. Linux and Mac launching, once T5 to T7 pass.
 9. Retire `edvr-installer-*` once the launcher has proved itself.
