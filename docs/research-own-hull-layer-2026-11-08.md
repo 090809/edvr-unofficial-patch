@@ -10,13 +10,15 @@ The smear is terrain that is newly uncovered at the hull edge every frame
 
 ## Status
 
-* **State (Step 1 built, not flown):** the hull layer prototype's Step 1 is
-  built (section "Step 1 build" at the end): behind `diag.hull_layer = dump`
-  (TEMPORARY, default off) the own-ship block and three lighting stages are
-  re-issued into private targets, and an eye dump writes the private HDR
-  beside the game's. **Next flight:** one eye dump over terrain, in flight,
-  with the key on; then `python tools\hull_layer_compare.py
-  <edvr_logs>\eyes\eye_<stamp>`.
+* **State (Step 1 v2 built, not flown):** section "Step 1 v2 build" at the
+  end. v1 flew (section "Step 1 flight"): the mechanism works, the verdict
+  was unreadable. v2 picks the own ship per record with a GPU own mask
+  seeded from the first hull draw after the shell, filters the neighbours'
+  pixels out of the private G-buffer, re-issues every lighting draw and
+  arms up to three eye dumps itself. **Next flight:** fly over terrain with
+  `diag.hull_layer = dump` and `fix.temporal_aa` on, no key presses; then
+  `edvr_log.py --health` and `python tools\hull_layer_compare.py
+  <edvr_logs>\eyes\eye_<stamp>` for each auto dump.
 * **Temporary keys of this arc:** `diag.hull_layer` (off | dump).
 * **Option (e), the hull hole-fill, fails** for the case the pilot reported
   (section "Result"): in dump 132100543006 only 5.8% of the band was visible
@@ -605,3 +607,116 @@ ledgers and census; the clear values are the game's as the clear hook sees
 them; that the shell and the block draw with four targets bound; and that no
 third pass draws the shell into a G-buffer of its own (`eye_frames` would be
 more than twice `frames`).
+
+## Step 1 v2 build (2026-11-08, compile-only, not flown)
+
+The fixes the v1 flight asked for (section "Step 1 flight"), still in the
+eye dump only: nothing the game draws or presents changes. Source:
+`src\d3d11\hull_layer.cpp` (hull_layer.h says what it does). Same key,
+`diag.hull_layer = off | dump` (TEMPORARY, default off). It now also needs
+engine motion (part of `fix.temporal_aa`, no key of its own): its patched
+pixel shaders write the record slot at MRT6, and the filter reads it.
+
+**What changed:**
+
+1. *The seed and the own mask.* Per eye-frame, the first hull-family
+   G-buffer draw after the cockpit shell is the seed. Its instance window
+   (the stride-8 instance stream, record index first) and the pool (VS t33,
+   336-byte records, position at bytes 16-27) are copied. One compute
+   dispatch then marks every pool record within 120 m of the seed records'
+   centroid in an own mask (one uint a record, sized from the pool's view).
+   The count is read back 2+ frames later with `DO_NOT_WAIT`, never a stall.
+   If the seed draw has no R32G32 slot target at RT6, the eye-frame does
+   nothing (`no_slot`, said once as `no-slot-target`).
+2. *Every hull-family draw, filtered per pixel.* From the seed to the eye's
+   depth copy (or the next eye's shell), every hull-family G-buffer draw is
+   issued again into private RT0-3, a private depth and a private slot
+   target (cleared to -1, no slot). A full-screen pass then sets RT0-3 to 0
+   and the depth to the clear value (SV_Depth, func ALWAYS) wherever the
+   slot names a record outside the mask. A count pass counts those pixels
+   (`filtered_px`). Neighbours in front of the own ship leave holes there,
+   which is accepted. The run, gap and terrain rule and its t33 test are
+   gone. Decals stay out.
+3. *All the lighting.* Every draw with VS `7E38A6AA`, `8289669D`,
+   `963B52C7`, `24DE25E4`, `B121A79E` or `0357BBB2` is re-issued, with any
+   PS. Every target and PS resource that has a private copy is swapped; the
+   shadow map and the light list stay the game's. Another VS that writes the
+   eye's HDR between the shadow mask and the sky is logged as an unknown
+   lighting pair. The depth copy and the shadow mask are unchanged.
+4. *Fixes.* A private copy whose game texture was unseen for 120 frames is
+   dropped (the cap is now 32). This is the v1 dump that captured nothing.
+5. *Auto dumps.* The layer arms the eye dump itself (the hotkey's own call,
+   `temporalPassArmEyeDump`) once it has seeded over terrain on 600 frames in
+   a row with an own mask of 20-200 records. At most 3 a session, 60 s
+   apart. The hotkey still works.
+
+**The files:** `eye_<stamp>_HullHdr.bin` (the private HDR after the eye's
+last private lighting draw), `eye_<stamp>_GameHdrLit.bin` (renamed from
+GameHdrSun: the game's HDR after its last lighting draw, before the sky) and
+`eye_<stamp>_HullDepth.bin` (the private depth after the filter). Eye 1's
+names end in `_e1`.
+
+**The log lines** (graphics log, untagged; `edvr_log.py --health` reads them
+as "hull layer"):
+
+```
+hull layer: state=applied frames=2700 eye_frames=5400 seeds=5400 no_seed=0
+  no_slot=0 refused=0 own=54/54/55 readbacks=5400 filtered_px=0/1200/9000
+  hull_draws=70/84/92 reissued=453600 no_slot_draws=0 clears=5400
+  filters=5400 subst=copy:10800,mask:32400,light:59400 light_draws=11/11/11
+  no_counterpart=copy:0,mask:0,light:0 unknown_light_pairs=0
+  ended=copy:5400,shell:0,light:0,frame:0 terrain_frames=2700 auto_dumps=0
+                                                          every 30 s (one line)
+hull layer: auto dump armed (reason: own mask 54 records, seeded over terrain
+  for 600 frames in a row; 1 of 3 this session)
+hull layer: dump <stamp> eye 0 frame N: HullHdr WxH format 26 written,
+  GameHdrLit written, HullDepth written; own=54 filtered_px=3000 seed=3/3
+  hull_draws=84 light_draws=11                              per eye, per dump
+hull layer: unknown lighting pair vs <16 hex> ps <16 hex> writes the eye's
+  HDR between the shadow mask and the sky (...)             once a pair
+```
+
+`state` is `applied`, `partial` (seeded, no lighting substituted),
+`mask-pending` (seeded, no readback yet), `no-shader`, `no-slot-target`,
+`seed-refused`, `no-seed` (the shell, no hull draw after it), `no-shell`
+(hull draws, no shell) or `no-eye-pass`. `own` and `filtered_px` are
+min/median/max over the window's readbacks; `seed=` in the dump line is the
+seed records read / the seed's instances.
+
+**Flight plan:** with the key on and `fix.temporal_aa` on, fly low over
+terrain for 10 s or more at a time, and do not press the dump key. The
+layer arms up to three dumps. Then:
+
+1. `python tools\edvr_log.py --target steam --expect-build <commit>
+   --health`: "hull layer" OK, `own` near 54 for the Anaconda, three `auto
+   dump armed` lines.
+2. For each dump: `python tools\hull_layer_compare.py
+   <edvr_logs>\eyes\eye_<stamp>` (and `--eye 1`). It reads the own count
+   from the dump's log line.
+
+- **Confirms Step 1:** HullHdr equals GameHdrLit on the hull pixels (median
+  luma ratio 0.95-1.35, at least half within 5%), with no better whole-pixel
+  shift, and `own` is 54 (Anaconda). AO and decals may differ.
+- **Refutes it:** the layer is black where the game is lit (the lighting
+  bindings), offset, or the private depth is empty. It is also refuted if
+  `own` is far from the ship's record count (the seed or the radius is
+  wrong), or if the neighbour pixels survive the filter in HullHdr.
+- **Inconclusive, not refuted:** GameHdrLit black on most hull pixels (the
+  comparison point is wrong again), or the luma close but not within the
+  limits.
+
+**Not verified before the flight:**
+
+- the instance stream binding (the stride-8 buffer in vertex slots 0-3,
+  offset plus StartInstanceLocation x 8);
+- that the pool view starts at element 0, and that pool positions are
+  camera-near enough for a float centroid. The first seed logs the view
+  once.
+- the slot target's format (R32G32_FLOAT) and its clear (-1, no slot);
+- the four lighting VS hashes from the `mt=` census, `B121A79E457669E8`
+  among them;
+- that `temporalPassArmEyeDump` may be called from the frame boundary;
+- that SV_Depth with func ALWAYS writes the D32S8 private depth as
+  expected. The filter leaves stencil as the neighbour wrote it.
+- The shaders compile at the first seed (d3dcompiler_47.dll), a one-time
+  hitch.

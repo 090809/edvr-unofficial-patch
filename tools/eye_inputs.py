@@ -35,7 +35,7 @@ retired) means target UI was separated before DLSS. In that case
 DlssColour is the world-only tone-mapped input, UiInfluence is its signed
 R32 target influence, and UiDepth is the clean private depth. HoloCoverage
 and UiEdits contain the clean maps actually consumed by reconstruction.
-HullHdr and GameHdrSun (diag.hull_layer, TEMPORARY) are R11G11B10_FLOAT (DXGI 26), read as float RGB;
+HullHdr and GameHdrLit (diag.hull_layer, TEMPORARY) are R11G11B10_FLOAT (DXGI 26), read as float RGB;
 HullDepth is the private depth (DXGI 19, the depth channel). _e1 names eye 1.
 Chrome0/Chrome1 (only when the scanner's screen was up) are the scanner's
 persistent chrome surfaces as its screen composite sampled them, RGBA8 at
@@ -116,7 +116,7 @@ def read(path):
         image = np.frombuffer(data, '<f4', offset=44).reshape(h, w, 2)
     elif fmt == 34:
         image = np.frombuffer(data, '<f2', offset=44).reshape(h, w, 2).astype('float32')
-    elif fmt == 26:  # R11G11B10_FLOAT: the HDR target (HullHdr, GameHdrSun; diag.hull_layer)
+    elif fmt == 26:  # R11G11B10_FLOAT: the HDR target (HullHdr, GameHdrLit; diag.hull_layer)
         image = r11g11b10(np.frombuffer(data, '<u4', offset=44).reshape(h, w))
     elif fmt in (27, 28, 29):
         image = np.frombuffer(data, 'u1', offset=44).reshape(h, w, 4).astype('float32') / 255.0
@@ -200,7 +200,7 @@ def self_test():
             else:
                 _, image = read(path)
                 np.testing.assert_array_equal(image, np.array(list(rgba), dtype='float32').reshape(1, 2, 4) / 255.0)
-        # R11G11B10_FLOAT (HullHdr, GameHdrSun): (1.0, 0.5, 2.0), then (1.5, 0, 0) and a denormal R.
+        # R11G11B10_FLOAT (HullHdr, GameHdrLit): (1.0, 0.5, 2.0), then (1.5, 0, 0) and a denormal R.
         hdr = struct.pack('<3I', 960 | 896 << 11 | 512 << 22, 992, 1)
         path.write_bytes(b'EDVRTEX1' + struct.pack('<9I', 1, 3, 1, 26, 12, 23, 1, 0, 0) + hdr)
         meta, data = _load(path)

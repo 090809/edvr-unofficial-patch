@@ -10614,21 +10614,30 @@ H_DESKTOP_STOP = r"desktop window: stopped \((?P<reason>.*)\); drawn=(?P<drawn>\
 H_DESKTOP_ACTIVE = r"desktop window: active #(?P<n>\d+)"   # F173: the window took the eye images (an activation): evidence that 3D was on
 H_DESKTOP_DECLINED = r"desktop window: not drawing -- (?P<why>.*)$"   # F173: the draw declined, and why
 H_DESKTOP_OTHER = r"desktop window: (?!setting |10 s: |stopped \()"
-# The hull layer, Step 1 (diag.hull_layer, TEMPORARY; src\d3d11\hull_layer.cpp, docs\research-own-hull-layer-2026-11-08.md): lines of the graphics log with no build tag, read the
-# frame generation shadow's way. The key line is state (said at each change, kept whatever --since says); the 30 s report and the dump lines are events.
+# The hull layer, Step 1 v2 (diag.hull_layer, TEMPORARY; src\d3d11\hull_layer.cpp, docs\research-own-hull-layer-2026-11-08.md): lines of the graphics log with no build tag, read
+# the frame generation shadow's way. The key line is state (said at each change, kept whatever --since says); the 30 s report, the dump, auto dump and unknown pair lines are events.
 H_HULL = "hull layer"
 H_HULL_LABEL = "hull layer: "
 H_HULL_KEY = r"hull layer: diag\.hull_layer=(?P<mode>\w+) \(TEMPORARY"
-H_HULL_REPORT = (r"hull layer: state=(?P<state>[\w-]+) frames=(?P<frames>\d+) eye_frames=(?P<eye_frames>\d+) blocks=(?P<blocks>\d+) not_found=(?P<not_found>\d+) "
-                 r"hull_draws=(?P<lo>\d+)/(?P<mid>\d+)/(?P<hi>\d+) gap_draws=(?P<gap>\d+) reissued=(?P<reissued>\d+) clears=(?P<clears>\d+) "
-                 r"subst=copy:(?P<s_copy>\d+),mask:(?P<s_mask>\d+),sun:(?P<s_sun>\d+) no_counterpart=copy:(?P<n_copy>\d+),mask:(?P<n_mask>\d+),sun:(?P<n_sun>\d+) "
-                 r"ended=terrain:(?P<e_terrain>\d+),non_pool:(?P<e_nonpool>\d+),gap:(?P<e_gap>\d+),frame:(?P<e_frame>\d+)")
+H_HULL_REPORT = (r"hull layer: state=(?P<state>[\w-]+) frames=(?P<frames>\d+) eye_frames=(?P<eye_frames>\d+) seeds=(?P<seeds>\d+) no_seed=(?P<no_seed>\d+) "
+                 r"no_slot=(?P<no_slot>\d+) refused=(?P<refused>\d+) own=(?P<own_lo>\d+)/(?P<own_mid>\d+)/(?P<own_hi>\d+) readbacks=(?P<readbacks>\d+) "
+                 r"filtered_px=(?P<f_lo>\d+)/(?P<f_mid>\d+)/(?P<f_hi>\d+) hull_draws=(?P<lo>\d+)/(?P<mid>\d+)/(?P<hi>\d+) reissued=(?P<reissued>\d+) "
+                 r"no_slot_draws=(?P<no_slot_draws>\d+) clears=(?P<clears>\d+) filters=(?P<filters>\d+) "
+                 r"subst=copy:(?P<s_copy>\d+),mask:(?P<s_mask>\d+),light:(?P<s_light>\d+) light_draws=(?P<l_lo>\d+)/(?P<l_mid>\d+)/(?P<l_hi>\d+) "
+                 r"no_counterpart=copy:(?P<n_copy>\d+),mask:(?P<n_mask>\d+),light:(?P<n_light>\d+) unknown_light_pairs=(?P<unknown>\d+) "
+                 r"ended=copy:(?P<e_copy>\d+),shell:(?P<e_shell>\d+),light:(?P<e_light>\d+),frame:(?P<e_frame>\d+) terrain_frames=(?P<terrain>\d+) "
+                 r"auto_dumps=(?P<auto>\d+)")
 H_HULL_DUMP = (r"hull layer: dump (?P<stamp>\S+) eye (?P<eye>\d) frame (?P<frame>\d+): HullHdr (?P<w>\d+)x(?P<h>\d+) format (?P<fmt>\d+) (?P<hull>[\w ]+), "
-               r"GameHdrSun (?P<game>[\w ]+), HullDepth (?P<depth>[\w ]+); block (?P<block>\d+) draws")
+               r"GameHdrLit (?P<game>[\w ]+), HullDepth (?P<depth>[\w ]+); own=(?P<own>-?\d+) filtered_px=(?P<filtered>-?\d+) "
+               r"seed=(?P<seed_read>-?\d+)/(?P<seed_inst>-?\d+) hull_draws=(?P<hull_draws>\d+) light_draws=(?P<light_draws>\d+)")
 H_HULL_NOTHING = r"hull layer: dump (?P<stamp>\S+) frame (?P<frame>\d+): nothing captured"
-# The rest of its lines (the dump armed, a private copy made, a cap or a create failure said once, an unknown key value): matched, not judged.
-H_HULL_OTHER = (r"hull layer: (?:dump \S+ armed|private copy made|\d+ private (?:copies|views) held|a \d+x\d+ format \d+ target is multisampled|the private copy of|"
-                r"a private view|diag\.hull_layer=\S+ is not off or dump)")
+H_HULL_AUTO = r"hull layer: auto dump armed \(reason: (?P<why>[^)]*)\)"
+H_HULL_UNKNOWN = r"hull layer: unknown lighting pair vs (?P<vs>[0-9A-F]{16}) ps (?P<ps>[0-9A-F]{16})"
+# The rest of its lines (the dump armed, a private copy made or dropped, a cap or a create failure said once, an unknown key value, the seed's facts and
+# refusals, the shaders): matched, not judged.
+H_HULL_OTHER = (r"hull layer: (?:dump \S+ armed|private copy (?:made|of a)|\d+ private (?:copies|views) held|a \d+x\d+ format \d+ target is multisampled|"
+                r"the private copy of|a private view|diag\.hull_layer=\S+ is not off or dump|no-slot-target:|a seed was refused|the seed reads the pool|"
+                r"the \w+ shader|the seed, filter and count shaders|the passes' states|\d+ unknown lighting pairs said|a stats readback)")
 # Frame generation, Phase 1 (fix.frame_generation_shadow, TEMPORARY; src\common\framegen_shadow_report.h): two lines of the graphics log with no build tag, read the way the desktop
 # window's are. The armed line is said once per change to on (so health_scan keeps it whatever --since says); the report line every second.
 H_FRAMEGEN = "frame generation shadow"
@@ -16947,38 +16956,49 @@ def _hj_desktop_window(rows, ctx):
 
 
 def _hj_hull_layer(rows, ctx=None):
-    """The hull layer, Step 1 (diag.hull_layer, TEMPORARY; src\\d3d11\\hull_layer.cpp): ran is the key line naming dump, applied is a 30 s report line with re-issues and
-    the sun stage substituted. OK when the window's reports re-issued the block and substituted the sun; PARTIAL when the block was re-issued but no sun draw got its
-    private counterpart; NEVER APPLIED when the key is on and no report follows (the layer never reported), or the reports say it ran and found nothing (no eye pass, or
-    an eye pass with no block); None with no line, or the key off and no report."""
+    """The hull layer, Step 1 v2 (diag.hull_layer, TEMPORARY; src\\d3d11\\hull_layer.cpp): ran is the key line naming dump, applied is a 30 s report line with seeds, an
+    own-mask readback and lighting substituted. OK when the window's reports seeded the own mask, read it back and substituted lighting draws; PARTIAL when it seeded
+    but no readback came back (mask-pending) or no lighting draw got its private counterpart; NEVER APPLIED when the key is on and no report follows (the layer never
+    reported), or the reports say it seeded nothing (the last line's state says why); None with no line, or the key off and no report."""
     keys = rows.get("key", [])
     reports = rows.get("report", [])
     dumps = rows.get("dump", [])
     nothing = rows.get("nothing", [])
+    autos = rows.get("auto", [])
+    unknown = rows.get("unknown", [])
     on = bool(keys) and keys[-1]["mode"] != "off"
     if not reports and not dumps and not nothing and not on:
         return None
     if not reports:
         return ("NEVER APPLIED", "diag.hull_layer=%s but no 'hull layer: state=' line follows in the window: the layer never reported (no 30 s window closed, or its "
                                  "boundary path is dead)" % (keys[-1]["mode"] if keys else "?"))
-    total = {k: sum(int(r[k]) for r in reports) for k in ("frames", "eye_frames", "blocks", "not_found", "reissued", "clears", "s_copy", "s_mask", "s_sun",
-                                                          "n_copy", "n_mask", "n_sun")}
+    total = {k: sum(int(r[k]) for r in reports) for k in ("frames", "eye_frames", "seeds", "no_seed", "no_slot", "refused", "readbacks", "reissued", "no_slot_draws",
+                                                          "filters", "s_copy", "s_mask", "s_light", "n_copy", "n_mask", "n_light", "unknown", "auto")}
     last = reports[-1]
-    text = ("%d report line(s): %d frame(s), %d eye-frame(s) with the cockpit shell, the block found in %d (none in %d frame(s)), hull draws an eye %s/%s/%s "
-            "(min/median/max, the last line; the ledgers say 37-40), %d re-issue(s), %d clear(s); substituted copy %d, mask %d, sun %d; no counterpart in "
-            "copy %d, mask %d, sun %d frame(s)" % (len(reports), total["frames"], total["eye_frames"], total["blocks"], total["not_found"], last["lo"], last["mid"],
-                                                   last["hi"], total["reissued"], total["clears"], total["s_copy"], total["s_mask"], total["s_sun"], total["n_copy"],
-                                                   total["n_mask"], total["n_sun"]))
+    text = ("%d report line(s): %d frame(s), %d eye-frame(s) with the cockpit shell, seeded %d (no seed %d, no slot target %d, refused %d), own records %s/%s/%s "
+            "(min/median/max, the last line; an Anaconda is 54) from %d readback(s), filtered px %s/%s/%s, hull draws an eye %s/%s/%s, %d re-issue(s) (%d without "
+            "the slot), %d filter pass(es); substituted copy %d, mask %d, light %d; light draws an eye %s/%s/%s; no counterpart in copy %d, mask %d, light %d "
+            "frame(s); %d unknown lighting pair(s); %d auto dump(s)"
+            % (len(reports), total["frames"], total["eye_frames"], total["seeds"], total["no_seed"], total["no_slot"], total["refused"], last["own_lo"],
+               last["own_mid"], last["own_hi"], total["readbacks"], last["f_lo"], last["f_mid"], last["f_hi"], last["lo"], last["mid"], last["hi"],
+               total["reissued"], total["no_slot_draws"], total["filters"], total["s_copy"], total["s_mask"], total["s_light"], last["l_lo"], last["l_mid"],
+               last["l_hi"], total["n_copy"], total["n_mask"], total["n_light"], max(total["unknown"], len(unknown)), max(total["auto"], len(autos))))
     if dumps:
-        text += "; dump %s: %s" % (dumps[-1]["stamp"], ", ".join("eye %s HullHdr %s GameHdrSun %s HullDepth %s (block %s)" % (d["eye"], d["hull"], d["game"], d["depth"], d["block"])
-                                                         for d in dumps if d["stamp"] == dumps[-1]["stamp"]))
+        text += "; dump %s: %s" % (dumps[-1]["stamp"], ", ".join("eye %s HullHdr %s GameHdrLit %s HullDepth %s (own %s, filtered %s px)"
+                                                                % (d["eye"], d["hull"], d["game"], d["depth"], d["own"], d["filtered"])
+                                                                for d in dumps if d["stamp"] == dumps[-1]["stamp"]))
     if nothing:
         text += "; %d dump(s) captured nothing" % len(nothing)
-    if total["reissued"] == 0:
-        why = "no eye pass drew the cockpit shell" if total["eye_frames"] == 0 else "the eye passes drew the cockpit shell but no own-ship block followed"
-        return ("NEVER APPLIED", text + ": it ran and re-issued nothing (%s)" % why)
-    if total["s_sun"] == 0:
-        return ("PARTIAL", text + ": the block was re-issued but no sun draw got its private counterpart")
+    if total["seeds"] == 0:
+        why = {"no-eye-pass": "no hull-family G-buffer draw and no cockpit shell", "no-shell": "hull-family G-buffer draws but no cockpit shell",
+               "no-seed": "the eye passes drew the cockpit shell but no hull-family draw followed", "no-slot-target":
+               "the seed draw had no slot target at render target 6 (engine motion's patched shaders, part of fix.temporal_aa)", "no-shader": "the layer's shaders did not compile",
+               "seed-refused": "every seed was refused (the 'a seed was refused' line says why)"}.get(last["state"], "state %s" % last["state"])
+        return ("NEVER APPLIED", text + ": it ran and seeded nothing (%s)" % why)
+    if total["readbacks"] == 0:
+        return ("PARTIAL", text + ": seeded, but no own-mask readback came back (mask-pending)")
+    if total["s_light"] == 0:
+        return ("PARTIAL", text + ": seeded and filtered, but no lighting draw got its private counterpart")
     return ("OK", text)
 
 def _hj_framegen_shadow(rows, ctx=None):
@@ -18417,12 +18437,14 @@ HEALTH_RULES = (
         ("gate_disengage", H_FRAMEGEN_GATE_DISENGAGE),
         ("gate_old", H_FRAMEGEN_GATE_OLD),
     ), _hj_framegen_lock),
-    # The hull layer, Step 1 (diag.hull_layer, TEMPORARY): the key, the 30 s report and the dump lines, graphics-log lines with no build tag.
+    # The hull layer, Step 1 v2 (diag.hull_layer, TEMPORARY): the key, the 30 s report, the dump, auto dump and unknown pair lines, graphics-log lines with no build tag.
     _hrule(H_HULL, (), (H_HULL_LABEL,), (
         ("key", H_HULL_KEY),
         ("report", H_HULL_REPORT),
         ("dump", H_HULL_DUMP),
         ("nothing", H_HULL_NOTHING),
+        ("auto", H_HULL_AUTO),
+        ("unknown", H_HULL_UNKNOWN),
         ("_", H_HULL_OTHER),
     ), _hj_hull_layer),
     # The SRV turret view (issue 140): lines of the graphics log that carry no build tag (health_scan reads them, as it reads the desktop window's, before it drops the untagged lines).
@@ -25837,29 +25859,46 @@ def self_test_health():
         def hl_key(mode="dump"):
             return RH("hull layer: diag.hull_layer=%s (TEMPORARY", mode)
 
-        def hl_report(state="applied", eye_frames=5400, blocks=5400, not_found=0, hd=(37, 39, 40), reissued=232200, sun=21600, nocp=(0, 0, 0)):
-            return RH("hull layer: state=%s", state, 2700, eye_frames, blocks, not_found, hd[0], hd[1], hd[2], 120, reissued, blocks, 10800, 32400, sun,
-                      nocp[0], nocp[1], nocp[2], 0, blocks, 0, 0)
+        def hl_report(state="applied", eye_frames=5400, seeds=5400, no_seed=0, no_slot=0, own=(54, 54, 55), readbacks=5400, filt=(0, 1200, 9000),
+                      hd=(70, 84, 92), reissued=453600, light=59400, ld=(11, 11, 11), nocp=(0, 0, 0)):
+            return RH("hull layer: state=%s", state, 2700, eye_frames, seeds, no_seed, no_slot, 0, own[0], own[1], own[2], readbacks, filt[0], filt[1], filt[2],
+                      hd[0], hd[1], hd[2], reissued, 0, seeds, seeds, 10800, 32400, light, ld[0], ld[1], ld[2], nocp[0], nocp[1], nocp[2], 0, seeds, 0, 0, 0,
+                      2700, 0)
+
+        def hl_idle(state, eye_frames=5400, no_seed=0, no_slot=0):
+            return hl_report(state, eye_frames=eye_frames, seeds=0, no_seed=no_seed, no_slot=no_slot, own=(0, 0, 0), readbacks=0, filt=(0, 0, 0), hd=(0, 0, 0),
+                             reissued=0, light=0, ld=(0, 0, 0), nocp=(2700, 2700, 2700))
 
         def hl_dump(eye=0, hull="written"):
-            return RH("hull layer: dump %ls eye %d", "123456789001", eye, 1234, 2016, 2240, 26, hull, "written", "written", 39)
+            return RH("hull layer: dump %ls eye %d", "123456789001", eye, 1234, 2816, 2448, 26, hull, "written", "written", 54, 3000, 3, 3, 84, 11)
 
         HL, hl_base = H_HULL, [f90_part()]
         check("hull layer: no line at all, nothing said (the key off)", hl_base, 0, [("OK", F90S)], lacks=["hull layer"])
         check("hull layer: the key off and no report says nothing", hl_base + [hl_key("off")], 0, [("OK", F90S)], lacks=[row("NEVER APPLIED", HL), row("OK", HL)])
-        check("hull layer: on, re-issuing and lighting, with a dump, is OK", hl_base + [hl_key(), RH("hull layer: dump %ls armed", "123456789001"), hl_dump(), hl_dump(eye=1),
-                                                                                   RH("hull layer: private copy made", 2016, 2240, 26, 0x28, 5), hl_report()], 0, [("OK", HL)],
-              has=["the block found in 5400 (none in 0 frame(s)), hull draws an eye 37/39/40", "substituted copy 10800, mask 32400, sun 21600",
-                   "dump 123456789001: eye 0 HullHdr written GameHdrSun written HullDepth written (block 39), eye 1 HullHdr written"], lacks=["UNPARSED", "do not match"])
+        check("hull layer: on, seeded, filtered and lit, with an auto dump, is OK",
+              hl_base + [hl_key(), RH("hull layer: the seed, filter and count shaders"), RH("hull layer: the seed reads the pool", 688128, 1, 0, 0, 2048, 336, 2048, 1,
+                                                                                         131072, 0),
+                         RH("hull layer: auto dump armed (reason:", 54, 600, 1, 3), RH("hull layer: dump %ls armed", "123456789001"), hl_dump(), hl_dump(eye=1),
+                         RH("hull layer: unknown lighting pair vs", 0x1234567890ABCDEF, 0xFEDCBA0987654321, 0, 77, 1),
+                         RH("hull layer: private copy made", 2016, 2240, 26, 0x28, 5), RH("hull layer: private copy of a %ux%u", 2016, 2240, 19, 120, 31),
+                         hl_report()], 0, [("OK", HL)],
+              has=["seeded 5400 (no seed 0, no slot target 0, refused 0), own records 54/54/55", "from 5400 readback(s), filtered px 0/1200/9000",
+                   "hull draws an eye 70/84/92", "substituted copy 10800, mask 32400, light 59400; light draws an eye 11/11/11",
+                   "1 unknown lighting pair(s); 1 auto dump(s)",
+                   "dump 123456789001: eye 0 HullHdr written GameHdrLit written HullDepth written (own 54, filtered 3000 px), eye 1 HullHdr written"],
+              lacks=["UNPARSED", "do not match"])
         check("hull layer: on and never reported is NEVER APPLIED", hl_base + [hl_key()], 3, [("NEVER APPLIED", HL)], has=["the layer never reported"])
-        check("hull layer: an eye pass with no block is NEVER APPLIED, ran and found nothing", hl_base + [hl_key(), hl_report("no-block", blocks=0, not_found=2700, hd=(0, 0, 0),
-                                                                                                                  reissued=0, sun=0, nocp=(2700, 2700, 2700))], 3,
-              [("NEVER APPLIED", HL)], has=["it ran and re-issued nothing (the eye passes drew the cockpit shell but no own-ship block followed)"])
-        check("hull layer: no eye pass at all is NEVER APPLIED, and says so", hl_base + [hl_key(), hl_report("no-eye-pass", eye_frames=0, blocks=0, not_found=2700,
-                                                                                                           hd=(0, 0, 0), reissued=0, sun=0)], 3,
-              [("NEVER APPLIED", HL)], has=["no eye pass drew the cockpit shell"])
-        check("hull layer: the block re-issued and the sun never substituted is PARTIAL", hl_base + [hl_key(), hl_report("partial", sun=0, nocp=(0, 0, 2700))], 0,
-              [("PARTIAL", HL)], has=["no sun draw got its private counterpart"])
+        check("hull layer: the shell with no seed is NEVER APPLIED, ran and seeded nothing", hl_base + [hl_key(), hl_idle("no-seed", no_seed=5400)], 3,
+              [("NEVER APPLIED", HL)], has=["it ran and seeded nothing (the eye passes drew the cockpit shell but no hull-family draw followed)"])
+        check("hull layer: no slot target is NEVER APPLIED, and names engine motion", hl_base + [hl_key(), RH("hull layer: no-slot-target:", "x"),
+                                                                                       hl_idle("no-slot-target", no_slot=5400)], 3,
+              [("NEVER APPLIED", HL)], has=["the seed draw had no slot target at render target 6 (engine motion's patched shaders"], lacks=["UNPARSED"])
+        check("hull layer: no eye pass at all is NEVER APPLIED, and says so", hl_base + [hl_key(), hl_idle("no-eye-pass", eye_frames=0)], 3,
+              [("NEVER APPLIED", HL)], has=["no hull-family G-buffer draw and no cockpit shell"])
+        check("hull layer: seeded with no readback is PARTIAL, mask pending", hl_base + [hl_key(), hl_report("mask-pending", own=(0, 0, 0), readbacks=0)], 0,
+              [("PARTIAL", HL)], has=["no own-mask readback came back (mask-pending)"])
+        check("hull layer: seeded and no lighting substituted is PARTIAL", hl_base + [hl_key(), hl_report("partial", light=0, ld=(0, 0, 0), nocp=(0, 0, 2700))], 0,
+              [("PARTIAL", HL)], has=["no lighting draw got its private counterpart"])
         check("hull layer: a report inside --since is read, the key before it is kept", hl_base + [(1, hl_key()), (70, hl_report())], 0, [("OK", HL)], extra=["--since", "10:01:00"])
         check("hull layer: a drifted report line is counted as unparsed and is no report", hl_base + [hl_key(), hl_report().replace(" reissued=", " reissues=")], 3,
               [("NEVER APPLIED", HL)], has=["line(s) the rule's patterns do not match"])
