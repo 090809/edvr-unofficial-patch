@@ -71,4 +71,17 @@ private:
 // The index of `remembered` in `folders`, by sameInstall; folders.size() when it is empty or not there.
 size_t rememberedInstallIndex(const std::vector<std::wstring>& folders, const std::wstring& remembered);
 
+struct GameInstall;  // detect.h
+
+// Which install the window opens on, given `remembered` (last_install). kNoRememberedInstall when there is none
+// to use: nothing remembered, or a folder that is gone, holds no game, or holds a legacy one. Otherwise an index
+// into `installs`, or installs.size() when the folder is not in the list but still holds a game the window takes
+// (one that was browsed to): *restored then holds it, described as Browse would, and the caller appends it. A
+// folder that describes into one already listed (a launcher folder above it, say) is that one, not a second entry.
+// `describe` and `isLegacyExe` are describeDir and eliteExeIsLegacy, or the rig's stand-ins.
+constexpr size_t kNoRememberedInstall = static_cast<size_t>(-1);
+size_t rememberedInstallChoice(const std::vector<GameInstall>& installs, const std::wstring& remembered,
+                               bool (*describe)(const std::wstring&, const std::wstring&, GameInstall*),
+                               bool (*isLegacyExe)(const std::wstring&), GameInstall* restored);
+
 }  // namespace edvr::installer

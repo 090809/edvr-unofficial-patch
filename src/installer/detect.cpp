@@ -476,7 +476,13 @@ std::vector<GameInstall> withoutLegacyInstalls(const std::vector<GameInstall>& i
     return kept;
 }
 
-std::vector<GameInstall> findInstalls() {
+const char* onlyLegacyInstallsText() {
+    // The planner's words for the same refusal, so Browse and the scan say one thing.
+    return "The only Elite Dangerous install found is Elite Dangerous (Horizons), not Elite Dangerous: Odyssey. "
+           "ED-UP supports Odyssey only; no ED-UP build supports that game.";
+}
+
+std::vector<GameInstall> findInstalls(size_t* legacyLeftOut) {
     std::vector<GameInstall> found;
     findSteam(&found);
     findEpic(&found);
@@ -497,7 +503,9 @@ std::vector<GameInstall> findInstalls() {
                      [](const GameInstall& a, const GameInstall& b) {
                          return a.odyssey && !b.odyssey;
                      });
-    return withoutLegacyInstalls(unique, eliteExeIsLegacy);
+    std::vector<GameInstall> supported = withoutLegacyInstalls(unique, eliteExeIsLegacy);
+    if (legacyLeftOut) *legacyLeftOut = unique.size() - supported.size();
+    return supported;
 }
 
 bool nvidiaAdapterPresent(std::wstring* name) {

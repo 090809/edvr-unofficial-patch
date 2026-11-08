@@ -93,6 +93,12 @@ bool loadFrontierLogin(const std::wstring& path, StoredLogin* out) {
     if (path.empty() || !readFileBytes(path, &bytes, 1u << 16, nullptr)) return false;
 
     StoredLogin found;
+    // Every way out wipes what was decrypted here; on success *out holds the only copy.
+    auto discard = [&]() {
+        wipeString(&found.password);
+        wipeString(&found.machineToken);
+        return false;
+    };
     bool headerSeen = false, emailSeen = false;
     size_t start = 0;
     while (start < bytes.size()) {
@@ -103,30 +109,27 @@ bool loadFrontierLogin(const std::wstring& path, StoredLogin* out) {
         start = end + 1;
         if (line.empty()) continue;
         if (!headerSeen) {
-            if (line != kHeader) return false;
+            if (line != kHeader) return discard();
             headerSeen = true;
             continue;
         }
         const size_t eq = line.find('=');
-        if (eq == std::string::npos) return false;
+        if (eq == std::string::npos) return discard();
         const std::string key = line.substr(0, eq), value = line.substr(eq + 1);
         if (key == "email") {
             found.email = value;
             emailSeen = true;
         } else if (key == "password") {
-            if (!unprotect(value, &found.password)) return false;
+            if (!unprotect(value, &found.password)) return discard();
         } else if (key == "machine_token") {
-            if (!unprotect(value, &found.machineToken)) return false;
+            if (!unprotect(value, &found.machineToken)) return discard();
         } else {
-            return false;  // a key this version did not write: not a file to trust
+            return discard();  // a key this version did not write: not a file to trust
         }
     }
-    if (!headerSeen || !emailSeen || found.email.empty()) {
-        wipeString(&found.password);
-        wipeString(&found.machineToken);
-        return false;
-    }
+    if (!headerSeen || !emailSeen || found.email.empty()) return discard();
     *out = found;
+    discard();
     return true;
 }
 
@@ -164,8 +167,8 @@ bool saveFrontierLogin(const std::wstring& path, const StoredLogin& login, std::
 bool forgetFrontierSecrets(const std::wstring& path) {
     StoredLogin login;
     if (!loadFrontierLogin(path, &login)) return deleteFrontierLogin(path);
-    login.password.clear();
-    login.machineToken.clear();
+    wipeString(&login.password);
+    wipeString(&login.machineToken);
     return saveFrontierLogin(path, login, nullptr);
 }
 

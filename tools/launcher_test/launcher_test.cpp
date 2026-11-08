@@ -802,6 +802,50 @@ void testCache() {
 
 // ---- launcher.ini ---------------------------------------------------------------------
 
+// Stand-ins for describeDir and eliteExeIsLegacy: a folder is a game when its path says Game or Legacy, one
+// that says Launcher describes into the Game folder beside it, and Legacy in the path makes it legacy.
+bool fakeDescribe(const std::wstring& dir, const std::wstring& source, GameInstall* out) {
+    const size_t launcher = dir.find(L"Launcher");
+    if (launcher != std::wstring::npos) {
+        out->dir = dir.substr(0, launcher) + L"Game";
+    } else if (dir.find(L"Game") != std::wstring::npos || dir.find(L"Legacy") != std::wstring::npos) {
+        out->dir = dir;
+    } else {
+        return false;
+    }
+    out->source = source;
+    return true;
+}
+bool fakeIsLegacy(const std::wstring& exe) { return exe.find(L"Legacy") != std::wstring::npos; }
+
+void testRememberedChoice() {
+    section("remembered install");
+    std::vector<GameInstall> installs(2);
+    installs[0].dir = L"C:\\Steam\\Game";
+    installs[0].source = L"Steam";
+    installs[1].dir = L"D:\\Frontier\\Game";
+    installs[1].source = L"Frontier launcher";
+    GameInstall restored;
+    check(rememberedInstallChoice(installs, L"", fakeDescribe, fakeIsLegacy, &restored) == kNoRememberedInstall, "nothing remembered: no choice");
+    check(rememberedInstallChoice(installs, L"d:/frontier/game/", fakeDescribe, fakeIsLegacy, &restored) == 1,
+          "a listed install is chosen, whatever the case or separators");
+    restored = GameInstall();
+    check(rememberedInstallChoice(installs, L"E:\\Browsed\\Game", fakeDescribe, fakeIsLegacy, &restored) == 2 && restored.dir == L"E:\\Browsed\\Game" &&
+              restored.source == L"Folder you chose",
+          "a browsed folder that still holds a game comes back as a new entry, labelled as Browse labels it");
+    check(rememberedInstallChoice(installs, L"E:\\Browsed\\Legacy", fakeDescribe, fakeIsLegacy, &restored) == kNoRememberedInstall,
+          "a browsed folder holding the legacy game does not come back");
+    check(rememberedInstallChoice(installs, L"E:\\Gone\\Nothing", fakeDescribe, fakeIsLegacy, &restored) == kNoRememberedInstall,
+          "nor one that holds no game any more");
+    check(rememberedInstallChoice(installs, L"D:\\Frontier\\Launcher", fakeDescribe, fakeIsLegacy, &restored) == 1,
+          "a folder that describes into a listed install is that install, not a second entry");
+    restored = GameInstall();
+    check(rememberedInstallChoice({}, L"E:\\Browsed\\Game", fakeDescribe, fakeIsLegacy, &restored) == 0 && restored.dir == L"E:\\Browsed\\Game",
+          "with nothing found by the scan, a browsed game is still restored");
+    check(std::string(onlyLegacyInstallsText()).find("Odyssey only") != std::string::npos,
+          "the scan's legacy-only line says what the planner says: Odyssey only");
+}
+
 void testState() {
     section("state");
     const std::wstring dir = fresh("state");
@@ -4553,6 +4597,39 @@ void testStoreSession() {
               "the line says so, nothing is started, and the stored password and token stay forgotten");
     }
 
+    // On the code step only a refusal asks for the code again. Anything else ends the sign-in once, with
+    // its own reason, and Frontier's route follows: no user is told a good code was wrong.
+    {
+        struct CodeCase {
+            const char* name;
+            Reply reply;
+            const char* reason;
+        };
+        const std::vector<CodeCase> cases = {
+            {"a 404", statusReply(404), "does not know"},
+            {"a redirect", statusReply(302), "redirect"},
+            {"an unavailable server", statusReply(503), "unavailable"},
+            {"a reply with no token", jsonReply("{\"nothing\":1}"), "carried no machine token"},
+            {"a web page", htmlReply(), "web page"},
+        };
+        int ran = 0;
+        for (const CodeCase& c : cases) {
+            DirectRig rig(std::string("store-code-fails-") + std::to_string(++ran), "direct_launch=on\n", true);
+            scriptStore(&rig.http, true);
+            rig.http.script[kFTokenPath] = {c.reply, tokenReply()};
+            rig.loginAnswers = {{true, kEmail, kPassword, true}};
+            rig.codeAnswers = {{true, kCode}, {true, kCode}};
+            rig.play(L"Frontier launcher", true, false);
+            check(rig.ui.pump([&]() { return rig.rec.spawns.size() == 1 && !rig.session->playing(); }), std::string(c.name) + " on the code: Frontier's route is taken");
+            check(rig.codeNotes.size() == 1 && rig.http.count(kFTokenPath) == 1 && rig.started.empty(),
+                  std::string(c.name) + " on the code: the code was asked for once and sent once, and no game was started directly (asked " +
+                      std::to_string(rig.codeNotes.size()) + ")");
+            bool said = false;
+            for (const std::string& line : rig.seen) said = said || (contains(line, "Direct launch did not work") && contains(line, c.reason));
+            check(said, std::string(c.name) + " on the code: the band's line gives that reason, not a wrong code");
+        }
+    }
+
     // Every fallback lands on Frontier's own route, which carries the VR or flat flag.
     {
         struct Case {
@@ -5082,6 +5159,7 @@ int main(int argc, char** argv) {
     testZip();
     testCache();
     testState();
+    testRememberedChoice();
     testUpdater();
     testPayload();
     testHttp();

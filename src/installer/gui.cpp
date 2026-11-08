@@ -868,7 +868,8 @@ void addInstall(const GameInstall& game) {
 void scanForInstalls() {
     SendMessageW(g.combo, CB_RESETCONTENT, 0, 0);
     g.installs.clear();
-    for (const GameInstall& game : findInstalls()) {
+    size_t legacyLeftOut = 0;
+    for (const GameInstall& game : findInstalls(&legacyLeftOut)) {
         g.installs.push_back(game);
         const std::wstring label = game.source + L"  \x00b7  " + game.dir;
         SendMessageW(g.combo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(label.c_str()));
@@ -886,11 +887,14 @@ void scanForInstalls() {
 
     if (g.installs.empty()) {
         g.haveSurvey = false;
-        setReport(
-                "No Elite Dangerous install was found.\r\n\r\n"
-                "Press Browse and point at the folder that holds EliteDangerous64.exe. For a "
-                "Frontier launcher install that is usually a folder ending in\r\n"
-                "    Products\\elite-dangerous-odyssey-64");
+        // An install that is there but not supported is not "not found".
+        const std::string first = legacyLeftOut > 0
+                                      ? std::string(onlyLegacyInstallsText()) + "\r\n\r\nIf Odyssey is installed somewhere else, press Browse"
+                                      : std::string("No Elite Dangerous install was found.\r\n\r\nPress Browse");
+        setReport(first +
+                  " and point at the folder that holds EliteDangerous64.exe. For a "
+                  "Frontier launcher install that is usually a folder ending in\r\n"
+                  "    Products\\elite-dangerous-odyssey-64");
         showSurvey();
         return;
     }

@@ -234,7 +234,9 @@ SignInResult frontierSignIn(const DirectEnv& env, FrontierApi& api, const std::s
                     wipeString(&minted);
                     break;
                 }
-                if (checked.outcome == ApiOutcome::Unavailable) {
+                // Only a refusal says the code was wrong. Anything else (the servers down, a reply the launcher
+                // cannot read, a web page, a redirect) is no reason to ask again, so the sign-in ends with it.
+                if (checked.outcome != ApiOutcome::Denied) {
                     clean();
                     return signInFailed(reasonFor(checked, false));
                 }

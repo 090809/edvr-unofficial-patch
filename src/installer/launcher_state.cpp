@@ -5,6 +5,7 @@
 #include <cstdlib>
 
 #include "../common/iniedit.h"
+#include "detect.h"
 #include "probe.h"
 #include "update_util.h"
 
@@ -141,6 +142,23 @@ size_t rememberedInstallIndex(const std::vector<std::wstring>& folders, const st
         if (LauncherState::sameInstall(folders[i], remembered)) return i;
     }
     return folders.size();
+}
+
+size_t rememberedInstallChoice(const std::vector<GameInstall>& installs, const std::wstring& remembered,
+                               bool (*describe)(const std::wstring&, const std::wstring&, GameInstall*),
+                               bool (*isLegacyExe)(const std::wstring&), GameInstall* restored) {
+    if (remembered.empty()) return kNoRememberedInstall;
+    std::vector<std::wstring> folders;
+    for (const GameInstall& game : installs) folders.push_back(game.dir);
+    const size_t listed = rememberedInstallIndex(folders, remembered);
+    if (listed < folders.size()) return listed;
+    GameInstall game;
+    if (!describe || !describe(remembered, L"Folder you chose", &game)) return kNoRememberedInstall;
+    if (isLegacyExe && withoutLegacyInstalls({game}, isLegacyExe).empty()) return kNoRememberedInstall;
+    const size_t same = rememberedInstallIndex(folders, game.dir);
+    if (same < folders.size()) return same;
+    *restored = game;
+    return installs.size();
 }
 
 }  // namespace edvr::installer

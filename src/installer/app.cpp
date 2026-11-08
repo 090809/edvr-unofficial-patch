@@ -376,10 +376,13 @@ int runConsole(const AppArgs& args) {
             return 2;
         }
     } else {
-        const std::vector<GameInstall> found = findInstalls();
+        size_t legacyLeftOut = 0;
+        const std::vector<GameInstall> found = findInstalls(&legacyLeftOut);
         if (found.empty()) {
-            writeOut("No Elite Dangerous install found. Pass --dir with the folder that holds "
-                     "EliteDangerous64.exe.\r\n");
+            if (legacyLeftOut > 0) writeOut(std::string(onlyLegacyInstallsText()) + "\r\n");
+            writeOut(legacyLeftOut > 0 ? "If Odyssey is installed somewhere else, pass --dir with the folder that holds EliteDangerous64.exe.\r\n"
+                                       : "No Elite Dangerous install found. Pass --dir with the folder that holds "
+                                         "EliteDangerous64.exe.\r\n");
             return 2;
         }
         if (found.size() > 1) {

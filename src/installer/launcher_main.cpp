@@ -308,13 +308,15 @@ bool launcherStartup(const AppArgs& args, int* exitCode) {
     if (!roots.canonical) return true;
 
     const std::wstring self = selfPath();
-    removeLauncherLeftovers(self);
 
     // One window. A launcher started by a self-update waits a moment for the old one to leave.
     if (!takeInstanceMutex(args.updated ? 8000 : 0)) {
         bringRunningLauncherForward();
         return false;
     }
+    // Only the launcher that holds the mutex clears .old and .new: a second start must not delete the
+    // .new a running launcher has just downloaded and verified and is about to swap in.
+    removeLauncherLeftovers(self);
 
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     const std::wstring home = roots.exePath();

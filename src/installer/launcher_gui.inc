@@ -78,19 +78,15 @@ std::string launcherRememberedMode() {
 size_t launcherRememberedInstall() {
     LauncherState state;
     state.load(joinPath(launcherRootsFor(g.args).launcherDir(), L"launcher.ini"), nullptr);
-    const std::wstring last = state.lastInstall();
-    if (last.empty()) return g.installs.size();
-    std::vector<std::wstring> folders;
-    for (const GameInstall& game : g.installs) folders.push_back(game.dir);
-    const size_t found = rememberedInstallIndex(folders, last);
-    if (found < folders.size()) return found;
-    GameInstall game;
-    if (!describeDir(last, L"Folder you chose", &game)) return g.installs.size();
-    if (withoutLegacyInstalls({game}, eliteExeIsLegacy).empty()) return g.installs.size();
-    g.installs.push_back(game);
-    const std::wstring label = game.source + L"  \x00b7  " + game.dir;
-    SendMessageW(g.combo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(label.c_str()));
-    return g.installs.size() - 1;
+    GameInstall restored;
+    const size_t choice = rememberedInstallChoice(g.installs, state.lastInstall(), describeDir, eliteExeIsLegacy, &restored);
+    if (choice == kNoRememberedInstall) return g.installs.size();
+    if (choice == g.installs.size()) {
+        g.installs.push_back(restored);
+        const std::wstring label = restored.source + L"  \x00b7  " + restored.dir;
+        SendMessageW(g.combo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(label.c_str()));
+    }
+    return choice;
 }
 
 // Shows, hides and enables everything the launcher owns, from the session and the survey.
