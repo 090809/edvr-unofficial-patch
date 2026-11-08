@@ -2014,6 +2014,9 @@ cc::Judge concourseJudgeHere(const PadSnapshot& s, bool nameReadable, const Node
 // the one the capture and aim lines carry, with g_frameStamp (the judge's own counter, advanced at the top of every tick) read as the window opened beside it. A judge that runs a frame late
 // lands in the next window. The judges only append under g_recMutex (when g_vrRecOn); the present thread's ticks sort and log, off the lock.
 std::atomic<bool> g_vrRecOn{false};
+// The room's centre in the store's world (the bake's origin), set as each window opens. The judges' own distance is from the store's camera, which in VR is the real head, not the
+// centre (the world check: "the store's camera" is where the commander stands), so the band 20 to 50 m from the centre could be past 60 m from it; nearness is measured from here.
+std::atomic<float> g_recCentre[3] = {};
 constexpr float kRecNearM = 60.0f, kRecKeptNearM = 50.0f;
 constexpr size_t kRecKeyCap = 4096, kRecDiffLines = 40, kRecKeptLines = 40;
 struct RecEntry {
@@ -2073,7 +2076,14 @@ void recNote(const PadSnapshot& s, uintptr_t record, uintptr_t node, const NodeI
              bool slabbed, char path) noexcept {
     try {
         const bool ok = sphere && std::isfinite(d) && std::isfinite(r) && std::isfinite(c[0]) && std::isfinite(c[1]) && std::isfinite(c[2]);
-        const float nearest = ok ? (d - r > 0.0f ? d - r : 0.0f) : -1.0f;
+        // From the room's centre (g_recCentre), not the judge's d (from the store's camera, the real head in VR).
+        float dc = 0.0f;
+        if (ok) {
+            const float dx = c[0] - g_recCentre[0].load(std::memory_order_relaxed), dy = c[1] - g_recCentre[1].load(std::memory_order_relaxed),
+                        dz = c[2] - g_recCentre[2].load(std::memory_order_relaxed);
+            dc = std::sqrt(dx * dx + dy * dy + dz * dz);
+        }
+        const float nearest = ok ? (dc - r > 0.0f ? dc - r : 0.0f) : -1.0f;
         if (ok && !(nearest <= kRecNearM)) return;
         char nm[64] = {};
         if (!(nameReadable && cachedNameOfNode(node, nm, sizeof(nm), &ni.validator))) std::snprintf(nm, sizeof(nm), "<unreadable>");
@@ -2240,8 +2250,9 @@ void recClose() noexcept {
 }
 
 // An aim that writes opens its window; the judge numbering is g_frameStamp as it stands now.
-void recOpen(uint32_t aimFrame, uint32_t face, uint32_t dwell) noexcept {
+void recOpen(uint32_t aimFrame, uint32_t face, uint32_t dwell, const float centre[3]) noexcept {
     try {
+        for (int k = 0; k < 3; ++k) g_recCentre[k].store(centre[k], std::memory_order_relaxed);
         RecState& st = recState();
         std::lock_guard<std::mutex> lock(st.m);
         st.cur = RecWin();
@@ -5287,7 +5298,7 @@ bool vrBakeAimTick(uint32_t frame) {
     g_vr.aimDwell[a] = dwell;
     g_vr.aimWrite[a] = writes;
     concoursePaneVrBakeAimFrame(frame, static_cast<int>(d), dwell, writes);
-    if (writes) recOpen(frame, d, dwell);   // TEMPORARY (H62 instrument, Flight 56): the judges' records of this aim's window
+    if (writes) recOpen(frame, d, dwell, g_vr.centre);   // TEMPORARY (H62 instrument, Flight 56): the judges' records of this aim's window
     for (int e = 0; e < 2; ++e) cvb::eyeAt(eyeToHead[e], rows, g_vr.aimPred[a][e]);
     g_vr.aimValid[a] = true;
     ++g_vr.aimTicks;
