@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run EDVR's Windows installer with Elite's recorded Steam Proton runtime."""
+"""Run EDVR's Windows installer, or with --launcher the ED-UP launcher, with Elite's recorded Steam Proton runtime."""
 
 import argparse
 import os
@@ -18,6 +18,10 @@ MAX_VDF = 4 * 1024 * 1024
 def parser():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--installer", type=Path, help="edvr-installer.exe (beside script or build/ by default)")
+    p.add_argument("--launcher", action="store_true",
+                   help="run ed-up-launcher.exe instead of the installer; arguments after a literal -- go to it")
+    p.add_argument("--launcher-exe", type=Path,
+                   help="ed-up-launcher.exe (beside script or build/ by default); implies nothing without --launcher")
     p.add_argument("--steam-dir", type=Path, help="Steam root; otherwise use STEAM_DIR or known locations")
     p.add_argument("--proton", type=Path, help="Proton directory or proton script; overrides the prefix record")
     p.add_argument("--game-dir", type=Path, help="folder holding EliteDangerous64.exe inside the installed game")
@@ -36,7 +40,39 @@ def parser():
     return p
 
 
+LAUNCHER_REFUSED = ("install", "repair", "uninstall", "collect_logs", "preview", "scope",
+                    "replace_settings", "remove_settings", "installer")
+
+
+def parse_argv(argv=None):
+    """Parse argv, splitting it at the first literal -- before argparse sees it.
+
+    args.passthrough is None when there was no --, else the words after it."""
+    words = list(sys.argv[1:] if argv is None else argv)
+    passthrough = None
+    if "--" in words:
+        cut = words.index("--")
+        words, passthrough = words[:cut], words[cut + 1:]
+    args = parser().parse_args(words)
+    args.passthrough = passthrough
+    return args
+
+
+def launcher_args(args):
+    for name in LAUNCHER_REFUSED:
+        if getattr(args, name):
+            raise ValueError("--%s is an installer option; it cannot be used with --launcher" %
+                             name.replace("_", "-"))
+    return list(args.passthrough or [])
+
+
 def installer_args(args):
+    if getattr(args, "passthrough", None) is not None and not args.launcher:
+        raise ValueError("arguments after -- are forwarded to the launcher; use --launcher")
+    if args.launcher_exe is not None and not args.launcher:
+        raise ValueError("--launcher-exe requires --launcher")
+    if args.launcher:
+        return launcher_args(args)
     action = next((name for name in ("install", "repair", "uninstall", "collect_logs", "preview")
                    if getattr(args, name)), None)
     if args.scope and action not in ("install", "repair", "preview"):
@@ -56,7 +92,16 @@ def installer_args(args):
     return result
 
 
+def launcher_path(args, script):
+    if args.launcher_exe is not None:
+        return args.launcher_exe.expanduser().resolve()
+    adjacent = script.resolve().parent / "ed-up-launcher.exe"
+    return adjacent if adjacent.is_file() else script.resolve().parents[1] / "build" / "ed-up-launcher.exe"
+
+
 def installer_path(args, script):
+    if args.launcher:
+        return launcher_path(args, script)
     if args.installer is not None:
         return args.installer.expanduser().resolve()
     adjacent = script.resolve().parent / "edvr-installer.exe"
@@ -322,7 +367,9 @@ def build_plan(args, *, script=Path(__file__), home=Path.home(), environ=None):
     forwarded = installer_args(args)
     installer = installer_path(args, script)
     if not installer.is_file():
-        raise ValueError("installer not found: %s (pass --installer PATH)" % installer)
+        raise ValueError("%s not found: %s (pass %s PATH)" % (
+            "launcher" if args.launcher else "installer", installer,
+            "--launcher-exe" if args.launcher else "--installer"))
     steam_roots = roots(args, home, env_in)
     steam_root, library, install_root, game = find_game(args, steam_roots)
     compatdata = compatdata_path(library, env_in)
@@ -350,6 +397,7 @@ def run(args, *, script=Path(__file__), home=Path.home(), environ=None,
         args, script=script, home=home, environ=environ)
     if args.dry_run:
         print("EDVR resolved launch plan (nothing executed or written):")
+        print("  program: %s" % ("launcher" if args.launcher else "installer"))
         print("  game: %s" % game)
         print("  prefix: %s" % compatdata)
         print("  Proton: %s" % proton)
@@ -368,12 +416,83 @@ def run(args, *, script=Path(__file__), home=Path.home(), environ=None,
         raise ValueError("could not start Steam's Proton/runtime: %s" % exc) from exc
 
 
+def launcher_self_test(parse, root, script, home, env, launch, calls):
+    import io
+    from contextlib import redirect_stdout
+
+    # Default exe resolution mirrors installer_path: beside the script, else <repo>/build.
+    launcher_args_ns = parse("--launcher")
+    assert launcher_path(launcher_args_ns, script) == script.resolve().parents[1] / "build" / "ed-up-launcher.exe"
+    exe = script.parent / "ed-up-launcher.exe"
+    exe.write_bytes(b"exe")
+    assert launcher_path(launcher_args_ns, script) == exe.resolve()
+    override = root / "elsewhere" / "my-launcher.exe"
+    assert launcher_path(parse("--launcher", "--launcher-exe", str(override)), script) == override.resolve()
+
+    # Passthrough: split at the first --, kept verbatim, later -- stay in it.
+    ns = parse("--launcher", "--dry-run", "--", "--direct-dry-run", "--vr", "--", "--channel", "rc")
+    assert ns.dry_run and ns.passthrough == ["--direct-dry-run", "--vr", "--", "--channel", "rc"]
+    assert parse("--launcher").passthrough is None
+    assert launcher_args(parse("--launcher")) == []
+
+    # The command shape: runinprefix, the launcher exe, --dir, then the passthrough; no installer flags.
+    plan_args = parse("--launcher", "--dry-run", "--", "--direct-dry-run", "--vr")
+    before = set(root.rglob("*"))
+    buf = io.StringIO()
+    count = len(calls)
+    with redirect_stdout(buf):
+        assert run(plan_args, script=script, home=home, environ=env, launch=launch,
+                   platform="linux", geteuid=lambda: 1000) == 0
+    assert len(calls) == count and set(root.rglob("*")) == before, "launcher --dry-run touched something"
+    command, process_env, _details = build_plan(plan_args, script=script, home=home, environ=env)
+    start = command.index("runinprefix")
+    assert command[start:start + 3] == ["runinprefix", str(exe.resolve()), "--dir"]
+    assert command[start + 4:] == ["--direct-dry-run", "--vr"]
+    assert "edvr-installer.exe" not in shlex.join(command) and "--install" not in command
+    assert "program: launcher" in buf.getvalue() and shlex.join(command) in buf.getvalue()
+    assert process_env["SteamAppId"] == APP_ID and "WINEPREFIX" not in process_env
+    bare = build_plan(parse("--launcher", "--dry-run"), script=script, home=home, environ=env)[0]
+    assert bare[-3:-1] == [str(exe.resolve()), "--dir"] and bare[-1] != "--install"
+    # A real launcher run uses the same command and returns the launcher's exit code.
+    assert run(parse("--launcher", "--", "--channel", "rc"), script=script, home=home, environ=env,
+               launch=launch, platform="linux", geteuid=lambda: 1000) == 23
+    assert calls[-1][0][-2:] == ["--channel", "rc"] and str(exe.resolve()) in calls[-1][0]
+    calls.pop()
+    # A missing launcher names --launcher-exe, not --installer.
+    exe.unlink()
+    try:
+        build_plan(parse("--launcher", "--dry-run"), script=script, home=home, environ=env)
+        raise AssertionError("missing launcher accepted")
+    except ValueError as exc:
+        assert "--launcher-exe" in str(exc) and "--installer" not in str(exc)
+    exe.write_bytes(b"exe")
+
+    # Installer-only options are refused in launcher mode.
+    for refused in (("--install",), ("--repair",), ("--uninstall",), ("--collect-logs",), ("--preview",),
+                    ("--scope", "flat"), ("--replace-settings",), ("--remove-settings",),
+                    ("--installer", str(exe))):
+        try:
+            launcher_args(parse("--launcher", *refused))
+            raise AssertionError("launcher accepted %s" % refused[0])
+        except ValueError as exc:
+            assert refused[0] in str(exc) and "--launcher" in str(exc)
+    # Passthrough and --launcher-exe are refused without --launcher.
+    for stray in (("--", "--vr"), ("--install", "--", "--vr"), ("--launcher-exe", str(exe))):
+        try:
+            installer_args(parse(*stray))
+            raise AssertionError("accepted %s without --launcher" % stray[0])
+        except ValueError as exc:
+            assert "--launcher" in str(exc)
+    # The installer path is unchanged by all of this.
+    assert installer_args(parse("--install")) == ["--install"]
+
+
 def self_test():
     import io
     from contextlib import redirect_stderr, redirect_stdout
     from tempfile import TemporaryDirectory
 
-    parse = lambda *words: parser().parse_args(words)
+    parse = lambda *words: parse_argv(list(words))
     assert installer_args(parse("--preview", "--scope", "flat", "--replace-settings")) == [
         "--install", "--dry-run", "--scope", "flat", "--replace-settings"]
     assert installer_args(parse()) == []
@@ -523,6 +642,7 @@ def self_test():
             except ValueError as exc:
                 assert "sudo" in str(exc)
             assert len(calls) == 1
+            launcher_self_test(parse, root, script, home, env, launch, calls)
             (compat / "config_info").unlink()
             try:
                 build_plan(args, script=script, home=home, environ=env)
@@ -591,7 +711,7 @@ def self_test():
 
 
 def main(argv=None):
-    args = parser().parse_args(argv)
+    args = parse_argv(argv)
     if args.self_test:
         self_test()
         return 0

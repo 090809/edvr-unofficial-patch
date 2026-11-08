@@ -26,9 +26,17 @@
 #include "logbundle.h"
 #include "mirror.h"
 #include "payload.h"
+#include "product_title.h"
 #include "settings.h"
 #include "settings_view.h"
 #include "ui.h"
+#ifdef EDUP_LAUNCHER
+#include "launch_route.h"
+#include "launcher_login_dialog.h"
+#include "launcher_main.h"
+#include "launcher_session.h"
+#include "layout_dpi.h"
+#endif
 
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "uxtheme.lib")
@@ -60,15 +68,26 @@ enum : int {
 
 const UINT kMsgFirstScan = WM_APP + 1;
 
+#ifndef EDUP_LAUNCHER   // the launcher has no tip link
 const wchar_t* kTipUrl = L"https://ko-fi.com/seancharacterecho";
-const wchar_t* kDiscordUrl = L"https://discord.gg/AWJ6djKKzr";
 const wchar_t* kTipText = L"ED-UP is free. If it makes your flight more enjoyable, you can";
+#endif
+const wchar_t* kDiscordUrl = L"https://discord.gg/AWJ6djKKzr";
+#ifdef EDUP_LAUNCHER
+// The launcher's update and Play band sits between the report card and the tip line (launcher_gui.inc).
+constexpr int kTipTop = 758;  // the tip line's top: the painted sentence and both links share it
+#else
 constexpr int kTipTop = 658;  // the tip line's top: the painted sentence and both links share it
+#endif
 
 // The client area and every control position below are in 96-dpi units, scaled
 // once at layout time.
 const int kClientWidth = 720;
+#ifdef EDUP_LAUNCHER
+const int kClientHeight = 786;
+#else
 const int kClientHeight = 688;
+#endif
 const int kMargin = 24;
 const int kCardPad = 20;
 
@@ -120,7 +139,8 @@ struct Gui {
     SettingsModel settings;
     std::string   settingsEdition = "vr";   // the file the settings screen edits: "vr" (edvr.ini) or "flat" (edvr-flat.ini)
     edvr::ModeRead mode = edvr::readGameMode(nullptr);  // Elite's 3D mode, read when the folder is surveyed
-    UINT dpi = 96;
+    UINT dpi = 96;      // what the client area is laid out at: the real dpi, or less when the window would not fit
+    UINT realDpi = 96;  // the window's own, which its frame and title bar are drawn at
 
     std::vector<Place>      places;
     std::vector<StatusRow>  status;
@@ -143,6 +163,16 @@ int dp(int v) { return ui::dp(v, g.dpi); }
 
 void setText(HWND control, const std::string& utf8) {
     SetWindowTextW(control, fromUtf8(utf8).c_str());
+}
+
+// Where this game's settings copy lives. The launcher keeps it under its data root, so a run
+// with --data-root leaves the user's real folder alone.
+std::wstring mirrorDirOfGame(const GameInstall& game) {
+#ifdef EDUP_LAUNCHER
+    return mirrorDirFor(game, launcherMirrorRoot(g.args));
+#else
+    return mirrorDirFor(game);
+#endif
 }
 
 // The report keeps no native scrollbar (an EDIT's bar is the one piece of
@@ -272,6 +302,10 @@ void syncSettingsSelector() {
     ShowWindow(g.settingsFlat, settingsShown && scope != "vr" ? SW_SHOW : SW_HIDE);
 }
 
+#ifdef EDUP_LAUNCHER
+#include "launcher_gui.inc"
+#endif
+
 // Everything moved and shown or hidden for the current screen and scale.
 //
 // The first version of this took the window's size from GetDpiForSystem and the
@@ -293,12 +327,14 @@ void applyLayout() {
     if (g.tip || g.discord) {
         HDC dc = GetDC(g.window);
         const HFONT caption = ui::fonts().caption;
+        const int discordWidth = ui::textWidth(dc, L"Ask on Discord", caption) + dp(2);
+#ifndef EDUP_LAUNCHER   // the launcher has no tip link, so there is no sentence to measure
         const int prefix = ui::textWidth(dc, kTipText, caption);
         const int space = ui::textWidth(dc, L" ", caption);
         const int tipWidth = ui::textWidth(dc, L"leave a tip", caption) + dp(2);
-        const int discordWidth = ui::textWidth(dc, L"Ask on Discord", caption) + dp(2);
-        ReleaseDC(g.window, dc);
         if (g.tip) MoveWindow(g.tip, dp(kMargin) + prefix + space, dp(kTipTop), tipWidth, dp(20), TRUE);
+#endif
+        ReleaseDC(g.window, dc);
         if (g.discord)
             MoveWindow(g.discord, dp(kClientWidth - kMargin) - discordWidth, dp(kTipTop), discordWidth, dp(20), TRUE);
     }
@@ -345,15 +381,52 @@ void applyLayout() {
 
     // Shown or hidden by the scope, not by the screen alone, so it runs after the loop above.
     syncSettingsSelector();
+#ifdef EDUP_LAUNCHER
+    layoutLauncherControls();
+#endif
     InvalidateRect(g.window, nullptr, TRUE);
+}
+
+// The dpi to lay the client area out at. The installer's window always fits, and takes the window's dpi.
+// The launcher's is taller: where it would not fit the monitor's work area (150% on a 1080p screen, or
+// 100% on the Steam Deck's 800 pixels) it is laid out smaller, so that Play is on the screen. `onMonitor`
+// names the monitor when the window has not moved there yet (WM_DPICHANGED); null means the window's own.
+UINT fitLayoutDpi(HWND window, UINT realDpi, const RECT* onMonitor) {
+#ifdef EDUP_LAUNCHER
+    const HMONITOR monitor = onMonitor ? MonitorFromRect(onMonitor, MONITOR_DEFAULTTONEAREST)
+                                       : MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO info{};
+    info.cbSize = sizeof(info);
+    if (!monitor || !GetMonitorInfoW(monitor, &info)) return realDpi;
+    RECT frame{0, 0, 0, 0};
+    AdjustWindowRectExForDpi(&frame, static_cast<DWORD>(GetWindowLongPtrW(window, GWL_STYLE)), FALSE, 0, realDpi);
+    return edvr::installer::layoutDpiFor(realDpi, info.rcWork.bottom - info.rcWork.top, kClientHeight, frame.bottom - frame.top);
+#else
+    (void)window;
+    (void)onMonitor;
+    return realDpi;
+#endif
 }
 
 void sizeWindowToLayout() {
     const DWORD style = static_cast<DWORD>(GetWindowLongPtrW(g.window, GWL_STYLE));
     RECT wanted{0, 0, dp(kClientWidth), dp(kClientHeight)};
-    AdjustWindowRectExForDpi(&wanted, style, FALSE, 0, g.dpi);
+    // The frame and title bar are the system's size, whatever the client area was laid out at.
+    AdjustWindowRectExForDpi(&wanted, style, FALSE, 0, g.realDpi);
     SetWindowPos(g.window, nullptr, 0, 0, wanted.right - wanted.left, wanted.bottom - wanted.top,
                  SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+#ifdef EDUP_LAUNCHER
+    // A window that opened low on the screen is moved up until its bottom edge, and Play, is in view.
+    MONITORINFO info{};
+    info.cbSize = sizeof(info);
+    RECT now{};
+    if (GetWindowRect(g.window, &now) &&
+        GetMonitorInfoW(MonitorFromWindow(g.window, MONITOR_DEFAULTTONEAREST), &info) && now.bottom > info.rcWork.bottom) {
+        const int top = now.top - (now.bottom - info.rcWork.bottom);
+        SetWindowPos(g.window, nullptr, now.left, top < info.rcWork.top ? info.rcWork.top : top, 0, 0,
+                     SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+#endif
 }
 
 // ---------------------------------------------------------------------------
@@ -617,6 +690,9 @@ void paintInstallScreen(HDC dc) {
         reportScrollState(&content, &page, &pos);
         ui::drawSlimScrollbar(dc, report, content, page, pos, g.dpi, g.reportDrag);
     }
+#ifdef EDUP_LAUNCHER
+    paintLauncherBand(dc);
+#endif
 }
 
 void paintSettingsScreen(HDC dc) {
@@ -663,11 +739,15 @@ void paintWindow(HWND window) {
     const ui::Fonts& f = ui::fonts();
     ui::fillRect(dc, client, t.windowBg);
 
-    RECT title{dp(kMargin), dp(18), dp(400), dp(50)};
-    ui::drawText(dc, L"ED-UP", title, f.title, t.text, DT_LEFT | DT_SINGLELINE);
+    RECT title{dp(kMargin), dp(18), dp(kClientWidth - kMargin), dp(50)};
+    ui::drawText(dc, kProductTitle, title, f.title, t.text, DT_LEFT | DT_SINGLELINE);
 
+#ifdef EDUP_LAUNCHER
+    const std::wstring subtitle = launcherSubtitle();
+#else
     const std::wstring subtitle = fromUtf8(payloadInfo().version) +
         L"  \x00b7  unofficial patch for Elite Dangerous in VR and flat";
+#endif
     RECT sub{dp(kMargin), dp(52), dp(kClientWidth - kMargin), dp(70)};
     ui::drawText(dc, subtitle, sub, f.caption, t.subtext, DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS);
 
@@ -677,8 +757,10 @@ void paintWindow(HWND window) {
     else
         paintSettingsScreen(dc);
 
+#ifndef EDUP_LAUNCHER   // no tip sentence in the launcher: the Discord link stands alone at the right
     RECT tip{dp(kMargin), dp(kTipTop), dp(kClientWidth - kMargin), dp(kTipTop + 20)};
     ui::drawText(dc, kTipText, tip, f.caption, t.subtext, DT_LEFT | DT_SINGLELINE);
+#endif
 
     BitBlt(screenDc, 0, 0, client.right, client.bottom, dc, 0, 0, SRCCOPY);
     SelectObject(dc, previous);
@@ -700,6 +782,9 @@ void showSurvey() {
         EnableWindow(g.repair, FALSE);
         EnableWindow(g.uninstall, FALSE);
         EnableWindow(g.collectLogs, FALSE);
+#ifdef EDUP_LAUNCHER
+        updateLauncherControls();
+#endif
         InvalidateRect(g.window, nullptr, TRUE);
         return;
     }
@@ -718,6 +803,9 @@ void showSurvey() {
     const bool installed = g.survey.d3d11.kind == DllKind::Edvr ||
                            g.survey.openvrCurrent.kind == DllKind::Edvr || g.survey.state.present;
     SetWindowTextW(g.install, installed ? L"Update" : L"Install");
+#ifdef EDUP_LAUNCHER
+    updateLauncherControls();
+#endif
     InvalidateRect(g.window, nullptr, TRUE);
 }
 
@@ -727,7 +815,7 @@ void loadSettings(const std::string& edition) {
     g.settingsEdition = edition;
     if (!g.haveSurvey) return;
     g.settings.load(g.survey.game.dir, edition);
-    settingsListSetModel(g.settingsList, &g.settings, mirrorDirFor(g.survey.game));
+    settingsListSetModel(g.settingsList, &g.settings, mirrorDirOfGame(g.survey.game));
 }
 
 void selectInstall(size_t index) {
@@ -780,19 +868,33 @@ void addInstall(const GameInstall& game) {
 void scanForInstalls() {
     SendMessageW(g.combo, CB_RESETCONTENT, 0, 0);
     g.installs.clear();
-    for (const GameInstall& game : findInstalls()) {
+    size_t legacyLeftOut = 0;
+    for (const GameInstall& game : findInstalls(&legacyLeftOut)) {
         g.installs.push_back(game);
         const std::wstring label = game.source + L"  \x00b7  " + game.dir;
         SendMessageW(g.combo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(label.c_str()));
     }
 
+#ifdef EDUP_LAUNCHER
+    // The launcher opens on the install Play was last pressed for, while it is still there.
+    const size_t remembered = launcherRememberedInstall();
+    if (remembered < g.installs.size()) {
+        SendMessageW(g.combo, CB_SETCURSEL, remembered, 0);
+        selectInstall(remembered);
+        return;
+    }
+#endif
+
     if (g.installs.empty()) {
         g.haveSurvey = false;
-        setReport(
-                "No Elite Dangerous install was found.\r\n\r\n"
-                "Press Browse and point at the folder that holds EliteDangerous64.exe. For a "
-                "Frontier launcher install that is usually a folder ending in\r\n"
-                "    Products\\elite-dangerous-odyssey-64");
+        // An install that is there but not supported is not "not found".
+        const std::string first = legacyLeftOut > 0
+                                      ? std::string(onlyLegacyInstallsText()) + "\r\n\r\nIf Odyssey is installed somewhere else, press Browse"
+                                      : std::string("No Elite Dangerous install was found.\r\n\r\nPress Browse");
+        setReport(first +
+                  " and point at the folder that holds EliteDangerous64.exe. For a "
+                  "Frontier launcher install that is usually a folder ending in\r\n"
+                  "    Products\\elite-dangerous-odyssey-64");
         showSurvey();
         return;
     }
@@ -847,7 +949,7 @@ void browseForFolder() {
         MessageBoxW(g.window,
                     L"There is no EliteDangerous64.exe in that folder, or in a Products folder "
                     L"under it.\n\nPick the folder that holds EliteDangerous64.exe itself.",
-                    L"ED-UP installer", MB_OK | MB_ICONWARNING);
+                    kAppTitle, MB_OK | MB_ICONWARNING);
         return;
     }
     addInstall(game);
@@ -860,6 +962,9 @@ std::wstring confirmText(const Plan& plan, const wchar_t* verb) {
         text += L"\nWorth knowing:\n";
         for (const std::string& p : plan.problems) text += L"! " + fromUtf8(p) + L"\n";
     }
+#ifdef EDUP_LAUNCHER
+    if (!lg.developerNote.empty()) text += L"\n! " + lg.developerNote + L"\n";
+#endif
     text += L"\nA copy of every file replaced goes into edvr_backup\\.\n\nGo ahead?";
     return text;
 }
@@ -872,6 +977,14 @@ void runAction(AppArgs::Act action) {
     // a picture that may be minutes old.
     g.survey = surveyTarget(g.survey.game);
 
+#ifdef EDUP_LAUNCHER
+    if (action != AppArgs::Act::Uninstall && !launcherPayloadReady()) {
+        setReport(toUtf8(launcherNoPayloadText()));
+        return;
+    }
+    launcherBeginAction();
+#endif
+
     AppArgs args = g.args;
     args.action = action;
     args.dir = g.survey.game.dir;
@@ -879,7 +992,7 @@ void runAction(AppArgs::Act action) {
     args.removeSettings = false;
     args.scope = scopeChoice();
 
-    const std::wstring mirrorDir = mirrorDirFor(g.survey.game);
+    const std::wstring mirrorDir = mirrorDirOfGame(g.survey.game);
     const bool canMirror = action != AppArgs::Act::Uninstall;
 
     // A folder with no settings file at all but a mirror outside it is exactly
@@ -902,9 +1015,15 @@ void runAction(AppArgs::Act action) {
                 fromUtf8(mirror.savedUtc) +
                 L".\n\nRestore them before installing? They are kept at\n" + mirror.dir +
                 L"\nprecisely so a game update wiping this folder cannot take them too.";
-            const int answer = MessageBoxW(g.window, text.c_str(), L"ED-UP installer",
+            const int answer = MessageBoxW(g.window, text.c_str(), kAppTitle,
                                            MB_YESNO | MB_ICONQUESTION);
-            if (answer == IDYES) {
+#ifdef EDUP_LAUNCHER
+            // A folder that needs administrator rights is written by the elevated copy, which does this too.
+            const bool restoreNow = launcherRestoreHere(answer == IDYES);
+#else
+            const bool restoreNow = true;
+#endif
+            if (answer == IDYES && restoreNow) {
                 std::vector<std::string> notes;
                 const bool restored = restoreFromMirror(g.survey.game.dir, mirror, args.scope, &notes);
                 if (!restored) {
@@ -913,7 +1032,7 @@ void runAction(AppArgs::Act action) {
                     std::wstring why = L"Not all of your saved settings could be restored:\n\n";
                     for (const std::string& n : notes) why += L"\x2022 " + fromUtf8(n) + L"\n";
                     why += L"\nThe install carries on with what is in the folder now.";
-                    MessageBoxW(g.window, why.c_str(), L"ED-UP installer", MB_OK | MB_ICONWARNING);
+                    MessageBoxW(g.window, why.c_str(), kAppTitle, MB_OK | MB_ICONWARNING);
                 }
                 // Whatever did come back is what the plan is for.
                 g.survey = surveyTarget(g.survey.game);
@@ -952,17 +1071,24 @@ void runAction(AppArgs::Act action) {
         // taken the foreground would be enough to modify a game folder. That
         // is not hypothetical: it happened twice during development, to a real
         // install, while windows were being opened for screenshots.
-        const int answer = MessageBoxW(g.window, confirmText(plan, verb).c_str(), L"ED-UP installer",
+        const int answer = MessageBoxW(g.window, confirmText(plan, verb).c_str(), kAppTitle,
                                        MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2);
         if (answer != IDYES) return;
     }
 
+#ifdef EDUP_LAUNCHER
+    // The launcher never runs itself elevated: a short-lived copy applies the plan.
+    if (launcherNeedsElevatedCopy()) {
+        launcherApplyElevated(args, plan);
+        return;
+    }
+#endif
     if (needsElevationFor(g.survey) && !isElevated()) {
         const int answer = MessageBoxW(
             g.window,
             L"This game folder can only be written to by an administrator (it is usually under "
             L"Program Files).\n\nRestart the installer with administrator rights and carry on?",
-            L"ED-UP installer", MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2);
+            kAppTitle, MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2);
         if (answer != IDYES) return;
         AppArgs elevated = args;
         elevated.autorun = true;
@@ -1092,7 +1218,8 @@ void showScreen(Screen screen) {
 }
 
 void createControls(HWND window) {
-    g.dpi = GetDpiForWindow(window);
+    g.realDpi = GetDpiForWindow(window);
+    g.dpi = fitLayoutDpi(window, g.realDpi, nullptr);
     ui::buildFonts(g.dpi);
     const ui::Fonts& f = ui::fonts();
 
@@ -1196,8 +1323,10 @@ void createControls(HWND window) {
     SetWindowSubclass(g.report, reportProc, 1, 0);
     place(g.report, kMargin + kCardPad - 4, 536, 636, 102, Screen::Install);
 
+#ifndef EDUP_LAUNCHER   // the launcher carries no tip link
     g.tip = ui::makeButton(window, L"leave a tip", kIdKofi, ui::ButtonStyle::Link, f.caption);
     place(g.tip, kMargin, kTipTop, 76, 20, Screen::Install, true);  // x and width fixed up in applyLayout
+#endif
 
     g.discord = ui::makeButton(window, L"Ask on Discord", kIdDiscord, ui::ButtonStyle::Link,
                                f.caption);
@@ -1214,6 +1343,10 @@ void createControls(HWND window) {
         SetWindowTheme(g.settingsList, L"DarkMode_Explorer", nullptr);
     }
 
+#ifdef EDUP_LAUNCHER
+    createLauncherControls(window);
+#endif
+
     // Deliberately not an explanation of what Install, Repair and Uninstall do.
     // A first reader of this window already knows, and the pane is where the
     // plan goes -- filling it with a lecture beforehand made the one thing it
@@ -1226,14 +1359,15 @@ void createControls(HWND window) {
 }
 
 void rescale(HWND window, UINT dpi, const RECT* suggested) {
-    g.dpi = dpi;
-    ui::buildFonts(dpi);
+    g.realDpi = dpi;
+    g.dpi = fitLayoutDpi(window, dpi, suggested);
+    ui::buildFonts(g.dpi);
     const ui::Fonts& f = ui::fonts();
     for (const Place& p : g.places) {
         SendMessageW(p.hwnd, WM_SETFONT, reinterpret_cast<WPARAM>(f.body), TRUE);
     }
     SendMessageW(g.report, WM_SETFONT, reinterpret_cast<WPARAM>(f.body), TRUE);
-    settingsListRescale(g.settingsList, dpi);
+    settingsListRescale(g.settingsList, g.dpi);
     applyLayout();
     if (suggested) {
         SetWindowPos(window, nullptr, suggested->left, suggested->top,
@@ -1296,6 +1430,9 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wparam, LPARAM lpa
                 scopeChanged();
                 return 0;
             }
+#ifdef EDUP_LAUNCHER
+            if (launcherCommand(id, code)) return 0;
+#endif
             if (code != BN_CLICKED) return 0;
             switch (id) {
                 case kIdBrowse: browseForFolder(); return 0;
@@ -1309,9 +1446,11 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wparam, LPARAM lpa
                 case kIdShowFolder: showSavedFolder(); return 0;
                 case kIdTabInstall: showScreen(Screen::Install); return 0;
                 case kIdTabSettings: showScreen(Screen::Settings); return 0;
+#ifndef EDUP_LAUNCHER   // no control has this id in the launcher
                 case kIdKofi:
                     ShellExecuteW(window, L"open", kTipUrl, nullptr, nullptr, SW_SHOWNORMAL);
                     return 0;
+#endif
                 case kIdDiscord:
                     ShellExecuteW(window, L"open", kDiscordUrl, nullptr, nullptr, SW_SHOWNORMAL);
                     return 0;
@@ -1418,7 +1557,16 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wparam, LPARAM lpa
             rescale(window, HIWORD(wparam), reinterpret_cast<const RECT*>(lparam));
             return 0;
 
+#ifdef EDUP_LAUNCHER
+        case kMsgLauncherJob:
+            runLauncherJob(lparam);
+            return 0;
+#endif
+
         case kMsgFirstScan: {
+#ifdef EDUP_LAUNCHER
+            launcherBegin();  // the payload and the update check run beside the scan
+#endif
             // After the window is up, so the first paint is not held behind a
             // registry and filesystem sweep.
             if (!g.args.dir.empty()) {
@@ -1433,14 +1581,23 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wparam, LPARAM lpa
             if (g.args.autorun && g.args.action != AppArgs::Act::None && g.haveSurvey) {
                 runAction(g.args.action);
             }
+#ifdef EDUP_LAUNCHER
+            launcherAfterScan();
+#endif
             return 0;
         }
 
         case WM_CLOSE:
+#ifdef EDUP_LAUNCHER
+            if (!launcherMayClose()) return 0;
+#endif
             DestroyWindow(window);
             return 0;
 
         case WM_DESTROY:
+#ifdef EDUP_LAUNCHER
+            launcherShutdown();  // stops the watcher and the workers; the game and EDLaunch are left running
+#endif
             ui::releaseFonts();
             PostQuitMessage(0);
             return 0;
@@ -1468,12 +1625,16 @@ int runGui(HINSTANCE instance, const AppArgs& args) {
     cls.hCursor = LoadCursorW(nullptr, IDC_ARROW);
     cls.hbrBackground = nullptr;  // painted, not erased
     cls.style = CS_HREDRAW | CS_VREDRAW;
+#ifdef EDUP_LAUNCHER
+    cls.lpszClassName = kLauncherWindowClass;
+#else
     cls.lpszClassName = L"EdvrInstallerWindow";
+#endif
     cls.hIcon = LoadIconW(instance, MAKEINTRESOURCEW(1));
     cls.hIconSm = cls.hIcon;
     RegisterClassExW(&cls);
 
-    HWND window = CreateWindowExW(0, cls.lpszClassName, L"ED-UP installer",
+    HWND window = CreateWindowExW(0, cls.lpszClassName, kAppTitle,
                                   (WS_OVERLAPPEDWINDOW & ~(WS_THICKFRAME | WS_MAXIMIZEBOX)) |
                                       WS_CLIPCHILDREN,
                                   CW_USEDEFAULT, CW_USEDEFAULT, kClientWidth, kClientHeight,

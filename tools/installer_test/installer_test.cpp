@@ -1906,6 +1906,19 @@ static void testPlanner() {
         s.eliteKind = EliteExeKind::Legacy;
         Plan plan = planInstall(s, options, payload);
         check(plan.blocked && plan.steps.empty(), "legacy Elite Dangerous is refused");
+
+        // The installs on offer leave legacy out, by the executable's own words: these are
+        // what the two real executables say. A folder's name does not decide it.
+        check(versionStringsNameLegacyElite(L"Elite:Dangerous", L"Elite:Dangerous Executable"), "the pre-Odyssey version strings read as legacy");
+        check(!versionStringsNameLegacyElite(L"Elite Dangerous: Odyssey", L"Elite Dangerous: Odyssey Executable"), "Odyssey's version strings do not");
+        check(!versionStringsNameLegacyElite(L"", L""), "an exe with no version strings is not called legacy");
+        GameInstall odysseyInstall, legacyInstall;
+        odysseyInstall.dir = L"C:\\Games\\ED\\Products\\elite-dangerous-odyssey-64";
+        legacyInstall.dir = L"C:\\Games\\ED\\Products\\elite-dangerous-64";
+        const std::vector<GameInstall> kept = withoutLegacyInstalls({legacyInstall, odysseyInstall}, [](const std::wstring& exe) {
+            return exe == L"C:\\Games\\ED\\Products\\elite-dangerous-64\\EliteDangerous64.exe";
+        });
+        check(kept.size() == 1 && kept[0].dir == odysseyInstall.dir, "the list drops a legacy install, tested on its executable's path, and keeps the Odyssey one");
         check(notesMention(plan, "Elite Dangerous (Horizons)"), "and named as Horizons, not Odyssey");
         check(notesMention(plan, "no ED-UP build supports this game"),
               "with no pointer at some other build");
