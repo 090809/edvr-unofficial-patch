@@ -2238,7 +2238,56 @@ void vrDrawDiffLog(DiffGroup& g) noexcept {
     std::vector<DiffKey> all;
     uint32_t distinct[kDiffFrames] = {}, dropped = 0;
     for (uint32_t f = 0; f < kDiffFrames; ++f) {
+// The members the constructor leaves alone when nothing is armed (concourse_pane.h), each to the value it was given as a default member initialiser.
+void ConcoursePaneScope::initCold() noexcept {
+    ctx_ = nullptr;
+    calls_ = nullptr;
+    planMirror_ = false;
+    planMark_ = false;
+    planOpaque_ = true;
+    planTint_ = false;
+    planSoft_ = false;
+    planGlow_ = 0.0f;
+    planSteady_ = false;
+    mirrorBound_ = false;
+    planBackdrop_ = false;
+    planCapture_ = false;
+    capDone_ = false;
+    capBound_ = false;
+    planProbe_ = false;
+    probeDone_ = false;
+    probeBound_ = false;
+    probePrevSampler_ = nullptr;
+    capPrevBs_ = nullptr;
+    capPrevFactor0_ = capPrevFactor1_ = capPrevFactor2_ = capPrevFactor3_ = 0.0f;
+    capPrevMask_ = 0;
+    capPrevPs_ = nullptr;
+    for (auto*& s : capPrevSrv_) s = nullptr;
+    capPrevDs_ = nullptr;
+    capPrevRef_ = 0;
+    prevSampler_ = nullptr;
+    planFactor0_ = planFactor1_ = planFactor2_ = planFactor3_ = 1.0f;
+    keyN_ = 0;
+    keyStart_ = 0;
+    keyBase_ = 0;
+    query_ = -1;
+    capQuery_ = -1;
+    testSlot_ = -1;
+    prevBs_ = nullptr;
+    prevFactor0_ = prevFactor1_ = prevFactor2_ = prevFactor3_ = 0.0f;
+    prevMask_ = 0;
+    prevPs_ = nullptr;
+    for (auto*& s : prevSrv_) s = nullptr;
+    prevDs_ = nullptr;
+    prevStencilRef_ = 0;
+    ctx1_ = nullptr;
+    prevCb_ = nullptr;
+    prevCbFirst_ = 0;
+    prevCbNum_ = 0;
+}
+
         std::sort(g.fr[f].keys.begin(), g.fr[f].keys.end(), diffLess);
+    initCold();   // first: nothing reads a cold member before this
         dropped += g.fr[f].dropped;
         for (size_t i = 0; i < g.fr[f].keys.size(); ++i) {
             if (i == 0 || !diffSame(g.fr[f].keys[i], g.fr[f].keys[i - 1])) {
@@ -2506,10 +2555,12 @@ void ConcoursePaneScope::beginBody(ID3D11DeviceContext* ctx, UINT indexCount, UI
     }
     if (tint) {
         const float* c = cc::kPaneColours[tintSlotOf(indexCount) % cc::kPaneColourCount];
-        for (int k = 0; k < 3; ++k) planFactor_[k] = c[k] * cc::kPaneTintIntensity;
-        planFactor_[3] = 1.0f;
+        planFactor0_ = c[0] * cc::kPaneTintIntensity;
+        planFactor1_ = c[1] * cc::kPaneTintIntensity;
+        planFactor2_ = c[2] * cc::kPaneTintIntensity;
+        planFactor3_ = 1.0f;
     } else if (!opaque) {
-        planFactor_[0] = planFactor_[1] = planFactor_[2] = planFactor_[3] = opacity;
+        planFactor0_ = planFactor1_ = planFactor2_ = planFactor3_ = opacity;
     }
     // The side test (plain phase, one frame in eight per pane): the first query wraps the game's draw and closes in beginMirror().
     if (plain && mark && g_testsOn.load(std::memory_order_acquire) && g_markReady.load(std::memory_order_acquire) &&
@@ -2642,7 +2693,14 @@ bool ConcoursePaneScope::beginCapturePass() noexcept {
         return refuse("the depth state could not be derived");
     }
     capPrevRef_ = ref;
-    ctx_->OMGetBlendState(&capPrevBs_, capPrevFactor_, &capPrevMask_);
+    {   // the factor is kept in four members (concourse_pane.h)
+        FLOAT f[4] = {};
+        ctx_->OMGetBlendState(&capPrevBs_, f, &capPrevMask_);
+        capPrevFactor0_ = f[0];
+        capPrevFactor1_ = f[1];
+        capPrevFactor2_ = f[2];
+        capPrevFactor3_ = f[3];
+    }
     ctx_->PSGetShader(&capPrevPs_, nullptr, nullptr);
     ctx_->PSGetShaderResources(kBdSceneSlot, kBdSrvCount, capPrevSrv_);
     const FLOAT zeros[4] = {};
@@ -2685,7 +2743,14 @@ bool ConcoursePaneScope::beginProbePass() noexcept {
         return false;
     }
     capPrevRef_ = ref;
-    ctx_->OMGetBlendState(&capPrevBs_, capPrevFactor_, &capPrevMask_);
+    {   // the factor is kept in four members (concourse_pane.h)
+        FLOAT f[4] = {};
+        ctx_->OMGetBlendState(&capPrevBs_, f, &capPrevMask_);
+        capPrevFactor0_ = f[0];
+        capPrevFactor1_ = f[1];
+        capPrevFactor2_ = f[2];
+        capPrevFactor3_ = f[3];
+    }
     ctx_->PSGetShader(&capPrevPs_, nullptr, nullptr);
     ctx_->PSGetShaderResources(kBdSceneSlot, kBdSrvCount, capPrevSrv_);
     ctx_->PSGetSamplers(kBdSamplerSlot, 1, &probePrevSampler_);
@@ -2736,7 +2801,10 @@ void ConcoursePaneScope::endProbePass() noexcept {
     calls_->setPs(ctx_, capPrevPs_, nullptr, 0);
     if (capPrevPs_) capPrevPs_->Release();
     capPrevPs_ = nullptr;
-    calls_->setBlend(ctx_, capPrevBs_, capPrevFactor_, capPrevMask_);
+    {
+        const FLOAT f[4] = {capPrevFactor0_, capPrevFactor1_, capPrevFactor2_, capPrevFactor3_};
+        calls_->setBlend(ctx_, capPrevBs_, f, capPrevMask_);
+    }
     if (capPrevBs_) capPrevBs_->Release();
     capPrevBs_ = nullptr;
 }
@@ -2761,7 +2829,10 @@ void ConcoursePaneScope::endCapturePass() noexcept {
     calls_->setPs(ctx_, capPrevPs_, nullptr, 0);
     if (capPrevPs_) capPrevPs_->Release();
     capPrevPs_ = nullptr;
-    calls_->setBlend(ctx_, capPrevBs_, capPrevFactor_, capPrevMask_);
+    {
+        const FLOAT f[4] = {capPrevFactor0_, capPrevFactor1_, capPrevFactor2_, capPrevFactor3_};
+        calls_->setBlend(ctx_, capPrevBs_, f, capPrevMask_);
+    }
     if (capPrevBs_) capPrevBs_->Release();
     capPrevBs_ = nullptr;
 }
@@ -2837,8 +2908,18 @@ bool ConcoursePaneScope::beginMirrorSlow() noexcept {
         stencilRef = planMark_ ? kMarkRef : ref;
     }
     // Bind.
-    ctx_->OMGetBlendState(&prevBs_, prevFactor_, &prevMask_);
-    calls_->setBlend(ctx_, repl, planFactor_, 0xFFFFFFFFu);
+    {
+        FLOAT f[4] = {};
+        ctx_->OMGetBlendState(&prevBs_, f, &prevMask_);
+        prevFactor0_ = f[0];
+        prevFactor1_ = f[1];
+        prevFactor2_ = f[2];
+        prevFactor3_ = f[3];
+    }
+    {
+        const FLOAT f[4] = {planFactor0_, planFactor1_, planFactor2_, planFactor3_};
+        calls_->setBlend(ctx_, repl, f, 0xFFFFFFFFu);
+    }
     flags_ |= kFlagBlend;
     if (planTint_) {
         if (white) {
@@ -2928,7 +3009,8 @@ void ConcoursePaneScope::end() noexcept {
         prevPs_ = nullptr;
     }
     if ((flags_ & kFlagBlend) != 0) {
-        calls_->setBlend(ctx_, prevBs_, prevFactor_, prevMask_);
+        const FLOAT f[4] = {prevFactor0_, prevFactor1_, prevFactor2_, prevFactor3_};
+        calls_->setBlend(ctx_, prevBs_, f, prevMask_);
         if (prevBs_) prevBs_->Release();
         prevBs_ = nullptr;
     }
