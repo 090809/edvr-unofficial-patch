@@ -5162,31 +5162,6 @@ void* temporalInner(void* srcTex, int eye, const float* bounds,
                             }
                         }
                     }
-                    // diag.hull_layer = separate (TEMPORARY, hull_layer.h Step 3): the own hull, taken out of the
-                    // main pass, composited back over the upscaled eye with the layer's own TAA, before anything reads
-                    // dlOut (the eye run's captures, the UI resolve, frame generation) and before the UI layer's door.
-                    if (usedDlaa && hullLayerCompositeWanted()) {
-                        HullLayerCompositeInputs hc;
-                        hc.source = src;
-                        hc.regionX = region[0];
-                        hc.regionY = region[1];
-                        hc.renderW = w;
-                        hc.renderH = h;
-                        hc.outW = oW;
-                        hc.outH = oH;
-                        hc.output = e.dlOut;
-                        hc.outputSrv = e.dlOutSrv;
-                        hc.tanNow = tanNow;
-                        hc.tanPrev = useTanPrev ? tanPrev : nullptr;
-                        hc.headDelta = deltaHead;
-                        hc.headTrans = p.tvUsed;
-                        hc.useTrans = p.tvUsed[3] != 0.0f;
-                        hc.depthA = p.knobs[0];
-                        hc.depthB = p.knobs[2];
-                        hc.jitterX = jxNow;
-                        hc.jitterY = jyNow;
-                        hullLayerCompositeEye(ctx, eye, hc);
-                    }
                     // One requested first-eye capture, after NGX and before
                     // UI bounds. Separates model artifacts from retained UI
                     // influence without changing any rendering or bindings.
@@ -5220,6 +5195,47 @@ void* temporalInner(void* srcTex, int eye, const float* bounds,
                         const bool uiResolvedHere = applyUiResolve(e.dlOutSrv);
                         gpuCensusEnd(ctx, GpuCensusSection::DoorUiResolve);
                         if (!uiResolvedHere) ctx->CopyResource(e.dlSubmit, e.dlOut);
+                    }
+                    // diag.hull_layer = separate (TEMPORARY, hull_layer.h Step 3): the own hull, taken out of the main
+                    // pass, composited back over the submitted eye with the layer's own TAA, AFTER the UI resolve and
+                    // before the UI layer's door. The resolve bounds NVIDIA's output by the raw input (its UI clamp, and
+                    // the corona hold on every faint flat pixel), and the raw input has no own hull: composited before
+                    // it, the hull was held to the background -- black over space, specks over lit terrain (the 21:45
+                    // flight, docs/research-own-hull-layer-2026-11-08.md). The eye run's P crops and DlssBeforeUi
+                    // (dlOut) no longer carry the hull; T, the final eye and HullComposite do.
+                    if (usedDlaa && hullLayerCompositeWanted()) {
+                        // dlSubmit read through a UNORM view, as frame generation's finish makes it; a game format the
+                        // view cannot take (no UAV either, so no resolve ran) composites into dlOut and copies again.
+                        if (!e.dlSubmitSrv && e.dlSubmitUav) {
+                            D3D11_SHADER_RESOURCE_VIEW_DESC vd{};
+                            vd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+                            vd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+                            vd.Texture2D.MipLevels = 1;
+                            if (FAILED(dev->CreateShaderResourceView(e.dlSubmit, &vd, &e.dlSubmitSrv))) e.dlSubmitSrv = nullptr;
+                        }
+                        const bool intoSubmit = e.dlSubmitSrv != nullptr;
+                        HullLayerCompositeInputs hc;
+                        hc.source = src;
+                        hc.regionX = region[0];
+                        hc.regionY = region[1];
+                        hc.renderW = w;
+                        hc.renderH = h;
+                        hc.outW = oW;
+                        hc.outH = oH;
+                        hc.output = intoSubmit ? e.dlSubmit : e.dlOut;
+                        hc.outputSrv = intoSubmit ? e.dlSubmitSrv : e.dlOutSrv;
+                        hc.afterUiResolve = intoSubmit;
+                        hc.tanNow = tanNow;
+                        hc.tanPrev = useTanPrev ? tanPrev : nullptr;
+                        hc.headDelta = deltaHead;
+                        hc.headTrans = p.tvUsed;
+                        hc.useTrans = p.tvUsed[3] != 0.0f;
+                        hc.depthA = p.knobs[0];
+                        hc.depthB = p.knobs[2];
+                        hc.jitterX = jxNow;
+                        hc.jitterY = jyNow;
+                        hullLayerCompositeEye(ctx, eye, hc);
+                        if (!intoSubmit) ctx->CopyResource(e.dlSubmit, e.dlOut);
                     }
                     // luma probe stage 1, dlss_out: e.dlSubmit already holds it
                     // here on every usedDlaa path, UI-resolved or copied

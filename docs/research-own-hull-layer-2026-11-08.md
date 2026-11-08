@@ -21,11 +21,10 @@ The smear is terrain that is newly uncovered at the hull edge every frame
   variant of the engine-motion patched hull and decal PS (mask at t127),
   proven on WARP. **Open:** the 6 own forward draws are not engine-motion
   families, so they still draw over the terrain.
-* **Step 3 built (compile-only, not flown):** section "Step 3 build". The
-  game's tonemap re-issued on the private HDR, the layer's own TAA (head
-  motion), composited over the upscaled eye before the UI door. Falls back
-  (ship in the main pass) on FG, flat/on foot, mask >400, a recent miss.
-  **Next flight:** FG off, `separate`, a turn over terrain; verdicts there.
+* **Step 3 flown 21:45 (3bcb06e7): hull held to the background** by the UI
+  resolve's raw-input clamp (section "Step 3 flight (21:45)"). Fixed: it now
+  composites onto dlSubmit after the resolve. **Next flight:** FG off; hull
+  solid over black space; `site=after_ui_resolve` = the applied composites.
 * **Temporary keys of this arc:** `diag.hull_layer` (off | dump | separate).
 * **Option (e), the hull hole-fill, fails** for the case the pilot reported
   (section "Result"): in dump 132100543006 only 5.8% of the band was visible
@@ -67,6 +66,8 @@ The smear is terrain that is newly uncovered at the hull edge every frame
     calls.
   * ruled out: option (e), the hull hole-fill, for the pilot's case, because
     the band was not in any recent frame (section "Result").
+  * ruled out (21:45): the composite's cover, depth test, TAA or blend as the
+    cause of the missing hull, because dlOut after it is correct on 16 frames.
 
 ## 1. How Elite draws the own hull
 
@@ -617,6 +618,52 @@ ledgers and census; the clear values are the game's as the clear hook sees
 them; that the shell and the block draw with four targets bound; and that no
 third pass draws the shell into a G-buffer of its own (`eye_frames` would be
 more than twice `frames`).
+
+## Step 3 flight (21:45) (2026-11-08, build 3bcb06e7): the hull held to the background
+
+Log `edvr_gfx_20261108_214551.log`; dumps 214749972002 and 215152750003 (the
+second taken where the pilot saw the failure). Separate engaged: 1395
+frames, 2788 composited eyes, `own_draws=109838`. The pilot saw the hull as
+a near-black silhouette over space and shadowed terrain and as speckle over
+lit terrain, and invisible looking into black space.
+
+* **The composite is right.** The eye run's P crops are dlOut right after
+  the composite (`temporal_pass.cpp`, the pre-UI stage); they carry the
+  solid hull on all 16 frames of both dumps (frame 0 equals DlssBeforeUi
+  and HullComposite exactly). The T crops (dlSubmit, what goes out) and
+  FinalCrisp have lost it: T matches FinalCrisp to 1.5/255, not P.
+* **Cause: the legacy UI resolve** (`ui_resolve.h`, `applyUiResolve`) runs
+  after the composite and writes dlSubmit from dlOut bounded by the *raw*
+  input (`e.dlColourSrv`), which by Step 2 has no own hull. Its corona hold
+  (`resolve.y` = `kCoronaSmearLevel` 64/255, always on under `ui_depth`)
+  clamps every pixel whose raw 3x3 is faint (luma < 64/255) and flat to the
+  raw 2x2 range +-1/255: over space or shadowed terrain the hull becomes the
+  background. Where the raw is bright or textured the weight is 0 and the
+  hull survives: the speckle. Pixels marked as UI get the same clamp
+  (+-ghost tolerance). A numpy re-run of the hold on P with the C crops
+  reproduces T to 0.002 (mean abs, 0..1) on the ~31-36k pixels where T and
+  P differ, against 0.18-0.56 for P itself; the weight there averages
+  0.98-0.99 (script `hold_sim.py`, scratch).
+* ruled out: the cover's depth test (reversed Z), the TAA history or the
+  composite's blend as the cause, because dlOut after the composite holds
+  the correct hull on every frame of both runs.
+* ruled out: a stale or one-frame-late tonemap re-issue, because
+  `declined=stale:2` in 2788 and the P crops hold the hull every frame.
+* ruled out: the final eye built from another source than dlSubmit, because
+  T (dlSubmit) already lacks the hull and FinalCrisp matches T.
+* ruled out: frame generation, sky ring or sharpen overwriting dlSubmit,
+  because FG was off and the T-from-P hold model leaves no residue.
+* **Fix:** the composite moves after the UI resolve and lands on dlSubmit
+  through a UNORM view (the same view frame generation's finish makes); a
+  game format that has no such view has no resolve either, and composites
+  into dlOut and copies again. The composite line gains
+  `site=after_ui_resolve:N,upscaler_out:M`; on the 21:45 build every
+  composite would have read `upscaler_out`. Consequence: the eye run's P
+  crops and DlssBeforeUi (dlOut) no longer show the hull; T, the final
+  eye and HullComposite do. The hull is no longer held by the resolve
+  against UI ghosts, which is right: the raw has no hull to bound it by.
+* Unverified: the fix in the headset. As before, anything the game drew
+  into its own eye over the hull (not the UI layer) ends up under it.
 
 ## Step 3 flight (2026-11-08 21:39, build 8386287e): separate barely engaged
 

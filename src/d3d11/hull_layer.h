@@ -105,7 +105,8 @@ struct HullLayerCompositeInputs {
     uint32_t regionX = 0, regionY = 0;     // the eye's region in it
     uint32_t renderW = 0, renderH = 0;     // the region's size: the render size
     uint32_t outW = 0, outH = 0;           // the upscaler's output size
-    ID3D11Texture2D* output = nullptr;     // the upscaler's output (R8G8B8A8_UNORM, outW x outH): the composite lands here
+    ID3D11Texture2D* output = nullptr;     // the eye at the output size, R8G8B8A8 family, outW x outH: the composite lands here
+                                           // (outputSrv a UNORM view of it)
     ID3D11ShaderResourceView* outputSrv = nullptr;
     const float* tanNow = nullptr;         // l r t b, jitter excluded
     const float* tanPrev = nullptr;        // last frame's, or null when the pass has no continuity (the layer's history restarts)
@@ -114,6 +115,10 @@ struct HullLayerCompositeInputs {
     bool useTrans = false;
     float depthA = 0.0f, depthB = 0.0f;    // the scene depth's encoding: written = A + B / metres
     float jitterX = 0.0f, jitterY = 0.0f;  // this frame's jitter, render pixels
+    // Where the composite lands: the submitted eye after the UI resolve (true), or the upscaler's output before it (false,
+    // only when no resolve can run). The resolve bounds its output by the raw input, which has no own hull, so a hull
+    // composited before it is held to the background (the 21:45 flight).
+    bool afterUiResolve = false;
 };
 
 // Step 3: right after the upscaler wrote VR eye `eye` (temporal_pass.cpp). A no-op unless diag.hull_layer = separate.

@@ -446,6 +446,7 @@ struct Window {
     uint32_t compositedEyes = 0, readyEyes = 0, failSeed = 0, failLit = 0, failTone = 0, failComposite = 0;
     uint32_t declined[kDeclines] = {};
     uint32_t toned = 0, toneDeclined = 0, historyResets = 0, byIndex = 0, ownMax = 0;
+    uint32_t siteAfterResolve = 0, siteUpscalerOut = 0;   // applied composites by where they landed (HullLayerCompositeInputs)
 };
 
 // Separate mode: what hullLayerBeforeMainDraw bound over the game's issue, which hullLayerAfterMainDraw puts back.
@@ -2256,13 +2257,15 @@ void report() {
         const double toneMs = timerTake(g_toneTimer), compMs = timerTake(g_compTimer);
         Log::get().note("hull layer: composite: separate_frames=%u composited_eyes=%u ready_eyes=%u fallback=framegen:%u,outside:%u,mask_pending:%u,"
                         "mask_large:%u,streak:%u failed=seed:%u,lit:%u,tone:%u,composite:%u declined=stale:%u,size:%u,gpu:%u toned=%u tone_declined=%u "
-                        "history_resets=%u matched_by_index=%u own_max=%u aa=hull_taa gpu_ms=tone:%.3f,composite:%.3f (separate mode, Step 3: frames whose "
-                        "main pass may discard the own ship, and those kept by reason; eye-frames composited after the upscaler, or made ready on a fallback "
-                        "frame; misses by stage hold the discard off %u frames; gpu_ms a call, -1 when none was timed)",
+                        "history_resets=%u matched_by_index=%u own_max=%u site=after_ui_resolve:%u,upscaler_out:%u aa=hull_taa gpu_ms=tone:%.3f,composite:%.3f "
+                        "(separate mode, Step 3: frames whose main pass may discard the own ship, and those kept by reason; eye-frames composited after the "
+                        "upscaler, or made ready on a fallback frame; misses by stage hold the discard off %u frames; site: where applied composites landed, "
+                        "upscaler_out only when no UI resolve can run; gpu_ms a call, -1 when none was timed)",
                         g_win.separateFrames, g_win.compositedEyes, g_win.readyEyes, g_win.fallback[kFbFrameGen], g_win.fallback[kFbOutside],
                         g_win.fallback[kFbMaskPending], g_win.fallback[kFbMaskLarge], g_win.fallback[kFbStreak], g_win.failSeed, g_win.failLit,
                         g_win.failTone, g_win.failComposite, g_win.declined[kDcStale], g_win.declined[kDcSize], g_win.declined[kDcGpu], g_win.toned,
-                        g_win.toneDeclined, g_win.historyResets, g_win.byIndex, g_win.ownMax, toneMs, compMs, kHoldFrames);
+                        g_win.toneDeclined, g_win.historyResets, g_win.byIndex, g_win.ownMax, g_win.siteAfterResolve, g_win.siteUpscalerOut, toneMs,
+                        compMs, kHoldFrames);
         g_saidMaskLarge = false;   // the large-mask line once a window
     }
 }
@@ -2536,6 +2539,7 @@ void hullLayerCompositeEye(ID3D11DeviceContext* ctx, int eye, const HullLayerCom
     e.compFrame = g_frame;
     e.compApplied = apply;
     if (byIndex) ++g_win.byIndex;
+    if (apply) ++(in.afterUiResolve ? g_win.siteAfterResolve : g_win.siteUpscalerOut);
 }
 
 void hullLayerFrameBoundary(ID3D11DeviceContext* ctx) {
