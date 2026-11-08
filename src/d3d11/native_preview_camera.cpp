@@ -184,10 +184,14 @@ __declspec(noinline) bool probeEye(uintptr_t pose) noexcept {
 // nativeCameraBakeTick (the window's close) ends it and the next aim renews it, so a tick that stalls cannot leave writing on; kBakeLeaseMs bounds even a window that never closes.
 constexpr unsigned kBakeCalls = 8;
 constexpr uint64_t kBakeLeaseMs = 500;
+// Two windows, not one: the tick closes a window (nativeCameraBakeTick) a little before the same tick's aim renews it (nativeCameraBakeAim), and a stub call
+// from another game thread in between must still be written. An aim not renewed lapses at the second window's close.
+constexpr uint32_t kBakeLeaseWindows = 2;
 struct BakeAim {
     std::atomic<bool> armed{false};      // the stub's one test while the bake is idle
     std::atomic<bool> writing{false};    // a pose is published: the window's base calls are written with it
     std::atomic<uint64_t> leaseUntilMs{0};   // GetTickCount64 past which the aim is no longer valid
+    std::atomic<uint32_t> windowsLeft{0};    // windows the current aim may still write: an aim grants kBakeLeaseWindows, each window's close takes one
     std::atomic<uint32_t> seq{0};        // even: the pose is whole
     previewcam::Pose pose;
     previewcam::Pose expected;           // the base Elite is expected to hold in a call this aim may write (published with pose, under seq)
@@ -404,16 +408,22 @@ void nativeCameraBakeAim(const float pose[16],const float expected[16]) noexcept
     if(expected)std::memcpy(g_bakeAim.expected.v,expected,sizeof(g_bakeAim.expected.v));
     g_bakeAim.seq.fetch_add(1,std::memory_order_release);
     g_bakeAim.leaseUntilMs.store(GetTickCount64()+kBakeLeaseMs,std::memory_order_release);
+    g_bakeAim.windowsLeft.store(kBakeLeaseWindows,std::memory_order_release);
     g_bakeAim.armed.store(true,std::memory_order_release);
-    g_bakeAim.writing.store(true,std::memory_order_release);   // the lease: one window, until nativeCameraBakeTick closes it
+    g_bakeAim.writing.store(true,std::memory_order_release);   // the lease: kBakeLeaseWindows windows, each closed by nativeCameraBakeTick
 }
 void nativeCameraBakeStopWriting() noexcept {g_bakeAim.writing.store(false,std::memory_order_release);}
 bool nativeCameraBakeWriting() noexcept {return g_bakeAim.writing.load(std::memory_order_acquire);}
 // Present thread, once a frame: the window since the last call, then a fresh one.
 void nativeCameraBakeTick(NativeCameraBakeWindow* out) noexcept {
     NativeCameraBakeWindow w;
-    // The window closes, so its aim's lease ends: the next window is written only if the tick aims again (nativeCameraBakeAim).
-    g_bakeAim.writing.store(false,std::memory_order_release);
+    // The window closes and takes one window of the aim's lease; at none left, writing stops until the tick aims again (nativeCameraBakeAim).
+    {
+        uint32_t left=g_bakeAim.windowsLeft.load(std::memory_order_acquire);
+        if(left>0)--left;
+        g_bakeAim.windowsLeft.store(left,std::memory_order_release);
+        if(left==0)g_bakeAim.writing.store(false,std::memory_order_release);
+    }
     w.armed=g_bakeAim.armed.load(std::memory_order_acquire);
     w.foreign=g_bakeAim.foreignCalls.exchange(0,std::memory_order_relaxed);
     w.calls=g_bakeAim.calls.exchange(0,std::memory_order_acq_rel);
