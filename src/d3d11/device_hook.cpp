@@ -287,10 +287,13 @@ struct State {
     // The eye dump key: both eyes as the headset receives them, to
     // edvr_logs\eyes as BMP (temporalPassArmEyeDump). Unbound by default.
     Hotkey eyesKey;
-    // What each of those three was last bound from (the ini text), so a reload
+    // The frame generation key: flips fix.frame_generation through the
+    // Performance page's row (an A/B in the headset). Unbound by default.
+    Hotkey frameGenKey;
+    // What each of those was last bound from (the ini text), so a reload
     // that changes one re-resolves it and one that does not says nothing: the
     // settings menu's Hotkeys page writes them while the game runs.
-    std::string dumpKeyText, censusKeyText, eyesKeyText, gpuPassKeyText, blendProbeKeyText;
+    std::string dumpKeyText, censusKeyText, eyesKeyText, gpuPassKeyText, blendProbeKeyText, frameGenKeyText;
     bool        diagnosticKeysBound = false;
     // The player's own FSS enter/quit keys, adopted from their Elite
     // bindings; they give the FSS mode latch its frame-exact edges.
@@ -1369,6 +1372,24 @@ void tickHotkeys() {
     if (g_state->blendProbeKey.pressed()) blendProbeRequest("hotkey.blend_probe");   // TEMPORARY (blend_probe.h)
     // The eye dump key: the next treated frame's two eyes to disk.
     if (g_state->eyesKey.pressed()) temporalPassArmEyeDump();
+    // The frame generation key: the Performance page's row, flipped. The same write a pick makes (ini, mirror, then the reload that
+    // re-reads the key), so it persists like the row; the toast says the new state.
+    if (g_state->frameGenKey.pressed()) {
+        const unsigned long long frame = static_cast<unsigned long long>(g_state->frameCounter);
+        char was[16] = "";
+        if (runtimeFlatProfile()) {
+            Log::get().note("hotkey: frame generation key pressed at frame %llu in the flat profile; frame generation is VR only, nothing changed.", frame);
+        } else if (!menuRowValue("fix.frame_generation", was, sizeof(was))) {
+            Log::get().note("hotkey: frame generation key pressed at frame %llu, but the settings menu has no fix.frame_generation row this session; nothing changed.", frame);
+        } else {
+            const bool on = _stricmp(was, "on") != 0;
+            if (menuSetRowValue("fix.frame_generation", on ? "on" : "off")) {
+                Log::get().note("hotkey: frame generation key: fix.frame_generation %s -> %s at frame %llu (written to the ini like the Performance page's row).",
+                                was[0] ? was : "(unset)", on ? "on" : "off", frame);
+                menuShowNotice(on ? "Frame generation: on" : "Frame generation: off");
+            }
+        }
+    }
     if (g_state->missedCensusNotes < kMissedDumpNotes &&
         g_state->censusKey.takeMissedWhileUnfocused()) {
         ++g_state->missedCensusNotes;
@@ -2133,6 +2154,13 @@ void configureDiagnosticHotkeys() {
          "hotkey: dump_eyes is set but bound nothing, so the eye dump cannot be armed this session "
          "(the settings menu's row still can).",
          " Both eyes go to edvr_logs\\eyes as BMP on each press, one hitch each."},
+        // The frame generation key (asked for 2026-11-08, for an A/B in the headset): each press flips fix.frame_generation
+        // through the Performance page's row, so the ini, the runtime's word and the Monitor block follow. Empty is off.
+        {&s.frameGenKey, &s.frameGenKeyText, Config::get().getString("hotkey.frame_generation", ""),
+         "hotkey.frame_generation", "frame generation",
+         "hotkey: frame_generation is set but bound nothing, so the frame generation key is off this session "
+         "(the Performance page's row still works).",
+         " Each press flips fix.frame_generation off/on (saved to the ini, like the Performance page's row) and says so in a toast."},
     };
     for (Item& it : items) {
         if (!first && *it.applied == it.value) continue;

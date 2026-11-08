@@ -206,7 +206,9 @@ ruled-out list); the summary above points here.
 
 BUILT, NOT FLOWN. A page after Fixes: `hotkey.menu`, `.compare_aa`,
 `.dump_camera`, and with `menu.developer` also
-`.dump_draws`, `.dump_eyes` (`# ui: ... | hotkey | live` is a row for
+`.dump_draws`, `.dump_eyes`, `.frame_generation` (2026-11-08: each press
+flips `fix.frame_generation` through its Performance page row, saved to the
+ini, with a "Frame generation: on/off" toast) (`# ui: ... | hotkey | live` is a row for
 everyone, `# dev: label ... | hotkey` a developer-only one). Enter waits for
 the NEXT input: a key with Ctrl/Shift/Alt held, a pad button or trigger, or a
 HOTAS button or hat. Esc cancels; Delete or Backspace clears, except
