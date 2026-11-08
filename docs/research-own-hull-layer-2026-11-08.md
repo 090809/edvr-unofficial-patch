@@ -454,6 +454,12 @@ c80a4ef1`). VR, OpenXR (EDVR runtime), 2817x2448 render per eye.
   - The second dump (192435503002) captured nothing. The 16-mirror cap was
     full of the first targets when the game made a new eye depth (log
     19:24:25).
+- **The ledger lost its instance streams.** Both dumps of this flight
+  wrote "0 instance streams (... stride 0)". Every earlier dump today
+  wrote 19, including 180353328001 on 639c02a9. Without them the records
+  per draw cannot be joined, which item 2 below needs. The suspect is the
+  hull layer: it was on, and the code otherwise differs from 639c02a9 only
+  by the FG gate commits. Check this with the key off before v2.
 - **Next build (Step 1 v2):**
   1. Re-issue every lighting draw of the eye, not the sun alone, and
      snapshot the game's HDR after the last lighting draw, before the sky.
