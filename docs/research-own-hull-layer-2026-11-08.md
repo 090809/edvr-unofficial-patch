@@ -10,8 +10,15 @@ The smear is terrain that is newly uncovered at the hull edge every frame
 
 ## Status
 
-* **State:** desk study only. No code was changed and no flight was flown.
-  The answer is yes, but not by changing what the game renders.
+* **State (updated same day):** the deciding offline test ran (section
+  "Result" at the end). **Option (e) fails for the case the pilot reported:**
+  in dump 132100543006 only 5.8% of the band was visible in the previous 8
+  frames; 88% was still behind the ship after 8 frames. The terrain that
+  emerges at the wing edge was never in any recent frame, so no fill, layer
+  or DLSS trick can supply it. What is left is game frame rate (the band is
+  terrain motion per frame), as the FG doc's 2026-11-08 entry concluded.
+  Layering may still help frame generation (see Result). The text below is
+  the study as written before the test.
 * **Finding 1, the hull is a deferred G-buffer object.** It is drawn by the
   pool families vs_66DE/ps_864F, 61AE/FC43, AACF/CF53 and DE54/E46E, plus the
   BBE5/DB3E decal overlay (depth writes off), into the same four-target
@@ -203,3 +210,48 @@ Flight confirmation, only after a build: in the temporal pass's window
 line, a counter of hidden-history pixels along the hull edge, which
 should fall to the fill's uncovered share. The pilot's view of the wing
 gap in a turn, against `fix` off.
+
+## Result (2026-11-08, offline, no build)
+
+Method as above, with changes forced by what the dumps hold:
+
+- Per-frame depth is not in the dump (Z is frame 0 only). The walk back
+  therefore uses frame k's own terrain vector for the first step. Each
+  later step uses the median world vector of frame j in a 65 px window.
+- Hull = decision path 11 with predicted depth over 10 m. "Seen" = world
+  path (2), not hull, and its 3x3 neighbours world too.
+- Crop: 1400x1400 (the D crop). MV sign: previous = current + MV, checked
+  per dump (median one-step error 7.9 against 26.3, and 0.5 against 2.9).
+
+Script and full tables: shared notes folder, `hull-fill-20261108\`
+(`hull_fill_test.py`, `fill_out*.txt`). Results excluding the H6 frames
+(rows unchanged, terrain MV 0):
+
+| dump | band px, frames 1-15 | seen within 8 frames | fill error p50 / p90 (luma) | open-terrain floor p50 |
+|---|---|---|---|---|
+| 131530778003 (slides away, 2-5% of gap) | 36,000 | 44-99% a frame | 7-34 / 29-130 | 6-9 |
+| 132100543006 (the reported smear, 25-37% of gap) | 318,910 | **5.8%** | 28.5 / 105.7 | 0.5-6 |
+
+- In 132100543006, 86-97% of band pixels a frame were **still behind
+  the ship or cockpit after 8 frames** (250-340 px of terrain travel).
+  Only 2-7% left the crop. So the crop is not the cause: that terrain
+  was hidden longer than the dump's whole history.
+- Even where a fill was found, its error is 3-5 times the open-terrain
+  floor. That comes from the walk's motion model (no depth, a constant
+  local flow), not from the fill idea, but it does not change the
+  verdict.
+- **Verdict, against the pre-written thresholds: below 40% in the
+  slide-into case. Option (e) cannot fix the reported smear.**
+  - ruled out: filling the band from earlier frames (e), because 94%
+    of it was not visible in any of the previous 8 frames (dump
+    132100543006).
+  - Options (a) and (c) remain the only ones that can supply that
+    terrain, since the game draws it every frame and depth discards it.
+    Their cost (re-lighting and post, several ms) was already judged too
+    high. A lower frame rate widens the band.
+- **What remains:**
+  - the band is DLSS's limit at this frame rate (FG doc 2026-11-08);
+  - for frame generation, layered extrapolation (world and hull warped
+    separately) still removes the hull-edge disocclusion *between* game
+    frames, where the world under last frame's hull is not needed. That
+    is a separate design question for the FG arc, not a fix for DLSS.
