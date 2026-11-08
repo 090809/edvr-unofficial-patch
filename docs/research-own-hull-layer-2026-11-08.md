@@ -10,15 +10,15 @@ The smear is terrain that is newly uncovered at the hull edge every frame
 
 ## Status
 
-* **State (Step 1 v2 built, not flown):** section "Step 1 v2 build" at the
-  end. v1 flew (section "Step 1 flight"): the mechanism works, the verdict
-  was unreadable. v2 picks the own ship per record with a GPU own mask
-  seeded from the first hull draw after the shell, filters the neighbours'
-  pixels out of the private G-buffer, re-issues every lighting draw and
-  arms up to three eye dumps itself. **Next flight:** fly over terrain with
-  `diag.hull_layer = dump` and `fix.temporal_aa` on, no key presses; then
-  `edvr_log.py --health` and `python tools\hull_layer_compare.py
-  <edvr_logs>\eyes\eye_<stamp>` for each auto dump.
+* **State (Step 1 CONFIRMED, 2026-11-08 20:30, build cfa4e5f5):** section
+  "Step 1 v2 flight (... 20:30 ...)". The private hull layer, picked per
+  record by the GPU own mask and re-lit by re-issuing the game's lighting,
+  equals the game's HDR where the game shows the hull. Median ratio 1.000;
+  85-98% of those pixels are bit-exact; AO and decals are the residue. The
+  neighbour filter is built but not yet exercised. **Next:** Step 2 (the
+  own ship out of the main pass, a discard in the engine-motion patched
+  hull PS) together with Step 3 (tonemap, composite after DLSS, AA), so
+  that the next flight shows the result instead of measuring a piece.
 * **Temporary keys of this arc:** `diag.hull_layer` (off | dump).
 * **Option (e), the hull hole-fill, fails** for the case the pilot reported
   (section "Result"): in dump 132100543006 only 5.8% of the band was visible
@@ -607,6 +607,36 @@ ledgers and census; the clear values are the game's as the clear hook sees
 them; that the shell and the block draw with four targets bound; and that no
 third pass draws the shell into a G-buffer of its own (`eye_frames` would be
 more than twice `frames`).
+
+## Step 1 v2 flight (2026-11-08 20:30, build cfa4e5f5): CONFIRMED
+
+Log `edvr_gfx_20261108_203001.log`, build verified. Three auto dumps:
+203155534001, 203204345002 (sunlit) and 203212174003 (the ship in
+shadow).
+
+- **The layer ran:** `state=applied`, 39-44 hull draws an eye, 4 lighting
+  draws an eye re-issued, `no_slot` on 16 of 1,878 eye-frames. The seed
+  draw has a single instance (`seed=1/1`).
+- **Verdict, `hull_layer_compare.py`, eye 0:** CONFIRMED on all three.
+  On the pixels where the game shows the hull, the private/game luma
+  median ratio is 1.000. 91.5-98.9% are within 5%, and 85-98% are
+  bit-exact. p95 is 1.013-1.090, the AO and decal residue.
+  - The first read said REFUTED or INCONCLUSIVE. The tool compared every
+    private hull pixel, but in the game's image the cockpit covers 73% of
+    them. Seen side by side (preview in the shared notes), the private
+    layer is the whole nose without the cockpit. The tool now keeps the
+    pixels where the eye run's scene depth `Z` equals the private depth,
+    with a self-test case for it.
+- **The own mask holds 136-271 records, not 54**, and up to thousands in
+  the 30 s lines. Replayed on three ledgers (`mask_check.py`), every
+  record within 120 m of the seed comes from the own ship. That is the 54
+  hull-family records, the 64 the own ship draws with other families
+  (cockpit, weapons) and records not drawn that frame. No neighbour's
+  hull records are in it. The filter only reads hull pixels, so the count
+  is cosmetic. A neighbour within 120 m (docking, tight formation) would
+  join the mask; that case is untested.
+- **Not exercised:** the neighbour filter (`filtered_px=0`: no ship near
+  in these dumps).
 
 ## Step 1 v2 flight (2026-11-08 20:19, build 472aaccf): no result, a shader keyword
 

@@ -58,9 +58,20 @@ def compare(prefix, eye=0, tol=0.05, clear_depth=0.0):
     if hull.ndim != 3 or game.ndim != 3 or hull.shape != game.shape or depth.shape != hull.shape[:2]:
         raise ValueError('the three files do not share one eye size (%s, %s, %s)' % (hull.shape, game.shape, depth.shape))
     mask = depth != np.float32(clear_depth)
+    out = {'eye': eye, 'tol': tol, 'private_pixels': int(mask.sum())}
+    # Where the game shows the hull: the eye run's scene depth (eye_<stamp>_Z.bin, written for eye 0) equals the private
+    # depth. Elsewhere the cockpit or canopy is in front in the game's image, and the two HDRs differ by design (the
+    # 2026-11-08 20:30 flight: 27% of the private pixels visible, 85-98% of those bit-exact).
+    zpath = '%s_Z.bin' % prefix
+    if os.path.exists(zpath):
+        zmeta, z = eye_inputs.read(zpath)
+        if zmeta.get('eye', 0) == eye and np.asarray(z).shape == depth.shape:
+            z = np.asarray(z, np.float32)
+            mask &= np.abs(z - depth) <= 1e-6 * np.maximum(np.abs(depth), np.float32(1e-9)) + np.float32(1e-9)
+            out['visible_only'] = True
     lh, lg = luma(np.nan_to_num(hull)), luma(np.nan_to_num(game))
     n = int(mask.sum())
-    out = {'hull_pixels': n, 'eye': eye, 'tol': tol}
+    out['hull_pixels'] = n
     if n < MIN_HULL:
         out.update(verdict='REFUTED', why='the private depth holds %d hull pixels (under %d): the block was not drawn into it' % (n, MIN_HULL))
         return out
@@ -120,6 +131,8 @@ def own_from_log(prefix, eye, log=None):
 
 def report(r):
     line = 'hull layer compare: eye %d, %d hull pixel(s)' % (r['eye'], r['hull_pixels'])
+    if r.get('visible_only'):
+        line += ' the game shows (of %d private)' % r['private_pixels']
     if r.get('own') is not None:
         line += ', own mask %d record(s), %d pixel(s) filtered as neighbours' % r['own']
     if 'game_lit' in r:
@@ -157,7 +170,7 @@ def self_test():
         with open(path, 'wb') as f:
             f.write(b'EDVRTEX1' + struct.pack('<9I', 1, w, h, fmt, w * px, 7, eye, 0, 0) + payload)
 
-    def case(name, priv_rgb, game_rgb, depth, want, eye=0):
+    def case(name, priv_rgb, game_rgb, depth, want, eye=0, scene_z=None):
         with tempfile.TemporaryDirectory() as temp:
             prefix = os.path.join(temp, 'eye_123456789001')
             sfx = '_e1' if eye else ''
@@ -167,6 +180,8 @@ def self_test():
             d = np.zeros((h, w, 2), dtype=np.float32)
             d[..., 0] = depth
             write(prefix + '_HullDepth%s.bin' % sfx, 19, eye, d.tobytes(), w, h, 8)
+            if scene_z is not None:
+                write(prefix + '_Z.bin', 41, eye, scene_z.astype(np.float32).tobytes(), w, h, 4)
             r = compare(prefix, eye=eye)
             if r['verdict'] != want:
                 failures.append('%s: %s, wanted %s (%r)' % (name, r['verdict'], want, r))
@@ -187,6 +202,14 @@ def self_test():
     case('an empty private depth', hull, game, np.zeros_like(depth), 'REFUTED')
     case('a layer at half the light', hull * 0.5, game, depth, 'INCONCLUSIVE')
     case('the game black too (the wrong comparison point)', np.zeros_like(game), np.zeros_like(game), depth, 'INCONCLUSIVE')
+    # The cockpit in front of most of the hull in the game's image (reversed Z: nearer is larger): its pixels differ by
+    # design. With the scene depth the comparison keeps the hull the game shows and confirms; without it, it cannot.
+    cockpit = depth > 0
+    cockpit[8:40, 10:44] = False
+    occluded_game = np.where(cockpit[..., None], game, 0.05)
+    scene_z = np.where(cockpit, depth, 0.9).astype(np.float32)
+    case('a cockpit in front, scene depth given', hull, occluded_game, depth, 'CONFIRMED', scene_z=scene_z)
+    case('a cockpit in front, no scene depth', hull, occluded_game, depth, 'INCONCLUSIVE')
     # The own-mask count comes from the dump's log line beside the eyes folder.
     with tempfile.TemporaryDirectory() as temp:
         os.makedirs(os.path.join(temp, 'eyes'))
@@ -208,7 +231,7 @@ def self_test():
     for f in failures:
         print('hull layer compare self-test FAILED: ' + f)
     if not failures:
-        print('hull layer compare self-test passed (9 cases)')
+        print('hull layer compare self-test passed (11 cases)')
     return 1 if failures else 0
 
 
