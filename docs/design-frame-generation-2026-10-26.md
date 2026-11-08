@@ -2,9 +2,9 @@
 
 ## Status
 
-- **State (2026-11-08): Phase 2.3 Lock flies** (fork `framegen-phase1`):
-  S in every slot, Lock holds; the pilot still reports smear (S quality
-  arc in the 2026-11-07/08 entries). Design from OFXR-Bridge `d7fcca72`,
+- **State (2026-11-08): Phase 2.4 built, not flown** (fork `framegen-phase1`):
+  `auto` and the performance gate (2026-11-08 gate entry); Lock (2.3) flies,
+  S in every slot; the remaining smear is the base frame (S quality arc). Design from OFXR-Bridge `d7fcca72`,
   EDVR `6b8ef374`. No issue yet.
 - **Recommendation:** take OFXR-Bridge's frame loop, not its synthesizer. Elite
   renders at half the headset rate and EDVR's runtime presents every display
@@ -19,9 +19,9 @@
   holds every real frame back at least one period (## Why not a straight port).
 - **When it runs (`auto`):** only while a measured gate holds. Elite is below
   headset rate, its frame fits in two periods with room for the synthesis, a
-  shadow score says the prediction is clean, and there is no cut. v1 admits
-  surface contexts only: on foot, the SRV, or a ship drawing planet surface.
-  Space is admitted on Phase 1 evidence (## The gate).
+  shadow score says the prediction is clean, and there is no cut. As built,
+  v1 admits a ship (supercruise too) or the SRV, not on foot, and has no
+  score term (## The gate; 2026-11-08 gate entry).
 - **Space:** use geometry, not flow. Stars and sky turn with rotation only. The
   cockpit moves with the head only. The world moves with the head and the
   extrapolated ship, movers with EDVR's engine-record vectors, and the UI on
@@ -49,12 +49,12 @@
 - **Phase 0 (no EDVR code):** fly stock OFXR-Bridge and VectorXR (colour-only
   routes) over EDVR at a bright settlement and in space, with each runtime's
   own smoothing off and then on. This is the visual reference to beat.
-- **Next:** 2.4 (gate, `auto`, H1). The pilot's remaining smear is EDVR's
-  base frame, FG off too: terrain disoccluded at the hull edge each frame,
-  DLSS's limit at this rate (2026-11-08 base-frame entry).
-- **Temporary keys (hidden):** `fix.frame_generation_shadow` (off | on), and
-  `fix.frame_generation` (off | on; built 2.3: `on` forces Lock, for A/B
-  flights; `auto` replaces it in 2.4).
+- **Next:** fly `auto` in a ship below headset rate and at full rate: the
+  `frame generation gate:` line is H1 (budget, margin) and says each
+  second why Lock is or is not allowed (2026-11-08 gate entry).
+- **Temporary keys:** `fix.frame_generation_shadow` (off | on, hidden), and
+  `fix.frame_generation`'s `on` (forces Lock, for A/B flights; `auto` is
+  the value meant to stay).
 - **Declined in design (re-open on new evidence):** ## Declined, including AFW
   as a replacement and flat-profile frame generation (2026-10-27).
 - **Open:** ## Open questions.
@@ -1726,6 +1726,48 @@ Environment: OpenXR (EDVR's runtime), left eye, render 2817x2448, output
   picture; the wing gap is not better under L or M. The band is DLSS's
   limit at this frame rate; it narrows only with a higher game frame rate.
 
+### 2026-11-08: Phase 2.4, the gate and `auto` (built, not flown)
+
+- **Key:** `fix.frame_generation = off | auto | on`. `off` as before (word 0,
+  no synthesizer, no gate line). `on` is 2.3's forced Lock. `auto` runs the
+  synthesizer and the slot; Lock engages only while the gate admits it, on
+  top of its own conditions (reason `auto_gate`, tested last). The hotkey
+  turns the key off, or back to the value it last turned off (auto first).
+- **Where it runs:** the d3d11 half (`perf_monitor.cpp` `frameGenGateFrame`,
+  once a frame), which already has the inputs: the Monitor page's GPU TIME and
+  CPU TIME series (median and max over 2 s), the display and predicted
+  periods, the synthesizer's window, Status.json and the journal. Lock's
+  counts come back in the slot. The pure gate is `src/common/framegen_gate.h`,
+  tabled in `framegen_synth_report_test`.
+- **ABI:** word 17 is 2 (auto, closed) or 3 (open). A 2.3 runtime reads only
+  1 as on, so auto reads off there; a 2.3 d3d11.dll reads `auto` in the ini
+  as off. The slot grows to size 4 (`lockMode`). With no size 4 slot for 10 s
+  of VR frames the gate holds the synthesizer and says so once.
+- **Terms as built:** engage after 2 s of: runtime knows auto, every input
+  measured (else `no_*`, fail-open), ship or SRV, real rate under 0.9 of the
+  display's or a halved predicted period, GPU median plus the synthesizer's
+  cost (both eyes, build plus finish) and the CPU median each under 0.85 of
+  two periods, no cut for 2 s, 5 s since the gate last let go. Let go at
+  once on a cut, a lost input or on foot, on `too_slow` (late_real over 5%
+  of at least 10 S slots over two windows), and on `fits_full_rate` (GPU and
+  CPU medians under 0.75 of one period for 3 s). `period_halved` and motion
+  stay Lock's own reasons. Cuts: GuiFocus 5 and up, the jump tunnel, the
+  temporal pass's camera gate, no pair for 250 ms, Lock's `no_projection`.
+- **Deviation, context:** v1 admits a ship anywhere (supercruise included)
+  and the SRV, not only surfaces as "### The gate" says: flights 6
+  (supercruise) and 12 (Lock holds in a ship) flew them. On foot is not
+  admitted (`on_foot`): unflown.
+- **Deviation, no shadow-score term:** the synthesizer's f = 1 score runs only
+  under the shadow key, so v1 has no score term; the design's "shadow score"
+  engage and disengage terms wait for a score that runs with `auto`.
+- **Choices made against the code:** the GPU figure is GPU TIME's (the
+  application render, else the frame's work span), which may already hold
+  the synthesizer's work, so adding its cost again errs safe. Elite's real
+  rate is the CPU series' count over 2 s. `too_slow` uses S slots for pairs.
+- **H1 instrument:** `frame generation gate: state= reason= mode= real_fps=
+  period_ms= gpu_ms=med/max cpu_ms=med/max synth_ms= budget_ms= margin_ms=
+  late_real= context= cut= lock=` once a second (auto and on), the edges in
+  auto. Never admitted reads `state=waiting reason=<why>`; `--health` says it.
 ### 2026-11-07: Phase 2.3, flight 11, the first Lock flight (same build)
 
 `fix.frame_generation = on`, about 12 minutes. Pilot: "a slight flicker",
