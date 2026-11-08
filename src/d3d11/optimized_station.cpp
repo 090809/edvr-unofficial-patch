@@ -95,7 +95,7 @@ struct TlsCounters {
     uint32_t sampleStore = 0, sampleProducer = 0, sampleRig = 0;   // the 1-in-32 sampling counters (the thread's own)
     uint64_t concRigSeen = 0, concRigVetoed = 0, concProdVetoed = 0, concProdKept = 0, concStoreCleared = 0;   // built 2026-11-05: the concourse cull's counts
     uint64_t concKept[4] = {};
-    uint64_t concRoomProd = 0, concRoomStore = 0;   // TEMPORARY (the rooms ceiling): records the cull's own rule kept and the slab culled
+    uint64_t concRoomProd = 0, concRoomStore = 0;   // the door rule: records the cull's own rule kept and the door rule culled
 };
 thread_local TlsCounters tlsTc;
 void tcFlush(TlsCounters& t) noexcept;
@@ -277,15 +277,21 @@ std::atomic<bool> g_camLookOn{false};         // TEMPORARY (the camera test): th
 int g_camLookGraceTicks = 0;                  // TEMPORARY: ticks after the look in which a big camera step is its own way back, not another room
 bool g_camLookSurvey = false;                 // TEMPORARY: the names survey was taken in the look: its report lists what is near the room's centre and still kept
 std::atomic<bool> g_liftGateOn{false};       // the tick's: the lift gate is on, the player is in a shut lift cabin (published in the snapshot as `lift`; part of g_concActive)
-// TEMPORARY (the rooms ceiling, hotkey.concourse_room_test): the tick's slab, published in the snapshot as `room`. Written by the tick and read by the publication, both under the state lock.
+// The door rule (cc::roomSeenSlab): the tick's verdict, published in the snapshot as `room`. Written by the tick and read by the publication, both under the state lock.
 struct RoomPub {
-    bool room = false;
-    bool only = false;
+    bool room = false;    // something is behind a shut door: records wholly outside `slab` are culled
+    bool only = false;    // the live room: that is the only rule
+    bool rigs = false;    // TEMPORARY (cc::DoorRuleMode::kRigs): a record the rule culls counts as culled in its rig's tally
     float origin[3] = {};
     float axis[3] = {};
     cc::RoomSlab slab;
 };
 RoomPub g_roomPub;
+// The doors' leaves (cc::kDoorLeafLeft, kDoorLeafRight), sighted by the store while the tick wants them (concourseSight) and read by the tick. A slot whose record is not a leaf's any more
+// is let go there.
+constexpr size_t kDoorLeafSlots = 8;
+std::atomic<uintptr_t> g_doorLeaf[kDoorLeafSlots] = {};
+std::atomic<bool> g_doorLeafWanted{false};
 std::atomic<bool> g_concSurveyArmed{false};   // the one-shot names are being gathered: the rig and producer vetoes forward so the store judges and names every record
 std::atomic<bool> g_concNamesOnly{false};     // TEMPORARY: an F3 with the cull off is gathering names: the store only reads each record (concourseNamesOnlyRecord)
 bool g_roomCutPending = false;   // the camera stepped over kRoomCutM this tick (resolveTickView); the concourse tick takes it, under the state lock
@@ -313,7 +319,7 @@ struct ConcourseWin {   // the 5 s summary's window (the callbacks' counters flu
     std::atomic<uint64_t> rigSeen{0}, rigVetoed{0}, prodVetoed{0}, prodKept{0}, storeCleared{0};
     std::atomic<uint64_t> tot[6] = {};    // the same counts, never reset: rig seen, rig vetoed, producer vetoed, producer kept, small-close kept, store cleared (the lift's summary takes differences)
     std::atomic<uint64_t> kept[4] = {};   // name, small-close, unreadable-name, unreadable-sphere (the producer's keeps)
-    std::atomic<uint64_t> roomProd{0}, roomStore{0};   // TEMPORARY (the rooms ceiling): taken by its own 5 s line
+    std::atomic<uint64_t> roomProd{0}, roomStore{0};   // the door rule's: taken by its own 5 s line
 };
 ConcourseWin g_concWin;
 
@@ -525,8 +531,9 @@ struct PadSnapshot {
     bool concourse = false;       // built 2026-11-05: the concourse cull is active (the producer veto judges by name)
     bool look = false;            // TEMPORARY (the camera test): the room off and the rest on (cc::concourseJudge)
     bool lift = false;            // built 2026-11-06: the player is in a shut lift cabin: the judgement keeps only what is near (cc::concourseJudge)
-    bool room = false;            // TEMPORARY (the rooms ceiling): a record wholly in another of the room's slabs is culled, whatever the rule above says
-    bool roomOnly = false;        // TEMPORARY: and that is the only rule (the live room, where the cull stands down)
+    bool room = false;            // the door rule: one of the room's own records wholly behind a shut door is culled, whatever the rule above says (cc::roomSeenSlab)
+    bool roomOnly = false;        // and that is the only rule (the live room, where the cull stands down)
+    bool roomRigs = false;        // TEMPORARY (cc::DoorRuleMode::kRigs): such a record counts as culled in its rig's tally
     float roomOrigin[3] = {};     // the anchor's centre
     float roomAxis[3] = {};       // its a2
     float roomLo = 0.0f, roomHi = 0.0f;
@@ -1962,10 +1969,11 @@ void concourseCountKept(TlsCounters& tc, cc::Judge j) noexcept {
     }
 }
 
-// TEMPORARY (the rooms ceiling, hotkey.concourse_room_test): whether the record's sphere lies wholly in another of the room's slabs, by the published slab. The lift and the look keep
-// their own rules.
-bool roomSlabCulls(const PadSnapshot& s, bool sphere, const float c[3], float r) noexcept {
+// The door rule: whether the record is one of the room's own (an allowed name, not the anchor) and its sphere lies wholly behind a shut door, by the published stretch. What is outside the
+// room (the carrier's hull, what the bridge's windows show) is not the rule's: the cull's own rule has it, where it runs. The lift and the look keep their own rules.
+bool roomSlabCulls(const PadSnapshot& s, const NodeInfo& ni, bool sphere, const float c[3], float r) noexcept {
     if (!s.room || !sphere || s.lift || s.look) return false;
+    if ((ni.flags & sealed::kNodeConcourseAllow) == 0 || (ni.flags & sealed::kNodeConcourseFarExempt) != 0) return false;
     const float along = (c[0] - s.roomOrigin[0]) * s.roomAxis[0] + (c[1] - s.roomOrigin[1]) * s.roomAxis[1] + (c[2] - s.roomOrigin[2]) * s.roomAxis[2];
     cc::RoomSlab slab;
     slab.lo = s.roomLo;
@@ -1978,7 +1986,7 @@ cc::Judge concourseJudgeHere(const PadSnapshot& s, bool nameReadable, const Node
     cc::Judge j = s.roomOnly && !s.lift && !s.look ? cc::Judge::kKeepName
                                                    : cc::concourseJudge(nameReadable, (ni.flags & sealed::kNodeConcourseAllow) != 0, sphere, d, r,
                                                                         (ni.flags & sealed::kNodeConcourseFarExempt) != 0, s.lift, s.look);
-    if (cc::judgeKeeps(j) && roomSlabCulls(s, sphere, c, r)) {
+    if (cc::judgeKeeps(j) && roomSlabCulls(s, ni, sphere, c, r)) {
         j = cc::Judge::kCull;
         *slabbed = true;
     }
@@ -2529,6 +2537,7 @@ void publishSnapshot() noexcept {
     s.look = g_camLookOn.load(std::memory_order_acquire);
     s.room = g_roomPub.room;
     s.roomOnly = g_roomPub.room && g_roomPub.only;
+    s.roomRigs = g_roomPub.room && g_roomPub.rigs;
     std::memcpy(s.roomOrigin, g_roomPub.origin, sizeof(s.roomOrigin));
     std::memcpy(s.roomAxis, g_roomPub.axis, sizeof(s.roomAxis));
     s.roomLo = g_roomPub.slab.lo;
@@ -2688,11 +2697,21 @@ void concourseSight(uintptr_t record, uintptr_t node, const NodeInfo& ni) noexce
     } else if ((ni.flags & sealed::kNodeConcourseAllow) != 0) {
         const bool hubWanted = g_concHubWanted.load(std::memory_order_relaxed);
         const char* liveWanted = g_concLiveWanted.load(std::memory_order_relaxed);
-        if (!hubWanted && !liveWanted) return;
+        const bool leafWanted = g_doorLeafWanted.load(std::memory_order_relaxed);
+        if (!hubWanted && !liveWanted && !leafWanted) return;
         char hn[64] = {};
         if (!cachedNameOfNode(node, hn, sizeof(hn), &ni.validator)) return;
         if (hubWanted && std::strcmp(hn, cc::kHubName) == 0) g_concHubAddr.store(record, std::memory_order_relaxed);
         else if (liveWanted && std::strcmp(hn, liveWanted) == 0) g_concLiveAddr.store(record, std::memory_order_relaxed);
+        else if (leafWanted && (std::strcmp(hn, cc::kDoorLeafLeft) == 0 || std::strcmp(hn, cc::kDoorLeafRight) == 0)) {
+            // A door's leaf: into the first free slot unless it is already held. Two callbacks may both take a slot for one record; the tick reads both alike.
+            for (std::atomic<uintptr_t>& slot : g_doorLeaf)
+                if (slot.load(std::memory_order_relaxed) == record) return;
+            for (std::atomic<uintptr_t>& slot : g_doorLeaf) {
+                uintptr_t expect = 0;
+                if (slot.compare_exchange_strong(expect, record, std::memory_order_relaxed)) return;
+            }
+        }
     }
 }
 
@@ -2998,9 +3017,12 @@ void afterStoreConcourse(uintptr_t bucket, uintptr_t record) noexcept {
     const cc::Judge j = concourseJudgeHere(s, nameReadable, ni, sphere, wr.world, d, sphere ? wr.radius : 0.0f, &slabbed);
     if (slabbed) ++tc.concRoomStore;
     const bool keep = cc::judgeKeeps(j);
+    // The door rule culls the record, but by default its rig's tally counts it kept, so the rule never vetoes a whole rig: a rig can draw what the store never judges (Flight 44's bridge
+    // floor, INFERRED), and its other records here say nothing of where that is.
+    const bool keepForRig = keep || (slabbed && !s.roomRigs);
     const float zero[3] = {0.0f, 0.0f, 0.0f};
     gatherRigNote(w, bucket, record, sphere ? wr.world : zero, sphere ? wr.radius : 0.0f, stamp,
-                  static_cast<uint8_t>(kFlagJudged | (keep ? kFlagKeep : 0)));
+                  static_cast<uint8_t>(kFlagJudged | (keepForRig ? kFlagKeep : 0)));
     if (g_concSurveyArmed.load(std::memory_order_relaxed) && nameReadable) {
         char nm[64] = {};
         if (cachedNameOfNode(node, nm, sizeof(nm), &ni.validator)) concourseSurveyNote(nm, j, d, sphere ? wr.radius : 0.0f);
@@ -3224,13 +3246,13 @@ bool g_viewHotkeyBound = false;
 Hotkey* g_camHotkey = nullptr;
 std::string g_camHotkeyText;
 bool g_camHotkeyBound = false;
-// TEMPORARY (the rooms ceiling, docs\concourse-cull-2026-11-05.md "Rooms behind bulkhead doors"): hotkey.concourse_room_test turns g_roomTestOn on and off. While on, at a room whose layout
-// has door planes (cc::RoomLayout::slabCut), every record wholly in another of its slabs is culled too, the doors ignored: the most a door rule could save. In the live room, where the cull
-// stands down, that is the only rule, so its windows stay the game's own.
+// The door rule (docs\concourse-cull-2026-11-05.md "Rooms behind bulkhead doors"): at a room whose layout has doors (cc::RoomLayout::slabCut), the room's own records behind a shut door
+// are culled. In the live room, where the cull stands down, that is the only rule, so its windows stay the game's own. TEMPORARY: hotkey.concourse_room_test steps g_doorMode.
 Hotkey* g_roomHotkey = nullptr;
 std::string g_roomHotkeyText;
 bool g_roomHotkeyBound = false;
-bool g_roomTestOn = false;
+cc::DoorRuleMode g_doorMode = cc::DoorRuleMode::kRecords;
+cc::DoorWatch g_doorWatch[2];
 uint64_t g_roomSumMs = 0;
 uint32_t g_camMode = 0;
 bool g_camHooked = false;
@@ -3490,12 +3512,10 @@ void concoursePoll(uint64_t now) {
         g_roomHotkeyText = roomKey;
         g_roomHotkey->setBinding(roomKey.c_str());
         if (g_roomHotkey->bound()) {
-            Log::get().note("concourse rooms: hotkey.concourse_room_test = \"%s\" bound (TEMPORARY: a press culls every record wholly in another of the room's slabs, the doors ignored, or stops)",
-                            roomKey.c_str());
+            Log::get().note("concourse doors: hotkey.concourse_room_test = \"%s\" bound (TEMPORARY: each press steps the door rule: records, records and rigs, off)", roomKey.c_str());
         } else {
-            g_roomTestOn = false;
-            if (!roomKey.empty()) Log::get().note("concourse rooms: hotkey.concourse_room_test = \"%s\" bound nothing", roomKey.c_str());
-            else if (!first) Log::get().note("concourse rooms: hotkey.concourse_room_test cleared (the test is off)");
+            if (!roomKey.empty()) Log::get().note("concourse doors: hotkey.concourse_room_test = \"%s\" bound nothing", roomKey.c_str());
+            else if (!first) Log::get().note("concourse doors: hotkey.concourse_room_test cleared (the door rule stays %s)", cc::doorRuleName(g_doorMode));
         }
     }
 }
@@ -3591,6 +3611,8 @@ void concourseSettingOffTick(uint64_t now) {
     g_backdropGate.reset();
     g_liftGate.reset();
     g_roomPub = RoomPub{};
+    g_doorLeafWanted.store(false, std::memory_order_relaxed);
+    for (cc::DoorWatch& dw : g_doorWatch) dw.reset();
     if (g_camTimer.stop()) concoursePaneBakeCancel();
     concoursePaneBakeArm(false);
     concoursePaneBakeRelease();
@@ -4394,26 +4416,32 @@ void concourseTick(uint64_t now, uint32_t frame) {
         }
     }
     const bool gateWanted = armed && social && !sealedNow;
-    // TEMPORARY (the rooms ceiling, hotkey.concourse_room_test): the press, and the camera's slab along the anchor's a2. The anchor's frame is read once a second while the test is wanted
-    // (the pose read is not free) and held between reads; the camera's place on it is this tick's. A change of slab, or of the live room, starts the rigs' verdicts afresh.
+    // The door rule (concourse_cull_core.h, roomSeenSlab): at a room whose layout has doors, the camera's place along the anchor's a2, each door's state from its leaves, and the stretch of
+    // a2 the camera can see into. The anchor's frame is read once a second while the rule is wanted (the pose read is not free) and held between reads; the camera's place and the leaves
+    // are this tick's. A change of what is culled, or of the live room, starts the rigs' verdicts afresh. hotkey.concourse_room_test (TEMPORARY) steps the rule's level.
     if (g_roomHotkey && g_roomHotkey->pressed()) {
-        g_roomTestOn = !g_roomTestOn;
-        Log::get().note("concourse rooms: the test is %s by hotkey.concourse_room_test (%s)", g_roomTestOn ? "on" : "off",
-                        g_concLayout->slabCuts > 0 ? "every record wholly in another of the room's slabs is culled, the doors ignored" : "this room has no door planes, so it does nothing here");
-        concoursePaneQueueToast(g_roomTestOn ? "Rooms test: on" : "Rooms test: off");
+        g_doorMode = cc::doorRuleNext(g_doorMode);
+        Log::get().note("concourse doors: the rule is %s by hotkey.concourse_room_test%s", cc::doorRuleName(g_doorMode),
+                        g_concLayout->slabCuts > 0 ? "" : " (this room has no doors known, so it does nothing here)");
+        char text[48];
+        std::snprintf(text, sizeof(text), "Doors: %s", cc::doorRuleName(g_doorMode));
+        concoursePaneQueueToast(text);
         g_roomSumMs = now;
         g_concWin.roomProd.store(0, std::memory_order_relaxed);
         g_concWin.roomStore.store(0, std::memory_order_relaxed);
+        bumpRigEpoch();   // the rigs' tallies mean something else at another level
     }
     RoomPub roomNow;
     float roomAlong = 0.0f;
+    const uint32_t doorCuts = g_concLayout->slabCuts < 2 ? g_concLayout->slabCuts : 2;
+    const bool doorsWanted = g_doorMode != cc::DoorRuleMode::kOff && gateWanted && effective && (anchor || inLiveRoom) && doorCuts > 0 && g_frameCamValid;
+    bool leavesMissing = false;
     {
         static float frameC[3] = {};
         static float frameA2[3] = {};
         static bool frameValid = false;
         static uint64_t frameMs = 0;
-        const bool roomWanted = g_roomTestOn && gateWanted && effective && (anchor || inLiveRoom) && g_concLayout->slabCuts > 0 && g_frameCamValid;
-        if (!roomWanted) {
+        if (!doorsWanted) {
             frameValid = false;
             frameMs = 0;
         } else if (!frameValid || now - frameMs >= 1000) {
@@ -4426,13 +4454,53 @@ void concourseTick(uint64_t now, uint32_t frame) {
                 frameA2[k] = ax[2][k];
             }
         }
-        if (roomWanted && frameValid) {
+        if (!doorsWanted || !frameValid) {
+            for (cc::DoorWatch& dw : g_doorWatch) dw.reset();
+        } else {
             roomAlong = (g_frameCam[0] - frameC[0]) * frameA2[0] + (g_frameCam[1] - frameC[1]) * frameA2[1] + (g_frameCam[2] - frameC[2]) * frameA2[2];
-            cc::RoomSlab slab;
-            if (cc::roomSlabOf(*g_concLayout, roomAlong, &slab)) {
+            // The doors' leaves: each sighted record read for its name and place. A record whose name is not a leaf's any more is let go.
+            bool seen[2][2] = {};
+            float pos[2][2][3] = {};
+            for (std::atomic<uintptr_t>& slot : g_doorLeaf) {
+                const uintptr_t addr = slot.load(std::memory_order_relaxed);
+                if (addr == 0) continue;
+                char nm[64] = {};
+                const int side = !cachedName(addr, nm, sizeof(nm))              ? -1
+                                 : std::strcmp(nm, cc::kDoorLeafLeft) == 0  ? 0
+                                 : std::strcmp(nm, cc::kDoorLeafRight) == 0 ? 1
+                                                                            : -1;
+                if (side < 0) {
+                    uintptr_t expect = addr;
+                    slot.compare_exchange_strong(expect, 0, std::memory_order_relaxed);
+                    continue;
+                }
+                const WorldRead wr = worldOfRecord(addr);
+                if (wr.source == 4) continue;
+                const float along = (wr.world[0] - frameC[0]) * frameA2[0] + (wr.world[1] - frameC[1]) * frameA2[1] + (wr.world[2] - frameC[2]) * frameA2[2];
+                const int cut = cc::doorCutOf(*g_concLayout, along);
+                if (cut < 0) continue;
+                seen[cut][side] = true;
+                for (int k = 0; k < 3; ++k) pos[cut][side][k] = wr.world[k];
+            }
+            bool blocks[2] = {};
+            for (uint32_t i = 0; i < doorCuts; ++i) {
+                const bool leavesKnown = seen[i][0] && seen[i][1];
+                if (!leavesKnown) leavesMissing = true;
+                const float gap = leavesKnown ? sealed::distance(pos[i][0], pos[i][1]) : 0.0f;
+                const cc::DoorState was = g_doorWatch[i].state();
+                const cc::DoorState st = g_doorWatch[i].step(leavesKnown, gap, now);
+                if (st != was)
+                    Log::get().note("concourse doors: the door at a2 %.1f is %s (%s, %.2f m apart)", static_cast<double>(g_concLayout->slabCut[i]), cc::doorStateName(st),
+                                    leavesKnown ? (gap > cc::kDoorOpenGapM ? "its leaves have parted" : "its leaves are together") : "its two leaves are not both seen",
+                                    static_cast<double>(gap));
+                blocks[i] = cc::doorBlocks(st, roomAlong, g_concLayout->slabCut[i]);
+            }
+            cc::RoomSlab seenSlab;
+            if (cc::roomSeenSlab(*g_concLayout, roomAlong, blocks, &seenSlab) && !cc::roomSlabWhole(seenSlab)) {
                 roomNow.room = true;
                 roomNow.only = inLiveRoom;
-                roomNow.slab = slab;
+                roomNow.rigs = g_doorMode == cc::DoorRuleMode::kRigs;
+                roomNow.slab = seenSlab;
                 for (int k = 0; k < 3; ++k) {
                     roomNow.origin[k] = frameC[k];
                     roomNow.axis[k] = frameA2[k];
@@ -4440,24 +4508,26 @@ void concourseTick(uint64_t now, uint32_t frame) {
             }
         }
     }
-    if (roomNow.room != g_roomPub.room || roomNow.only != g_roomPub.only || (roomNow.room && !cc::sameRoomSlab(roomNow.slab, g_roomPub.slab))) {
+    g_doorLeafWanted.store(doorsWanted && leavesMissing, std::memory_order_relaxed);
+    if (roomNow.room != g_roomPub.room || roomNow.only != g_roomPub.only || roomNow.rigs != g_roomPub.rigs || (roomNow.room && !cc::sameRoomSlab(roomNow.slab, g_roomPub.slab))) {
         bumpRigEpoch();
         if (roomNow.room) {
-            char lo[16] = "open", hi[16] = "open";
+            char lo[16] = "none", hi[16] = "none";
             if (roomNow.slab.lo > -cc::kRoomSlabOpen) std::snprintf(lo, sizeof(lo), "%.1f", static_cast<double>(roomNow.slab.lo));
             if (roomNow.slab.hi < cc::kRoomSlabOpen) std::snprintf(hi, sizeof(hi), "%.1f", static_cast<double>(roomNow.slab.hi));
-            Log::get().note("concourse rooms: the camera is at a2 %.1f, in the slab from %s to %s: records wholly outside it are culled%s", static_cast<double>(roomAlong), lo, hi,
-                            roomNow.only ? " (the live room: that is the only rule, the cull's own stands down)" : " (with the cull's own rule)");
-        } else if (g_roomTestOn) {
-            Log::get().note("concourse rooms: no slab now (room %d, wanted %d, layout cuts %u, camera %d): nothing is culled by it", (anchor || inLiveRoom) ? 1 : 0, gateWanted && effective ? 1 : 0,
-                            g_concLayout->slabCuts, g_frameCamValid ? 1 : 0);
+            Log::get().note("concourse doors: the camera is at a2 %.1f; behind a shut door below a2 %s and above a2 %s, the room's own records are culled (%s%s)", static_cast<double>(roomAlong), lo,
+                            hi, cc::doorRuleName(g_doorMode), roomNow.only ? "; the live room: that is the only rule, the cull's own stands down" : "");
+        } else if (g_roomPub.room) {
+            Log::get().note("concourse doors: nothing is behind a shut door now (camera at a2 %.1f, rule %s, wanted %d)", static_cast<double>(roomAlong), cc::doorRuleName(g_doorMode),
+                            doorsWanted ? 1 : 0);
         }
     }
     g_roomPub = roomNow;
-    if (g_roomTestOn && now - g_roomSumMs >= 5000) {
+    if (doorsWanted && now - g_roomSumMs >= 5000) {
         g_roomSumMs = now;
-        Log::get().note("concourse rooms 5s: %s, camera at a2 %.1f; records culled by the slab that the cull's own rule kept: producer %llu, store %llu",
-                        !roomNow.room ? "no slab" : roomNow.only ? "the live room's slab alone" : "the slab with the cull's own rule", static_cast<double>(roomAlong),
+        Log::get().note("concourse doors 5s: rule %s, camera at a2 %.1f, doors %s %s; records the rule culled that the cull's own rule kept: producer %llu, store %llu",
+                        cc::doorRuleName(g_doorMode), static_cast<double>(roomAlong), cc::doorStateName(g_doorWatch[0].state()),
+                        doorCuts > 1 ? cc::doorStateName(g_doorWatch[1].state()) : "-",
                         static_cast<unsigned long long>(g_concWin.roomProd.exchange(0, std::memory_order_relaxed)),
                         static_cast<unsigned long long>(g_concWin.roomStore.exchange(0, std::memory_order_relaxed)));
     }
@@ -4707,7 +4777,7 @@ void concourseTick(uint64_t now, uint32_t frame) {
     const bool backdropLift = concourseBackdropStep(now, wantCull);
     const bool cullPart = cullPartRaw && !backdropLift;
     const bool cullActive = cullPart || liftOn || lookOn;
-    const bool roomOnlyOn = roomNow.room && roomNow.only && !liftOn && !lookOn;   // TEMPORARY (the rooms ceiling): the live room, by its slab alone
+    const bool roomOnlyOn = roomNow.room && roomNow.only && !liftOn && !lookOn;   // the live room: the door rule alone
     const bool active = cullActive || roomOnlyOn;
     ConcoursePaneFeed feed;   // the look wants the game's own picture: no pane treatment, nothing withheld; nor does the live room's slab
     feed.measure = gateWanted && !lookOn && !bakeHolds;
@@ -4751,7 +4821,7 @@ void concourseTick(uint64_t now, uint32_t frame) {
             g_concSumFrames = 0;
             for (int k = 0; k < 3; ++k) g_concSumCalls[k] = g_concCallsTotal[k].load(std::memory_order_relaxed);
             Log::get().note(cullPart     ? "concourse cull: on"
-                            : roomOnlyOn ? "concourse cull: on (the rooms test alone, in the live room: only what is wholly in another slab is culled)"
+                            : roomOnlyOn ? "concourse cull: on (the door rule alone, in the live room: only the room's own records behind a shut door are culled)"
                                          : "concourse cull: on (the lift: doors shut with the player inside)");
         } else {
             g_concActive.store(false, std::memory_order_release);

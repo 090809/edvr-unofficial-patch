@@ -938,7 +938,7 @@ constexpr float kBackdropRadiusDefaultM = 600.0f, kBackdropRadiusMinM = 10.0f, k
 // and the cull came on down there and took the hangar's walls (Flight 36). So there the camera must be near it too: 23 m at the bay, the hub's own radius 42 m, the hangar 503 m.
 // liveRoomName: a room inside the anchor's reach that the bake, taken at the anchor's centre, cannot show: while the camera is inside that record's sphere the cull stands down there and
 // its windows are the game's own. Null: none.
-// slabCut (TEMPORARY, the rooms ceiling, hotkey.concourse_room_test): the room's doors as planes across its a2, in metres from the anchor along a2. Zero cuts: none known.
+// slabCut: the room's doors as planes across its a2, in metres from the anchor along a2 (the door rule, roomSeenSlab). Zero cuts: none known.
 struct RoomLayout {
     uint32_t bayN;
     float backdropRadiusM;
@@ -976,8 +976,10 @@ inline bool anchorMeansRoomHere(const RoomLayout& room, bool cameraKnown, bool a
 inline bool insideLiveRoom(const RoomLayout& room, bool cameraKnown, bool liveRead, float cameraDistM, float liveRadiusM) noexcept {
     return room.liveRoomName != nullptr && cameraKnown && liveRead && std::isfinite(cameraDistM) && std::isfinite(liveRadiusM) && liveRadiusM > 0.0f && cameraDistM <= liveRadiusM;
 }
-// TEMPORARY (the rooms ceiling, hotkey.concourse_room_test; docs\concourse-cull-2026-11-05.md "Rooms behind bulkhead doors"): the stretch of a2 the camera is in, between the cuts either
-// side of it, and whether a record's sphere lies wholly past either end of it, which is another room. The doors are ignored: this measures the most a door rule could save.
+// The door rule (docs\concourse-cull-2026-11-05.md "Rooms behind bulkhead doors"). The room's doors are planes across its a2 (RoomLayout::slabCut). The stretch of a2 the camera can see
+// into runs to the first door each way that blocks: one known shut, with the camera more than kDoorNearM from its plane, as Elite's doors open on approach and the room behind must be back
+// before they do. A record whose sphere lies wholly past either end is behind a shut door. Flight 44's ceiling, every door taken as shut, culled to the 144 fps cap everywhere: at least
+// 1.6 ms in the elevator bay, 0.7 in the central space, 0.3 on the bridge.
 constexpr float kRoomSlabOpen = 1.0e30f;
 struct RoomSlab {
     float lo = -kRoomSlabOpen;
@@ -1002,6 +1004,83 @@ inline bool roomSlabOutside(const RoomSlab& s, float along, float radius) noexce
     return along + radius < s.lo || along - radius > s.hi;
 }
 inline bool sameRoomSlab(const RoomSlab& a, const RoomSlab& b) noexcept { return a.lo == b.lo && a.hi == b.hi; }
+// The stretch the camera can see into: only the cuts whose door blocks bound it. None blocking is the whole of a2.
+inline bool roomSeenSlab(const RoomLayout& room, float camAlong, const bool blocks[2], RoomSlab* out) noexcept {
+    if (!out || !blocks || room.slabCuts == 0 || room.slabCuts > 2 || !std::isfinite(camAlong)) return false;
+    RoomSlab s;
+    for (uint32_t i = 0; i < room.slabCuts; ++i) {
+        if (!blocks[i]) continue;
+        const float c = room.slabCut[i];
+        if (c <= camAlong) {
+            if (c > s.lo) s.lo = c;
+        } else if (c < s.hi) {
+            s.hi = c;
+        }
+    }
+    *out = s;
+    return true;
+}
+inline bool roomSlabWhole(const RoomSlab& s) noexcept { return s.lo <= -kRoomSlabOpen && s.hi >= kRoomSlabOpen; }
+
+// A door's state, from its two leaves (Narrow_Door_Left and _Right on a carrier: Flight 43, 0.8 to 1.0 m apart shut, 4.4 m open, at both doors). Open as soon as the leaves part past
+// kDoorOpenGapM, shut again only after kDoorShutHoldMs at or under kDoorShutGapM, so the room behind is back from the first part of an opening and stays through a closing. Not read is
+// not known, and a door not known never blocks.
+constexpr float kDoorNearM = 5.0f;          // a first value: no flight has said how near a door opens
+constexpr float kDoorMatchM = 3.0f;         // a leaf belongs to the cut it lies within this of, along a2
+constexpr float kDoorShutGapM = 1.1f, kDoorOpenGapM = 1.3f;
+constexpr uint64_t kDoorShutHoldMs = 300;
+constexpr const char* kDoorLeafLeft = "Narrow_Door_Left";
+constexpr const char* kDoorLeafRight = "Narrow_Door_Right";
+enum class DoorState : uint8_t { kUnknown, kShut, kOpen };
+inline const char* doorStateName(DoorState s) noexcept { return s == DoorState::kShut ? "shut" : s == DoorState::kOpen ? "open" : "not known"; }
+class DoorWatch {
+public:
+    DoorState step(bool gapKnown, float gapM, uint64_t nowMs) noexcept {
+        if (!gapKnown || !std::isfinite(gapM)) {
+            state_ = DoorState::kUnknown;
+            shutSinceMs_ = 0;
+            return state_;
+        }
+        if (gapM > kDoorOpenGapM) {
+            state_ = DoorState::kOpen;
+            shutSinceMs_ = 0;
+        } else if (gapM <= kDoorShutGapM) {
+            if (shutSinceMs_ == 0) shutSinceMs_ = nowMs;
+            if (state_ != DoorState::kOpen || nowMs - shutSinceMs_ >= kDoorShutHoldMs) state_ = DoorState::kShut;
+        } else if (state_ == DoorState::kUnknown) {
+            state_ = DoorState::kOpen;   // between the two, first seen: parting or closing, so not shut
+            shutSinceMs_ = 0;
+        } else {
+            shutSinceMs_ = 0;
+        }
+        return state_;
+    }
+    DoorState state() const noexcept { return state_; }
+    void reset() noexcept {
+        state_ = DoorState::kUnknown;
+        shutSinceMs_ = 0;
+    }
+
+private:
+    DoorState state_ = DoorState::kUnknown;
+    uint64_t shutSinceMs_ = 0;
+};
+inline bool doorBlocks(DoorState s, float camAlong, float cut) noexcept {
+    return s == DoorState::kShut && std::isfinite(camAlong) && std::fabs(camAlong - cut) > kDoorNearM;
+}
+// Which cut a leaf at `along` belongs to, or -1.
+inline int doorCutOf(const RoomLayout& room, float along) noexcept {
+    if (!std::isfinite(along)) return -1;
+    for (uint32_t i = 0; i < room.slabCuts && i < 2; ++i)
+        if (std::fabs(along - room.slabCut[i]) <= kDoorMatchM) return static_cast<int>(i);
+    return -1;
+}
+// The door rule's levels (TEMPORARY, hotkey.concourse_room_test steps them for a flight to compare): records only, the default, where a record the rule culls still counts as kept in
+// its rig's tally, so the rule never vetoes a whole rig; rigs too, where it counts as culled; and off. Flight 44's ceiling counted it as culled, and the bridge's floor went: a rig is
+// vetoed when every record of it the store judged was culled, and the floor was in no list of culled records, so it is INFERRED to ride in such a rig.
+enum class DoorRuleMode : uint8_t { kRecords, kRigs, kOff };
+inline DoorRuleMode doorRuleNext(DoorRuleMode m) noexcept { return m == DoorRuleMode::kRecords ? DoorRuleMode::kRigs : m == DoorRuleMode::kRigs ? DoorRuleMode::kOff : DoorRuleMode::kRecords; }
+inline const char* doorRuleName(DoorRuleMode m) noexcept { return m == DoorRuleMode::kRecords ? "records" : m == DoorRuleMode::kRigs ? "records and rigs" : "off"; }
 
 // The live room from tick to tick. A tick with its record not read (the address lost and sighted again on the next pass) keeps "inside" for up to kLiveRoomHoldMs: Flight 42 had
 // the cull on for one tick 6 m inside the bridge, its record unread, and the bake on the bridge windows for that frame. A tick that reads it, inside or out, says at once.

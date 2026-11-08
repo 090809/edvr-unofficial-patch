@@ -3439,6 +3439,42 @@ int main(int argc, char** argv) {
             check(cc::roomSlabOf(cc::kRoomCarrier, 0.0f, &a) && cc::roomSlabOf(cc::kRoomCarrier, 10.0f, &b) && cc::sameRoomSlab(a, b) && cc::roomSlabOf(cc::kRoomCarrier, 20.0f, &b) &&
                       !cc::sameRoomSlab(a, b), "rooms: the slab changes only across a door");
         }
+        {
+            // The door rule: only a blocking door bounds what the camera can see into.
+            cc::RoomSlab s;
+            const bool both[2] = {true, true}, bayDoor[2] = {true, false}, bridgeDoor[2] = {false, true}, none[2] = {false, false};
+            check(cc::roomSeenSlab(cc::kRoomCarrier, -17.3f, both, &s) && s.lo <= -cc::kRoomSlabOpen && s.hi == -11.0f, "doors: from the elevator bay, its shut door bounds it");
+            check(cc::roomSeenSlab(cc::kRoomCarrier, -17.3f, bridgeDoor, &s) && s.lo <= -cc::kRoomSlabOpen && s.hi == 19.0f, "doors: its door open, the bridge's shut, the central space is seen");
+            check(cc::roomSeenSlab(cc::kRoomCarrier, 4.5f, both, &s) && s.lo == -11.0f && s.hi == 19.0f, "doors: the central space between two shut doors");
+            check(cc::roomSeenSlab(cc::kRoomCarrier, 4.5f, bayDoor, &s) && s.lo == -11.0f && s.hi >= cc::kRoomSlabOpen, "doors: the bridge's door open, the bridge is seen");
+            check(cc::roomSeenSlab(cc::kRoomCarrier, 21.5f, both, &s) && s.lo == 19.0f && s.hi >= cc::kRoomSlabOpen, "doors: from the bridge, its shut door bounds it");
+            check(cc::roomSeenSlab(cc::kRoomCarrier, 4.5f, none, &s) && cc::roomSlabWhole(s), "doors: no door shut, nothing is behind one");
+            check(!cc::roomSeenSlab(cc::kRoomStation, 4.5f, both, &s) && !cc::roomSeenSlab(cc::kRoomCarrier, std::nanf(""), both, &s), "doors: no doors known, or no place, says nothing");
+            // A door blocks only shut, and only with the camera past kDoorNearM from its plane.
+            check(cc::doorBlocks(cc::DoorState::kShut, -17.3f, -11.0f) && !cc::doorBlocks(cc::DoorState::kShut, -14.7f, -11.0f) && !cc::doorBlocks(cc::DoorState::kShut, 21.5f, 19.0f),
+                  "doors: a shut door blocks from 6 m, not from 3.7 or 2.5");
+            check(!cc::doorBlocks(cc::DoorState::kOpen, -17.3f, -11.0f) && !cc::doorBlocks(cc::DoorState::kUnknown, -17.3f, -11.0f), "doors: an open door, or one not known, never blocks");
+            check(cc::doorCutOf(cc::kRoomCarrier, -11.0f) == 0 && cc::doorCutOf(cc::kRoomCarrier, 19.1f) == 1 && cc::doorCutOf(cc::kRoomCarrier, 4.5f) == -1 && cc::doorCutOf(cc::kRoomStation, 0.0f) == -1,
+                  "doors: a leaf belongs to the door it lies at");
+            // The leaves: shut 0.8 to 1.0 m apart, open 4.4 (Flight 43).
+            cc::DoorWatch dw;
+            check(dw.step(false, 0.0f, 0) == cc::DoorState::kUnknown, "door watch: unseen is not known");
+            check(dw.step(true, 0.94f, 100) == cc::DoorState::kShut, "door watch: together is shut at once");
+            check(dw.step(true, 1.2f, 116) == cc::DoorState::kShut, "door watch: a little apart is still shut");
+            check(dw.step(true, 1.4f, 132) == cc::DoorState::kOpen, "door watch: parting past 1.3 m is open");
+            check(dw.step(true, 4.4f, 500) == cc::DoorState::kOpen && dw.step(true, 1.0f, 1000) == cc::DoorState::kOpen, "door watch: open, and closing stays open");
+            check(dw.step(true, 0.9f, 1000 + cc::kDoorShutHoldMs - 1) == cc::DoorState::kOpen && dw.step(true, 0.9f, 1000 + cc::kDoorShutHoldMs) == cc::DoorState::kShut,
+                  "door watch: shut again only after the hold");
+            check(dw.step(false, 0.0f, 2000) == cc::DoorState::kUnknown, "door watch: a leaf lost is not known again");
+            check(dw.step(true, 1.2f, 2016) == cc::DoorState::kOpen, "door watch: first seen half apart is not shut");
+            check(dw.step(true, std::nanf(""), 2032) == cc::DoorState::kUnknown, "door watch: an unreadable gap is not known");
+            dw.reset();
+            check(dw.state() == cc::DoorState::kUnknown, "door watch: reset forgets it");
+            check(cc::doorRuleNext(cc::DoorRuleMode::kRecords) == cc::DoorRuleMode::kRigs && cc::doorRuleNext(cc::DoorRuleMode::kRigs) == cc::DoorRuleMode::kOff &&
+                      cc::doorRuleNext(cc::DoorRuleMode::kOff) == cc::DoorRuleMode::kRecords, "doors: the key steps records, rigs, off");
+            check(std::strcmp(cc::kDoorLeafLeft, "Narrow_Door_Left") == 0 && cc::concourseAllowName(cc::kDoorLeafLeft, nullptr) && cc::concourseAllowName(cc::kDoorLeafRight, nullptr),
+                  "doors: the leaves' names are ones the store sees as allowed");
+        }
         for (const char* n : {"SA_Carrier_01", "SA_Carrier_01_Bar", "SA_Carrier_01_Bridge", "SA_Carrier_01_Bar_WindowShutters0", "SA_Carrier_DoorA0", "PS_FUI_STAT_BigScreen_Carrier_01",
                               "FUI_Panel_4x2_Carrier_010", "RandomDirt_NarrowRightA0", "Narrow_Door_Left_Tech", "Arm_Base0"})
             check(cc::concourseAllowName(n, nullptr), "concourse carrier: the room's own name is on the list");
