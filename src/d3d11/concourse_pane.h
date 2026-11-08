@@ -258,7 +258,12 @@ bool concoursePaneVrBakeBegin() noexcept;         // the rows are copied from th
 // Capture from the next frame: the cube's origin (render world), each face's right, up and forward (faces[f][0..8]), the faces wanted, the frames' near plane (for the log)
 // and the room's cut (nearer the origin is not written). The people's draws are left out from now (cc::bakePeopleVs), as in flat.
 void concoursePaneVrBakeCapture(const float origin[3], const float faces[5][9], uint32_t mask, float nearM, float cutM) noexcept;
-void concoursePaneVrBakeEnd(bool publish, const char* line) noexcept;   // publish: the cube becomes the windows' view, as flat's finish; `line` is the tick's finish text
+bool concoursePaneVrBakeEnd(bool publish, const char* line) noexcept;   // publish: the cube becomes the windows' view, as flat's finish; `line` is the tick's finish text; true when it published
+// TEMPORARY (H58-H61 instrument, Flight 53): which face and dwell a frame was aimed at, and whether it writes the cube. A frame with no entry, or not a write frame, only counts.
+void concoursePaneVrBakeAimFrame(uint32_t frame, int face, uint32_t dwell, bool write) noexcept;
+// TEMPORARY (H58-H61 instrument, Flight 53): each wanted direction of the cube just published, as a 512 square image of a 90 degree field (faces[d][0..8] = right, up, forward),
+// colour and distance, to <log folder>\concourse_bake\<stamp>_<kind>_dir<d>_colour.bmp and _dist.bmp, with a line each. kind: "vr" or "flat".
+void concoursePaneBakeDump(const char* kind, const float faces[5][9], uint32_t mask) noexcept;
 struct ConcourseVrBakeRows {
     uint32_t frame = 0;
     int eye = -1;
@@ -269,6 +274,10 @@ struct ConcourseVrBakeCount {
     bool dispatched[2] = {}, both[2] = {};   // both: the other eye's rows were this frame's (the union count is good)
     int face[2] = {-1, -1};
     uint32_t status[2] = {}, onFace[2] = {}, inView[2] = {}, written[2] = {}, eitherView[2] = {};
+    // TEMPORARY (H58-H61 instrument, Flight 53): over the texels on the face and in this eye's view.
+    uint32_t pastCut[2] = {}, nothingDrawn[2] = {};
+    uint32_t cutBy[2][4] = {};     // cut (not past the room's cut), by the eye's distance t: <5, 5-20, 20-50, >=50
+    uint32_t drawnBy[2][5] = {};   // drawn (z > 0), by t: <50, 50-200, 200-1000, 1000-4000, >=4000
 };
 uint32_t concoursePaneVrBakeTakeRows(ConcourseVrBakeRows* out, uint32_t cap) noexcept;
 uint32_t concoursePaneVrBakeTakeCounts(ConcourseVrBakeCount* out, uint32_t cap) noexcept;

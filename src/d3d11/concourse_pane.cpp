@@ -4,6 +4,7 @@
 #include <windows.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -3629,6 +3630,8 @@ constexpr uint32_t kVrSlots = 8;          // frames whose counts and rows are on
 constexpr UINT kVrRows = 10;              // b1 rows 270..279
 constexpr UINT kVrRowFirst = 270;
 constexpr uint32_t kVrOutCap = 32;
+constexpr uint32_t kVrCountWords = 32;                    // TEMPORARY (H58-H61 instrument, Flight 53): words an eye's counts take (the shader's comment lists them)
+constexpr uint32_t kVrCountBytes = 2u * kVrCountWords * 4u;
 std::atomic<bool> g_vrDiscover{false}, g_vrToneSeen{false}, g_vrRunning{false}, g_vrCapturing{false}, g_vrWantPrepare{false};
 bool g_vrArmedNow = false, g_vrReady = false;
 ConcourseVrToneSeen g_vrToneWhat;
@@ -3671,6 +3674,13 @@ uint32_t g_vrRowsOutN = 0;
 ConcourseVrBakeCount g_vrCountOut[kVrOutCap];
 uint32_t g_vrCountOutN = 0;
 bool g_vrSaidRefused = false;
+// TEMPORARY (H58-H61 instrument, Flight 53): the aim ring, keyed by frame. Packed: bit 63 valid, bits 32..62 the low 31 bits of the frame, 8 the write flag, 4..7 the dwell, 0..3 the face.
+constexpr uint32_t kVrAimRing = 16;
+std::atomic<uint64_t> g_vrAimRing[kVrAimRing];
+bool vrAimWrites(uint32_t frame) noexcept {
+    const uint64_t v = g_vrAimRing[frame % kVrAimRing].load(std::memory_order_acquire);
+    return (v >> 63) != 0 && static_cast<uint32_t>((v >> 32) & 0x7FFFFFFFu) == (frame & 0x7FFFFFFFu) && (v & 0x100u) != 0;
+}
 
 template <class T>
 void vrRelease(T*& p) noexcept {
@@ -3703,8 +3713,10 @@ void vrReleaseAll() noexcept {
 // first scene draw (t3 the other eye's), the clip matrix in column form is m[r * 4 + c] = row (270 + c) lane r, as the flat bake builds it, and its inverse is made per group
 // (concourse_vr_bake_core.h, the cofactors' one text). A frame is taken only when its eye's row 275 is within lim.x of the origin (a frame the bake aimed); the face is the
 // wanted one nearest where the frame looks (clip w's coefficients, as flat's forward), and a texel only on that face's own square, inside the eye's clip. Counts: per eye at
-// ctl.z * 32 bytes: on the face, in this eye's view, written, in either eye's view; at +16 the face + 1 and at +20 the frame's status (1 taken, 2 not at the centre, 3 no
-// face near where it looks, 4 the rows do not invert).
+// ctl.z * 128 bytes (32 words; TEMPORARY, H58-H61 instrument, Flight 53): word 0 on the face, 1 in this eye's view, 2 written (past the room's cut, on a write frame only: ctl.w),
+// 3 in either eye's view, 4 the face + 1, 5 the frame's status (1 taken, 2 not at the centre, 3 no face near where it looks, 4 the rows do not invert), 6 past the cut (what would
+// be written), 7 nothing drawn (z == 0), 8..11 cut by the eye's distance t (<5, 5-20, 20-50, >=50), 12..16 drawn (z > 0) by t (<50, 50-200, 200-1000, 1000-4000, >=4000); the words
+// 6..16 count the texels on the face and in this eye's view.
 bool vrMakeShader(ID3D11Device* device) noexcept {
     typedef HRESULT(WINAPI * PfnCompile)(LPCVOID, SIZE_T, LPCSTR, const void*, void*, LPCSTR, LPCSTR, UINT, UINT, ID3DBlob**, ID3DBlob**);
     static PfnCompile compile = nullptr;
@@ -3730,7 +3742,7 @@ bool vrMakeShader(ID3D11Device* device) noexcept {
         "groupshared float gInv[16];\n"
         "groupshared int gFace;\n"
         "groupshared uint gStatus;\n"
-        "groupshared uint gCount[4];\n"
+        "groupshared uint gCount[15];\n"
         "bool inClip(float3 d, float4 a, float4 b, float4 c, out float2 ndc) {\n"
         "    float4 h = d.x * a + d.y * b + d.z * c;\n"
         "    ndc = float2(2.0, 2.0);\n"
@@ -3743,7 +3755,7 @@ bool vrMakeShader(ID3D11Device* device) noexcept {
         "    float4 r0 = rowsA[0], r1 = rowsA[1], r2 = rowsA[2], r3 = rowsA[3];\n"
         "    float3 off = rowsA[5].xyz - origin.xyz;\n"
         "    if (gi == 0) {\n"
-        "        gCount[0] = 0u; gCount[1] = 0u; gCount[2] = 0u; gCount[3] = 0u;\n"
+        "        [unroll] for (int c0 = 0; c0 < 15; ++c0) gCount[c0] = 0u;\n"
         "        float3 fw = float3(r0.w, r1.w, r2.w);\n"
         "        float fl = length(fw);\n"
         "        int best = -1;\n"
@@ -3788,6 +3800,7 @@ bool vrMakeShader(ID3D11Device* device) noexcept {
         "                float2 uv = float2(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);\n"
         "                float z = sceneDepth.Load(int3(uv * size.xy, 0));\n"
         "                float t = size.w;\n"
+        "                if (z <= 0.0) InterlockedAdd(gCount[5], 1u, o);\n"
         "                if (z > 0.0) {\n"
         "                    float4 v = float4(ndc, z, 1.0);\n"
         "                    float4 b;\n"
@@ -3798,23 +3811,33 @@ bool vrMakeShader(ID3D11Device* device) noexcept {
         "                    if (abs(b.w) > 1e-20) { float l = length(b.xyz / b.w); if (l < t) t = l; }\n"
         "                }\n"
         "                float rl = length(off + d * t);\n"
+        "                if (z > 0.0) {\n"
+        "                    uint bd = t < 50.0 ? 0u : t < 200.0 ? 1u : t < 1000.0 ? 2u : t < 4000.0 ? 3u : 4u;\n"
+        "                    InterlockedAdd(gCount[10u + bd], 1u, o);\n"
+        "                }\n"
         "                if (rl > size.z) {\n"
-        "                    cube[id] = float4(clamp(scene.SampleLevel(smp, uv, 0.0).rgb, 0.0, 60000.0), 1.0);\n"
-        "                    distCube[id] = clamp(rl, 1.0, size.w);\n"
-        "                    InterlockedAdd(gCount[2], 1u, o);\n"
+        "                    InterlockedAdd(gCount[4], 1u, o);\n"
+        "                    if (ctl.w != 0u) {\n"
+        "                        cube[id] = float4(clamp(scene.SampleLevel(smp, uv, 0.0).rgb, 0.0, 60000.0), 1.0);\n"
+        "                        distCube[id] = clamp(rl, 1.0, size.w);\n"
+        "                        InterlockedAdd(gCount[2], 1u, o);\n"
+        "                    }\n"
+        "                } else {\n"
+        "                    uint cb = t < 5.0 ? 0u : t < 20.0 ? 1u : t < 50.0 ? 2u : 3u;\n"
+        "                    InterlockedAdd(gCount[6u + cb], 1u, o);\n"
         "                }\n"
         "            }\n"
         "        }\n"
         "    }\n"
         "    GroupMemoryBarrierWithGroupSync();\n"
         "    if (gi == 0) {\n"
-        "        uint base = ctl.z * 32u;\n"
+        "        uint base = ctl.z * 128u;\n"
         "        uint o2;\n"
         "        if (gStatus == 1u) {\n"
-        "            if (gCount[0] != 0u) counts.InterlockedAdd(base + 0u, gCount[0], o2);\n"
-        "            if (gCount[1] != 0u) counts.InterlockedAdd(base + 4u, gCount[1], o2);\n"
-        "            if (gCount[2] != 0u) counts.InterlockedAdd(base + 8u, gCount[2], o2);\n"
-        "            if (gCount[3] != 0u) counts.InterlockedAdd(base + 12u, gCount[3], o2);\n"
+        "            [unroll] for (uint ci = 0u; ci < 15u; ++ci) {\n"
+        "                uint wi = ci < 4u ? ci : ci + 2u;\n"
+        "                if (gCount[ci] != 0u) counts.InterlockedAdd(base + wi * 4u, gCount[ci], o2);\n"
+        "            }\n"
         "        }\n"
         "        if (gid.x == 0u && gid.y == 0u && gid.z == 0u) {\n"
         "            counts.Store(base + 16u, (uint)(gFace + 1));\n"
@@ -3888,7 +3911,7 @@ bool vrMake(ID3D11Device* device) noexcept {
     for (uint32_t s = 0; s < kVrSlots && good; ++s) {
         if (!g_vrCount[s]) {
             D3D11_BUFFER_DESC bd{};
-            bd.ByteWidth = 64;
+            bd.ByteWidth = kVrCountBytes;
             bd.Usage = D3D11_USAGE_DEFAULT;
             bd.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
             bd.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS;
@@ -3899,13 +3922,13 @@ bool vrMake(ID3D11Device* device) noexcept {
             ud.Format = DXGI_FORMAT_R32_TYPELESS;
             ud.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
             ud.Buffer.FirstElement = 0;
-            ud.Buffer.NumElements = 16;
+            ud.Buffer.NumElements = kVrCountBytes / 4u;
             ud.Buffer.Flags = D3D11_BUFFER_UAV_FLAG_RAW;
             good = SUCCEEDED(device->CreateUnorderedAccessView(g_vrCount[s], &ud, &g_vrCountUav[s])) && g_vrCountUav[s];
         }
         if (good && !g_vrCountStage[s]) {
             D3D11_BUFFER_DESC bd{};
-            bd.ByteWidth = 64;
+            bd.ByteWidth = kVrCountBytes;
             bd.Usage = D3D11_USAGE_STAGING;
             bd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
             good = SUCCEEDED(device->CreateBuffer(&bd, nullptr, &g_vrCountStage[s])) && g_vrCountStage[s];
@@ -3981,7 +4004,7 @@ void vrBakeTick(ID3D11Device* device, uint32_t frame) noexcept {
         const HRESULT hr = imm->Map(g_vrCountStage[s], 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &mp);
         if (hr == DXGI_ERROR_WAS_STILL_DRAWING) continue;
         if (SUCCEEDED(hr) && mp.pData) {
-            uint32_t u[16];
+            uint32_t u[2 * kVrCountWords];
             std::memcpy(u, mp.pData, sizeof(u));
             imm->Unmap(g_vrCountStage[s], 0);
             if (g_vrCountOutN < kVrOutCap) {
@@ -3991,12 +4014,17 @@ void vrBakeTick(ID3D11Device* device, uint32_t frame) noexcept {
                 for (int e = 0; e < 2; ++e) {
                     c.dispatched[e] = sl.dispatched[e];
                     c.both[e] = sl.both[e];
-                    c.onFace[e] = u[e * 8 + 0];
-                    c.inView[e] = u[e * 8 + 1];
-                    c.written[e] = u[e * 8 + 2];
-                    c.eitherView[e] = u[e * 8 + 3];
-                    c.face[e] = static_cast<int>(u[e * 8 + 4]) - 1;
-                    c.status[e] = u[e * 8 + 5];
+                    const uint32_t* w = u + e * kVrCountWords;
+                    c.onFace[e] = w[0];
+                    c.inView[e] = w[1];
+                    c.written[e] = w[2];
+                    c.eitherView[e] = w[3];
+                    c.face[e] = static_cast<int>(w[4]) - 1;
+                    c.status[e] = w[5];
+                    c.pastCut[e] = w[6];
+                    c.nothingDrawn[e] = w[7];
+                    for (int k = 0; k < 4; ++k) c.cutBy[e][k] = w[8 + k];
+                    for (int k = 0; k < 5; ++k) c.drawnBy[e][k] = w[12 + k];
                 }
             } else {
                 g_vrLost.fetch_add(1, std::memory_order_relaxed);
@@ -4144,6 +4172,7 @@ void concoursePaneVrBakeToneDraw(ID3D11DeviceContext* ctx, char kind, uint32_t c
     g_vrK.size[1] = static_cast<float>(ta.hdrH);
     g_vrK.ctl[1] = other ? 1u : 0u;
     g_vrK.ctl[2] = static_cast<uint32_t>(eye);
+    g_vrK.ctl[3] = vrAimWrites(frame) ? 1u : 0u;   // TEMPORARY (H58-H61 instrument, Flight 53): only a write frame writes the cube; the rest count
     ID3D11ComputeShader* oldCs = nullptr;
     ID3D11ShaderResourceView* oldSrv[4] = {};
     ID3D11UnorderedAccessView* oldUav[3] = {};
@@ -4217,6 +4246,7 @@ bool concoursePaneVrBakeBegin() noexcept {
     g_vrSnapNoCb.store(0, std::memory_order_relaxed);
     g_vrLost.store(0, std::memory_order_relaxed);
     g_vrRowsOutN = g_vrCountOutN = 0;
+    for (auto& a : g_vrAimRing) a.store(0, std::memory_order_relaxed);
     for (uint32_t& o : g_vrLastOrder) o = 0;
     g_vrSaidRefused = false;
     g_vrCapturing.store(false, std::memory_order_release);
@@ -4242,7 +4272,7 @@ void concoursePaneVrBakeCapture(const float origin[3], const float faces[5][9], 
     g_vrK.lim[2] = cv::kFaceMinDot;
     g_vrK.lim[3] = 0.0f;
     g_vrK.ctl[0] = mask;
-    g_vrK.ctl[3] = 0;
+    g_vrK.ctl[3] = 0;   // set per dispatch from the aim ring
     g_bakePeopleLeft.store(0, std::memory_order_relaxed);
     g_bakePeopleOff.store(true, std::memory_order_release);
     detail::g_concoursePaneArmed.store(true, std::memory_order_release);   // the next draw, not the next tick: updateArmed keeps it while the people's flag holds
@@ -4264,12 +4294,18 @@ void concoursePaneVrBakeCapture(const float origin[3], const float faces[5][9], 
                     static_cast<double>(cv::kAtCentreM), std::acos(static_cast<double>(cv::kFaceMinDot)) * 57.29578);
 }
 
-void concoursePaneVrBakeEnd(bool publish, const char* line) noexcept {
+void concoursePaneVrBakeAimFrame(uint32_t frame, int face, uint32_t dwell, bool write) noexcept {
+    const uint64_t v = (1ull << 63) | (static_cast<uint64_t>(frame & 0x7FFFFFFFu) << 32) | (write ? 0x100ull : 0ull) | (static_cast<uint64_t>(dwell & 0xFu) << 4) |
+                       static_cast<uint64_t>(face & 0xF);
+    g_vrAimRing[frame % kVrAimRing].store(v, std::memory_order_release);
+}
+
+bool concoursePaneVrBakeEnd(bool publish, const char* line) noexcept {
     const bool wasCapturing = g_vrCapturing.exchange(false, std::memory_order_acq_rel);
     const bool peopleWere = wasCapturing && g_bakePeopleOff.exchange(false, std::memory_order_acq_rel);
     const bool wasRunning = g_vrRunning.exchange(false, std::memory_order_acq_rel);
     vrSetHooks();
-    if (!wasRunning) return;
+    if (!wasRunning) return false;
     bool published = false;
     if (publish && wasCapturing) {
         ID3D11DeviceContext* imm = nullptr;
@@ -4288,6 +4324,7 @@ void concoursePaneVrBakeEnd(bool publish, const char* line) noexcept {
     Log::get().note("concourse bake: %s; %s; the people's draws left out over its frames: %llu%s", line ? line : "vr: ended",
                     published ? "the windows show it now" : publish ? "NOT PUBLISHED (no immediate context, or it never captured)" : "nothing is published",
                     static_cast<unsigned long long>(g_bakePeopleLeft.load(std::memory_order_relaxed)), peopleWere || !wasCapturing ? "" : " (the people were not being left out)");
+    return published;
 }
 
 uint32_t concoursePaneVrBakeTakeRows(ConcourseVrBakeRows* out, uint32_t cap) noexcept {
@@ -4302,6 +4339,268 @@ uint32_t concoursePaneVrBakeTakeCounts(ConcourseVrBakeCount* out, uint32_t cap) 
     g_vrCountOutN = 0;
     return n;
 }
+// ---- TEMPORARY (H58-H61 instrument, Flight 53): the cube dump ------------------------------------------------------------------------------------------------------------
+// Each wanted direction of the published cube pair (the front textures, which the panes sample: backdropPublishFront has just copied the back's mip 0 into them) as a 512 square
+// image of a 90 degree field, dir = normalize(f + x * r + y * u) with x and y from -1 to 1 and the top row +u, point-sampled at mip 0 by a small compute shader into a 512 x 512 x 5
+// array (colour as float4, distance as float), one staging read-back, then BMPs. Colour: x / (1 + x) per channel, then 1 / 2.2; distance: log scale, 1 m black to the far value
+// white; a far texel (>= 0.99 x far, nothing drawn) pure blue; an unwritten texel (colour alpha < 0.5) pure magenta in both.
+namespace {
+constexpr uint32_t kDumpSize = 512;
+struct DumpConstants {
+    float fr[5][4], fu[5][4], ff[5][4];
+    float p[4];
+};
+template <class T>
+struct DumpRel {
+    T* p = nullptr;
+    ~DumpRel() {
+        if (p) p->Release();
+    }
+};
+bool dumpWriteBmp(const std::wstring& path, const std::vector<uint8_t>& bgrBottomUp) noexcept {
+    const uint32_t bytes = static_cast<uint32_t>(bgrBottomUp.size());
+    BITMAPFILEHEADER fh{};
+    BITMAPINFOHEADER ih{};
+    fh.bfType = 0x4D42;
+    fh.bfOffBits = sizeof(fh) + sizeof(ih);
+    fh.bfSize = fh.bfOffBits + bytes;
+    ih.biSize = sizeof(ih);
+    ih.biWidth = static_cast<LONG>(kDumpSize);
+    ih.biHeight = static_cast<LONG>(kDumpSize);
+    ih.biPlanes = 1;
+    ih.biBitCount = 24;
+    ih.biCompression = BI_RGB;
+    ih.biSizeImage = bytes;
+    HANDLE f = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return false;
+    DWORD wrote = 0;
+    bool ok = WriteFile(f, &fh, sizeof(fh), &wrote, nullptr) != 0;
+    if (ok) ok = WriteFile(f, &ih, sizeof(ih), &wrote, nullptr) != 0;
+    if (ok) ok = WriteFile(f, bgrBottomUp.data(), bytes, &wrote, nullptr) != 0;
+    CloseHandle(f);
+    return ok;
+}
+uint8_t dumpTone(float x) noexcept {
+    x = x > 0.0f ? x : 0.0f;
+    const float m = std::pow(x / (1.0f + x), 1.0f / 2.2f);
+    const float b = m * 255.0f + 0.5f;
+    return static_cast<uint8_t>(b < 0.0f ? 0.0f : b > 255.0f ? 255.0f : b);
+}
+}  // namespace
+
+void concoursePaneBakeDump(const char* kind, const float faces[5][9], uint32_t mask) noexcept {
+    LARGE_INTEGER q0{}, qf{}, q1{};
+    QueryPerformanceCounter(&q0);
+    QueryPerformanceFrequency(&qf);
+    ID3D11Device* device = g_bakeDevice;
+    ID3D11ShaderResourceView* csrv = g_bdFrontSrv.load(std::memory_order_acquire);
+    ID3D11ShaderResourceView* dsrv = g_bdDistFrontSrv.load(std::memory_order_acquire);
+    DumpRel<ID3D11DeviceContext> imm;
+    if (device) device->GetImmediateContext(&imm.p);
+    if (!imm.p || !csrv || !dsrv || !g_bdCubeValid.load(std::memory_order_acquire)) {
+        Log::get().note("concourse bake: dump: nothing dumped: the cube pair or the device is not there");
+        return;
+    }
+    typedef HRESULT(WINAPI * PfnCompile)(LPCVOID, SIZE_T, LPCSTR, const void*, void*, LPCSTR, LPCSTR, UINT, UINT, ID3DBlob**, ID3DBlob**);
+    static PfnCompile compile = nullptr;
+    if (!compile) {
+        HMODULE mod = LoadLibraryW(L"d3dcompiler_47.dll");   // never freed: a blob's vtable lives in it
+        if (mod) compile = reinterpret_cast<PfnCompile>(GetProcAddress(mod, "D3DCompile"));
+    }
+    if (!compile) {
+        Log::get().note("concourse bake: dump: nothing dumped: d3dcompiler_47.dll was not found");
+        return;
+    }
+    const char* hlsl =
+        "cbuffer C : register(b0) { float4 fr[5]; float4 fu[5]; float4 ff[5]; float4 p; };\n"
+        "TextureCube<float4> colT : register(t0);\n"
+        "TextureCube<float> distT : register(t1);\n"
+        "SamplerState pt : register(s0);\n"
+        "RWTexture2DArray<float4> outC : register(u0);\n"
+        "RWTexture2DArray<float> outD : register(u1);\n"
+        "[numthreads(16, 16, 1)]\n"
+        "void main(uint3 id : SV_DispatchThreadID) {\n"
+        "    float x = (float(id.x) + 0.5) / 512.0 * 2.0 - 1.0;\n"
+        "    float y = 1.0 - (float(id.y) + 0.5) / 512.0 * 2.0;\n"
+        "    float3 d = normalize(ff[id.z].xyz + x * fr[id.z].xyz + y * fu[id.z].xyz);\n"
+        "    outC[id] = colT.SampleLevel(pt, d, 0.0);\n"
+        "    outD[id] = distT.SampleLevel(pt, d, 0.0);\n"
+        "}\n";
+    DumpRel<ID3DBlob> code, errors;
+    const HRESULT hr = compile(hlsl, std::strlen(hlsl), "concourse_bake_dump", nullptr, nullptr, "main", "cs_5_0", 0, 0, &code.p, &errors.p);
+    if (FAILED(hr) || !code.p) {
+        Log::get().note("concourse bake: dump: nothing dumped: the shader did not compile: %.300s", errors.p ? static_cast<const char*>(errors.p->GetBufferPointer()) : "no message");
+        return;
+    }
+    DumpRel<ID3D11ComputeShader> cs;
+    if (FAILED(device->CreateComputeShader(code.p->GetBufferPointer(), code.p->GetBufferSize(), nullptr, &cs.p)) || !cs.p) {
+        Log::get().note("concourse bake: dump: nothing dumped: the shader did not create");
+        return;
+    }
+    DumpRel<ID3D11Texture2D> texC, texD, stC, stD;
+    DumpRel<ID3D11UnorderedAccessView> uavC, uavD;
+    DumpRel<ID3D11Buffer> cb;
+    DumpRel<ID3D11SamplerState> smp;
+    bool good = true;
+    for (int k = 0; k < 4 && good; ++k) {
+        D3D11_TEXTURE2D_DESC td{};
+        td.Width = td.Height = kDumpSize;
+        td.MipLevels = 1;
+        td.ArraySize = 5;
+        td.SampleDesc.Count = 1;
+        td.Format = (k & 1) == 0 ? DXGI_FORMAT_R32G32B32A32_FLOAT : DXGI_FORMAT_R32_FLOAT;
+        if (k < 2) {
+            td.Usage = D3D11_USAGE_DEFAULT;
+            td.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
+        } else {
+            td.Usage = D3D11_USAGE_STAGING;
+            td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        }
+        ID3D11Texture2D** out = k == 0 ? &texC.p : k == 1 ? &texD.p : k == 2 ? &stC.p : &stD.p;
+        good = SUCCEEDED(device->CreateTexture2D(&td, nullptr, out)) && *out;
+    }
+    for (int k = 0; k < 2 && good; ++k) {
+        D3D11_UNORDERED_ACCESS_VIEW_DESC ud{};
+        ud.Format = k == 0 ? DXGI_FORMAT_R32G32B32A32_FLOAT : DXGI_FORMAT_R32_FLOAT;
+        ud.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2DARRAY;
+        ud.Texture2DArray.ArraySize = 5;
+        ID3D11UnorderedAccessView** out = k == 0 ? &uavC.p : &uavD.p;
+        good = SUCCEEDED(device->CreateUnorderedAccessView(k == 0 ? texC.p : texD.p, &ud, out)) && *out;
+    }
+    DumpConstants k{};
+    for (int d = 0; d < 5; ++d)
+        for (int c = 0; c < 3; ++c) {
+            k.fr[d][c] = faces[d][c];
+            k.fu[d][c] = faces[d][3 + c];
+            k.ff[d][c] = faces[d][6 + c];
+        }
+    if (good) {
+        D3D11_BUFFER_DESC bd{};
+        bd.ByteWidth = sizeof(DumpConstants);
+        bd.Usage = D3D11_USAGE_DEFAULT;
+        bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+        D3D11_SUBRESOURCE_DATA init{};
+        init.pSysMem = &k;
+        D3D11_SAMPLER_DESC sd{};
+        sd.Filter = D3D11_FILTER_MIN_MAG_MIP_POINT;
+        sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+        sd.ComparisonFunc = D3D11_COMPARISON_NEVER;
+        sd.MaxLOD = D3D11_FLOAT32_MAX;
+        good = SUCCEEDED(device->CreateBuffer(&bd, &init, &cb.p)) && cb.p && SUCCEEDED(device->CreateSamplerState(&sd, &smp.p)) && smp.p;
+    }
+    if (!good) {
+        Log::get().note("concourse bake: dump: nothing dumped: its textures, views, constants or sampler could not be made");
+        return;
+    }
+    {
+        FlatComputeInternalScope internal;
+        ID3D11ComputeShader* oldCs = nullptr;
+        ID3D11ShaderResourceView* oldSrv[2] = {};
+        ID3D11UnorderedAccessView* oldUav[2] = {};
+        ID3D11Buffer* oldCb = nullptr;
+        ID3D11SamplerState* oldSmp = nullptr;
+        imm.p->CSGetShader(&oldCs, nullptr, nullptr);
+        imm.p->CSGetShaderResources(0, 2, oldSrv);
+        imm.p->CSGetUnorderedAccessViews(0, 2, oldUav);
+        imm.p->CSGetConstantBuffers(0, 1, &oldCb);
+        imm.p->CSGetSamplers(0, 1, &oldSmp);
+        ID3D11ShaderResourceView* srv[2] = {csrv, dsrv};
+        ID3D11UnorderedAccessView* uav[2] = {uavC.p, uavD.p};
+        imm.p->CSSetShader(cs.p, nullptr, 0);
+        imm.p->CSSetConstantBuffers(0, 1, &cb.p);
+        imm.p->CSSetSamplers(0, 1, &smp.p);
+        imm.p->CSSetShaderResources(0, 2, srv);
+        imm.p->CSSetUnorderedAccessViews(0, 2, uav, nullptr);
+        imm.p->Dispatch(kDumpSize / 16u, kDumpSize / 16u, 5);
+        ID3D11UnorderedAccessView* noUav[2] = {};
+        ID3D11ShaderResourceView* noSrv[2] = {};
+        imm.p->CSSetUnorderedAccessViews(0, 2, noUav, nullptr);
+        imm.p->CSSetShaderResources(0, 2, noSrv);
+        imm.p->CSSetShader(oldCs, nullptr, 0);
+        imm.p->CSSetConstantBuffers(0, 1, &oldCb);
+        imm.p->CSSetSamplers(0, 1, &oldSmp);
+        imm.p->CSSetShaderResources(0, 2, oldSrv);
+        imm.p->CSSetUnorderedAccessViews(0, 2, oldUav, nullptr);
+        if (oldCs) oldCs->Release();
+        if (oldCb) oldCb->Release();
+        if (oldSmp) oldSmp->Release();
+        for (auto* q : oldSrv) if (q) q->Release();
+        for (auto* q : oldUav) if (q) q->Release();
+        imm.p->CopyResource(stC.p, texC.p);
+        imm.p->CopyResource(stD.p, texD.p);
+    }
+    const std::wstring dir = Log::get().dir() + L"\\concourse_bake";
+    CreateDirectoryW(dir.c_str(), nullptr);
+    SYSTEMTIME stm{};
+    GetLocalTime(&stm);
+    const float farM = cc::kBackdropFarM;
+    const float logFar = std::log(farM);
+    uint32_t done = 0;
+    std::vector<uint8_t> imgC(static_cast<size_t>(kDumpSize) * kDumpSize * 3u), imgD(imgC.size());
+    std::vector<float> written;
+    written.reserve(static_cast<size_t>(kDumpSize) * kDumpSize);
+    for (uint32_t d = 0; d < 5; ++d) {
+        if ((mask & (1u << d)) == 0) continue;
+        D3D11_MAPPED_SUBRESOURCE mc{}, md{};
+        if (FAILED(imm.p->Map(stC.p, D3D11CalcSubresource(0, d, 1), D3D11_MAP_READ, 0, &mc))) continue;
+        if (FAILED(imm.p->Map(stD.p, D3D11CalcSubresource(0, d, 1), D3D11_MAP_READ, 0, &md))) {
+            imm.p->Unmap(stC.p, D3D11CalcSubresource(0, d, 1));
+            continue;
+        }
+        written.clear();
+        uint32_t unwritten = 0, farN = 0;
+        for (uint32_t j = 0; j < kDumpSize; ++j) {
+            const float* rc = reinterpret_cast<const float*>(static_cast<const uint8_t*>(mc.pData) + static_cast<size_t>(j) * mc.RowPitch);
+            const float* rd = reinterpret_cast<const float*>(static_cast<const uint8_t*>(md.pData) + static_cast<size_t>(j) * md.RowPitch);
+            const size_t row = static_cast<size_t>(kDumpSize - 1u - j) * kDumpSize * 3u;   // BMP rows run bottom-up
+            for (uint32_t i = 0; i < kDumpSize; ++i) {
+                const float* c = rc + i * 4u;
+                const float dist = rd[i];
+                uint8_t* oc = imgC.data() + row + static_cast<size_t>(i) * 3u;
+                uint8_t* od = imgD.data() + row + static_cast<size_t>(i) * 3u;
+                if (!(c[3] >= 0.5f)) {
+                    ++unwritten;
+                    oc[0] = od[0] = 255;
+                    oc[1] = od[1] = 0;
+                    oc[2] = od[2] = 255;   // B G R: magenta
+                    continue;
+                }
+                written.push_back(dist);
+                if (dist >= 0.99f * farM) {
+                    ++farN;
+                    oc[0] = od[0] = 255;
+                    oc[1] = od[1] = 0;
+                    oc[2] = od[2] = 0;   // blue
+                    continue;
+                }
+                oc[0] = dumpTone(c[2]);
+                oc[1] = dumpTone(c[1]);
+                oc[2] = dumpTone(c[0]);
+                const float g = std::log(dist > 1.0f ? dist : 1.0f) / logFar;
+                od[0] = od[1] = od[2] = static_cast<uint8_t>((g < 0.0f ? 0.0f : g > 1.0f ? 1.0f : g) * 255.0f + 0.5f);
+            }
+        }
+        imm.p->Unmap(stD.p, D3D11CalcSubresource(0, d, 1));
+        imm.p->Unmap(stC.p, D3D11CalcSubresource(0, d, 1));
+        float median = 0.0f;
+        if (!written.empty()) {
+            std::nth_element(written.begin(), written.begin() + written.size() / 2, written.end());
+            median = written[written.size() / 2];
+        }
+        wchar_t nameC[96], nameD[96];
+        _snwprintf_s(nameC, 96, _TRUNCATE, L"%04u%02u%02u_%02u%02u%02u_%hs_dir%u_colour.bmp", stm.wYear, stm.wMonth, stm.wDay, stm.wHour, stm.wMinute, stm.wSecond, kind ? kind : "x", d);
+        _snwprintf_s(nameD, 96, _TRUNCATE, L"%04u%02u%02u_%02u%02u%02u_%hs_dir%u_dist.bmp", stm.wYear, stm.wMonth, stm.wDay, stm.wHour, stm.wMinute, stm.wSecond, kind ? kind : "x", d);
+        const bool okC = dumpWriteBmp(dir + L"\\" + nameC, imgC), okD = dumpWriteBmp(dir + L"\\" + nameD, imgD);
+        const double total = static_cast<double>(kDumpSize) * kDumpSize;
+        Log::get().note("concourse bake: dump: dir %u: %ls: unwritten %.1f%%, far %.1f%%, written median distance %.0f m%s", d, nameC, static_cast<double>(unwritten) * 100.0 / total,
+                        static_cast<double>(farN) * 100.0 / total, static_cast<double>(median), okC && okD ? "" : " (A FILE WAS NOT WRITTEN)");
+        ++done;
+    }
+    QueryPerformanceCounter(&q1);
+    Log::get().note("concourse bake: dump: %u direction(s) of %s to %ls in %.0f ms", done, kind ? kind : "?", dir.c_str(),
+                    static_cast<double>(q1.QuadPart - q0.QuadPart) * 1000.0 / static_cast<double>(qf.QuadPart ? qf.QuadPart : 1));
+}
+
 ConcourseVrBakeStats concoursePaneVrBakeStats() noexcept {
     ConcourseVrBakeStats s;
     s.toneDraws = g_vrToneDraws.load(std::memory_order_relaxed);

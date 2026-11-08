@@ -34,6 +34,7 @@ constexpr float kFaceMinDot = 0.82f;            // a frame looking more than abo
 constexpr float kWorldOffsetM = 0.5f;           // the world check: render less store past this is taken as an offset
 constexpr float kCoveredFrac = 0.99f;           // a face whose frames covered this share of its texels is done
 constexpr uint32_t kAimsPerFace = 3;            // the first aim and two more, then a face that is still short is let go
+constexpr uint32_t kVrBakeDwell = 3;            // TEMPORARY (H58-H61 instrument, Flight 53): frames held on a new aim; only the last one writes
 constexpr uint32_t kReadbackTicks = 7;          // an aim's frame, its capture and the read-back of its counts take about this many ticks
 constexpr float kPitchMaxRad = 0.35f;           // about 20 degrees: a frustum that needs more is not centred, it is logged
 
@@ -238,24 +239,38 @@ public:
         want_ = want & ((1u << kFaces) - 1u);
         covered_ = 0;
         last_ = kFaces - 1;
+        dwell_ = kVrBakeDwell;
         for (uint32_t f = 0; f < kFaces; ++f) {
             aims_[f] = 0;
             lastAim_[f] = 0;
             best_[f] = 0.0f;
         }
     }
-    // The face this tick aims at, and whether it is a new aim (false: the last face stays).
-    uint32_t next(uint32_t tick, bool* fresh) noexcept {
+    // The face this tick aims at, and whether it is a new aim (false: the face is held, or the last face stays). TEMPORARY (H58-H61 instrument, Flight 53): a new aim holds
+    // its face for kVrBakeDwell ticks; *dwell is the index of this tick in the hold (0..kVrBakeDwell-1), or kVrBakeDwell for a tick that only stays on the last face.
+    // aims_ counts whole holds, and lastAim_ is the tick of the hold's last frame.
+    uint32_t next(uint32_t tick, bool* fresh, uint32_t* dwell = nullptr) noexcept {
+        if (dwell_ + 1 < kVrBakeDwell) {
+            ++dwell_;
+            lastAim_[last_] = tick;
+            if (fresh) *fresh = false;
+            if (dwell) *dwell = dwell_;
+            return last_;
+        }
         for (uint32_t k = 1; k <= kFaces; ++k) {
             const uint32_t f = (last_ + k) % kFaces;
             if (!eligible(f, tick)) continue;
             last_ = f;
             ++aims_[f];
             lastAim_[f] = tick;
+            dwell_ = 0;
             if (fresh) *fresh = true;
+            if (dwell) *dwell = 0;
             return f;
         }
+        dwell_ = kVrBakeDwell;
         if (fresh) *fresh = false;
+        if (dwell) *dwell = kVrBakeDwell;
         return last_;
     }
     void noteCoverage(uint32_t f, float frac) noexcept {
@@ -282,7 +297,7 @@ private:
         if (aims_[f] >= kAimsPerFace) return false;
         return aims_[f] == 0 || tick - lastAim_[f] >= kReadbackTicks;
     }
-    uint32_t want_ = 0, covered_ = 0, last_ = kFaces - 1;
+    uint32_t want_ = 0, covered_ = 0, last_ = kFaces - 1, dwell_ = kVrBakeDwell;
     uint32_t aims_[kFaces] = {}, lastAim_[kFaces] = {};
     float best_[kFaces] = {};
 };

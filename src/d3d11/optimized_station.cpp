@@ -3377,10 +3377,10 @@ bool g_concKindSeen = false;
 namespace cvb = concourse_vr;
 enum class VrBakePhase : uint8_t { kIdle, kMeasure, kAim };
 constexpr uint32_t kVrMeasureMaxTicks = 10;   // no rows back by then: the world check is not made
-constexpr uint32_t kVrBakeTicksMax = 48;      // the measure, three rounds of aims and their read-backs, with room to spare
+constexpr uint32_t kVrBakeTicksMax = 96;      // the measure, three rounds of aims (each held kVrBakeDwell ticks: TEMPORARY, H58-H61 instrument, Flight 53) and their read-backs, with room to spare
 constexpr uint32_t kVrHoldLag = 3;            // frames withheld after each aim's tick: the frames still in flight after the last
 constexpr uint32_t kVrHoldFollowTicks = 8;    // the hold's line, this many ticks after the end
-constexpr uint32_t kVrLogLines = 48;          // per bake: the stub, rows, capture and aim lines together
+constexpr uint32_t kVrLogLines = 640;         // per bake: the stub, rows, capture and aim lines together (TEMPORARY, H58-H61 instrument, Flight 53: every capture line of every aim frame)
 constexpr uint32_t kVrRing = 16;
 struct VrBakeState {
     VrBakePhase phase = VrBakePhase::kIdle;
@@ -3401,7 +3401,8 @@ struct VrBakeState {
     uint32_t baseFrame[kVrRing] = {};
     float base[kVrRing][16] = {};
     bool baseValid[kVrRing] = {};
-    uint32_t aimFrame[kVrRing] = {}, aimFace[kVrRing] = {};
+    uint32_t aimFrame[kVrRing] = {}, aimFace[kVrRing] = {}, aimDwell[kVrRing] = {};   // aimDwell: TEMPORARY (H58-H61 instrument, Flight 53)
+    bool aimWrite[kVrRing] = {};                                                    // the frame writes the cube (the hold's last frame); the rest only count
     float aimPred[kVrRing][2][3] = {};
     bool aimValid[kVrRing] = {};
     ConcourseVrBakeRows rows[kVrRing][2];
@@ -3463,7 +3464,17 @@ void vrBakeEnd(bool publish, const char* why, uint64_t now, uint32_t frame) {
                   static_cast<unsigned long long>(g_vr.status[4]), static_cast<unsigned long long>(g_vr.written[0]), static_cast<unsigned long long>(g_vr.written[1]), st.firstOrder[0],
                   st.firstOrder[1], st.firstOrder[2], st.firstOrder[3], g_vr.aimTicks, g_vr.headMissing,
                   !aimed ? "; it never aimed" : any ? "" : "; NOTHING CAPTURED, the cube is as it was");
-    concoursePaneVrBakeEnd(publish && aimed && any, line);
+    const bool published = concoursePaneVrBakeEnd(publish && aimed && any, line);
+    if (published) {   // TEMPORARY (H58-H61 instrument, Flight 53): the cube just published, one image a wanted direction
+        float f9[cvb::kFaces][9] = {};
+        for (uint32_t d = 0; d < cvb::kFaces; ++d)
+            for (int k = 0; k < 3; ++k) {
+                f9[d][k] = g_vr.faces[d].r[k];
+                f9[d][3 + k] = g_vr.faces[d].u[k];
+                f9[d][6 + k] = g_vr.faces[d].f[k];
+            }
+        concoursePaneBakeDump("vr", f9, g_vr.plan.want() & g_vr.faceMask);
+    }
     if (g_vr.aimTicks > 0) {
         g_vr.holdFollow = true;
         g_vr.holdFollowFrame = frame + kVrHoldFollowTicks;
@@ -4801,16 +4812,29 @@ void vrBakeEveryTick(uint32_t frame, bool social) {
             const uint32_t st = c.status[e] < 5 ? c.status[e] : 0;
             ++g_vr.status[st];
             float frac = 0.0f;
+            // TEMPORARY (H58-H61 instrument, Flight 53): the frame's aim entry says whether it was a write frame; a frame with none only counts.
+            const uint32_t ai = c.frame % kVrRing;
+            const bool haveAim = g_vr.aimValid[ai] && g_vr.aimFrame[ai] == c.frame;
+            const bool writeFrame = haveAim && g_vr.aimWrite[ai];
             if (st == 1 && c.face[e] >= 0 && c.face[e] < static_cast<int>(cvb::kFaces) && c.onFace[e] > 0) {
                 frac = static_cast<float>(c.both[e] ? c.eitherView[e] : c.inView[e]) / static_cast<float>(c.onFace[e]);
-                g_vr.plan.noteCoverage(static_cast<uint32_t>(c.face[e]), frac);
+                if (writeFrame) g_vr.plan.noteCoverage(static_cast<uint32_t>(c.face[e]), frac);
                 g_vr.written[e] += c.written[e];
                 ++g_vr.taken;
             }
-            if (vrLogTake())
-                Log::get().note("concourse bake: vr capture: frame %u eye %d: %s; face %d: %u texels on it, %u in this eye's view, %u written, %u in either eye's view (%.1f%% covered%s)",
-                                c.frame, e, vrStatusName(st), c.face[e], c.onFace[e], c.inView[e], c.written[e], c.eitherView[e], static_cast<double>(frac) * 100.0,
+            if (vrLogTake()) {
+                char dwellText[40];
+                if (haveAim && g_vr.aimDwell[ai] < cvb::kVrBakeDwell)
+                    std::snprintf(dwellText, sizeof(dwellText), "dwell %u of %u", g_vr.aimDwell[ai], cvb::kVrBakeDwell);
+                else
+                    std::snprintf(dwellText, sizeof(dwellText), "%s", haveAim ? "past the dwell, the last face stays" : "no aim for this frame");
+                Log::get().note("concourse bake: vr capture: frame %u eye %d: %s; face %d; %s; %s; %u texels on it, %u in this eye's view, %u past the cut, %u written, %u nothing drawn; "
+                                "cut by distance <5 %u, 5-20 %u, 20-50 %u, >=50 %u; drawn by distance <50 %u, 50-200 %u, 200-1000 %u, 1000-4000 %u, >=4000 %u; %u in either eye's view (%.1f%% covered%s)",
+                                c.frame, e, vrStatusName(st), c.face[e], dwellText, writeFrame ? "writes" : "counts only", c.onFace[e], c.inView[e], c.pastCut[e], c.written[e],
+                                c.nothingDrawn[e], c.cutBy[e][0], c.cutBy[e][1], c.cutBy[e][2], c.cutBy[e][3], c.drawnBy[e][0], c.drawnBy[e][1], c.drawnBy[e][2], c.drawnBy[e][3],
+                                c.drawnBy[e][4], c.eitherView[e], static_cast<double>(frac) * 100.0,
                                 c.both[e] ? "" : "; the other eye's rows were not this frame's, so this eye alone");
+            }
         }
     }
 }
@@ -4897,7 +4921,9 @@ void vrBakeAimStart(uint32_t frame) {
 // One aim: the next face, the base from the latest head, the hold, the near value. What the eyes should show is kept for the rows' lines.
 void vrBakeAimTick(uint32_t frame) {
     bool fresh = false;
-    const uint32_t d = g_vr.plan.next(g_vr.tick, &fresh);
+    uint32_t dwell = 0;   // TEMPORARY (H58-H61 instrument, Flight 53): this tick's place in the face's hold; only the hold's last frame writes
+    const uint32_t d = g_vr.plan.next(g_vr.tick, &fresh, &dwell);
+    const bool writes = dwell + 1 == cvb::kVrBakeDwell;
     uint64_t seq = 0;
     float head[12] = {}, eyeToHead[2][12] = {};
     if ((g_vr.faceMask & (1u << d)) == 0 || !nativeTemporalHeadPose(&seq, head, eyeToHead)) {
@@ -4921,15 +4947,22 @@ void vrBakeAimTick(uint32_t frame) {
     const uint32_t a = frame % kVrRing;
     g_vr.aimFrame[a] = frame;
     g_vr.aimFace[a] = d;
+    g_vr.aimDwell[a] = dwell;
+    g_vr.aimWrite[a] = writes;
+    concoursePaneVrBakeAimFrame(frame, static_cast<int>(d), dwell, writes);
     for (int e = 0; e < 2; ++e) cvb::eyeAt(eyeToHead[e], rows, g_vr.aimPred[a][e]);
     g_vr.aimValid[a] = true;
     ++g_vr.aimTicks;
     if (vrLogTake()) {
-        char hText[200], bText[200];
+        char hText[200], bText[200], holdText[72];
+        if (dwell < cvb::kVrBakeDwell)
+            std::snprintf(holdText, sizeof(holdText), "%s, dwell %u of %u, %s", fresh ? "a new aim" : "held", dwell, cvb::kVrBakeDwell, writes ? "writes" : "counts only");
+        else
+            std::snprintf(holdText, sizeof(holdText), "the last face stays, counts only");
         vrPoseText(hg.v, hText, sizeof(hText));
         vrPoseText(b.v, bText, sizeof(bText));
         Log::get().note("concourse bake: vr aim: frame %u, tick %u: face %u (%s, aim %u), the head as the game composes it %s; B %s; predicted eye 0 %.3f %.3f %.3f, eye 1 %.3f %.3f %.3f", frame,
-                        g_vr.tick, d, fresh ? "a new aim" : "the last face stays", g_vr.plan.aims(d), hText, bText, static_cast<double>(g_vr.aimPred[a][0][0]),
+                        g_vr.tick, d, holdText, g_vr.plan.aims(d), hText, bText, static_cast<double>(g_vr.aimPred[a][0][0]),
                         static_cast<double>(g_vr.aimPred[a][0][1]), static_cast<double>(g_vr.aimPred[a][0][2]), static_cast<double>(g_vr.aimPred[a][1][0]),
                         static_cast<double>(g_vr.aimPred[a][1][1]), static_cast<double>(g_vr.aimPred[a][1][2]));
     }
@@ -5410,8 +5443,24 @@ void concourseTick(uint64_t now, uint32_t frame) {
             concourseCameraTestLook(g_camLookCentre, g_camLookAxes[1], cc::camTestLookDir(now - g_camTimer.startMs()));
         }
         concourseCameraTestControl(g_camMode, lookOn, g_camTimer.armed() || g_camTimer.active());
-        if (camEnd == cc::CamTestEnd::kDone) concoursePaneBakeFinish();
-        else if (camEnd != cc::CamTestEnd::kNone && baking) concoursePaneBakeCancel();
+        if (camEnd == cc::CamTestEnd::kDone) {
+            concoursePaneBakeFinish();
+            if (baking) {   // TEMPORARY (H58-H61 instrument, Flight 53): the cube just published, one image a wanted direction
+                float f9[cvb::kFaces][9] = {};
+                uint32_t dumpMask = 0;
+                for (uint32_t d = 0; d < cvb::kFaces; ++d) {
+                    cvb::Face fc;
+                    if (!cvb::faceOf(g_camLookAxes, d, &fc)) continue;
+                    dumpMask |= 1u << d;
+                    for (int k = 0; k < 3; ++k) {
+                        f9[d][k] = fc.r[k];
+                        f9[d][3 + k] = fc.u[k];
+                        f9[d][6 + k] = fc.f[k];
+                    }
+                }
+                concoursePaneBakeDump("flat", f9, dumpMask & g_camBakeMask);
+            }
+        } else if (camEnd != cc::CamTestEnd::kNone && baking) concoursePaneBakeCancel();
         if (g_camTimer.armed() && !camWasArmed)
             Log::get().note("concourse camera test: armed: %s (cabin %.2f m, gaps %.2f %.2f, camera %.2f %.2f %.2f); waiting for the anchor; bake directions 0x%X, near %.0f m",
                             camArmedWhy, static_cast<double>(liftRead.cabinDistM), static_cast<double>(liftRead.gap1), static_cast<double>(liftRead.gap2), static_cast<double>(g_frameCam[0]),

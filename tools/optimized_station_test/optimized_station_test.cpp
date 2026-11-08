@@ -331,27 +331,37 @@ void testVrBake() {
         check(!cvb::worldOffset(store, near1, off, &dist) && dist < 0.5f, "vr bake: the world check: within half a metre is one world");
         check(cvb::worldOffset(store, far1, off, &dist) && std::fabs(off[1] + 29.0f) < 1e-4f && dist > 30.0f, "vr bake: tens of metres is an offset, render less store");
     }
-    // The aims: each face once in order, a short one again once its counts are due, three times at most, then let go.
+    // The aims: each face held for kVrBakeDwell ticks in order (TEMPORARY, H58-H61 instrument, Flight 53), a short one again once its counts are due, three times at most, then let go.
     {
         cvb::AimPlan p;
         p.reset(0x1Fu);
-        bool fresh = false;
-        uint32_t order[5];
-        for (uint32_t t = 1; t <= 5; ++t) order[t - 1] = p.next(t, &fresh);
-        check(order[0] == 0 && order[1] == 1 && order[2] == 2 && order[3] == 3 && order[4] == 4 && fresh, "vr bake: the aims go round the faces in order");
-        check(p.next(6, &fresh) == 4 && !fresh, "vr bake: with every face aimed and its counts not due, the last stays");
+        check(cvb::kVrBakeDwell == 3, "vr bake: the dwell is three frames");
+        bool fresh = false, orderOk = true, dwellOk = true, freshOk = true, aimsOk = true;
+        uint32_t dw = 99;
+        for (uint32_t t = 1; t <= 15; ++t) {
+            const uint32_t f = p.next(t, &fresh, &dw);
+            orderOk = orderOk && f == (t - 1) / 3;
+            dwellOk = dwellOk && dw == (t - 1) % 3;
+            freshOk = freshOk && fresh == (dw == 0);
+            aimsOk = aimsOk && p.aims(f) == 1;
+        }
+        check(orderOk && dwellOk && freshOk && aimsOk, "vr bake: five faces give fifteen ticks in face order, dwell 0, 1, 2 each, fresh only on dwell 0, one aim a face");
         for (uint32_t f = 0; f < 5; ++f) p.noteCoverage(f, f == 2 ? 0.9f : 1.0f);
-        check(p.covered() == 0x1Bu && !p.finished(7), "vr bake: a face at 90 percent is short, and the bake goes on");
-        check(p.next(9, &fresh) == 4 && !fresh, "vr bake: a short face waits for its counts' ticks");
-        check(p.next(10, &fresh) == 2 && fresh && p.aims(2) == 2, "vr bake: then it is aimed at again");
-        check(p.next(17, &fresh) == 2 && fresh && p.aims(2) == 3, "vr bake: and once more");
-        check(p.next(30, &fresh) == 2 && !fresh, "vr bake: not a fourth time");
-        check(!p.finished(23) && p.finished(24), "vr bake: the bake ends once its last aim's counts are due");
+        check(p.covered() == 0x1Bu && !p.finished(15), "vr bake: a face at 90 percent is short, and the bake goes on");
+        check(p.next(16, &fresh, &dw) == 2 && fresh && dw == 0 && p.aims(2) == 2, "vr bake: then it is aimed at again, from its last frame's tick");
+        check(p.next(17, &fresh, &dw) == 2 && !fresh && dw == 1 && p.next(18, &fresh, &dw) == 2 && !fresh && dw == 2 && p.aims(2) == 2, "vr bake: held for its dwell, still one aim");
+        check(p.next(24, &fresh, &dw) == 2 && !fresh && dw == cvb::kVrBakeDwell, "vr bake: a short face waits for its counts' ticks (the last stays, no write)");
+        check(p.next(25, &fresh, &dw) == 2 && fresh && dw == 0 && p.aims(2) == 3, "vr bake: and once more");
+        check(p.next(26, &fresh, &dw) == 2 && p.next(27, &fresh, &dw) == 2 && dw == 2, "vr bake: held again");
+        check(p.next(40, &fresh, &dw) == 2 && !fresh && p.aims(2) == 3, "vr bake: not a fourth time");
+        check(!p.finished(33) && p.finished(34), "vr bake: the bake ends once its last aim's last frame's counts are due");
         check(std::fabs(p.best(2) - 0.9f) < 1e-6f, "vr bake: the best coverage is kept for the finish line");
         p.reset(0x10u);
-        check(p.next(1, &fresh) == 4 && fresh && p.next(2, &fresh) == 4 && !fresh, "vr bake: one face wanted: it alone");
+        check(p.next(1, &fresh, &dw) == 4 && fresh && dw == 0 && p.next(2, &fresh, &dw) == 4 && !fresh && dw == 1 && p.next(3, &fresh, &dw) == 4 && dw == 2 &&
+                  p.next(4, &fresh, &dw) == 4 && !fresh && dw == cvb::kVrBakeDwell,
+              "vr bake: one face wanted: it alone");
         p.noteCoverage(4, 0.995f);
-        check(p.finished(3) && p.covered() == 0x10u, "vr bake: covered, finished at once");
+        check(p.finished(5) && p.covered() == 0x10u, "vr bake: covered, finished at once");
         p.reset(0x1Fu);
         p.noteCoverage(9, 1.0f);
         check(p.covered() == 0u, "vr bake: a face out of range is ignored");
