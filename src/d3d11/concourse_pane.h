@@ -133,6 +133,7 @@ struct ConcoursePaneFeed {
     bool withhold = false;      // the cull is on and the phase is the plain mirror phase: the outside draws are not issued, the mirror is marked
     bool effects = false;       // the outside effects are not issued although the phase is not the plain one (the backdrop capture's lift); withhold implies it
     bool sealed = false;        // the hangar is sealed: the families that can only be outside are not issued (concourse_cull_core.h, sealedToo)
+    bool realSky = false;       // this room's windows show the real sky (cc::RoomLayout::realSky): the planet, its atmosphere and the sun are issued with the cull on (skySide)
     float bayOpacity = 1.0f;    // the clearing pane's opacity, 0 to 1
     float enterShare = 0.0f;    // the share of the view at which the clearing starts (diag.concourse_clear_share); 0 never: a pane read as exterior that fills this much becomes the clearing pane
     float up[3] = {};           // the anchor's local up axis in world (the steady glow's sky test); zero when not valid

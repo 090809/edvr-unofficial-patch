@@ -549,6 +549,12 @@ bool stationWindowDistanceRowDisabled() { return Config::get().getString("fix.op
 
 const char* stationWindowDistanceHint() { return "Needs Optimized stations: turn it on above to use this."; }
 
+// fix.skip_rooms_behind_doors (the Skip rooms behind doors row, under Window 3D distance on the flat panel's Performance tab): part of Optimized stations too, so dimmed and
+// refused the same way while that is off.
+bool isRoomsBehindDoorsRow(const MenuRowDef& d) { return strcmp(d.section, "fix") == 0 && strcmp(d.key, "skip_rooms_behind_doors") == 0; }
+
+const char* roomsBehindDoorsRefusal() { return "Skip rooms behind doors is inactive: turn Optimized stations on above first."; }
+
 const char* stationWindowDistanceRefusal() { return "Window 3D distance is inactive: turn Optimized stations on above first."; }
 
 // The on-foot panel's width: "auto", or a width in pixels -- never a list, so
@@ -2553,10 +2559,12 @@ void buildContent(MenuContent& c) {
             const bool hudAaRow = isHudAntiAliasingRow(d);
             const bool glassDirtRow = isCockpitGlassDirtRow(d);
             const bool windowDistanceRow = isStationWindowDistanceRow(d);
+            const bool doorsRow = isRoomsBehindDoorsRow(d);
             const bool dim = (dlssRow && dlssPresetDisabled()) ||
                              (sharpenRow && sharpenRowDisabled()) ||
                              (hudAaRow && hudAntiAliasingRowDisabled()) ||
                              (glassDirtRow && cockpitGlassDirtRowDisabled()) ||
+                             (doorsRow && stationWindowDistanceRowDisabled()) ||
                              (windowDistanceRow && stationWindowDistanceRowDisabled());
             l.dim = dim;
             strncpy(l.left, d.label, sizeof(l.left) - 1);
@@ -2630,7 +2638,7 @@ void buildContent(MenuContent& c) {
                 snprintf(c.hint, sizeof(c.hint), "%s", hudAntiAliasingHint());
             else if (hi && dim && glassDirtRow)
                 snprintf(c.hint, sizeof(c.hint), "%s", cockpitGlassDirtHint());
-            else if (hi && dim && windowDistanceRow)
+            else if (hi && dim && (windowDistanceRow || doorsRow))
                 snprintf(c.hint, sizeof(c.hint), "%s", stationWindowDistanceHint());
             else if (hi && dim && runtimeFlatProfile())
                 snprintf(c.hint, sizeof(c.hint), "%s",
@@ -3140,6 +3148,11 @@ void stepRow(int defIndex, int dir, int mult) {
         g_s.contentDirty = true;
         return;
     }
+    if (isRoomsBehindDoorsRow(d) && stationWindowDistanceRowDisabled()) {
+        g_s.lastWrite = roomsBehindDoorsRefusal();
+        g_s.contentDirty = true;
+        return;
+    }
     if (isOpenxrRenderScaleRow(d)) {
         // A width for the worn headset, stepped by 100 px on the grid of
         // round hundreds (steppedResolution); the generated row is Text,
@@ -3550,6 +3563,11 @@ void beginEdit(int entryIndex, int defIndex) {
     }
     if (isStationWindowDistanceRow(kMenuRows[defIndex]) && stationWindowDistanceRowDisabled()) {
         s.lastWrite = stationWindowDistanceRefusal();
+        s.contentDirty = true;
+        return;
+    }
+    if (isRoomsBehindDoorsRow(kMenuRows[defIndex]) && stationWindowDistanceRowDisabled()) {
+        s.lastWrite = roomsBehindDoorsRefusal();
         s.contentDirty = true;
         return;
     }
@@ -4015,6 +4033,9 @@ void dispatchNav(MenuNav nav, uint64_t now) {
                         s.contentDirty = true;
                     } else if (isStationWindowDistanceRow(d) && stationWindowDistanceRowDisabled()) {
                         s.lastWrite = stationWindowDistanceRefusal();
+                        s.contentDirty = true;
+                    } else if (isRoomsBehindDoorsRow(d) && stationWindowDistanceRowDisabled()) {
+                        s.lastWrite = roomsBehindDoorsRefusal();
                         s.contentDirty = true;
                     } else {
                         applyChange(def, d.shipped);

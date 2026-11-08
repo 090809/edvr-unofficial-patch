@@ -137,6 +137,7 @@ float g_glowLoggedLv[4] = {};
 // The index count treated as the clearing pane (36, the bay window, until an exterior pane fills the view), and the entry share the feed carries.
 std::atomic<uint32_t> g_clearN{cc::kBayIndexCount};
 std::atomic<uint32_t> g_bayN{cc::kBayIndexCount};   // this room's bay window (the feed's, from its anchor)
+std::atomic<bool> g_realSkyNow{false};                // this room's windows show the real sky (the feed's): skySide families are issued with the cull on
 std::atomic<float> g_radiusFed{cc::kBackdropRadiusDefaultM};   // this room's sphere, unless the key says
 std::atomic<float> g_enterShareFed{0.0f};
 
@@ -2212,15 +2213,19 @@ void ConcoursePaneScope::begin(ID3D11DeviceContext* ctx, UINT indexCount, UINT s
         int fam = cc::withheldPsIndex(ps);
         bool sealedToo = fam >= 0 && cc::kWithheldPs[fam].sealedToo;
         bool washToo = fam >= 0 && cc::kWithheldPs[fam].washToo;
+        bool skySide = fam >= 0 && cc::kWithheldPs[fam].skySide;
         if (fam < 0 && followed) {
             const int v = cc::withheldVsIndex(bindingShaderHash(BindSlot::Vs));
             if (v >= 0) {
                 fam = static_cast<int>(cc::kWithheldPsCount) + v;
                 sealedToo = cc::kWithheldVs[v].sealedToo;
                 washToo = cc::kWithheldVs[v].washToo;
+                skySide = cc::kWithheldVs[v].skySide;
             }
         }
-        if (fam >= 0 && (cullOn || (sealedOn && sealedToo) || (washOff && washToo))) {
+        // A room with the real sky in its windows (a carrier) draws the planet, its atmosphere and the sun with the cull on; a sealed hangar still does not.
+        const bool skyKept = skySide && g_realSkyNow.load(std::memory_order_relaxed);
+        if (fam >= 0 && ((cullOn && !skyKept) || (sealedOn && sealedToo) || (washOff && washToo))) {
             withheld_ = true;
             g_withheld.fetch_add(1, std::memory_order_relaxed);
             g_withheldFam[fam].fetch_add(1, std::memory_order_relaxed);
@@ -3123,6 +3128,7 @@ void concoursePaneSetFeed(const ConcoursePaneFeed& feed) noexcept {
     }
     g_feedEffects.store(feed.effects, std::memory_order_relaxed);
     g_feedSealed.store(feed.sealed, std::memory_order_relaxed);
+    g_realSkyNow.store(feed.realSky, std::memory_order_relaxed);
     g_bayOpacity.store(feed.bayOpacity, std::memory_order_relaxed);
     g_enterShareFed.store(feed.enterShare, std::memory_order_relaxed);
     for (int k = 0; k < 3; ++k) g_upFed[k].store(feed.upValid ? feed.up[k] : 0.0f, std::memory_order_relaxed);

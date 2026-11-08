@@ -168,11 +168,15 @@ constexpr uint64_t kTwinPs = 0x34A1475B2C790DFAull;
 // the particle batches and an engine glow (its own ship's on the pad); no census has been taken in a sealed hangar yet to say otherwise.
 // washToo: also withheld while the windows show the bake, the cull lifted or not. The scatter is a wash over the whole screen, room included. When the cull lifted at the bay it came back in
 // one frame (Flight 25's second clip, Sean: "anything we can do to make this blend better?"), and the bake has none in it, so the room and the windows jumped together.
+// skySide: the planet, its atmosphere and the sun's glare. In a room whose windows show the real sky (RoomLayout::realSky, a fleet carrier) they are drawn with the cull on, as the stars
+// always are (Sean, after Flight 46: "Can we exclude the skybox/planets/sunlight from being culled here?"). Ships and weapons fire stay withheld ("I want the ships to still be culled,
+// it's only the background I want kept") until a window clears ("Can we still use the window clears distance to restore those culled objects in this scenario?").
 struct WithheldFamily {
     uint64_t hash;
     const char* name;
     bool sealedToo = false;
     bool washToo = false;
+    bool skySide = false;
 };
 constexpr WithheldFamily kWithheldPs[] = {
     {0x3B0B38CD96F53BC1ull, "plume", true},
@@ -184,11 +188,11 @@ constexpr WithheldFamily kWithheldPs[] = {
     {0xC5DF9CC943476289ull, "multicannon rounds", true},
     {0xC49F999F7D3C801Dull, "shield strike", true},
     {0xBD801F2FB02522EBull, "smoke", true},
-    {0x6EF82262EB12A037ull, "atmosphere", true},
-    {0x5BCB6B95BE7C0700ull, "atmosphere quad A", true},
-    {0x97DBC87FCAA429C4ull, "atmosphere quad B", true},
+    {0x6EF82262EB12A037ull, "atmosphere", true, false, true},
+    {0x5BCB6B95BE7C0700ull, "atmosphere quad A", true, false, true},
+    {0x97DBC87FCAA429C4ull, "atmosphere quad B", true, false, true},
     {0xD56F859BE4781431ull, "flares"},
-    {0x43E5E6EB67AC751Bull, "planet surface", true},
+    {0x43E5E6EB67AC751Bull, "planet surface", true, false, true},
     {0x41152F82C6E8BE1Full, "scatter", false, true},  // VS AFFEF018: fullscreen, additive, no depth test, reads only the depth
     {0x2BAE3742FEB916D9ull, "particles A"},           // VS AFBCD3AD, 9F4BBCFC (docs\billboard-root-cause-2026-10-16.md)
     {0x3789CA2062E196FBull, "particles B"},           // VS 9AEC596A
@@ -201,16 +205,16 @@ constexpr WithheldFamily kWithheldPs[] = {
     {0x2519C9050946D545ull, "light cones", false, true},
 };
 constexpr WithheldFamily kWithheldVs[] = {
-    {0x72BDD292154158ADull, "body surface", true},
-    {0x26FC402B1274EE7Bull, "planetary pipeline", true},
-    {0x9FFA5D5E79F04873ull, "planetary 2", true},
-    {0x3530A6FD15EDE145ull, "planetary 3", true},
-    {0x71DD9863DCFC0986ull, "planet surface vs", true},
-    {0xACE405F428C17EF6ull, "terrain patch", true},
-    {0x19F70CE80DA3242Bull, "body sphere", true},
-    {0xC7FA0C0F5DD49180ull, "beside the bodies", true},
-    {0x8BD7C37ABCEE7E45ull, "sun", true},
-    {0x1F3AD1584D7FA3C8ull, "sun arcs", true},
+    {0x72BDD292154158ADull, "body surface", true, false, true},
+    {0x26FC402B1274EE7Bull, "planetary pipeline", true, false, true},
+    {0x9FFA5D5E79F04873ull, "planetary 2", true, false, true},
+    {0x3530A6FD15EDE145ull, "planetary 3", true, false, true},
+    {0x71DD9863DCFC0986ull, "planet surface vs", true, false, true},
+    {0xACE405F428C17EF6ull, "terrain patch", true, false, true},
+    {0x19F70CE80DA3242Bull, "body sphere", true, false, true},
+    {0xC7FA0C0F5DD49180ull, "beside the bodies", true, false, true},
+    {0x8BD7C37ABCEE7E45ull, "sun", true, false, true},
+    {0x1F3AD1584D7FA3C8ull, "sun arcs", true, false, true},
 };
 constexpr size_t kWithheldPsCount = sizeof(kWithheldPs) / sizeof(kWithheldPs[0]);
 constexpr size_t kWithheldVsCount = sizeof(kWithheldVs) / sizeof(kWithheldVs[0]);
@@ -939,6 +943,9 @@ constexpr float kBackdropRadiusDefaultM = 600.0f, kBackdropRadiusMinM = 10.0f, k
 // liveRoomName: a room inside the anchor's reach that the bake, taken at the anchor's centre, cannot show: while the camera is inside that record's sphere the cull stands down there and
 // its windows are the game's own. Null: none.
 // slabCut: the room's doors as planes across its a2, in metres from the anchor along a2 (the door rule, roomSeenSlab). Zero cuts: none known.
+// realSky: the room's windows look out on open space, so they show the real sky and no bake is taken: the glass is the game's own, the stars, the planet, its atmosphere and the sun are
+// drawn with the cull on (WithheldFamily::skySide), and everything else the cull takes outside (the hull, ships, weapons fire) is culled until a window clears on approach
+// (fix.station_window_distance), which brings it all back as at any other room.
 struct RoomLayout {
     uint32_t bayN;
     float backdropRadiusM;
@@ -947,6 +954,7 @@ struct RoomLayout {
     const char* liveRoomName = nullptr;
     uint32_t slabCuts = 0;
     float slabCut[2] = {};
+    bool realSky = false;
 };
 inline constexpr RoomLayout kRoomStation{kBayIndexCount, kBackdropRadiusDefaultM, "a large station's", 0.0f};
 inline constexpr RoomLayout kRoomPort{12u, 300.0f, "a surface port's", 100.0f};
@@ -959,7 +967,10 @@ inline constexpr RoomLayout kRoomOutpost{30u, 300.0f, "an orbital outpost's", 10
 // between, and in them the bake showed a flat grey surface (Flight 41, Sean: "some strange artifacting in the window bake for the command deck").
 // Its doors (Flight 43's survey): the elevator bay's sealed door at a2 = -11 and the bridge's at +19, both a Narrow_Door_Left and _Right pair. They split it into the elevator bay,
 // the central space with its services, and the bridge and command area.
-inline constexpr RoomLayout kRoomCarrier{30u, 300.0f, "a fleet carrier's", 100.0f, "SA_Carrier_01_Bridge", 2u, {-11.0f, 19.0f}};
+// The real sky (2026-11-08): Sean, after Flight 46, saw the bake's square edges in the bar's windows: "maybe the best thing to do here is not bake an image at all, but just restore the
+// culled ships and weapons fire outside once a player triggers the approach to the window", then "Can we exclude the skybox/planets/sunlight from being culled here?". Flight 45 had
+// the bake flat navy toward the bar's -a0 (H54) where Elite's own view is black sky, stars and the planet.
+inline constexpr RoomLayout kRoomCarrier{30u, 300.0f, "a fleet carrier's", 100.0f, "SA_Carrier_01_Bridge", 2u, {-11.0f, 19.0f}, true};
 inline const RoomLayout& roomLayoutOf(const char* anchorName) noexcept {
     if (!anchorName) return kRoomStation;
     if (std::strcmp(anchorName, kPortAnchorName) == 0) return kRoomPort;

@@ -3252,6 +3252,8 @@ Hotkey* g_roomHotkey = nullptr;
 std::string g_roomHotkeyText;
 bool g_roomHotkeyBound = false;
 cc::DoorRuleMode g_doorMode = cc::DoorRuleMode::kRecords;
+bool g_doorsSetting = true;       // fix.skip_rooms_behind_doors, read in concoursePoll
+bool g_doorsSettingSeen = false;
 cc::DoorWatch g_doorWatch[2];
 uint64_t g_roomSumMs = 0;
 // The door watch's log: each door's last change (its frame and time, for the closing line's "open for"), the changes in the 5 s window, and the door block's own cost per tick
@@ -3459,6 +3461,15 @@ void concoursePoll(uint64_t now) {
         Log::get().note("concourse cull: a window clears at %.1f percent of the view (fix.station_window_distance, or diag.concourse_clear_share; 0 never clears)", static_cast<double>(clearPct));
         g_concEnterSeen = true;
         g_concEnterShare = clearPct / 100.0f;
+    }
+    // fix.skip_rooms_behind_doors: the door rule, its own switch under Optimized stations (anything but "off" is on). Off, the rule stands down whatever its hotkey says.
+    {
+        const bool doorsOn = cfg.getString("fix.skip_rooms_behind_doors", "on") != "off";
+        if (!g_doorsSettingSeen || doorsOn != g_doorsSetting) {
+            Log::get().note("concourse doors: fix.skip_rooms_behind_doors = %s", doorsOn ? "on" : "off");
+            g_doorsSettingSeen = true;
+            g_doorsSetting = doorsOn;
+        }
     }
     const std::string extra = cfg.getString("diag.concourse_keep", "");
     if (!g_concExtraSeen || extra != g_concExtraApplied) {
@@ -4429,10 +4440,11 @@ void concourseTick(uint64_t now, uint32_t frame) {
     // are this tick's. A change of what is culled, or of the live room, starts the rigs' verdicts afresh. hotkey.concourse_room_test (TEMPORARY) steps the rule's level.
     if (g_roomHotkey && g_roomHotkey->pressed()) {
         g_doorMode = cc::doorRuleNext(g_doorMode);
-        Log::get().note("concourse doors: the rule is %s by hotkey.concourse_room_test%s", cc::doorRuleName(g_doorMode),
-                        g_concLayout->slabCuts > 0 ? "" : " (this room has no doors known, so it does nothing here)");
-        char text[48];
-        std::snprintf(text, sizeof(text), "Doors: %s", cc::doorRuleName(g_doorMode));
+        Log::get().note("concourse doors: the rule is %s by hotkey.concourse_room_test%s%s", cc::doorRuleName(g_doorMode),
+                        g_concLayout->slabCuts > 0 ? "" : " (this room has no doors known, so it does nothing here)",
+                        g_doorsSetting ? "" : " (fix.skip_rooms_behind_doors is off, so it stays off)");
+        char text[64];
+        std::snprintf(text, sizeof(text), "Doors: %s%s", cc::doorRuleName(g_doorMode), g_doorsSetting ? "" : " (setting off)");
         concoursePaneQueueToast(text);
         g_roomSumMs = now;
         g_concWin.roomProd.store(0, std::memory_order_relaxed);
@@ -4442,7 +4454,8 @@ void concourseTick(uint64_t now, uint32_t frame) {
     RoomPub roomNow;
     float roomAlong = 0.0f;
     const uint32_t doorCuts = g_concLayout->slabCuts < 2 ? g_concLayout->slabCuts : 2;
-    const bool doorsWanted = g_doorMode != cc::DoorRuleMode::kOff && gateWanted && effective && (anchor || inLiveRoom) && doorCuts > 0 && g_frameCamValid;
+    const cc::DoorRuleMode doorMode = g_doorsSetting ? g_doorMode : cc::DoorRuleMode::kOff;   // fix.skip_rooms_behind_doors off: the rule is off
+    const bool doorsWanted = doorMode != cc::DoorRuleMode::kOff && gateWanted && effective && (anchor || inLiveRoom) && doorCuts > 0 && g_frameCamValid;
     bool leavesMissing = false;
     const int64_t doorCost0 = doorsWanted ? costTicks() : 0;
     {
@@ -4535,7 +4548,7 @@ void concourseTick(uint64_t now, uint32_t frame) {
             if (cc::roomSeenSlab(*g_concLayout, roomAlong, blocks, &seenSlab) && !cc::roomSlabWhole(seenSlab)) {
                 roomNow.room = true;
                 roomNow.only = inLiveRoom;
-                roomNow.rigs = g_doorMode == cc::DoorRuleMode::kRigs;
+                roomNow.rigs = doorMode == cc::DoorRuleMode::kRigs;
                 roomNow.slab = seenSlab;
                 for (int k = 0; k < 3; ++k) {
                     roomNow.origin[k] = frameC[k];
@@ -4581,9 +4594,23 @@ void concourseTick(uint64_t now, uint32_t frame) {
     }
     // The cull waits for the windows' bake: until there is one, the room and its windows are the game's own, and a bake that never comes costs nothing but the saving. A ride up opens
     // the bake's window at the anchor's first sighting, so this holds for that one tick.
-    const bool bakeMode = g_camHooked && g_camMode == cc::kCamTestModeBake;
+    // A room with the real sky in its windows (cc::RoomLayout::realSky, a carrier) takes no bake: the cull does not wait for one and neither a ride nor the room in view starts one.
+    const bool realSky = g_concLayout->realSky;
+    const bool bakeMode = g_camHooked && g_camMode == cc::kCamTestModeBake && !realSky;
+    {
+        static const char* saidRealSky = nullptr;
+        if (realSky && anchor && saidRealSky != g_concLayout->name) {
+            saidRealSky = g_concLayout->name;
+            Log::get().note("concourse cull: %s windows show the real sky: no bake, the glass is the game's own, the stars, the planet, its atmosphere and the sun are drawn with "
+                            "the cull on, and the rest of the outside (hull, ships, weapons fire) is culled until a window clears",
+                            g_concLayout->name);
+        } else if (!realSky) {
+            saidRealSky = nullptr;
+        }
+    }
     const bool bakeHolds = bakeMode && !concoursePaneBakeDone() && !g_camTimer.active();
     const bool wantCull = gateWanted && effective && anchor && !bakeHolds;   // the cull is wanted: the panes are treated whatever phase the clearing machine is in
+    // A real-sky room clears as any other: from afar only the sky is kept (skySide), and a window that fills fix.station_window_distance's share brings the rest back.
     const cc::ClearOutput clr = concourseClearStep(now, wantCull, gateWanted, gateWanted ? concoursePaneShares() : ConcoursePaneShares{});
     // Built 2026-11-06: the lift. In a shut cabin the room is not drawn, in either room: the lift gate (concourse_cull_core.h) reads the cabin and its doors from the
     // survey's table. It needs the key on and the commander on foot, with the hangar not sealed; otherwise it stands down.
@@ -4627,7 +4654,8 @@ void concourseTick(uint64_t now, uint32_t frame) {
                     camArmedWhy = noRide == cc::BakeNoRide::kFirst ? "no ride, the room in view with no bake" : "no ride, the render size has risen since the bake";
                 }
             }
-            if (g_camTimer.step(g_camMode, liftOn && !bakeWaits, anchor, now, &camEnd)) {
+            const bool rideBakes = !(realSky && g_camMode == cc::kCamTestModeBake);   // a real-sky room: a ride up arms no bake
+            if (g_camTimer.step(g_camMode, liftOn && !bakeWaits && rideBakes, anchor, now, &camEnd)) {
                 liftOn = false;
                 g_liftGate.stop();
             }
@@ -4829,7 +4857,8 @@ void concourseTick(uint64_t now, uint32_t frame) {
     const bool active = cullActive || roomOnlyOn;
     ConcoursePaneFeed feed;   // the look wants the game's own picture: no pane treatment, nothing withheld; nor does the live room's slab
     feed.measure = gateWanted && !lookOn && !bakeHolds;
-    feed.treat = wantCull && !lookOn;
+    feed.treat = wantCull && !lookOn && !realSky;   // a real-sky room's glass is the game's own, never treated; it is still measured, so a window clears
+    feed.realSky = realSky;
     feed.withhold = cullActive && !lookOn;
     feed.effects = (cullActive || backdropLift) && !lookOn;
     feed.bayOpacity = clr.bayOpacity;

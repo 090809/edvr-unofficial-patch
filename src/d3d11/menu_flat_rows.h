@@ -42,6 +42,8 @@ inline constexpr FlatPageRow kFlatPageRows[] = {
     {"fix", "optimized_stations", FlatRowRead::Allowlist},
     // Directly under Optimized stations, and dimmed while that is off (menu.cpp): flat only for now, since the concourse cull and its bake are.
     {"fix", "station_window_distance", FlatRowRead::Allowlist},
+    // Under it, and dimmed while Optimized stations is off (menu.cpp): the rooms behind a carrier's shut doors, flat only as the concourse cull is.
+    {"fix", "skip_rooms_behind_doors", FlatRowRead::Allowlist},
 };
 inline constexpr size_t kFlatPageRowCount = sizeof(kFlatPageRows) / sizeof(kFlatPageRows[0]);
 

@@ -490,11 +490,12 @@ void panelTable(const std::string& root, const std::string& gen) {
           "the flat panel has exactly three tabs: Performance, Visual, then Debug last");
     {
         const char* const order[][2] = {{"fix", "temporal_aa"}, {"fix", "temporal_aa_model"}, {"fix", "render_sharpness"}, {"fix", "ui_quality"},
-                                        {"fix", "hud_antialiasing"}, {"fix", "optimized_stations"}, {"fix", "station_window_distance"}};
-        bool same = kFlatPageRowCount == 7;
-        for (size_t i = 0; same && i < 7; ++i)
+                                        {"fix", "hud_antialiasing"}, {"fix", "optimized_stations"}, {"fix", "station_window_distance"}, {"fix", "skip_rooms_behind_doors"}};
+        bool same = kFlatPageRowCount == 8;
+        for (size_t i = 0; same && i < 8; ++i)
             same = std::strcmp(kFlatPageRows[i].section, order[i][0]) == 0 && std::strcmp(kFlatPageRows[i].key, order[i][1]) == 0;
-        check(same, "the Performance tab has the flat page's seven rows in their order (HUD Anti-Aliasing directly under UI quality, Window 3D distance directly under Optimized stations)");
+        check(same, "the Performance tab has the flat page's eight rows in their order (HUD Anti-Aliasing directly under UI quality, Window 3D distance directly under Optimized stations, "
+                    "Skip rooms behind doors under that)");
     }
     check(kFlatVisualRowCount == 5 && std::strcmp(kFlatVisualRows[0].section, "visual") == 0 && std::strcmp(kFlatVisualRows[0].key, "intro_video") == 0 &&
               std::strcmp(kFlatVisualRows[1].section, "visual") == 0 && std::strcmp(kFlatVisualRows[1].key, "star_glow") == 0 &&

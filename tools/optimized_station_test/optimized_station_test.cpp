@@ -3486,6 +3486,23 @@ int main(int argc, char** argv) {
                       cc::doorRuleNext(cc::DoorRuleMode::kOff) == cc::DoorRuleMode::kRecords, "doors: the key steps records, rigs, off");
             check(std::strcmp(cc::kDoorLeafLeft, "Narrow_Door_Left") == 0 && cc::concourseAllowName(cc::kDoorLeafLeft, nullptr) && cc::concourseAllowName(cc::kDoorLeafRight, nullptr),
                   "doors: the leaves' names are ones the store sees as allowed");
+            // The real sky (2026-11-08): a carrier's windows show it; the large stations, ports and outposts keep their bake.
+            check(cc::kRoomCarrier.realSky && !cc::kRoomStation.realSky && !cc::kRoomPort.realSky && !cc::kRoomOutpost.realSky, "real sky: a carrier's room only");
+            auto skySideOf = [](const char* name, int want) {
+                for (size_t i = 0; i < cc::kWithheldPsCount; ++i)
+                    if (std::strcmp(cc::kWithheldPs[i].name, name) == 0) return static_cast<int>(cc::kWithheldPs[i].skySide) == want;
+                for (size_t i = 0; i < cc::kWithheldVsCount; ++i)
+                    if (std::strcmp(cc::kWithheldVs[i].name, name) == 0) return static_cast<int>(cc::kWithheldVs[i].skySide) == want;
+                return false;
+            };
+            bool skyOk = true;
+            for (const char* n : {"atmosphere", "atmosphere quad A", "atmosphere quad B", "planet surface", "body surface", "planetary pipeline", "planetary 2", "planetary 3",
+                                  "planet surface vs", "terrain patch", "body sphere", "beside the bodies", "sun", "sun arcs"})
+                skyOk = skyOk && skySideOf(n, 1);
+            for (const char* n : {"plume", "plume twin", "trail ribbon", "beams and bolts", "multicannon rounds", "shield strike", "smoke", "flares", "scatter", "particles A", "ship ribbon",
+                                  "ship engine glow", "light cones"})
+                skyOk = skyOk && skySideOf(n, 0);
+            check(skyOk, "real sky: the planet, its atmosphere and the sun are the sky's; ships, weapons fire and the room's washes are not");
         }
         for (const char* n : {"SA_Carrier_01", "SA_Carrier_01_Bar", "SA_Carrier_01_Bridge", "SA_Carrier_01_Bar_WindowShutters0", "SA_Carrier_DoorA0", "PS_FUI_STAT_BigScreen_Carrier_01",
                               "FUI_Panel_4x2_Carrier_010", "RandomDirt_NarrowRightA0", "Narrow_Door_Left_Tech", "Arm_Base0"})
