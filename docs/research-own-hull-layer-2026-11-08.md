@@ -652,6 +652,34 @@ lit terrain, and invisible looking into black space.
 * Unverified: the fix in the headset. As before, anything the game drew
   into its own eye over the hull (not the UI layer) ends up under it.
 
+## Separate mode flown (2026-11-08 ~22:00, build 4e252a32): works; night vision, load blink
+
+Log `edvr_gfx_20261108_215951.log`, FG off. The pilot: the ship is drawn,
+the wing-edge terrain smear is gone, the HUD is correct. The composite site
+was `after_ui_resolve` on every applied composite.
+
+- **Night vision does not reach the own ship.** Census 3 (dump
+  220517898003, night vision off) against census 4 (220530815004, on) at
+  the same spot. In the eye pass, night vision adds one draw an eye:
+  - VS `FCF7BD2896751D96`, 240 indices, 2 instances;
+  - into the HDR (f26), with the eye depth bound, after the lighting;
+  - reading t0 a 6x1 f39, t1 the depth copy, t2 G-buffer RT0, t3 a 1x1.
+
+  It also adds an offscreen 256x256 G-buffer pass of the own ship's
+  families, which the eye pass does not read. Fix: night vision joins the
+  re-issued lighting draws (`kLightVs`). Its depth-copy, RT0 and HDR inputs
+  have private mirrors, so the hull layer gets night vision as the game
+  draws it.
+- **The ship blinked at the start, while textures streamed in.** The 22:01:53
+  window: `failed=composite:2`, `fallback=streak:16`, and `mask_pending`
+  right before. Each miss lost one frame (that frame's main pass had
+  already discarded the ship); the 16-frame hold then let separate resume
+  into the next miss.
+  - Fix: the hold is 120 frames, and any other fallback ending
+    (mask pending, frame generation, outside) starts it too. The layer
+    still runs on held frames, so a miss there restarts the hold
+    without a visible loss.
+
 ## Step 3 flight (2026-11-08 21:39, build 8386287e): separate barely engaged
 
 Log `edvr_gfx_20261108_213914.log`, build verified. FG was switched off

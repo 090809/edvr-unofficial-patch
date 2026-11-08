@@ -44,8 +44,11 @@ constexpr uint64_t kTerrainVs = 0x72BDD292154158ADull;   // the terrain's colour
 constexpr uint32_t kTerrainVsHigh = 0x6C320453u;         // the other terrain family, known by its prefix only (the ledgers)
 constexpr uint64_t kSkyVs = 0xF8FA801F2CB1E27Cull;       // the sky, the first forward draw after the lighting (flat_projection_recipes.h)
 // The lighting: the full-screen sun and ambient, then the instanced volumes (the doc's "The binding map", the mt= census).
-constexpr uint64_t kLightVs[6] = {0x7E38A6AA1269C901ull, 0x8289669D93A18C1Dull, 0x963B52C73B4143ACull,
-                                  0x24DE25E496342EB8ull, 0xB121A79E457669E8ull, 0x0357BBB2DEE43C1Full};
+// The last is the game's night vision (2026-11-08 census 3 against 4: one draw an eye into the HDR after the lighting,
+// reading the depth copy and G-buffer RT0); re-issued like a light so the own hull gets it in separate mode.
+constexpr uint64_t kLightVs[7] = {0x7E38A6AA1269C901ull, 0x8289669D93A18C1Dull, 0x963B52C73B4143ACull,
+                                  0x24DE25E496342EB8ull, 0xB121A79E457669E8ull, 0x0357BBB2DEE43C1Full,
+                                  0xFCF7BD2896751D96ull};
 constexpr UINT kPoolSlot = 33;            // VS t33: the pool a pool draw reads
 constexpr UINT kSlotTarget = 6;           // engine motion's MRT6 (dxbc_engine_velocity.h kEngineVelocityTarget): float2(2*slot+1, depth)
 constexpr uint32_t kRecordBytes = 336;    // a pool record (tools\eye_run_ledger.py REC)
@@ -68,7 +71,10 @@ constexpr ULONGLONG kReportMs = 30000;
 // the discard off for kHoldFrames frames. 1500, not 400: the own ship's undrawn records near it (interior, LODs) put
 // 260-700 records in the mask over terrain with no neighbour (ledgers 193029413006, 214124277001; 2026-11-08 21:40).
 constexpr uint32_t kOwnMaskMax = 1500;
-constexpr uint32_t kHoldFrames = 16;
+// 120, not 16 (2026-11-08 22:00): while textures streamed in, misses came every few dozen frames and each 16-frame hold
+// ended in another lost frame, so the ship blinked. The layer still runs and is checked on held frames, so a hold only
+// ends after 120 frames in a row without a miss. Any other fallback ending starts the same hold (decideNext).
+constexpr uint32_t kHoldFrames = 120;
 constexpr float kTaaCurrent = 0.1f;       // the hull layer's TAA: this frame's weight against the clamped history
 constexpr UINT kTimerRing = 8;            // timestamp sets a timer keeps in flight
 constexpr int kToneStage = 10;            // Pending::stage of the tonemap re-issue (not a Stage)
@@ -2094,6 +2100,9 @@ void decideNext() {
         ++g_win.separateFrames;
     else
         ++g_win.fallback[why];
+    // A fallback other than the hold itself (mask pending or large, frame generation, outside) re-arms the hold, so
+    // separate resumes only after kHoldFrames clean frames, never on the first frame the reason clears.
+    if (!g_discard && why != kFbStreak) g_hold = kHoldFrames;
 }
 
 // ---- the readbacks, the dump ------------------------------------------------------------------------------------------
