@@ -37,9 +37,12 @@
 //      plane's motion and stretched along it past the bar), where the background pull read each row from a different neighbour
 //   16 an orphan (FG_ORPHAN): fgSynSrc's offer withheld from one pixel of a still plane (an edit of the rig's own build) leaves a key and no read offer; the resolve counts it and
 //      makes it a hole the fill reads right, not the all-ones read 2047 px off; the production build makes none
+//   17 the hull's outline against space (FG_HALO, FG_SENTINEL_SURFACE): an outline drawn without depth 2 px outside a still hull over a moving far plane stays on the hull and
+//      nowhere in the sky; a patch of the hull with a rejected history moves with the hull, not with the sky past the silhouette
 // Mutations (each replaces one of the shader's #define switches, or the host's f, and the case it guards must fail): f ignored, the head turn not taken out of the
 // vector, the guard off, the fill from the nearer side, the score's turn not applied, the score's turn applied the wrong way round, an edge pixel on its own vector, the
-// sentinel as a vector, S resampled bilinear, the cubic without its clamp (FG_SHARP=3), the hole fill by the background pull alone (FG_FILL_REPROJ), an orphan read as its all-ones (FG_ORPHAN).
+// sentinel as a vector, S resampled bilinear, the cubic without its clamp (FG_SHARP=3), the hole fill by the background pull alone (FG_FILL_REPROJ), an orphan read as its all-ones (FG_ORPHAN), the halo off (FG_HALO), a rejected vector from any
+// surface (FG_SENTINEL_SURFACE).
 #include <windows.h>
 #include <d3d11.h>
 #include <wrl/client.h>
@@ -589,9 +592,10 @@ Edge case5Edge(Gpu& g, Scope& sc, bool report) {
     std::snprintf(label, sizeof(label), "case 5: the object keeps its colour past its edge (worst deviation %.4f)", e.objWorst);
     sc.ok(e.objWorst < 0.01f, label);
     // The sky pixel beside the object takes the object's depth and, since 2026-11-07, its vector (FG_DILATE_MV): it moves with the object and loses its S pixels to the
-    // object's own, so the guard moves no read here (one a row before, when it moved by the sky's vector).
-    std::snprintf(label, sizeof(label), "case 5: the counters: the strip of 2 px by %d rows was filled from the background (%u), nothing was left (%u), the guard moved no read (%u)", RH, e.filled, e.left, e.guard);
-    sc.ok(e.filled >= 2u * (RH - 2) && e.filled <= 2u * RH + 4 && e.left == 0 && e.guard == 0u, label);
+    // object's own, so the 3x3 guard moves no read here (one a row before, when it moved by the sky's vector). Since 2026-11-08 (FG_HALO) the sky pixel 2 px out moves with
+    // the object too, and the sky pixel 3 px out keeps on itself the footprint read that would reach into that halo: one guarded read a row, the sky's own colour.
+    std::snprintf(label, sizeof(label), "case 5: the counters: the strip of 2 px by %d rows was filled from the background (%u), nothing was left (%u), the guard moved at most one read a row (%u)", RH, e.filled, e.left, e.guard);
+    sc.ok(e.filled >= 2u * (RH - 2) && e.filled <= 2u * RH + 4 && e.left == 0 && e.guard <= static_cast<unsigned>(RH), label);
     if (g_verbose && report) std::printf("  case 5: sky worst %.4f, object worst %.4f, filled %u, left %u, guard %u\n", e.skyWorst, e.objWorst, e.filled, e.left, e.guard);
     return e;
 }
@@ -1791,6 +1795,55 @@ Orphan case16Orphan(Gpu& g, Scope& sc, bool report, const char* define = "") {
     return e;
 }
 
+// Case 17 (2026-11-08, eye dump 120812713001, the own hull's outline torn against space in a ship turn): the hull (right of x = 64, 60 m, still in the eye: vectors 0) over
+// the far plane that the ship's turn moves away from it (vectors +8 px: at f = 0.5 S reads the sky 4 px to the right). Red is the render x read: the sky a gradient, the
+// outline the game draws without depth just outside the hull (x 62 and 63, the far plane, the sky's vectors: B's output carries it 2 render px out) -100, the hull 1000,
+// and a patch on the hull (x 70 to 73, 58 m) whose history was rejected (the sentinel in its vectors, within 32 px of the sky) 500 + x. Expected: the outline stays on the
+// hull (S at 62 and 63 reads -100) and nowhere in the sky (no S pixel left of 62 reads under -50: neither carried with the sky nor read back by the hole fill), the sky
+// moves as the sky (S reads x + 4 up to x 53), and the patch moves with the hull, its own surface, not with the sky beyond the silhouette (S at 70 to 73 reads 500 + x).
+struct HullHalo { bool ran = false; float outline = 0.0f, skyMin = 0.0f, skyWorst = 0.0f, patchWorst = 0.0f; };
+
+HullHalo case17HullHalo(Gpu& g, Scope& sc, bool report) {
+    HullHalo e;
+    char label[300];
+    Scene S;
+    for (int y = 0; y < RH; ++y)
+        for (int x = 0; x < RW; ++x) {
+            const size_t i = static_cast<size_t>(y) * RW + x;
+            const bool hull = x >= 64, outline = x == 62 || x == 63, patch = x >= 70 && x <= 73;
+            float* p = &S.rgba[i * 4];
+            p[0] = patch ? 500.0f + static_cast<float>(x) : (hull ? 1000.0f : (outline ? -100.0f : static_cast<float>(x)));
+            p[1] = static_cast<float>(y); p[2] = 0.5f; p[3] = 1.0f;
+            S.depth[i] = patch ? depthOf(58.0f) : (hull ? depthOf(60.0f) : 0.0f);
+            S.mv[i * 2] = patch ? 2.0f * RW : (hull ? 0.0f : 8.0f);
+            S.mv[i * 2 + 1] = patch ? 2.0f * RH : 0.0f;
+        }
+    FrameGenSynthCb cb;
+    frameGenSynthFillCb(cb, RW, RH, RW, RH, kTan, 0.0f, kDepthB, 10.0f, 0.5f, Deltas(0.0f, 0.0f, 0.0f, 0.0f).d);
+    const Run r = runSynth(g, S, cb);
+    sc.ok(r.ok, "case 17: the synthesizer ran");
+    if (!r.ok) return e;
+    e.ran = true;
+    e.outline = -1e9f;
+    e.skyMin = 1e9f;
+    for (int y = 4; y < RH - 4; ++y) {
+        e.outline = std::max(e.outline, std::max(r.at(62, y, 0, RW), r.at(63, y, 0, RW)));
+        for (int x = 8; x <= 61; ++x) e.skyMin = std::min(e.skyMin, r.at(x, y, 0, RW));
+        for (int x = 8; x <= 53; ++x) e.skyWorst = std::max(e.skyWorst, std::fabs(r.at(x, y, 0, RW) - (x + 4.0f)));
+        for (int x = 70; x <= 73; ++x) e.patchWorst = std::max(e.patchWorst, std::fabs(r.at(x, y, 0, RW) - (500.0f + x)));
+    }
+    std::snprintf(label, sizeof(label), "case 17: the outline drawn without depth 2 px outside the hull stays on the hull (S at x 62 and 63 read at most %.2f, the outline -100)", e.outline);
+    sc.ok(e.outline < -99.0f, label);
+    std::snprintf(label, sizeof(label), "case 17: no outline in the sky, carried with it or read back by the fill (the least S left of x 62 reads %.2f; the outline -100)", e.skyMin);
+    sc.ok(e.skyMin > -50.0f, label);
+    std::snprintf(label, sizeof(label), "case 17: the sky moves as the sky (worst %.4f px)", e.skyWorst);
+    sc.ok(e.skyWorst < 0.1f, label);
+    std::snprintf(label, sizeof(label), "case 17: the hull's patch with a rejected history moves with the hull, not the sky past the silhouette (worst %.4f px)", e.patchWorst);
+    sc.ok(e.patchWorst < 0.1f, label);
+    if (g_verbose && report) std::printf("  case 17: outline column %.2f, least sky read %.2f, sky worst %.4f px, patch worst %.4f px\n", e.outline, e.skyMin, e.skyWorst, e.patchWorst);
+    return e;
+}
+
 int run() {
     Gpu g;
     if (!g.init()) {
@@ -1813,7 +1866,8 @@ int run() {
     case14Sharp(g, sc, true);
     case15Uncover(g, sc, true);
     case16Orphan(g, sc, true);
-    if (!alive("cases 1 to 5 and 13 to 16")) return 1;
+    case17HullHalo(g, sc, true);
+    if (!alive("cases 1 to 5 and 13 to 17")) return 1;
     case6Module(g, sc);
     if (!alive("case 6")) return 1;
     case7Check(g, sc);
@@ -1846,7 +1900,7 @@ int run() {
 
     // The mutations: each must break its case.
     struct Mutation { const char* define; const char* what; std::function<void(Scope&)> run; unsigned fails = 0; };
-    Mutation muts[12] = {
+    Mutation muts[14] = {
         {"FG_USE_F", "f ignored (the landing uses f = 1 whatever the block says)", [&](Scope& s) { case2World(g, s); }},
         {"FG_REMOVE_HEAD", "the head turn not taken out of the vector", [&](Scope& s) { case2World(g, s); }},
         // Since the edge pixels move by the vector of the pixel whose depth they took (FG_DILATE_MV), the guard has nothing to move in case 5: it is checked on the
@@ -1863,6 +1917,8 @@ int run() {
         {"FG_SHARP=3", "S's cubic resample without its ringing clamp", [&](Scope& s) { case14Sharp(g, s, false); }},
         {"FG_FILL_REPROJ", "the hole fill by the background pull alone (no reprojection, no stretch)", [&](Scope& s) { case15Uncover(g, s, false); }},
         {"FG_ORPHAN", "an orphan (a key and no read offer) read as its all-ones, not made a hole", [&](Scope& s) { case16Orphan(g, s, false, "FG_ORPHAN"); }},
+        {"FG_HALO", "the far plane 2 px from a hull on the sky's motion and read by the fill as sky", [&](Scope& s) { case17HullHalo(g, s, false); }},
+        {"FG_SENTINEL_SURFACE", "a rejected vector borrowed from the farthest ring pixel, past the silhouette", [&](Scope& s) { case17HullHalo(g, s, false); }},
     };
     for (Mutation& m : muts) {
         ComPtr<ID3D11ComputeShader> mutated[kEntries], saved[kEntries];
@@ -1881,9 +1937,9 @@ int run() {
         if (ms.fails == 0) { ++g_failures; std::printf("FAIL: mutation: %s still passes\n", m.what); }
     }
     // Case 3 reads the head's part the same way as case 2: the head-turn mutation must break it too (a second look, not a second count).
-    std::printf("%s: %u checks, %u failures (mutations: f ignored broke %u checks, head turn not removed broke %u, guard off broke %u, fill from the nearer side broke %u, turn not applied broke %u, turn the wrong way round broke %u, own vector at an edge broke %u, sentinel as a vector broke %u, bilinear resample broke %u, unclamped cubic broke %u, background pull alone broke %u, orphan not a hole broke %u, slot pose ignored broke %u, slot step inverted broke %u)\n",
+    std::printf("%s: %u checks, %u failures (mutations: f ignored broke %u checks, head turn not removed broke %u, guard off broke %u, fill from the nearer side broke %u, turn not applied broke %u, turn the wrong way round broke %u, own vector at an edge broke %u, sentinel as a vector broke %u, bilinear resample broke %u, unclamped cubic broke %u, background pull alone broke %u, orphan not a hole broke %u, halo off broke %u, sentinel from any surface broke %u, slot pose ignored broke %u, slot step inverted broke %u)\n",
                 g_failures ? "FAIL" : "PASS", g_checks, g_failures, muts[0].fails, muts[1].fails, muts[2].fails, muts[3].fails, muts[4].fails, muts[5].fails, muts[6].fails, muts[7].fails,
-                muts[8].fails, muts[9].fails, muts[10].fails, muts[11].fails, poseIgnored, poseInverted);
+                muts[8].fails, muts[9].fails, muts[10].fails, muts[11].fails, muts[12].fails, muts[13].fails, poseIgnored, poseInverted);
     return g_failures ? 1 : 0;
 }
 

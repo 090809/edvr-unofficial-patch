@@ -4,7 +4,7 @@
 // stats words are cleared to 0 by the API (ClearUnorderedAccessViewUint, framegen_synth_pass.h); the read offsets are set to all ones by fgSynSplat (each thread its own
 // pixel; the S grid is the render grid): a pixel whose key is 0 has kNoRead written by fgSynResolve, and a pixel whose key is not 0 has its offset written by fgSynSrc (the
 // pixel that set the key finds it there again and offers it; of tied offers the smallest packed value stands, InterlockedMin, so S does not depend on the order they run in).
-//   fgSynSplat     each B pixel carried to S by its class's motion (fgSynTarget; its class and depth are the nearest of the 3x3 around it, synDepth9, taken where they are read) and
+//   fgSynSplat     each B pixel carried to S by its class's motion (fgSynTarget; its class and depth are the nearest of the 3x3 around it, synDepth9, or of the 5x5's ring for the far plane beside a surface, synHalo, taken where they are read) and
 //                  scattered as a key into the four pixels of its bilinear footprint (InterlockedMax: the nearer surface wins; a pixel that is its own nearest beats one that borrowed
 //                  the dilated depth);
 //   fgSynSrc       the second pass over the same keys: each pixel writes, to every footprint pixel whose final key is its own, that S pixel's READ OFFSET: the B position to read,
@@ -38,7 +38,7 @@
 //
 // The key: 0 a hole, 4 the far plane, else (max(asuint(1 / metres), 8) & ~7) | 4 when the pixel is its own nearest | class (1 cockpit, 2 world). A larger key is a nearer surface.
 //
-// The eleven #defines at the top of kFrameGenSynthCs are the rig's mutation points (tools\framegen_synth_test replaces one with 0 and the case it guards must fail); production
+// The thirteen #defines at the top of kFrameGenSynthCs are the rig's mutation points (tools\framegen_synth_test replaces one with 0 and the case it guards must fail); production
 // compiles them all 1.
 #include <cstring>
 #include <string>
@@ -54,7 +54,9 @@ inline constexpr char kFrameGenSynthCs[] = R"HLSL(
 #define FG_FILL_FAR 1
 #define FG_FILL_REPROJ 1   // a hole is carried back by the background's motion, stretched along it where B is occluded there too (0: the background pull alone)
 #define FG_DILATE_MV 1   // a pixel moves by the vector of the 3x3 pixel whose depth it took (0: its own)
+#define FG_HALO 1       // a far-plane pixel 2 px from a nearer surface (outside the 3x3) takes that surface's depth and vector (0: the 3x3 alone)
 #define FG_SENTINEL 1   // a rejected-history vector (the size * 2 sentinel) borrows its background's (0: taken as motion)
+#define FG_SENTINEL_SURFACE 1   // ...from a ring pixel on its own surface first (0: the farthest ring pixel, whatever surface)
 #define FG_TURN 1        // the score turns S by the residual head rotation (0: it scores it unturned)
 #define FG_TURN_SIGN 1   // the residual is applied the right way round (0: its transpose)
 #define FG_ORPHAN 1      // a pixel with a key and no read offer is a hole, filled (0: its all-ones read as a guarded offset, 2047 px off)
@@ -274,6 +276,38 @@ int2 synNearest9(int2 q, float z9[9], float zr) {
 #endif
 }
 
+bool synFar(float zr) {
+    bool far;
+    temporalDepthMetres(zr, dk.x, dk.y, far);
+    return far;
+}
+
+// FG_HALO (2026-11-08, eye dump 120812713001): the outline the game draws around the own hull against space writes no depth, and B's output carries it (and its glow) to 2
+// render pixels from the hull, past the 3x3. A pixel whose 3x3 is all the far plane but whose 5x5 outer ring holds a nearer surface takes the nearest of that ring's depths
+// and that pixel's vector, so the outline moves with the hull and not with the sky. Elsewhere zr and vq stand.
+float synHalo(int2 q, float zr, inout int2 vq) {
+#if FG_HALO
+    if (!synFar(zr)) return zr;
+    float zb = zr;
+    int2 best = vq;
+    [unroll] for (int i = 0; i < 16; ++i) {
+        int2 d = i < 5 ? int2(i - 2, -2) : (i < 10 ? int2(i - 7, 2) : (i < 13 ? int2(-2, i - 11) : int2(2, i - 14)));
+        int2 n = clamp(q + d, int2(0, 0), int2(sz.x, sz.y) - 1);
+        float zn = Depth.Load(int3(n.x, n.y, 0));
+        if (zn > zb) { zb = zn; best = n; }
+    }
+    if (!synFar(zb)) { vq = best; return zb; }
+#endif
+    return zr;
+}
+
+// A pixel's dilated depth (the 3x3's nearest, else the halo's) with its 3x3 depths and the pixel whose vector it moves by.
+float synDilated(int2 q, out float z9[9], out int2 vq) {
+    float zr = synDepth9(q, z9);
+    vq = synNearest9(q, z9, zr);
+    return synHalo(q, zr, vq);
+}
+
 // A written depth's metres, 1e9 for the far plane (the guard's comparisons).
 float synMetresOrFar(float zr) {
     bool far;
@@ -290,18 +324,27 @@ float2 synVector(int2 q, float2 headPrevMinusB) {
     float2 mv = Mv.Load(int3(q.x, q.y, 0));
 #if FG_SENTINEL
     if (!synRejected(mv)) return mv;
-    float bestZ = 2.0;
-    float2 best = headPrevMinusB;
+    float bestZ = 2.0, sameZ = 2.0;
+    float2 best = headPrevMinusB, same = headPrevMinusB;
+#if FG_SENTINEL_SURFACE
+    float mq = synMetresOrFar(Depth.Load(int3(q.x, q.y, 0)));
+    float mLo = mq * kFillBackMargin, mHi = mq >= 1.0e9 ? 2.0e9 : mq * kFillBackFar;
+#endif
     [loop] for (int r = 2; r <= 32; r *= 2) {
         [unroll] for (int j = 0; j < 8; ++j) {
             int2 d = int2(j < 3 ? -1 : (j > 4 ? 1 : 0), (j == 0 || j == 3 || j == 5) ? -1 : ((j == 2 || j == 4 || j == 7) ? 1 : 0));
             int2 n = clamp(q + d * r, int2(0, 0), int2(sz.x, sz.y) - 1);
             float2 v = Mv.Load(int3(n.x, n.y, 0));
             float zn = Depth.Load(int3(n.x, n.y, 0));
-            if (!synRejected(v) && zn < bestZ) { bestZ = zn; best = v; }
+            bool ok = !synRejected(v);
+            if (ok && zn < bestZ) { bestZ = zn; best = v; }
+#if FG_SENTINEL_SURFACE
+            float mn = synMetresOrFar(zn);
+            if (ok && mn >= mLo && mn <= mHi && zn < sameZ) { sameZ = zn; same = v; }
+#endif
         }
     }
-    return best;
+    return sameZ < 2.0 ? same : best;
 #else
     return mv;
 #endif
@@ -346,13 +389,30 @@ bool fgSynTargetZ(uint2 id, float zr, uint own, int2 vq, out float2 pp, out uint
 // fgSynTargetZ with the pixel's 3x3 read here (the splat).
 bool fgSynTarget(uint2 id, out float2 pp, out uint key) {
     float z9[9];
-    float zr = synDepth9(int2(id), z9);
-    return fgSynTargetZ(id, zr, (z9[4] == zr) ? 4u : 0u, synNearest9(int2(id), z9, zr), pp, key);
+    int2 vq;
+    float zr = synDilated(int2(id), z9, vq);
+    return fgSynTargetZ(id, zr, (z9[4] == zr) ? 4u : 0u, vq, pp, key);
 }
 
 // The 3x3 depths' metres (synMetresOrFar of each), once per source pixel: the guard's comparisons.
 void synMetres9(float z9[9], out float m9[9]) {
     [unroll] for (int j = 0; j < 9; ++j) m9[j] = synMetresOrFar(z9[j]);
+}
+
+// FG_HALO's side of the guard: a far-plane pixel whose 5x5 is all the far plane but whose 7x7 ring holds a nearer surface offers reads up to a pixel toward it, into that
+// surface's halo (the outline, read back 4 px into the sky in 120812713001's turn). Each such ring pixel marks the 3x3 neighbour in its direction as nearer, so the guard
+// keeps the read on the pixel itself when its offset points that way.
+void synHaloMetres(int2 q, float zr, inout float m9[9]) {
+#if FG_HALO
+    if (!synFar(zr)) return;
+    [unroll] for (int i = 0; i < 24; ++i) {
+        int2 d = i < 7 ? int2(i - 3, -3) : (i < 14 ? int2(i - 10, 3) : (i < 19 ? int2(-3, i - 16) : int2(3, i - 21)));
+        int2 n = clamp(q + d, int2(0, 0), int2(sz.x, sz.y) - 1);
+        float m = synMetresOrFar(Depth.Load(int3(n.x, n.y, 0)));
+        int j = (sign(d.y) + 1) * 3 + sign(d.x) + 1;
+        m9[j] = min(m9[j], m);
+    }
+#endif
 }
 
 // The guard: a source pixel (its 3x3 metres m9) with a nearer neighbour (by more than kGuardMargin) on the side its landing offset `off` points to would read across the
@@ -402,12 +462,14 @@ void fgSynSrc(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
     GroupMemoryBarrierWithGroupSync();
     if (id.x < uint(sz.x) && id.y < uint(sz.y)) {
         float z9[9];
-        float zr = synDepth9(int2(id.xy), z9);
+        int2 vq;
+        float zr = synDilated(int2(id.xy), z9, vq);
         float2 pp;
         uint key;
-        if (fgSynTargetZ(id.xy, zr, (z9[4] == zr) ? 4u : 0u, synNearest9(int2(id.xy), z9, zr), pp, key)) {
+        if (fgSynTargetZ(id.xy, zr, (z9[4] == zr) ? 4u : 0u, vq, pp, key)) {
             float m9[9];
             synMetres9(z9, m9);
+            synHaloMetres(int2(id.xy), zr, m9);
             int2 base = int2(floor(pp));
             [unroll] for (int dy = 0; dy < 2; ++dy) {
                 [unroll] for (int dx = 0; dx < 2; ++dx) {
@@ -447,16 +509,18 @@ bool synWinnerRead(int2 n, out float2 rd) {
         int2 w = lo + int2(j & 3, j >> 2);
         if (w.x < 0 || w.y < 0 || w.x >= sz.x || w.y >= sz.y) continue;
         float z9[9];
-        float zr = synDepth9(w, z9);
+        int2 vq;
+        float zr = synDilated(w, z9, vq);
         float2 pp;
         uint kw;
-        if (!fgSynTargetZ(uint2(w), zr, (z9[4] == zr) ? 4u : 0u, synNearest9(w, z9, zr), pp, kw) || kw != key) continue;
+        if (!fgSynTargetZ(uint2(w), zr, (z9[4] == zr) ? 4u : 0u, vq, pp, kw) || kw != key) continue;
         int2 dd = n - int2(floor(pp));
         if (dd.x < 0 || dd.x > 1 || dd.y < 0 || dd.y > 1) continue;
         float2 off = float2(n) - pp;
         float2 r = float2(w) + off;
         float m9[9];
         synMetres9(z9, m9);
+        synHaloMetres(w, zr, m9);
         if (synGuarded(m9, off)) r = float2(w);
         float2 oc = clamp(r - float2(n), -kMaxOffset, kMaxOffset);
         float d = abs(oc.x - o.x) + abs(oc.y - o.y);
@@ -479,6 +543,19 @@ bool synBackAt(float2 p, float mBg, float mFar) {
         float m = synMetresOrFar(Depth.Load(int3(q.x, q.y, 0)));
         if (m < mBg * kFillBackMargin || m > mFar) return false;
     }
+#if FG_HALO
+    // The far plane within 2 px of a nearer surface is FG_HALO's: the outline drawn there without depth, not the sky.
+    if (mBg >= 1.0e9) {
+        float zMax = 0.0;
+        [loop] for (int y = -2; y <= 3; ++y) {
+            [unroll] for (int x = -2; x <= 3; ++x) {
+                int2 h = clamp(i0 + int2(x, y), int2(0, 0), int2(sz.x, sz.y) - 1);
+                zMax = max(zMax, Depth.Load(int3(h.x, h.y, 0)));
+            }
+        }
+        if (!synFar(zMax)) return false;
+    }
+#endif
     return true;
 }
 
@@ -540,11 +617,12 @@ uint fgSynFill(int2 c, out float2 rd) {
     // The occluder at r: where it lands in S (its own motion), so the step follows the background's motion relative to it.
     int2 q = clamp(int2(floor(r + 0.5)), int2(0, 0), int2(sz.x, sz.y) - 1);
     float z9[9];
-    float zr = synDepth9(q, z9);
+    int2 vq;
+    float zr = synDilated(q, z9, vq);
     float2 pq;
     uint kq;
     float2 occ = float2(0.0, 0.0);
-    if (fgSynTargetZ(uint2(q), zr, (z9[4] == zr) ? 4u : 0u, synNearest9(q, z9, zr), pq, kq)) occ = pq - float2(q);
+    if (fgSynTargetZ(uint2(q), zr, (z9[4] == zr) ? 4u : 0u, vq, pq, kq)) occ = pq - float2(q);
     float2 rel = -o - occ;   // the background's step B to S, less the occluder's
     if (dot(rel, rel) > 0.0625) {
         float2 dir = normalize(rel);
