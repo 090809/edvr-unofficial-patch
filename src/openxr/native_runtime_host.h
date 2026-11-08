@@ -343,10 +343,12 @@ class NativeRuntimeHost : public SystemSource, public FrameSink, public Composit
   std::shared_ptr<FlatOwnerWaits> flatWaits=std::make_shared<FlatOwnerWaits>(flatOwnerHooks());
   std::atomic<bool> frameCycleEnabledNoted{false},frameCycleFirstNoted{false},postSubmitFirstNoted{false};
   std::atomic<uint64_t> frameCycleWaitToken{0},frameCycleSubmitToken{0},frameCycleSequence{0};
-  // Phase-0 timing (src/common/periodic_work.h) of the 30 s frame-cycle report: built by makeReport's sorts
-  // inside frameCycles.waitCallerEnd and written by reportFrameCycles, both on Elite's thread, the only user
-  // of this instance. Summaries and SLOW lines go to the runtime's own trace (recordFrameCycleReport): this
-  // DLL has no edvr::Log. Context: the samples the report sorted.
+  // Phase-0 timing (src/common/periodic_work.h) of the 30 s frame-cycle report: built by makeReport's order-statistic
+  // selections inside frameCycles.waitCallerEnd (formerly 28 full sorts), then formatted and written in one batch by
+  // reportFrameCycles, both on Elite's thread (the report reads state other threads write, so it stays there), the only user
+  // of this instance. The span covers the whole report: the build, the owner-invoke and pose-cache lines, the window's lines
+  // and the write. Summaries and SLOW lines go to the runtime's own trace (recordFrameCycleReport): this
+  // DLL has no edvr::Log. Context: the samples the report summarised.
   PeriodicWork frameCycleReportWork{"frame_cycle_report","samples"};
   // native_long_cycle: count is every completed cycle past the threshold,
   // logged or not; logged is how many printed. A cycle of kFreezeAlwaysLogMs (250 ms) or more always prints,
@@ -1512,7 +1514,7 @@ class NativeRuntimeHost : public SystemSource, public FrameSink, public Composit
         timingApplicationSequence.store(opened?sequence:0,std::memory_order_release);
         producerSequence=opened?sequence:0;
       }
-      // waitCallerEnd is where a finished 30 s window becomes its report (makeReport's 28 sorts), so its
+      // waitCallerEnd is where a finished 30 s window becomes its report (makeReport's selections), so its
       // duration is the build half of the report's cost; reportFrameCycles below adds the write half.
       const uint64_t cycleEndBegan=frameCycleUs();
       frameCycles.waitCallerEnd(cycleToken,out.sequence,cycleEndBegan,GetTickCount64(),caller,cycleShape,
@@ -2614,9 +2616,12 @@ class NativeRuntimeHost : public SystemSource, public FrameSink, public Composit
     maybeLongCycleCounts();
     if(!frameCycleFirstNoted&&frameCycles.firstComplete()) {frameCycleFirstNoted=true;nativeTracePrintf("native_frame_cycle,first_complete=1\n");}
     FrameCycleStats::Report r{};if(!frameCycles.takeReport(r))return;
+    // The report's whole cost from here: the owner-invoke and pose-cache lines, then the window's own, then the one write of every
+    // line (NativeTraceBatch). buildUs, the caller's time in waitCallerEnd (makeReport's selections), is added below.
+    const uint64_t writeBegan=frameCycleUs();
+    NativeTraceBatch lines;
     emitOwnerInvoke(r.window,r.valid);
     emitPoseCache(r.window);
-    const uint64_t writeBegan=frameCycleUs();
     const auto& c=r.cycle;const double validSum=c.mean*double(r.valid);
     nativeTracePrintf("native_frame_cycle_window,window=%llu,boundary=host_wait_return_to_next_host_wait_return,admitted=%llu,valid=%u,first=%llu,last=%llu,elapsed_ms=%llu,valid_cycle_sum_ms=%.3f,caller_wait_fps=%.3f,valid_sample_fps=%.3f,caller_thread=%u,wait_thread=%u,thread_consistent=%u,input=%ux%u/%ux%u,output=%ux%u/%ux%u,pacing=%u,should_render=%u,scene_ready=%u,generation=%llu,feature_epoch=%llu,missing_clock=%llu,missing_reentrant=%llu,missing_thread=%llu,missing_sequence=%llu,missing_partial=%llu,missing_duplicate_eye=%llu,missing_direct_owner=%llu,missing_scope=%llu,missing_overflow=%llu,late_frames=%llu,frame_end_overlap=%u\n",
       (unsigned long long)r.window,(unsigned long long)r.admitted,r.valid,(unsigned long long)r.firstSequence,(unsigned long long)r.lastSequence,(unsigned long long)r.elapsedMs,validSum,
@@ -2661,6 +2666,7 @@ class NativeRuntimeHost : public SystemSource, public FrameSink, public Composit
     postPhase("post_present_handoff",r.handoffNested,r.handoffValid,1);
     postPhase("handoff_count",r.handoffCount,r.handoffValid,1,"calls");
     reportPerformanceMetrics(r.window);
+    lines.close(); // the write is part of the span below
     recordFrameCycleReport(buildUs+(frameCycleUs()-writeBegan),r.valid);
   }
   void reportSubmitStats() {
