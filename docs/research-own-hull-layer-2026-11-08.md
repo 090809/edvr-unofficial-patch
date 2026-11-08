@@ -19,6 +19,13 @@ The smear is terrain that is newly uncovered at the hull edge every frame
   terrain motion per frame), as the FG doc's 2026-11-08 entry concluded.
   Layering may still help frame generation (see Result). The text below is
   the study as written before the test.
+* **Update, draw order (section "The eye pass's draw order"):** option (a)
+  is cheaper than Finding 3 says. The own ship is one contiguous block of
+  37-40 G-buffer draws (54-57 records) in all six captures. The terrain is
+  drawn after it and fills its pixels once the block is left out. The
+  lighting is 4-12 draws an eye. A hull layer costs ~80 re-issues an eye
+  and about one lighting pass on the GPU. Next: the five open checks in that
+  section, all offline.
 * **Finding 1, the hull is a deferred G-buffer object.** It is drawn by the
   pool families vs_66DE/ps_864F, 61AE/FC43, AACF/CF53 and DE54/E46E, plus the
   BBE5/DB3E decal overlay (depth writes off), into the same four-target
@@ -255,3 +262,73 @@ Script and full tables: shared notes folder, `hull-fill-20261108\`
     separately) still removes the hull-edge disocclusion *between* game
     frames, where the world under last frame's hull is not needed. That
     is a separate design question for the FG arc, not a fix for DLSS.
+
+## The eye pass's draw order (2026-11-08, offline, no build)
+
+Question: can the own hull be split off at the G-buffer, before the lighting,
+and what would re-lighting it cost? Source: the eye run ledgers
+`edvr_logs\pool\draws_<stamp>.bin` (v2 rows: VS, PS, RT token, instance
+range; `tools\eye_run_ledger.py` format), `inst_*` and `pool_*` for the
+records. Six captures: 132100543006 (terrain, the smear), 222433569001,
+225627723003, 120812713001 (space), 152830339005 (station), 202822011003
+(busy station, 5,406 draws). Scripts: shared notes `hull-fill-20261108\`
+(`draw_order.py`, `hull_block.py`, `block_pos.py`).
+
+The frame, the same in all six (L then R where the stage is per eye):
+
+1. Depth-only prepass into each eye, null PS, ~40-50 draws an eye
+   (`ACE405F4`, 26k-104k vertices a draw, not pool draws: terrain). The
+   hull is not in it.
+2. G-buffer, left eye, then right. Inside it: cockpit shell (`BFE5` x15),
+   pool draws, then **the own ship as one contiguous block of 37-40 draws**
+   (AACF 10, DE54 13-15, 66DE 13, 61AE 1; 1-8 instances a draw), then the
+   terrain (`6C320453`, `72BDD292`), then more pool draws.
+3. Hull decals (`BBE5`) as their own run after each eye's G-buffer, 22-25
+   draws an eye (hundreds at a station: other ships').
+4. Screen-space passes, 3 draws an eye (`DEF19B03`, `53211E8C` x2).
+5. **Lighting: 4-12 draws an eye** (`7E38A6AA`, `8289669D`, `24DE25E4`,
+   `0357BBB2`, `963B52C7`), instanced volumes, 279-2,693 instances.
+6. Forward and transparents into the lit target, 57-200 draws an eye
+   (34-156 of them pool draws).
+
+The block is the own ship:
+
+- Its records are the same 54-57 in every capture and every frame, 60-75 m
+  apart, and none of them is drawn by any other hull-family draw. At the
+  busy station the 32 other ships' records are all outside it.
+- The same 11-13 records also take the hull decals.
+- Not yet checked: that the camera sits inside the block's extent (needs
+  `camera_<stamp>.json` and the pool's frame of reference).
+
+What this changes:
+
+- The split can be per draw, not per pixel. The own ship arrives as one
+  batch, not mixed into other ships' instanced calls. The ruled-out line
+  above is about a rule by shader pair, and it stands; a rule by batch
+  (the family block after the cockpit shell, or by its records) is new.
+- The terrain is drawn after the hull with the prepass's depth. With the
+  hull block left out of the main G-buffer, the terrain fills the hull's
+  pixels by itself.
+- Re-lighting a hull layer is ~10 draws an eye, not a re-run of the
+  pipeline: re-issue the block (~40) and its decals (~22) into a private
+  G-buffer and depth, then the 3 screen-space and 4-12 lighting draws with
+  those bound. That is ~80 immediate re-issues an eye, ~25-50 µs of CPU at
+  the measured 283-349 ns a draw. GPU: about lighting_volume's 0.1-0.7 ms
+  again, less if scissored to the hull, plus the terrain now shaded under
+  the hull. **Finding 3's "several ms" was wrong for (a).**
+
+Open, each needs a check before a build:
+
+1. Camera containment, above.
+2. Which inputs the 3 screen-space draws and the lighting read (G-buffer
+   SRVs, depth, their outputs), and whether fog and atmosphere are in the
+   lighting draws or in the forward pass.
+3. The forward pass over the hull layer: the own ship's transparents
+   (engine glow, glass) must be tested against the hull layer's depth;
+   world transparents behind the hull must not land on it.
+4. Where the composite goes: before the game's tonemap (HDR, so one
+   tonemap covers both) and after DLSS. The hull layer then needs its own
+   anti-aliasing: a second DLSS feature (~1 ms) or EDVR's TAA on a static
+   layer.
+5. Shadows the hull casts on itself and on the terrain come from shadow
+   maps drawn before the eye pass. Leaving them alone keeps them.
