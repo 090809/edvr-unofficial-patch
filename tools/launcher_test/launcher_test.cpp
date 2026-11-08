@@ -28,6 +28,12 @@
 //   direct       direct launch: Frontier scripted by hand, Steam a fake library the real loader loads,
 //                every row of the fallback table, the order of the ticket, the sign-in and the start
 //   dry run      --direct-dry-run's masked output
+//   frontier login file       the stored Frontier-store login: DPAPI round trip, damage, entropy
+//   frontier store: session   the three-call sign-in, a later launch, a denied login, a refused code, every
+//                             cancel, every fallback to Frontier's own route, unticking
+//   frontier dialogs          the two real windows, hidden and driven by posted keys
+//   log bundle and the login  a bundle never holds the stored login or a launcher log
+//   frontier store: dry run   the stored login only, never asked, never changed
 //   args         the launcher's command line
 //
 // Nothing here touches the real %LOCALAPPDATA%\EDVR, a game folder or any host but
@@ -41,6 +47,7 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
+#include <wincrypt.h>
 #include <shellapi.h>
 #include <shlobj.h>
 #include <shobjidl.h>
@@ -62,19 +69,23 @@
 #include "../../src/installer/detect.h"
 #include "../../src/installer/direct_launch.h"
 #include "../../src/installer/frontier_api.h"
+#include "../../src/installer/frontier_login.h"
 #include "../../src/installer/launch_route.h"
 #include "../../src/installer/launcher_core.h"
+#include "../../src/installer/launcher_login_dialog.h"
 #include "../../src/installer/launcher_main.h"
 #include "../../src/installer/launcher_plan.h"
 #include "../../src/installer/launcher_register.h"
 #include "../../src/installer/launcher_session.h"
 #include "../../src/installer/launcher_state.h"
 #include "../../src/installer/layout_dpi.h"
+#include "../../src/installer/logbundle.h"
 #include "../../src/installer/machine_id.h"
 #include "../../src/installer/selfupdate.h"
 #include "../../src/installer/payload.h"
 #include "../../src/installer/probe.h"
 #include "../../src/installer/steam_ticket.h"
+#include "../../src/installer/ui.h"
 #include "../../src/installer/update_cache.h"
 #include "../../src/installer/update_http.h"
 #include "../../src/installer/update_json.h"
@@ -1618,6 +1629,8 @@ private:
             reply(s, 302, "Found", "Location: /echo\r\n", "");
         } else if (path == "/3.0/user/purchases") {
             reply(s, 307, "Temporary Redirect", "Location: /echo\r\n", "");
+        } else if (path == "/3.0/user/frontier/auth") {
+            reply(s, 302, "Found", "Location: /echo\r\n", "");
         } else {
             reply(s, 404, "Not Found", "", "");
         }
@@ -1875,6 +1888,38 @@ void testHttp() {
         resp = client.get(direct);
         check(!resp.transportOk && !contains(resp.error, "SENTINEL") && !contains(resp.error, "127.0.0.1") && !contains(resp.error, "authToken"), "and neither does the HTTP client's own error: " + resp.error);
     }
+
+    // POST, as Frontier's store sign-in makes it: no body, Content-Length: 0, and no redirect followed.
+    {
+        WinHttpClient wire(true, "9.8.7");
+        HttpRequest post;
+        post.method = "POST";
+        post.url = server.url("/echo?a=1");
+        const HttpResponse echoed = wire.get(post);
+        check(echoed.transportOk && echoed.status == 200 && echoed.body.find("POST /echo?a=1 HTTP/1.1") == 0, "a POST goes out as one: " + echoed.body.substr(0, 40));
+        check(requestHeader(echoed.body, "Content-Length") == "0" && requestHeader(echoed.body, "Authorization").empty() && requestHeader(echoed.body, "User-Agent") == "ed-up-launcher/9.8.7",
+              "with an empty body declared as Content-Length: 0, and the honest user agent");
+        post.url = server.url("/redir");
+        post.followRedirects = true;
+        const size_t before = server.requests().size();
+        const HttpResponse redirected = wire.get(post);
+        check(redirected.transportOk && redirected.status == 302 && server.requests().size() == before + 1, "a redirect to a POST is never followed, even when following is on");
+        HttpRequest odd;
+        odd.method = "DELETE";
+        odd.url = server.url("/ok");
+        check(!wire.get(odd).transportOk, "a method other than GET and POST is refused");
+
+        // The Frontier-store sign-in's first call on the wire: POST, email and password as hex, in the port's order.
+        FrontierApi api(wire, "http://127.0.0.1:" + std::to_string(server.port));
+        std::string enc;
+        const size_t beforeApi = server.requests().size();
+        const ApiResult first = api.frontierFirstSignIn("a@b.c", "pw", "0123456789abcdef", &enc);
+        check(first.outcome == ApiOutcome::RegistrationRequired && enc.empty(), "a 302 to the first sign-in is not followed and gives no code");
+        const std::vector<std::string> seen = server.requests();
+        check(seen.size() == beforeApi + 1 && seen.back().find("POST /3.0/user/frontier/auth?email=6140622E63&password=7077&machineId=0123456789abcdef&lang=en&fTime=") == 0,
+              "its query is email, password, machineId, lang, fTime, with the first two as hex of their bytes: " + (seen.empty() ? std::string() : seen.back().substr(0, 120)));
+        check(!seen.empty() && !contains(seen.back(), "Authorization") && !contains(first.message, "6140622E63") && !contains(first.message, "127.0.0.1"), "no Authorization header, and nothing sent is in the message");
+    }
     server.shutdown();
 }
 
@@ -1887,7 +1932,7 @@ void testHttp() {
 // HKCU this rig creates and removes, and every folder is under the scratch folder.
 // ===========================================================================================
 
-std::wstring g_fakes;  // build\launcher_fakes
+std::wstring g_fakes;  // build\launcher_test_fakes
 std::wstring g_self;   // this program, started again as the stand-in for the elevated copy
 const wchar_t* kFakeGame = L"ed_up_fake_game.exe";
 const wchar_t* kFakeEd = L"ed_up_fake_edlaunch.exe";
@@ -3005,7 +3050,7 @@ void testSession() {
 // ---- direct launch -------------------------------------------------------------------------------------
 //
 // Frontier's servers are never contacted and the real Steam is never loaded. Every reply below is written
-// by hand from what min-ed-launcher's source reads; the Steam library is build\launcher_fakes\steam_api64.dll
+// by hand from what min-ed-launcher's source reads; the Steam library is build\launcher_test_fakes\steam_api64.dll
 // (fake_steam_api.cpp), loaded by the launcher's own loader and export binding; and the game that "starts"
 // is the fake program. The fake library and this rig write what happens, in order, to one log, so the
 // order is proved from what the code did, not from what it says.
@@ -3013,6 +3058,14 @@ void testSession() {
 const char* kFrontier = "https://frontier.example.invalid";
 const char* kAuthToken = "SENTINEL-AUTH-7f3a91c2";
 const char* kMachineToken = "SENTINEL-MACHINE-c20e55d1";
+// Frontier-store sign-in, all made up. None of them may reach a message, a band line, console output or a file
+// (the login file holds the email in the clear and nothing else of these).
+const char* kEmail = "sentinel.cmdr.4c1e@example.invalid";
+const char* kPassword = "SENTINEL-PASSWORD-9d2c41";
+const char* kCode = "SENTINEL-CODE-7731";
+const char* kBadCode = "SENTINEL-BADCODE-2208";
+const char* kEncCode = "SENTINEL-ENC-5b8e";
+const char* kServerMachineToken = "SENTINEL-SERVERSIDE-MACHINE-e1f0";  // what the server's sign-in reply says; the port ignores it
 const char* kFakeTicket = "14000000ABCDEF010203";               // the fake library's canned ticket, as hex
 const char* kMachineGuid = "6f4e2c1a-9b3d-4e8f-a1c2-0d5b7e9f3a11";
 const char* kFrontierGuid = "c0ffee00-1234-4abc-8def-0123456789ab";
@@ -3055,10 +3108,39 @@ std::string joined(const std::vector<std::string>& parts) {
 
 // Text that must never hold a token, the ticket or the machine ID.
 bool leaks(const std::string& text) {
-    for (const char* secret : {kAuthToken, kMachineToken, kFakeTicket, kExpectedMachineId}) {
+    for (const char* secret : {kAuthToken, kMachineToken, kFakeTicket, kExpectedMachineId, kEmail, kPassword, kCode, kBadCode, kEncCode, kServerMachineToken}) {
         if (contains(text, secret)) return true;
     }
     return false;
+}
+
+// treeHas, leaving one file name out: the stored login holds the email in the clear and must hold nothing else.
+bool treeHasSkipping(const std::wstring& dir, const std::vector<std::string>& needles, const std::wstring& skipName) {
+    WIN32_FIND_DATAW find;
+    HANDLE h = FindFirstFileW(P(dir, L"*").c_str(), &find);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    bool found = false;
+    do {
+        const std::wstring name = find.cFileName;
+        if (name == L"." || name == L"..") continue;
+        const std::wstring full = P(dir, name);
+        if (find.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            found = found || treeHasSkipping(full, needles, skipName);
+            continue;
+        }
+        if (_wcsicmp(name.c_str(), skipName.c_str()) == 0) continue;
+        const std::string bytes = readAll(full);
+        for (const std::string& n : needles) found = found || contains(bytes, n);
+    } while (FindNextFileW(h, &find));
+    FindClose(h);
+    return found;
+}
+
+// Every sentinel but the email, for a scan that includes the login file; the email too for one that skips it.
+std::vector<std::string> frontierNeedles(bool withEmail) {
+    std::vector<std::string> out = {kAuthToken, kMachineToken, kFakeTicket, kExpectedMachineId, kPassword, kCode, kBadCode, kEncCode, kServerMachineToken};
+    if (withEmail) out.push_back(kEmail);
+    return out;
 }
 
 bool treeHas(const std::wstring& dir, const std::vector<std::string>& needles) {
@@ -3256,8 +3338,46 @@ GameTree makeGame(const std::wstring& base, bool withDll = true) {
     writeAll(g.edlaunch, "x");
     writeAll(P(g.product, L"EliteDangerous64.exe"), "x");
     writeVersionInfo(g.product, "4.2.1.0");
-    if (withDll) CopyFileW(P(g_fakes, L"steam_api64.dll").c_str(), g.dll.c_str(), FALSE);
+    if (withDll && !CopyFileW(P(g_fakes, L"steam_api64.dll").c_str(), g.dll.c_str(), FALSE))
+        check(false, "the fake steam_api64.dll could not be copied into " + narrowUtf8(g.root) + ": Windows error " + std::to_string(GetLastError()));
     return g;
+}
+
+// <base>\FrontierStore\Elite Dangerous: EDLaunch.exe at the top and the Odyssey product inside, and no Steam library
+// anywhere: an install from Frontier's own store. Its path has no steamapps\common, which is how --direct-dry-run tells.
+GameTree makeFrontierStore(const std::wstring& base) {
+    GameTree g;
+    g.root = P(base, L"FrontierStore\\Elite Dangerous");
+    g.product = P(g.root, L"Products\\elite-dangerous-odyssey-64");
+    g.edlaunch = P(g.root, L"EDLaunch.exe");
+    writeAll(g.edlaunch, "x");
+    writeAll(P(g.product, L"EliteDangerous64.exe"), "x");
+    writeVersionInfo(g.product, "4.2.1.0");
+    return g;
+}
+
+const std::string kFAuthPath = "/3.0/user/frontier/auth";
+const std::string kFTokenPath = "/3.0/user/frontier/token";
+
+Reply encReply() { return jsonReply(std::string("{\"encCode\":\"") + kEncCode + "\"}"); }
+Reply tokenReply() { return jsonReply(std::string("{\"machineToken\":\"") + kMachineToken + "\"}"); }
+// The server's reply names its own machine token; the port uses the one it sent.
+Reply frontierAuthReply() { return jsonReply(std::string("{\"authToken\":\"") + kAuthToken + "\",\"machineToken\":\"" + kServerMachineToken + "\"}"); }
+
+// Frontier's store, scripted: with `firstTime` the auth path answers the first call with a code and the second
+// with the token, as it does for a PC it has not seen; otherwise every auth call is the sign-in proper.
+void scriptStore(FrontierHttp* http, bool firstTime) {
+    scriptHappy(http);
+    http->script[kFAuthPath] = firstTime ? std::vector<Reply>{encReply(), frontierAuthReply()} : std::vector<Reply>{frontierAuthReply()};
+    http->script[kFTokenPath] = {tokenReply()};
+}
+
+bool saveLogin(const std::wstring& path, const char* password, const char* token) {
+    StoredLogin login;
+    login.email = kEmail;
+    login.password = password ? password : "";
+    login.machineToken = token ? token : "";
+    return saveFrontierLogin(path, login, nullptr);
 }
 
 struct RigKeys {
@@ -3722,9 +3842,29 @@ struct DirectRig {
     Recorder rec;
     std::unique_ptr<LauncherSession> session;
 
-    explicit DirectRig(const std::string& name, const std::string& ini) {
+    // A Frontier-store install's questions, answered from these lists (an empty list is a Cancel). They are
+    // called on the window's thread, which is this one: the rig checks that, and what each was told.
+    struct LoginAnswer {
+        bool ok;
+        std::string email, password;
+        bool remember;
+    };
+    struct CodeAnswer {
+        bool ok;
+        std::string code;
+    };
+    std::vector<LoginAnswer> loginAnswers;
+    std::vector<CodeAnswer> codeAnswers;
+    std::vector<std::string> loginNotes, loginEmails, codeNotes, codeEmails;
+    std::vector<bool> loginRemembers, askedOnWindowThread;
+    std::vector<StoredLogin> fileWhenAsked;  // what frontier-login.dat held when the login was asked for
+    std::thread::id windowThread = std::this_thread::get_id();
+    std::wstring loginPath;
+
+    explicit DirectRig(const std::string& name, const std::string& ini, bool frontierStore = false) {
         base = fresh(name);
-        game = makeGame(base);
+        game = frontierStore ? makeFrontierStore(base) : makeGame(base);
+        loginPath = P(base, L"launcher\\frontier-login.dat");
         keys = rigKeys(widenUtf8(name), true);
         scriptHappy(&http);
         if (!ini.empty()) writeAll(P(base, L"launcher\\launcher.ini"), ini);
@@ -3746,6 +3886,30 @@ struct DirectRig {
         e.frontierBase = kFrontier;
         e.machineKeys = keys.keys;
         e.clock.unixNow = []() { return 1700000000ll; };
+        e.askLogin = [this](const std::string& note, LoginForm* form) {
+            askedOnWindowThread.push_back(std::this_thread::get_id() == windowThread);
+            loginNotes.push_back(note);
+            loginEmails.push_back(form->email);
+            loginRemembers.push_back(form->remember);
+            StoredLogin onDisk;
+            loadFrontierLogin(loginPath, &onDisk);
+            fileWhenAsked.push_back(onDisk);
+            const size_t n = loginNotes.size() - 1;
+            if (n >= loginAnswers.size() || !loginAnswers[n].ok) return false;
+            form->email = loginAnswers[n].email;
+            form->password = loginAnswers[n].password;
+            form->remember = loginAnswers[n].remember;
+            return true;
+        };
+        e.askCode = [this](const std::string& email, const std::string& note, std::string* code) {
+            askedOnWindowThread.push_back(std::this_thread::get_id() == windowThread);
+            codeEmails.push_back(email);
+            codeNotes.push_back(note);
+            const size_t n = codeNotes.size() - 1;
+            if (n >= codeAnswers.size() || !codeAnswers[n].ok) return false;
+            *code = codeAnswers[n].code;
+            return true;
+        };
         e.startGame = [this](const std::wstring& exe, const std::wstring& args, const std::wstring& dir) -> HANDLE {
             started.push_back({exe, args, dir});
             eventLog("START");
@@ -3983,6 +4147,731 @@ void testDryRun() {
     dropKeys(keys);
 }
 
+// ---- Frontier's own store: the stored login, the sign-in, the dialogs, the dry run --------------------------
+
+std::string pathsOf(FrontierHttp& http) {
+    std::string out;
+    for (const HttpRequest& r : http.requests) out += (out.empty() ? "" : " ") + pathOf(r.url);
+    return out;
+}
+
+// The sign-in's pieces, from the production code's own hex so a flight's URL and the rig agree.
+std::string hexed(const char* text) { return hexOfBytes(text); }
+
+void testLoginFile() {
+    section("frontier login file");
+    const std::wstring dir = fresh("login-file");
+    const std::wstring path = P(dir, L"launcher\\frontier-login.dat");
+
+    check(saveLogin(path, kPassword, kMachineToken), "a login is written, creating the folder");
+    StoredLogin got;
+    check(loadFrontierLogin(path, &got) && got.email == kEmail && got.password == kPassword && got.machineToken == kMachineToken, "and reads back whole: DPAPI round trip for the password and the machine token");
+    const std::string bytes = readAll(path);
+    check(bytes.find("EDUP-FRONTIER-LOGIN 1\n") == 0 && contains(bytes, std::string("email=") + kEmail), "the file says what it is and holds the email in the clear");
+    check(!contains(bytes, kPassword) && !contains(bytes, kMachineToken) && !contains(bytes, hexed(kPassword)) && !contains(bytes, hexed(kMachineToken)), "and neither the password nor the machine token, in the clear or as hex, is anywhere in its bytes");
+    check(bytes.size() > 200, "the blobs are there: the file is not just a header and an email (" + std::to_string(bytes.size()) + " bytes)");
+
+    // Not remembering the password leaves it out altogether.
+    check(saveLogin(path, nullptr, kMachineToken) && !contains(readAll(path), "password=") && contains(readAll(path), "machine_token="), "no password to remember: no password line is written");
+    check(loadFrontierLogin(path, &got) && got.email == kEmail && got.password.empty() && got.machineToken == kMachineToken, "and it reads back as an email and a token");
+    check(saveLogin(path, kPassword, nullptr) && loadFrontierLogin(path, &got) && got.password == kPassword && got.machineToken.empty(), "a login with no token yet reads back as one");
+
+    // Damage reads as no login at all, and leaves nothing in the result.
+    saveLogin(path, kPassword, kMachineToken);
+    const std::string whole = readAll(path);
+    {
+        // A digit near the end of the blob, where DPAPI keeps its signature.
+        std::string tampered = whole;
+        const size_t at = tampered.find('\n', tampered.find("password=")) - 4;
+        tampered[at] = tampered[at] == 'a' ? 'b' : 'a';
+        writeAll(path, tampered);
+        StoredLogin dirty;
+        dirty.email = "left over";
+        check(!loadFrontierLogin(path, &dirty) && dirty.email.empty() && dirty.password.empty() && dirty.machineToken.empty(), "a changed byte inside the encrypted password is no login");
+    }
+    {
+        std::string tampered = whole;
+        const size_t at = tampered.find('\n', tampered.find("machine_token=")) - 4;
+        tampered[at] = tampered[at] == '0' ? '1' : '0';
+        writeAll(path, tampered);
+        check(!loadFrontierLogin(path, &got), "nor is one inside the encrypted token");
+    }
+    writeAll(path, whole.substr(0, whole.size() - 12));
+    check(!loadFrontierLogin(path, &got), "a file cut short is no login");
+    writeAll(path, "not a login file\nemail=x\n");
+    check(!loadFrontierLogin(path, &got), "a file with another header is no login");
+    writeAll(path, whole + "extra=1\n");
+    check(!loadFrontierLogin(path, &got), "a line this version did not write is no login");
+    writeAll(path, std::string("EDUP-FRONTIER-LOGIN 1\n") + "password=00\n");
+    check(!loadFrontierLogin(path, &got), "a header and a password that does not decrypt, with no email, is no login");
+    writeAll(path, std::string());
+    check(!loadFrontierLogin(path, &got), "an empty file is no login");
+    check(!loadFrontierLogin(P(dir, L"launcher\\missing.dat"), &got), "a missing file is no login");
+
+    // Encrypted without this program's entropy: the same user, another program's blob.
+    {
+        const std::string secret = "SENTINEL-NO-ENTROPY";
+        DATA_BLOB in;
+        in.pbData = reinterpret_cast<BYTE*>(const_cast<char*>(secret.data()));
+        in.cbData = static_cast<DWORD>(secret.size());
+        DATA_BLOB out{};
+        check(CryptProtectData(&in, L"rig", nullptr, nullptr, nullptr, CRYPTPROTECT_UI_FORBIDDEN, &out) != FALSE, "the rig can protect a blob of its own");
+        std::string hex;
+        static const char digits[] = "0123456789abcdef";
+        for (DWORD i = 0; i < out.cbData; ++i) {
+            hex.push_back(digits[out.pbData[i] >> 4]);
+            hex.push_back(digits[out.pbData[i] & 15]);
+        }
+        LocalFree(out.pbData);
+        writeAll(path, std::string("EDUP-FRONTIER-LOGIN 1\nemail=") + kEmail + "\npassword=" + hex + "\n");
+        check(!loadFrontierLogin(path, &got), "a blob protected without the launcher's entropy string does not open");
+    }
+
+    // Writing and forgetting.
+    check(!saveFrontierLogin(path, StoredLogin(), nullptr), "an empty login is not written");
+    StoredLogin breaking;
+    breaking.email = "a@b\nc@d";
+    check(!saveFrontierLogin(path, breaking, nullptr), "an email with a line break is not written");
+    saveLogin(path, kPassword, kMachineToken);
+    check(forgetFrontierSecrets(path) && loadFrontierLogin(path, &got) && got.email == kEmail && got.password.empty() && got.machineToken.empty() && !contains(readAll(path), "password=") && !contains(readAll(path), "machine_token="),
+          "forgetting keeps the email and drops the password and the token");
+    check(deleteFrontierLogin(path) && !exists(path) && deleteFrontierLogin(path), "deleting removes the file, and is fine when it is already gone");
+    std::string error;
+    check(!saveFrontierLogin(L"", StoredLogin{kEmail, "", ""}, &error) && !contains(error, kEmail), "a login that cannot be written says so without a value: " + error);
+    std::string wiped = "secret";
+    wipeString(&wiped);
+    check(wiped.empty(), "wipeString leaves an empty string");
+
+    check(contains(loginPrivacyLine(false), "stored encrypted for this Windows user") && !contains(loginPrivacyLine(false), "Wine"), "the line under the form says the password is stored encrypted for this Windows user");
+    check(contains(loginPrivacyLine(true), "Wine or Proton") && contains(loginPrivacyLine(true), "not strongly protected") && !contains(loginPrivacyLine(true), "encrypted for this Windows user"), "and under Wine or Proton that the saved password is not strongly protected");
+    check(contains(loginPrivacyLine(false), "only to Frontier's servers") && contains(loginPrivacyLine(true), "only to Frontier's servers"), "both say the password goes only to Frontier's servers");
+    LoginForm form;
+    check(!loginFormComplete(form) && !loginFormComplete(LoginForm{"a@b", "", true}) && !loginFormComplete(LoginForm{"", "pw", true}) && loginFormComplete(LoginForm{"a@b", "pw", false}), "a form is complete only with an email and a password");
+}
+
+void testStoreSession() {
+    section("frontier store: the session");
+    endFakes();
+    setSteamMode("");
+    const std::string flagVr = "/autorun /autoquit /edo /vr", flagFlat = "/autorun /autoquit /edo /novr";
+
+    // The first sign-in on a PC: auth, then a code, then the token, then auth again with it.
+    {
+        DirectRig rig("store-first", "direct_launch=on\n", true);
+        scriptStore(&rig.http, true);
+        rig.loginAnswers = {{true, kEmail, kPassword, true}};
+        rig.codeAnswers = {{true, kCode}};
+        rig.play(L"Frontier launcher", true, false);
+        check(rig.session->playing() && contains(rig.session->playLine(), "Signing in"), "Play marks the session busy at once: " + rig.session->playLine());
+        check(rig.ui.pump([&]() { return rig.ui.closed == 1; }), "the window closes when the game exits");
+        check(pathsOf(rig.http) == kTimePath + " " + kFAuthPath + " " + kFTokenPath + " " + kFAuthPath + " " + kPurchasesPath + " " + kInstallerPath, "six calls, in order: time, auth, token, auth, purchases, installer: " + pathsOf(rig.http));
+        if (rig.http.requests.size() == 6) {
+            const HttpRequest& first = rig.http.requests[1];
+            const HttpRequest& token = rig.http.requests[2];
+            const HttpRequest& second = rig.http.requests[3];
+            const HttpRequest& purchases = rig.http.requests[4];
+            const HttpRequest& installer = rig.http.requests[5];
+            for (int i = 1; i <= 3; ++i) {
+                const HttpRequest& r = rig.http.requests[static_cast<size_t>(i)];
+                check(r.method == "POST" && r.headers.empty() && headerOf(r, "Authorization") == "<none>" && !r.followRedirects && r.maxBytes == kFrontierMaxBytes && r.url.compare(0, std::strlen(kFrontier), kFrontier) == 0,
+                      "call " + std::to_string(i) + " is a POST with no Authorization header, no redirect followed and a 4 MiB cap: " + pathOf(r.url));
+            }
+            check(queryNames(first.url) == "email,password,machineId,lang,fTime" && queryValue(first.url, "email") == hexed(kEmail) && queryValue(first.url, "password") == hexed(kPassword) && queryValue(first.url, "machineId") == kExpectedMachineId &&
+                      queryValue(first.url, "lang") == "en",
+                  "first auth: email, password (both as hex of their bytes), machineId, lang, fTime: " + queryNames(first.url));
+            check(queryNames(token.url) == "machineId,plainCode,encCode,lang" && queryValue(token.url, "plainCode") == kCode && queryValue(token.url, "encCode") == kEncCode && queryValue(token.url, "machineId") == kExpectedMachineId,
+                  "token: machineId, plainCode (as typed), encCode (as Frontier sent it), lang: " + queryNames(token.url));
+            check(queryNames(second.url) == "email,password,machineId,machineToken,lang,fTime" && queryValue(second.url, "machineToken") == kMachineToken && queryValue(second.url, "email") == hexed(kEmail) && queryValue(second.url, "password") == hexed(kPassword),
+                  "second auth: email, password, machineId, machineToken, lang, fTime, with the token the code earned: " + queryNames(second.url));
+            check(purchases.method == "GET" && queryNames(purchases.url) == "fTime,authToken,machineToken" && queryValue(purchases.url, "authToken") == kAuthToken && queryValue(purchases.url, "machineToken") == kMachineToken && headerOf(purchases, "Authorization") == "<none>",
+                  "purchases: fTime, authToken, machineToken in the query and no Authorization header: " + queryNames(purchases.url));
+            check(installer.method == "GET" && queryNames(installer.url) == "machineToken,authToken,machineId,sku,os,fTime" && queryValue(installer.url, "sku") == "FORC-FDEV-DO-38-IBE" && headerOf(installer, "Authorization") == "<none>",
+                  "installer: the same query as on Steam, and no header: " + queryNames(installer.url));
+        }
+        check(rig.started.size() == 1 && rig.started[0].exe == P(rig.game.product, L"EliteDangerous64.exe") && rig.started[0].dir == rig.game.product, "the game is started once, from its own folder");
+        const std::string args = rig.started.empty() ? std::string() : narrowUtf8(rig.started[0].args);
+        check(args == std::string("\"ServerToken ") + kMachineToken + " " + kAuthToken + " /Zz\" /vr /edo --foo", "the command line has no /steam, the token the code earned (not the one the server's reply names) and the auth token: " + args);
+        check(!contains(args, "/steam") && !contains(args, kServerMachineToken), "no /steam, and the server's own machine token is not used");
+        check(eventIndex(eventTags(), "load") < 0 && eventIndex(eventTags(), "init") < 0 && eventIndex(eventTags(), "START") >= 0, "Steam's library was never loaded, and the game was started: " + joined(eventTags()));
+        check(rig.rec.uris.empty() && rig.rec.spawns.empty() && rig.hidden == 1, "no store address and no EDLaunch, and the window hid once");
+        check(rig.loginNotes.size() == 1 && rig.codeNotes.size() == 1 && rig.loginNotes[0].empty() && rig.codeNotes[0].empty() && rig.loginEmails[0].empty() && rig.codeEmails[0] == kEmail,
+              "the login was asked for once, with nothing known, and the code once, naming the email it went to");
+        check(rig.askedOnWindowThread.size() == 2 && rig.askedOnWindowThread[0] && rig.askedOnWindowThread[1], "both questions were asked on the window's thread, not the worker's");
+        StoredLogin saved;
+        check(loadFrontierLogin(rig.loginPath, &saved) && saved.email == kEmail && saved.password == kPassword && saved.machineToken == kMachineToken, "frontier-login.dat holds the email, the password and the token");
+        const std::string bytes = readAll(rig.loginPath);
+        check(!contains(bytes, kPassword) && !contains(bytes, kMachineToken) && !contains(bytes, kAuthToken) && !contains(bytes, kCode) && !contains(bytes, kEncCode), "and none of them, nor the code, is readable in its bytes");
+        check(!rig.anyLineLeaks() && !treeHas(rig.base, frontierNeedles(false)) && !treeHasSkipping(rig.base, frontierNeedles(true), L"frontier-login.dat"),
+              "no line the band showed (" + std::to_string(rig.seen.size()) + ") and no file under the data root holds a sentinel, the login file holding only the email");
+        check(treeHas(rig.base, {kEmail}), "the control: the scan does see the email where it is meant to be, in the login file");
+        LauncherState state;
+        state.load(P(P(rig.base, L"launcher"), L"launcher.ini"), nullptr);
+        check(state.mode(rig.game.product) == "vr" && state.directLaunch(), "VR is remembered for the install, and the setting is still on");
+    }
+
+    // A later launch: the stored login, one call, and nothing asked.
+    {
+        DirectRig rig("store-later", "direct_launch=on\n", true);
+        scriptStore(&rig.http, false);
+        saveLogin(rig.loginPath, kPassword, kMachineToken);
+        rig.play(L"Frontier launcher", false, false);
+        check(rig.ui.pump([&]() { return rig.ui.closed == 1; }), "a later launch starts the game and closes the window");
+        check(pathsOf(rig.http) == kTimePath + " " + kFAuthPath + " " + kPurchasesPath + " " + kInstallerPath, "four calls: one sign-in, as the password is sent every time: " + pathsOf(rig.http));
+        const HttpRequest* auth = rig.http.nth(kFAuthPath);
+        check(auth && auth->method == "POST" && queryNames(auth->url) == "email,password,machineId,machineToken,lang,fTime" && queryValue(auth->url, "password") == hexed(kPassword) && queryValue(auth->url, "machineToken") == kMachineToken,
+              "it is the call with the machine token, and the password goes with it");
+        check(rig.loginNotes.empty() && rig.codeNotes.empty(), "nothing was asked");
+        check(!rig.started.empty() && narrowUtf8(rig.started[0].args) == std::string("\"ServerToken ") + kMachineToken + " " + kAuthToken + " /Zz\" /novr /edo --foo", "flat is /novr, and still no /steam");
+        StoredLogin saved;
+        check(loadFrontierLogin(rig.loginPath, &saved) && saved.password == kPassword && saved.machineToken == kMachineToken, "the stored login is kept");
+        check(!rig.anyLineLeaks() && !treeHasSkipping(rig.base, frontierNeedles(true), L"frontier-login.dat"), "no sentinel in a line or another file");
+    }
+
+    // The password was not remembered: the token is, so the window asks for the password only, and no code is needed.
+    {
+        DirectRig rig("store-forget-password", "direct_launch=on\n", true);
+        scriptStore(&rig.http, true);
+        rig.loginAnswers = {{true, kEmail, kPassword, false}};
+        rig.codeAnswers = {{true, kCode}};
+        rig.play(L"Frontier launcher", true, false);
+        check(rig.ui.pump([&]() { return rig.ui.closed == 1; }), "a first run that does not remember the password still starts the game");
+        check(rig.http.count(kFAuthPath) == 2 && rig.http.count(kFTokenPath) == 1 && rig.started.size() == 1, "after the whole first-time sequence: " + pathsOf(rig.http));
+        StoredLogin saved;
+        check(loadFrontierLogin(rig.loginPath, &saved) && saved.email == kEmail && saved.password.empty() && saved.machineToken == kMachineToken && !contains(readAll(rig.loginPath), "password="), "only the email and the token are stored");
+    }
+    {
+        DirectRig rig("store-token-only", "direct_launch=on\n", true);
+        scriptStore(&rig.http, false);
+        saveLogin(rig.loginPath, nullptr, kMachineToken);
+        rig.loginAnswers = {{true, kEmail, kPassword, true}};
+        rig.play(L"Frontier launcher", true, false);
+        check(rig.ui.pump([&]() { return rig.ui.closed == 1; }), "a stored token with no password asks for the password and starts the game");
+        check(rig.loginNotes.size() == 1 && rig.loginEmails[0] == kEmail && rig.loginRemembers[0] == false && rig.codeNotes.empty(), "the form came up with the email filled in, the box as the user left it, and no code asked");
+        check(pathsOf(rig.http) == kTimePath + " " + kFAuthPath + " " + kPurchasesPath + " " + kInstallerPath, "the token was used with the typed password: one sign-in call: " + pathsOf(rig.http));
+        StoredLogin saved;
+        check(loadFrontierLogin(rig.loginPath, &saved) && saved.password == kPassword && saved.machineToken == kMachineToken, "and ticking the box this time stored the password");
+    }
+
+    // A saved login Frontier denies: the password and token are forgotten first, then the window asks again.
+    {
+        DirectRig rig("store-denied", "direct_launch=on\n", true);
+        scriptStore(&rig.http, false);
+        rig.http.script[kFAuthPath] = {statusReply(403), encReply(), frontierAuthReply()};
+        saveLogin(rig.loginPath, "SENTINEL-OLD-PASSWORD-0001", "SENTINEL-OLD-TOKEN-0002");
+        rig.loginAnswers = {{true, kEmail, kPassword, true}};
+        rig.codeAnswers = {{true, kCode}};
+        rig.play(L"Frontier launcher", true, false);
+        check(rig.ui.pump([&]() { return rig.ui.closed == 1; }), "after a denied saved login, a new sign-in starts the game");
+        check(pathsOf(rig.http) == kTimePath + " " + kFAuthPath + " " + kFAuthPath + " " + kFTokenPath + " " + kFAuthPath + " " + kPurchasesPath + " " + kInstallerPath, "the denied call, then the whole first-time sequence: " + pathsOf(rig.http));
+        check(rig.loginNotes.size() == 1 && contains(rig.loginNotes[0], "did not accept the saved sign-in") && rig.loginEmails[0] == kEmail, "the window said the saved sign-in was refused, with the email it had");
+        check(rig.fileWhenAsked.size() == 1 && rig.fileWhenAsked[0].email == kEmail && rig.fileWhenAsked[0].password.empty() && rig.fileWhenAsked[0].machineToken.empty(), "and by then the stored password and token were gone and the email was kept");
+        const HttpRequest* denied = rig.http.nth(kFAuthPath, 0);
+        check(denied && queryValue(denied->url, "machineToken") == "SENTINEL-OLD-TOKEN-0002" && queryValue(denied->url, "password") == hexed("SENTINEL-OLD-PASSWORD-0001"), "the denied call carried the saved password and token");
+        const HttpRequest* again = rig.http.nth(kFAuthPath, 1);
+        check(again && queryNames(again->url) == "email,password,machineId,lang,fTime" && queryValue(again->url, "password") == hexed(kPassword), "the next call is a first sign-in with the new password");
+        StoredLogin saved;
+        check(loadFrontierLogin(rig.loginPath, &saved) && saved.password == kPassword && saved.machineToken == kMachineToken, "and the new login is what is stored");
+    }
+
+    // A password Frontier refuses on a first sign-in: asked again, with a note.
+    {
+        DirectRig rig("store-bad-password", "direct_launch=on\n", true);
+        scriptStore(&rig.http, true);
+        rig.http.script[kFAuthPath] = {statusReply(400), encReply(), frontierAuthReply()};
+        rig.loginAnswers = {{true, kEmail, "SENTINEL-WRONG-PASSWORD", true}, {true, kEmail, kPassword, true}};
+        rig.codeAnswers = {{true, kCode}};
+        rig.play(L"Frontier launcher", true, false);
+        check(rig.ui.pump([&]() { return rig.ui.closed == 1; }), "a second try after a refused password starts the game");
+        check(rig.loginNotes.size() == 2 && rig.loginNotes[0].empty() && contains(rig.loginNotes[1], "did not accept that email and password") && rig.loginEmails[1] == kEmail, "the second form carried a note and the email: " + (rig.loginNotes.size() > 1 ? rig.loginNotes[1] : std::string()));
+        check(rig.codeNotes.size() == 1, "only the good password led to a code");
+    }
+
+    // A refused code, then a good one: the same encCode is used for both.
+    {
+        DirectRig rig("store-bad-code", "direct_launch=on\n", true);
+        scriptStore(&rig.http, true);
+        rig.http.script[kFTokenPath] = {statusReply(403), tokenReply()};
+        rig.loginAnswers = {{true, kEmail, kPassword, true}};
+        rig.codeAnswers = {{true, kBadCode}, {true, kCode}};
+        rig.play(L"Frontier launcher", true, false);
+        check(rig.ui.pump([&]() { return rig.ui.closed == 1; }), "a refused code and then a good one start the game");
+        check(rig.codeNotes.size() == 2 && rig.codeNotes[0].empty() && contains(rig.codeNotes[1], "did not accept that code"), "the second code window said the first was refused: " + (rig.codeNotes.size() > 1 ? rig.codeNotes[1] : std::string()));
+        check(rig.http.count(kFTokenPath) == 2 && queryValue(rig.http.nth(kFTokenPath, 0)->url, "plainCode") == kBadCode && queryValue(rig.http.nth(kFTokenPath, 1)->url, "plainCode") == kCode &&
+                  queryValue(rig.http.nth(kFTokenPath, 1)->url, "encCode") == kEncCode && rig.http.count(kFAuthPath) == 2,
+              "the token call was made twice with the two codes and one encCode, and the first auth call was not repeated");
+        check(rig.started.size() == 1 && !rig.anyLineLeaks(), "the game started once and no line leaks");
+    }
+
+    // Cancel at each prompt: nothing is started, and nothing else is tried.
+    {
+        DirectRig rig("store-cancel-login", "direct_launch=on\n", true);
+        scriptStore(&rig.http, true);
+        rig.play(L"Frontier launcher", true, false);
+        check(rig.ui.pump([&]() { return !rig.session->playing(); }), "cancelling the login ends the launch");
+        check(rig.session->playLine() == "Sign-in cancelled." && rig.started.empty() && rig.rec.uris.empty() && rig.rec.spawns.empty() && rig.hidden == 0 && rig.ui.closed == 0, "the line says so, and nothing is started or opened: " + rig.session->playLine());
+        check(rig.http.count(kFAuthPath) == 0 && rig.http.count(kFTokenPath) == 0 && rig.http.count(kPurchasesPath) == 0 && !exists(rig.loginPath), "no sign-in call was made and nothing was stored");
+    }
+    {
+        DirectRig rig("store-cancel-code", "direct_launch=on\n", true);
+        scriptStore(&rig.http, true);
+        rig.loginAnswers = {{true, kEmail, kPassword, true}};
+        rig.play(L"Frontier launcher", true, false);
+        check(rig.ui.pump([&]() { return !rig.session->playing(); }), "cancelling the code ends the launch");
+        check(rig.session->playLine() == "Sign-in cancelled." && rig.started.empty() && rig.rec.uris.empty() && rig.rec.spawns.empty(), "the line says so, and nothing is started or opened");
+        check(rig.http.count(kFAuthPath) == 1 && rig.http.count(kFTokenPath) == 0 && rig.http.count(kPurchasesPath) == 0 && !exists(rig.loginPath), "only the first sign-in call was made, no token was asked for, and nothing was stored");
+    }
+    {
+        DirectRig rig("store-cancel-reask", "direct_launch=on\n", true);
+        scriptStore(&rig.http, false);
+        rig.http.script[kFAuthPath] = {statusReply(401)};
+        saveLogin(rig.loginPath, kPassword, kMachineToken);
+        rig.play(L"Frontier launcher", true, false);
+        check(rig.ui.pump([&]() { return !rig.session->playing(); }), "cancelling the window that follows a denied saved login ends the launch");
+        StoredLogin saved;
+        check(rig.session->playLine() == "Sign-in cancelled." && rig.started.empty() && rig.rec.spawns.empty() && loadFrontierLogin(rig.loginPath, &saved) && saved.email == kEmail && saved.password.empty() && saved.machineToken.empty(),
+              "the line says so, nothing is started, and the stored password and token stay forgotten");
+    }
+
+    // Every fallback lands on Frontier's own route, which carries the VR or flat flag.
+    {
+        struct Case {
+            const char* name;
+            std::function<void(DirectRig&)> arrange;
+            const char* reason;
+        };
+        const std::vector<Case> cases = {
+            {"no answer", [](DirectRig& r) { r.http.script[kFAuthPath] = {noAnswer("no route")}; }, "could not be reached"},
+            {"an unavailable server", [](DirectRig& r) { r.http.script[kPurchasesPath] = {statusReply(503)}; }, "unavailable"},
+            {"a refused purchases call", [](DirectRig& r) { r.http.script[kPurchasesPath] = {statusReply(403)}; }, "refused the request (HTTP 403)"},
+            {"the web page twice", [](DirectRig& r) { r.http.script[kFAuthPath] = {htmlReply(), htmlReply()}; }, "web page instead of a sign-in reply"},
+            {"a redirect on sign-in", [](DirectRig& r) { r.http.script[kFAuthPath] = {statusReply(302)}; }, "redirect"},
+            {"a redirect on the version", [](DirectRig& r) { r.http.script[kInstallerPath] = {statusReply(307)}; }, "redirect"},
+            {"a game that needs patching", [](DirectRig& r) { r.http.script[kInstallerPath] = {jsonReply("{\"version\":\"9.9.9.9\"}")}; }, "game needs patching"},
+            {"a reply with no token", [](DirectRig& r) { r.http.script[kFAuthPath] = {jsonReply("{\"nothing\":1}")}; }, "carried no token"},
+            {"a product that is not listed", [](DirectRig& r) { r.http.script[kPurchasesPath] = {jsonReply("{\"purchases\":[]}")}; }, "not among the products"},
+        };
+        int ran = 0;
+        for (const Case& c : cases) {
+            const bool vr = ran++ % 2 == 0;
+            DirectRig rig(std::string("store-fallback-") + std::to_string(ran), "direct_launch=on\n", true);
+            scriptStore(&rig.http, false);
+            saveLogin(rig.loginPath, kPassword, kMachineToken);
+            c.arrange(rig);
+            rig.play(L"Frontier launcher", vr, false);
+            check(rig.ui.pump([&]() { return rig.rec.spawns.size() == 1 && !rig.session->playing(); }), std::string(c.name) + ": Frontier's route is taken and its watcher ends");
+            check(rig.rec.spawns.size() == 1 && rig.rec.spawns[0].exe == rig.game.edlaunch && narrowUtf8(rig.rec.spawns[0].args) == (vr ? flagVr : flagFlat) && rig.rec.uris.empty(),
+                  std::string(c.name) + ": EDLaunch is started with the " + (vr ? "VR" : "flat") + " flag: " + (rig.rec.spawns.empty() ? std::string() : narrowUtf8(rig.rec.spawns[0].args)));
+            check(rig.started.empty() && rig.hidden == 0 && rig.ui.closed == 0 && eventIndex(eventTags(), "START") < 0, std::string(c.name) + ": no game is started directly");
+            bool said = false, steamNamed = false;
+            for (const std::string& line : rig.seen) {
+                if (!contains(line, "Direct launch did not work")) continue;  // the watcher's later lines name Steam among the stores
+                said = said || (contains(line, c.reason) && contains(line, "Frontier's launcher") && contains(line, "VR or flat choice"));
+                steamNamed = steamNamed || contains(line, "Steam");
+            }
+            check(said && !steamNamed, std::string(c.name) + ": the band's line said why, and that Frontier's launcher follows with the choice, without a word about Steam");
+            // A sign-in that worked is written again (the encryption differs each time); what it holds must not change.
+            StoredLogin kept;
+            check(rig.loginNotes.empty() && rig.codeNotes.empty() && loadFrontierLogin(rig.loginPath, &kept) && kept.email == kEmail && kept.password == kPassword && kept.machineToken == kMachineToken,
+                  std::string(c.name) + ": nothing was asked and the stored login still holds what it did");
+            LauncherState state;
+            state.load(P(P(rig.base, L"launcher"), L"launcher.ini"), nullptr);
+            check(state.mode(rig.game.product) == (vr ? "vr" : "flat"), std::string(c.name) + ": the choice is remembered for the install");
+            check(!rig.anyLineLeaks() && !treeHasSkipping(rig.base, frontierNeedles(true), L"frontier-login.dat"), std::string(c.name) + ": no sentinel in a line or a file");
+        }
+        check(ran == 9, "every fallback case was run through the session (" + std::to_string(ran) + ")");
+    }
+
+    // A session that cannot ask: a Frontier-store install with no window stops where it would have asked.
+    {
+        DirectRig rig("store-no-window", "direct_launch=on\n", true);
+        scriptStore(&rig.http, true);
+        // The rig's session was built with questions; one built without them cannot ask.
+        SessionEnv e;
+        e.roots.dataRoot = rig.base;
+        e.roots.canonical = false;
+        e.selfExe = P(rig.base, L"self.exe");
+        e.keys = g_testKeys;
+        e.makeHttp = [&rig]() { return std::unique_ptr<HttpClient>(new Share(&rig.http)); };
+        std::mutex m;
+        std::vector<std::function<void()>> queue;
+        e.post = [&](std::function<void()> f) {
+            std::lock_guard<std::mutex> l(m);
+            queue.push_back(std::move(f));
+        };
+        e.frontierBase = kFrontier;
+        e.machineKeys = rig.keys.keys;
+        e.clock.unixNow = []() { return 1700000000ll; };
+        LauncherSession quiet(e);
+        quiet.beginPlay(L"Frontier launcher", rig.game.product, true, false, rig.rec.ops(), WatchNames(), WatchTiming());
+        const DWORD end = GetTickCount() + 10000;
+        while (quiet.playing() && static_cast<int>(GetTickCount() - end) < 0) {
+            std::vector<std::function<void()>> jobs;
+            {
+                std::lock_guard<std::mutex> l(m);
+                jobs.swap(queue);
+            }
+            for (auto& j : jobs) j();
+            Sleep(5);
+        }
+        check(!quiet.playing() && contains(quiet.playLine(), "Sign in once from the launcher's window"), "with no window to ask in, the launch stops and says to sign in from the window: " + quiet.playLine());
+        check(rig.http.count(kFAuthPath) == 0 && rig.rec.spawns.empty() && rig.rec.uris.empty() && rig.started.empty(), "and no sign-in call is made and nothing is started");
+        quiet.shutdown();
+    }
+
+    // Only the Steam and Frontier-store sources go direct; Epic and a picked folder do not, even with the key on.
+    {
+        DirectRig rig("store-other-sources", "direct_launch=on\n", true);
+        scriptStore(&rig.http, false);
+        WatchNames names;
+        names.game = kFakeGame;
+        names.edlaunch = kFakeEd;
+        WatchTiming timing;
+        timing.pollMs = 40;
+        timing.startupWaitMs = 200;
+        timing.closeWaitMs = 100;
+        rig.session->beginPlay(L"Folder you chose", rig.game.product, true, false, rig.rec.ops(), names, timing);
+        rig.session->shutdown();
+        check(rig.rec.spawns.size() == 1 && rig.http.requests.empty() && rig.started.empty(), "a folder the user picked takes EDLaunch's route and contacts nothing");
+    }
+
+    // Elevated: refused before anything is contacted.
+    {
+        DirectRig rig("store-elevated", "direct_launch=on\n", true);
+        scriptStore(&rig.http, true);
+        rig.loginAnswers = {{true, kEmail, kPassword, true}};
+        rig.play(L"Frontier launcher", true, true);
+        check(!rig.session->playing() && rig.session->playLine() == elevatedRefusal() && rig.http.requests.empty() && rig.loginNotes.empty() && rig.started.empty() && rig.rec.spawns.empty(), "an elevated launcher refuses before it contacts or asks anything");
+    }
+
+    // Unticking deletes the login; the question for a Frontier install says so and what it stores.
+    {
+        DirectRig rig("store-untick", "direct_launch=on\n", true);
+        saveLogin(rig.loginPath, kPassword, kMachineToken);
+        check(exists(rig.loginPath) && rig.session->directLaunch(), "the login is stored and the setting is on");
+        check(!rig.session->setDirectLaunch(false, nullptr) && !exists(rig.loginPath), "unticking turns it off and deletes frontier-login.dat");
+        LauncherState state;
+        state.load(P(P(rig.base, L"launcher"), L"launcher.ini"), nullptr);
+        check(state.get("direct_launch") == "off", "and launcher.ini says off");
+        int asked = 0;
+        check(rig.session->setDirectLaunch(true, [&]() { ++asked; return true; }) && asked == 1 && !exists(rig.loginPath), "turning it on again asks and stores nothing");
+        saveLogin(rig.loginPath, kPassword, nullptr);
+        check(!rig.session->setDirectLaunch(false, nullptr) && !exists(rig.loginPath), "and unticking deletes the file again");
+        const std::string q = kDirectLaunchQuestionFrontier;
+        check(q.find("Start Elite directly instead of through Frontier's launcher?") == 0 && contains(q, "ask for your Frontier email and password") && contains(q, "code Frontier emails you, once on this PC") &&
+                  contains(q, "encrypted for this Windows user") && contains(q, "Frontier has not approved this.") && contains(q, "unticking also deletes the stored login") && q.substr(q.size() - 11) == "Turn it on?",
+              "the Frontier question says it will ask for the login, may need an emailed code once, stores it encrypted, that Frontier has not approved this, and that unticking deletes it");
+        check(!contains(std::string(kDirectLaunchQuestion), "email and password") && contains(std::string(kDirectLaunchQuestion), "No password or token is stored."), "the Steam question is unchanged");
+    }
+}
+
+// The two real windows, hidden, driven from a helper thread by posted keys and messages.
+struct DialogDrive {
+    std::atomic<bool> returned{false};
+};
+
+HWND waitForDialog() {
+    for (int i = 0; i < 1000; ++i) {
+        HWND w = FindWindowW(kFrontierDialogClass, nullptr);
+        if (w) return w;
+        Sleep(5);
+    }
+    return nullptr;
+}
+
+// The boxes by their control IDs (10 email, 11 password, 12 code), not by where they sit in the window's list.
+HWND nthEdit(HWND dialog, int n) { return GetDlgItem(dialog, n == 2 ? 12 : 10 + n); }
+
+// A test that waits for a dialog must not wait forever: if one is still up after the helper is done, close it.
+struct DialogWatchdog {
+    std::atomic<bool> stop{false};
+    std::thread thread;
+    DialogWatchdog() {
+        thread = std::thread([this]() {
+            for (int i = 0; i < 2000 && !stop; ++i) Sleep(5);
+            while (!stop) {
+                HWND w = FindWindowW(kFrontierDialogClass, nullptr);
+                if (w) PostMessageW(w, WM_CLOSE, 0, 0);
+                Sleep(50);
+            }
+        });
+    }
+    ~DialogWatchdog() {
+        stop = true;
+        thread.join();
+    }
+};
+
+void typeInto(HWND edit, const wchar_t* text) { SendMessageW(edit, WM_SETTEXT, 0, reinterpret_cast<LPARAM>(text)); }
+void pressKey(HWND to, WPARAM key) { PostMessageW(to, WM_KEYDOWN, key, 0); }
+
+void testLoginDialog() {
+    section("frontier dialogs");
+    ui::buildFonts(96);
+    DialogWatchdog watchdog;
+    FrontierDialogOptions options;
+    options.visible = false;  // nobody's desktop is disturbed: the window exists and takes messages, hidden
+
+    // Return on an empty form does nothing; so does Sign in; Return on a complete one signs in.
+    {
+        DialogDrive drive;
+        int styleOk = 0;
+        bool stillThereAfterEmptyReturn = false, stillThereAfterEmptyClick = false, stillThereAfterOneField = false, okDisabledWhenEmpty = false, okEnabledWhenComplete = false;
+        std::thread helper([&]() {
+            HWND dialog = waitForDialog();
+            if (!dialog) return;
+            HWND email = nthEdit(dialog, 0), password = nthEdit(dialog, 1);
+            styleOk = (!(GetWindowLongPtrW(email, GWL_STYLE) & ES_PASSWORD) ? 1 : 0) + ((GetWindowLongPtrW(password, GWL_STYLE) & ES_PASSWORD) ? 1 : 0);
+            HWND ok = FindWindowExW(dialog, nullptr, L"BUTTON", L"Sign in");
+            okDisabledWhenEmpty = ok && !IsWindowEnabled(ok);
+            pressKey(email, VK_RETURN);
+            Sleep(250);
+            stillThereAfterEmptyReturn = IsWindow(dialog) && !drive.returned;
+            SendMessageW(dialog, WM_COMMAND, MAKEWPARAM(1, BN_CLICKED), reinterpret_cast<LPARAM>(ok));
+            Sleep(250);
+            stillThereAfterEmptyClick = IsWindow(dialog) && !drive.returned;
+            typeInto(email, L"  cmdr@example.invalid ");
+            pressKey(password, VK_RETURN);
+            Sleep(250);
+            stillThereAfterOneField = IsWindow(dialog) && !drive.returned;
+            typeInto(password, L"made-up-password");
+            Sleep(50);
+            okEnabledWhenComplete = ok && IsWindowEnabled(ok);
+            pressKey(password, VK_RETURN);
+        });
+        LoginForm form;
+        form.remember = true;
+        const bool signedIn = showFrontierLogin(options, std::string(), &form);
+        drive.returned = true;
+        helper.join();
+        check(styleOk == 2, "the email box is plain and the password box is masked");
+        check(okDisabledWhenEmpty && okEnabledWhenComplete, "Sign in is unavailable until both boxes have something in them");
+        check(stillThereAfterEmptyReturn && stillThereAfterEmptyClick && stillThereAfterOneField, "Return on an empty form, Sign in on one, and Return with only the email do not submit it");
+        check(signedIn && form.email == "cmdr@example.invalid" && form.password == "made-up-password" && form.remember, "Return on a complete form signs in, with the email trimmed and Remember ticked by default");
+    }
+    // Escape cancels, and the form is left as it was; the email it started with is in the box.
+    {
+        std::wstring shown;
+        std::thread helper([&]() {
+            HWND dialog = waitForDialog();
+            if (!dialog) return;
+            HWND email = nthEdit(dialog, 0);
+            wchar_t text[128]{};
+            GetWindowTextW(email, text, 128);
+            shown = text;
+            typeInto(nthEdit(dialog, 1), L"typed-then-abandoned");
+            pressKey(email, VK_ESCAPE);
+        });
+        LoginForm form;
+        form.email = "known@example.invalid";
+        const bool signedIn = showFrontierLogin(options, "Frontier did not accept the saved sign-in.", &form);
+        helper.join();
+        check(!signedIn && form.password.empty() && form.email == "known@example.invalid", "Escape cancels, and nothing typed is handed back");
+        check(shown == L"known@example.invalid", "the email the launcher knew was already in the box");
+    }
+    // Remember can be unticked; a window closed with its close box is a cancel.
+    {
+        std::thread helper([&]() {
+            HWND dialog = waitForDialog();
+            if (!dialog) return;
+            typeInto(nthEdit(dialog, 0), L"a@b.invalid");
+            typeInto(nthEdit(dialog, 1), L"pw");
+            SendMessageW(dialog, WM_COMMAND, MAKEWPARAM(3, BN_CLICKED), 0);
+            pressKey(nthEdit(dialog, 1), VK_RETURN);
+        });
+        LoginForm form;
+        const bool signedIn = showFrontierLogin(options, std::string(), &form);
+        helper.join();
+        check(signedIn && !form.remember && form.email == "a@b.invalid" && form.password == "pw", "unticking Remember is handed back");
+        std::thread closer([&]() {
+            HWND dialog = waitForDialog();
+            if (dialog) PostMessageW(dialog, WM_CLOSE, 0, 0);
+        });
+        LoginForm other;
+        check(!showFrontierLogin(options, std::string(), &other), "closing the window is a cancel");
+        closer.join();
+    }
+    // The code window.
+    {
+        bool stillThere = false;
+        std::atomic<bool> returned{false};
+        std::thread helper([&]() {
+            HWND dialog = waitForDialog();
+            if (!dialog) return;
+            HWND code = nthEdit(dialog, 2);
+            pressKey(code, VK_RETURN);
+            Sleep(250);
+            stillThere = IsWindow(dialog) && !returned;
+            typeInto(code, L"  123456 ");
+            pressKey(code, VK_RETURN);
+        });
+        std::string code;
+        const bool accepted = showFrontierCode(options, "cmdr@example.invalid", std::string(), &code);
+        returned = true;
+        helper.join();
+        check(stillThere && accepted && code == "123456", "an empty code is not submitted, and a typed one comes back trimmed");
+        std::thread escaper([&]() {
+            HWND dialog = waitForDialog();
+            if (dialog) pressKey(nthEdit(dialog, 2), VK_ESCAPE);
+        });
+        std::string none = "unchanged";
+        check(!showFrontierCode(options, "x@y.invalid", "Frontier did not accept that code.", &none) && none == "unchanged", "Escape cancels the code window, and hands back nothing");
+        escaper.join();
+    }
+    check(FindWindowW(kFrontierDialogClass, nullptr) == nullptr, "no dialog window is left behind");
+}
+
+// A bundle built from a folder layout that holds the stored login and a launcher log never contains either.
+void testBundleLeavesLoginOut() {
+    section("log bundle and the login");
+    const std::wstring base = fresh("bundle-login");
+    const std::wstring launcher = P(base, L"EDVR\\launcher");
+    const std::wstring game = P(base, L"Game");
+    saveLogin(P(launcher, L"frontier-login.dat"), kPassword, kMachineToken);
+    writeAll(P(launcher, L"ed-up-launcher.log"), std::string("a launcher log that names ") + kEmail + " and " + kAuthToken + "\n");
+    writeAll(P(game, L"EliteDangerous64.exe"), "x");
+    writeAll(P(game, L"edvr_logs\\edvr_vr_20260827_140003.log"), "SENTINEL-CONTROL-IN-A-REAL-LOG\n");
+    // The login and the launcher log in the places a bundle looks: the game folder and its log folder.
+    const std::string loginBytes = readAll(P(launcher, L"frontier-login.dat")), logBytes = readAll(P(launcher, L"ed-up-launcher.log"));
+    for (const wchar_t* where : {L"frontier-login.dat", L"edvr_logs\\frontier-login.dat"}) writeAll(P(game, where), loginBytes);
+    for (const wchar_t* where : {L"ed-up-launcher.log", L"edvr_logs\\ed-up-launcher.log"}) writeAll(P(game, where), logBytes);
+    const DumpSearch noDumps{P(base, L"nodumps_local"), P(base, L"nodumps_temp")};
+    const std::wstring out = P(base, L"out");
+    createDirectories(out);
+    const LogBundle bundle = collectLogs(game, out, &noDumps);
+    check(bundle.ok && exists(bundle.zipPath), "the bundle is written: " + bundle.error);
+    std::string joinedNames;
+    for (const std::wstring& n : bundle.included) joinedNames += narrowUtf8(n) + "\n";
+    const std::string zip = bundle.ok ? readAll(bundle.zipPath) : std::string();
+    check(contains(zip, "SENTINEL-CONTROL-IN-A-REAL-LOG"), "the control: a sentinel in a log the bundle does take is readable in the zip, so the scan below can see");
+    check(contains(joinedNames, "edvr_vr_20260827_140003.log"), "and the session's log is in it");
+    check(!contains(joinedNames, "frontier-login") && !contains(joinedNames, "ed-up-launcher.log") && !contains(joinedNames, "launcher"), "no entry is the stored login or a launcher log: " + joinedNames);
+    check(!contains(zip, kEmail) && !contains(zip, kAuthToken) && !contains(zip, "EDUP-FRONTIER-LOGIN"), "and neither file's contents are anywhere in the zip");
+    // The settings can send logs to any folder, the launcher's own included.
+    const std::wstring game2 = P(base, L"Game2");
+    writeAll(P(game2, L"EliteDangerous64.exe"), "x");
+    writeAll(P(game2, L"edvr.ini"), "[log]\r\ndir = " + narrowUtf8(launcher) + "\r\n");
+    writeAll(P(launcher, L"edvr_vr_20260827_140003.log"), "SENTINEL-CONTROL-IN-THE-LAUNCHER-FOLDER\n");
+    const LogBundle second = collectLogs(game2, out, &noDumps);
+    std::string names2;
+    for (const std::wstring& n : second.included) names2 += narrowUtf8(n) + "\n";
+    const std::string zip2 = second.ok ? readAll(second.zipPath) : std::string();
+    check(second.ok && contains(zip2, "SENTINEL-CONTROL-IN-THE-LAUNCHER-FOLDER"), "with the logs sent to the launcher's folder its log is taken, as the control");
+    check(!contains(names2, "frontier-login") && !contains(names2, "ed-up-launcher.log") && !contains(zip2, kEmail) && !contains(zip2, kAuthToken) && !contains(zip2, "EDUP-FRONTIER-LOGIN"), "and still the stored login and the launcher log are not: " + names2);
+}
+
+// --direct-dry-run on a Frontier-store folder: the stored login only, never asked, never changed.
+void testStoreDryRun() {
+    section("frontier store: --direct-dry-run");
+    const std::wstring base = fresh("store-dry");
+    const GameTree game = makeFrontierStore(base);
+    RigKeys keys = rigKeys(L"store-dry", true);
+    const std::wstring loginPath = P(base, L"launcher\\frontier-login.dat");
+    AppArgs a;
+    a.directDryRun = true;
+    a.dir = game.product;
+    a.vr = true;
+    int asked = 0;
+    auto env = [&](FrontierHttp* http) {
+        DirectEnv e = directEnv(http, keys.keys, nullptr);
+        e.loginPath = loginPath;
+        // A caller that could answer. A dry run must never reach them.
+        e.prompts.askLogin = [&asked](const std::string&, LoginForm* form) {
+            ++asked;
+            form->email = kEmail;
+            form->password = kPassword;
+            return true;
+        };
+        e.prompts.askCode = [&asked](const std::string&, const std::string&, std::string* code) {
+            ++asked;
+            *code = kCode;
+            return true;
+        };
+        return e;
+    };
+
+    {
+        FrontierHttp http;
+        scriptStore(&http, false);
+        http.script[kPurchasesPath] = {jsonReply(purchasesJson(std::string("--id ") + kExpectedMachineId + " --mail " + kEmail, "/Zz"))};
+        saveLogin(loginPath, kPassword, kMachineToken);
+        const std::string before = readAll(loginPath);
+        std::vector<std::string> out;
+        resetEvents();
+        const int code = directDryRunLines(a, env(&http), &out);
+        const std::string all = joined(out);
+        check(code == 0 && out.size() >= 3, "a stored login gives a plan and exit code 0: " + std::to_string(code) + " " + all);
+        check(!out.empty() && contains(out[0], "Frontier's own store"), "the first line says which kind of install it took this for: " + (out.empty() ? std::string() : out[0]));
+        check(!leaks(all), "no token, machine ID, email or password is anywhere in what is printed");
+        check(!out.empty() && out.back() == "    " + narrowUtf8(P(game.product, L"EliteDangerous64.exe")) + " \"ServerToken <masked> <masked> /Zz\" /vr --id <masked> --mail <masked>",
+              "the last line is the program and its arguments, with no /steam and every token, the machine ID and the email as <masked>: " + (out.empty() ? std::string() : out.back()));
+        check(pathsOf(http) == kTimePath + " " + kFAuthPath + " " + kPurchasesPath + " " + kInstallerPath && eventTags().size() == 4 && eventIndex(eventTags(), "START") < 0 && eventIndex(eventTags(), "load") < 0,
+              "one sign-in call, Steam never loaded, nothing started: " + pathsOf(http));
+        check(asked == 0 && readAll(loginPath) == before, "nothing was asked and the stored login was not touched");
+    }
+    {
+        // Flat.
+        FrontierHttp http;
+        scriptStore(&http, false);
+        saveLogin(loginPath, kPassword, kMachineToken);
+        AppArgs flat = a;
+        flat.vr = false;
+        flat.novr = true;
+        std::vector<std::string> out;
+        check(directDryRunLines(flat, env(&http), &out) == 0 && !out.empty() && contains(out.back(), " /novr /edo --foo") && !contains(out.back(), "/steam"), "--novr prints /novr");
+    }
+    {
+        // No stored login at all: it says so, asks nothing, contacts nothing beyond the clock.
+        FrontierHttp http;
+        scriptStore(&http, true);
+        deleteFrontierLogin(loginPath);
+        std::vector<std::string> out;
+        const int code = directDryRunLines(a, env(&http), &out);
+        check(code == 3 && !out.empty() && contains(out.back(), "Sign in once from the launcher's window") && !contains(out.back(), "Direct launch did not work") && !leaks(joined(out)),
+              "with no stored login it stops and says to sign in once from the window: " + (out.empty() ? std::string() : out.back()));
+        check(asked == 0 && http.count(kFAuthPath) == 0 && http.count(kFTokenPath) == 0 && !exists(loginPath), "and asks nothing, makes no sign-in call and stores nothing");
+    }
+    {
+        // A login with no password (not remembered): the same stop.
+        FrontierHttp http;
+        scriptStore(&http, false);
+        saveLogin(loginPath, nullptr, kMachineToken);
+        std::vector<std::string> out;
+        check(directDryRunLines(a, env(&http), &out) == 3 && !out.empty() && contains(out.back(), "Sign in once from the launcher's window") && http.count(kFAuthPath) == 0 && asked == 0, "a stored login with no password stops the same way");
+    }
+    {
+        // A password but no token yet: a dry run must not make Frontier email a code.
+        FrontierHttp http;
+        scriptStore(&http, true);
+        saveLogin(loginPath, kPassword, nullptr);
+        std::vector<std::string> out;
+        const int code = directDryRunLines(a, env(&http), &out);
+        check(code == 3 && !out.empty() && contains(out.back(), "emailed code") && http.count(kFAuthPath) == 0 && http.count(kFTokenPath) == 0 && asked == 0, "a login with no token stops before the call that would email a code: " + (out.empty() ? std::string() : out.back()));
+    }
+    {
+        // Denied: the dry run reports it and leaves the stored login alone.
+        FrontierHttp http;
+        scriptStore(&http, false);
+        http.script[kFAuthPath] = {statusReply(403)};
+        saveLogin(loginPath, kPassword, kMachineToken);
+        const std::string before = readAll(loginPath);
+        std::vector<std::string> out;
+        const int code = directDryRunLines(a, env(&http), &out);
+        check(code == 3 && !out.empty() && contains(out.back(), "did not accept the saved login") && !leaks(joined(out)) && asked == 0 && readAll(loginPath) == before && http.count(kFAuthPath) == 1,
+              "a denied login exits 3 with one call, asks nothing, and the stored login is unchanged: " + (out.empty() ? std::string() : out.back()));
+    }
+    {
+        // Any other failure is a fallback line for Frontier's launcher, not Steam.
+        FrontierHttp http;
+        scriptStore(&http, false);
+        http.script[kPurchasesPath] = {statusReply(503)};
+        saveLogin(loginPath, kPassword, kMachineToken);
+        std::vector<std::string> out;
+        const int code = directDryRunLines(a, env(&http), &out);
+        check(code == 3 && !out.empty() && contains(out.back(), "Direct launch did not work: Frontier's servers are unavailable (HTTP 503)") && contains(out.back(), "Frontier's launcher") && !contains(out.back(), "Steam"), "an unavailable server is a fallback to Frontier's launcher: " + (out.empty() ? std::string() : out.back()));
+    }
+    dropKeys(keys);
+}
+
 // ---- the command line ---------------------------------------------------------------------------
 
 AppArgs parse(std::vector<std::wstring> words) {
@@ -4079,6 +4968,11 @@ int main(int argc, char** argv) {
     testDirectPlan();
     testDirectSession();
     testDryRun();
+    testLoginFile();
+    testStoreSession();
+    testLoginDialog();
+    testBundleLeavesLoginOut();
+    testStoreDryRun();
     testArgs();
     endFakes();
     SetEnvironmentVariableW(L"EDUP_FAKE_STEAM_LOG", nullptr);

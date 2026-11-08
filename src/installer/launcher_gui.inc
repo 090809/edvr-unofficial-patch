@@ -94,18 +94,21 @@ void updateLauncherControls() {
     ShowWindow(lg.rc, onScreen ? SW_SHOW : SW_HIDE);
 
     // Play. Only a route that carries VR or flat gets two buttons: Frontier's, and Steam's once the
-    // launcher starts Elite itself (direct launch, which is off unless the user turned it on).
+    // launcher starts Elite itself (direct launch, which is off unless the user turned it on). The
+    // setting is offered for a Steam install and for one from Frontier's own store.
     lg.playCaption.clear();
     bool showPlay = false, showPair = false, showDirect = false, playEnabled = false;
     if (survey) {
         const LaunchRoute route = routeFor(g.survey.game.source, g.survey.game.dir, true);
         const bool anyGame = g.survey.gameRunningHere || g.survey.gameRunningElsewhere;
         playEnabled = !lg.session->playing() && !busy && !anyGame && !g.survey.gameRunStateUnknown;
-        showDirect = route.kind == RouteKind::Steam;
+        const bool frontierStore = route.kind == RouteKind::Frontier && _wcsicmp(g.survey.game.source.c_str(), L"Frontier launcher") == 0;
+        showDirect = route.kind == RouteKind::Steam || frontierStore;
         const bool directOn = showDirect && lg.session->directLaunch();
         if (route.kind == RouteKind::Frontier || directOn) {
             showPair = true;
-            lg.playCaption = directOn ? L"Signs in itself. If that fails, it starts through Steam."
+            lg.playCaption = directOn ? (frontierStore ? L"Signs in itself. If that fails, it starts EDLaunch."
+                                                       : L"Signs in itself. If that fails, it starts through Steam.")
                                       : L"Starts EDLaunch with the mode you pick, then closes it when Elite exits.";
             const bool flat = launcherRememberedMode() == "flat";
             ui::setButtonStyle(lg.playVr, flat ? ui::ButtonStyle::Secondary : ui::ButtonStyle::Primary);
@@ -219,6 +222,22 @@ void launcherBegin() {
         showSurvey();
         runAction(AppArgs::Act::Install);
     };
+    // A Frontier-store direct launch asks for the login, and for the code Frontier emails, in modal windows
+    // of the launcher's own. Both run here, on the window's thread, while the session's worker waits.
+    env.askLogin = [window](const std::string& note, LoginForm* form) {
+        FrontierDialogOptions options;
+        options.owner = window;
+        options.dpi = g.dpi;
+        options.underWine = runningUnderWine();
+        return showFrontierLogin(options, note, form);
+    };
+    env.askCode = [window](const std::string& email, const std::string& note, std::string* code) {
+        FrontierDialogOptions options;
+        options.owner = window;
+        options.dpi = g.dpi;
+        options.underWine = runningUnderWine();
+        return showFrontierCode(options, email, note, code);
+    };
     env.closeWindow = [window]() { PostMessageW(window, WM_CLOSE, 0, 0); };
     env.hideWindow = [window]() { ShowWindow(window, SW_HIDE); };
     env.windowAside = [window](bool aside) {
@@ -278,8 +297,11 @@ bool launcherCommand(int id, int code) {
         case kIdDirect: {
             // Turning it on asks first, with No as the default; a No leaves it off. Turning it off just does.
             const bool want = !ui::checkboxChecked(lg.direct);
-            lg.session->setDirectLaunch(want, []() {
-                return MessageBoxW(g.window, fromUtf8(kDirectLaunchQuestion).c_str(), kAppTitle,
+            // A Steam install is asked with Steam's words; one from Frontier's store is told about the login.
+            const bool frontierStore = g.haveSurvey && _wcsicmp(g.survey.game.source.c_str(), L"Frontier launcher") == 0;
+            const char* question = frontierStore ? kDirectLaunchQuestionFrontier : kDirectLaunchQuestion;
+            lg.session->setDirectLaunch(want, [question]() {
+                return MessageBoxW(g.window, fromUtf8(question).c_str(), kAppTitle,
                                    MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) == IDYES;
             });
             updateLauncherControls();

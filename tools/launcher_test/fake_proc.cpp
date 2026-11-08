@@ -1,6 +1,6 @@
 // fake_proc -- the programs launcher_test starts in place of EDLaunch and Elite.
 //
-// One source, built twice by build.bat into build\launcher_fakes\:
+// One source, built twice by build.bat into build\launcher_test_fakes\:
 //   ed_up_fake_edlaunch.exe   (-DFAKE_EDLAUNCH) has a top-level window that is never shown, so
 //                             the watcher has a window to post WM_CLOSE to without anything
 //                             appearing on the desktop;

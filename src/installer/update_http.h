@@ -1,4 +1,4 @@
-// HTTP GET for the updater, behind an interface so the rig can script it.
+// HTTP GET (and body-less POST) for the updater, behind an interface so the rig can script it.
 //
 // WinHttpClient is the one real implementation. It speaks HTTPS only: a plain
 // http:// address is refused before any socket opens, with one exception for the
@@ -21,6 +21,10 @@
 namespace edvr::installer {
 
 struct HttpRequest {
+    // "GET" or "POST". A POST has no body and goes out with Content-Length: 0 (Frontier's sign-in calls
+    // are POSTs with everything in the query), and a redirect to one is never followed, whatever
+    // followRedirects says: a redirect would turn it into a GET somewhere else.
+    std::string method = "GET";
     std::string url;
     std::vector<std::pair<std::string, std::string>> headers;
     // Empty: the body is returned in HttpResponse::body. Otherwise a 200 body is

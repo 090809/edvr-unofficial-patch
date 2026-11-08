@@ -41,7 +41,7 @@ bool startsWith(const std::string& text, const char* prefix) { return text.compa
 
 // What the status and the body say, before any call looks for its own fields. Ok means a 200 that is
 // not the ownership page; the caller still has to find what it needs in the body.
-ApiResult classify(const HttpResponse& reply) {
+ApiResult classify(const HttpResponse& reply, bool steam = true) {
     ApiResult result;
     result.httpStatus = reply.status;
     if (!reply.transportOk) {
@@ -55,7 +55,8 @@ ApiResult classify(const HttpResponse& reply) {
         // Content-Type, so the first bytes decide, as in Api.fs.
         if (startsWith(reply.body, "<!DOCTYPE html")) {
             result.outcome = ApiOutcome::OwnershipPage;
-            result.message = "Frontier could not confirm that this account owns the game, which it does now and then";
+            result.message = steam ? "Frontier could not confirm that this account owns the game, which it does now and then"
+                                   : "Frontier answered with a web page instead of a sign-in reply";
             return result;
         }
         result.outcome = ApiOutcome::Ok;
@@ -63,10 +64,12 @@ ApiResult classify(const HttpResponse& reply) {
     }
     if (reply.status == 302) {
         result.outcome = ApiOutcome::RegistrationRequired;
-        result.message = "Frontier wants this Steam account registered or linked (" + code + ")";
+        result.message = steam ? "Frontier wants this Steam account registered or linked (" + code + ")"
+                               : "Frontier answered with a redirect, which the launcher does not follow (" + code + ")";
     } else if (reply.status == 307) {
         result.outcome = ApiOutcome::LinkAvailable;
-        result.message = "Frontier offers to link this Steam account to a Frontier account (" + code + ")";
+        result.message = steam ? "Frontier offers to link this Steam account to a Frontier account (" + code + ")"
+                               : "Frontier answered with a redirect, which the launcher does not follow (" + code + ")";
     } else if (reply.status == 400 || reply.status == 401 || reply.status == 403) {
         result.outcome = ApiOutcome::Denied;
         result.message = "Frontier refused the request (" + code + ")";
@@ -109,9 +112,22 @@ FrontierApi::FrontierApi(HttpClient& http, std::string baseUrl, const std::atomi
     baseTick_ = clock_.tickMs();
 }
 
+std::string hexOfBytes(const std::string& text) {
+    static const char digits[] = "0123456789ABCDEF";
+    std::string out;
+    out.reserve(text.size() * 2);
+    for (const char raw : text) {
+        const unsigned char c = static_cast<unsigned char>(raw);
+        out.push_back(digits[c >> 4]);
+        out.push_back(digits[c & 15]);
+    }
+    return out;
+}
+
 HttpResponse FrontierApi::send(const std::string& path, const std::vector<std::pair<std::string, std::string>>& query,
-                               const std::string& bearer) {
+                               const std::string& bearer, bool post) {
     HttpRequest request;
+    request.method = post ? "POST" : "GET";
     request.url = base_ + path;
     for (size_t i = 0; i < query.size(); ++i) {
         request.url += i == 0 ? '?' : '&';
@@ -166,9 +182,70 @@ ApiResult FrontierApi::steamAuth(const std::string& machineId, const std::string
     return result;
 }
 
+ApiResult FrontierApi::frontierFirstSignIn(const std::string& email, const std::string& password, const std::string& machineId,
+                                           std::string* encCode) {
+    const HttpResponse reply = send("/3.0/user/frontier/auth",
+                                    {{"email", hexOfBytes(email)},
+                                     {"password", hexOfBytes(password)},
+                                     {"machineId", machineId},
+                                     {"lang", kFrontierLang},
+                                     {"fTime", fTime()}},
+                                    std::string(), true);
+    ApiResult result = classify(reply, false);
+    if (result.outcome != ApiOutcome::Ok) return result;
+    JsonValue json;
+    if (!parseJson(reply.body, &json, nullptr) || !json.isObject()) return unexpected(reply.status, "Frontier's sign-in reply was not in the form the launcher expects");
+    const std::string* found = stringMember(json, "encCode");
+    if (!found || found->empty()) return unexpected(reply.status, "Frontier's sign-in reply carried no verification code");
+    *encCode = *found;
+    return result;
+}
+
+ApiResult FrontierApi::frontierMachineToken(const std::string& machineId, const std::string& plainCode, const std::string& encCode,
+                                            std::string* machineToken) {
+    const HttpResponse reply = send("/3.0/user/frontier/token",
+                                    {{"machineId", machineId}, {"plainCode", plainCode}, {"encCode", encCode}, {"lang", kFrontierLang}},
+                                    std::string(), true);
+    ApiResult result = classify(reply, false);
+    if (result.outcome != ApiOutcome::Ok) return result;
+    JsonValue json;
+    if (!parseJson(reply.body, &json, nullptr) || !json.isObject()) return unexpected(reply.status, "Frontier's reply to the code was not in the form the launcher expects");
+    const std::string* found = stringMember(json, "machineToken");
+    if (!found || found->empty()) return unexpected(reply.status, "Frontier's reply to the code carried no machine token");
+    *machineToken = *found;
+    return result;
+}
+
+ApiResult FrontierApi::frontierAuth(const std::string& email, const std::string& password, const std::string& machineId,
+                                    const std::string& machineToken, FrontierSession* session) {
+    const HttpResponse reply = send("/3.0/user/frontier/auth",
+                                    {{"email", hexOfBytes(email)},
+                                     {"password", hexOfBytes(password)},
+                                     {"machineId", machineId},
+                                     {"machineToken", machineToken},
+                                     {"lang", kFrontierLang},
+                                     {"fTime", fTime()}},
+                                    std::string(), true);
+    ApiResult result = classify(reply, false);
+    if (result.outcome != ApiOutcome::Ok) return result;
+    JsonValue json;
+    if (!parseJson(reply.body, &json, nullptr) || !json.isObject()) return unexpected(reply.status, "Frontier's sign-in reply was not in the form the launcher expects");
+    const std::string* authToken = stringMember(json, "authToken");
+    if (!authToken || authToken->empty()) return unexpected(reply.status, "Frontier's sign-in reply carried no token");
+    session->authToken = *authToken;
+    session->machineToken = machineToken;
+    session->frontierStore = true;
+    return result;
+}
+
 ApiResult FrontierApi::purchases(const FrontierSession& session, PurchaseList* out) {
-    const HttpResponse reply = send("/3.0/user/purchases", {{"fTime", fTime()}}, session.authToken);
-    ApiResult result = classify(reply);
+    // A Frontier-store session names its tokens in the query, after fTime; a Steam one sends the bearer header.
+    HttpResponse reply;
+    if (session.frontierStore)
+        reply = send("/3.0/user/purchases", {{"fTime", fTime()}, {"authToken", session.authToken}, {"machineToken", session.machineToken}}, std::string());
+    else
+        reply = send("/3.0/user/purchases", {{"fTime", fTime()}}, session.authToken);
+    ApiResult result = classify(reply, !session.frontierStore);
     if (result.outcome != ApiOutcome::Ok) return result;
     JsonValue json;
     if (!parseJson(reply.body, &json, nullptr) || !json.isObject()) return unexpected(reply.status, "Frontier's list of purchases was not in the form the launcher expects");
@@ -208,8 +285,8 @@ ApiResult FrontierApi::installerVersion(const FrontierSession& session, const st
                                      {"sku", sku},
                                      {"os", "win"},
                                      {"fTime", fTime()}},
-                                    session.authToken);
-    ApiResult result = classify(reply);
+                                    session.frontierStore ? std::string() : session.authToken);
+    ApiResult result = classify(reply, !session.frontierStore);
     if (result.outcome != ApiOutcome::Ok) return result;
     JsonValue json;
     if (!parseJson(reply.body, &json, nullptr) || !json.isObject()) return unexpected(reply.status, "Frontier's reply about the game's version was not in the form the launcher expects");

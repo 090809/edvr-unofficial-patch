@@ -35,6 +35,18 @@ inline constexpr const char* kDirectLaunchQuestion =
     "is yours. Untick this at any time to go back to Frontier's launcher.\n\n"
     "Turn it on?";
 
+// The same question for an install from Frontier's own store, where the launcher asks for the login itself.
+// Unticking deletes what it stored, and the question says so.
+inline constexpr const char* kDirectLaunchQuestionFrontier =
+    "Start Elite directly instead of through Frontier's launcher?\n\n"
+    "The launcher signs in to Frontier's servers itself, then starts the game. It starts faster, and you can "
+    "pick VR or flat here. It will ask for your Frontier email and password, and may need a code Frontier "
+    "emails you, once on this PC. The login is stored encrypted for this Windows user; the password only if "
+    "you tick Remember my password.\n\n"
+    "Frontier has not approved this. It could act against an account that signs in this way, and the choice "
+    "is yours. Untick this at any time to go back to Frontier's launcher; unticking also deletes the stored login.\n\n"
+    "Turn it on?";
+
 enum class PayloadState { Loading, Ready, None };
 enum class CheckState { NotYet, Checking, UpToDate, Available, Refused, Skipped };
 
@@ -68,6 +80,11 @@ struct SessionEnv {
     MachineIdKeys machineKeys;
     ApiClock clock;
     GameStarter startGame;                     // returns the process to wait on; empty means startGameProcess
+    // A Frontier-store install's questions. Each runs on the window's thread, shows its modal window and
+    // returns the answer, false for cancelled. The session asks from its worker and waits. Empty: a
+    // Frontier-store install cannot ask, so direct launch stops where it would have.
+    std::function<bool(const std::string& note, LoginForm* form)> askLogin;
+    std::function<bool(const std::string& email, const std::string& note, std::string* code)> askCode;
 };
 
 class LauncherSession {
@@ -100,15 +117,17 @@ public:
     void beginUpdate();
 
     // Starts the game and watches until it is over. `elevated` refuses, before anything is contacted.
-    // A Steam install with direct launch on signs in to Frontier and starts the game itself, and falls
-    // back to Steam's route, saying why, when it cannot. Every other install takes its route.
+    // A Steam or Frontier-store install ("Frontier launcher") with direct launch on signs in to Frontier and
+    // starts the game itself, and falls back to its own route, saying why, when it cannot. A cancelled
+    // question starts nothing and says "Sign-in cancelled." Every other install takes its route.
     void beginPlay(const std::wstring& source, const std::wstring& gameDir, bool vr, bool elevated,
                    const RouteOps& ops, const WatchNames& names, const WatchTiming& timing);
     bool playing() const { return playing_; }
     const std::string& playLine() const { return playLine_; }
 
     // launcher.ini's direct_launch: off unless it says on. Turning it on calls `confirm` first (the
-    // window's question), and a false from it leaves the setting as it was. Returns the setting after.
+    // window's question), and a false from it leaves the setting as it was. Turning it off deletes the
+    // stored Frontier login. Returns the setting after.
     bool directLaunch() const { return directLaunch_; }
     bool setDirectLaunch(bool on, const std::function<bool()>& confirm);
 
@@ -136,6 +155,10 @@ private:
                             const std::string& startLine);
     void beginDirectPlay(const std::wstring& source, const std::wstring& gameDir, bool vr, const RouteOps& ops,
                          const WatchNames& names, const WatchTiming& timing);
+    // Posts `ask` to the window's thread and waits for it from the worker. False when it was cancelled or
+    // the session is closing. The answers travel in shared state, so a worker that gives up leaves nothing dangling.
+    struct Asked;
+    std::shared_ptr<Asked> askOnWindow(const std::function<bool(Asked&)>& ask);
 
     SessionEnv env_;
     std::vector<std::thread> workers_;

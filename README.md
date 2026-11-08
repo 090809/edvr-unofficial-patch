@@ -126,6 +126,23 @@ sign-in fails, the launcher says why and starts the game through Steam instead.
 The sign-in is ported from [min-ed-launcher](https://github.com/rfvgyhn/min-ed-launcher)
 (MIT licence; `ed-up-launcher.exe --licenses` prints it).
 
+The same checkbox is there for a game installed through Frontier's own store.
+The launcher then asks for your Frontier email and password in its own window and
+sends them to Frontier's servers as Frontier's launcher does, as hex in the
+request, and nowhere else. The first time on a PC, Frontier emails you a code,
+which the launcher asks for and sends back; Frontier answers with a token for
+this PC. The launcher keeps `frontier-login.dat` in its own folder
+(`%LOCALAPPDATA%\EDVR\launcher\`): your email in the clear, that token encrypted
+for your Windows user, and your password, encrypted the same way, only if you
+leave "Remember my password on this PC" ticked. Encrypted here means Windows'
+DPAPI: a program running as you can still ask Windows to decrypt it, and under
+Wine or Proton it is not strongly protected. The password is sent with every
+sign-in, saved or typed. If Frontier refuses the saved login, the launcher
+forgets the saved password and token and asks again. Unticking the checkbox
+deletes `frontier-login.dat`, and so does `--unregister`. If a sign-in fails
+for any other reason, the launcher says why and starts Frontier's launcher with
+your VR or flat choice instead; cancelling a window starts nothing.
+
 ### Linux on Steam (Proton)
 
 Download `ed-up-installer-linux-<version>.zip` from the release and unzip it. It

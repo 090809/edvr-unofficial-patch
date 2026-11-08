@@ -5,10 +5,12 @@
 #include <windows.h>
 #include <objbase.h>
 
+#include <cwctype>
 #include <functional>
 #include <vector>
 
 #include "direct_launch.h"
+#include "frontier_login.h"
 #include "launch_route.h"
 #include "launcher_plan.h"
 #include "launcher_register.h"
@@ -204,6 +206,8 @@ int runDirectDryRun(const AppArgs& args, Output& out) {
     WinHttpClient http(false, EDUP_LAUNCHER_VERSION);
     DirectEnv env;
     env.http = &http;
+    // A Frontier-store install uses the login the window stored, and never asks for one here.
+    env.loginPath = joinPath(launcherRootsFor(args).launcherDir(), kFrontierLoginFile);
     std::vector<std::string> lines;
     const int code = directDryRunLines(args, env, &lines);
     for (const std::string& line : lines) out.line(line);
@@ -235,9 +239,17 @@ int directDryRunLines(const AppArgs& args, DirectEnv env, std::vector<std::strin
         return 2;
     }
     env.progress = [lines](const std::string& line) { lines->push_back(line); };
+    // Steam keeps its games under steamapps\common; anything else is taken for Frontier's own store.
+    std::wstring lowered = args.dir;
+    for (wchar_t& c : lowered) c = c == L'/' ? L'\\' : static_cast<wchar_t>(towlower(c));
     DirectRequest request;
     request.productDir = args.dir;
     request.vr = args.vr;
+    request.frontier = lowered.find(L"\\steamapps\\") == std::wstring::npos;
+    // A dry run never asks and never changes the stored login, whatever the caller handed in.
+    env.prompts = FrontierPrompts();
+    lines->push_back(request.frontier ? "Dry run for an install from Frontier's own store, with the stored login."
+                                      : "Dry run for a Steam install, with the Steam login.");
     const DirectPlan plan = planDirectLaunch(env, request);
 
     size_t start = 0;
@@ -250,7 +262,8 @@ int directDryRunLines(const AppArgs& args, DirectEnv env, std::vector<std::strin
         start = end + 1;
     }
     if (!plan.start) {
-        lines->push_back(maskSecrets(fallbackLine(plan.reason), plan.secrets));
+        // A stop is a whole sentence of its own, not a fallback: the dry run starts nothing either way.
+        lines->push_back(maskSecrets(plan.stopped ? plan.reason : fallbackLine(plan.reason, request.frontier), plan.secrets));
         return 3;
     }
     lines->push_back("Dry run: nothing was started. The command line would be:");

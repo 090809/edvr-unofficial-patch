@@ -32,6 +32,7 @@
 #include "ui.h"
 #ifdef EDUP_LAUNCHER
 #include "launch_route.h"
+#include "launcher_login_dialog.h"
 #include "launcher_main.h"
 #include "launcher_session.h"
 #include "layout_dpi.h"

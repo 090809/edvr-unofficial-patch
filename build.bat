@@ -811,8 +811,9 @@ set INSTALLER_LIBS=user32.lib gdi32.lib gdiplus.lib dwmapi.lib uxtheme.lib ^
     shell32.lib ole32.lib comctl32.lib advapi32.lib version.lib bcrypt.lib dxgi.lib kernel32.lib
 REM What the launcher adds to INSTALLER_SRC (its main.cpp, gui.cpp and the rest are the same files, built
 REM with /DEDUP_LAUNCHER): the update core and the launcher_* and selfupdate files. launcher_test links
-REM these too (the last four are direct launch: Frontier's API, the machine ID, the Steam ticket, the sequence).
-REM winhttp.lib is the one library the installer does not need.
+REM these too (frontier_api to direct_launch are direct launch: Frontier's API, the machine ID, the Steam ticket,
+REM the sequence; frontier_login is the stored Frontier-store login, and launcher_login_dialog its two windows,
+REM which the rig drives with ui.cpp). winhttp.lib is the one library the installer does not need.
 set LAUNCHER_SRC="src\installer\launcher_core.cpp" "src\installer\launcher_register.cpp" ^
     "src\installer\launcher_plan.cpp" "src\installer\launch_route.cpp" ^
     "src\installer\launcher_session.cpp" "src\installer\launcher_main.cpp" ^
@@ -822,7 +823,8 @@ set LAUNCHER_SRC="src\installer\launcher_core.cpp" "src\installer\launcher_regis
     "src\installer\update_cache.cpp" "src\installer\update_util.cpp" ^
     "src\installer\launcher_state.cpp" "src\installer\frontier_api.cpp" ^
     "src\installer\machine_id.cpp" "src\installer\steam_ticket.cpp" ^
-    "src\installer\direct_launch.cpp"
+    "src\installer\direct_launch.cpp" "src\installer\frontier_login.cpp" ^
+    "src\installer\launcher_login_dialog.cpp"
 
 if defined EDVR_DLL_ONLY goto dll_only_finish
 
@@ -3347,18 +3349,20 @@ REM the command line. The fake programs have no window the desktop could see: fa
 if not exist "%OBJ%\launchertest" mkdir "%OBJ%\launchertest"
 if not exist "%OBJ%\launchertest\fakeg" mkdir "%OBJ%\launchertest\fakeg"
 if not exist "%OBJ%\launchertest\fakee" mkdir "%OBJ%\launchertest\fakee"
-if not exist "%BUILD%\launcher_fakes" mkdir "%BUILD%\launcher_fakes"
+REM The fakes' folder is named for this rig: run_jobs removes the "<label>_" folders of a rig that passes, and a
+REM folder called launcher_fakes was the "launcher" rig's, deleted under this one whenever that job finished first.
+if not exist "%BUILD%\launcher_test_fakes" mkdir "%BUILD%\launcher_test_fakes"
 python tools\launcher_fixtures.py --out "%BUILD%\launcher_test_fixtures"
 if errorlevel 1 ( echo [edvr] ERROR: launcher fixtures failed & exit /b 1 )
 %CC% /nologo /O2 /MT /std:c++17 /EHsc /W4 /GR- /DWIN32_LEAN_AND_MEAN /DNOMINMAX ^
     /D_CRT_SECURE_NO_WARNINGS /DUNICODE /D_UNICODE /DFAKE_EDLAUNCH ^
-    /Fo"%OBJ%\launchertest\fakee"\ /Fe"%BUILD%\launcher_fakes\ed_up_fake_edlaunch.exe" ^
+    /Fo"%OBJ%\launchertest\fakee"\ /Fe"%BUILD%\launcher_test_fakes\ed_up_fake_edlaunch.exe" ^
     "tools\launcher_test\fake_proc.cpp" ^
     /link /INCREMENTAL:NO /SUBSYSTEM:WINDOWS user32.lib shell32.lib
 if errorlevel 1 ( echo [edvr] ERROR: the fake EDLaunch build failed & exit /b 1 )
 %CC% /nologo /O2 /MT /std:c++17 /EHsc /W4 /GR- /DWIN32_LEAN_AND_MEAN /DNOMINMAX ^
     /D_CRT_SECURE_NO_WARNINGS /DUNICODE /D_UNICODE ^
-    /Fo"%OBJ%\launchertest\fakeg"\ /Fe"%BUILD%\launcher_fakes\ed_up_fake_game.exe" ^
+    /Fo"%OBJ%\launchertest\fakeg"\ /Fe"%BUILD%\launcher_test_fakes\ed_up_fake_game.exe" ^
     "tools\launcher_test\fake_proc.cpp" ^
     /link /INCREMENTAL:NO /SUBSYSTEM:WINDOWS user32.lib shell32.lib
 if errorlevel 1 ( echo [edvr] ERROR: the fake game build failed & exit /b 1 )
@@ -3367,7 +3371,7 @@ REM loader and export binding run in the rig and the real Steam is never touched
 if not exist "%OBJ%\launchertest\fakesteam" mkdir "%OBJ%\launchertest\fakesteam"
 %CC% /nologo /O2 /MT /std:c++17 /EHsc /W4 /GR- /DWIN32_LEAN_AND_MEAN /DNOMINMAX ^
     /D_CRT_SECURE_NO_WARNINGS /LD ^
-    /Fo"%OBJ%\launchertest\fakesteam"\ /Fe"%BUILD%\launcher_fakes\steam_api64.dll" ^
+    /Fo"%OBJ%\launchertest\fakesteam"\ /Fe"%BUILD%\launcher_test_fakes\steam_api64.dll" ^
     "tools\launcher_test\fake_steam_api.cpp" ^
     /link /INCREMENTAL:NO kernel32.lib
 if errorlevel 1 ( echo [edvr] ERROR: the fake steam_api64.dll build failed & exit /b 1 )
@@ -3379,10 +3383,10 @@ if errorlevel 1 ( echo [edvr] ERROR: the fake steam_api64.dll build failed & exi
     "src\installer\probe.cpp" "src\common\iniedit.cpp" "src\installer\state.cpp" ^
     "src\installer\mirror.cpp" "src\installer\settings.cpp" ^
     "src\installer\logbundle.cpp" "src\installer\app.cpp" "src\installer\payload.cpp" ^
-    %LAUNCHER_SRC% ^
+    "src\installer\ui.cpp" %LAUNCHER_SRC% ^
     /link /INCREMENTAL:NO %INSTALLER_LIBS% winhttp.lib ws2_32.lib
 if errorlevel 1 ( echo [edvr] ERROR: launcher_test build failed & exit /b 1 )
-"%BUILD%\launcher_test.exe" "%ROOT%" "%BUILD%\launcher_test_fixtures" "%BUILD%\launcher_test_scratch" "%BUILD%\launcher_fakes" || (
+"%BUILD%\launcher_test.exe" "%ROOT%" "%BUILD%\launcher_test_fixtures" "%BUILD%\launcher_test_scratch" "%BUILD%\launcher_test_fakes" || (
     echo [edvr] ERROR: the launcher update core failed its own tests
     exit /b 1
 )

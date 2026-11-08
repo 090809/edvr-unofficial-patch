@@ -15,6 +15,11 @@
 // error: the caller starts the game through Steam instead (docs\design-launcher-2026-11-07.md,
 // "Falling back"), and the launcher never patches the game, which is what a version difference is for.
 //
+// An install from Frontier's own store takes the same steps with a different sign-in and no Steam: the
+// stored login (frontier_login.h) or, where something is missing, the window's questions, then the same
+// purchases, version check and command line without /steam. Cancelling a question is a stop, not a
+// fallback: nothing is started.
+//
 // Direct launch is opt-in (launcher.ini, direct_launch=on). The tokens exist only in memory for the length
 // of a launch: they are in the plan's command line and nowhere else, and maskSecrets takes them out of
 // any text that is shown.
@@ -34,9 +39,36 @@
 
 namespace edvr::installer {
 
+// What the Frontier sign-in form holds. Never logged or shown back.
+struct LoginForm {
+    std::string email;
+    std::string password;
+    bool remember = true;  // "Remember my password on this PC"
+};
+
+// True when both fields have something in them: the only forms a dialog may submit.
+bool loginFormComplete(const LoginForm& form);
+
+// The line under the login form. Under Wine or Proton the saved password is not strongly protected, and
+// the line says so instead of that it is stored encrypted for this Windows user.
+std::string loginPrivacyLine(bool underWine);
+
+// The window's two questions. Both are called on the thread planDirectLaunch runs on, wait for the
+// answer, and return false when the user cancelled. Empty functions mean the launch never asks, as in a
+// dry run: what is missing then stops it.
+struct FrontierPrompts {
+    // `note` says why it is asked again, or is empty. `form` holds the email it knows, and the answer on return.
+    std::function<bool(const std::string& note, LoginForm* form)> askLogin;
+    // `email` is where the code went. `note` is empty or says the last code was refused.
+    std::function<bool(const std::string& email, const std::string& note, std::string* code)> askCode;
+};
+
 struct DirectEnv {
     HttpClient* http = nullptr;
     std::string apiBase = kFrontierApiBase;
+    // Frontier-store installs: where frontier-login.dat is, and how to ask. An empty path stores nothing.
+    std::wstring loginPath;
+    FrontierPrompts prompts;
     // Empty means the real one, over the steam_api64.dll at the path it is given.
     std::function<std::unique_ptr<SteamSession>(const std::wstring& dllPath)> makeSteam;
     MachineIdKeys machineKeys;
@@ -49,10 +81,14 @@ struct DirectEnv {
 struct DirectRequest {
     std::wstring productDir;  // the Products\ folder of the game: GameInstall.dir
     bool vr = true;
+    bool frontier = false;    // an install from Frontier's own store: its sign-in, and no /steam
 };
 
 struct DirectPlan {
     bool start = false;        // true: start the game with exe, args and workDir. False: fall back.
+    // With !start: true when nothing is to be started at all, and `reason` is the whole sentence to show
+    // (the user cancelled, or a dry run has no saved login to use). False is a fallback to the store route.
+    bool stopped = false;
     std::wstring exe;
     std::wstring args;         // after the exe name; holds the tokens
     std::wstring workDir;
@@ -63,15 +99,17 @@ struct DirectPlan {
 
 DirectPlan planDirectLaunch(const DirectEnv& env, const DirectRequest& request);
 
-// The band's line for a fallback: the reason, and that the game will use the mode it is set to.
-std::string fallbackLine(const std::string& reason);
+// The band's line for a fallback: the reason, and what starts the game instead. Steam's route carries no
+// flag, so the game uses the mode it is set to; Frontier's carries the VR or flat choice.
+std::string fallbackLine(const std::string& reason, bool frontierStore = false);
 
 // Every occurrence of each secret replaced by <masked>.
 std::string maskSecrets(const std::string& text, const std::vector<std::string>& secrets);
 
 // The game's arguments, as Product.createArgString builds them without the watchdog:
 //   "ServerToken <machineToken> <authToken> <serverArgs>" [/steam] /vr|/novr [gameArgs]
-// An offline product has an empty quoted token. `serverArgs` and `gameArgs` are the product's own.
+// `steamAware` is false for a Frontier-store install, which never gets /steam. An offline product has an
+// empty quoted token. `serverArgs` and `gameArgs` are the product's own.
 std::string directCommandLine(bool online, const std::string& machineToken, const std::string& authToken,
                               const std::string& serverArgs, bool steamAware, bool vr, const std::string& gameArgs);
 

@@ -3,7 +3,11 @@
 #include <windows.h>
 
 #include <cctype>
+#include <chrono>
+#include <condition_variable>
+#include <mutex>
 
+#include "frontier_login.h"
 #include "launch_route.h"
 #include "launcher_state.h"
 #include "probe.h"
@@ -21,6 +25,13 @@ std::string sentence(std::string text) {
 }
 
 std::wstring launcherIniPath(const LauncherRoots& roots) { return joinPath(roots.launcherDir(), L"launcher.ini"); }
+
+std::wstring frontierLoginPath(const LauncherRoots& roots) { return joinPath(roots.launcherDir(), kFrontierLoginFile); }
+
+// The installs the launcher can sign in for itself: Steam's, and the one from Frontier's own store.
+bool goesDirect(const std::wstring& source) {
+    return _wcsicmp(source.c_str(), L"Steam") == 0 || _wcsicmp(source.c_str(), L"Frontier launcher") == 0;
+}
 
 // "name 42%" or just the name when the size is not known.
 std::string progressText(const std::string& name, unsigned long long received, unsigned long long total) {
@@ -233,6 +244,8 @@ LauncherSession::LauncherSession(SessionEnv env) : env_(std::move(env)) {
 }
 
 bool LauncherSession::setDirectLaunch(bool on, const std::function<bool()>& confirm) {
+    // Unticking forgets the Frontier login, whether or not the setting was on a moment ago.
+    if (!on) deleteFrontierLogin(frontierLoginPath(env_.roots));
     if (on == directLaunch_) return directLaunch_;
     // Only turning it on is a decision to be asked about; a No leaves it exactly as it was.
     if (on && (!confirm || !confirm())) return directLaunch_;
@@ -261,7 +274,7 @@ void LauncherSession::rememberMode(const std::wstring& gameDir, bool vr) {
 void LauncherSession::beginPlay(const std::wstring& source, const std::wstring& gameDir, bool vr, bool elevated,
                                 const RouteOps& ops, const WatchNames& names, const WatchTiming& timing) {
     if (playing_) return;
-    if (directLaunch_ && _wcsicmp(source.c_str(), L"Steam") == 0) {
+    if (directLaunch_ && goesDirect(source)) {
         // Refused before anything is contacted, as the routes are.
         if (elevated) {
             playLine_ = elevatedRefusal();
@@ -331,6 +344,33 @@ void LauncherSession::startRouteAndWatch(const std::wstring& source, const std::
 // Direct launch (docs\design-launcher-2026-11-07.md, "Direct, on Steam and the Frontier store"): the
 // sign-in on a worker, the start, and the wait on the process handle held here. A fallback goes back
 // to the window's thread and takes the Steam route, with its reason as the line.
+// What a question to the window shares between the worker that asks and the window's thread that answers.
+struct LauncherSession::Asked {
+    std::mutex m;
+    std::condition_variable cv;
+    bool done = false;
+    bool ok = false;
+    LoginForm form;
+    std::string code;
+};
+
+std::shared_ptr<LauncherSession::Asked> LauncherSession::askOnWindow(const std::function<bool(Asked&)>& ask) {
+    std::shared_ptr<Asked> state = std::make_shared<Asked>();
+    post([state, ask]() {
+        const bool ok = ask(*state);
+        std::lock_guard<std::mutex> lock(state->m);
+        state->ok = ok;
+        state->done = true;
+        state->cv.notify_all();
+    });
+    std::unique_lock<std::mutex> lock(state->m);
+    while (!state->done) {
+        if (cancel_) return nullptr;  // the window is closing and may never run the job
+        state->cv.wait_for(lock, std::chrono::milliseconds(100));
+    }
+    return state;
+}
+
 void LauncherSession::beginDirectPlay(const std::wstring& source, const std::wstring& gameDir, bool vr, const RouteOps& ops,
                                       const WatchNames& names, const WatchTiming& timing) {
     rememberMode(gameDir, vr);
@@ -338,7 +378,8 @@ void LauncherSession::beginDirectPlay(const std::wstring& source, const std::wst
     playLine_ = "Signing in to Frontier...";
     changed();
     const std::string base = env_.frontierBase.empty() ? std::string(kFrontierApiBase) : env_.frontierBase;
-    spawn([this, source, gameDir, vr, ops, names, timing, base]() {
+    const bool frontierStore = _wcsicmp(source.c_str(), L"Steam") != 0;
+    spawn([this, source, gameDir, vr, ops, names, timing, base, frontierStore]() {
         std::unique_ptr<HttpClient> http = makeHttp();
         DirectEnv direct;
         direct.http = http.get();
@@ -354,19 +395,54 @@ void LauncherSession::beginDirectPlay(const std::wstring& source, const std::wst
                 changed();
             });
         };
+        if (frontierStore) {
+            direct.loginPath = frontierLoginPath(env_.roots);
+            // The window's modal questions, asked from here: the job runs on the window's thread and
+            // this thread waits for the answer.
+            if (env_.askLogin && env_.askCode) {
+                direct.prompts.askLogin = [this](const std::string& note, LoginForm* form) {
+                    const LoginForm known = *form;
+                    const std::shared_ptr<Asked> answer = askOnWindow([this, note, known](Asked& a) {
+                        a.form = known;
+                        return env_.askLogin(note, &a.form);
+                    });
+                    if (!answer || !answer->ok) return false;
+                    *form = answer->form;
+                    wipeString(&answer->form.password);
+                    return true;
+                };
+                direct.prompts.askCode = [this](const std::string& email, const std::string& note, std::string* code) {
+                    const std::shared_ptr<Asked> answer = askOnWindow([this, email, note](Asked& a) { return env_.askCode(email, note, &a.code); });
+                    if (!answer || !answer->ok) return false;
+                    *code = answer->code;
+                    return true;
+                };
+            }
+        }
         DirectRequest request;
         request.productDir = gameDir;
         request.vr = vr;
+        request.frontier = frontierStore;
         DirectPlan plan = planDirectLaunch(direct, request);
         if (cancel_) return;  // the window is closing
 
-        // Whatever went wrong, the game is not running yet: Steam's route is the way on.
-        auto fallBack = [this, source, gameDir, vr, ops, names, timing](const std::string& reason) {
-            post([this, source, gameDir, vr, ops, names, timing, reason]() {
+        // Whatever went wrong, the game is not running yet: the install's own route is the way on.
+        auto fallBack = [this, source, gameDir, vr, ops, names, timing, frontierStore](const std::string& reason) {
+            post([this, source, gameDir, vr, ops, names, timing, reason, frontierStore]() {
                 playing_ = false;
-                startRouteAndWatch(source, gameDir, vr, false, ops, names, timing, fallbackLine(reason));
+                startRouteAndWatch(source, gameDir, vr, false, ops, names, timing, fallbackLine(reason, frontierStore));
             });
         };
+        if (!plan.start && plan.stopped) {
+            // A cancelled question, or a sign-in that cannot go on without one: nothing is started.
+            const std::string line = plan.reason;
+            post([this, line]() {
+                playing_ = false;
+                playLine_ = line;
+                changed();
+            });
+            return;
+        }
         if (!plan.start) {
             fallBack(plan.reason);
             return;

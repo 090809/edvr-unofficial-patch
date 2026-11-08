@@ -6,6 +6,7 @@
 #include <cstdlib>
 
 #include "detect.h"
+#include "frontier_login.h"
 #include "launch_route.h"
 #include "update_json.h"
 #include "update_util.h"
@@ -83,8 +84,8 @@ DirectPlan fallback(DirectPlan plan, const std::string& reason) {
 }
 
 // One reason for each way a call can end, the words of the design's table.
-std::string reasonFor(const ApiResult& result) {
-    if (result.outcome == ApiOutcome::RegistrationRequired || result.outcome == ApiOutcome::LinkAvailable)
+std::string reasonFor(const ApiResult& result, bool steam = true) {
+    if (steam && (result.outcome == ApiOutcome::RegistrationRequired || result.outcome == ApiOutcome::LinkAvailable))
         return "Your Steam and Frontier accounts need linking (HTTP " + std::to_string(result.httpStatus) + ")";
     return result.message;
 }
@@ -99,7 +100,183 @@ ApiResult callWithRetry(const DirectEnv& env, const std::function<ApiResult()>& 
     return result;
 }
 
+enum class SignInEnd { Ok, Fallback, Stopped };
+
+struct SignInResult {
+    SignInEnd end = SignInEnd::Ok;
+    std::string reason;
+};
+
+SignInResult signInFailed(const std::string& reason) { return {SignInEnd::Fallback, reason}; }
+SignInResult signInStopped(const std::string& sentence) { return {SignInEnd::Stopped, sentence}; }
+
+// Frontier's own sign-in (Api.login and Api.authenticate for the Frontier platform): the stored login
+// where it is whole, else the window's questions, then the emailed code once on this PC. The password
+// goes into every sign-in; the machine token alone does not sign in.
+//
+// A launch that may not ask (a dry run) uses only what is stored, changes nothing on disk, and stops
+// when something is missing or refused.
+SignInResult frontierSignIn(const DirectEnv& env, FrontierApi& api, const std::string& machineId, DirectPlan* plan,
+                            FrontierSession* session) {
+    auto say = [&](const std::string& line) {
+        if (env.progress) env.progress(line);
+    };
+    auto stopped = [&]() { return env.cancel && env.cancel->load(); };
+    const bool mayAsk = static_cast<bool>(env.prompts.askLogin) && static_cast<bool>(env.prompts.askCode);
+    const bool mayStore = mayAsk && !env.loginPath.empty();
+    auto secret = [&](const std::string& value) {
+        if (!value.empty()) plan->secrets.push_back(value);
+    };
+
+    StoredLogin saved;
+    const bool haveFile = !env.loginPath.empty() && loadFrontierLogin(env.loginPath, &saved);
+    std::string email = saved.email, password = saved.password, token = saved.machineToken;
+    bool remember = haveFile ? !saved.password.empty() : true;
+    wipeString(&saved.password);
+    wipeString(&saved.machineToken);
+    secret(email);
+    secret(password);
+    secret(token);
+
+    // What is kept for the next launch: the email always, the token once there is one, the password if asked to.
+    auto persist = [&]() {
+        if (!mayStore) return;
+        StoredLogin keep;
+        keep.email = email;
+        keep.machineToken = token;
+        if (remember) keep.password = password;
+        saveFrontierLogin(env.loginPath, keep, nullptr);
+        wipeString(&keep.password);
+        wipeString(&keep.machineToken);
+    };
+    auto clean = [&]() {
+        wipeString(&password);
+        wipeString(&token);
+    };
+
+    std::string note;
+    for (;;) {
+        if (stopped()) {
+            clean();
+            return signInFailed("The sign-in was stopped");
+        }
+        if (email.empty() || password.empty()) {
+            if (!mayAsk) {
+                clean();
+                return signInStopped("No saved Frontier login to use. Sign in once from the launcher's window first, with Remember my password ticked.");
+            }
+            LoginForm form;
+            form.email = email;
+            form.remember = remember;
+            say("Waiting for your Frontier login...");
+            const bool answered = env.prompts.askLogin(note, &form);
+            note.clear();
+            if (!answered) {
+                wipeString(&form.password);
+                clean();
+                return signInStopped("Sign-in cancelled.");
+            }
+            // A machine token belongs to one account on this PC.
+            if (!sameText(form.email, email)) wipeString(&token);
+            email = form.email;
+            password = form.password;
+            remember = form.remember;
+            wipeString(&form.password);
+            if (!loginFormComplete(LoginForm{email, password, remember})) {
+                note = "Enter both the email and the password.";
+                continue;
+            }
+            secret(email);
+            secret(password);
+        }
+
+        if (token.empty()) {
+            // This call makes Frontier email a code, so a launch that may not ask never makes it, and
+            // it is made once: an ownership page is not retried.
+            if (!mayAsk) {
+                clean();
+                return signInStopped("Frontier wants an emailed code on this PC. Sign in once from the launcher's window first.");
+            }
+            say("Signing in to Frontier...");
+            std::string encCode;
+            const ApiResult first = api.frontierFirstSignIn(email, password, machineId, &encCode);
+            secret(encCode);
+            if (first.outcome == ApiOutcome::Denied) {
+                if (mayStore) forgetFrontierSecrets(env.loginPath);
+                note = "Frontier did not accept that email and password.";
+                wipeString(&password);
+                continue;
+            }
+            if (first.outcome != ApiOutcome::Ok) {
+                clean();
+                return signInFailed(reasonFor(first, false));
+            }
+            // A code was emailed. It is asked for until Frontier takes one or the user gives up.
+            std::string codeNote;
+            for (;;) {
+                if (stopped()) {
+                    clean();
+                    return signInFailed("The sign-in was stopped");
+                }
+                std::string code;
+                say("Waiting for the code Frontier emailed you...");
+                if (!env.prompts.askCode(email, codeNote, &code)) {
+                    clean();
+                    return signInStopped("Sign-in cancelled.");
+                }
+                secret(code);
+                say("Checking the code...");
+                std::string minted;
+                const ApiResult checked = api.frontierMachineToken(machineId, code, encCode, &minted);
+                if (checked.outcome == ApiOutcome::Ok) {
+                    token = minted;
+                    secret(token);
+                    wipeString(&minted);
+                    break;
+                }
+                if (checked.outcome == ApiOutcome::Unavailable) {
+                    clean();
+                    return signInFailed(reasonFor(checked, false));
+                }
+                codeNote = "Frontier did not accept that code. Check the email and type it again.";
+            }
+            persist();
+        }
+
+        say("Signing in to Frontier...");
+        const ApiResult signedIn = callWithRetry(env, [&]() { return api.frontierAuth(email, password, machineId, token, session); });
+        secret(session->authToken);
+        if (signedIn.outcome == ApiOutcome::Ok) {
+            persist();
+            clean();
+            return SignInResult();
+        }
+        if (signedIn.outcome == ApiOutcome::Denied) {
+            if (!mayAsk) {
+                clean();
+                return signInStopped("Frontier did not accept the saved login. Sign in again from the launcher's window.");
+            }
+            // The saved login no longer works: forget the password and the token, and ask again.
+            if (mayStore) forgetFrontierSecrets(env.loginPath);
+            note = "Frontier did not accept the saved sign-in. Please sign in again.";
+            wipeString(&password);
+            wipeString(&token);
+            continue;
+        }
+        clean();
+        return signInFailed(reasonFor(signedIn, false));
+    }
+}
+
 }  // namespace
+
+bool loginFormComplete(const LoginForm& form) { return !form.email.empty() && !form.password.empty(); }
+
+std::string loginPrivacyLine(bool underWine) {
+    if (underWine)
+        return "Your password goes only to Frontier's servers. Under Wine or Proton the saved password is not strongly protected on this PC.";
+    return "Your password goes only to Frontier's servers. It is stored encrypted for this Windows user, and only if the box is ticked.";
+}
 
 const Purchase* chooseProduct(const std::vector<Purchase>& items, const std::string& folder) {
     // Odyssey and live Horizons share one folder and differ by filter, so the folder alone does not
@@ -143,7 +320,9 @@ std::string directCommandLine(bool online, const std::string& machineToken, cons
     return "\"" + serverToken + "\" " + options;
 }
 
-std::string fallbackLine(const std::string& reason) {
+std::string fallbackLine(const std::string& reason, bool frontierStore) {
+    if (frontierStore)
+        return "Direct launch did not work: " + reason + ". Starting through Frontier's launcher instead, with the VR or flat choice you made.";
     return "Direct launch did not work: " + reason + ". Starting through Steam instead; Elite will use the mode it is set to.";
 }
 
@@ -176,11 +355,15 @@ DirectPlan planDirectLaunch(const DirectEnv& env, const DirectRequest& request) 
     const std::wstring exe = joinPath(request.productDir, widenUtf8(info.executable));
     if (!fileExists(exe)) return fallback(plan, "Elite's program was not found in its folder");
 
-    // Steam's library sits beside EDLaunch.exe, which is at the top of the install.
-    const std::wstring edlaunch = findEdLaunch(request.productDir);
-    const size_t slash = edlaunch.find_last_of(L"\\/");
-    const std::wstring dll = edlaunch.empty() ? std::wstring() : joinPath(edlaunch.substr(0, slash), L"steam_api64.dll");
-    if (dll.empty() || !fileExists(dll)) return fallback(plan, "steam_api64.dll was not found beside Elite's launcher");
+    // Steam's library sits beside EDLaunch.exe, which is at the top of the install. A Frontier-store
+    // install has no Steam to ask.
+    std::wstring dll;
+    if (!request.frontier) {
+        const std::wstring edlaunch = findEdLaunch(request.productDir);
+        const size_t slash = edlaunch.find_last_of(L"\\/");
+        dll = edlaunch.empty() ? std::wstring() : joinPath(edlaunch.substr(0, slash), L"steam_api64.dll");
+        if (dll.empty() || !fileExists(dll)) return fallback(plan, "steam_api64.dll was not found beside Elite's launcher");
+    }
 
     // 2. The machine ID.
     std::string machineId, error;
@@ -193,31 +376,41 @@ DirectPlan planDirectLaunch(const DirectEnv& env, const DirectRequest& request) 
     say("Asking Frontier for the time...");
     api.syncTime();
 
-    say("Asking Steam for a sign-in ticket...");
-    std::unique_ptr<SteamSession> steam = env.makeSteam ? env.makeSteam(dll) : makeSteamSession(dll);
-    std::string ticket;
-    if (!steam || !steam->getTicket(&ticket, &error)) {
-        if (steam) steam->release();
-        return fallback(plan, steam ? error : "Steam could not be reached");
-    }
-    plan.secrets.push_back(ticket);
-
-    // 5. Sign in. The ticket is cancelled and Steam shut down as soon as Frontier has had it, which is
-    // before anything else is asked and so before the game is started, whatever the answer was.
-    say("Signing in to Frontier with your Steam account...");
     FrontierSession session;
-    const ApiResult signedIn = callWithRetry(env, [&]() { return api.steamAuth(machineId, ticket, &session); });
-    steam->release();
-    steam.reset();
-    plan.secrets.push_back(session.authToken);
-    plan.secrets.push_back(session.machineToken);
-    if (signedIn.outcome != ApiOutcome::Ok) return fallback(plan, reasonFor(signedIn));
+    if (request.frontier) {
+        const SignInResult in = frontierSignIn(env, api, machineId, &plan, &session);
+        plan.secrets.push_back(session.authToken);
+        plan.secrets.push_back(session.machineToken);
+        if (in.end != SignInEnd::Ok) {
+            plan.stopped = in.end == SignInEnd::Stopped;
+            return fallback(plan, in.reason);
+        }
+    } else {
+        say("Asking Steam for a sign-in ticket...");
+        std::unique_ptr<SteamSession> steam = env.makeSteam ? env.makeSteam(dll) : makeSteamSession(dll);
+        std::string ticket;
+        if (!steam || !steam->getTicket(&ticket, &error)) {
+            if (steam) steam->release();
+            return fallback(plan, steam ? error : "Steam could not be reached");
+        }
+        plan.secrets.push_back(ticket);
+
+        // 5. Sign in. The ticket is cancelled and Steam shut down as soon as Frontier has had it, which is
+        // before anything else is asked and so before the game is started, whatever the answer was.
+        say("Signing in to Frontier with your Steam account...");
+        const ApiResult signedIn = callWithRetry(env, [&]() { return api.steamAuth(machineId, ticket, &session); });
+        steam->release();
+        steam.reset();
+        plan.secrets.push_back(session.authToken);
+        plan.secrets.push_back(session.machineToken);
+        if (signedIn.outcome != ApiOutcome::Ok) return fallback(plan, reasonFor(signedIn));
+    }
 
     // 6. The product among the purchases.
     say("Checking what the account owns...");
     PurchaseList purchases;
     const ApiResult bought = callWithRetry(env, [&]() { return api.purchases(session, &purchases); });
-    if (bought.outcome != ApiOutcome::Ok) return fallback(plan, reasonFor(bought));
+    if (bought.outcome != ApiOutcome::Ok) return fallback(plan, reasonFor(bought, !request.frontier));
     const Purchase* product = chooseProduct(purchases.items, lastFolder(request.productDir));
     plan.detail = "Purchases: " + std::to_string(purchases.items.size()) + ", fields: " + purchases.shape + "\r\n";
     if (!product) return fallback(plan, "Elite is not among the products Frontier lists for this account");
@@ -227,7 +420,7 @@ DirectPlan planDirectLaunch(const DirectEnv& env, const DirectRequest& request) 
     std::string remoteVersion;
     const ApiResult installer =
         callWithRetry(env, [&]() { return api.installerVersion(session, machineId, product->sku, &remoteVersion); });
-    if (installer.outcome != ApiOutcome::Ok) return fallback(plan, reasonFor(installer));
+    if (installer.outcome != ApiOutcome::Ok) return fallback(plan, reasonFor(installer, !request.frontier));
     plan.detail += "Version on disk: " + info.version + ", Frontier's: " + remoteVersion + "\r\n";
     std::vector<long long> remoteParts;
     if (!parseVersion(remoteVersion, &remoteParts)) return fallback(plan, "Frontier named a game version the launcher cannot read");
@@ -240,7 +433,7 @@ DirectPlan planDirectLaunch(const DirectEnv& env, const DirectRequest& request) 
     if (!product->serverArgs.empty()) serverArgs += (serverArgs.empty() ? "" : " ") + product->serverArgs;
     plan.exe = exe;
     plan.workDir = request.productDir;
-    plan.args = widenUtf8(directCommandLine(!info.offline, session.machineToken, session.authToken, serverArgs, info.steamAware,
+    plan.args = widenUtf8(directCommandLine(!info.offline, session.machineToken, session.authToken, serverArgs, info.steamAware && !request.frontier,
                                             request.vr, product->gameArgs));
     plan.start = true;
     return plan;

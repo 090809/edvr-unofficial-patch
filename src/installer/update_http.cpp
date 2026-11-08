@@ -195,8 +195,14 @@ HttpResponse WinHttpClient::get(const HttpRequest& request) {
     if (!urlAllowed(request.url, allowLoopbackHttp_, &policyError)) return stop(policyError);
     const unsigned long long limit = request.maxBytes ? request.maxBytes : kDefaultMaxBytes;
 
+    if (request.method != "GET" && request.method != "POST") return stop("the request method is not supported");
+    const bool isPost = request.method == "POST";
+    const bool follow = request.followRedirects && !isPost;
+    const std::wstring verb = isPost ? L"POST" : L"GET";
+
     std::wstring headerText;
     for (const auto& header : request.headers) headerText += widenUtf8(header.first + ": " + header.second + "\r\n");
+    if (isPost) headerText += L"Content-Length: 0\r\n";
 
     std::string url = request.url;
     for (int hop = 0; hop <= 10; ++hop) {
@@ -209,7 +215,7 @@ HttpResponse WinHttpClient::get(const HttpRequest& request) {
         Handle connection(WinHttpConnect(static_cast<HINTERNET>(session_), widenUtf8(parsed.host).c_str(),
                                          parsed.port, 0));
         if (!connection.h) return stop(failureText("could not connect"));
-        Handle req(WinHttpOpenRequest(connection.h, L"GET", widenUtf8(parsed.target).c_str(), nullptr,
+        Handle req(WinHttpOpenRequest(connection.h, verb.c_str(), widenUtf8(parsed.target).c_str(), nullptr,
                                       WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
                                       parsed.https ? WINHTTP_FLAG_SECURE : 0));
         if (!req.h) return stop(failureText("could not start the request"));
@@ -227,7 +233,7 @@ HttpResponse WinHttpClient::get(const HttpRequest& request) {
                                  WINHTTP_HEADER_NAME_BY_INDEX, &status, &statusBytes, WINHTTP_NO_HEADER_INDEX))
             return stop(failureText("the reply has no status"));
 
-        if (isRedirect(static_cast<int>(status)) && !request.followRedirects) {
+        if (isRedirect(static_cast<int>(status)) && !follow) {
             result.status = static_cast<int>(status);
             result.transportOk = true;
             return result;
