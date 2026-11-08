@@ -375,6 +375,50 @@ atmosphere (2) and the tonemap (1-3). That is about 80-90 draws, all
 immediate. The hull layer's own anti-aliasing is still open: a second DLSS
 feature (~1 ms) or EDVR's TAA on a layer that is static in view.
 
+### The binding map, from an existing census (same day)
+
+The pilot's flight at 13:14 already carries a full draw census: census 7 in
+`edvr_gfx_20261108_131109.log`, frame 1, 597 eye draws. It has no `mt=`
+(render targets 1-3), which commit 6727f7ff adds. Script: shared notes
+`census_hull.py`. Left eye (the right eye is the same at #405-552):
+
+| Stage | Draw | Writes | Reads |
+|---|---|---|---|
+| G-buffer | hull block (`DE54` ...) | RT0 f23 `E76C20`, RT1-3 not recorded; depth f19 `E78A60`, GEQUAL, write on | material textures, the pool at VS t33 |
+| Depth copy | #237 `DEF19B03`/`CB95394B` | f39 `E76EE0` | the eye depth `E78A60` |
+| AO apply | #429 `DEF19B03`/`06CD42A9` | blends into f27 `E771A0` (a G-buffer target) | a 704x612 f60 target, made offscreen |
+| Shadow mask | #430-431 `53211E8C` x2 | f60 `E77F60`, stencil 10 | depth copy, G-buffer `E75BA0` and `E771A0`, a 1024x512 lookup |
+| Lighting | #432-435 (`7E38A6AA`, `8289669D`, `24DE25E4`, `0357BBB2`) | HDR f26 `E77460` (R11G11B10), additive | depth copy, G-buffer `E76C20`, `E75BA0`, `E771A0`, shadow mask; `24DE25E4` also a 1536x1536 shadow map and an 896-byte light list |
+| Sky, atmosphere | #443 `F8FA801F`, #446 `41E245D4`, #447 `D95905C1` | HDR `E77460`; `41E245D4` writes depth too | depth copy, sky and LUT textures |
+| Own forward | #450-480, the six pairs | HDR `E77460`, depth test on | their own textures and the pool, nothing screen-space |
+| Tonemap | #592 `2D78DC3F`/`99C21CEB`, a 3-vertex triangle | f27 `E77CA0` (8-bit eye) | t1 = HDR `E77460`; t0 = `@2000`, not in the id table (an offscreen product: exposure or bloom) |
+
+What it settles:
+
+- The G-buffer is at least three targets: `E76C20` (f23), `E75BA0` and
+  `E771A0` (f27). Nothing in the census writes the last two as RT0, so
+  they are the block's RT1 and RT2. The flight with `mt=` confirms that and
+  names RT3.
+- Every screen-space input the hull layer needs is made inside the eye
+  pass from depth and the G-buffer: the depth copy, the shadow mask and the
+  lighting. All of them can be re-issued against a private G-buffer.
+- Two inputs come from outside the eye pass:
+  - **AO** is a compute chain. Depth is reduced to 176x153 (f39), then a
+    dispatch (`ch=D31E7812`, 44x39 groups) writes a 704x612 f60 target,
+    and #429 blends that into G-buffer `E771A0`. On a hull layer the AO
+    would be the world's. Either re-dispatch the chain on the hull's depth
+    or apply none to the hull.
+  - **The tonemap's t0** (`@2000`) did not resolve (census 7's id table
+    was full: 2,048 interned, 2,547 overflowed), and no draw, copy or
+    dispatch in the census writes it by token. The tonemap reads only t0
+    and the HDR, so no separate bloom texture enters it. t0 is most likely
+    the exposure value from the compute exposure chain
+    (`gpu-pass-profile-2026-10-12.md`, class `exposure`). Then the
+    re-issued tonemap applies the world's exposure to the hull, which is
+    what the game does today.
+- The atmosphere writes depth, so in the hull layer it must run after the
+  own forward draws or with depth writes off.
+
 **Next, the first build (compile-only, a measurement):** an instrument with
 no visual change. Per eye, it finds the block (the hull families' run after
 the cockpit shell), takes its records, and logs the block's length, its
