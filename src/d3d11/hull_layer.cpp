@@ -304,6 +304,8 @@ constexpr char kTaaHlsl[] =
     "    float wsum = 0.0;\n"
     "    float4 lo = 1e9;\n"
     "    float4 hi = -1e9;\n"
+    "    float4 m1 = 0.0;\n"
+    "    float4 m2 = 0.0;\n"
     "    float zr = 0.0;\n"
     "    [unroll] for (int dy = -1; dy <= 1; ++dy) {\n"
     "        [unroll] for (int dx = -1; dx <= 1; ++dx) {\n"
@@ -319,10 +321,19 @@ constexpr char kTaaHlsl[] =
     "            wsum += wt;\n"
     "            lo = min(lo, s);\n"
     "            hi = max(hi, s);\n"
+    "            m1 += s;\n"
+    "            m2 += s * s;\n"
     "            zr = max(zr, coverDepth.Load(int3(origin.xy + q, 0)));\n"
     "        }\n"
     "    }\n"
     "    cur /= max(wsum, 1e-6);\n"
+    // Variance clipping (2026-11-08 23:10): the history is held to the 3x3's mean +- 1.25 sigma, inside its min/max. A
+    // min/max box alone swings with the jitter on thin high-contrast lines (the decals' panel lines), so the history
+    // jumped and those lines flickered as if there were no TAA (the pilot).
+    "    m1 /= 9.0;\n"
+    "    float4 sd = sqrt(max(m2 / 9.0 - m1 * m1, 0.0));\n"
+    "    lo = max(lo, m1 - 1.25 * sd);\n"
+    "    hi = min(hi, m1 + 1.25 * sd);\n"
     "    float4 res = cur;\n"
     "    if (jit.z != 0.0) {\n"
     "        float3 d;\n"
@@ -350,7 +361,7 @@ constexpr char kTaaHlsl[] =
 // softer than DLSS's. A cross unsharp mask on the TAA result, clamped to the cross's range (no halo); only where the whole
 // cross is hull (alpha 1), so the silhouette's anti-aliased edge stays as the TAA left it. The history is not sharpened.
 // hlsl-check: kSharpHlsl hull_layer_sharp_cs cs_5_0
-constexpr float kSharpAmount = 0.8f;   // c + amount * (c - mean of the 4 neighbours)
+constexpr float kSharpAmount = 0.6f;   // c + amount * (c - mean of the 4 neighbours); 0.8 amplified the thin lines' flicker (23:10)
 constexpr char kSharpHlsl[] =
     "Texture2D<float4> hist : register(t0);\n"
     "Texture2D<float4> world : register(t1);\n"

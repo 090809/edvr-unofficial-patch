@@ -775,6 +775,20 @@ decals read the main pass's copy, which no longer holds the own hull.
 - ruled out: the CS step `CBAAD243` as the dark decals' cause, because it
   reads only the depth-derived `4FD03C16` output (census 3, resolved ids).
 
+**Close to the original (build 4c9005e8, 23:05).** The pilot: "the picture
+is close to the original". Two things remain:
+- the outlines (thin panel lines) are a little soft;
+- they now flicker "as if there were no TAA".
+
+Fix:
+- **Variance clipping.** The history is held to the 3x3 mean ± 1.25
+  sigma, inside the min/max box. On thin contrasted lines the min/max box
+  swings with the jitter and lets the history jump.
+- **Sharpen 0.6** instead of 0.8: it amplified that flicker.
+
+`hlsl_embedded_check.py` now skips C++ comment lines between the literals:
+a quoted phrase in one was read as HLSL.
+
 ## Optimisation debt (recorded 2026-11-08 at the pilot's request)
 
 The layer was built to work first. Before it ships as anything but a

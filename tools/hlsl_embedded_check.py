@@ -28,6 +28,8 @@ LITERAL = re.compile(r'"((?:[^"\\]|\\.)*)"')
 
 
 def literals(chunk):
+    # C++ comment lines between the literals are not HLSL; a quoted phrase in one was read as code once (2026-11-08).
+    chunk = re.sub(r'^\s*//.*$', '', chunk, flags=re.M)
     return ''.join(bytes(m.group(1), 'utf-8').decode('unicode_escape') for m in LITERAL.finditer(chunk))
 
 
@@ -97,6 +99,7 @@ def self_test():
         return 0
     good = ('// hlsl-check: kGood good_cs cs_5_0\n#define CB "cbuffer GoodCb : register(b0) { uint n; };\\n"\n'
             'constexpr char kGood[] = CB\n    "RWByteAddressBuffer o : register(u0);\\n"\n'
+            '    // a C++ comment with a "quoted phrase" between the literals is not HLSL\n'
             '    "[numthreads(1, 1, 1)] void good_cs() { o.Store(0, n); }\\n";\n')
     bad = good.replace('GoodCb', 'Pass').replace('kGood', 'kBad').replace('good_cs', 'bad_cs')
     missing = '// hlsl-check: kNone none_cs cs_5_0\n'
