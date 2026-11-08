@@ -2,10 +2,10 @@
 
 ## Status
 
-- **State (2026-11-07): Phase 1 slice FLOWN 6 TIMES** (fork
-  `framegen-phase1`; "flight 5", "flight 6" entries). The world, near a
-  surface and in supercruise, extrapolates at the ceiling with ex2dh. Design from OFXR-Bridge
-  `d7fcca72` and EDVR `6b8ef374`. No issue yet.
+- **State (2026-11-08): Phase 2.3 Lock flies** (fork `framegen-phase1`):
+  S in every slot, Lock holds; the pilot still reports smear (S quality
+  arc in the 2026-11-07/08 entries). Design from OFXR-Bridge `d7fcca72`,
+  EDVR `6b8ef374`. No issue yet.
 - **Recommendation:** take OFXR-Bridge's frame loop, not its synthesizer. Elite
   renders at half the headset rate and EDVR's runtime presents every display
   period. The frame in between is **extrapolated** from Elite's newest frame,
@@ -49,16 +49,9 @@
 - **Phase 0 (no EDVR code):** fly stock OFXR-Bridge and VectorXR (colour-only
   routes) over EDVR at a bright settlement and in space, with each runtime's
   own smoothing off and then on. This is the visual reference to beat.
-- **Next: fly the flight 11 fix** (the game's frame sequences skip the S slots;
-  `frame generation lock: replayed B:` names each replay). Lock 2:1 flown once.
-  Built, not flown: S's edges in a ship turn (sentinel vectors, dilated vectors);
-  S resampled Catmull-Rom (`FG_SHARP`, 0.82 -> 0.94); hole fill along the motion (`FG_FILL_REPROJ`);
-  `fgSynSrc`'s tie deterministic (2026-11-08: second time pass, the passes near their bounds);
-  the resample in 8 fetches instead of 16 (2026-11-08 third time pass: it was fetch-bound, not
-  memory-bound; 0.57 -> 0.54 ms per eye, replays unchanged); the hull's
-  outline against space (2026-11-08: `FG_HALO`, `FG_SENTINEL_SURFACE`;
-  +0.07 ms per eye).
-  H1, H8, H9 and the surface classifier are still unbuilt; on foot unflown.
+- **Next:** fly the 2026-11-08 S fixes (sharp resample, hole fill along the
+  motion, hull outline vs space) with `hotkey.frame_generation` for an
+  on/off A/B. H1, H8, H9 and the surface classifier are unbuilt.
 - **Temporary keys (hidden):** `fix.frame_generation_shadow` (off | on), and
   `fix.frame_generation` (off | on; built 2.3: `on` forces Lock, for A/B
   flights; `auto` replaces it in 2.4).
