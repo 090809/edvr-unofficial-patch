@@ -2,25 +2,27 @@
 
 ## Status
 
-- **State:** build order steps 2 and 3 are built on branch
-  `claude/hungry-heyrovsky-000d7b` (2026-11-07), and the full build passes. No release
-  carries the launcher yet. Step 4 has not started.
+- **State:** build order steps 2, 3 and 4 are built on branch
+  `claude/hungry-heyrovsky-000d7b`, and the full build passes. No release carries the
+  launcher yet. Step 5 has not started.
 - **Proven, 2026-11-07 (see Test results):** CI builds the split assets, the signing
   tool's signature verifies through BCrypt, and a test release on GitHub was refused
   or accepted correctly over real HTTPS. The launcher downloaded it, verified every
   file and installed it into a scratch folder with no write to the real folders.
+- **Flown, 2026-11-08:** direct launch on Steam, VR and flat, from the launcher's window
+  (see Test results).
 - **Rig-tested only, not yet run for real:** the first run's copy and registration, a
-  self-update, a real UAC prompt and the elevated copy, and Play through Steam, Epic
-  or EDLaunch, including closing EDLaunch. No one has flown any of it.
-- **Next flight:** `ed-up-launcher.exe --data-root <scratch folder>` shows the real
-  window without copying or registering itself, and offers Play. Press Play on each
-  store and watch EDLaunch close after the game exits. Self-update and the first run
-  need the next real release.
-- **Blocks step 4:** Frontier's terms on third-party launchers are still unread, and
-  they have to be read before direct launch is built, not only before it ships.
+  self-update, a real UAC prompt and the elevated copy, and the EDLaunch route on any
+  store, including closing EDLaunch.
+- **Next flight:** with direct launch off, Play on each store, watching EDLaunch close
+  after the game exits. Self-update and the first run need the next real release.
+- **Frontier's terms** were read on 2026-11-07 before step 4. None of them names a
+  third-party launcher. The maintainer chose to make direct launch opt-in.
 - **Waiting on others:** SignPath had not replied on 2026-11-07. A launcher-only
   signing answer could still move it to its own repo (see Why this repo).
 - **Decisions:**
+  - Direct launch is off until the user ticks it, and asks first. It starts the game
+    without WatchDog64, as min-ed-launcher does by default (2026-11-07).
   - The launcher's names are `ed-up-*`, and its private keys are in the maintainer's
     password manager, with both public keys in the exe (see Updates).
   - An update needs a click. Nothing downloads or changes until Download is pressed,
@@ -31,9 +33,9 @@
   - It is one Windows exe everywhere. On Linux and Mac it runs inside Proton or
     CrossOver beside the game, with no cross-platform SDK.
   - It updates from GitHub Releases, using a signed manifest.
-  - It starts the game directly on Steam and on the Frontier store. The sign-in
+  - It can start the game directly on Steam and on the Frontier store. The sign-in
     is ported to C++ from min-ed-launcher. EDLaunch stays for Epic, for patching
-    the game, and as the fallback when direct launch fails.
+    the game, as the fallback when direct launch fails, and as the default.
   - VR or flat is `/vr` or `/novr`, never a Settings.xml write on a direct
     launch.
 - **Proven on Windows, 2026-11-07 (T1 to T4, see Test results):** a process Steam
@@ -442,6 +444,25 @@ from the cache lag described under Updates, which this test found and `5033812c`
 The acceptance, download and install rows used the CI-built launcher at the tag. The
 refusal rows used a local build with the fix, which does not touch the signature check.
 
+Direct launch on Steam (step 4), from `18ac1c3f` with `--data-root` on a scratch folder. The
+Steam install held DLL build `v0.22.0-rc.6-394-g35aa1d87` from another branch, which is not
+under test here; only the launcher is.
+
+| Test | Result | Evidence |
+|---|---|---|
+| Dry run, 2026-11-07 | Pass | Signed in on the first try. Six purchases, with the field names the port reads (`product_sku`, `directory`, `filter`, `gameargs`, `serverargs`, `sortkey`). The game version matched Frontier's (`2026.10.23.334925`). The command line ended `"ServerToken <masked> <masked> " /steam /vr`, and nothing was started |
+| Play VR, 2026-11-08 06:35 | Pass | `command line /vr applied`, the game's arguments `<redacted> /steam /vr` with no `/language`, so EDLaunch did not start it. The runtime log has `steam_identity,source=inherited,app_id=359320`, and the OpenXR session reached VISIBLE and shut down cleanly |
+| Play flat, 06:37 | Pass | `command line /novr applied`, `<redacted> /steam /novr`, and no runtime log, so `openvr_api.dll` never loaded |
+
+Before the port touched Frontier, a second reading of min-ed-launcher's source found three
+places where it differed: the purchase fields are `product_sku` and `product_name`, `fTime`
+carries five decimals, and Odyssey and live Horizons share one folder, so the product is
+chosen by the `edo` filter. All three were fixed before the dry run.
+
+Not shown yet: whether Steam counts playtime and the overlay works on screen, whether
+the game's language is right without the `/language` EDLaunch passes, and what each
+fallback looks like for real.
+
 ## Build order
 
 1. T1 to T4 (done).
@@ -450,7 +471,7 @@ refusal rows used a local build with the fix, which does not touch the signature
 3. Launcher from the installer: file cache in place of the embedded payload, update,
    self-update, and the EDLaunch route with the close after exit. It ships beside the
    installer. (Built, update path proven, not flown.)
-4. Direct launch on Steam. Read Frontier's terms first.
+4. Direct launch on Steam, opt-in. (Built, flown VR and flat.)
 5. Pre-launch check and `--wrap`.
 6. Direct launch on the Frontier store, with its login window.
 7. The per-eye field, the headset record and the settings table as data.

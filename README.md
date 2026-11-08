@@ -102,10 +102,11 @@ from there; removing it from that list (or `ed-up-launcher.exe --unregister`)
 takes all of that away again, and leaves ED-UP in your game folders and your
 settings copies alone.
 
-It contacts two places, and only these: `api.github.com`, to ask this project's
-releases whether a newer one exists, and GitHub's release downloads, for the
-files of a release you chose to install. Each request carries the launcher's
-name and version and nothing that identifies you or your PC. Nothing is
+It contacts `api.github.com`, to ask this project's releases whether a newer one
+exists, and GitHub's release downloads, for the files of a release you chose to
+install. Each request to GitHub carries the launcher's name and version and
+nothing that identifies you or your PC. With direct launch turned on (below) it
+also signs in to Frontier's servers, `api.zaonce.net`, and nothing else. Nothing is
 downloaded or changed until you press Download. A release is offered only if its
 manifest carries a signature that verifies against a public key inside the
 launcher, so a changed or substituted release is refused. If GitHub cannot be
@@ -115,6 +116,15 @@ Play starts the game through Steam, Epic or Frontier's own launcher, and
 watches until it exits so that it can close the Frontier launcher window left
 behind. Only Frontier's launcher takes a VR or flat choice from the launcher;
 through Steam or Epic the game starts in the mode it is already set to.
+
+On Steam, a checkbox can start the game directly instead, with VR or flat as you
+choose. The launcher then signs in to Frontier's servers with your Steam login,
+sending what Frontier's own launcher sends (a sign-in ticket from Steam and an ID
+for this PC), and starts the game itself. It is off until you turn it on, and
+Frontier has not approved it. No password or token is stored. If any part of the
+sign-in fails, the launcher says why and starts the game through Steam instead.
+The sign-in is ported from [min-ed-launcher](https://github.com/rfvgyhn/min-ed-launcher)
+(MIT licence; `ed-up-launcher.exe --licenses` prints it).
 
 ### Linux on Steam (Proton)
 

@@ -105,7 +105,7 @@ void updateLauncherControls() {
         const bool directOn = showDirect && lg.session->directLaunch();
         if (route.kind == RouteKind::Frontier || directOn) {
             showPair = true;
-            lg.playCaption = directOn ? L"Signs in with your Steam login and starts Elite itself. If that fails it uses Steam."
+            lg.playCaption = directOn ? L"Signs in itself. If that fails, it starts through Steam."
                                       : L"Starts EDLaunch with the mode you pick, then closes it when Elite exits.";
             const bool flat = launcherRememberedMode() == "flat";
             ui::setButtonStyle(lg.playVr, flat ? ui::ButtonStyle::Secondary : ui::ButtonStyle::Primary);
