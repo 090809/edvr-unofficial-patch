@@ -63,7 +63,9 @@ constexpr uint32_t kRing = 4;             // readback staging buffers an eye
 constexpr uint32_t kReadbackLag = 2;      // frames before a readback is tried (DO_NOT_WAIT)
 constexpr uint32_t kLightSpan = 64;       // draws after the shadow mask that may pass with no sky before the lighting window closes
 constexpr uint32_t kMaxUnknownPairs = 16;
-constexpr uint32_t kAutoFrames = 600, kAutoMax = 3, kAutoOwnLo = 20, kAutoOwnHi = 200;
+// kAutoMax 0: the auto dumps are off (the pilot, 2026-11-08 22:25: each dump's hitch in the headset is too disruptive);
+// the dump_eyes key still arms one by hand. Raise it to bring them back for an unattended measurement flight.
+constexpr uint32_t kAutoFrames = 600, kAutoMax = 0, kAutoOwnLo = 20, kAutoOwnHi = 200;
 constexpr ULONGLONG kAutoGapMs = 60000;
 constexpr ULONGLONG kReportMs = 30000;
 // Step 3 (separate): the discard's safety. A mask past kOwnMaskMax records holds a station's or another ship's records
