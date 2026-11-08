@@ -608,6 +608,21 @@ them; that the shell and the block draw with four targets bound; and that no
 third pass draws the shell into a G-buffer of its own (`eye_frames` would be
 more than twice `frames`).
 
+## Step 1 v2 flight (2026-11-08 20:19, build 472aaccf): no result, a shader keyword
+
+Log `edvr_gfx_20261108_201922.log`, build verified. The layer never ran:
+`hull_layer_count_cs` failed to compile at run time (`error X3000: syntax
+error: unexpected token 'Pass'`). `Pass` is an HLSL keyword, and it was the
+name of the cbuffer shared by the count and filter shaders. Every window
+logged `state=no-shader`. Five dumps (202246398001 to 202450601005) carry
+only GameHdrLit. A few eye-frames also logged `no-slot-target` (2-10 a
+window); read that again on the next flight.
+
+The fix renames the cbuffer, and adds `tools\hlsl_embedded_check.py`, gated
+in `build.bat`. It compiles every `// hlsl-check:` shader of a source with
+the system `d3dcompiler_47.dll`, so a run-time shader cannot fail first in a
+flight. It reproduces this error on the 472aaccf source.
+
 ## Step 1 v2 build (2026-11-08, compile-only, not flown)
 
 The fixes the v1 flight asked for (section "Step 1 flight"), still in the

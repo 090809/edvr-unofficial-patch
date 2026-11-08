@@ -85,6 +85,12 @@ bool isTerrainVs(uint64_t vs) { return vs == kTerrainVs || static_cast<uint32_t>
 
 // ---- the shaders (compiled at the first seed with d3dcompiler_47.dll, the gpu_pass_delay_shader.h way) ----------------
 
+// Compiled at run time; tools\hlsl_embedded_check.py compiles them in the build (build.bat gate), one line each:
+// hlsl-check: kSeedHlsl hull_layer_seed_cs cs_5_0
+// hlsl-check: kCountHlsl hull_layer_count_cs cs_5_0
+// hlsl-check: kFilterVsHlsl hull_layer_filter_vs vs_5_0
+// hlsl-check: kFilterPsHlsl hull_layer_filter_ps ps_5_0
+//
 // The seed: the seed draw's instance window names its records; their mean position is the own ship's centre, and every
 // pool record within the radius of it is the own ship's. One group; one uint a record in the mask; stats = (own records,
 // filtered pixels, seed records read, seed instances).
@@ -133,7 +139,7 @@ constexpr char kSeedHlsl[] =
 // A pixel is a neighbour's when its private slot is set (2*slot+1 >= 1; the clear is -1) and names a record outside the
 // own mask (or outside the pool).
 #define HULL_LAYER_PASS_HLSL                                                                       \
-    "cbuffer Pass : register(b0) { uint recordCount; float clearDepth; uint width; uint height; };\n" \
+    "cbuffer HullLayerPassCb : register(b0) { uint recordCount; float clearDepth; uint width; uint height; };\n" \
     "Texture2D<float2> slots : register(t0);\n"                                                    \
     "ByteAddressBuffer ownMask : register(t1);\n"                                                  \
     "bool foreignSlot(float x) {\n"                                                                \

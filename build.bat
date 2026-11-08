@@ -3431,6 +3431,8 @@ python tools\run_jobs.py --jobs 4 ^
     --gate "tools\eye_bmp_to_png.py --self-test" ^
     --gate "tools\character_motion_check.py --self-test" ^
     --gate "tools\hull_layer_compare.py --self-test" ^
+    --gate "tools\hlsl_embedded_check.py --self-test" ^
+    --gate "tools\hlsl_embedded_check.py" ^
     --gate "tools\diff_eye_dump.py --self-test" ^
     --gate "tools\eye_run_fit.py --self-test" ^
     --gate "tools\eye_run_shimmer.py --self-test" ^
