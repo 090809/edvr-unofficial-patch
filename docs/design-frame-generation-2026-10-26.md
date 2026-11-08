@@ -49,11 +49,9 @@
 - **Phase 0 (no EDVR code):** fly stock OFXR-Bridge and VectorXR (colour-only
   routes) over EDVR at a bright settlement and in space, with each runtime's
   own smoothing off and then on. This is the visual reference to beat.
-- **Next:** fly the 2026-11-08 S fixes (sharp resample, hole fill along the
-  motion, hull outline vs space) with `hotkey.frame_generation` for an
-  on/off A/B. H1, H8, H9 and the surface classifier are unbuilt.
-- **Base frame (FG off), 2026-11-08:** the wing-gap smear is terrain
-  disoccluded at the hull edge each frame; hull vectors are right (journal).
+- **Next:** 2.4 (gate, `auto`, H1). The pilot's remaining smear is EDVR's
+  base frame, FG off too: terrain disoccluded at the hull edge each frame,
+  DLSS's limit at this rate (2026-11-08 base-frame entry).
 - **Temporary keys (hidden):** `fix.frame_generation_shadow` (off | on), and
   `fix.frame_generation` (off | on; built 2.3: `on` forces Lock, for A/B
   flights; `auto` replaces it in 2.4).
