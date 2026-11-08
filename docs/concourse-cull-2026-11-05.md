@@ -602,6 +602,16 @@ Flat, Steam, c841a58b, at the `CraterPort`, in its room, with F2 (the type is no
 4. The two other panes seen from the middle (n=36 and n=24): what are they, and do they look right?
 5. F2 on and off at one spot for the frame time: 11.5 to 15.3 ms there with the cull off.
 
+## Flight 48 results, first part: the bake has no sun
+
+c841a58b, log `edvr_gfx_20261108_050858`, the `CraterPort` with F2 at 05:10:40: `the room is a surface port's (its anchor is SA_PlanetPortHub_Compact)`. The bake took 110 ms, all five directions captured, near plane 50 m. `the sun stays on` (05:10:35). Sean, with two screenshots of the bay: "I notice the bake doesn't seem to include the sunlight and possibly terrain/skybox?". With the window clear, the buildings are sunlit, the ground grey, the sky black with stars. In the bake the buildings show only their windows' lights on near-black walls, there is no ground, and the sky is navy with no stars. That matches H54 at the carrier's bar (navy, no stars, no planet).
+
+- `ruled out: withheld families in the bake's frames, because feed.withhold and feed.effects are false while the camera is moved (lookOn), so terrain, sun and sky families are issued then (code).`
+- `ruled out: the display's fallback as the navy, because the fallback is kSteadyColour, a pale white, and the capture writes texels with no depth too (at kBackdropFarM) (code).`
+- **H57** The bake's near plane, 50 m, clips what Elite draws close to the camera on purpose: the sky dome and stars, the sun's disc and glare, and perhaps the sun's lighting pass. That would explain the navy sky (nothing drawn there), the missing stars, and at the carrier the missing planet. Test, no build: `diag.concourse_bake_near = 5` in Sean's `edvr-flat.ini` (set 2026-11-08), relaunch, a new bake at the `CraterPort`. At 5 m the room's own walls are captured too, so most of the windows will show the room. Look only through the bay, where the glass lets the outside in: a black sky with stars and sunlit buildings there confirms H57 for what lies between 5 and 50 m. Unchanged leaves it open below 5 m.
+- **H58** The sun's shadows follow the player's camera, not the moved one: the shadow cascades are built for where Sean stood, so what the bake looks at from the room's centre falls outside them and reads as shadowed. It does not explain the navy sky. Discriminator: in a bake, the buildings in the direction Sean was facing when it ran are lit and the others are not.
+- **If H57 holds:** the fix is to bake at the game's own near plane and leave out the room's own records in the bake's frames by name (the store already tells the room from the outside), instead of cutting them with the near plane.
+
 ## Flight 47, first part: the suspended bar
 
 c841a58b, log `edvr_gfx_20261108_044500`, build matched. Sean suspended the carrier's bar service mid-session: "Interesting bug, I suspended the bar service." A 3.3 s clip from 04:51:50, standing still, flickers every few frames between a grey panelled wall filling the view and the corridor behind it to the bar's dark window. A restart cleared it: "I restarted the game and its not doing the bug anymore".
