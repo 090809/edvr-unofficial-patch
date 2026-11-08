@@ -34,7 +34,7 @@ constexpr float kFaceMinDot = 0.82f;            // a frame looking more than abo
 constexpr float kWorldOffsetM = 0.5f;           // the world check: render less store past this is taken as an offset
 constexpr float kCoveredFrac = 0.99f;           // a face whose frames covered this share of its texels is done
 constexpr uint32_t kAimsPerFace = 3;            // the first aim and two more, then a face that is still short is let go
-constexpr uint32_t kVrBakeDwell = 3;            // TEMPORARY (H58-H61 instrument, Flight 53): frames held on a new aim; only the last one writes
+constexpr uint32_t kVrBakeDwell = 3;            // frames held on a new aim: the room's upper structure flickers on some frames (Flight 53, H62), and the cube keeps the union of a face's frames
 constexpr uint32_t kReadbackTicks = 7;          // an aim's frame, its capture and the read-back of its counts take about this many ticks
 constexpr float kPitchMaxRad = 0.35f;           // about 20 degrees: a frustum that needs more is not centred, it is logged
 
@@ -246,8 +246,8 @@ public:
             best_[f] = 0.0f;
         }
     }
-    // The face this tick aims at, and whether it is a new aim (false: the face is held, or the last face stays). TEMPORARY (H58-H61 instrument, Flight 53): a new aim holds
-    // its face for kVrBakeDwell ticks; *dwell is the index of this tick in the hold (0..kVrBakeDwell-1), or kVrBakeDwell for a tick that only stays on the last face.
+    // The face this tick aims at, and whether it is a new aim (false: the face is held, or the last face stays). A new aim holds its face for kVrBakeDwell ticks, because
+    // the room's upper structure flickers on some frames (Flight 53, H62) and every held frame writes, so the cube keeps the union; *dwell is the index of this tick in the hold (0..kVrBakeDwell-1), or kVrBakeDwell for a tick that only stays on the last face.
     // aims_ counts whole holds, and lastAim_ is the tick of the hold's last frame.
     uint32_t next(uint32_t tick, bool* fresh, uint32_t* dwell = nullptr) noexcept {
         if (dwell_ + 1 < kVrBakeDwell) {

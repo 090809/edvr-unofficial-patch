@@ -3377,7 +3377,7 @@ bool g_concKindSeen = false;
 namespace cvb = concourse_vr;
 enum class VrBakePhase : uint8_t { kIdle, kMeasure, kAim };
 constexpr uint32_t kVrMeasureMaxTicks = 10;   // no rows back by then: the world check is not made
-constexpr uint32_t kVrBakeTicksMax = 96;      // the measure, three rounds of aims (each held kVrBakeDwell ticks: TEMPORARY, H58-H61 instrument, Flight 53) and their read-backs, with room to spare
+constexpr uint32_t kVrBakeTicksMax = 96;      // the measure, three rounds of aims (each held kVrBakeDwell ticks) and their read-backs, with room to spare
 constexpr uint32_t kVrHoldLag = 3;            // frames withheld after each aim's tick: the frames still in flight after the last
 constexpr uint32_t kVrHoldFollowTicks = 8;    // the hold's line, this many ticks after the end
 constexpr uint32_t kVrLogLines = 640;         // per bake: the stub, rows, capture and aim lines together (TEMPORARY, H58-H61 instrument, Flight 53: every capture line of every aim frame)
@@ -4812,7 +4812,7 @@ void vrBakeEveryTick(uint32_t frame, bool social) {
             const uint32_t st = c.status[e] < 5 ? c.status[e] : 0;
             ++g_vr.status[st];
             float frac = 0.0f;
-            // TEMPORARY (H58-H61 instrument, Flight 53): the frame's aim entry says whether it was a write frame; a frame with none only counts.
+            // The frame's aim entry says whether it was a write frame (every aimed dwell frame is); a frame with none only counts.
             const uint32_t ai = c.frame % kVrRing;
             const bool haveAim = g_vr.aimValid[ai] && g_vr.aimFrame[ai] == c.frame;
             const bool writeFrame = haveAim && g_vr.aimWrite[ai];
@@ -4921,9 +4921,9 @@ void vrBakeAimStart(uint32_t frame) {
 // One aim: the next face, the base from the latest head, the hold, the near value. What the eyes should show is kept for the rows' lines.
 void vrBakeAimTick(uint32_t frame) {
     bool fresh = false;
-    uint32_t dwell = 0;   // TEMPORARY (H58-H61 instrument, Flight 53): this tick's place in the face's hold; only the hold's last frame writes
+    uint32_t dwell = 0;   // this tick's place in the face's hold; every held frame writes (the cube keeps the union of a face's frames)
     const uint32_t d = g_vr.plan.next(g_vr.tick, &fresh, &dwell);
-    const bool writes = dwell + 1 == cvb::kVrBakeDwell;
+    const bool writes = dwell < cvb::kVrBakeDwell;
     uint64_t seq = 0;
     float head[12] = {}, eyeToHead[2][12] = {};
     if ((g_vr.faceMask & (1u << d)) == 0 || !nativeTemporalHeadPose(&seq, head, eyeToHead)) {
@@ -4956,7 +4956,7 @@ void vrBakeAimTick(uint32_t frame) {
     if (vrLogTake()) {
         char hText[200], bText[200], holdText[72];
         if (dwell < cvb::kVrBakeDwell)
-            std::snprintf(holdText, sizeof(holdText), "%s, dwell %u of %u, %s", fresh ? "a new aim" : "held", dwell, cvb::kVrBakeDwell, writes ? "writes" : "counts only");
+            std::snprintf(holdText, sizeof(holdText), "%s, dwell %u of %u, %s", fresh ? "a new aim" : "held", dwell, cvb::kVrBakeDwell, "writes");
         else
             std::snprintf(holdText, sizeof(holdText), "the last face stays, counts only");
         vrPoseText(hg.v, hText, sizeof(hText));

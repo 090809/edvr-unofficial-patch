@@ -68,6 +68,7 @@ public:
 
 private:
     void begin(ID3D11DeviceContext* ctx, UINT indexCount, UINT startIndex, INT baseVertex, const ConcoursePaneCalls& calls) noexcept;
+    void beginBody(ID3D11DeviceContext* ctx, UINT indexCount, UINT startIndex, INT baseVertex, const ConcoursePaneCalls& calls) noexcept;
     bool nextMirrorPassSlow() noexcept;
     void bindPsCb(ID3D11Buffer* own) noexcept;   // constant buffer 2 of the pixel stage, the previous one kept for end()
     bool beginMirrorSlow() noexcept;

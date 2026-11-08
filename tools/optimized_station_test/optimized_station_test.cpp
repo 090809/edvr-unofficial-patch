@@ -331,7 +331,7 @@ void testVrBake() {
         check(!cvb::worldOffset(store, near1, off, &dist) && dist < 0.5f, "vr bake: the world check: within half a metre is one world");
         check(cvb::worldOffset(store, far1, off, &dist) && std::fabs(off[1] + 29.0f) < 1e-4f && dist > 30.0f, "vr bake: tens of metres is an offset, render less store");
     }
-    // The aims: each face held for kVrBakeDwell ticks in order (TEMPORARY, H58-H61 instrument, Flight 53), a short one again once its counts are due, three times at most, then let go.
+    // The aims: each face held for kVrBakeDwell ticks in order (every held frame writes: the cube keeps the union), a short one again once its counts are due, three times at most, then let go.
     {
         cvb::AimPlan p;
         p.reset(0x1Fu);
@@ -350,7 +350,7 @@ void testVrBake() {
         check(p.covered() == 0x1Bu && !p.finished(15), "vr bake: a face at 90 percent is short, and the bake goes on");
         check(p.next(16, &fresh, &dw) == 2 && fresh && dw == 0 && p.aims(2) == 2, "vr bake: then it is aimed at again, from its last frame's tick");
         check(p.next(17, &fresh, &dw) == 2 && !fresh && dw == 1 && p.next(18, &fresh, &dw) == 2 && !fresh && dw == 2 && p.aims(2) == 2, "vr bake: held for its dwell, still one aim");
-        check(p.next(24, &fresh, &dw) == 2 && !fresh && dw == cvb::kVrBakeDwell, "vr bake: a short face waits for its counts' ticks (the last stays, no write)");
+        check(p.next(24, &fresh, &dw) == 2 && !fresh && dw == cvb::kVrBakeDwell, "vr bake: a short face waits for its counts' ticks (the last stays, counts only)");
         check(p.next(25, &fresh, &dw) == 2 && fresh && dw == 0 && p.aims(2) == 3, "vr bake: and once more");
         check(p.next(26, &fresh, &dw) == 2 && p.next(27, &fresh, &dw) == 2 && dw == 2, "vr bake: held again");
         check(p.next(40, &fresh, &dw) == 2 && !fresh && p.aims(2) == 3, "vr bake: not a fourth time");

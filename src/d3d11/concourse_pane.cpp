@@ -2186,11 +2186,141 @@ bool ensureMarked(ID3D11DeviceContext* ctx, const ConcoursePaneCalls& calls) noe
     return true;
 }
 
+// ---- TEMPORARY (H62 instrument, Flight 54): the VR bake's draw diff ---------------------------------------------------------------------------------------------------------
+// During the VR bake's aim frames every draw the scope sees that is not withheld and has a depth-stencil view bound is keyed (vertex shader, pixel shader, index count, start index)
+// and kept per frame. When a face's frames are over (the next face's first aim, or the bake's end) the keys whose count is not the same on all of the face's frames are logged,
+// largest index count first: the draws behind the band of the room's upper structure that Flight 53 saw on some frames and not others, with the camera unchanged.
+std::atomic<bool> g_vrDiffOn{false};
+uint64_t vrAimEntry(uint32_t frame) noexcept;   // the aim ring's packed entry for the frame (0 when none), defined with the ring
+constexpr uint32_t kDiffFrames = 3;             // the frames of a face compared (kVrBakeDwell)
+constexpr uint32_t kDiffKeyCap = 16384;         // draws kept a frame; the rest are counted as dropped
+constexpr uint32_t kDiffLines = 30;
+struct DiffKey {
+    uint64_t vs, ps;
+    uint32_t idx, start;
+};
+bool diffLess(const DiffKey& a, const DiffKey& b) noexcept {
+    if (a.vs != b.vs) return a.vs < b.vs;
+    if (a.ps != b.ps) return a.ps < b.ps;
+    if (a.idx != b.idx) return a.idx < b.idx;
+    return a.start < b.start;
+}
+bool diffSame(const DiffKey& a, const DiffKey& b) noexcept { return a.vs == b.vs && a.ps == b.ps && a.idx == b.idx && a.start == b.start; }
+struct DiffFrame {
+    uint32_t frame = 0, draws = 0, dropped = 0;
+    std::vector<DiffKey> keys;
+};
+struct DiffGroup {
+    bool active = false;
+    uint32_t face = 0, n = 0;
+    DiffFrame fr[kDiffFrames];
+};
+std::mutex g_diffMutex;   // the draw threads and the tick both touch the group
+DiffGroup g_diff;
+
+// Counts of a key in a sorted list.
+uint32_t diffCount(const std::vector<DiffKey>& sorted, const DiffKey& k) noexcept {
+    const auto r = std::equal_range(sorted.begin(), sorted.end(), k, diffLess);
+    return static_cast<uint32_t>(r.second - r.first);
+}
+
+// Logs the group's diff and empties it. The caller holds g_diffMutex.
+void vrDrawDiffFlushLocked() noexcept {
+    if (!g_diff.active) return;
+    DiffGroup& g = g_diff;
+    g.active = false;
+    std::vector<DiffKey> all;
+    uint32_t distinct[kDiffFrames] = {}, dropped = 0;
+    for (uint32_t f = 0; f < kDiffFrames; ++f) {
+        std::sort(g.fr[f].keys.begin(), g.fr[f].keys.end(), diffLess);
+        dropped += g.fr[f].dropped;
+        for (size_t i = 0; i < g.fr[f].keys.size(); ++i) {
+            if (i == 0 || !diffSame(g.fr[f].keys[i], g.fr[f].keys[i - 1])) {
+                ++distinct[f];
+                all.push_back(g.fr[f].keys[i]);
+            }
+        }
+    }
+    std::sort(all.begin(), all.end(), diffLess);
+    all.erase(std::unique(all.begin(), all.end(), diffSame), all.end());
+    struct Diff {
+        DiffKey k;
+        uint32_t c[kDiffFrames];
+    };
+    std::vector<Diff> diffs;
+    for (const DiffKey& k : all) {
+        Diff d{};
+        d.k = k;
+        bool differ = false;
+        for (uint32_t f = 0; f < kDiffFrames; ++f) {
+            d.c[f] = diffCount(g.fr[f].keys, k);
+            if (d.c[f] != d.c[0]) differ = true;
+        }
+        if (differ) diffs.push_back(d);
+    }
+    std::stable_sort(diffs.begin(), diffs.end(), [](const Diff& a, const Diff& b) { return a.k.idx > b.k.idx; });
+    Log::get().note("concourse bake: vr draw diff: face %u, frames %u %u %u: draws %u %u %u, distinct keys %u %u %u, keys that differ %u (dropped %u)", g.face, g.fr[0].frame, g.fr[1].frame,
+                    g.fr[2].frame, g.fr[0].draws, g.fr[1].draws, g.fr[2].draws, distinct[0], distinct[1], distinct[2], static_cast<unsigned>(diffs.size()), dropped);
+    for (size_t i = 0; i < diffs.size() && i < kDiffLines; ++i)
+        Log::get().note("concourse bake: vr draw diff: face %u: vs %016llX ps %016llX indices %u start %u: counts %u %u %u", g.face, static_cast<unsigned long long>(diffs[i].k.vs),
+                        static_cast<unsigned long long>(diffs[i].k.ps), diffs[i].k.idx, diffs[i].k.start, diffs[i].c[0], diffs[i].c[1], diffs[i].c[2]);
+    for (DiffFrame& f : g.fr) f = DiffFrame{};
+    g.n = 0;
+}
+void vrDrawDiffFlush() noexcept {
+    std::lock_guard<std::mutex> lock(g_diffMutex);
+    vrDrawDiffFlushLocked();
+}
+
+// One draw the scope saw and did not withhold. Cheap out of the VR bake (one flag); in it, only an aim frame's draws are looked at.
+void vrDrawDiffNote(ID3D11DeviceContext* ctx, UINT indexCount, UINT startIndex) noexcept {
+    const uint32_t frame = g_frameNow.load(std::memory_order_relaxed);
+    const uint64_t e = vrAimEntry(frame);
+    if ((e >> 63) == 0 || static_cast<uint32_t>((e >> 32) & 0x7FFFFFFFu) != (frame & 0x7FFFFFFFu) || (e & 0x100u) == 0) return;   // not an aim frame that writes
+    const uint32_t face = static_cast<uint32_t>(e & 0xF), dwell = static_cast<uint32_t>((e >> 4) & 0xF);
+    ID3D11DepthStencilView* dsv = nullptr;
+    ctx->OMGetRenderTargets(0, nullptr, &dsv);
+    if (!dsv) return;
+    dsv->Release();
+    const bool followed = ctx == g_immediate.load(std::memory_order_relaxed);
+    DiffKey k;
+    k.vs = followed ? bindingShaderHash(BindSlot::Vs) : vertexShaderHash(ctx);
+    k.ps = followed ? bindingShaderHash(BindSlot::Ps) : pixelShaderHash(ctx);
+    k.idx = indexCount;
+    k.start = startIndex;
+    std::lock_guard<std::mutex> lock(g_diffMutex);
+    DiffGroup& g = g_diff;
+    if (g.active && (g.face != face || (dwell == 0 && g.n > 0 && g.fr[g.n - 1].frame != frame))) vrDrawDiffFlushLocked();
+    if (!g.active) {
+        g.active = true;
+        g.face = face;
+        g.n = 0;
+    }
+    uint32_t slot = kDiffFrames;
+    for (uint32_t i = 0; i < g.n; ++i)
+        if (g.fr[i].frame == frame) slot = i;
+    if (slot == kDiffFrames) {
+        if (g.n >= kDiffFrames) return;
+        slot = g.n++;
+        g.fr[slot].frame = frame;
+    }
+    DiffFrame& f = g.fr[slot];
+    ++f.draws;
+    if (f.keys.size() < kDiffKeyCap) f.keys.push_back(k);
+    else ++f.dropped;
+}
+
 }  // namespace
 
 // begin() changes no state. It runs the capture path, the withheld check, the family match, the one-shot material read and the share query, then only DECIDES the
 // plan (a mirror draw or none, marked or not, opaque or fading) and opens the side test's first query when one is due.
 void ConcoursePaneScope::begin(ID3D11DeviceContext* ctx, UINT indexCount, UINT startIndex, INT baseVertex, const ConcoursePaneCalls& calls) noexcept {
+    beginBody(ctx, indexCount, startIndex, baseVertex, calls);
+    // TEMPORARY (H62 instrument, Flight 53): the VR bake's draw diff sees every draw of the scene pass, after the decisions above (a draw withheld here is not drawn).
+    if (ctx && !withheld_ && g_vrDiffOn.load(std::memory_order_relaxed)) vrDrawDiffNote(ctx, indexCount, startIndex);
+}
+
+void ConcoursePaneScope::beginBody(ID3D11DeviceContext* ctx, UINT indexCount, UINT startIndex, INT baseVertex, const ConcoursePaneCalls& calls) noexcept {
     if (!ctx) return;
     if (g_capturing.load(std::memory_order_acquire)) {
         const int q = captureBegin(ctx, indexCount);
@@ -3681,6 +3811,7 @@ bool vrAimWrites(uint32_t frame) noexcept {
     const uint64_t v = g_vrAimRing[frame % kVrAimRing].load(std::memory_order_acquire);
     return (v >> 63) != 0 && static_cast<uint32_t>((v >> 32) & 0x7FFFFFFFu) == (frame & 0x7FFFFFFFu) && (v & 0x100u) != 0;
 }
+uint64_t vrAimEntry(uint32_t frame) noexcept { return g_vrAimRing[frame % kVrAimRing].load(std::memory_order_acquire); }
 
 template <class T>
 void vrRelease(T*& p) noexcept {
@@ -4172,7 +4303,7 @@ void concoursePaneVrBakeToneDraw(ID3D11DeviceContext* ctx, char kind, uint32_t c
     g_vrK.size[1] = static_cast<float>(ta.hdrH);
     g_vrK.ctl[1] = other ? 1u : 0u;
     g_vrK.ctl[2] = static_cast<uint32_t>(eye);
-    g_vrK.ctl[3] = vrAimWrites(frame) ? 1u : 0u;   // TEMPORARY (H58-H61 instrument, Flight 53): only a write frame writes the cube; the rest count
+    g_vrK.ctl[3] = vrAimWrites(frame) ? 1u : 0u;   // an aimed dwell frame writes the cube (the union of a face's frames); the rest only count (TEMPORARY counters, H58-H61)
     ID3D11ComputeShader* oldCs = nullptr;
     ID3D11ShaderResourceView* oldSrv[4] = {};
     ID3D11UnorderedAccessView* oldUav[3] = {};
@@ -4250,6 +4381,7 @@ bool concoursePaneVrBakeBegin() noexcept {
     for (uint32_t& o : g_vrLastOrder) o = 0;
     g_vrSaidRefused = false;
     g_vrCapturing.store(false, std::memory_order_release);
+    g_vrDiffOn.store(false, std::memory_order_release);
     g_vrRunning.store(true, std::memory_order_release);
     vrSetHooks();
     return true;
@@ -4288,6 +4420,11 @@ void concoursePaneVrBakeCapture(const float origin[3], const float faces[5][9], 
     }
     if (imm) imm->Release();
     g_vrCapturing.store(true, std::memory_order_release);
+    {
+        std::lock_guard<std::mutex> lock(g_diffMutex);
+        g_diff = DiffGroup{};
+    }
+    g_vrDiffOn.store(true, std::memory_order_release);   // TEMPORARY (H62 instrument, Flight 54)
     Log::get().note("concourse bake: vr: capture: origin %.2f %.2f %.2f, faces 0x%X, near %.0f m, the room's cut %.0f m (nearer is not written), the people left out; a frame is taken "
                     "when its eye is within %.1f m of the origin and looks within %.0f degrees of a face",
                     static_cast<double>(origin[0]), static_cast<double>(origin[1]), static_cast<double>(origin[2]), mask, static_cast<double>(nearM), static_cast<double>(cutM),
@@ -4302,6 +4439,8 @@ void concoursePaneVrBakeAimFrame(uint32_t frame, int face, uint32_t dwell, bool 
 
 bool concoursePaneVrBakeEnd(bool publish, const char* line) noexcept {
     const bool wasCapturing = g_vrCapturing.exchange(false, std::memory_order_acq_rel);
+    g_vrDiffOn.store(false, std::memory_order_release);   // TEMPORARY (H62 instrument, Flight 54): the last face's diff is logged now
+    vrDrawDiffFlush();
     const bool peopleWere = wasCapturing && g_bakePeopleOff.exchange(false, std::memory_order_acq_rel);
     const bool wasRunning = g_vrRunning.exchange(false, std::memory_order_acq_rel);
     vrSetHooks();
