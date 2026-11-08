@@ -629,7 +629,25 @@ Flat, Steam, 35aa1d87, no keys, at the `CraterPort` (now automatic): arrive in t
 
 ## VR, next (Sean, 2026-11-08)
 
-"After we fix this bake issue, let's pivot to VR so it works just as well as flat." His first VR look at the `CraterPort`: "it did not automatically take a bake, when I pressed F2, it culled it seemed but left a grey haze on the bay window". Expected for now: `concourseAutoOn` is flat only, and the bake needs a camera route VR does not have (0x283FA20, the transition flash's mailbox, moves the picture in VR; see "Rendering from the concourse's centre"). With F2 and no bake, the panes fall back to the steady treatment, which is INFERRED to be the haze.
+"After we fix this bake issue, let's pivot to VR so it works just as well as flat." His first VR look at the `CraterPort`: "it did not automatically take a bake, when I pressed F2, it culled it seemed but left a grey haze on the bay window". Then, after Flight 49: "let's move on to VR so we can release this feature".
+
+**What keeps it flat (code survey, 2026-11-08):**
+- `concourseAutoOn` returns false outside flat. `camTestInstall` refuses VR, so there is no bake.
+- The bake's capture is called only from flat's resolve (`flat_runtime.cpp`, two sites). The hold is a desktop Present trick (`device_hook.cpp`, `concoursePaneBakePresent`).
+- Window 3D distance and Skip rooms behind doors are `menu flat_performance` rows, so they are not on VR's menu.
+- The haze is the designed no-bake treatment: steady panes at `kSteadyColour`, the bay at level 0.5.
+- Nothing else is flat-gated: the store cull, the withheld families, the lift, the door rule, the real sky and the pane hooks (the VR draw paths build `ConcoursePaneScope`) all run in VR. INFERRED, not checked: whether VR's per-eye `cb1` rows 270 to 279, which the backdrop shaders read, match flat's; whether the withheld hashes match; and which eye `g_frameCam` reads.
+
+**The VR bake's pieces (research, 2026-11-08):**
+- **Camera:** `native_preview_camera.cpp`'s stub on `0x283FA20` writes the head pose before the eye offsets, and it shipped in rc.2 for the ship preview. In VR both the cull's copy and the draw's copy of the camera follow it, unlike flat's Flight 20. Any direction can be written. The eye offsets come after, so the IPD stays unless the runtime answers an identity eye-to-head transform. On Sean's canted Pimax each eye has its own yaw, so the bake's direction match (dot above 0.999) needs each eye's real forward. The near plane is the same `.data` float, so 5 m reaches VR too. Not found: which mode takes the cameras from `W+0x790` instead (`vfn+0x28` returning 5 or 6), possibly the 2D screen.
+- **Field of view:** EDVR's runtime answers `GetProjectionMatrix` per frame, and the scope zoom (B3, flown) already narrows it frame by frame through the frame answer, at one to two frames' lag. A square 90 for the bake frames goes the same way. Traps: the hidden-area mesh, the light-grid cache and the optics announcement. The render size stays the headset's, not square, so the compute shader's aspect test needs changing.
+- **Capture:** the game's tonemap draw, once per eye (`tonemap_admit.h`, used by `fix.ui_quality`). There is H, HDR, per eye, plus the depth probe's texture and rows EDVR built itself. This is the same stage as flat's. The 2D screen has the VR world route's resolve, which already carries what flat's bake takes.
+- **Hold:** `requestSubmitHold` / a per-frame mark at the first eye's latch. The compositor replays the last good pair, world-locked, and no production caller uses it today. It is refused (a black frame) with no kept pair or after a reference or recentre change; on foot it is unflown.
+
+**Plan:**
+1. **A proving build, one flight.** VR runs the cull automatically where no bake is needed: a carrier, with its real sky, door rule and clear. The two rows go on VR's menu, and VR's panes stay the game's glass where there is no bake (no haze). Bake-type stations stay the game's own in VR until the VR bake works. Three temporary probe keys, at a station: (1) the hold alone for 10 frames: withheld, replayed, empty; (2) the camera and a square 90 for 5 frames, visible on purpose: stub calls, `cb1` row 275 against the written pose, the projection's span, by eye; (3) at the tone draw per eye on those frames: H's format and size, depth, the eye, and the panes' `cb1` rows.
+2. **The VR bake**, built on what the probes show: capture per eye into the same cube, the hold around it, automatic like flat's.
+3. **After it:** DLSS and exposure after the bake, the light-grid cache, the clear's 12 percent share, frame time, and the 2D screen.
 
 ## Flight 48 results, first part: the bake has no sun
 
