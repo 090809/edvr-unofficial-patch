@@ -24,8 +24,12 @@ The smear is terrain that is newly uncovered at the hull edge every frame
   37-40 G-buffer draws (54-57 records) in all six captures. The terrain is
   drawn after it and fills its pixels once the block is left out. The
   lighting is 4-12 draws an eye. A hull layer costs ~80 re-issues an eye
-  and about one lighting pass on the GPU. Next: the five open checks in that
-  section, all offline.
+  and about one lighting pass on the GPU. The five offline checks passed.
+  100% of the keyed hull pixels at 10-150 m are the block's records, and
+  the ship has 6 forward draws an eye. Atmosphere and sky are in the forward
+  pass. The composite needs a re-issued tonemap, since DLSS runs after it.
+  Next: a compile-only binding census of the block, lighting, atmosphere
+  and tonemap draws, then one terrain flight.
 * **Finding 1, the hull is a deferred G-buffer object.** It is drawn by the
   pool families vs_66DE/ps_864F, 61AE/FC43, AACF/CF53 and DE54/E46E, plus the
   BBE5/DB3E decal overlay (depth writes off), into the same four-target
@@ -317,18 +321,63 @@ What this changes:
   again, less if scissored to the hull, plus the terrain now shaded under
   the hull. **Finding 3's "several ms" was wrong for (a).**
 
-Open, each needs a check before a build:
+### The five checks (same day, offline; scripts `slot_check.py`, `forward.py`, `rdef.py`)
 
-1. Camera containment, above.
-2. Which inputs the 3 screen-space draws and the lighting read (G-buffer
-   SRVs, depth, their outputs), and whether fog and atmosphere are in the
-   lighting draws or in the forward pass.
-3. The forward pass over the hull layer: the own ship's transparents
-   (engine glow, glass) must be tested against the hull layer's depth;
-   world transparents behind the hull must not land on it.
-4. Where the composite goes: before the game's tonemap (HDR, so one
-   tonemap covers both) and after DLSS. The hull layer then needs its own
-   anti-aliasing: a second DLSS feature (~1 ms) or EDVR's TAA on a static
-   layer.
-5. Shadows the hull casts on itself and on the terrain come from shadow
-   maps drawn before the eye pass. Leaving them alone keeps them.
+1. **Pixel ownership: passed.** EngineSlots (MRT6, code = 2 x slot + 1)
+   against the block's records of the matching ledger frame (slots frame N
+   = ledger frame N+1): **100% of the keyed pixels at 10-150 m** belong to
+   block records, 451,748 px in 132100543006 and 427,584 px in 222433569001.
+   So do 46-48% of the keyed pixels under 10 m (the ship's own near parts;
+   the rest is the cockpit shell). One frame off, the match is 0%: record
+   indices are reassigned every frame, so the own list must be rebuilt per
+   frame from the block, never cached.
+2. **Lighting inputs: rebindable.** From the shader notes in
+   `design-flat-temporal-aa-2026-09-23.md` (1818, 4616-4624): the light
+   draws load depth at t0 and the G-buffer at t1-3, and write two targets.
+   `8289669D` / `C6E6E419` (point and spot volumes) adds a structured light
+   list at t0 of the VS. `7E38A6AA` is the full-screen pass. The 3
+   screen-space draws are a copy (`DEF19B03`) and full-screen triangles
+   with inert PS (`53211E8C` / `B403F48C`). These shaders are not in this
+   machine's `edvr_logs\shaders`, and their RDEF is stripped, so the
+   exact slot list is a check for the first build's census.
+   **Atmosphere and sky are in the forward pass**, not in the lighting:
+   `41E245D4` and `D95905C1` (atmosphere, depth read as a texture) and
+   `F8FA801F` (sky), one each an eye, right after the lighting. In the world
+   layer they see world depth, which is right for the terrain behind the
+   hull. The hull layer needs those 2 draws re-issued against its own depth
+   (inscatter over 40-80 m is small, but the colour shift is visible in a
+   thick atmosphere).
+3. **Forward pass: 6 own-ship draws an eye.** In all three captures
+   checked, exactly six forward draws take block records: `88DCF116`
+   (the laser), `025B4B9F` and `0B5981F2` / `C5A5C7E8`, `F464E27C`,
+   `6DB587D2` and `2B3F53DD` / `B2DE0A41`. They move to the hull layer like
+   the block. Everything else in the forward pass (HUD, sky, starfield,
+   atmosphere, billboards) stays in the world layer. The flight HUD
+   `B7790CBF` is routed by the UI layer already.
+4. **Composite: after DLSS, through a re-issued tonemap.** EDVR's temporal
+   pass, and so DLSS, runs on the tonemapped eye (`black-holes.md` B4;
+   `cockpit-hud-layer-design-2026-09-27.md` 117). So the hull layer cannot
+   ride the game's tonemap. It needs the game's own tonemap draw re-issued
+   on it, as the UI layer's tonemap re-issue does (do not transcribe the
+   tonemap: the cockpit HUD design rejects that). Then it is upscaled and
+   composited by depth against the main depth, which keeps the cockpit in
+   front. Side effects to check: exposure is metered without the hull (the
+   world-only image), and bloom from the hull's lights is lost unless the
+   layer's own bloom is added.
+5. **Shadows: unchanged.** The ledger has no depth-only eye draws (RT -1)
+   in any of the six frames, so the shadow maps are drawn outside the eye
+   pass. Leaving them alone keeps the hull's shadow on the terrain and on
+   itself.
+
+**Re-issue budget per eye:** the block (~40), its decals (~22), the
+screen-space passes (3), the lighting (4-12), the 6 forward draws, the
+atmosphere (2) and the tonemap (1-3). That is about 80-90 draws, all
+immediate. The hull layer's own anti-aliasing is still open: a second DLSS
+feature (~1 ms) or EDVR's TAA on a layer that is static in view.
+
+**Next, the first build (compile-only, a measurement):** an instrument with
+no visual change. Per eye, it finds the block (the hull families' run after
+the cockpit shell), takes its records, and logs the block's length, its
+records, and the full bindings of the light, atmosphere and tonemap draws
+(SRVs, RTVs, DSV). One flight over terrain then fixes the slot list for the
+re-issue.
