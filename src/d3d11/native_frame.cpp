@@ -27,6 +27,7 @@ constexpr unsigned kPoolSize = 16;
 
 // Frame pairs latched by latchSubmit; read by nativeFrameLatchedFrames().
 std::atomic<uint64_t> g_latchedFrames{0};
+std::atomic<uint64_t> g_heldLatches{0};   // TEMPORARY (concourse vr probe): latches that took a held frame
 
 struct State {
     ID3D11Device* device = nullptr; // borrowed; the host owns its lifetime
@@ -599,6 +600,7 @@ HRESULT WINAPI latchSubmit(void* context, uint64_t sequence,
     if (!state->latched) {
         const bool marked = edvr::glitchFrameMarked();
         state->held = edvr::takeSubmitHoldFrame();
+        if (state->held) g_heldLatches.fetch_add(1, std::memory_order_relaxed);
         state->cachedDecision = {};
         state->cachedDecision.size = sizeof(state->cachedDecision);
         state->cachedDecision.version = EDVR_NATIVE_FRAME_VERSION_1;
@@ -670,6 +672,7 @@ void nativeFrameFovTrimDegrees(uint32_t out[3]) {
 }
 
 uint64_t nativeFrameLatchedFrames() { return g_latchedFrames.load(std::memory_order_relaxed); }
+uint64_t nativeFrameHeldLatches() { return g_heldLatches.load(std::memory_order_relaxed); }
 
 // F22: the look-to-aim total the next version 6 beginFrame hands the runtime.
 void nativeFrameSetLookYaw(float total, uint32_t gameFrame, uint32_t resetSerial) {

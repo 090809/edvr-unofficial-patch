@@ -84,6 +84,8 @@ corrupted. Do not regenerate the one-liner — extend the script.
 | Read an on-foot recording (needs log.on_foot_detail on; F9 marks a moment) | `python tools\onfoot_check.py --target <game dir> --expect-build HEAD [--mark N]` | reading the on-foot 1 s lines by hand |
 | Reflow release notes or docs | `python tools\reflow_notes.py` | reflowing by hand or by regex |
 | Credit contributors in release notes | `python tools\release_credits.py --from <previous-tag> --thanks` | writing the credits from memory or ad-hoc `gh` queries |
+| Sign a release manifest (the maintainer, in their own terminal: `generate` and `sign` refuse without one, and the private keys never enter a session) | `python tools\sign_manifest.py sign <manifest>`, then `python tools\sign_manifest.py verify <folder>` | signing in CI, or any other tool that sees the private key |
+| Try the launcher without touching the real folders | `ed-up-launcher.exe --data-root <scratch folder>` (with `--check-update`, `--update` or `--channel rc`) | running it bare, which copies and registers itself on this machine |
 | Make a worktree that can build | `python tools\worktree.py add <path>` | `git worktree add` alone (no deps) |
 | Post PR replies, a review or a summary | `python tools\pr_post.py --pr N --since <time> ...` | hand-built `gh api` / `gh pr comment` / `gh pr review` calls |
 | Compile on Linux for a test flight | `python3 tools/linux_toolchain.py build-dlls` | running `build.bat` under Wine by hand |
@@ -211,7 +213,8 @@ minutes after a flight finally reproduced the effect being chased.
 - For an actual release from a non-native host, merge the validated
   source, push the exact clean `vX.Y.Z` tag, and require that tag's full
   Windows build and package run to pass. Download and verify all three
-  ZIPs with `SHA256SUMS`, generate and review release notes including
+  ZIPs with `SHA256SUMS`, have the maintainer sign the manifest,
+  generate and review release notes including
   `release_credits.py`'s `## Thanks` section, then create a draft
   release; publication remains an explicit step. On native Windows, the
   full local build and `package.bat <version>` at the clean version tag
@@ -407,7 +410,7 @@ the Ghidra scripts, and, kept local and never committed, the game executables fo
 | `src\d3d11\` | the graphics half: hooks, shader fixes, the draw census |
 | `src\openxr\` | the native OpenXR runtime: the OpenVR ABI Elite calls, translated to OpenXR |
 | `src\openvr\compat\` | the OpenVR ABI header |
-| `src\installer\` | the self-contained installer and its log bundler |
+| `src\installer\` | the self-contained installer and its log bundler, and the launcher that grows out of them (`update_*`, `launcher_*`, built with `EDUP_LAUNCHER`) |
 | `src\common\` | config, logging, the crash sentinel |
 | `tools\` | Python tools, each with `--self-test`; C++ test rigs in subdirs |
 | `docs\` | one investigation doc per arc — read its `## Status` block first |

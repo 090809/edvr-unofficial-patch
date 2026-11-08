@@ -279,6 +279,8 @@ void nativeFrameFovTrimDegrees(uint32_t out[3]);
 // The frame pairs the runtime has latched through latchSubmit, since the DLL loaded. Counted whatever the fixes; the mode watch
 // samples it once a second (mode_watch.cpp).
 uint64_t nativeFrameLatchedFrames();
+// TEMPORARY (concourse vr probe, docs\concourse-cull-2026-11-05.md): of those, the frame pairs whose latch took a held frame from requestSubmitHold (the hold probe's readout).
+uint64_t nativeFrameHeldLatches();
 
 // F22: the look-to-aim compensation the next beginFrame hands the runtime (version 6): the cumulative total in radians and the game frame it was
 // taken at. Set by the frame thread once per frame (native_on_foot.cpp, lookPublishTick); read under the provider's lock by beginFrame.

@@ -91,6 +91,60 @@ To place the files yourself, follow
 done by hand. It shows where each file goes and covers the `openvr_api.dll`
 rename that most manual installs get wrong.
 
+### The launcher
+
+`ed-up-launcher.exe`, a separate download on the release page, is the
+installer's window with two additions: it keeps itself and the ED-UP files up
+to date, and it has a Play button. It carries no files of its own. The first
+time it runs it copies itself to `%LOCALAPPDATA%\EDVR\launcher\`, adds a Start
+menu shortcut and an entry in Windows' list of installed programs, and starts
+from there; removing it from that list (or `ed-up-launcher.exe --unregister`)
+takes all of that away again, and leaves ED-UP in your game folders and your
+settings copies alone.
+
+It contacts `api.github.com`, to ask this project's releases whether a newer one
+exists, and GitHub's release downloads, for the files of a release you chose to
+install. Each request to GitHub carries the launcher's name and version and
+nothing that identifies you or your PC. With direct launch turned on (below) it
+also signs in to Frontier's servers, `api.zaonce.net`, and nothing else. Nothing is
+downloaded or changed until you press Download. A release is offered only if its
+manifest carries a signature that verifies against a public key inside the
+launcher, so a changed or substituted release is refused. If GitHub cannot be
+reached the launcher says so in one line and carries on.
+
+Play starts the game through Steam, Epic or Frontier's own launcher, and
+watches until it exits so that it can close the Frontier launcher window left
+behind. Only Frontier's launcher takes a VR or flat choice from the launcher;
+through Steam or Epic the game starts in the mode it is already set to. While the
+game runs, the launcher waits minimised on the taskbar, and it comes back when the
+game exits. It opens on the install you last pressed Play for.
+
+On Steam, a checkbox can start the game directly instead, with VR or flat as you
+choose. The launcher then signs in to Frontier's servers with your Steam login,
+sending what Frontier's own launcher sends (a sign-in ticket from Steam and an ID
+for this PC), and starts the game itself. It is off until you turn it on, and
+Frontier has not approved it. No password or token is stored. If any part of the
+sign-in fails, the launcher says why and starts the game through Steam instead.
+The sign-in is ported from [min-ed-launcher](https://github.com/rfvgyhn/min-ed-launcher)
+(MIT licence; `ed-up-launcher.exe --licenses` prints it).
+
+The same checkbox is there for a game installed through Frontier's own store.
+The launcher then asks for your Frontier email and password in its own window and
+sends them to Frontier's servers as Frontier's launcher does, as hex in the
+request, and nowhere else. The first time on a PC, Frontier emails you a code,
+which the launcher asks for and sends back; Frontier answers with a token for
+this PC. The launcher keeps `frontier-login.dat` in its own folder
+(`%LOCALAPPDATA%\EDVR\launcher\`): your email in the clear, that token encrypted
+for your Windows user, and your password, encrypted the same way, only if you
+leave "Remember my password on this PC" ticked. Encrypted here means Windows'
+DPAPI: a program running as you can still ask Windows to decrypt it, and under
+Wine or Proton it is not strongly protected. The password is sent with every
+sign-in, saved or typed. If Frontier refuses the saved login, the launcher
+forgets the saved password and token and asks again. Unticking the checkbox
+deletes `frontier-login.dat`, and so does `--unregister`. If a sign-in fails
+for any other reason, the launcher says why and starts Frontier's launcher with
+your VR or flat choice instead; cancelling a window starts nothing.
+
 ### Linux on Steam (Proton)
 
 Download `ed-up-installer-linux-<version>.zip` from the release and unzip it. It
@@ -122,6 +176,15 @@ Preview starts Steam's Proton and runtime and may update prefix bookkeeping.
 anything or writing files. See `README-linux.txt` in the ZIP for options. The
 shell launcher forwards all options to the Python wrapper; you can also run
 `python3 edvr-installer-linux.py` directly.
+
+The launcher runs the same way. Download `ed-up-launcher-linux-<version>.zip`,
+unzip it, run Elite once from Steam and close it, then run `./ed-up-launcher.sh`
+(`--dry-run` shows what would run; options for the launcher itself go after a
+lone `--`). It runs inside Elite's Proton prefix and keeps its downloads and
+settings there, under `drive_c/users/steamuser/AppData/Local/EDVR`. Play starts
+Elite through Steam; direct launch is not offered on Linux yet. This is new and
+untested on Linux, so the window, updates and Play may not work yet; logs and
+reports are welcome. See `README-launcher-linux.txt` in the ZIP.
 
 ### Checking it worked
 

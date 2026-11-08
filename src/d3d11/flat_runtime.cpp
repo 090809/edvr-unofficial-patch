@@ -1,3 +1,4 @@
+#include "concourse_pane.h"   // TEMPORARY: the bake's frames (docs\concourse-cull-2026-11-05.md)
 #include "flat_light_payload_capture.h"
 #include <sstream>
 #include "flat_origin_capture.h"
@@ -350,6 +351,12 @@ struct State {
     FlatSourceSpell sourceSpell;
     FlatMonoSourceless sourcelessLast;
     uint64_t sourcelessLastFrame=0;
+    // 2026-11-08 (DLSS to spatial in ground-and-sky views): the stock pool-family draws behind the last no-source refusal, the 5 s window's
+    // tally of them (flat_source_spell.h flatSourceVetoLine), and whether this frame's refusing verdict counted one.
+    FlatFamilyVeto vetoLast[kFlatFamilyVetoKinds];
+    uint32_t vetoLastKinds=0, vetoLastOverflowDraws=0;
+    FlatSourceVetoWindow vetoWindow;
+    bool frameVetoByFamily=false;
     // What a SOURCE-FREE frame (selected, no pool draw: section 104) held on the scene's depth, and the 5 s window's tally of how many of
     // those frames held nothing but hologram-family draws (the loading screen's hologram ghost, docs\design-flat-ui-quality-2026-10-05.md).
     FlatMonoSourceless sourceFreeLast;
@@ -1059,6 +1066,14 @@ static void noteSourceFreeContent(State& s, const FlatMonoFrame& sel) {
     if(!n.draws) { ++s.sourceFreeEmptyWindow; return; }
     if(blankScene(sel)) ++s.sourceFreeHoloOnlyWindow; else ++s.sourceFreeOtherWindow;   // "filter-only" in the line
 }
+// A refusal for no supported motion source, on either route (the copy route's selector or the HDR route's): the stock draws its verdict
+// counted, as the frame's prefix holds them now (the same draws the selector was given), for `flat source veto 5s`.
+static void noteVetoNames(State& s, const FlatMonoFrame& sel) {
+    if (sel.reason != FlatMonoReason::NoSupportedSource) return;
+    for (uint32_t i = 0; i < kFlatFamilyVetoKinds; ++i) s.vetoLast[i] = s.prefix.familyVetoes[i];
+    s.vetoLastKinds = s.prefix.familyVetoKinds; s.vetoLastOverflowDraws = s.prefix.familyVetoOverflowDraws;
+    s.frameVetoByFamily = sel.sourceless.vetoFamilyDraws != 0;
+}
 static void reportSourceSpell(State& s) {
     const FlatSourceSpellWindow w=s.sourceSpell.take();
     if(s.sourceFreeSeenWindow) {
@@ -1089,6 +1104,11 @@ static void reportSourceSpell(State& s) {
         flatSourceSpellLine(line,sizeof(line),w,s.sourcelessLast,s.sourcelessLastFrame,notes,part);
         Log::get().note("%s",line);
     }
+    // The stock pool-family draws that veto a no-source view's admission, every window (a zero is printed, so a build without this line and a
+    // window with nothing to name read differently).
+    flatSourceVetoLine(line,sizeof(line),s.vetoWindow,s.sourcelessLast,s.sourcelessLastFrame,s.vetoLast,s.vetoLastKinds,s.vetoLastOverflowDraws);
+    Log::get().note("%s",line);
+    s.vetoWindow=FlatSourceVetoWindow{};
 }
 static void reportForegroundDomain(State& s) {
     const auto& n=s.foregroundCounts;
@@ -4165,6 +4185,10 @@ static void hdrSelectAtTrigger(State& s) {
     const bool autoKey = s.hdrKey == FlatHdrKey::Auto;
     s.hdrWindow.lastVerdict = sel.selected() ? "selected" : flatMonoReasonName(sel.reason);
     s.hdrWindow.noteSelection(s.hdrWindow.lastVerdict);   // the key off's answer: what the selector says at each trigger
+    // 2026-11-08 (Sean's Frontier flight at 11:03, render at the output): a view the HDR route refuses for no source is named on the
+    // source lines as the copy route's is; the copy route's selector never sees it.
+    if (sel.reason == FlatMonoReason::NoSupportedSource) { s.sourcelessLast = sel.sourceless; s.sourcelessLastFrame = s.prefix.frame; }
+    noteVetoNames(s, sel);
     if (!s.hdrFirstTriggerLogged) {
         s.hdrFirstTriggerLogged = true;
         char text[700];
@@ -4174,12 +4198,18 @@ static void hdrSelectAtTrigger(State& s) {
     if (autoKey && !s.hdrLatch.tripped) {
         // The route speaks for the frame's stand-down verdict only where it will resolve the frame (flatHdrTriggerSeen: a
         // selected frame the mode's route evaluates at the render size for, not one below the output and not EDVR's TAA above
-        // it; those are the copy's, by its whitelist or by its structure). Its refusals add nothing: merged as themselves they
-        // outrank the copy stage's structural one, and at R < D every frame the copy route refuses would read as transient, so
-        // the stand-down and the F8 warning would never start.
+        // it; those are the copy's, by its whitelist or by its structure). Its refusals add nothing but one: merged as themselves
+        // they outrank the copy stage's structural one, and at R < D every frame the copy route refuses would read as transient,
+        // so the stand-down and the F8 warning would never start. The exception is below: no motion source, where the route
+        // itself resolves the frame (flatHdrTriggerRefusalSeen).
         const FlatFrameSeen routeSeen = flatHdrTriggerSeen(sel,
             s.engine);
         if (routeSeen == FlatFrameSeen::Treatable) { s.frameSeen = FlatFrameSeen::Treatable; s.frameReason = sel.reason; }
+        // Where the route itself resolves the frame, its refusal for no source is the view's and passes: it speaks as Transient, above the
+        // copy stage's structural no-known-tone-pass, so neither the stand-down nor the F8 warning blames the post chain (flat_hdr_route.h).
+        const FlatFrameSeen refusalSeen = flatHdrTriggerRefusalSeen(sel, s.engine, s.hdr.trigger.hdrWidth, s.hdr.trigger.hdrHeight,
+                                                                    s.prefix.width, s.prefix.height);
+        if (refusalSeen > s.frameSeen) { s.frameSeen = refusalSeen; s.frameReason = sel.reason; }
     }
     {
         flatcpu::Scope trace(flatcpu::kTrace);
@@ -4511,8 +4541,12 @@ void flatRuntimePresent(IDXGISwapChain* swap, uint64_t frame, HRESULT hr, UINT f
     // frame the fallback must count.
     flatCameraInjectClose(s.frameHadPhase,s.phase.applied!=0,s.phase.previousAcceptedValid,s.namedDepth!=nullptr);
     // A frame with a verdict feeds the spell tracker (flat_source_spell.h): refused for no source, treated, and whether it carried a phase.
-    if(endedSeen!=FlatFrameSeen::None)
+    if(endedSeen!=FlatFrameSeen::None) {
         s.sourceSpell.frame(endedReason==FlatMonoReason::NoSupportedSource,endedSeen==FlatFrameSeen::Treatable,s.frameHadPhase);
+        s.vetoWindow.frame(endedReason==FlatMonoReason::NoSupportedSource,endedSeen==FlatFrameSeen::Treatable,
+            s.prefix.unsupportedFamilyDraws!=0,s.frameVetoByFamily);
+    }
+    s.frameVetoByFamily=false;
     // The jitter cycle's length, read live (advanced.temporal_aa_jitter_phases: a whole number from 8 to 64, default 8).
     // A value the cycle cannot use reads as 8: one Config could not parse says so itself (once), and one outside the range is said here, once
     // per value. A change starts a new cycle, so the phase and the resolver's history restart as the jitter toggle's do, and the log names it.
@@ -6683,6 +6717,7 @@ FlatRuntimeDrawScope::FlatRuntimeDrawScope(ID3D11DeviceContext* context, uint32_
         if (verdictConflicting) reportConflict(s);
         // What the view held when it had no motion source (section 104); the line names it.
         if (selected.reason == FlatMonoReason::NoSupportedSource) { s.sourcelessLast = selected.sourceless; s.sourcelessLastFrame = s.prefix.frame; }
+        noteVetoNames(s, selected);
         noteSourceFreeContent(s, selected);
         // What the selector made of a frame whose glow pass the first-person path admitted (2026-10-29): selected or why not, whether it
         // took a source, and whether the camera it took is the world's. Six lines at most, ten seconds apart.
@@ -7523,6 +7558,7 @@ FlatRuntimeDrawScope::FlatRuntimeDrawScope(ID3D11DeviceContext* context, uint32_
         return;
     }
     fetchCelestialRecords(ctx, f);   // planet patch motion: this frame's records for the resolve's t18
+    concoursePaneBakeFrame(ctx, f.color, f.depth, f.camera, f.renderWidth, f.renderHeight);   // TEMPORARY (docs\concourse-cull-2026-11-05.md): one relaxed load when no bake runs
     if (!flatMonoResolve(s.device.Get(), ctx, f, &outputView, &s.reason)) {
         const char* temporalReason=s.reason;
         const char* fallbackReason=nullptr;
@@ -7877,6 +7913,7 @@ void FlatRuntimeDrawScope::treatHdr(const FlatMonoFrame& selected, uint32_t srvS
     }
     reach("resolve");   // the frame is the resolver's from here
     fetchCelestialRecords(ctx, f);   // planet patch motion: this frame's records for the resolve's t18
+    concoursePaneBakeFrame(ctx, f.color, f.depth, f.camera, f.renderWidth, f.renderHeight);   // TEMPORARY (docs\concourse-cull-2026-11-05.md): one relaxed load when no bake runs
     if (!flatMonoResolve(s.device.Get(), ctx, f, &outputView, &s.reason)) {
         const char* temporalReason = s.reason;
         // The backend (or the route's own guard) refused before H was written. Recover the jitter into H, or decline.

@@ -126,4 +126,55 @@ inline int flatSourceSpellLine(char* out, size_t n, const FlatSourceSpellWindow&
         last.records, last.draws, last.sameCameraDraws, last.poolRecords, last.distinctPairs);
 }
 
+// WHAT VETOED THE SOURCE-FREE ADMISSION (2026-11-08, a flat report of DLSS dropping to spatial on a planet when the SRV left the view).
+// The log of it, on foot, had nine spells of no-supported-motion-source-pair over views of ground and sky: records-on-scene-depth 2, one pair, no
+// pool-kind record, the same pair that other windows took source-free. The selector refuses a no-source view only for a stock pool-family draw
+// (FlatMonoFrameInput::unsupportedFamilyDraws) or an unsupported pool-kind record on the HDR's depth, and the summary above lists the HDR's depth
+// alone, so the draw that decided it was named nowhere. This window counts the frames and names the draws:
+//   frames                  frames with a verdict (a final copy was seen);
+//   with-stock-family       of them, frames that held a stock pool-family draw anywhere in a scene-shaped depth;
+//   of-those-selected       of those, the frames the selector took anyway (a supported draw was in view, so the veto was never asked: the SRV
+//                           on screen, if the report is right);
+//   refused-by-family       frames refused for no source whose verdict counted a stock family draw (the selector's own answer);
+//   refused-by-pool         frames refused for no source whose verdict counted none (so an unsupported pool-kind record on the HDR's depth).
+struct FlatSourceVetoWindow {
+    uint64_t frames = 0, withFamily = 0, withFamilySelected = 0, refusedByFamily = 0, refusedByPool = 0;
+    // noSource: refused for no supported motion source pair. selected: the selector took it. familyDraws: the frame held a stock family draw at
+    // its end. verdictFamily: the refusing verdict counted one (FlatMonoSourceless::vetoFamilyDraws).
+    void frame(bool noSource, bool selected, bool familyDraws, bool verdictFamily) {
+        ++frames;
+        if (familyDraws) { ++withFamily; if (selected) ++withFamilySelected; }
+        if (noSource) { if (verdictFamily) ++refusedByFamily; else ++refusedByPool; }
+    }
+};
+
+// One line (under 850 characters at the widest digits, inside kFlatLogLineBudget): the window, then the last refused frame's causes and the
+// stock draws that frame held. depth=hdr says the draw wrote the HDR's own depth, depth=other a different scene-shaped depth. A depth=hdr draw
+// can still be missing from the source line's pairs: that summary walks only the records the selector assembled (the targets' writes, the
+// tone, the sources), and a G-buffer draw is none of them (Sean's 11:03 trace). target is the colour target's size (0x0 for a depth-only draw).
+inline int flatSourceVetoLine(char* out, size_t n, const FlatSourceVetoWindow& w, const FlatMonoSourceless& last, uint64_t lastFrame,
+                              const FlatFamilyVeto (&v)[kFlatFamilyVetoKinds], uint32_t kinds, uint32_t overflowDraws) {
+    char draws[760];
+    size_t at = 0;
+    draws[0] = 0;
+    if (kinds > kFlatFamilyVetoKinds) kinds = kFlatFamilyVetoKinds;
+    for (uint32_t i = 0; i < kinds; ++i) {
+        const auto& e = v[i];
+        const int k = std::snprintf(draws + at, sizeof(draws) - at,
+            "%s[VS=%016llX PS=%016llX draws=%u depth=%s target=%ux%u color=%u camera=%u]", i ? " " : "",
+            static_cast<unsigned long long>(e.vs), static_cast<unsigned long long>(e.ps), e.draws,
+            e.depth && e.depth == last.depth ? "hdr" : "other", e.width, e.height, e.color ? 1u : 0u, e.camera ? 1u : 0u);
+        if (k < 0 || at + static_cast<size_t>(k) >= sizeof(draws)) break;
+        at += static_cast<size_t>(k);
+    }
+    if (!at) std::snprintf(draws, sizeof(draws), "none");
+    return std::snprintf(out, n,
+        "flat source veto 5s: frames=%llu with-stock-family=%llu of-those-selected=%llu refused-by-family=%llu refused-by-pool=%llu; "
+        "last refused frame=%llu: stock-family-draws=%u unsupported-pool-draws=%u kinds=%u past-the-kinds=%u; stock draws: %s",
+        static_cast<unsigned long long>(w.frames), static_cast<unsigned long long>(w.withFamily),
+        static_cast<unsigned long long>(w.withFamilySelected), static_cast<unsigned long long>(w.refusedByFamily),
+        static_cast<unsigned long long>(w.refusedByPool), static_cast<unsigned long long>(lastFrame),
+        last.vetoFamilyDraws, last.vetoPoolDraws, kinds, overflowDraws, draws);
+}
+
 }  // namespace edvr

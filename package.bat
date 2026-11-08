@@ -16,4 +16,6 @@ python "%ROOT%\tools\build_receipt.py" --verify-tree "%ROOT%\build\full_build_re
 )
 echo [edvr] staging native release
 call python "%ROOT%\tools\package_native.py" "%VERSION%" %2 || exit /b 1
+echo [edvr] dist\ed-up-manifest.json is unsigned, and a release without its .sig is not offered as an update.
+echo [edvr] sign it in your own terminal: python tools\sign_manifest.py sign dist\ed-up-manifest.json
 exit /b 0

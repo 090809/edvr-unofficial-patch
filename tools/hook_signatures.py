@@ -1989,6 +1989,7 @@ AUDIT_EXACT_ONLY = (
     ("d3d11/native_on_foot_f141.h", "the exact-build ADS sight point hooks (they feed the ADS eye), called functions, vtable and slot"),
     ("d3d11/native_on_foot_f154.h", "the exact-build screen-space owner's vtable slot and the stolen size of its hook"),
     ("d3d11/mem_tick.cpp", "a diagnostic whose addresses are not in the table"),
+    ("d3d11/concourse_camera_test.cpp", "the TEMPORARY concourse camera test (docs/concourse-cull-2026-11-05.md): installs only when gameBuildKnown(), so its RVAs are the known build's and need no resolver"),
     ("d3d11/srv_radar_anchor.cpp", "the SRV radar anchor's exact-build hooks: the placement setter, the slot camera"),
     ("d3d11/terrain_cull_cover*", "terrain cull cover, which finds its site by its own scan on an unknown build"),
 )

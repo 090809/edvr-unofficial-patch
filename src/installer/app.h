@@ -31,6 +31,23 @@ struct AppArgs {
     bool         help = false;
     bool         badArg = false;
     std::wstring badArgText;
+
+#ifdef EDUP_LAUNCHER
+    // The launcher's own flags (docs\design-launcher-2026-11-07.md). The installer's target does not
+    // define EDUP_LAUNCHER, so it neither has these fields nor accepts these flags.
+    std::wstring payloadDir;       // --payload <dir>: install from an unpacked ed-up-<ver>.zip
+    std::wstring dataRoot;         // --data-root <dir>: every launcher folder under here, nothing registered
+    std::wstring planFile;         // --apply-plan <file>: the elevated copy's whole job
+    std::string  channel;          // --channel stable|rc, for this run
+    bool         checkUpdate = false;  // --check-update
+    bool         update = false;       // --update
+    bool         unregister = false;   // --unregister
+    bool         updated = false;      // --updated: started by a self-update (internal)
+    bool         directDryRun = false; // --direct-dry-run: sign in, print the masked command line, start nothing
+    bool         vr = false;           // --vr, for --direct-dry-run
+    bool         novr = false;         // --novr, for --direct-dry-run
+    bool         licenses = false;     // --licenses: print the third-party licence the launcher carries
+#endif
 };
 
 AppArgs parseArgs(int argc, wchar_t** argv);

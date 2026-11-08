@@ -298,6 +298,10 @@ struct FlatRuntimePrefix {
     uint32_t firstPersonDraws = 0;
     // The draws of a pool family left stock (FlatRuntimeDraw::poolFamilyVs): the selector's FlatMonoFrameInput::unsupportedFamilyDraws.
     uint32_t unsupportedFamilyDraws = 0;
+    // Which draws made unsupportedFamilyDraws, the first kFlatFamilyVetoKinds distinct (vs, ps, depth) and how many draws fell past them: a
+    // log line only (flat_source_spell.h flatSourceVetoLine), never part of a verdict or the contract hash, so a replay judges as it did.
+    FlatFamilyVeto familyVetoes[kFlatFamilyVetoKinds];
+    uint32_t familyVetoKinds = 0, familyVetoOverflowDraws = 0;
     // Temporal AA is off this frame (flat_ui_layer_math.h flatUiMapTemporalOff: a map or the Full System Scanner is open): no temporal
     // resolve, no jitter, no history. The runtime sets it at the frame boundary from the frame's one GuiFocus read; it is false in every
     // recorded trace, so a replay judges a frame as it always did.
@@ -307,6 +311,22 @@ struct FlatRuntimePrefix {
     // frame whose first fault was the camera disagreement but which other faults also marked, so it was refused as before.
     bool cameraConflictWaived = false, cameraConflictKept = false;
 };
+// A stock pool-family draw (FlatRuntimeDraw::poolFamilyVs) into the frame's veto table: its (vs, ps, depth) key, the draws that share it, and
+// what the first of them looked like. Draws past the table's kinds are only counted.
+inline void flatRuntimeNoteFamilyVeto(FlatRuntimePrefix& p, const FlatContractObservation& k) {
+    uint32_t at = 0;
+    while (at < p.familyVetoKinds && !(p.familyVetoes[at].vs == k.vs && p.familyVetoes[at].ps == k.ps && p.familyVetoes[at].depth == k.depth)) ++at;
+    if (at == p.familyVetoKinds) {
+        if (at == kFlatFamilyVetoKinds) { ++p.familyVetoOverflowDraws; return; }
+        FlatFamilyVeto& v = p.familyVetoes[at];
+        v = FlatFamilyVeto{};
+        v.vs = k.vs; v.ps = k.ps; v.depth = k.depth;
+        v.width = k.width; v.height = k.height;
+        v.color = k.color != nullptr; v.camera = k.camera != nullptr;
+        ++p.familyVetoKinds;
+    }
+    ++p.familyVetoes[at].draws;
+}
 // Only a current reducer attestation makes forward-camera refusal global.
 // Retained phase-planning H identity is not current authority. Keep the tone
 // proof after revocation clears hdrCamera/sets hdrBad, so cancellation still
@@ -1048,6 +1068,7 @@ inline FlatMonoFrame flatRuntimeObserve(FlatRuntimePrefix& p, const FlatRuntimeD
             (d.effectiveStencilWrite && !d.overlayProtected)) && k.depth == suffix.overlayDepth)
             bad(suffix, FlatRuntimeConflict::OverlaySuffix, suffix.tone);
     }
+    if (d.poolFamilyVs) flatRuntimeNoteFamilyVeto(p, d.key);   // the log's names for the stock family draws counted below
     flatRuntimeReachedDraw(p, k);   // a draw reaches its depth and its colour, and a depth-only draw its depth
     if (d.poolFamilyVs) ++p.unsupportedFamilyDraws;
     if (!k.color) return out;
