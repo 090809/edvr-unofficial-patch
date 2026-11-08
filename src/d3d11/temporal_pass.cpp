@@ -42,6 +42,7 @@
 #include "object_probe.h"   // objectProbeArmLedger: the armed frame's draw ledger
 #include "pixel_probe.h"    // pixelProbeArm: who drew this pixel, the same armed frame
 #include "depth_writer_probe.h"   // depthWriterArm: who wrote each pixel's depth, the same armed frame
+#include "hull_layer.h"           // hullLayerArmDump: the private hull layer, the same armed frame (diag.hull_layer, TEMPORARY)
 #include "ui_depth.h"   // the interface's coverage mask and resolve tuning
 #include "blend_probe.h"   // TEMPORARY blend probe: asks for eye 0's per-pixel decisions, one relaxed load a frame unarmed
 #include "ui_resolve.h"
@@ -7079,6 +7080,7 @@ static bool beginEyeRun(bool companion,const edvr::NativeOnFootAirborneSnapshot*
     // The depth writer map rides the same run when advanced.pixel_probe has a point (one key arms both): the id of the last draw that
     // changed each pixel's depth, for naming what disowns a pool record's slot.
     if(pixelProbeConfigured())depthWriterArm(g_eyeRunStamp);
+    hullLayerArmDump(g_eyeRunStamp);   // diag.hull_layer (TEMPORARY): the private hull layer's HDR and depth beside the game's, one frame; a no-op with the key off
     mkArm(g_eyeRunStamp);   // F59: the waypoint dump (marker probe on only)
     if(!companion) {
         g_airborneCompanion=AirborneCompanionRequest{};
