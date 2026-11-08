@@ -938,12 +938,15 @@ constexpr float kBackdropRadiusDefaultM = 600.0f, kBackdropRadiusMinM = 10.0f, k
 // and the cull came on down there and took the hangar's walls (Flight 36). So there the camera must be near it too: 23 m at the bay, the hub's own radius 42 m, the hangar 503 m.
 // liveRoomName: a room inside the anchor's reach that the bake, taken at the anchor's centre, cannot show: while the camera is inside that record's sphere the cull stands down there and
 // its windows are the game's own. Null: none.
+// slabCut (TEMPORARY, the rooms ceiling, hotkey.concourse_room_test): the room's doors as planes across its a2, in metres from the anchor along a2. Zero cuts: none known.
 struct RoomLayout {
     uint32_t bayN;
     float backdropRadiusM;
     const char* name;
     float roomReachM;
     const char* liveRoomName = nullptr;
+    uint32_t slabCuts = 0;
+    float slabCut[2] = {};
 };
 inline constexpr RoomLayout kRoomStation{kBayIndexCount, kBackdropRadiusDefaultM, "a large station's", 0.0f};
 inline constexpr RoomLayout kRoomPort{12u, 300.0f, "a surface port's", 100.0f};
@@ -954,7 +957,9 @@ inline constexpr RoomLayout kRoomOutpost{30u, 300.0f, "an orbital outpost's", 10
 // list: the core 116 m past the bridge window, the command tower around the rooms, the engines 255 m off. The bridge is inside the 100 m reach; the lift to the hangar cuts 1331 m.
 // The bridge is the live room. Its windows lie 50 m from the bake's centre along the room's +a2, with the command tower (MS_Command_Tower4, kept in the bake, its sphere around the centre) in
 // between, and in them the bake showed a flat grey surface (Flight 41, Sean: "some strange artifacting in the window bake for the command deck").
-inline constexpr RoomLayout kRoomCarrier{30u, 300.0f, "a fleet carrier's", 100.0f, "SA_Carrier_01_Bridge"};
+// Its doors (Flight 43's survey): the elevator bay's sealed door at a2 = -11 and the bridge's at +19, both a Narrow_Door_Left and _Right pair. They split it into the elevator bay,
+// the central space with its services, and the bridge and command area.
+inline constexpr RoomLayout kRoomCarrier{30u, 300.0f, "a fleet carrier's", 100.0f, "SA_Carrier_01_Bridge", 2u, {-11.0f, 19.0f}};
 inline const RoomLayout& roomLayoutOf(const char* anchorName) noexcept {
     if (!anchorName) return kRoomStation;
     if (std::strcmp(anchorName, kPortAnchorName) == 0) return kRoomPort;
@@ -971,6 +976,33 @@ inline bool anchorMeansRoomHere(const RoomLayout& room, bool cameraKnown, bool a
 inline bool insideLiveRoom(const RoomLayout& room, bool cameraKnown, bool liveRead, float cameraDistM, float liveRadiusM) noexcept {
     return room.liveRoomName != nullptr && cameraKnown && liveRead && std::isfinite(cameraDistM) && std::isfinite(liveRadiusM) && liveRadiusM > 0.0f && cameraDistM <= liveRadiusM;
 }
+// TEMPORARY (the rooms ceiling, hotkey.concourse_room_test; docs\concourse-cull-2026-11-05.md "Rooms behind bulkhead doors"): the stretch of a2 the camera is in, between the cuts either
+// side of it, and whether a record's sphere lies wholly past either end of it, which is another room. The doors are ignored: this measures the most a door rule could save.
+constexpr float kRoomSlabOpen = 1.0e30f;
+struct RoomSlab {
+    float lo = -kRoomSlabOpen;
+    float hi = kRoomSlabOpen;
+};
+inline bool roomSlabOf(const RoomLayout& room, float camAlong, RoomSlab* out) noexcept {
+    if (!out || room.slabCuts == 0 || room.slabCuts > 2 || !std::isfinite(camAlong)) return false;
+    RoomSlab s;
+    for (uint32_t i = 0; i < room.slabCuts; ++i) {
+        const float c = room.slabCut[i];
+        if (c <= camAlong) {
+            if (c > s.lo) s.lo = c;
+        } else if (c < s.hi) {
+            s.hi = c;
+        }
+    }
+    *out = s;
+    return true;
+}
+inline bool roomSlabOutside(const RoomSlab& s, float along, float radius) noexcept {
+    if (!std::isfinite(along) || !std::isfinite(radius) || radius < 0.0f) return false;
+    return along + radius < s.lo || along - radius > s.hi;
+}
+inline bool sameRoomSlab(const RoomSlab& a, const RoomSlab& b) noexcept { return a.lo == b.lo && a.hi == b.hi; }
+
 // The live room from tick to tick. A tick with its record not read (the address lost and sighted again on the next pass) keeps "inside" for up to kLiveRoomHoldMs: Flight 42 had
 // the cull on for one tick 6 m inside the bridge, its record unread, and the bake on the bridge windows for that frame. A tick that reads it, inside or out, says at once.
 constexpr uint64_t kLiveRoomHoldMs = 500;

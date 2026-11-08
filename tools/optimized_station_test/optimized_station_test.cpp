@@ -3419,6 +3419,26 @@ int main(int argc, char** argv) {
             check(!live.step(cc::kRoomCarrier, true, false, 0.0f, 0.0f, 6016), "live room latch: reset forgets it");
         }
         check(cc::kBakeAfterJumpMs >= cc::kBakeRoomSettleMs, "carrier jump: the bake waits at least as long as a room settling");
+        {
+            // The rooms ceiling (TEMPORARY): Flight 43's carrier, its doors at a2 -11 and +19. The elevator bay's survey stood at -25.4, the central space's at +4.5, the bridge from +21.
+            cc::RoomSlab s;
+            check(cc::kRoomCarrier.slabCuts == 2u && cc::kRoomCarrier.slabCut[0] == -11.0f && cc::kRoomCarrier.slabCut[1] == 19.0f, "rooms: a carrier's doors from the survey");
+            check(cc::kRoomStation.slabCuts == 0u && cc::kRoomPort.slabCuts == 0u && cc::kRoomOutpost.slabCuts == 0u && !cc::roomSlabOf(cc::kRoomStation, 0.0f, &s),
+                  "rooms: no other layout has doors, and there is no slab there");
+            check(cc::roomSlabOf(cc::kRoomCarrier, -25.4f, &s) && s.lo <= -cc::kRoomSlabOpen && s.hi == -11.0f, "rooms: the elevator bay runs to its door");
+            check(cc::roomSlabOutside(s, 0.0f, 10.0f) && cc::roomSlabOutside(s, 45.8f, 25.0f), "rooms: from there the central space's service and the bridge are another room");
+            check(!cc::roomSlabOutside(s, 0.0f, 33.1f) && !cc::roomSlabOutside(s, -26.0f, 2.0f), "rooms: the anchor's sphere reaches it, and the lift is in it");
+            check(cc::roomSlabOf(cc::kRoomCarrier, 4.5f, &s) && s.lo == -11.0f && s.hi == 19.0f, "rooms: the central space lies between the doors");
+            check(cc::roomSlabOutside(s, -26.0f, 2.0f) && cc::roomSlabOutside(s, 45.8f, 25.0f) && !cc::roomSlabOutside(s, 18.0f, 2.0f) && !cc::roomSlabOutside(s, -12.0f, 1.5f),
+                  "rooms: from there the lift and the bridge are not, and what reaches across a door is kept");
+            check(cc::roomSlabOf(cc::kRoomCarrier, 21.2f, &s) && s.lo == 19.0f && s.hi >= cc::kRoomSlabOpen, "rooms: the bridge runs from its door");
+            check(cc::roomSlabOutside(s, -26.0f, 2.0f) && cc::roomSlabOutside(s, 4.5f, 10.0f) && !cc::roomSlabOutside(s, 45.8f, 25.0f), "rooms: from the bridge the rest is another room");
+            check(cc::roomSlabOf(cc::kRoomCarrier, -11.0f, &s) && s.lo == -11.0f && s.hi == 19.0f, "rooms: on a door's plane is the room it opens into");
+            check(!cc::roomSlabOutside(s, std::nanf(""), 1.0f) && !cc::roomSlabOutside(s, 100.0f, -1.0f) && !cc::roomSlabOf(cc::kRoomCarrier, std::nanf(""), &s), "rooms: nothing unreadable is culled");
+            cc::RoomSlab a, b;
+            check(cc::roomSlabOf(cc::kRoomCarrier, 0.0f, &a) && cc::roomSlabOf(cc::kRoomCarrier, 10.0f, &b) && cc::sameRoomSlab(a, b) && cc::roomSlabOf(cc::kRoomCarrier, 20.0f, &b) &&
+                      !cc::sameRoomSlab(a, b), "rooms: the slab changes only across a door");
+        }
         for (const char* n : {"SA_Carrier_01", "SA_Carrier_01_Bar", "SA_Carrier_01_Bridge", "SA_Carrier_01_Bar_WindowShutters0", "SA_Carrier_DoorA0", "PS_FUI_STAT_BigScreen_Carrier_01",
                               "FUI_Panel_4x2_Carrier_010", "RandomDirt_NarrowRightA0", "Narrow_Door_Left_Tech", "Arm_Base0"})
             check(cc::concourseAllowName(n, nullptr), "concourse carrier: the room's own name is on the list");
