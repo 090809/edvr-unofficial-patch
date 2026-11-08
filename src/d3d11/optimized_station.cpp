@@ -4444,7 +4444,21 @@ void concourseVrProbeToneDraw(ID3D11DeviceContext* ctx, char kind, uint32_t coun
     if (!tonemapAdmitStructure(ctx, bindingShaderHash(BindSlot::Ps), ta) || !tonemapAdmitFull(ta, bindingShaderHash(BindSlot::Vs))) return;
     int eye = -1;
     ResourceInfo ri;
-    if (ta.rtvRes && bindingResolveResourceProbe(ta.rtvRes, &ri) && ri.isTexture2D) eye = uiDepthEyeOfTargetReadOnly(ri.resource);
+    const void* rt = nullptr;
+    if (ta.rtvRes && bindingResolveResourceProbe(ta.rtvRes, &ri) && ri.isTexture2D) {
+        rt = ri.resource;
+        eye = uiDepthEyeOfTargetReadOnly(ri.resource);
+    }
+    // Flight 50: the eye table had not seen the tone's target (eye -1 on all 28 lines), so the depth and the rows were never asked for. Two tone draws a frame were admitted;
+    // the eye is then taken from their order in the frame (the first eye 0), and the line says which way it was told, with the target, so the order can be checked.
+    static uint32_t orderFrame = ~0u, orderNext = 0;   // the render thread only
+    if (orderFrame != frame) {
+        orderFrame = frame;
+        orderNext = 0;
+    }
+    const int byOrder = static_cast<int>(orderNext++);
+    const bool eyeByOrder = eye < 0 && byOrder < 2;
+    if (eyeByOrder) eye = byOrder;
     static uint32_t doneFrame[2] = {~0u, ~0u};   // one line per eye per frame (the render thread only)
     if (eye >= 0 && eye < 2) {
         if (doneFrame[eye] == frame) return;
@@ -4460,9 +4474,9 @@ void concourseVrProbeToneDraw(ID3D11DeviceContext* ctx, char kind, uint32_t coun
     char cam[300];
     vrProbeCameraText(eye, cam, sizeof(cam));
     g_vrProbeToneLines.fetch_add(1, std::memory_order_relaxed);
-    Log::get().note("concourse vr probe: tone: frame %u [%s%s] eye %d: H (PS t1) format %u %ux%u; depth %s; %s",
+    Log::get().note("concourse vr probe: tone: frame %u [%s%s] eye %d (%s, target %p): H (PS t1) format %u %ux%u; depth %s; %s",
                     frame, phase == 1 ? "before" : phase == 2 ? "probe frame" : "after", phase == 2 ? (nativeCameraProbeWrote(frame) ? ", the stub wrote" : ", the stub did NOT write") : "", eye,
-                    static_cast<unsigned>(ta.hdrFmt), ta.hdrW, ta.hdrH, depthText, cam);
+                    eyeByOrder ? "by the draw's order in the frame" : eye >= 0 ? "by the eye table" : "not told", rt, static_cast<unsigned>(ta.hdrFmt), ta.hdrW, ta.hdrH, depthText, cam);
 }
 
 namespace {

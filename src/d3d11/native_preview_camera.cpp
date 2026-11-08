@@ -107,9 +107,11 @@ uint8_t* previewRelay(uintptr_t target,void* callback) noexcept {
 // probe idle (the default) eyeApply reads one atomic and goes on as before. While the probe is armed, a window of frames each lets the FIRST call of 0x283FA20 in that
 // window raise the head pose's translation by g_probe.offset (visible on purpose); every other call is only counted and described. A "window" is the span between two
 // present-thread ticks (nativeCameraProbeTick), so a frame's calls are the ones the game's threads made since the last tick.
-// The first-call rule: the call that takes index 0 of the window's atomic counter AND whose pose pointer is not an address on the calling thread's stack. 0x2845730's second
-// call per frame hands a stack address (the RE pass of 2026-11-07); the ship preview's own guard is different (eyeCommit refuses a pose more than 0.5 m from the published
-// head), which the probe cannot use, having no published head. A first call that is itself at a stack address is logged and not written.
+// The first-call rule: the call that takes index 0 of the window's atomic counter, with a readable, finite pose that is not the identity. Flight 50 (7bc497b5): every frame's
+// first call carried the head pose (rows rotated, the translation a few metres) at an address on 0x2845730's stack, which is its working copy of W+0x3330 (the RE pass of
+// 2026-11-07), and the next call an identity pose on the heap. The first build refused a stack address and so wrote nothing. The ship preview's own guard is different
+// (eyeCommit refuses a pose more than 0.5 m from the published head), which the probe cannot use, having no published head. Each of the window's first kProbeRecords calls is logged.
+constexpr unsigned kProbeRecords = 6;   // Flight 50: 6 calls a frame
 struct ProbeRecord {
     std::atomic<uint32_t> ready{0};
     uintptr_t at=0;
@@ -121,7 +123,7 @@ struct Probe {
     std::atomic<bool> writing{false};    // this window may write its first call
     std::atomic<uint32_t> calls{0};      // calls since the last tick (the index of the next call)
     std::atomic<uint32_t> stackCalls{0};
-    ProbeRecord rec[2];                  // the first call, and the first other call, of the window
+    ProbeRecord rec[kProbeRecords];      // the window's first calls, in order
     float offset[3]{};
     uint32_t frames=0,left=0,wroteWindows=0,startFrame=0,lastWindowFrame=0;
     std::atomic<uint32_t> wroteMask{0};  // bit i: the window at startFrame+i wrote
@@ -139,18 +141,27 @@ bool probeReadPose(uintptr_t at,float (&out)[12]) noexcept {
     for(unsigned r=0;r<4;++r)for(unsigned c=0;c<3;++c)out[r*3+c]=p.v[r*4+c];
     return true;
 }
+// The identity pose (Flight 50's second call each frame): not a head, so never written.
+bool probeIdentity(const previewcam::Pose& p) noexcept {
+    for(unsigned r=0;r<4;++r)for(unsigned c=0;c<3;++c){
+        const float want=(r<3&&r==c)?1.0f:0.0f;
+        const float d=p.v[r*4+c]-want;
+        if(d>1e-4f||d<-1e-4f)return false;
+    }
+    return true;
+}
 // Called on the game's threads from eyeApply, after the null test. Wait-free: no log, no allocation. True when it wrote.
 __declspec(noinline) bool probeEye(uintptr_t pose) noexcept {
     const uint32_t n=g_probe.calls.fetch_add(1,std::memory_order_acq_rel);
     const auto* tib=reinterpret_cast<const NT_TIB*>(NtCurrentTeb());
     const bool stack=pose>=reinterpret_cast<uintptr_t>(tib->StackLimit)&&pose<reinterpret_cast<uintptr_t>(tib->StackBase);
     if(stack)g_probe.stackCalls.fetch_add(1,std::memory_order_relaxed);
-    ProbeRecord* r=n<2?&g_probe.rec[n]:nullptr;
+    ProbeRecord* r=n<kProbeRecords?&g_probe.rec[n]:nullptr;
     if(r){r->at=pose;r->stack=stack;r->wrote=false;r->readable=probeReadPose(pose,r->before);for(float& f:r->after)f=0.0f;}
     bool wrote=false;
-    if(n==0&&!stack&&r&&r->readable&&g_probe.writing.load(std::memory_order_acquire)) {
+    if(n==0&&r&&r->readable&&g_probe.writing.load(std::memory_order_acquire)) {
         previewcam::Pose p;
-        if(previewcam::get(g_previewMemory,pose,p)&&previewcam::finite(p)) {
+        if(previewcam::get(g_previewMemory,pose,p)&&previewcam::finite(p)&&!probeIdentity(p)) {
             for(unsigned c=0;c<3;++c)p.v[12+c]+=g_probe.offset[c];
             wrote=g_previewMemory.write(g_previewMemory.context,pose,&p,sizeof(p));
         }
@@ -341,19 +352,19 @@ void nativeCameraProbeTick(uint32_t frame) {
     if(!g_probe.armed.load(std::memory_order_acquire))return;
     g_probe.writing.store(false,std::memory_order_release);
     const uint32_t wf=g_probe.lastWindowFrame,idx=wf-g_probe.startFrame;
-    const char* phase=idx==0?"before: the press's own frame, nothing written":idx<=g_probe.frames?"probe: the first call is written":"after: nothing written";
+    const char* phase=idx==0?"before: the press's own frame, nothing written":idx<=g_probe.frames?"probe: the first call is written unless it is the identity":"after: nothing written";
     bool wroteAny=false;
     char b[160],a[160];
-    for(unsigned k=0;k<2;++k){
+    for(unsigned k=0;k<kProbeRecords;++k){
         ProbeRecord& r=g_probe.rec[k];
         if(!r.ready.load(std::memory_order_acquire))continue;
         wroteAny=wroteAny||r.wrote;
         if(!r.readable){
-            Log::get().note("concourse vr probe: camera frame %u: %s call at 0x%llX: pose unreadable",wf,k?"first other":"first",(unsigned long long)r.at);
+            Log::get().note("concourse vr probe: camera frame %u: call %u at 0x%llX: pose unreadable",wf,k,(unsigned long long)r.at);
         } else {
             probeFloats(r.before,b);probeFloats(r.after,a);
-            Log::get().note("concourse vr probe: camera frame %u: %s call at 0x%llX%s, wrote %s; pose before %s; after %s",
-                wf,k?"first other":"first",(unsigned long long)r.at,r.stack?" (a stack address)":"",r.wrote?"yes":"no",b,a);
+            Log::get().note("concourse vr probe: camera frame %u: call %u at 0x%llX%s, wrote %s; pose before %s; after %s",
+                wf,k,(unsigned long long)r.at,r.stack?" (a stack address)":"",r.wrote?"yes":"no",b,a);
         }
         r.ready.store(0,std::memory_order_release);
     }
