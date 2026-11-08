@@ -26,6 +26,7 @@ void concourseCameraTestLook(const float centre[3], const float up[3], uint32_t 
 void concourseCameraTestControl(uint32_t mode, bool acting, bool busy) noexcept;
 void concourseCameraTestAim(const float centre[3], const float forward[3], const float up[3], float fovRad, float nearM) noexcept;   // the bake's frame: unit axes, vertical field of view in radians, near plane in metres
 bool concourseCameraTestHooked() noexcept;
+bool concourseCameraTestCanMove() noexcept;   // the producer hook (0x2874290) is in, so the look and the bake can move flat's camera
 void concourseCameraTestSnapshot(ConcourseCameraTestSnap* out) noexcept;
 
 // TEMPORARY (the VR bake): the near value at RVA 0x5E85B8C without the flat hooks. Resolve checks the build and the 0.025 read there (false with why). Raise reads the value

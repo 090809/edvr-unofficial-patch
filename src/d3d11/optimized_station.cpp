@@ -5405,15 +5405,18 @@ void concourseTick(uint64_t now, uint32_t frame) {
     // TEMPORARY (the VR bake): in VR the bake's camera is the eye stub's, and its mode is the bake whenever it is available. Flat: vrBake is false, camMode is g_camMode, and
     // bakeMode is what it was.
     const bool vrBake = !runtimeFlatProfile() && vrBakeAvail();
-    // Flat with its camera hooks not bound (a session that started in VR, then switched): no bake is armed or begun, and nothing holds a Present or moves the camera; the windows keep
-    // whatever cube was published before. The mode reads 0 on this path, so neither a ride up nor the room in view arms the camera test.
-    const bool camHooksBound = concourseCameraTestHooked();
+    // Flat without the camera's producer hook (0x2874290), which is the only way the look and the bake move flat's camera: no bake is armed or begun, and nothing holds a Present
+    // or moves the camera; the windows keep whatever cube was published before. Flight 55: after a switch from VR the install skipped that hook ("already patched by another
+    // EDVR module") while the others went in, and two bakes held the screen 266 ms each with the camera never moved. The mode reads 0 on this path, so neither a ride up nor the
+    // room in view arms the camera test.
+    const bool camHooksBound = concourseCameraTestCanMove();
     {
         static bool saidNoHooks = false;
-        if (runtimeFlatProfile() && !camHooksBound) {
+        if (runtimeFlatProfile() && !camHooksBound && (g_camHooked || g_camAutoTried)) {
             if (!saidNoHooks) {
                 saidNoHooks = true;
-                Log::get().note("concourse bake: flat: no bake: the flat camera hooks are not bound in this session (it started in VR), so the windows keep the bake they have");
+                Log::get().note("concourse bake: flat: no bake: the camera's producer hook (0x2874290) is not installed in this session (the camera test's install lines say why), so "
+                                "the windows keep the bake they have");
             }
         } else {
             saidNoHooks = false;

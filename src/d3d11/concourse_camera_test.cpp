@@ -396,6 +396,10 @@ void concourseCameraTestAim(const float centre[3],const float forward[3],const f
 }
 
 bool concourseCameraTestHooked() noexcept {return g_ctHooked.load(std::memory_order_acquire)!=0;}
+// The look and the bake move flat's camera only through the producer hook (producerObserved, 0x2874290). Flight 55: after a switch from VR to flat the automatic
+// install found 0x2874290 "already patched by another EDVR module" and skipped it, yet the other hooks went in, so "hooked" was true and two bakes held the screen with
+// the camera never moved. This is the test that matters.
+bool concourseCameraTestCanMove() noexcept {return (g_ctHooked.load(std::memory_order_acquire)&(1u<<kIdxProducer))!=0;}
 
 // TEMPORARY (the concourse cull's VR bake, docs\concourse-cull-2026-11-05.md): the same .data float, for VR, where the flat hooks are never installed. 0x2845730 passes it to
 // 0x283FA20 as the eye cameras' near (analysis\decomp\decomp_2845730_334925.txt: DAT_145e85b8c, and 0x287B330 stores that argument at camera +0x234). Its address is checked
