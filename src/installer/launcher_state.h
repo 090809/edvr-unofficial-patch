@@ -9,6 +9,8 @@
 //   mode.<16 hex>      the play mode remembered for one install folder: the first
 //                      16 hex characters of the SHA-256 of the folder's path,
 //                      lower-cased, with backslashes and no trailing separator
+//   last_install       the install folder Play was last pressed for, as a path; the
+//                      window opens on it while it is still an install it can use
 //
 // A line this code does not know (another version's key, a comment) is kept as
 // it was, in place, so a newer launcher's file survives an older one. Saving is
@@ -54,9 +56,19 @@ public:
     std::string mode(const std::wstring& installFolder) const;
     void setMode(const std::wstring& installFolder, const std::string& mode);
 
+    // Empty when the file has none.
+    std::wstring lastInstall() const;
+    void setLastInstall(const std::wstring& installFolder);
+
+    // The same folder by modeKey's rules: case, slash direction and a trailing separator do not count.
+    static bool sameInstall(const std::wstring& a, const std::wstring& b);
+
 private:
     std::wstring path_;
     std::vector<std::string> lines_;
 };
+
+// The index of `remembered` in `folders`, by sameInstall; folders.size() when it is empty or not there.
+size_t rememberedInstallIndex(const std::vector<std::wstring>& folders, const std::wstring& remembered);
 
 }  // namespace edvr::installer

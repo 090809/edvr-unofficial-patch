@@ -261,11 +261,12 @@ bool LauncherSession::setDirectLaunch(bool on, const std::function<bool()>& conf
     return directLaunch_;
 }
 
-void LauncherSession::rememberMode(const std::wstring& gameDir, bool vr) {
+void LauncherSession::rememberPlay(const std::wstring& gameDir, const char* mode) {
     LauncherState state;
     std::string ignored;
     if (state.load(launcherIniPath(env_.roots), &ignored)) {
-        state.setMode(gameDir, vr ? "vr" : "flat");
+        if (mode) state.setMode(gameDir, mode);
+        state.setLastInstall(gameDir);
         createDirectories(env_.roots.launcherDir());
         state.save(&ignored);
     }
@@ -297,8 +298,9 @@ void LauncherSession::startRouteAndWatch(const std::wstring& source, const std::
         changed();
         return;
     }
-    // The Frontier route is the only one that carried a choice, so only it is remembered.
-    if (route.carriesMode) rememberMode(gameDir, vr);
+    // Every start remembers its install. The Frontier route is the only one that carried a choice of
+    // mode, so only its mode is remembered.
+    rememberPlay(gameDir, route.carriesMode ? (vr ? "vr" : "flat") : nullptr);
     playing_ = true;
     playLine_ = startLine;
     changed();
@@ -373,7 +375,7 @@ std::shared_ptr<LauncherSession::Asked> LauncherSession::askOnWindow(const std::
 
 void LauncherSession::beginDirectPlay(const std::wstring& source, const std::wstring& gameDir, bool vr, const RouteOps& ops,
                                       const WatchNames& names, const WatchTiming& timing) {
-    rememberMode(gameDir, vr);
+    rememberPlay(gameDir, vr ? "vr" : "flat");
     playing_ = true;
     playLine_ = "Signing in to Frontier...";
     changed();
@@ -456,8 +458,7 @@ void LauncherSession::beginDirectPlay(const std::wstring& source, const std::wst
         }
         post([this]() {
             playLine_ = "Elite is running.";
-            if (env_.hideWindow) env_.hideWindow();
-            else if (env_.windowAside) env_.windowAside(true);
+            if (env_.windowAside) env_.windowAside(true);
             changed();
         });
         while (WaitForSingleObject(process, 200) == WAIT_TIMEOUT) {
@@ -470,8 +471,8 @@ void LauncherSession::beginDirectPlay(const std::wstring& source, const std::wst
         post([this]() {
             playing_ = false;
             playLine_ = "Elite has closed.";
+            if (env_.windowAside) env_.windowAside(false);
             changed();
-            if (env_.closeWindow) env_.closeWindow();
         });
     });
 }

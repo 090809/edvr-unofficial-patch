@@ -69,10 +69,9 @@ struct SessionEnv {
     std::function<void()> changed;          // state moved: repaint, re-enable
     std::function<void()> payloadSwitched;  // an update was adopted and the payload is now it: carry on to the install
     std::function<void()> closeWindow;      // the new launcher is running: this one is done
-    std::function<void(bool aside)> windowAside;  // the game started (true) or is over (false)
-    // A direct launch hides the window while the game runs (windowAside's minimising is the fallback
-    // when this is empty) and closes it when the game exits.
-    std::function<void()> hideWindow;
+    // The game started (true) or is over (false), on every route. The window is minimised while the game
+    // runs and comes back when it exits, and stays open for another Play.
+    std::function<void(bool aside)> windowAside;
 
     // Direct launch's seams. Empty or default means the real one; the rig uses its own.
     std::string frontierBase;                  // empty means api.zaonce.net
@@ -149,7 +148,8 @@ private:
         if (env_.changed) env_.changed();
     }
     void spawn(std::function<void()> work) { workers_.emplace_back(std::move(work)); }
-    void rememberMode(const std::wstring& gameDir, bool vr);
+    // Writes last_install, and the install's mode unless `mode` is null.
+    void rememberPlay(const std::wstring& gameDir, const char* mode);
     void startRouteAndWatch(const std::wstring& source, const std::wstring& gameDir, bool vr, bool elevated,
                             const RouteOps& ops, const WatchNames& names, const WatchTiming& timing,
                             const std::string& startLine);

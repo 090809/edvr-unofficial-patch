@@ -73,6 +73,26 @@ std::string launcherRememberedMode() {
     return state.mode(g.survey.game.dir) == "flat" ? "flat" : "vr";
 }
 
+// The install Play was last pressed for, as an index into g.installs, else g.installs.size(). A folder
+// that was browsed to is put back in the list while it still holds a game the window would take.
+size_t launcherRememberedInstall() {
+    LauncherState state;
+    state.load(joinPath(launcherRootsFor(g.args).launcherDir(), L"launcher.ini"), nullptr);
+    const std::wstring last = state.lastInstall();
+    if (last.empty()) return g.installs.size();
+    std::vector<std::wstring> folders;
+    for (const GameInstall& game : g.installs) folders.push_back(game.dir);
+    const size_t found = rememberedInstallIndex(folders, last);
+    if (found < folders.size()) return found;
+    GameInstall game;
+    if (!describeDir(last, L"Folder you chose", &game)) return g.installs.size();
+    if (withoutLegacyInstalls({game}, eliteExeIsLegacy).empty()) return g.installs.size();
+    g.installs.push_back(game);
+    const std::wstring label = game.source + L"  \x00b7  " + game.dir;
+    SendMessageW(g.combo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(label.c_str()));
+    return g.installs.size() - 1;
+}
+
 // Shows, hides and enables everything the launcher owns, from the session and the survey.
 void updateLauncherControls() {
     if (!lg.session) return;
@@ -239,7 +259,6 @@ void launcherBegin() {
         return showFrontierCode(options, email, note, code);
     };
     env.closeWindow = [window]() { PostMessageW(window, WM_CLOSE, 0, 0); };
-    env.hideWindow = [window]() { ShowWindow(window, SW_HIDE); };
     env.windowAside = [window](bool aside) {
         ShowWindow(window, aside ? SW_MINIMIZE : SW_RESTORE);
         if (!aside) SetForegroundWindow(window);

@@ -115,7 +115,9 @@ reached the launcher says so in one line and carries on.
 Play starts the game through Steam, Epic or Frontier's own launcher, and
 watches until it exits so that it can close the Frontier launcher window left
 behind. Only Frontier's launcher takes a VR or flat choice from the launcher;
-through Steam or Epic the game starts in the mode it is already set to.
+through Steam or Epic the game starts in the mode it is already set to. While the
+game runs, the launcher waits minimised on the taskbar, and it comes back when the
+game exits. It opens on the install you last pressed Play for.
 
 On Steam, a checkbox can start the game directly instead, with VR or flat as you
 choose. The launcher then signs in to Frontier's servers with your Steam login,

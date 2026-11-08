@@ -12,8 +12,9 @@
 - **Flown, 2026-11-08:** direct launch on Steam, VR and flat, and on the Frontier store,
   flat, with a first sign-in and its emailed code. A dry run then signed in from the
   saved login with no prompt (see Test results).
-- **Found in that flight:** the window picks the first install with EDVR in it on
-  every start, not the one played last, so a second Play went to Steam.
+- **Found in that flight:** the window picked the first install with EDVR in it on
+  every start, not the one played last, so a second Play went to Steam. It now opens
+  on the install Play was last pressed for (rig-tested, not flown).
 - **Rig-tested only, not yet run for real:** the first run's copy and registration, a
   self-update, a real UAC prompt and the elevated copy, a Frontier-store launch in VR
   (dry run only), and the EDLaunch route on any store, including closing EDLaunch.
@@ -249,7 +250,10 @@ more for Frontier, so roughly 1,500 lines of C++.
 6. Start `EliteDangerous64.exe` from the product folder, unelevated:
    `"ServerToken <machineToken> <authToken> <serverArgs>"`, then `/steam` on
    Steam, then exactly one of `/vr` and `/novr`, then the product's game arguments.
-7. Hide the window, wait on the process handle, and exit with the game.
+7. Minimise the window and wait on the process handle. When the game exits the
+   window comes back and stays open, as on the EDLaunch route. It first hid and
+   exited with the game, which read as the launcher closing when the game started
+   (changed 2026-11-08).
 
 The game folders on the maintainer's machine, 2026-11-07:
 
@@ -340,7 +344,9 @@ over a file at 0 went into VR, and `/novr` over a file at 4 stayed flat with no
 `openvr_api.dll` load. A flat start with no `/novr` opens a live OpenXR session,
 and `/novr` avoids that. Settings.xml is shared across stores and outlives the
 launch, while a flag touches nothing. The launcher remembers the last mode per
-install, in its own `launcher.ini`.
+install, in its own `launcher.ini`, and which install Play was last pressed for. The
+window opens on that install while it is still there, rather than on the first one
+found with EDVR in it.
 
 ## Pre-launch check and repair
 

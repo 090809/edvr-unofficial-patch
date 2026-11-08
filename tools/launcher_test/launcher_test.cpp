@@ -823,6 +823,26 @@ void testState() {
     check(t.mode(L"C:\\Games\\Other").empty(), "another folder has no mode");
     check(LauncherState::modeKey(L"C:\\Games\\Elite") == "mode.3d6b05c4d8ea02f1", "the mode key is the first 16 hex of the SHA-256 of the lower-cased folder");
 
+    // last_install: the folder Play was last pressed for, kept as a path and matched as the mode keys are.
+    {
+        const std::wstring lastPath = P(fresh("state-last"), L"launcher.ini");
+        LauncherState a;
+        check(a.load(lastPath, &err) && a.lastInstall().empty(), "no install is remembered at first");
+        const std::wstring folder = L"D:\\Spiele\\\x00c9lite \x5b89\\Products\\elite-dangerous-odyssey-64";
+        a.setLastInstall(folder);
+        check(a.save(&err), "saving last_install works: " + err);
+        LauncherState b;
+        check(b.load(lastPath, &err) && b.lastInstall() == folder, "last_install round-trips, non-ASCII included");
+        const std::vector<std::wstring> folders = {L"C:\\Steam\\Products\\elite-dangerous-odyssey-64",
+                                                   L"c:/users/me/appdata/local/frontier_developments/products/elite-dangerous-odyssey-64/"};
+        check(rememberedInstallIndex(folders, L"C:\\Users\\Me\\AppData\\Local\\Frontier_Developments\\Products\\elite-dangerous-odyssey-64") == 1,
+              "the remembered install is found in the list whatever the case or separators");
+        check(rememberedInstallIndex(folders, L"C:\\Steam\\Products") == folders.size(), "a folder not in the list is not found");
+        check(rememberedInstallIndex(folders, L"") == folders.size(), "nothing remembered finds nothing");
+        check(rememberedInstallIndex({}, L"C:\\Steam") == 0, "an empty list finds nothing");
+        check(!LauncherState::sameInstall(L"", L""), "two empty paths are not the same install");
+    }
+
     // direct_launch: off unless the file says exactly "on".
     check(!t.directLaunch(), "direct launch is off when the key is missing");
     t.setDirectLaunch(true);
@@ -3029,6 +3049,7 @@ void testSession() {
         LauncherState state;
         state.load(P(settingsFor(base).launcherDir, L"launcher.ini"), nullptr);
         check(state.mode(products) == "flat", "the flat choice is remembered for that folder");
+        check(state.lastInstall() == products, "and that folder is the install the window opens on next");
         for (HANDLE h : started) endProgram(h);
 
         // Steam: the address only, and no mode remembered.
@@ -3036,6 +3057,8 @@ void testSession() {
         check(spawned.size() == 2 && spawned[1] == L"steam://rungameid/359320", "Steam is started by its address");
         state.load(P(settingsFor(base).launcherDir, L"launcher.ini"), nullptr);
         check(state.mode(P(base, L"SteamGame")).empty(), "and a store that cannot carry a mode remembers none");
+        check(state.lastInstall() == P(base, L"SteamGame") && state.mode(products) == "flat",
+              "but it is now the install the window opens on next, and the Frontier folder keeps its mode");
         session.shutdown();   // the watcher for it would wait out its 1.5 s otherwise
         // An elevated launcher refuses, starting nothing.
         Ui ui3;
@@ -3838,7 +3861,7 @@ struct DirectRig {
     };
     std::vector<Start> started;
     std::vector<HANDLE> processes;
-    int hidden = 0;
+    int minimised = 0, restored = 0;  // windowAside(true) and windowAside(false)
     Recorder rec;
     std::unique_ptr<LauncherSession> session;
 
@@ -3881,8 +3904,10 @@ struct DirectRig {
             seen.push_back(session ? session->playLine() : std::string());
         };
         e.closeWindow = [this]() { ++ui.closed; };
-        e.windowAside = [this](bool aside) { ui.aside.push_back(aside); };
-        e.hideWindow = [this]() { ++hidden; };
+        e.windowAside = [this](bool aside) {
+            ui.aside.push_back(aside);
+            ++(aside ? minimised : restored);
+        };
         e.frontierBase = kFrontier;
         e.machineKeys = keys.keys;
         e.clock.unixNow = []() { return 1700000000ll; };
@@ -3967,17 +3992,19 @@ void testDirectSession() {
         check(others == 6, "every other value was tried");
     }
 
-    // On: direct. The game is started by the launcher, the window hides and closes, nothing else is opened.
+    // On: direct. The game is started by the launcher, the window steps aside and comes back and stays open,
+    // and nothing else is opened.
     {
         DirectRig rig("direct-on", "direct_launch=on\n");
         check(rig.session->directLaunch(), "direct_launch=on is on");
         rig.play(L"Steam", false, false);
         check(rig.session->playing() && contains(rig.session->playLine(), "Signing in"), "Play marks the session busy at once, with the first line: " + rig.session->playLine());
-        check(rig.ui.pump([&]() { return rig.ui.closed == 1; }), "the window closes when the game exits");
+        check(rig.ui.pump([&]() { return rig.restored == 1; }), "the window comes back when the game exits");
         check(rig.started.size() == 1 && rig.started[0].exe == P(rig.game.product, L"EliteDangerous64.exe") && rig.started[0].dir == rig.game.product, "the game is started once, from its own folder");
         check(!rig.started.empty() && narrowUtf8(rig.started[0].args) == std::string("\"ServerToken ") + kMachineToken + " " + kAuthToken + " /Zz\" /steam /novr /edo --foo", "with the port's command line, /novr for flat");
         check(rig.rec.uris.empty() && rig.rec.spawns.empty(), "no store address is opened and nothing is spawned");
-        check(rig.hidden == 1 && rig.ui.aside.empty(), "the window was hidden once, when the game started");
+        check(rig.ui.aside == std::vector<bool>{true, false} && rig.ui.closed == 0,
+              "the window stepped aside once when the game started, came back when it ended, and was not closed");
         check(!rig.session->playing() && rig.session->playLine() == "Elite has closed.", "and the line ends: " + rig.session->playLine());
         const std::vector<std::string> tags = eventTags();
         const int start = eventIndex(tags, "START");
@@ -3986,6 +4013,7 @@ void testDirectSession() {
         LauncherState state;
         state.load(P(P(rig.base, L"launcher"), L"launcher.ini"), nullptr);
         check(state.mode(rig.game.product) == "flat" && state.directLaunch(), "flat is remembered for the install, and the setting is still on");
+        check(state.lastInstall() == rig.game.product, "a direct launch remembers its install for the next start");
         check(!rig.anyLineLeaks(), "no line the band showed (" + std::to_string(rig.seen.size()) + ") holds a token");
         check(!treeHas(rig.base, {kAuthToken, kMachineToken, kFakeTicket, kExpectedMachineId}), "no token, ticket or machine ID is in any file under the data root");
     }
@@ -3994,7 +4022,7 @@ void testDirectSession() {
     {
         DirectRig rig("direct-vr", "direct_launch=on\n");
         rig.play(L"Steam", true, false);
-        check(rig.ui.pump([&]() { return rig.ui.closed == 1; }) && rig.started.size() == 1 && contains(narrowUtf8(rig.started[0].args), " /steam /vr /edo --foo"), "Play VR starts the game with /vr");
+        check(rig.ui.pump([&]() { return rig.restored == 1; }) && rig.started.size() == 1 && contains(narrowUtf8(rig.started[0].args), " /steam /vr /edo --foo"), "Play VR starts the game with /vr");
     }
 
     // Elevated: refused before anything is contacted.
@@ -4030,7 +4058,7 @@ void testDirectSession() {
             rig.play(L"Steam", true, false);
             check(rig.ui.pump([&]() { return rig.rec.uris.size() == 1 && !rig.session->playing(); }), std::string(c.name) + ": the Steam route is taken and its watcher ends");
             setSteamMode("");
-            check(uris(rig.rec) == std::vector<std::string>{steamUri} && rig.started.empty() && rig.hidden == 0 && rig.ui.closed == 0, std::string(c.name) + ": Steam's address is opened and no game is started");
+            check(uris(rig.rec) == std::vector<std::string>{steamUri} && rig.started.empty() && rig.ui.closed == 0, std::string(c.name) + ": Steam's address is opened and no game is started");
             bool said = false;
             for (const std::string& line : rig.seen) said = said || (contains(line, "Direct launch did not work") && contains(line, c.reason) && contains(line, "mode it is set to"));
             check(said, std::string(c.name) + ": the band's line said why and that the game uses the mode it is set to");
@@ -4263,7 +4291,7 @@ void testStoreSession() {
         rig.codeAnswers = {{true, kCode}};
         rig.play(L"Frontier launcher", true, false);
         check(rig.session->playing() && contains(rig.session->playLine(), "Signing in"), "Play marks the session busy at once: " + rig.session->playLine());
-        check(rig.ui.pump([&]() { return rig.ui.closed == 1; }), "the window closes when the game exits");
+        check(rig.ui.pump([&]() { return rig.restored == 1; }), "the window comes back when the game exits");
         check(pathsOf(rig.http) == kTimePath + " " + kFAuthPath + " " + kFTokenPath + " " + kFAuthPath + " " + kPurchasesPath + " " + kInstallerPath, "six calls, in order: time, auth, token, auth, purchases, installer: " + pathsOf(rig.http));
         if (rig.http.requests.size() == 6) {
             const HttpRequest& first = rig.http.requests[1];
@@ -4293,7 +4321,7 @@ void testStoreSession() {
         check(args == std::string("\"ServerToken ") + kMachineToken + " " + kAuthToken + " /Zz\" /vr /edo --foo", "the command line has no /steam, the token the code earned (not the one the server's reply names) and the auth token: " + args);
         check(!contains(args, "/steam") && !contains(args, kServerMachineToken), "no /steam, and the server's own machine token is not used");
         check(eventIndex(eventTags(), "load") < 0 && eventIndex(eventTags(), "init") < 0 && eventIndex(eventTags(), "START") >= 0, "Steam's library was never loaded, and the game was started: " + joined(eventTags()));
-        check(rig.rec.uris.empty() && rig.rec.spawns.empty() && rig.hidden == 1, "no store address and no EDLaunch, and the window hid once");
+        check(rig.rec.uris.empty() && rig.rec.spawns.empty() && rig.minimised == 1 && rig.ui.closed == 0, "no store address and no EDLaunch, and the window stepped aside once and was not closed");
         check(rig.loginNotes.size() == 1 && rig.codeNotes.size() == 1 && rig.loginNotes[0].empty() && rig.codeNotes[0].empty() && rig.loginEmails[0].empty() && rig.codeEmails[0] == kEmail,
               "the login was asked for once, with nothing known, and the code once, naming the email it went to");
         check(rig.askedOnWindowThread.size() == 2 && rig.askedOnWindowThread[0] && rig.askedOnWindowThread[1], "both questions were asked on the window's thread, not the worker's");
@@ -4315,7 +4343,7 @@ void testStoreSession() {
         scriptStore(&rig.http, false);
         saveLogin(rig.loginPath, kPassword, kMachineToken);
         rig.play(L"Frontier launcher", false, false);
-        check(rig.ui.pump([&]() { return rig.ui.closed == 1; }), "a later launch starts the game and closes the window");
+        check(rig.ui.pump([&]() { return rig.restored == 1; }), "a later launch starts the game");
         check(pathsOf(rig.http) == kTimePath + " " + kFAuthPath + " " + kPurchasesPath + " " + kInstallerPath, "four calls: one sign-in, as the password is sent every time: " + pathsOf(rig.http));
         const HttpRequest* auth = rig.http.nth(kFAuthPath);
         check(auth && auth->method == "POST" && queryNames(auth->url) == "email,password,machineId,machineToken,lang,fTime" && queryValue(auth->url, "password") == hexed(kPassword) && queryValue(auth->url, "machineToken") == kMachineToken,
@@ -4334,7 +4362,7 @@ void testStoreSession() {
         rig.loginAnswers = {{true, kEmail, kPassword, false}};
         rig.codeAnswers = {{true, kCode}};
         rig.play(L"Frontier launcher", true, false);
-        check(rig.ui.pump([&]() { return rig.ui.closed == 1; }), "a first run that does not remember the password still starts the game");
+        check(rig.ui.pump([&]() { return rig.restored == 1; }), "a first run that does not remember the password still starts the game");
         check(rig.http.count(kFAuthPath) == 2 && rig.http.count(kFTokenPath) == 1 && rig.started.size() == 1, "after the whole first-time sequence: " + pathsOf(rig.http));
         StoredLogin saved;
         check(loadFrontierLogin(rig.loginPath, &saved) && saved.email == kEmail && saved.password.empty() && saved.machineToken == kMachineToken && !contains(readAll(rig.loginPath), "password="), "only the email and the token are stored");
@@ -4345,7 +4373,7 @@ void testStoreSession() {
         saveLogin(rig.loginPath, nullptr, kMachineToken);
         rig.loginAnswers = {{true, kEmail, kPassword, true}};
         rig.play(L"Frontier launcher", true, false);
-        check(rig.ui.pump([&]() { return rig.ui.closed == 1; }), "a stored token with no password asks for the password and starts the game");
+        check(rig.ui.pump([&]() { return rig.restored == 1; }), "a stored token with no password asks for the password and starts the game");
         check(rig.loginNotes.size() == 1 && rig.loginEmails[0] == kEmail && rig.loginRemembers[0] == false && rig.codeNotes.empty(), "the form came up with the email filled in, the box as the user left it, and no code asked");
         check(pathsOf(rig.http) == kTimePath + " " + kFAuthPath + " " + kPurchasesPath + " " + kInstallerPath, "the token was used with the typed password: one sign-in call: " + pathsOf(rig.http));
         StoredLogin saved;
@@ -4361,7 +4389,7 @@ void testStoreSession() {
         rig.loginAnswers = {{true, kEmail, kPassword, true}};
         rig.codeAnswers = {{true, kCode}};
         rig.play(L"Frontier launcher", true, false);
-        check(rig.ui.pump([&]() { return rig.ui.closed == 1; }), "after a denied saved login, a new sign-in starts the game");
+        check(rig.ui.pump([&]() { return rig.restored == 1; }), "after a denied saved login, a new sign-in starts the game");
         check(pathsOf(rig.http) == kTimePath + " " + kFAuthPath + " " + kFAuthPath + " " + kFTokenPath + " " + kFAuthPath + " " + kPurchasesPath + " " + kInstallerPath, "the denied call, then the whole first-time sequence: " + pathsOf(rig.http));
         check(rig.loginNotes.size() == 1 && contains(rig.loginNotes[0], "did not accept the saved sign-in") && rig.loginEmails[0] == kEmail, "the window said the saved sign-in was refused, with the email it had");
         check(rig.fileWhenAsked.size() == 1 && rig.fileWhenAsked[0].email == kEmail && rig.fileWhenAsked[0].password.empty() && rig.fileWhenAsked[0].machineToken.empty(), "and by then the stored password and token were gone and the email was kept");
@@ -4381,7 +4409,7 @@ void testStoreSession() {
         rig.loginAnswers = {{true, kEmail, "SENTINEL-WRONG-PASSWORD", true}, {true, kEmail, kPassword, true}};
         rig.codeAnswers = {{true, kCode}};
         rig.play(L"Frontier launcher", true, false);
-        check(rig.ui.pump([&]() { return rig.ui.closed == 1; }), "a second try after a refused password starts the game");
+        check(rig.ui.pump([&]() { return rig.restored == 1; }), "a second try after a refused password starts the game");
         check(rig.loginNotes.size() == 2 && rig.loginNotes[0].empty() && contains(rig.loginNotes[1], "did not accept that email and password") && rig.loginEmails[1] == kEmail, "the second form carried a note and the email: " + (rig.loginNotes.size() > 1 ? rig.loginNotes[1] : std::string()));
         check(rig.codeNotes.size() == 1, "only the good password led to a code");
     }
@@ -4394,7 +4422,7 @@ void testStoreSession() {
         rig.loginAnswers = {{true, kEmail, kPassword, true}};
         rig.codeAnswers = {{true, kBadCode}, {true, kCode}};
         rig.play(L"Frontier launcher", true, false);
-        check(rig.ui.pump([&]() { return rig.ui.closed == 1; }), "a refused code and then a good one start the game");
+        check(rig.ui.pump([&]() { return rig.restored == 1; }), "a refused code and then a good one start the game");
         check(rig.codeNotes.size() == 2 && rig.codeNotes[0].empty() && contains(rig.codeNotes[1], "did not accept that code"), "the second code window said the first was refused: " + (rig.codeNotes.size() > 1 ? rig.codeNotes[1] : std::string()));
         check(rig.http.count(kFTokenPath) == 2 && queryValue(rig.http.nth(kFTokenPath, 0)->url, "plainCode") == kBadCode && queryValue(rig.http.nth(kFTokenPath, 1)->url, "plainCode") == kCode &&
                   queryValue(rig.http.nth(kFTokenPath, 1)->url, "encCode") == kEncCode && rig.http.count(kFAuthPath) == 2,
@@ -4408,7 +4436,7 @@ void testStoreSession() {
         scriptStore(&rig.http, true);
         rig.play(L"Frontier launcher", true, false);
         check(rig.ui.pump([&]() { return !rig.session->playing(); }), "cancelling the login ends the launch");
-        check(rig.session->playLine() == "Sign-in cancelled." && rig.started.empty() && rig.rec.uris.empty() && rig.rec.spawns.empty() && rig.hidden == 0 && rig.ui.closed == 0, "the line says so, and nothing is started or opened: " + rig.session->playLine());
+        check(rig.session->playLine() == "Sign-in cancelled." && rig.started.empty() && rig.rec.uris.empty() && rig.rec.spawns.empty() && rig.minimised == 0 && rig.ui.closed == 0, "the line says so, and nothing is started or opened: " + rig.session->playLine());
         check(rig.http.count(kFAuthPath) == 0 && rig.http.count(kFTokenPath) == 0 && rig.http.count(kPurchasesPath) == 0 && !exists(rig.loginPath), "no sign-in call was made and nothing was stored");
     }
     {
@@ -4461,7 +4489,7 @@ void testStoreSession() {
             check(rig.ui.pump([&]() { return rig.rec.spawns.size() == 1 && !rig.session->playing(); }), std::string(c.name) + ": Frontier's route is taken and its watcher ends");
             check(rig.rec.spawns.size() == 1 && rig.rec.spawns[0].exe == rig.game.edlaunch && narrowUtf8(rig.rec.spawns[0].args) == (vr ? flagVr : flagFlat) && rig.rec.uris.empty(),
                   std::string(c.name) + ": EDLaunch is started with the " + (vr ? "VR" : "flat") + " flag: " + (rig.rec.spawns.empty() ? std::string() : narrowUtf8(rig.rec.spawns[0].args)));
-            check(rig.started.empty() && rig.hidden == 0 && rig.ui.closed == 0 && eventIndex(eventTags(), "START") < 0, std::string(c.name) + ": no game is started directly");
+            check(rig.started.empty() && rig.ui.closed == 0 && eventIndex(eventTags(), "START") < 0, std::string(c.name) + ": no game is started directly");
             bool said = false, steamNamed = false;
             for (const std::string& line : rig.seen) {
                 if (!contains(line, "Direct launch did not work")) continue;  // the watcher's later lines name Steam among the stores
@@ -4569,10 +4597,17 @@ struct DialogDrive {
     std::atomic<bool> returned{false};
 };
 
+// FindWindowW sees the dialog from inside its WM_CREATE, before createControls has made its boxes, and a helper
+// that went on then typed into null windows (four failures in a loaded build, 2026-11-08). A message sent from
+// this thread is answered only once the dialog's thread is back in its message loop, when every control exists.
 HWND waitForDialog() {
-    for (int i = 0; i < 1000; ++i) {
+    const DWORD end = GetTickCount() + 20000;
+    while (static_cast<int>(GetTickCount() - end) < 0) {
         HWND w = FindWindowW(kFrontierDialogClass, nullptr);
-        if (w) return w;
+        if (w) {
+            DWORD_PTR ignored = 0;
+            return SendMessageTimeoutW(w, WM_NULL, 0, 0, SMTO_NORMAL, 20000, &ignored) ? w : nullptr;
+        }
         Sleep(5);
     }
     return nullptr;
@@ -4581,13 +4616,15 @@ HWND waitForDialog() {
 // The boxes by their control IDs (10 email, 11 password, 12 code), not by where they sit in the window's list.
 HWND nthEdit(HWND dialog, int n) { return GetDlgItem(dialog, n == 2 ? 12 : 10 + n); }
 
-// A test that waits for a dialog must not wait forever: if one is still up after the helper is done, close it.
+// A test that waits for a dialog must not wait forever: once the section has run a minute, every dialog is
+// closed. Ten seconds was once within reach of a healthy run in a loaded build, and it closed dialogs under test.
 struct DialogWatchdog {
     std::atomic<bool> stop{false};
     std::thread thread;
     DialogWatchdog() {
         thread = std::thread([this]() {
-            for (int i = 0; i < 2000 && !stop; ++i) Sleep(5);
+            const DWORD end = GetTickCount() + 60000;
+            while (!stop && static_cast<int>(GetTickCount() - end) < 0) Sleep(20);
             while (!stop) {
                 HWND w = FindWindowW(kFrontierDialogClass, nullptr);
                 if (w) PostMessageW(w, WM_CLOSE, 0, 0);

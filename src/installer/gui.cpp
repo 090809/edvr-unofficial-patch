@@ -874,6 +874,16 @@ void scanForInstalls() {
         SendMessageW(g.combo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(label.c_str()));
     }
 
+#ifdef EDUP_LAUNCHER
+    // The launcher opens on the install Play was last pressed for, while it is still there.
+    const size_t remembered = launcherRememberedInstall();
+    if (remembered < g.installs.size()) {
+        SendMessageW(g.combo, CB_SETCURSEL, remembered, 0);
+        selectInstall(remembered);
+        return;
+    }
+#endif
+
     if (g.installs.empty()) {
         g.haveSurvey = false;
         setReport(

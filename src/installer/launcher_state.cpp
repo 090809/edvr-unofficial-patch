@@ -128,4 +128,19 @@ void LauncherState::setMode(const std::wstring& installFolder, const std::string
     set(modeKey(installFolder), mode);
 }
 
+std::wstring LauncherState::lastInstall() const { return widenUtf8(get("last_install")); }
+
+void LauncherState::setLastInstall(const std::wstring& installFolder) { set("last_install", narrowUtf8(installFolder)); }
+
+bool LauncherState::sameInstall(const std::wstring& a, const std::wstring& b) {
+    return !a.empty() && !b.empty() && modeKey(a) == modeKey(b);
+}
+
+size_t rememberedInstallIndex(const std::vector<std::wstring>& folders, const std::wstring& remembered) {
+    for (size_t i = 0; i < folders.size(); ++i) {
+        if (LauncherState::sameInstall(folders[i], remembered)) return i;
+    }
+    return folders.size();
+}
+
 }  // namespace edvr::installer
