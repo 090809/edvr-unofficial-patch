@@ -652,6 +652,20 @@ lit terrain, and invisible looking into black space.
 * Unverified: the fix in the headset. As before, anything the game drew
   into its own eye over the hull (not the UI layer) ends up under it.
 
+## Night vision on the hull (2026-11-08 ~22:15, build 1a1b6c60)
+
+The pilot: night vision now reaches the own ship, but "the ship's outline
+used to be wider"; not disliked. Night vision draws its outline at depth
+edges, on both sides of the silhouette. In separate mode:
+- the private layer has the inner half (the hull pixels);
+- the composite's cover keeps only hull pixels, so the outer half, on the
+  background side, is dropped;
+- the main pass has no hull edge left to draw it.
+
+A possible change, not made: widen the cover to pixels around the hull
+where the private HDR received night-vision light. Deferred while the
+pilot is content.
+
 ## Separate mode flown (2026-11-08 ~22:00, build 4e252a32): works; night vision, load blink
 
 Log `edvr_gfx_20261108_215951.log`, FG off. The pilot: the ship is drawn,
