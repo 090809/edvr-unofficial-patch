@@ -460,6 +460,43 @@ c80a4ef1`). VR, OpenXR (EDVR runtime), 2817x2448 render per eye.
   per draw cannot be joined, which item 2 below needs. The suspect is the
   hull layer: it was on, and the code otherwise differs from 639c02a9 only
   by the FG gate commits. Check this with the key off before v2.
+- **Later dumps of the same flight (19:28-19:30, key still on) have
+  instance streams again** (19 each: 192850710003, 192950193004,
+  193014549005, 193029413006, 193050273007). So the first two empty
+  ledgers were not the layer's doing. Script: shared notes
+  `own_records.py`, `cb_per_object.py`.
+  - In all five, the **first hull-family G-buffer draw after the cockpit
+    shell belongs to the own ship**. Clustering each draw's records by
+    position (120 m) gives object A with exactly 54 records every time.
+    100% of the keyed pixels at 10-150 m are A's, and 98-99% under 10 m.
+  - Neighbour ships are drawn interleaved with A, for example
+    `ABBBCAAAA...AACCBB` and `AAAA(x5)AAAAAAAA x AAAA...xxxxx`. So no run,
+    gap or order rule can isolate A.
+  - Per draw, nothing CPU-visible separates A from a neighbour. VS cb0 is
+    unbound (`c=-`). VS t33 and t38 are the same views for all draws. Only
+    the mesh range (`ia=` start index, base vertex) differs, and a
+    neighbour of the same ship type would share it.
+  - ruled out: telling the own ship's draws apart on the CPU by binding,
+    order or contiguity, because neighbours interleave and share every
+    binding (census 6 = 193029413006: 71 hull draws, 26 of them a
+    neighbour's, all with identical tokens).
+- **Own-ship identity on the GPU, per instance (the design for v2):**
+  1. **Seed.** At the first hull-family G-buffer draw after the shell, the
+     CPU knows its instance range (start instance, count) and has the
+     instance stream SRV bound. A tiny compute dispatch reads the seed
+     records' positions from the pool. It marks every pool record within
+     120 m of their centroid in an own mask (2,048 bits). The log line
+     prints the mask's count (54 expected for the Anaconda).
+  2. **Filter in the pixel shader.** The four hull families are already
+     patched by engine motion (MRT6 slot export, `dxbc_engine_velocity.h`).
+     Add an own-mask SRV to the patch:
+     - in the main pass, discard own instances (Step 2);
+     - in the private re-issue, discard all others (Step 1).
+     Then every hull-family G-buffer draw is re-issued (70-90 an eye),
+     and mixed draws are handled per instance. Decals need the same
+     filter.
+  3. It depends on `fix.engine_motion` (the patched shaders). Without it
+     the layer is off.
 - **Next build (Step 1 v2):**
   1. Re-issue every lighting draw of the eye, not the sun alone, and
      snapshot the game's HDR after the last lighting draw, before the sky.
