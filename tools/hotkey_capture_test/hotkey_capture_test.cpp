@@ -310,6 +310,39 @@ void testHotkeyEdge() {
         h.setBinding("231D012D:Joy_3");
         check(h.pressed(), "setting the same binding again does not swallow a press");
     }
+    // Key up: pressed() reads the key and nothing else (no modifiers, no focus query),
+    // and leaves the same state that pressedWith(false, held, focused) leaves for
+    // every held/focused combination.
+    {
+        static int s_modReads = 0;
+        static bool s_f20 = false;
+        hotkeySetKeyboardReaderForTest([](int vk) {
+            if (vk == VK_CONTROL || vk == VK_MENU || vk == VK_SHIFT) ++s_modReads;
+            return vk == VK_F20 && s_f20;
+        });
+        for (int variant = 0; variant < 5; ++variant) {
+            Hotkey a;   // pressed()
+            Hotkey b;   // pressedWith(false, held, focused)
+            a.setKey(VK_F20, variant == 4 ? kHotkeyCtrl : 0);
+            b.setKey(VK_F20, variant == 4 ? kHotkeyCtrl : 0);
+            a.setGameMirrored(variant & 1);
+            b.setGameMirrored(variant & 1);
+            s_f20 = false;
+            s_modReads = 0;
+            const bool ra = a.pressed();
+            const bool rb = b.pressedWith(false, (variant & 2) ? kHotkeyCtrl : 0, (variant & 1) != 0);
+            check(ra == rb && !ra, "key up: pressed() and pressedWith(false,...) agree: no edge");
+            check(s_modReads == 0, "key up: no modifier is read");
+            check(!a.takeMissedWhileUnfocused() && !b.takeMissedWhileUnfocused(),
+                  "key up: nothing is recorded as missed while unfocused");
+            // Next frame, key down: both latches were left false, so the press is an edge
+            // under the same conditions (game-mirrored = focused).
+            s_f20 = true;
+            check(b.pressedWith(true, variant == 4 ? kHotkeyCtrl : 0, true),
+                  "key up then down: the edge is still there");
+        }
+        hotkeySetKeyboardReaderForTest(nullptr);
+    }
     // Focus is the keyboard's rule: a pad or joystick press with another window up is
     // missed, said once, and not fired when focus returns.
     {
