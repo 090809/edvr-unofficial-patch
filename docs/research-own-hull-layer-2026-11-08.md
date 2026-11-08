@@ -422,6 +422,50 @@ terrain names G-buffer RT1-3 and the lighting's second target. Read the dump
 with `census_hull.py <log> --census N`. The open design items are then the
 AO re-dispatch and the hull layer's anti-aliasing.
 
+## Step 1 flight (2026-11-08 19:20, build c80a4ef1, dump 192424067001)
+
+Log `edvr_gfx_20261108_192046.log`, build verified (`--expect-build
+c80a4ef1`). VR, OpenXR (EDVR runtime), 2817x2448 render per eye.
+
+- **What worked.** The layer ran (`state=applied`). It found a block in
+  every eye-frame and re-issued it into private targets, and all three
+  stages were substituted. The dump wrote HullHdr, GameHdrSun and
+  HullDepth for both eyes. The private depth covers the lower 34.5% of the
+  view, where the nose is. The game's frame was not touched.
+- **The verdict cannot be read.** `hull_layer_compare.py` says REFUTED
+  (99% of the private hull black), but GameHdrSun is black too: 0.1% of
+  all pixels are non-zero, terrain included. The comparison point is
+  wrong, not the layer.
+  - ruled out: `7E38A6AA`/`7CECABDE` as the sun pass, because the game's
+    HDR right after it is black on 99.9% of the frame (dump 192424067001).
+    The sun and the other lights are in the volume draws after it.
+    `24DE25E4` and `B121A79E` read the 1536x1536 shadow map.
+- **The block over-takes.** The census of the same dump has 92 hull-family
+  G-buffer draws an eye, not 39. Another ship's draws follow the own
+  block with gaps of 1-13 pool draws. The layer took 84 in the dump frame.
+  - ruled out: recognising the own ship as the contiguous hull-family run
+    after the cockpit shell, because the game draws front to back and a
+    neighbouring ship joins the run (census of 192424067001, 92 against 39
+    an eye).
+- **Two code bugs:**
+  - A run never ended at the terrain (`ended=gap` on all 2,858 blocks).
+    The "pool draw" test reads whether VS t33 is bound, but D3D state
+    persists, so t33 is still bound on the terrain draws.
+  - The second dump (192435503002) captured nothing. The 16-mirror cap was
+    full of the first targets when the game made a new eye depth (log
+    19:24:25).
+- **Next build (Step 1 v2):**
+  1. Re-issue every lighting draw of the eye, not the sun alone, and
+     snapshot the game's HDR after the last lighting draw, before the sky.
+     The comparison is then exact, apart from AO and decals.
+  2. Recognise the own ship by record, not by run. Options: a per-draw
+     test of the draw's records against the camera (the own ship
+     contains it); or keep the run but end it at the first hull draw whose
+     records lie outside the first draws' cluster. Settle this offline on
+     the ledger of a dump with a neighbour ship first.
+  3. End a run on the terrain by its VS, without the t33 test. Evict
+     mirrors of game resources not seen for a few frames.
+
 ## Step 1 build (2026-11-08, compile-only, not flown)
 
 The hull layer in the eye dump only: a private, lit copy of the own ship's
