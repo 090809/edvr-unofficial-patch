@@ -3459,17 +3459,29 @@ int main(int argc, char** argv) {
             // The leaves: shut 0.8 to 1.0 m apart, open 4.4 (Flight 43).
             cc::DoorWatch dw;
             check(dw.step(false, 0.0f, 0) == cc::DoorState::kUnknown, "door watch: unseen is not known");
-            check(dw.step(true, 0.94f, 100) == cc::DoorState::kShut, "door watch: together is shut at once");
-            check(dw.step(true, 1.2f, 116) == cc::DoorState::kShut, "door watch: a little apart is still shut");
-            check(dw.step(true, 1.4f, 132) == cc::DoorState::kOpen, "door watch: parting past 1.3 m is open");
-            check(dw.step(true, 4.4f, 500) == cc::DoorState::kOpen && dw.step(true, 1.0f, 1000) == cc::DoorState::kOpen, "door watch: open, and closing stays open");
-            check(dw.step(true, 0.9f, 1000 + cc::kDoorShutHoldMs - 1) == cc::DoorState::kOpen && dw.step(true, 0.9f, 1000 + cc::kDoorShutHoldMs) == cc::DoorState::kShut,
-                  "door watch: shut again only after the hold");
-            check(dw.step(false, 0.0f, 2000) == cc::DoorState::kUnknown, "door watch: a leaf lost is not known again");
-            check(dw.step(true, 1.2f, 2016) == cc::DoorState::kOpen, "door watch: first seen half apart is not shut");
+            check(dw.step(true, 0.94f, 100) == cc::DoorState::kUnknown && dw.rest() == 0.94f, "door watch: together, first seen, is its rest but not yet shut");
+            check(dw.step(true, 0.94f, 107) == cc::DoorState::kUnknown && dw.step(true, 0.94f, 107 + cc::kDoorStillMs - 1) == cc::DoorState::kUnknown &&
+                      dw.step(true, 0.94f, 107 + cc::kDoorStillMs) == cc::DoorState::kShut,
+                  "door watch: shut once still at rest for the hold");
+            check(dw.step(true, 0.95f, 300) == cc::DoorState::kShut, "door watch: a centimetre past rest is still shut");
+            check(dw.step(true, 0.97f, 307) == cc::DoorState::kOpen, "door watch: the first step past rest by 2 cm is open, whoever opened it");
+            check(dw.step(true, 4.4f, 1000) == cc::DoorState::kOpen && dw.step(true, 0.95f, 1500) == cc::DoorState::kOpen, "door watch: open, and closing back to rest stays open");
+            check(dw.step(true, 0.94f, 1507) == cc::DoorState::kOpen && dw.step(true, 0.94f, 1514) == cc::DoorState::kOpen && dw.step(true, 0.94f, 1514 + cc::kDoorStillMs - 1) == cc::DoorState::kOpen &&
+                      dw.step(true, 0.94f, 1514 + cc::kDoorStillMs) == cc::DoorState::kShut,
+                  "door watch: shut again only after the leaves are still at rest for the hold");
+            check(dw.step(false, 0.0f, 2000) == cc::DoorState::kUnknown && dw.rest() == 0.94f, "door watch: a leaf lost is not known, and the rest stays");
+            check(dw.step(true, 1.2f, 2016) == cc::DoorState::kOpen, "door watch: seen again apart from its rest is open");
             check(dw.step(true, std::nanf(""), 2032) == cc::DoorState::kUnknown, "door watch: an unreadable gap is not known");
             dw.reset();
-            check(dw.state() == cc::DoorState::kUnknown, "door watch: reset forgets it");
+            check(dw.state() == cc::DoorState::kUnknown && dw.rest() == 0.0f, "door watch: reset forgets it and its rest");
+            check(dw.step(true, 1.2f, 3000) == cc::DoorState::kOpen, "door watch: first seen half apart, no rest known, is not shut");
+            dw.reset();
+            check(dw.step(true, 1.25f, 4000) == cc::DoorState::kOpen && dw.step(true, 1.05f, 4007) == cc::DoorState::kOpen && dw.step(true, 0.9f, 4014) == cc::DoorState::kOpen &&
+                      dw.step(true, 0.9f, 4021) == cc::DoorState::kOpen && dw.step(true, 0.9f, 4021 + cc::kDoorStillMs) == cc::DoorState::kShut && dw.rest() == 0.9f,
+                  "door watch: first seen closing, the rest follows it down and it is shut once still");
+            dw.reset();
+            check(dw.step(true, 0.9f, 5000) == cc::DoorState::kUnknown && dw.step(true, 0.908f, 5007) == cc::DoorState::kUnknown && dw.step(true, 0.916f, 5014) == cc::DoorState::kUnknown,
+                  "door watch: leaves still moving are never shut");
             check(cc::doorRuleNext(cc::DoorRuleMode::kRecords) == cc::DoorRuleMode::kRigs && cc::doorRuleNext(cc::DoorRuleMode::kRigs) == cc::DoorRuleMode::kOff &&
                       cc::doorRuleNext(cc::DoorRuleMode::kOff) == cc::DoorRuleMode::kRecords, "doors: the key steps records, rigs, off");
             check(std::strcmp(cc::kDoorLeafLeft, "Narrow_Door_Left") == 0 && cc::concourseAllowName(cc::kDoorLeafLeft, nullptr) && cc::concourseAllowName(cc::kDoorLeafRight, nullptr),

@@ -1022,13 +1022,18 @@ inline bool roomSeenSlab(const RoomLayout& room, float camAlong, const bool bloc
 }
 inline bool roomSlabWhole(const RoomSlab& s) noexcept { return s.lo <= -kRoomSlabOpen && s.hi >= kRoomSlabOpen; }
 
-// A door's state, from its two leaves (Narrow_Door_Left and _Right on a carrier: Flight 43, 0.8 to 1.0 m apart shut, 4.4 m open, at both doors). Open as soon as the leaves part past
-// kDoorOpenGapM, shut again only after kDoorShutHoldMs at or under kDoorShutGapM, so the room behind is back from the first part of an opening and stays through a closing. Not read is
-// not known, and a door not known never blocks.
+// A door's state, from its two leaves (Narrow_Door_Left and _Right on a carrier: Flight 43, 0.8 to 1.0 m apart shut, 4.4 m open, at both doors), whoever opens it: the player, an NPC
+// or the game. The watch learns the door's rest, the least gap it has seen at or under kDoorShutGapM, and calls the door open on the first step its leaves stand more than kDoorMoveM
+// past that rest, so the room behind is back while the crack is a centimetre or two. It is shut again only once the leaves are back within kDoorMoveM of rest and have moved no more
+// than kDoorStillM a step for kDoorStillMs, so a closing door keeps its room until it has stopped. Before a rest is known (a door first seen apart), past kDoorOpenGapM is open and
+// between the two first seen is open. Not read is not known, and a door not known never blocks. Elite's own door state (the decision to open, a frame or more before the leaves move)
+// is not read: the log's first-move line says how wide the crack was when the watch caught it, which says whether that would buy anything.
 constexpr float kDoorNearM = 5.0f;          // a first value: no flight has said how near a door opens
 constexpr float kDoorMatchM = 3.0f;         // a leaf belongs to the cut it lies within this of, along a2
 constexpr float kDoorShutGapM = 1.1f, kDoorOpenGapM = 1.3f;
-constexpr uint64_t kDoorShutHoldMs = 300;
+constexpr float kDoorMoveM = 0.02f;         // past rest by more than this is open
+constexpr float kDoorStillM = 0.005f;       // a step that moves the gap more than this is not still
+constexpr uint64_t kDoorStillMs = 100;
 constexpr const char* kDoorLeafLeft = "Narrow_Door_Left";
 constexpr const char* kDoorLeafRight = "Narrow_Door_Right";
 enum class DoorState : uint8_t { kUnknown, kShut, kOpen };
@@ -1037,33 +1042,49 @@ class DoorWatch {
 public:
     DoorState step(bool gapKnown, float gapM, uint64_t nowMs) noexcept {
         if (!gapKnown || !std::isfinite(gapM)) {
-            state_ = DoorState::kUnknown;
-            shutSinceMs_ = 0;
+            state_ = DoorState::kUnknown;   // the rest is the door's, and stays
+            havePrev_ = false;
+            still_ = false;
             return state_;
         }
-        if (gapM > kDoorOpenGapM) {
+        const bool moved = !havePrev_ || std::fabs(gapM - prev_) > kDoorStillM;
+        prev_ = gapM;
+        havePrev_ = true;
+        if (gapM <= kDoorShutGapM && (rest_ <= 0.0f || gapM < rest_)) rest_ = gapM;
+        const bool restKnown = rest_ > 0.0f;
+        if (restKnown ? gapM > rest_ + kDoorMoveM : gapM > kDoorOpenGapM) {
             state_ = DoorState::kOpen;
-            shutSinceMs_ = 0;
-        } else if (gapM <= kDoorShutGapM) {
-            if (shutSinceMs_ == 0) shutSinceMs_ = nowMs;
-            if (state_ != DoorState::kOpen || nowMs - shutSinceMs_ >= kDoorShutHoldMs) state_ = DoorState::kShut;
-        } else if (state_ == DoorState::kUnknown) {
-            state_ = DoorState::kOpen;   // between the two, first seen: parting or closing, so not shut
-            shutSinceMs_ = 0;
+            still_ = false;
+        } else if (!restKnown) {
+            if (state_ == DoorState::kUnknown) state_ = DoorState::kOpen;   // between the two, first seen: parting or closing, so not shut
+            still_ = false;
+        } else if (moved) {
+            still_ = false;
         } else {
-            shutSinceMs_ = 0;
+            if (!still_) stillSinceMs_ = nowMs;
+            still_ = true;
+            if (nowMs - stillSinceMs_ >= kDoorStillMs) state_ = DoorState::kShut;
         }
         return state_;
     }
     DoorState state() const noexcept { return state_; }
+    float rest() const noexcept { return rest_; }   // 0: not known
     void reset() noexcept {
         state_ = DoorState::kUnknown;
-        shutSinceMs_ = 0;
+        rest_ = 0.0f;
+        prev_ = 0.0f;
+        havePrev_ = false;
+        still_ = false;
+        stillSinceMs_ = 0;
     }
 
 private:
     DoorState state_ = DoorState::kUnknown;
-    uint64_t shutSinceMs_ = 0;
+    float rest_ = 0.0f;
+    float prev_ = 0.0f;
+    bool havePrev_ = false;
+    bool still_ = false;
+    uint64_t stillSinceMs_ = 0;
 };
 inline bool doorBlocks(DoorState s, float camAlong, float cut) noexcept {
     return s == DoorState::kShut && std::isfinite(camAlong) && std::fabs(camAlong - cut) > kDoorNearM;

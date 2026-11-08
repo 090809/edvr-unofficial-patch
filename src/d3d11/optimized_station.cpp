@@ -3254,6 +3254,14 @@ bool g_roomHotkeyBound = false;
 cc::DoorRuleMode g_doorMode = cc::DoorRuleMode::kRecords;
 cc::DoorWatch g_doorWatch[2];
 uint64_t g_roomSumMs = 0;
+// The door watch's log: each door's last change (its frame and time, for the closing line's "open for"), the changes in the 5 s window, and the door block's own cost per tick
+// in that window (QPC, to answer whether reading the leaves each frame costs anything worth a hook).
+uint32_t g_doorChangeFrame[2] = {};
+uint64_t g_doorChangeMs[2] = {};
+uint32_t g_doorOpenings = 0, g_doorLogLines = 0;
+constexpr uint32_t kDoorLogLinesMax = 400;   // a door that flaps (leaves that jitter past kDoorMoveM) is counted, not logged without end
+int64_t g_doorCostTicks = 0, g_doorCostMax = 0;
+uint32_t g_doorCostN = 0;
 uint32_t g_camMode = 0;
 bool g_camHooked = false;
 bool g_camModeByKey = false;           // a press of the key chose the mode: the automatic bake leaves it alone
@@ -4436,7 +4444,9 @@ void concourseTick(uint64_t now, uint32_t frame) {
     const uint32_t doorCuts = g_concLayout->slabCuts < 2 ? g_concLayout->slabCuts : 2;
     const bool doorsWanted = g_doorMode != cc::DoorRuleMode::kOff && gateWanted && effective && (anchor || inLiveRoom) && doorCuts > 0 && g_frameCamValid;
     bool leavesMissing = false;
+    const int64_t doorCost0 = doorsWanted ? costTicks() : 0;
     {
+        static bool blockedWas[2] = {};
         static float frameC[3] = {};
         static float frameA2[3] = {};
         static bool frameValid = false;
@@ -4456,6 +4466,7 @@ void concourseTick(uint64_t now, uint32_t frame) {
         }
         if (!doorsWanted || !frameValid) {
             for (cc::DoorWatch& dw : g_doorWatch) dw.reset();
+            blockedWas[0] = blockedWas[1] = false;
         } else {
             roomAlong = (g_frameCam[0] - frameC[0]) * frameA2[0] + (g_frameCam[1] - frameC[1]) * frameA2[1] + (g_frameCam[2] - frameC[2]) * frameA2[2];
             // The doors' leaves: each sighted record read for its name and place. A record whose name is not a leaf's any more is let go.
@@ -4489,11 +4500,36 @@ void concourseTick(uint64_t now, uint32_t frame) {
                 const float gap = leavesKnown ? sealed::distance(pos[i][0], pos[i][1]) : 0.0f;
                 const cc::DoorState was = g_doorWatch[i].state();
                 const cc::DoorState st = g_doorWatch[i].step(leavesKnown, gap, now);
-                if (st != was)
-                    Log::get().note("concourse doors: the door at a2 %.1f is %s (%s, %.2f m apart)", static_cast<double>(g_concLayout->slabCut[i]), cc::doorStateName(st),
-                                    leavesKnown ? (gap > cc::kDoorOpenGapM ? "its leaves have parted" : "its leaves are together") : "its two leaves are not both seen",
-                                    static_cast<double>(gap));
+                const double cut = static_cast<double>(g_concLayout->slabCut[i]);
+                const double camFrom = std::fabs(static_cast<double>(roomAlong) - cut);
+                const double rest = static_cast<double>(g_doorWatch[i].rest());
+                if (st != was) {
+                    if (st == cc::DoorState::kOpen && was == cc::DoorState::kShut) ++g_doorOpenings;
+                    if (g_doorLogLines < kDoorLogLinesMax) {
+                        ++g_doorLogLines;
+                        if (!leavesKnown)
+                            Log::get().note("concourse doors: the door at a2 %.1f is not known, frame %u (its two leaves are not both seen)", cut, frame);
+                        else if (st == cc::DoorState::kOpen && was == cc::DoorState::kShut)
+                            // The first move: the frame the leaves stood kDoorMoveM past rest, how wide the crack was then, where the camera was, and whether the room behind
+                            // was culled until this frame (it is back from this tick's publish).
+                            Log::get().note("concourse doors: the door at a2 %.1f started opening, frame %u: leaves %.3f m apart, %.3f past their rest of %.3f; camera %.1f m from it; "
+                                            "the room behind it was %s",
+                                            cut, frame, static_cast<double>(gap), static_cast<double>(gap) - rest, rest, camFrom,
+                                            blockedWas[i] ? "culled until this frame" : "not culled (the door did not block)");
+                        else if (st == cc::DoorState::kShut && was == cc::DoorState::kOpen)
+                            Log::get().note("concourse doors: the door at a2 %.1f is shut, frame %u: leaves %.3f m apart (rest %.3f), still for %llu ms; open for %u frames, %llu ms; "
+                                            "camera %.1f m from it",
+                                            cut, frame, static_cast<double>(gap), rest, static_cast<unsigned long long>(cc::kDoorStillMs), frame - g_doorChangeFrame[i],
+                                            static_cast<unsigned long long>(now - g_doorChangeMs[i]), camFrom);
+                        else
+                            Log::get().note("concourse doors: the door at a2 %.1f is %s, frame %u (first seen: leaves %.3f m apart, rest %s%.3f); camera %.1f m from it", cut,
+                                            cc::doorStateName(st), frame, static_cast<double>(gap), rest > 0.0 ? "" : "not known, ", rest, camFrom);
+                    }
+                    g_doorChangeFrame[i] = frame;
+                    g_doorChangeMs[i] = now;
+                }
                 blocks[i] = cc::doorBlocks(st, roomAlong, g_concLayout->slabCut[i]);
+                blockedWas[i] = blocks[i];
             }
             cc::RoomSlab seenSlab;
             if (cc::roomSeenSlab(*g_concLayout, roomAlong, blocks, &seenSlab) && !cc::roomSlabWhole(seenSlab)) {
@@ -4509,27 +4545,39 @@ void concourseTick(uint64_t now, uint32_t frame) {
         }
     }
     g_doorLeafWanted.store(doorsWanted && leavesMissing, std::memory_order_relaxed);
+    if (doorsWanted) {
+        const int64_t d = costTicks() - doorCost0;
+        g_doorCostTicks += d;
+        if (d > g_doorCostMax) g_doorCostMax = d;
+        ++g_doorCostN;
+    }
     if (roomNow.room != g_roomPub.room || roomNow.only != g_roomPub.only || roomNow.rigs != g_roomPub.rigs || (roomNow.room && !cc::sameRoomSlab(roomNow.slab, g_roomPub.slab))) {
         bumpRigEpoch();
         if (roomNow.room) {
             char lo[16] = "none", hi[16] = "none";
             if (roomNow.slab.lo > -cc::kRoomSlabOpen) std::snprintf(lo, sizeof(lo), "%.1f", static_cast<double>(roomNow.slab.lo));
             if (roomNow.slab.hi < cc::kRoomSlabOpen) std::snprintf(hi, sizeof(hi), "%.1f", static_cast<double>(roomNow.slab.hi));
-            Log::get().note("concourse doors: the camera is at a2 %.1f; behind a shut door below a2 %s and above a2 %s, the room's own records are culled (%s%s)", static_cast<double>(roomAlong), lo,
-                            hi, cc::doorRuleName(g_doorMode), roomNow.only ? "; the live room: that is the only rule, the cull's own stands down" : "");
+            Log::get().note("concourse doors: frame %u, the camera is at a2 %.1f; behind a shut door below a2 %s and above a2 %s, the room's own records are culled (%s%s)", frame,
+                            static_cast<double>(roomAlong), lo, hi, cc::doorRuleName(g_doorMode), roomNow.only ? "; the live room: that is the only rule, the cull's own stands down" : "");
         } else if (g_roomPub.room) {
-            Log::get().note("concourse doors: nothing is behind a shut door now (camera at a2 %.1f, rule %s, wanted %d)", static_cast<double>(roomAlong), cc::doorRuleName(g_doorMode),
-                            doorsWanted ? 1 : 0);
+            Log::get().note("concourse doors: frame %u, nothing is behind a shut door now (camera at a2 %.1f, rule %s, wanted %d)", frame, static_cast<double>(roomAlong),
+                            cc::doorRuleName(g_doorMode), doorsWanted ? 1 : 0);
         }
     }
     g_roomPub = roomNow;
     if (doorsWanted && now - g_roomSumMs >= 5000) {
         g_roomSumMs = now;
-        Log::get().note("concourse doors 5s: rule %s, camera at a2 %.1f, doors %s %s; records the rule culled that the cull's own rule kept: producer %llu, store %llu",
+        const double usPerTick = 1e6 / static_cast<double>(costFreq());
+        Log::get().note("concourse doors 5s: rule %s, camera at a2 %.1f, doors %s %s (rest %.3f %.3f), openings %u; records the rule culled that the cull's own rule kept: producer %llu, "
+                        "store %llu; the door watch's cost: %.1f us a tick on average, %.1f at most, over %u ticks",
                         cc::doorRuleName(g_doorMode), static_cast<double>(roomAlong), cc::doorStateName(g_doorWatch[0].state()),
-                        doorCuts > 1 ? cc::doorStateName(g_doorWatch[1].state()) : "-",
-                        static_cast<unsigned long long>(g_concWin.roomProd.exchange(0, std::memory_order_relaxed)),
-                        static_cast<unsigned long long>(g_concWin.roomStore.exchange(0, std::memory_order_relaxed)));
+                        doorCuts > 1 ? cc::doorStateName(g_doorWatch[1].state()) : "-", static_cast<double>(g_doorWatch[0].rest()), static_cast<double>(g_doorWatch[1].rest()),
+                        g_doorOpenings, static_cast<unsigned long long>(g_concWin.roomProd.exchange(0, std::memory_order_relaxed)),
+                        static_cast<unsigned long long>(g_concWin.roomStore.exchange(0, std::memory_order_relaxed)),
+                        g_doorCostN ? static_cast<double>(g_doorCostTicks) * usPerTick / g_doorCostN : 0.0, static_cast<double>(g_doorCostMax) * usPerTick, g_doorCostN);
+        g_doorOpenings = 0;
+        g_doorCostTicks = g_doorCostMax = 0;
+        g_doorCostN = 0;
     }
     // The cull waits for the windows' bake: until there is one, the room and its windows are the game's own, and a bake that never comes costs nothing but the saving. A ride up opens
     // the bake's window at the anchor's first sighting, so this holds for that one tick.
