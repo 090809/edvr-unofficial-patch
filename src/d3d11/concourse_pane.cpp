@@ -17,14 +17,18 @@
 #include "../common/runtime_profile.h"
 #include "binding_shadow.h"
 #include "concourse_cull_core.h"
+#include "concourse_vr_bake_core.h"   // TEMPORARY (the VR bake): the capture shader's inverse and its limits
+#include "depth_probe.h"              // TEMPORARY (the VR bake): each eye's scene depth, and a draw's eye by its depth view
 #include "exposure_fix.h"
 #include "flat_compute_readback.h"
 #include "journal_watch.h"
 #include "shader_swap.h"
+#include "tonemap_admit.h"            // TEMPORARY (the VR bake): the game's tonemap draw, recognised structurally
 
 namespace edvr {
 namespace detail {
 std::atomic<bool> g_concoursePaneArmed{false};
+std::atomic<uint32_t> g_concourseVrBakeHooks{0};
 }  // namespace detail
 
 namespace {
@@ -3328,8 +3332,11 @@ void bakeEndHold(const char* why, uint64_t nowMs) noexcept {
                     static_cast<unsigned long long>(nowMs - g_bakeHoldStartMs), g_bakeSeenAtCentre, g_bakeCaps);
 }
 
+bool vrBakeHoldsCube() noexcept;   // TEMPORARY (the VR bake, below): armed or running, so the cube is not released (always false in the flat profile)
+
 void bakeTick(ID3D11Device* device, uint64_t nowMs) noexcept {
-    if (g_bakeWantRelease.exchange(false, std::memory_order_acq_rel) && !g_bakeArmedNow && !g_bakeWatch.load(std::memory_order_acquire) && (g_bakeReady || g_bakeBaked.load(std::memory_order_acquire))) {
+    if (g_bakeWantRelease.exchange(false, std::memory_order_acq_rel) && !g_bakeArmedNow && !g_bakeWatch.load(std::memory_order_acquire) && !vrBakeHoldsCube() &&
+        (g_bakeReady || g_bakeBaked.load(std::memory_order_acquire))) {
         releaseBackdrop();
         g_bakeReady = false;
         g_bakeCapHeight = 0;
@@ -3615,6 +3622,702 @@ void concoursePaneBakePresent(IDXGISwapChain* swap) noexcept {
     back->Release();
 }
 
+// ---- The VR bake (TEMPORARY, concourse_pane.h) ----------------------------------------------------------------------------------------------------------------------------
+namespace {
+namespace cv = edvr::concourse_vr;
+constexpr uint32_t kVrSlots = 8;          // frames whose counts and rows are on their way back
+constexpr UINT kVrRows = 10;              // b1 rows 270..279
+constexpr UINT kVrRowFirst = 270;
+constexpr uint32_t kVrOutCap = 32;
+std::atomic<bool> g_vrDiscover{false}, g_vrToneSeen{false}, g_vrRunning{false}, g_vrCapturing{false}, g_vrWantPrepare{false};
+bool g_vrArmedNow = false, g_vrReady = false;
+ConcourseVrToneSeen g_vrToneWhat;
+ID3D11Device* g_vrDevice = nullptr;       // not held: compared only
+ID3D11ComputeShader* g_csVr = nullptr;
+ID3D11Buffer* g_cbVr = nullptr;
+ID3D11Buffer* g_vrRowsBuf[2] = {};
+ID3D11ShaderResourceView* g_vrRowsSrv[2] = {};
+ID3D11Buffer* g_vrRowsStage[2][kVrSlots] = {};
+ID3D11Buffer* g_vrCount[kVrSlots] = {};
+ID3D11UnorderedAccessView* g_vrCountUav[kVrSlots] = {};
+ID3D11Buffer* g_vrCountStage[kVrSlots] = {};
+ID3D11Texture2D* g_vrDepthTex[2] = {};    // the texture each cached view was made on (the view holds it)
+ID3D11ShaderResourceView* g_vrDepthSrv[2] = {};
+struct VrCountSlot {
+    uint32_t frame = 0xFFFFFFFFu, copyFrame = 0;
+    bool used = false, copied = false;
+    bool dispatched[2] = {}, both[2] = {};
+};
+VrCountSlot g_vrSlot[kVrSlots];
+struct VrRowSlot {
+    uint32_t frame = 0xFFFFFFFFu;
+    bool pending = false;
+};
+VrRowSlot g_vrRowSlot[2][kVrSlots];
+uint32_t g_vrSnapFrame[2] = {0xFFFFFFFFu, 0xFFFFFFFFu};
+uint32_t g_vrToneFrame = 0xFFFFFFFFu, g_vrToneNext = 0, g_vrSeq = 0;
+uint32_t g_vrOrder[4] = {}, g_vrOrderFrame = 0xFFFFFFFFu, g_vrLastOrder[4] = {};
+struct VrBakeConstants {
+    float faceR[5][4], faceU[5][4], faceF[5][4];
+    float origin[4];
+    float size[4];     // width, height, the room's cut, the far limit
+    float lim[4];      // the at-centre limit, the face slack, the least forward dot, 0
+    uint32_t ctl[4];   // the faces wanted, the other eye's rows are this frame's, the eye, 0
+};
+VrBakeConstants g_vrK{};
+std::atomic<uint64_t> g_vrToneDraws{0}, g_vrDisp[2], g_vrNoRows{0}, g_vrNoDepth{0}, g_vrRefused{0}, g_vrSnaps[2], g_vrSnapNoCb{0}, g_vrLost{0};
+ConcourseVrBakeRows g_vrRowsOut[kVrOutCap];
+uint32_t g_vrRowsOutN = 0;
+ConcourseVrBakeCount g_vrCountOut[kVrOutCap];
+uint32_t g_vrCountOutN = 0;
+bool g_vrSaidRefused = false;
+
+template <class T>
+void vrRelease(T*& p) noexcept {
+    if (p) p->Release();
+    p = nullptr;
+}
+void vrReleaseAll() noexcept {
+    vrRelease(g_csVr);
+    vrRelease(g_cbVr);
+    for (int e = 0; e < 2; ++e) {
+        vrRelease(g_vrRowsBuf[e]);
+        vrRelease(g_vrRowsSrv[e]);
+        vrRelease(g_vrDepthSrv[e]);
+        g_vrDepthTex[e] = nullptr;
+        for (uint32_t s = 0; s < kVrSlots; ++s) {
+            vrRelease(g_vrRowsStage[e][s]);
+            g_vrRowSlot[e][s] = VrRowSlot{};
+        }
+    }
+    for (uint32_t s = 0; s < kVrSlots; ++s) {
+        vrRelease(g_vrCount[s]);
+        vrRelease(g_vrCountUav[s]);
+        vrRelease(g_vrCountStage[s]);
+        g_vrSlot[s] = VrCountSlot{};
+    }
+    g_vrReady = false;
+}
+
+// The VR variant of the bake's shader. One cube texel a thread, as flat's, but every matrix is the frame's own on the GPU: t2 holds this eye's b1 rows 270..279 copied at its
+// first scene draw (t3 the other eye's), the clip matrix in column form is m[r * 4 + c] = row (270 + c) lane r, as the flat bake builds it, and its inverse is made per group
+// (concourse_vr_bake_core.h, the cofactors' one text). A frame is taken only when its eye's row 275 is within lim.x of the origin (a frame the bake aimed); the face is the
+// wanted one nearest where the frame looks (clip w's coefficients, as flat's forward), and a texel only on that face's own square, inside the eye's clip. Counts: per eye at
+// ctl.z * 32 bytes: on the face, in this eye's view, written, in either eye's view; at +16 the face + 1 and at +20 the frame's status (1 taken, 2 not at the centre, 3 no
+// face near where it looks, 4 the rows do not invert).
+bool vrMakeShader(ID3D11Device* device) noexcept {
+    typedef HRESULT(WINAPI * PfnCompile)(LPCVOID, SIZE_T, LPCSTR, const void*, void*, LPCSTR, LPCSTR, UINT, UINT, ID3DBlob**, ID3DBlob**);
+    static PfnCompile compile = nullptr;
+    if (!compile) {
+        HMODULE mod = LoadLibraryW(L"d3dcompiler_47.dll");   // never freed: a blob's vtable lives in it
+        if (mod) compile = reinterpret_cast<PfnCompile>(GetProcAddress(mod, "D3DCompile"));
+    }
+    if (!compile) {
+        Log::get().note("concourse bake: vr: d3dcompiler_47.dll was not found: no VR capture shader");
+        return false;
+    }
+    const std::string n = std::to_string(cc::kBackdropCubeSize) + ".0";
+    const std::string hlsl = std::string(cc::cubeDirHlsl()) + cv::inverse4Hlsl() +
+        "cbuffer C : register(b0) { float4 faceR[5]; float4 faceU[5]; float4 faceF[5]; float4 origin; float4 size; float4 lim; uint4 ctl; };\n"
+        "Texture2D<float4> scene : register(t0);\n"
+        "Texture2D<float> sceneDepth : register(t1);\n"
+        "Buffer<float4> rowsA : register(t2);\n"
+        "Buffer<float4> rowsB : register(t3);\n"
+        "SamplerState smp : register(s0);\n"
+        "RWTexture2DArray<float> distCube : register(u0);\n"
+        "RWTexture2DArray<float4> cube : register(u1);\n"
+        "RWByteAddressBuffer counts : register(u2);\n"
+        "groupshared float gInv[16];\n"
+        "groupshared int gFace;\n"
+        "groupshared uint gStatus;\n"
+        "groupshared uint gCount[4];\n"
+        "bool inClip(float3 d, float4 a, float4 b, float4 c, out float2 ndc) {\n"
+        "    float4 h = d.x * a + d.y * b + d.z * c;\n"
+        "    ndc = float2(2.0, 2.0);\n"
+        "    if (h.w <= 1e-4) return false;\n"
+        "    ndc = h.xy / h.w;\n"
+        "    return abs(ndc.x) < 1.0 && abs(ndc.y) < 1.0;\n"
+        "}\n"
+        "[numthreads(32, 32, 1)]\n"
+        "void main(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupID, uint gi : SV_GroupIndex) {\n"
+        "    float4 r0 = rowsA[0], r1 = rowsA[1], r2 = rowsA[2], r3 = rowsA[3];\n"
+        "    float3 off = rowsA[5].xyz - origin.xyz;\n"
+        "    if (gi == 0) {\n"
+        "        gCount[0] = 0u; gCount[1] = 0u; gCount[2] = 0u; gCount[3] = 0u;\n"
+        "        float3 fw = float3(r0.w, r1.w, r2.w);\n"
+        "        float fl = length(fw);\n"
+        "        int best = -1;\n"
+        "        float bestDot = lim.z;\n"
+        "        if (fl > 1e-6) {\n"
+        "            fw /= fl;\n"
+        "            [unroll] for (int f = 0; f < 5; ++f) {\n"
+        "                float k = dot(fw, faceF[f].xyz);\n"
+        "                if ((ctl.x & (1u << (uint)f)) != 0u && k > bestDot) { bestDot = k; best = f; }\n"
+        "            }\n"
+        "        }\n"
+        "        uint st = 1u;\n"
+        "        if (!(dot(off, off) < lim.x * lim.x)) st = 2u;\n"
+        "        else if (best < 0) st = 3u;\n"
+        "        float m[16];\n"
+        "        m[0] = r0.x; m[1] = r1.x; m[2] = r2.x; m[3] = r3.x;\n"
+        "        m[4] = r0.y; m[5] = r1.y; m[6] = r2.y; m[7] = r3.y;\n"
+        "        m[8] = r0.z; m[9] = r1.z; m[10] = r2.z; m[11] = r3.z;\n"
+        "        m[12] = r0.w; m[13] = r1.w; m[14] = r2.w; m[15] = r3.w;\n"
+        "        float inv[16];\n"
+        "        [unroll] for (int z0 = 0; z0 < 16; ++z0) inv[z0] = 0.0;\n"
+        "        if (st == 1u && !invert4(m, inv)) st = 4u;\n"
+        "        [unroll] for (int k2 = 0; k2 < 16; ++k2) gInv[k2] = inv[k2];\n"
+        "        gFace = best;\n"
+        "        gStatus = st;\n"
+        "    }\n"
+        "    GroupMemoryBarrierWithGroupSync();\n"
+        "    if (gStatus == 1u) {\n"
+        "        int f = gFace;\n"
+        "        float3 d = normalize(cubeDir(id.z, (float2(id.xy) + 0.5) / " + n + "));\n"
+        "        float dF = dot(d, faceF[f].xyz);\n"
+        "        if (dF > 0.0 && abs(dot(d, faceR[f].xyz)) <= lim.y * dF && abs(dot(d, faceU[f].xyz)) <= lim.y * dF) {\n"
+        "            uint o;\n"
+        "            InterlockedAdd(gCount[0], 1u, o);\n"
+        "            float2 ndc, ndcB;\n"
+        "            bool inA = inClip(d, r0, r1, r2, ndc);\n"
+        "            bool inB = false;\n"
+        "            if (ctl.y != 0u) inB = inClip(d, rowsB[0], rowsB[1], rowsB[2], ndcB);\n"
+        "            if (inA || inB) InterlockedAdd(gCount[3], 1u, o);\n"
+        "            if (inA) {\n"
+        "                InterlockedAdd(gCount[1], 1u, o);\n"
+        "                float2 uv = float2(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);\n"
+        "                float z = sceneDepth.Load(int3(uv * size.xy, 0));\n"
+        "                float t = size.w;\n"
+        "                if (z > 0.0) {\n"
+        "                    float4 v = float4(ndc, z, 1.0);\n"
+        "                    float4 b;\n"
+        "                    b.x = gInv[0] * v.x + gInv[1] * v.y + gInv[2] * v.z + gInv[3] * v.w;\n"
+        "                    b.y = gInv[4] * v.x + gInv[5] * v.y + gInv[6] * v.z + gInv[7] * v.w;\n"
+        "                    b.z = gInv[8] * v.x + gInv[9] * v.y + gInv[10] * v.z + gInv[11] * v.w;\n"
+        "                    b.w = gInv[12] * v.x + gInv[13] * v.y + gInv[14] * v.z + gInv[15] * v.w;\n"
+        "                    if (abs(b.w) > 1e-20) { float l = length(b.xyz / b.w); if (l < t) t = l; }\n"
+        "                }\n"
+        "                float rl = length(off + d * t);\n"
+        "                if (rl > size.z) {\n"
+        "                    cube[id] = float4(clamp(scene.SampleLevel(smp, uv, 0.0).rgb, 0.0, 60000.0), 1.0);\n"
+        "                    distCube[id] = clamp(rl, 1.0, size.w);\n"
+        "                    InterlockedAdd(gCount[2], 1u, o);\n"
+        "                }\n"
+        "            }\n"
+        "        }\n"
+        "    }\n"
+        "    GroupMemoryBarrierWithGroupSync();\n"
+        "    if (gi == 0) {\n"
+        "        uint base = ctl.z * 32u;\n"
+        "        uint o2;\n"
+        "        if (gStatus == 1u) {\n"
+        "            if (gCount[0] != 0u) counts.InterlockedAdd(base + 0u, gCount[0], o2);\n"
+        "            if (gCount[1] != 0u) counts.InterlockedAdd(base + 4u, gCount[1], o2);\n"
+        "            if (gCount[2] != 0u) counts.InterlockedAdd(base + 8u, gCount[2], o2);\n"
+        "            if (gCount[3] != 0u) counts.InterlockedAdd(base + 12u, gCount[3], o2);\n"
+        "        }\n"
+        "        if (gid.x == 0u && gid.y == 0u && gid.z == 0u) {\n"
+        "            counts.Store(base + 16u, (uint)(gFace + 1));\n"
+        "            counts.Store(base + 20u, gStatus);\n"
+        "        }\n"
+        "    }\n"
+        "}\n";
+    ID3DBlob* code = nullptr;
+    ID3DBlob* errors = nullptr;
+    const HRESULT hr = compile(hlsl.c_str(), hlsl.size(), "concourse_bake_vr", nullptr, nullptr, "main", "cs_5_0", 0, 0, &code, &errors);
+    if (errors) {
+        if (FAILED(hr)) Log::get().note("concourse bake: vr: the shader: %.600s", static_cast<const char*>(errors->GetBufferPointer()));
+        errors->Release();
+    }
+    if (FAILED(hr) || !code) {
+        if (code) code->Release();
+        Log::get().note("concourse bake: vr: the capture shader did not compile");
+        return false;
+    }
+    const HRESULT hc = device->CreateComputeShader(code->GetBufferPointer(), code->GetBufferSize(), nullptr, &g_csVr);
+    code->Release();
+    if (FAILED(hc) || !g_csVr) {
+        g_csVr = nullptr;
+        Log::get().note("concourse bake: vr: the capture shader did not create (hr %08X)", static_cast<unsigned>(hc));
+        return false;
+    }
+    return true;
+}
+
+bool vrMake(ID3D11Device* device) noexcept {
+    if (!device) return false;
+    if (g_vrDevice != device) {
+        vrReleaseAll();
+        g_vrDevice = device;
+    }
+    if (g_vrReady) return true;
+    if (!g_csVr && !vrMakeShader(device)) return false;
+    bool good = true;
+    if (!g_cbVr) {
+        D3D11_BUFFER_DESC bd{};
+        bd.ByteWidth = sizeof(VrBakeConstants);
+        bd.Usage = D3D11_USAGE_DEFAULT;
+        bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+        good = good && SUCCEEDED(device->CreateBuffer(&bd, nullptr, &g_cbVr)) && g_cbVr;
+    }
+    for (int e = 0; e < 2 && good; ++e) {
+        if (!g_vrRowsBuf[e]) {
+            D3D11_BUFFER_DESC bd{};
+            bd.ByteWidth = kVrRows * 16u;
+            bd.Usage = D3D11_USAGE_DEFAULT;
+            bd.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+            good = SUCCEEDED(device->CreateBuffer(&bd, nullptr, &g_vrRowsBuf[e])) && g_vrRowsBuf[e];
+        }
+        if (good && !g_vrRowsSrv[e]) {
+            D3D11_SHADER_RESOURCE_VIEW_DESC sd{};
+            sd.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+            sd.ViewDimension = D3D11_SRV_DIMENSION_BUFFER;
+            sd.Buffer.FirstElement = 0;
+            sd.Buffer.NumElements = kVrRows;
+            good = SUCCEEDED(device->CreateShaderResourceView(g_vrRowsBuf[e], &sd, &g_vrRowsSrv[e])) && g_vrRowsSrv[e];
+        }
+        for (uint32_t s = 0; s < kVrSlots && good; ++s) {
+            if (g_vrRowsStage[e][s]) continue;
+            D3D11_BUFFER_DESC bd{};
+            bd.ByteWidth = kVrRows * 16u;
+            bd.Usage = D3D11_USAGE_STAGING;
+            bd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+            good = SUCCEEDED(device->CreateBuffer(&bd, nullptr, &g_vrRowsStage[e][s])) && g_vrRowsStage[e][s];
+        }
+    }
+    for (uint32_t s = 0; s < kVrSlots && good; ++s) {
+        if (!g_vrCount[s]) {
+            D3D11_BUFFER_DESC bd{};
+            bd.ByteWidth = 64;
+            bd.Usage = D3D11_USAGE_DEFAULT;
+            bd.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
+            bd.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS;
+            good = SUCCEEDED(device->CreateBuffer(&bd, nullptr, &g_vrCount[s])) && g_vrCount[s];
+        }
+        if (good && !g_vrCountUav[s]) {
+            D3D11_UNORDERED_ACCESS_VIEW_DESC ud{};
+            ud.Format = DXGI_FORMAT_R32_TYPELESS;
+            ud.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
+            ud.Buffer.FirstElement = 0;
+            ud.Buffer.NumElements = 16;
+            ud.Buffer.Flags = D3D11_BUFFER_UAV_FLAG_RAW;
+            good = SUCCEEDED(device->CreateUnorderedAccessView(g_vrCount[s], &ud, &g_vrCountUav[s])) && g_vrCountUav[s];
+        }
+        if (good && !g_vrCountStage[s]) {
+            D3D11_BUFFER_DESC bd{};
+            bd.ByteWidth = 64;
+            bd.Usage = D3D11_USAGE_STAGING;
+            bd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+            good = SUCCEEDED(device->CreateBuffer(&bd, nullptr, &g_vrCountStage[s])) && g_vrCountStage[s];
+        }
+    }
+    if (!good) {
+        Log::get().note("concourse bake: vr: the rows, counts or constant buffers could not be made");
+        vrReleaseAll();
+        return false;
+    }
+    g_vrReady = true;
+    return true;
+}
+
+// A view of an eye's scene depth (the depth probe's texture), made once per texture. Null when it cannot be read as a shader resource.
+ID3D11ShaderResourceView* vrDepthView(ID3D11Device* device, int eye, ID3D11Texture2D* tex) noexcept {
+    if (!device || eye < 0 || eye > 1 || !tex) return nullptr;
+    if (g_vrDepthTex[eye] == tex && g_vrDepthSrv[eye]) return g_vrDepthSrv[eye];
+    vrRelease(g_vrDepthSrv[eye]);
+    g_vrDepthTex[eye] = nullptr;
+    D3D11_TEXTURE2D_DESC td{};
+    tex->GetDesc(&td);
+    const DXGI_FORMAT f = bdDepthReadFormat(td.Format);
+    if (f == DXGI_FORMAT_UNKNOWN || (td.BindFlags & D3D11_BIND_SHADER_RESOURCE) == 0 || td.SampleDesc.Count != 1) return nullptr;
+    D3D11_SHADER_RESOURCE_VIEW_DESC vd{};
+    vd.Format = f;
+    vd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+    vd.Texture2D.MipLevels = 1;
+    if (FAILED(device->CreateShaderResourceView(tex, &vd, &g_vrDepthSrv[eye])) || !g_vrDepthSrv[eye]) {
+        g_vrDepthSrv[eye] = nullptr;
+        return nullptr;
+    }
+    g_vrDepthTex[eye] = tex;
+    return g_vrDepthSrv[eye];
+}
+
+bool vrBakeHoldsCube() noexcept { return g_vrArmedNow || g_vrRunning.load(std::memory_order_acquire); }
+
+void vrSetHooks() noexcept {
+    const uint32_t bits = (g_vrDiscover.load(std::memory_order_relaxed) || g_vrRunning.load(std::memory_order_relaxed) ? 1u : 0u) |
+                          (g_vrRunning.load(std::memory_order_relaxed) ? 2u : 0u);
+    detail::g_concourseVrBakeHooks.store(bits, std::memory_order_relaxed);
+}
+
+// The pane tick's part: the prepare, the counts copied once their frame has ended, and the copies mapped once they are in (no wait).
+void vrBakeTick(ID3D11Device* device, uint32_t frame) noexcept {
+    if (device != g_vrDevice && g_vrDevice) {   // another device: its buffers are not this one's
+        vrReleaseAll();
+        g_vrDevice = nullptr;
+    }
+    if (g_vrWantPrepare.exchange(false, std::memory_order_acq_rel)) {
+        const uint64_t t0 = GetTickCount64();
+        const bool ok = vrMake(device);
+        Log::get().note("concourse bake: vr: armed: the VR capture shader and its buffers are %s after %llu ms", ok ? "ready" : "NOT READY", static_cast<unsigned long long>(GetTickCount64() - t0));
+    }
+    vrSetHooks();
+    if (!g_vrReady || !device) return;
+    ID3D11DeviceContext* imm = g_immediate.load(std::memory_order_relaxed);
+    if (!imm) return;
+    FlatComputeInternalScope internal;
+    for (uint32_t s = 0; s < kVrSlots; ++s) {
+        VrCountSlot& sl = g_vrSlot[s];
+        if (!sl.used) continue;
+        if (!sl.copied) {
+            if (frame == sl.frame) continue;   // its draws are still to come
+            imm->CopyResource(g_vrCountStage[s], g_vrCount[s]);
+            sl.copied = true;
+            sl.copyFrame = frame;
+            continue;
+        }
+        if (frame == sl.copyFrame) continue;
+        D3D11_MAPPED_SUBRESOURCE mp{};
+        const HRESULT hr = imm->Map(g_vrCountStage[s], 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &mp);
+        if (hr == DXGI_ERROR_WAS_STILL_DRAWING) continue;
+        if (SUCCEEDED(hr) && mp.pData) {
+            uint32_t u[16];
+            std::memcpy(u, mp.pData, sizeof(u));
+            imm->Unmap(g_vrCountStage[s], 0);
+            if (g_vrCountOutN < kVrOutCap) {
+                ConcourseVrBakeCount& c = g_vrCountOut[g_vrCountOutN++];
+                c = ConcourseVrBakeCount{};
+                c.frame = sl.frame;
+                for (int e = 0; e < 2; ++e) {
+                    c.dispatched[e] = sl.dispatched[e];
+                    c.both[e] = sl.both[e];
+                    c.onFace[e] = u[e * 8 + 0];
+                    c.inView[e] = u[e * 8 + 1];
+                    c.written[e] = u[e * 8 + 2];
+                    c.eitherView[e] = u[e * 8 + 3];
+                    c.face[e] = static_cast<int>(u[e * 8 + 4]) - 1;
+                    c.status[e] = u[e * 8 + 5];
+                }
+            } else {
+                g_vrLost.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        sl = VrCountSlot{};
+    }
+    for (int e = 0; e < 2; ++e)
+        for (uint32_t s = 0; s < kVrSlots; ++s) {
+            VrRowSlot& rs = g_vrRowSlot[e][s];
+            if (!rs.pending || frame == rs.frame) continue;
+            D3D11_MAPPED_SUBRESOURCE mp{};
+            const HRESULT hr = imm->Map(g_vrRowsStage[e][s], 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &mp);
+            if (hr == DXGI_ERROR_WAS_STILL_DRAWING) continue;
+            if (SUCCEEDED(hr) && mp.pData) {
+                if (g_vrRowsOutN < kVrOutCap) {
+                    ConcourseVrBakeRows& r = g_vrRowsOut[g_vrRowsOutN++];
+                    r.frame = rs.frame;
+                    r.eye = e;
+                    std::memcpy(r.rows, mp.pData, sizeof(r.rows));
+                } else {
+                    g_vrLost.fetch_add(1, std::memory_order_relaxed);
+                }
+                imm->Unmap(g_vrRowsStage[e][s], 0);
+            }
+            rs.pending = false;
+        }
+}
+}  // namespace
+
+void concoursePaneVrBakeSnapDraw(ID3D11DeviceContext* ctx) noexcept {
+    if (!ctx || !g_vrReady || !g_vrRunning.load(std::memory_order_relaxed)) return;
+    const uint32_t frame = g_frameNow.load(std::memory_order_relaxed);
+    void* dsv = bindingGet(BindSlot::Dsv0);
+    int eye = -1, target = -1;
+    if (!dsv || !depthProbeCurrentSceneEyeOf(static_cast<ID3D11DepthStencilView*>(dsv), &eye, &target) || eye < 0 || eye > 1) return;
+    if (g_vrSnapFrame[eye] == frame) return;
+    g_vrSnapFrame[eye] = frame;   // one try a frame an eye, taken or not
+    ID3D11Buffer* b1 = nullptr;
+    UINT first = 0, num = 0;
+    ID3D11DeviceContext1* ctx1 = nullptr;
+    if (SUCCEEDED(ctx->QueryInterface(IID_PPV_ARGS(&ctx1))) && ctx1) {
+        ctx1->VSGetConstantBuffers1(1, 1, &b1, &first, &num);
+        ctx1->Release();
+    } else {
+        ctx->VSGetConstantBuffers(1, 1, &b1);
+    }
+    if (!b1) {
+        g_vrSnapNoCb.fetch_add(1, std::memory_order_relaxed);
+        g_vrSnapFrame[eye] = 0xFFFFFFFFu;   // another draw of this eye may have it
+        return;
+    }
+    D3D11_BUFFER_DESC bd{};
+    b1->GetDesc(&bd);
+    const UINT offset = (first + kVrRowFirst) * 16u;
+    if (bd.ByteWidth < offset + kVrRows * 16u) {
+        b1->Release();
+        g_vrSnapNoCb.fetch_add(1, std::memory_order_relaxed);
+        g_vrSnapFrame[eye] = 0xFFFFFFFFu;
+        return;
+    }
+    const D3D11_BOX box{offset, 0, 0, offset + kVrRows * 16u, 1, 1};
+    const uint32_t s = frame % kVrSlots;
+    {
+        FlatComputeInternalScope internal;
+        ctx->CopySubresourceRegion(g_vrRowsBuf[eye], 0, 0, 0, 0, b1, 0, &box);
+        ctx->CopySubresourceRegion(g_vrRowsStage[eye][s], 0, 0, 0, 0, b1, 0, &box);
+    }
+    b1->Release();
+    if (g_vrRowSlot[eye][s].pending) g_vrLost.fetch_add(1, std::memory_order_relaxed);
+    g_vrRowSlot[eye][s].frame = frame;
+    g_vrRowSlot[eye][s].pending = true;
+    g_vrSnaps[eye].fetch_add(1, std::memory_order_relaxed);
+    if (g_vrOrderFrame != frame) {
+        g_vrOrderFrame = frame;
+        for (uint32_t& o : g_vrOrder) o = 0;
+    }
+    g_vrOrder[eye * 2] = ++g_vrSeq;
+}
+
+void concoursePaneVrBakeToneDraw(ID3D11DeviceContext* ctx, char kind, uint32_t count, uint32_t instances, uint32_t startInstance) noexcept {
+    if (!ctx || (kind != 'D' && kind != 'N') || count != 3 || instances != 1 || startInstance != 0) return;
+    ToneAdmit ta;
+    if (!tonemapAdmitStructure(ctx, bindingShaderHash(BindSlot::Ps), ta) || !tonemapAdmitFull(ta, bindingShaderHash(BindSlot::Vs)) || ta.hdrSlotRead < 0) return;
+    const uint32_t frame = g_frameNow.load(std::memory_order_relaxed);
+    if (frame != g_vrToneFrame) {
+        g_vrToneFrame = frame;
+        g_vrToneNext = 0;
+    }
+    // The eye by the draw's order in the frame, the first eye 0 (Flight 51: two admitted tonemap draws a frame, eye 0 then eye 1, the eye table never told).
+    const int eye = g_vrToneNext < 2 ? static_cast<int>(g_vrToneNext) : -1;
+    ++g_vrToneNext;
+    if (eye < 0) return;
+    ID3D11Texture2D* depth = nullptr;
+    const bool depthOk = depthProbeSceneDepth(ta.hdrW, ta.hdrH, eye, &depth) && depth;
+    if (!g_vrToneSeen.load(std::memory_order_relaxed) && depthOk) {
+        D3D11_TEXTURE2D_DESC dd{};
+        depth->GetDesc(&dd);
+        g_vrToneWhat.hdrW = ta.hdrW;
+        g_vrToneWhat.hdrH = ta.hdrH;
+        g_vrToneWhat.hdrFmt = static_cast<uint32_t>(ta.hdrFmt);
+        g_vrToneWhat.depthFmt = static_cast<uint32_t>(dd.Format);
+        g_vrToneSeen.store(true, std::memory_order_release);
+    }
+    if (!g_vrCapturing.load(std::memory_order_acquire) || !g_vrReady) return;
+    g_vrToneDraws.fetch_add(1, std::memory_order_relaxed);
+    if (g_vrOrderFrame == frame) g_vrOrder[eye * 2 + 1] = ++g_vrSeq;
+    if (g_vrSnapFrame[eye] != frame) {
+        g_vrNoRows.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    ID3D11ShaderResourceView* depthSrv = depthOk ? vrDepthView(g_vrDevice, eye, depth) : nullptr;
+    if (!depthSrv) {
+        g_vrNoDepth.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    ID3D11ShaderResourceView* hdr = nullptr;
+    ctx->PSGetShaderResources(static_cast<UINT>(ta.hdrSlotRead), 1, &hdr);
+    ID3D11UnorderedAccessView* uavCube[2] = {g_bdDistBackUav.load(std::memory_order_acquire), g_bdBackUav.load(std::memory_order_acquire)};
+    ID3D11SamplerState* smp = g_bdSampler.load(std::memory_order_acquire);
+    if (!hdr || !uavCube[0] || !uavCube[1] || !smp || !g_csVr || !g_cbVr || ta.hdrW == 0 || ta.hdrH == 0) {
+        if (!g_vrSaidRefused) {
+            g_vrSaidRefused = true;
+            Log::get().note("concourse bake: vr: a tone draw refused: H %d, cubes %d, sampler %d, shader %d, %ux%u", hdr ? 1 : 0, uavCube[0] && uavCube[1] ? 1 : 0, smp ? 1 : 0,
+                            g_csVr ? 1 : 0, ta.hdrW, ta.hdrH);
+        }
+        if (hdr) hdr->Release();
+        g_vrRefused.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    const bool other = g_vrSnapFrame[1 - eye] == frame;
+    const uint32_t s = frame % kVrSlots;
+    VrCountSlot& sl = g_vrSlot[s];
+    FlatComputeInternalScope internal;
+    if (sl.frame != frame) {
+        if (sl.used) g_vrLost.fetch_add(1, std::memory_order_relaxed);
+        sl = VrCountSlot{};
+        sl.frame = frame;
+        sl.used = true;
+        const UINT zero[4] = {};
+        ctx->ClearUnorderedAccessViewUint(g_vrCountUav[s], zero);
+        for (int k = 0; k < 4; ++k) g_vrLastOrder[k] = 0;
+    }
+    g_vrK.size[0] = static_cast<float>(ta.hdrW);
+    g_vrK.size[1] = static_cast<float>(ta.hdrH);
+    g_vrK.ctl[1] = other ? 1u : 0u;
+    g_vrK.ctl[2] = static_cast<uint32_t>(eye);
+    ID3D11ComputeShader* oldCs = nullptr;
+    ID3D11ShaderResourceView* oldSrv[4] = {};
+    ID3D11UnorderedAccessView* oldUav[3] = {};
+    ID3D11Buffer* oldCb = nullptr;
+    ID3D11SamplerState* oldSmp = nullptr;
+    ctx->CSGetShader(&oldCs, nullptr, nullptr);
+    ctx->CSGetShaderResources(0, 4, oldSrv);
+    ctx->CSGetUnorderedAccessViews(0, 3, oldUav);
+    ctx->CSGetConstantBuffers(0, 1, &oldCb);
+    ctx->CSGetSamplers(0, 1, &oldSmp);
+    ctx->UpdateSubresource(g_cbVr, 0, nullptr, &g_vrK, 0, 0);
+    ID3D11ShaderResourceView* srv[4] = {hdr, depthSrv, g_vrRowsSrv[eye], g_vrRowsSrv[1 - eye]};
+    ID3D11UnorderedAccessView* uav[3] = {uavCube[0], uavCube[1], g_vrCountUav[s]};
+    ctx->CSSetShader(g_csVr, nullptr, 0);
+    ctx->CSSetConstantBuffers(0, 1, &g_cbVr);
+    ctx->CSSetSamplers(0, 1, &smp);
+    ctx->CSSetShaderResources(0, 4, srv);
+    ctx->CSSetUnorderedAccessViews(0, 3, uav, nullptr);
+    ctx->Dispatch(cc::kBackdropCubeSize / 32u, cc::kBackdropCubeSize / 32u, 6);
+    ctx->CSSetShader(oldCs, nullptr, 0);
+    ctx->CSSetConstantBuffers(0, 1, &oldCb);
+    ctx->CSSetSamplers(0, 1, &oldSmp);
+    ctx->CSSetShaderResources(0, 4, oldSrv);
+    ctx->CSSetUnorderedAccessViews(0, 3, oldUav, nullptr);
+    if (oldCs) oldCs->Release();
+    if (oldCb) oldCb->Release();
+    if (oldSmp) oldSmp->Release();
+    for (auto* p : oldSrv) if (p) p->Release();
+    for (auto* p : oldUav) if (p) p->Release();
+    hdr->Release();
+    sl.dispatched[eye] = true;
+    sl.both[eye] = other;
+    g_vrDisp[eye].fetch_add(1, std::memory_order_relaxed);
+    if (g_vrOrderFrame == frame)
+        for (int k = 0; k < 4; ++k) g_vrLastOrder[k] = g_vrOrder[k];
+}
+
+void concoursePaneVrBakeDiscover(bool on) noexcept {
+    g_vrDiscover.store(on && !g_vrToneSeen.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    vrSetHooks();
+}
+
+bool concoursePaneVrToneSeen(ConcourseVrToneSeen* what) noexcept {
+    if (!g_vrToneSeen.load(std::memory_order_acquire)) return false;
+    if (what) *what = g_vrToneWhat;
+    return true;
+}
+
+void concoursePaneVrBakeArm(bool on) noexcept {
+    if (on && !g_vrArmedNow) {
+        g_bakeWantPrepare.store(true, std::memory_order_release);   // the cube, made and cleared by the bake's own prepare (bakeTick)
+        g_vrWantPrepare.store(true, std::memory_order_release);
+    }
+    g_vrArmedNow = on;
+}
+
+bool concoursePaneVrBakeBegin() noexcept {
+    if (!g_bakeReady || !g_vrReady || !g_bakeDevice) {
+        Log::get().note("concourse bake: vr: begin: the cube is %s and the VR shader %s: nothing is captured", g_bakeReady ? "ready" : "NOT READY", g_vrReady ? "ready" : "NOT READY");
+        return false;
+    }
+    for (uint32_t& f : g_vrSnapFrame) f = 0xFFFFFFFFu;
+    for (int e = 0; e < 2; ++e) {
+        g_vrDisp[e].store(0, std::memory_order_relaxed);
+        g_vrSnaps[e].store(0, std::memory_order_relaxed);
+    }
+    g_vrToneDraws.store(0, std::memory_order_relaxed);
+    g_vrNoRows.store(0, std::memory_order_relaxed);
+    g_vrNoDepth.store(0, std::memory_order_relaxed);
+    g_vrRefused.store(0, std::memory_order_relaxed);
+    g_vrSnapNoCb.store(0, std::memory_order_relaxed);
+    g_vrLost.store(0, std::memory_order_relaxed);
+    g_vrRowsOutN = g_vrCountOutN = 0;
+    for (uint32_t& o : g_vrLastOrder) o = 0;
+    g_vrSaidRefused = false;
+    g_vrCapturing.store(false, std::memory_order_release);
+    g_vrRunning.store(true, std::memory_order_release);
+    vrSetHooks();
+    return true;
+}
+
+void concoursePaneVrBakeCapture(const float origin[3], const float faces[5][9], uint32_t mask, float nearM, float cutM) noexcept {
+    for (int f = 0; f < 5; ++f)
+        for (int k = 0; k < 3; ++k) {
+            g_vrK.faceR[f][k] = faces[f][k];
+            g_vrK.faceU[f][k] = faces[f][3 + k];
+            g_vrK.faceF[f][k] = faces[f][6 + k];
+        }
+    for (int f = 0; f < 5; ++f) g_vrK.faceR[f][3] = g_vrK.faceU[f][3] = g_vrK.faceF[f][3] = 0.0f;
+    for (int k = 0; k < 3; ++k) g_vrK.origin[k] = origin[k];
+    g_vrK.origin[3] = 0.0f;
+    g_vrK.size[2] = cutM;
+    g_vrK.size[3] = cc::kBackdropFarM;
+    g_vrK.lim[0] = cv::kAtCentreM;
+    g_vrK.lim[1] = cv::kFaceSlack;
+    g_vrK.lim[2] = cv::kFaceMinDot;
+    g_vrK.lim[3] = 0.0f;
+    g_vrK.ctl[0] = mask;
+    g_vrK.ctl[3] = 0;
+    g_bakePeopleLeft.store(0, std::memory_order_relaxed);
+    g_bakePeopleOff.store(true, std::memory_order_release);
+    detail::g_concoursePaneArmed.store(true, std::memory_order_release);   // the next draw, not the next tick: updateArmed keeps it while the people's flag holds
+    g_bakeHoldStartMs = GetTickCount64();                                  // the people's 2 s backstop counts from here
+    ID3D11Buffer* originBuf = g_bdOrigin.load(std::memory_order_acquire);
+    ID3D11DeviceContext* imm = nullptr;
+    if (g_bakeDevice) g_bakeDevice->GetImmediateContext(&imm);
+    if (imm && originBuf) {
+        FlatComputeInternalScope internal;
+        const float o[4] = {origin[0], origin[1], origin[2], 0.0f};
+        imm->UpdateSubresource(originBuf, 0, nullptr, o, 0, 0);
+        g_bdOriginSet.store(true, std::memory_order_release);
+    }
+    if (imm) imm->Release();
+    g_vrCapturing.store(true, std::memory_order_release);
+    Log::get().note("concourse bake: vr: capture: origin %.2f %.2f %.2f, faces 0x%X, near %.0f m, the room's cut %.0f m (nearer is not written), the people left out; a frame is taken "
+                    "when its eye is within %.1f m of the origin and looks within %.0f degrees of a face",
+                    static_cast<double>(origin[0]), static_cast<double>(origin[1]), static_cast<double>(origin[2]), mask, static_cast<double>(nearM), static_cast<double>(cutM),
+                    static_cast<double>(cv::kAtCentreM), std::acos(static_cast<double>(cv::kFaceMinDot)) * 57.29578);
+}
+
+void concoursePaneVrBakeEnd(bool publish, const char* line) noexcept {
+    const bool wasCapturing = g_vrCapturing.exchange(false, std::memory_order_acq_rel);
+    const bool peopleWere = wasCapturing && g_bakePeopleOff.exchange(false, std::memory_order_acq_rel);
+    const bool wasRunning = g_vrRunning.exchange(false, std::memory_order_acq_rel);
+    vrSetHooks();
+    if (!wasRunning) return;
+    bool published = false;
+    if (publish && wasCapturing) {
+        ID3D11DeviceContext* imm = nullptr;
+        if (g_bakeDevice) g_bakeDevice->GetImmediateContext(&imm);
+        if (imm) {
+            backdropPublishFront(imm);
+            g_bdCaptures.store(1, std::memory_order_release);
+            g_bdCubeValid.store(true, std::memory_order_release);
+            g_bakeBaked.store(true, std::memory_order_release);
+            g_bdAutoOn.store(false, std::memory_order_relaxed);
+            setMode(kModeBackdrop, "the VR bake", false);
+            published = true;
+            imm->Release();
+        }
+    }
+    Log::get().note("concourse bake: %s; %s; the people's draws left out over its frames: %llu%s", line ? line : "vr: ended",
+                    published ? "the windows show it now" : publish ? "NOT PUBLISHED (no immediate context, or it never captured)" : "nothing is published",
+                    static_cast<unsigned long long>(g_bakePeopleLeft.load(std::memory_order_relaxed)), peopleWere || !wasCapturing ? "" : " (the people were not being left out)");
+}
+
+uint32_t concoursePaneVrBakeTakeRows(ConcourseVrBakeRows* out, uint32_t cap) noexcept {
+    const uint32_t n = g_vrRowsOutN < cap ? g_vrRowsOutN : cap;
+    for (uint32_t i = 0; i < n; ++i) out[i] = g_vrRowsOut[i];
+    g_vrRowsOutN = 0;
+    return n;
+}
+uint32_t concoursePaneVrBakeTakeCounts(ConcourseVrBakeCount* out, uint32_t cap) noexcept {
+    const uint32_t n = g_vrCountOutN < cap ? g_vrCountOutN : cap;
+    for (uint32_t i = 0; i < n; ++i) out[i] = g_vrCountOut[i];
+    g_vrCountOutN = 0;
+    return n;
+}
+ConcourseVrBakeStats concoursePaneVrBakeStats() noexcept {
+    ConcourseVrBakeStats s;
+    s.toneDraws = g_vrToneDraws.load(std::memory_order_relaxed);
+    for (int e = 0; e < 2; ++e) {
+        s.dispatches[e] = g_vrDisp[e].load(std::memory_order_relaxed);
+        s.snaps[e] = g_vrSnaps[e].load(std::memory_order_relaxed);
+    }
+    s.noRows = g_vrNoRows.load(std::memory_order_relaxed);
+    s.noDepth = g_vrNoDepth.load(std::memory_order_relaxed);
+    s.refused = g_vrRefused.load(std::memory_order_relaxed);
+    s.snapNoCb = g_vrSnapNoCb.load(std::memory_order_relaxed);
+    s.lost = g_vrLost.load(std::memory_order_relaxed);
+    for (int k = 0; k < 4; ++k) s.firstOrder[k] = g_vrLastOrder[k];
+    return s;
+}
+
 void concoursePaneTick(ID3D11Device* device, uint32_t frame, uint64_t nowMs) noexcept {
     g_lastTickMs = nowMs;
     logWithheld(nowMs);
@@ -3720,6 +4423,7 @@ void concoursePaneTick(ID3D11Device* device, uint32_t frame, uint64_t nowMs) noe
     }
     backdropTick(device, frame);
     bakeTick(device, nowMs);
+    vrBakeTick(device, frame);   // TEMPORARY (the VR bake): its prepare and read-backs; nothing while it was never armed
     // A backstop: a bake takes about 110 ms, and every end of one clears the people's flag. A bake ended some other way (its mode stepped by the key mid-bake) would leave the
     // people out for good, so past 2 s they come back, and the log says so.
     if (g_bakePeopleOff.load(std::memory_order_acquire) && nowMs - g_bakeHoldStartMs > 2000 && g_bakePeopleOff.exchange(false, std::memory_order_acq_rel))

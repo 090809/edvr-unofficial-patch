@@ -2632,6 +2632,10 @@ DrawVerdict beginPanelOverride(ID3D11DeviceContext* self, char kind, UINT count,
     if (concourseVrProbeToneArmed() && self == g_state->ownerCtx) {
         concourseVrProbeToneDraw(self, kind, count, instances, args.startInstance);
     }
+    // TEMPORARY (the concourse cull's VR bake, concourse_pane.h): the game's tonemap, once per eye, is where a bake frame is captured. One relaxed load while no bake runs.
+    if (concourseVrBakeToneArmed() && self == g_state->ownerCtx) {
+        concoursePaneVrBakeToneDraw(self, kind, count, instances, args.startInstance);
+    }
     // The pool probe (object_probe.h): one bool while off; a few t33 reads a
     // frame until the pool is known, then one a second. The bool is now read
     // HERE: objectProbeWantsDraws() is the callee's own first test, inline,
@@ -5968,6 +5972,9 @@ void STDMETHODCALLTYPE hookedDrawIndexedInstanced(ID3D11DeviceContext* self,
                 temporalPassNoteRigidDraw(temporalEye, scene, sceneVs);
                 if(scene)scene->Release();
             }
+            // TEMPORARY (the concourse cull's VR bake, concourse_pane.h): while a bake runs, each eye's camera rows (VS b1 270..279) are copied on the GPU at its first
+            // recognised scene draw of the frame. One relaxed load otherwise.
+            if (recognisedScene && concourseVrBakeSnapArmed()) concoursePaneVrBakeSnapDraw(self);
             // The VR camera census (vr_camera_census.h): at the 2D screen's composite, once an eye. g_vrWorldWants is true
             // whenever the census is wanted, so with the key off this is one load of a false bool.
             if (g_vrWorldWants && vrCameraCensusWanted()) cameraCensusEyeDraw(self);

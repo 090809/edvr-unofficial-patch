@@ -4,6 +4,7 @@
 // prefix and sphere, the bay's volume, and the unreadable rule. No DLL and no game.
 #include "../../src/d3d11/optimized_station_core.h"
 #include "../../src/d3d11/concourse_cull_core.h"   // the concourse cull: allow-list, gate, judge, rig verdict, pane triples (pure)
+#include "../../src/d3d11/concourse_vr_bake_core.h"   // the concourse cull's VR bake: the aim, the conversions, the pitch, the face test (pure)
 #include "../../src/d3d11/avatar_hooks_core.h"
 #include "../../src/d3d11/journal_watch.h"   // journalSeatedFromFlags (a constexpr; the rig does not link the watcher)
 #include "../../src/d3d11/station_gather_core.h"
@@ -90,6 +91,300 @@ se::TickRecord heldTick(uint32_t frame, uint64_t nowMs) {
     r.refresh = se::HeldRefresh::kRefreshed;
     r.camValid = true;
     return r;
+}
+
+// ---- The concourse cull's VR bake (src\d3d11\concourse_vr_bake_core.h): the conventions, each pinned against the game's own multiply (previewcam::compose) -----------------
+namespace cvb = edvr::concourse_vr;
+// An OpenVR 3x4 (row-major, column vectors) from a rotation and a translation.
+void ovrPose(const double R[3][3], const double t[3], float m[12]) {
+    for (int i = 0; i < 3; ++i) {
+        for (int j = 0; j < 3; ++j) m[i * 4 + j] = static_cast<float>(R[i][j]);
+        m[i * 4 + 3] = static_cast<float>(t[i]);
+    }
+}
+void ovrRotY(double deg, double R[3][3]) {
+    const double a = deg * 3.14159265358979 / 180.0, c = std::cos(a), s = std::sin(a);
+    const double r[3][3] = {{c, 0, s}, {0, 1, 0}, {-s, 0, c}};
+    std::memcpy(R, r, sizeof(r));
+}
+void ovrRotX(double deg, double R[3][3]) {
+    const double a = deg * 3.14159265358979 / 180.0, c = std::cos(a), s = std::sin(a);
+    const double r[3][3] = {{1, 0, 0}, {0, c, -s}, {0, s, c}};
+    std::memcpy(R, r, sizeof(r));
+}
+void mat3Mul(const double A[3][3], const double B[3][3], double out[3][3]) {
+    for (int i = 0; i < 3; ++i)
+        for (int j = 0; j < 3; ++j) {
+            out[i][j] = 0.0;
+            for (int k = 0; k < 3; ++k) out[i][j] += A[i][k] * B[k][j];
+        }
+}
+// X * E in OpenVR's column vectors: the eye's pose in the seated space.
+void ovrCompose(const float X[12], const float E[12], float out[12]) {
+    for (int i = 0; i < 3; ++i) {
+        for (int j = 0; j < 3; ++j) out[i * 4 + j] = X[i * 4 + 0] * E[0 * 4 + j] + X[i * 4 + 1] * E[1 * 4 + j] + X[i * 4 + 2] * E[2 * 4 + j];
+        out[i * 4 + 3] = X[i * 4 + 0] * E[3] + X[i * 4 + 1] * E[7] + X[i * 4 + 2] * E[11] + X[i * 4 + 3];
+    }
+}
+bool poseNear(const cvb::Pose& a, const cvb::Pose& b, float tol) {
+    for (int r = 0; r < 4; ++r)
+        for (int c = 0; c < 3; ++c)
+            if (!(std::fabs(a.v[r * 4 + c] - b.v[r * 4 + c]) <= tol)) return false;
+    return true;
+}
+bool vecNear(const float* a, const float* b, float tol) { return std::fabs(a[0] - b[0]) <= tol && std::fabs(a[1] - b[1]) <= tol && std::fabs(a[2] - b[2]) <= tol; }
+// The camera 0x287B330 builds from an eye matrix: forward = normalize(row 2), right = normalize(row 1 x row 2), up = forward x right, position = row 3.
+void gameCamera(const cvb::Pose& eye, float right[3], float up[3], float forward[3], float pos[3]) {
+    for (int k = 0; k < 3; ++k) {
+        forward[k] = eye.v[8 + k];
+        pos[k] = eye.v[12 + k];
+    }
+    cvb::normalize3(forward);
+    const float r1[3] = {eye.v[4], eye.v[5], eye.v[6]}, r2[3] = {eye.v[8], eye.v[9], eye.v[10]};
+    cvb::cross3(r1, r2, right);
+    cvb::normalize3(right);
+    cvb::cross3(forward, right, up);
+}
+
+void testVrBake() {
+    using cvb::Pose;
+    // A head yawed 30 degrees and pitched 10, at a seated place; a canted left eye (8 degrees out) and its offset.
+    double Ry[3][3], Rx[3][3], Rh[3][3], Re[3][3];
+    ovrRotY(30.0, Ry);
+    ovrRotX(10.0, Rx);
+    mat3Mul(Ry, Rx, Rh);
+    ovrRotY(8.0, Re);
+    const double th[3] = {0.21, 1.62, -0.33}, te[3] = {-0.032, 0.0, 0.011};
+    float X[12], E[12], XE[12];
+    ovrPose(Rh, th, X);
+    ovrPose(Re, te, E);
+    ovrCompose(X, E, XE);
+    const Pose hg = cvb::gameFromOpenVr(X), eg = cvb::gameFromOpenVr(E);
+    // G is S*X*S in rows (docs\canted-projection.md: 0x4E3690 converts the head to S*H*S): the head's forward, OpenVR's -z, z-negated, is row 2.
+    {
+        const float fwdOvr[3] = {-static_cast<float>(Rh[0][2]), -static_cast<float>(Rh[1][2]), -static_cast<float>(Rh[2][2])};
+        const float fwdGame[3] = {fwdOvr[0], fwdOvr[1], -fwdOvr[2]};
+        check(vecNear(&hg.v[8], fwdGame, 1e-5f), "vr bake: G puts the head's forward (OpenVR -z, z negated) in row 2");
+        const float tGame[3] = {static_cast<float>(th[0]), static_cast<float>(th[1]), static_cast<float>(-th[2])};
+        check(vecNear(&hg.v[12], tGame, 1e-6f), "vr bake: G's row 3 is the translation with z negated");
+        check(std::fabs(cvb::det3(hg) - 1.0f) < 1e-5f, "vr bake: G keeps a rotation proper");
+    }
+    // G(X * E) = G(E) * G(X): the eye matrix 0x4E2640 makes (E times H in rows) is G of the eye's seated pose.
+    check(poseNear(cvb::mul(eg, hg), cvb::gameFromOpenVr(XE), 1e-5f), "vr bake: G(E) * G(H) in Elite's rows is G of the eye's pose X * E");
+    check(poseNear(cvb::mul(hg, cvb::rigidInverse(hg)), cvb::identityPose(), 1e-5f), "vr bake: the rigid inverse undoes the head");
+    // The axes of a room, not along the world's: a yaw of 40 degrees and a small tilt, right-handed (a0 x a1 = a2).
+    double Ra[3][3], Rt[3][3], Rr[3][3];
+    ovrRotY(40.0, Ra);
+    ovrRotX(3.0, Rt);
+    mat3Mul(Ra, Rt, Rr);
+    float axes[3][3];
+    for (int a = 0; a < 3; ++a)
+        for (int k = 0; k < 3; ++k) axes[a][k] = static_cast<float>(Rr[k][a]);
+    const float centre[3] = {1203.5f, -88.25f, 4410.0f};
+    cvb::Face faces[cvb::kFaces];
+    bool allFaces = true, properAll = true, mirrorAll = true;
+    for (uint32_t d = 0; d < cvb::kFaces; ++d) {
+        allFaces = allFaces && cvb::faceOf(axes, d, &faces[d]);
+        properAll = properAll && std::fabs(cvb::det3(cvb::faceRows(faces[d], centre, 1.0f)) - 1.0f) < 1e-5f;
+        mirrorAll = mirrorAll && std::fabs(cvb::det3(cvb::faceRows(faces[d], centre, -1.0f)) + 1.0f) < 1e-5f;
+    }
+    check(allFaces, "vr bake: the five faces are made from the room's axes");
+    check(properAll && mirrorAll, "vr bake: a face's rows are a proper rotation, and a mirrored base flips it");
+    check(vecNear(faces[0].f, axes[2], 1e-6f) && vecNear(faces[2].f, axes[0], 1e-6f) && vecNear(faces[4].f, axes[1], 1e-6f) && vecNear(faces[4].u, axes[2], 1e-6f),
+          "vr bake: the faces look as flat's bakeForward does (0 +a2, 2 +a0, 4 up with a2 as its up)");
+    {
+        const float back[3] = {-axes[2][0], -axes[2][1], -axes[2][2]};
+        check(vecNear(faces[1].f, back, 1e-6f) && vecNear(faces[1].u, axes[1], 1e-6f), "vr bake: face 1 looks along -a2 with the room's up");
+        float rx[3];
+        cvb::cross3(faces[0].u, faces[0].f, rx);
+        check(vecNear(faces[0].r, rx, 1e-6f), "vr bake: right = up x forward, as 0x287B330 takes right = row 1 x row 2");
+    }
+    {
+        float skew[3][3];
+        std::memcpy(skew, axes, sizeof(skew));
+        for (int k = 0; k < 3; ++k) skew[1][k] += 0.2f * axes[2][k];   // an up that leans toward forward
+        cvb::Face f0;
+        check(cvb::faceOf(skew, 0, &f0) && std::fabs(cvb::dot3(f0.u, f0.f)) < 1e-6f && std::fabs(cvb::dot3(f0.r, f0.f)) < 1e-6f && std::fabs(cvb::dot3(f0.u, f0.u) - 1.0f) < 1e-5f,
+              "vr bake: skewed axes are made orthonormal, forward first");
+        const float zero[3][3] = {};
+        check(!cvb::faceOf(zero, 0, &f0) && !cvb::faceOf(axes, 5, &f0), "vr bake: no face from zero axes or past the fifth");
+    }
+    // The aim: B = H^-1 * D, and Elite's multiply of the head with it gives D back (native_preview_camera_core.h compose, the game's own).
+    for (uint32_t d = 0; d < cvb::kFaces; ++d) {
+        const cvb::Face pf = cvb::pitchFace(faces[d], 0.096f);
+        const Pose rows = cvb::faceRows(pf, centre, 1.0f);
+        const Pose b = cvb::aimBase(hg, rows);
+        const Pose back = edvr::previewcam::compose(hg, b, cvb::identityPose());
+        char what[96];
+        std::snprintf(what, sizeof(what), "vr bake: face %u: B = H^-1 * D, and compose(H, B) is D", d);
+        check(poseNear(back, rows, 5e-3f), what);   // translations of thousands of metres: float rounding
+    }
+    // The whole chain as Elite runs it: eye = (G(E) * G(H)) * B, and 0x287B330's camera from it. A parallel eye looks exactly along the face, from the centre less its offset.
+    {
+        const float ipdOnly[12] = {1, 0, 0, -0.032f, 0, 1, 0, 0, 0, 0, 1, 0};
+        const Pose b = cvb::aimBase(hg, cvb::faceRows(faces[2], centre, 1.0f));
+        const Pose eye = cvb::mul(cvb::mul(cvb::gameFromOpenVr(ipdOnly), hg), b);
+        float r[3], u[3], f[3], p[3], pred[3];
+        gameCamera(eye, r, u, f, p);
+        cvb::eyeAt(ipdOnly, cvb::faceRows(faces[2], centre, 1.0f), pred);
+        check(vecNear(f, faces[2].f, 1e-5f) && vecNear(u, faces[2].u, 1e-5f) && vecNear(r, faces[2].r, 1e-5f), "vr bake: a parallel eye's camera looks along the face, its up the face's up");
+        check(vecNear(p, pred, 5e-3f), "vr bake: and sits where eyeAt predicts");
+        float expect[3];
+        for (int k = 0; k < 3; ++k) expect[k] = centre[k] - 0.032f * faces[2].r[k];
+        check(vecNear(p, expect, 5e-3f), "vr bake: which is the centre less half the eyes' separation along the face's right");
+    }
+    // A canted eye: the camera's forward is the face's turned by the eye's own rotation, read through S (the true eye in OpenVR's head axes, z negated, over the face's rows).
+    {
+        const Pose rows = cvb::faceRows(faces[0], centre, 1.0f);
+        const Pose eye = cvb::mul(cvb::mul(eg, hg), cvb::aimBase(hg, rows));
+        float r[3], u[3], f[3], p[3];
+        gameCamera(eye, r, u, f, p);
+        const double qo[3] = {-Re[0][2], -Re[1][2], -Re[2][2]};   // the eye's forward in the head's OpenVR axes
+        const float q[3] = {static_cast<float>(qo[0]), static_cast<float>(qo[1]), static_cast<float>(-qo[2])};
+        float expect[3];
+        for (int k = 0; k < 3; ++k) expect[k] = q[0] * faces[0].r[k] + q[1] * faces[0].u[k] + q[2] * faces[0].f[k];
+        check(vecNear(f, expect, 1e-5f), "vr bake: a canted eye's forward is its own cant, in the face's frame");
+        check(std::fabs(cvb::dot3(f, faces[0].f) - static_cast<float>(std::cos(8.0 * 3.14159265358979 / 180.0))) < 1e-5f, "vr bake: 8 degrees off the face, as the cant");
+        float pred[3];
+        cvb::eyeAt(E, rows, pred);
+        check(vecNear(p, pred, 5e-3f), "vr bake: and its place is eyeAt's");
+    }
+    // The pitch that centres a face in the frusta (docs\concourse-cull-2026-11-05.md "Flight 51 results"): a Quest 3 up 42, down 53, pitched up about 5.5; the Pimax Crystal Super
+    // at plus and minus 46.8, level.
+    {
+        const auto t = [](double deg) { return static_cast<float>(std::tan(deg * 3.14159265358979 / 180.0)); };
+        const float quest[2][4] = {{-t(54.0), t(42.0), -t(53.0), t(42.0)}, {-t(42.0), t(54.0), -t(53.0), t(42.0)}};
+        const float pimax[2][4] = {{-t(51.4), t(41.2), -t(46.8), t(46.8)}, {-t(41.2), t(51.4), -t(46.8), t(46.8)}};
+        const float narrow[2][4] = {{-t(51.4), t(41.2), -t(44.0), t(44.0)}, {-t(41.2), t(51.4), -t(44.0), t(44.0)}};
+        const bool both[2] = {true, true}, none[2] = {false, false};
+        const float parallel[2][12] = {{1, 0, 0, -0.032f, 0, 1, 0, 0, 0, 0, 1, 0}, {1, 0, 0, 0.032f, 0, 1, 0, 0, 0, 0, 1, 0}};
+        const float pq = cvb::pitchForFrusta(quest, both), pp = cvb::pitchForFrusta(pimax, both);
+        check(std::fabs(pq * 57.29578f - 5.5f) < 0.05f, "vr bake: a Quest 3's frusta (up 42, down 53) pitch the head up 5.5 degrees");
+        check(std::fabs(pp) < 1e-6f, "vr bake: the Pimax's (46.8 both ways) leave it level");
+        check(cvb::pitchForFrusta(quest, none) == 0.0f, "vr bake: no frustum read: no pitch");
+        check(cvb::faceSpare(quest, parallel, both, 0.0f) < 0.0f, "vr bake: level, the Quest 3 misses the face's top (42 under 45)");
+        const float sq = cvb::faceSpare(quest, parallel, both, pq);
+        check(sq > 0.05f && sq < 0.09f, "vr bake: pitched, it covers the face with about 2.5 degrees spare (0.076 in tangent)");
+        const float sp = cvb::faceSpare(pimax, parallel, both, 0.0f);
+        check(sp > 0.05f && sp < 0.08f, "vr bake: the Pimax's two eyes cover the face, about 1.5 degrees spare");
+        const bool one[2] = {true, false};
+        check(cvb::faceSpare(pimax, parallel, one, 0.0f) < 0.0f, "vr bake: one Pimax eye alone does not (its inner side is 41.2)");
+        check(cvb::faceSpare(narrow, parallel, both, 0.0f) < 0.0f, "vr bake: frusta under 45 vertically do not");
+    }
+    // The face test (the capture shader's twin) and the faces' tiling: with the down face added, every direction lies on exactly one face's square.
+    {
+        const float* f = faces[2].f;
+        const float* r = faces[2].r;
+        const float* u = faces[2].u;
+        const auto dirOf = [&](float a, float b, float out[3]) {
+            for (int k = 0; k < 3; ++k) out[k] = f[k] + a * r[k] + b * u[k];
+            cvb::normalize3(out);
+        };
+        float d[3];
+        dirOf(0.0f, 0.0f, d);
+        check(cvb::onFace(d, faces[2], cvb::kFaceSlack), "vr bake: the face's centre is on it");
+        dirOf(0.96f, -0.96f, d);
+        check(cvb::onFace(d, faces[2], cvb::kFaceSlack), "vr bake: a corner just inside is on it");
+        dirOf(1.001f, 0.0f, d);
+        check(cvb::onFace(d, faces[2], cvb::kFaceSlack) && !cvb::onFace(d, faces[2], 1.0f), "vr bake: an edge 0.1 percent past is taken with the slack only");
+        dirOf(1.05f, 0.0f, d);
+        check(!cvb::onFace(d, faces[2], cvb::kFaceSlack), "vr bake: 5 percent past the edge is not");
+        const float behind[3] = {-f[0], -f[1], -f[2]};
+        check(!cvb::onFace(behind, faces[2], cvb::kFaceSlack), "vr bake: behind is not");
+        cvb::Face all[6];
+        for (int k = 0; k < 5; ++k) all[k] = faces[k];
+        for (int k = 0; k < 3; ++k) {
+            all[5].f[k] = -axes[1][k];
+            all[5].u[k] = axes[2][k];
+        }
+        cvb::cross3(all[5].u, all[5].f, all[5].r);
+        uint32_t samples = 0, once = 0;
+        for (uint32_t face = 0; face < 6; ++face)
+            for (int a = 0; a < 9; ++a)
+                for (int b = 0; b < 9; ++b) {
+                    float dir[3];
+                    edvr::concourse::cubeDirOf(face, 0.053f + 0.1f * static_cast<float>(a), 0.047f + 0.1f * static_cast<float>(b), dir);
+                    cvb::normalize3(dir);
+                    int n = 0;
+                    for (const cvb::Face& fc : all) n += cvb::onFace(dir, fc, 1.0f) ? 1 : 0;
+                    ++samples;
+                    once += n == 1 ? 1u : 0u;
+                }
+        check(samples == once, "vr bake: the five faces and the floor tile the cube's directions, each on exactly one square");
+    }
+    // Which face a frame shows: the nearest wanted one within about 35 degrees.
+    {
+        float fw[3];
+        for (int k = 0; k < 3; ++k) fw[k] = faces[2].f[k] * 0.98f + faces[2].u[k] * 0.17f;   // about 10 degrees up
+        check(cvb::faceOfView(fw, faces, 0x1Fu, cvb::kFaceMinDot) == 2, "vr bake: a frame looking 10 degrees above face 2 shows face 2");
+        check(cvb::faceOfView(fw, faces, 0x1Bu, cvb::kFaceMinDot) == -1, "vr bake: not when face 2 is not wanted");
+        float diag[3];
+        for (int k = 0; k < 3; ++k) diag[k] = faces[2].f[k] + faces[0].f[k];   // 45 degrees between two faces
+        check(cvb::faceOfView(diag, faces, 0x1Fu, cvb::kFaceMinDot) == -1, "vr bake: half way between two faces shows neither");
+        const float zero[3] = {};
+        check(cvb::faceOfView(zero, faces, 0x1Fu, cvb::kFaceMinDot) == -1, "vr bake: no forward, no face");
+    }
+    // The world check.
+    {
+        const float store[3] = {100.0f, 20.0f, -5.0f}, near1[3] = {100.3f, 20.1f, -5.2f}, far1[3] = {101.363f, -9.0f, 12.0f};
+        float off[3], dist = 0.0f;
+        check(!cvb::worldOffset(store, near1, off, &dist) && dist < 0.5f, "vr bake: the world check: within half a metre is one world");
+        check(cvb::worldOffset(store, far1, off, &dist) && std::fabs(off[1] + 29.0f) < 1e-4f && dist > 30.0f, "vr bake: tens of metres is an offset, render less store");
+    }
+    // The aims: each face once in order, a short one again once its counts are due, three times at most, then let go.
+    {
+        cvb::AimPlan p;
+        p.reset(0x1Fu);
+        bool fresh = false;
+        uint32_t order[5];
+        for (uint32_t t = 1; t <= 5; ++t) order[t - 1] = p.next(t, &fresh);
+        check(order[0] == 0 && order[1] == 1 && order[2] == 2 && order[3] == 3 && order[4] == 4 && fresh, "vr bake: the aims go round the faces in order");
+        check(p.next(6, &fresh) == 4 && !fresh, "vr bake: with every face aimed and its counts not due, the last stays");
+        for (uint32_t f = 0; f < 5; ++f) p.noteCoverage(f, f == 2 ? 0.9f : 1.0f);
+        check(p.covered() == 0x1Bu && !p.finished(7), "vr bake: a face at 90 percent is short, and the bake goes on");
+        check(p.next(9, &fresh) == 4 && !fresh, "vr bake: a short face waits for its counts' ticks");
+        check(p.next(10, &fresh) == 2 && fresh && p.aims(2) == 2, "vr bake: then it is aimed at again");
+        check(p.next(17, &fresh) == 2 && fresh && p.aims(2) == 3, "vr bake: and once more");
+        check(p.next(30, &fresh) == 2 && !fresh, "vr bake: not a fourth time");
+        check(!p.finished(23) && p.finished(24), "vr bake: the bake ends once its last aim's counts are due");
+        check(std::fabs(p.best(2) - 0.9f) < 1e-6f, "vr bake: the best coverage is kept for the finish line");
+        p.reset(0x10u);
+        check(p.next(1, &fresh) == 4 && fresh && p.next(2, &fresh) == 4 && !fresh, "vr bake: one face wanted: it alone");
+        p.noteCoverage(4, 0.995f);
+        check(p.finished(3) && p.covered() == 0x10u, "vr bake: covered, finished at once");
+        p.reset(0x1Fu);
+        p.noteCoverage(9, 1.0f);
+        check(p.covered() == 0u, "vr bake: a face out of range is ignored");
+    }
+    // The capture shader's inverse: one text for the C++ and the HLSL; against the flat bake's own inverse, on a reversed infinite camera.
+    {
+        const double sx = 0.5625, sy = 1.0, nearP = 5.0;
+        const double right[3] = {0.5, 0.866025404, 0.0}, up[3] = {0.866025404, -0.5, 0.0}, fwd[3] = {0.0, 0.0, -1.0};
+        float rows[4][4] = {};
+        for (int i = 0; i < 3; ++i) {   // the flat test's camera (m[0 + i], m[4 + i], m[12 + i] and m[8 + 3]) written as the b1 rows that make it: rows[c][r] = m[r * 4 + c]
+            rows[i][0] = static_cast<float>(sx * right[i]);
+            rows[i][1] = static_cast<float>(sy * up[i]);
+            rows[i][3] = static_cast<float>(fwd[i]);
+        }
+        rows[3][2] = static_cast<float>(nearP);
+        float m[16], inv[16];
+        cvb::clipColumns(rows, m);
+        double md[16], invd[16];
+        for (int i = 0; i < 16; ++i) md[i] = m[i];
+        check(m[0 * 4 + 1] == rows[1][0] && m[3 * 4 + 2] == rows[2][3] && m[2 * 4 + 3] == rows[3][2], "vr bake: the clip matrix's columns are the rows, as the flat bake builds it");
+        check(cvb::inverse4(m, inv) && edvr::concourse::invert4(md, invd), "vr bake: the cofactor inverse and the flat bake's both invert the camera");
+        bool same = true;
+        for (int i = 0; i < 16; ++i) same = same && std::fabs(inv[i] - static_cast<float>(invd[i])) < 1e-4f * (1.0f + std::fabs(static_cast<float>(invd[i])));
+        check(same, "vr bake: and agree");
+        const float flatM[16] = {1, 0, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1};
+        check(!cvb::inverse4(flatM, inv), "vr bake: a singular matrix is refused");
+        const char* h = cvb::inverse4Hlsl();
+        int lines = 0;
+        for (const char* q = std::strstr(h, "    inv["); q; q = std::strstr(q + 1, "    inv[")) ++lines;
+        check(std::strstr(h, "bool invert4(float m[16], out float inv[16])") != nullptr && lines == 16, "vr bake: the HLSL twin has the function and its sixteen cofactors");
+        check(std::strstr(h, "inv[0] = m[5] * m[10] * m[15] - m[5] * m[11] * m[14]") != nullptr && std::strstr(h, "float det = m[0] * inv[0] + m[1] * inv[4]") != nullptr,
+              "vr bake: written from the same text as the C++");
+    }
 }
 
 }  // namespace
@@ -4720,6 +5015,7 @@ int main(int argc, char** argv) {
             check(sd.side(x) == cc::PaneSide::kInterior, "concourse pane sides: reset forgets the largest reading");
         }
     }
+    testVrBake();
 
     std::printf("optimized_station_test: %d checks, %d failures\n", g_checks, g_failures);
     return g_failures ? 1 : 0;

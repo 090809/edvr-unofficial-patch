@@ -388,6 +388,44 @@ void concourseCameraTestAim(const float centre[3],const float forward[3],const f
 
 bool concourseCameraTestHooked() noexcept {return g_ctHooked.load(std::memory_order_acquire)!=0;}
 
+// TEMPORARY (the concourse cull's VR bake, docs\concourse-cull-2026-11-05.md): the same .data float, for VR, where the flat hooks are never installed. 0x2845730 passes it to
+// 0x283FA20 as the eye cameras' near (analysis\decomp\decomp_2845730_334925.txt: DAT_145e85b8c, and 0x287B330 stores that argument at camera +0x234). Its address is checked
+// exactly as flat's install checks it (the build, then the 0.025 that was read), and the write and the put-back are flat's own ctNearRaise and ctNearRestore.
+bool concourseNearValueResolve(const char** why) noexcept {
+    const char* sink=nullptr;
+    if(!why)why=&sink;
+    *why=nullptr;
+    try {
+        std::lock_guard<std::mutex> lock(g_installMutex);
+        if(g_ctNearAt.load(std::memory_order_relaxed))return true;
+        if(!gameBuildKnown()){*why="the game build is not 334925, the build the near value's address was read on";return false;}
+        const uintptr_t base=reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+        if(!base){*why="the module base could not be read";return false;}
+        if(!ctNearValueOk(base+kCtNearValueRva)){*why="the value there is not the 0.025 that was read";return false;}
+        g_ctNearAt.store(reinterpret_cast<float*>(base+kCtNearValueRva),std::memory_order_relaxed);
+        return true;
+    } catch(...) {*why="an exception while resolving it";return false;}
+}
+bool concourseNearValueRaise(float nearM,float* before) noexcept {
+    float* at=g_ctNearAt.load(std::memory_order_relaxed);
+    if(before)*before=0.0f;
+    if(!at)return false;
+    __try {
+        if(before)*before=*static_cast<volatile float*>(at);
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        g_ctFaults.fetch_add(1,std::memory_order_relaxed);
+        return false;
+    }
+    ctNearRaise(nearM);
+    return g_ctNearRaised.load(std::memory_order_relaxed);
+}
+bool concourseNearValueRestore() noexcept {
+    const bool was=g_ctNearRaised.load(std::memory_order_relaxed);
+    ctNearRestore();
+    return was;
+}
+float concourseNearValueRestoredTo() noexcept {return kCtNearValue;}
+
 void concourseCameraTestSnapshot(ConcourseCameraTestSnap* out) noexcept {
     if(!out)return;
     out->hookMask=g_ctHooked.load(std::memory_order_acquire);

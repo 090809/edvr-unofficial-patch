@@ -28,4 +28,11 @@ void concourseCameraTestAim(const float centre[3], const float forward[3], const
 bool concourseCameraTestHooked() noexcept;
 void concourseCameraTestSnapshot(ConcourseCameraTestSnap* out) noexcept;
 
+// TEMPORARY (the VR bake): the near value at RVA 0x5E85B8C without the flat hooks. Resolve checks the build and the 0.025 read there (false with why). Raise reads the value
+// (into `before`) and writes `nearM`, flat's ctNearRaise; Restore puts back the 0.025 read at resolve (flat's ctNearRestore) and says whether it had been raised.
+bool concourseNearValueResolve(const char** why) noexcept;
+bool concourseNearValueRaise(float nearM, float* before) noexcept;
+bool concourseNearValueRestore() noexcept;
+float concourseNearValueRestoredTo() noexcept;
+
 }  // namespace edvr

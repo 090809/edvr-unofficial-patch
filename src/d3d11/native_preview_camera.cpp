@@ -173,6 +173,55 @@ __declspec(noinline) bool probeEye(uintptr_t pose) noexcept {
     }
     return wrote;
 }
+// TEMPORARY (the concourse cull's VR bake, docs\concourse-cull-2026-11-05.md "Flight 51 results"): a third client of the eye stub. The stub's pose is the base B that 0x283FA20
+// multiplies Elite's eye matrices with (eye_i = E_i * H * B, concourse_vr_bake_core.h), so the bake publishes the B that puts the head at the room's centre looking along a face,
+// and every call of a window that carries Elite's base is written with it: a call at a stack address (0x2845730's copy of W+0x3330) whose pose is not the identity (Flight 51:
+// calls 0, 2 and 4 of each frame carried the base, the heap calls 1, 3 and 5 the identity). Observing, it writes nothing and records what Elite left there. Wait-free in the
+// stub: a seqlock guards the published pose, and a torn read is not written.
+constexpr unsigned kBakeCalls = 8;
+struct BakeAim {
+    std::atomic<bool> armed{false};      // the stub's one test while the bake is idle
+    std::atomic<bool> writing{false};    // a pose is published: the window's base calls are written with it
+    std::atomic<uint32_t> seq{0};        // even: the pose is whole
+    previewcam::Pose pose;
+    std::atomic<uint32_t> calls{0}, stackCalls{0}, wroteMask{0}, tornCalls{0};
+    std::atomic<uint32_t> firstReady{0};
+    bool firstStack=false,firstReadable=false;
+    float firstBefore[16]{};
+    float callT[kBakeCalls][3]{};        // each call's translation before (for the log)
+    std::atomic<uint32_t> callStackMask{0};
+} g_bakeAim;
+bool bakeReadPublished(previewcam::Pose& out) noexcept {
+    const uint32_t s1=g_bakeAim.seq.load(std::memory_order_acquire);
+    if(s1&1u)return false;
+    std::memcpy(&out,&g_bakeAim.pose,sizeof(out));
+    std::atomic_thread_fence(std::memory_order_acquire);
+    return g_bakeAim.seq.load(std::memory_order_relaxed)==s1;
+}
+// Called on the game's threads from eyeApply, after the null test. True when it wrote.
+__declspec(noinline) bool bakeEye(uintptr_t pose) noexcept {
+    const uint32_t n=g_bakeAim.calls.fetch_add(1,std::memory_order_acq_rel);
+    const auto* tib=reinterpret_cast<const NT_TIB*>(NtCurrentTeb());
+    const bool stack=pose>=reinterpret_cast<uintptr_t>(tib->StackLimit)&&pose<reinterpret_cast<uintptr_t>(tib->StackBase);
+    if(stack)g_bakeAim.stackCalls.fetch_add(1,std::memory_order_relaxed);
+    previewcam::Pose before;
+    const bool readable=previewcam::get(g_previewMemory,pose,before)&&previewcam::finite(before);
+    if(n<kBakeCalls&&readable){
+        for(unsigned c=0;c<3;++c)g_bakeAim.callT[n][c]=before.v[12+c];
+        if(stack)g_bakeAim.callStackMask.fetch_or(1u<<n,std::memory_order_relaxed);
+    }
+    if(n==0){
+        g_bakeAim.firstStack=stack;g_bakeAim.firstReadable=readable;
+        if(readable)std::memcpy(g_bakeAim.firstBefore,before.v,sizeof(g_bakeAim.firstBefore));
+        g_bakeAim.firstReady.store(1,std::memory_order_release);
+    }
+    if(!g_bakeAim.writing.load(std::memory_order_acquire)||!stack||!readable||probeIdentity(before))return false;
+    previewcam::Pose p;
+    if(!bakeReadPublished(p)||!previewcam::finite(p)){g_bakeAim.tornCalls.fetch_add(1,std::memory_order_relaxed);return false;}
+    const bool wrote=g_previewMemory.write(g_previewMemory.context,pose,&p,sizeof(p));
+    if(wrote&&n<32)g_bakeAim.wroteMask.fetch_or(1u<<n,std::memory_order_relaxed);
+    return wrote;
+}
 __declspec(noinline) bool eyeCommit(uintptr_t pose,const previewcam::EyeSnapshot& snapshot) noexcept {
     previewcam::Pose current;
     if(!previewcam::get(g_previewMemory,pose,current)||!previewcam::finite(current))return false;
@@ -187,6 +236,8 @@ void eyeApply(uintptr_t pose) noexcept {
     if(!pose)return;
     // TEMPORARY (the concourse VR probe): while it is armed it takes the call first; a pose it wrote is not the ship preview's to overwrite.
     if(g_probe.armed.load(std::memory_order_acquire)&&probeEye(pose))return;
+    // TEMPORARY (the concourse VR bake): while it is armed it sees every call; a pose it wrote is not the ship preview's to overwrite.
+    if(g_bakeAim.armed.load(std::memory_order_acquire)&&bakeEye(pose))return;
     previewcam::EyeSnapshot snapshot;
     if(!g_previewEngine.loadEye(snapshot))return;
     eyeCommit(pose,snapshot);
@@ -312,6 +363,50 @@ void nativePreviewCameraStop() noexcept {
     g_previewEngine.enable(false);
     g_probe.writing.store(false,std::memory_order_release);
     g_probe.armed.store(false,std::memory_order_release);
+    g_bakeAim.writing.store(false,std::memory_order_release);
+    g_bakeAim.armed.store(false,std::memory_order_release);
+}
+
+bool nativeCameraBakeAvailable(const char** why) {
+    const char* ignored=nullptr;
+    if(!why)why=&ignored;
+    *why=nullptr;
+    if(!g_previewAttempted){g_previewAttempted=true;g_previewInstalled=previewInstall();}
+    if(!g_previewInstalled){*why="the eye stub is not installed (the \"native preview camera:\" line says why)";return false;}
+    return true;
+}
+void nativeCameraBakeObserve(bool on) noexcept {
+    if(!on){g_bakeAim.writing.store(false,std::memory_order_release);g_bakeAim.armed.store(false,std::memory_order_release);return;}
+    if(!g_previewInstalled)return;
+    g_bakeAim.armed.store(true,std::memory_order_release);
+}
+void nativeCameraBakeAim(const float pose[16]) noexcept {
+    if(!g_previewInstalled||!pose)return;
+    g_bakeAim.seq.fetch_add(1,std::memory_order_acq_rel);   // odd: a reader in the stub refuses the pose until it is whole again
+    std::atomic_thread_fence(std::memory_order_release);
+    std::memcpy(g_bakeAim.pose.v,pose,sizeof(g_bakeAim.pose.v));
+    g_bakeAim.seq.fetch_add(1,std::memory_order_release);
+    g_bakeAim.armed.store(true,std::memory_order_release);
+    g_bakeAim.writing.store(true,std::memory_order_release);
+}
+void nativeCameraBakeStopWriting() noexcept {g_bakeAim.writing.store(false,std::memory_order_release);}
+bool nativeCameraBakeWriting() noexcept {return g_bakeAim.writing.load(std::memory_order_acquire);}
+// Present thread, once a frame: the window since the last call, then a fresh one.
+void nativeCameraBakeTick(NativeCameraBakeWindow* out) noexcept {
+    NativeCameraBakeWindow w;
+    w.armed=g_bakeAim.armed.load(std::memory_order_acquire);
+    w.calls=g_bakeAim.calls.exchange(0,std::memory_order_acq_rel);
+    w.stackCalls=g_bakeAim.stackCalls.exchange(0,std::memory_order_relaxed);
+    w.wroteMask=g_bakeAim.wroteMask.exchange(0,std::memory_order_relaxed);
+    w.torn=g_bakeAim.tornCalls.exchange(0,std::memory_order_relaxed);
+    w.stackMask=g_bakeAim.callStackMask.exchange(0,std::memory_order_relaxed);
+    if(g_bakeAim.firstReady.exchange(0,std::memory_order_acq_rel)){
+        w.firstSeen=true;w.firstStack=g_bakeAim.firstStack;w.firstReadable=g_bakeAim.firstReadable;
+        if(w.firstReadable)std::memcpy(w.firstBefore,g_bakeAim.firstBefore,sizeof(w.firstBefore));
+    }
+    const unsigned n=w.calls<kBakeCalls?w.calls:kBakeCalls;
+    for(unsigned k=0;k<n&&k<NativeCameraBakeWindow::kCalls;++k)for(unsigned c=0;c<3;++c)w.callT[k][c]=g_bakeAim.callT[k][c];
+    if(out)*out=w;
 }
 
 bool nativeCameraProbeArm(const float offset[3],uint32_t frames,uint32_t frame,const char** why) {

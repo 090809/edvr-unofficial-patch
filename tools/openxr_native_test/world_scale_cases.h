@@ -95,6 +95,8 @@ template<class Check> void runWorldScaleCases(Check&& check) {
   // ---- the readers of eyeToHead are the classified ones ----
   const std::vector<std::string> want={
     "src\\common\\native_temporal.h",          // (a) the temporal frame struct: the eye transforms as given to Elite
+    "src\\d3d11\\concourse_vr_bake_core.h",    // (a) TEMPORARY, the concourse cull's VR bake: where Elite's eye cameras land for an aimed base (the pair as Elite is given it)
+    "src\\d3d11\\optimized_station.cpp",       // (a) TEMPORARY, ... its tick: the head and the eye pair of the frame, from nativeTemporalHeadPose
     "src\\d3d11\\native_temporal.cpp",         // (a) the temporal pass's eyes: motion, the ADS eye offsets, the history reset on a moved separation
     "src\\d3d11\\srv_turret.cpp",              // (a) the SRV turret HUD's anchored move: the eyes as Elite is given them (the head and the eye matrices of the frame)
     "src\\d3d11\\srv_turret_math.h",           // (a) ... its eye frame from them (eyeFrameFrom)

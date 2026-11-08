@@ -233,4 +233,49 @@ void concoursePaneBakeFrame(ID3D11DeviceContext* ctx, ID3D11ShaderResourceView* 
 // From Present, just before the real one: keeps the back buffer, or puts the kept image back. One relaxed load when no bake runs.
 void concoursePaneBakePresent(IDXGISwapChain* swap) noexcept;
 
+// ---- The VR bake (TEMPORARY, docs\concourse-cull-2026-11-05.md "Flight 51 results"): the same cube, filled from VR's own frames --------------------------------------------
+// The cull's tick (optimized_station.cpp) aims the eye cameras through the eye stub; this half copies each eye's camera rows (VS b1 270..279) on the GPU at its first
+// recognised scene draw of a frame (SnapDraw, from vscreen.cpp's VR draw path), and at each eye's admitted tonemap draw (ToneDraw, the VR eye draw path, eye by the draw's
+// order in the frame as the proving build found it) dispatches the VR variant of the bake's shader with that eye's H (PS t1), its scene depth (depth_probe.h) and its rows.
+// The shader inverts the rows on the GPU, takes a texel only on the face the frame looks along (its own square) and inside the frame's clip, and counts per eye: the texels on
+// the face, those in this eye's view, those written (past the room's cut) and those in either eye's view. The counts and the rows are read back a few frames later (the
+// pane tick) for the cull's tick. The flat bake's shader, constants and callers are untouched; nothing here runs in the flat profile (the hooks are armed only by the VR tick).
+namespace detail {
+extern std::atomic<uint32_t> g_concourseVrBakeHooks;   // bit 0: the tone draw is handed over; bit 1: the scene draws are
+}
+inline bool concourseVrBakeToneArmed() noexcept { return (detail::g_concourseVrBakeHooks.load(std::memory_order_relaxed) & 1u) != 0; }
+inline bool concourseVrBakeSnapArmed() noexcept { return (detail::g_concourseVrBakeHooks.load(std::memory_order_relaxed) & 2u) != 0; }
+void concoursePaneVrBakeToneDraw(ID3D11DeviceContext* ctx, char kind, uint32_t count, uint32_t instances, uint32_t startInstance) noexcept;
+void concoursePaneVrBakeSnapDraw(ID3D11DeviceContext* ctx) noexcept;
+// The tone draw is looked for (no capture) while `on`; once one is admitted with an eye and its depth, Seen says so for the session, with what it was.
+struct ConcourseVrToneSeen {
+    uint32_t hdrW = 0, hdrH = 0, hdrFmt = 0, depthFmt = 0;
+};
+void concoursePaneVrBakeDiscover(bool on) noexcept;
+bool concoursePaneVrToneSeen(ConcourseVrToneSeen* what) noexcept;
+void concoursePaneVrBakeArm(bool on) noexcept;    // the cube and the VR shader are made and the cube cleared (the pane tick); no desktop hold
+bool concoursePaneVrBakeBegin() noexcept;         // the rows are copied from the next frame (the world check); false (with a line) when the cube or the shader is not ready
+// Capture from the next frame: the cube's origin (render world), each face's right, up and forward (faces[f][0..8]), the faces wanted, the frames' near plane (for the log)
+// and the room's cut (nearer the origin is not written). The people's draws are left out from now (cc::bakePeopleVs), as in flat.
+void concoursePaneVrBakeCapture(const float origin[3], const float faces[5][9], uint32_t mask, float nearM, float cutM) noexcept;
+void concoursePaneVrBakeEnd(bool publish, const char* line) noexcept;   // publish: the cube becomes the windows' view, as flat's finish; `line` is the tick's finish text
+struct ConcourseVrBakeRows {
+    uint32_t frame = 0;
+    int eye = -1;
+    float rows[10][4] = {};   // b1 270..279
+};
+struct ConcourseVrBakeCount {
+    uint32_t frame = 0;
+    bool dispatched[2] = {}, both[2] = {};   // both: the other eye's rows were this frame's (the union count is good)
+    int face[2] = {-1, -1};
+    uint32_t status[2] = {}, onFace[2] = {}, inView[2] = {}, written[2] = {}, eitherView[2] = {};
+};
+uint32_t concoursePaneVrBakeTakeRows(ConcourseVrBakeRows* out, uint32_t cap) noexcept;
+uint32_t concoursePaneVrBakeTakeCounts(ConcourseVrBakeCount* out, uint32_t cap) noexcept;
+struct ConcourseVrBakeStats {
+    uint64_t toneDraws = 0, dispatches[2] = {}, noRows = 0, noDepth = 0, refused = 0, snaps[2] = {}, snapNoCb = 0, lost = 0;
+    uint32_t firstOrder[4] = {};   // the last captured frame's order: eye 0's rows, eye 0's tone, eye 1's rows, eye 1's tone (a sequence number each; 0 not seen)
+};
+ConcourseVrBakeStats concoursePaneVrBakeStats() noexcept;
+
 }  // namespace edvr
