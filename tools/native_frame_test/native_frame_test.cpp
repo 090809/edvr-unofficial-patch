@@ -6493,7 +6493,18 @@ int wmain(int argc, wchar_t** argv) {
                   lockOn.second.reservedTerrainGuard[lw] == 1u && lockOn.second.reservedTerrainGuard[w] == 0u && lw == 17u,
               "frame generation lock: a version 12 answer carries fix.frame_generation in word 17 (1 on, 0 off), the shadow's word 18 untouched by it");
         check(both.first && both.second.reservedTerrainGuard[lw] == 1u && both.second.reservedTerrainGuard[w] == 1u,
-              "frame generation lock: both keys on: words 17 and 18 both 1");
+              "frame generation lock: both keys on: words 17 and 18 both 1");        // Phase 2.4: auto rides the same word as 2 (the gate closed) or 3 (open); a version 11 answer still leaves it zero.
+        edvr::nativeFrameSetFrameGenLockWord(2u);
+        const auto autoClosed = ask(EDVR_NATIVE_FRAME_VERSION_12, 100010);
+        edvr::nativeFrameSetFrameGenLockWord(3u);
+        const auto autoOpen = ask(EDVR_NATIVE_FRAME_VERSION_12, 100011);
+        const auto autoOpen11 = ask(EDVR_NATIVE_FRAME_VERSION_11, 100012);
+        edvr::nativeFrameSetFrameGenLockWord(0u);
+        const auto autoOff = ask(EDVR_NATIVE_FRAME_VERSION_12, 100013);
+        check(autoClosed.first && autoClosed.second.reservedTerrainGuard[lw] == 2u && autoOpen.first && autoOpen.second.reservedTerrainGuard[lw] == 3u &&
+                  autoOpen.second.reservedTerrainGuard[w] == 0u && autoOpen11.first && autoOpen11.second.reservedTerrainGuard[lw] == 0u && autoOff.first &&
+                  autoOff.second.reservedTerrainGuard[lw] == 0u,
+              "frame generation 2.4: auto rides word 17 as 2 (gate closed) or 3 (open), a version 11 answer leaves it zero, and 0 is off again");
         check(lockOn11.first && lockOn11.second.version == EDVR_NATIVE_FRAME_VERSION_11 && lockOn11.second.reservedTerrainGuard[lw] == 0u,
               "frame generation lock: a version 11 answer leaves word 17 zero whatever the key says (an older runtime reads off)");
         bool rest = true;

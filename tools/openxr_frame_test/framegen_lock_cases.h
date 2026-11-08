@@ -98,7 +98,8 @@ void gateTable() {
                       {&FrameGenLockConditions::separate, FrameGenLockReason::NotSeparate}, {&FrameGenLockConditions::projection, FrameGenLockReason::NoProjection},
                       {&FrameGenLockConditions::replay, FrameGenLockReason::NoReplay}, {&FrameGenLockConditions::noMenu, FrameGenLockReason::Menu},
                       {&FrameGenLockConditions::sFinished, FrameGenLockReason::Unfinished}, {&FrameGenLockConditions::sDelivering, FrameGenLockReason::NoS},
-                      {&FrameGenLockConditions::notDeferred, FrameGenLockReason::DeferredPacing}, {&FrameGenLockConditions::finishDone, FrameGenLockReason::FinishPending}};
+                      {&FrameGenLockConditions::notDeferred, FrameGenLockReason::DeferredPacing}, {&FrameGenLockConditions::finishDone, FrameGenLockReason::FinishPending},
+                      {&FrameGenLockConditions::admitted, FrameGenLockReason::Gate}};   // 2.4: auto with the d3d11 half's gate closed (word 17 = 2)
   uint64_t t = 3000000;
   for (const Row& r : rows) {
     FrameGenLockGate e;
@@ -116,6 +117,11 @@ void gateTable() {
   FrameGenLockConditions two = allHold();
   two.projection = false; two.notDeferred = false;
   check(frameGenLockBlocker(two) == FrameGenLockReason::NoProjection, "lock gate: two failing: the first in order is said");
+  FrameGenLockConditions closed = allHold();
+  closed.admitted = false; closed.sDelivering = false;
+  check(frameGenLockBlocker(closed) == FrameGenLockReason::NoS && std::strcmp(frameGenLockReasonName(FrameGenLockReason::Gate), "auto_gate") == 0 &&
+            static_cast<int>(FrameGenLockReason::Gate) + 1 == static_cast<int>(FrameGenLockReason::Count),
+        "lock gate: 2.4's auto_gate is tested last (Lock's own blocker is said first) and is last in the table (an older d3d11.dll reads the others as before)");
   // The runtime's period (flight 11, 18:12-18:15: disengaged, SteamVR flipped its period between 11.1 and 22.2 ms and the old blocker restarted the dwell every second).
   {
     FrameGenLockConditions halved = allHold();

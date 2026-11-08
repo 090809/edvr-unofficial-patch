@@ -878,6 +878,7 @@ extern "C" HRESULT WINAPI edvrFrameGenNoteSlot(const EdvrNativeFrameGenSlot* slo
   if(slot->size>=EDVR_NATIVE_FRAMEGEN_SLOT_SIZE_3){
     m.known=edvr::kFrameGenMonitorSlot;m.reason=slot->lockReason;m.lastSecond=slot->lastSecond==1u;
     m.sSlots=slot->sSlots;m.fromS=slot->fromS;m.lateS=slot->lateS;m.lateReal=slot->lateReal;m.slotDegMedian=slot->slotDegMedian;m.xrBytes=slot->xrBytes;
+    m.autoKnown=slot->size>=EDVR_NATIVE_FRAMEGEN_SLOT_SIZE_4;   // Phase 2.4: a runtime that reads fix.frame_generation = auto (the gate's no_runtime otherwise)
   }else m.known=edvr::kFrameGenMonitorOldSlot;
   const uint64_t nowMs=GetTickCount64();
   std::lock_guard<std::mutex> l(g_fgMu);g_fgSlot=next;g_fgMonitor=m;g_fgMonitorMs=nowMs;

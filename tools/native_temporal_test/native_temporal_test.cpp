@@ -479,8 +479,8 @@ void run(){
     fs=frame(11,22);fs.head[3]=.1f;
     float headS[12]={std::cos(a),0,std::sin(a),.11f, 0,1,0,0, -std::sin(a),0,std::cos(a),0};
     const auto slot=FrameGenSlotChannel::slot(22,1000000000,1011111111,headS,true);
-    check(slot.size==EDVR_NATIVE_FRAMEGEN_SLOT_SIZE_3&&slot.version==1&&slot.poseValid==1&&slot.consumer==1&&slot.slotTime==1011111111&&slot.lockEngaged==0,"frame generation slot: the runtime's slot carries the pose, T_S and the consumer (size 3 since the Monitor page, Lock not engaged)");
-    check(slot.lockReason==uint32_t(edvr::FrameGenLockReason::KeyOff)&&slot.lastSecond==0&&slot.slotDegMedian<0.0f&&slot.xrBytes==0,"frame generation slot: its Monitor fields default to Lock's key off, no window, no miss");
+    check(slot.size==EDVR_NATIVE_FRAMEGEN_SLOT_SIZE_4&&slot.version==1&&slot.poseValid==1&&slot.consumer==1&&slot.slotTime==1011111111&&slot.lockEngaged==0,"frame generation slot: the runtime's slot carries the pose, T_S and the consumer (size 4 since 2.4's auto, Lock not engaged)");
+    check(slot.lockReason==uint32_t(edvr::FrameGenLockReason::KeyOff)&&slot.lastSecond==0&&slot.slotDegMedian<0.0f&&slot.xrBytes==0&&slot.lockMode==0,"frame generation slot: its Monitor fields default to Lock's key off, no window, no miss, mode off");
     check(edvrFrameGenNoteSlot(&slot)==S_OK,"frame generation slot: the provider takes a version 1 slot");
     begin(t,fs);treat(t,22,0,source.Get());
     float rot[9],tr[3];edvr::frameGenSlotStep(headS,fs.head,fs.eyeToHead[0],rot,tr);
@@ -516,8 +516,8 @@ void run(){
     check(none.poseValid==0&&none.slotTime==0,"frame generation slot: no T_S means no pose, whatever head is passed");
     // Phase 2.3: Lock's bit rides a size 2 slot. Engaged: the treat of that very pair reads it; a size 1 slot (a 2.2 runtime) is read as not engaged whatever its bytes past
     // size 1 say; a slot for another pair is not this treat's; the next treat without a slot reads not engaged.
-    check(EDVR_NATIVE_FRAMEGEN_SLOT_SIZE_1==88u&&EDVR_NATIVE_FRAMEGEN_SLOT_SIZE_2==96u&&EDVR_NATIVE_FRAMEGEN_SLOT_SIZE_3==136u,
-          "frame generation lock: the slot's size 1 is 2.2's 88 bytes, size 2 adds the lock word (96), size 3 the Monitor page's fields (136)");
+    check(EDVR_NATIVE_FRAMEGEN_SLOT_SIZE_1==88u&&EDVR_NATIVE_FRAMEGEN_SLOT_SIZE_2==96u&&EDVR_NATIVE_FRAMEGEN_SLOT_SIZE_3==136u&&EDVR_NATIVE_FRAMEGEN_SLOT_SIZE_4==144u,
+          "frame generation lock: the slot's size 1 is 2.2's 88 bytes, size 2 adds the lock word (96), size 3 the Monitor page's fields (136), size 4 the mode (144)");
     auto locked=FrameGenSlotChannel::slot(27,1000000000,1011111111,headS,true,true);
     check(locked.lockEngaged==1&&edvrFrameGenNoteSlot(&locked)==S_OK,"frame generation lock: an engaged slot is handed and taken");
     fs=frame(11,27);begin(t,fs);treat(t,27,0,source.Get());
@@ -536,7 +536,10 @@ void run(){
       check(edvrFrameGenNoteSlot(&m3)==S_OK,"frame generation monitor: a size 3 slot is taken");
       const edvr::FrameGenMonitorRuntime got=edvr::nativeTemporalFrameGenMonitor();
       check(got.known==edvr::kFrameGenMonitorSlot&&got.reason==uint32_t(edvr::FrameGenLockReason::NoS)&&got.lastSecond&&got.sSlots==45&&got.fromS==44&&got.lateS==1&&
-            got.lateReal==2&&got.slotDegMedian==0.5f&&got.xrBytes==1234&&got.ageMs<1000,"frame generation monitor: ...and the page reads its fields as handed");
+            got.lateReal==2&&got.slotDegMedian==0.5f&&got.xrBytes==1234&&got.ageMs<1000&&got.autoKnown,"frame generation monitor: ...and the page reads its fields as handed (a size 4 slot: the runtime knows auto)");
+      auto m3only=m3;m3only.sequence=32;m3only.size=EDVR_NATIVE_FRAMEGEN_SLOT_SIZE_3;m3only.lockMode=1;
+      check(edvrFrameGenNoteSlot(&m3only)==S_OK&&edvr::nativeTemporalFrameGenMonitor().known==edvr::kFrameGenMonitorSlot&&!edvr::nativeTemporalFrameGenMonitor().autoKnown,
+            "frame generation 2.4: a size 3 slot (a 2.3 runtime with the Monitor fields) reads as not knowing auto, whatever lies past its size");
       auto m2=m3;m2.sequence=31;m2.size=EDVR_NATIVE_FRAMEGEN_SLOT_SIZE_2;
       check(edvrFrameGenNoteSlot(&m2)==S_OK,"frame generation monitor: a size 2 slot (a 2.3 runtime) is taken");
       const edvr::FrameGenMonitorRuntime old=edvr::nativeTemporalFrameGenMonitor();

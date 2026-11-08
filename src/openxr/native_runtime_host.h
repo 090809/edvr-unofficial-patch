@@ -67,6 +67,7 @@
 #include "../common/native_temporal.h"        // frame generation 2.2: the slot channel's structs
 #include "framegen_slot_transfer.h"
 #include "framegen_lock.h"   // frame generation 2.3: Lock 2:1, the gate and the S slot
+#include "../common/framegen_gate.h"   // frame generation 2.4: word 17's values (auto)
 #include "head_track_probe.h"   // F87h: the headset's tracking, one line a second (read only)
 #include "view_fov_note.h"   // F194: the views' field of view, said at the first located views and when it changes
 #include "pose_gap.h"
@@ -618,6 +619,7 @@ class NativeRuntimeHost : public SystemSource, public FrameSink, public Composit
     uint32_t unfinishedSaid=~0u;      // Phase 2.3b: the why of the last "not finished" line (~0: none said since the key went on)
     // The Monitor page (the slot's size 3): the last closed one-second window's counts, as its line said them. lastValid false until one closes after the key went on.
     bool lastValid=false;uint32_t lastSSlots=0,lastFromS=0,lastLateS=0,lastLateReal=0;
+    bool armedAuto=false;             // Phase 2.4: the armed line last said auto (said again when the key moves between on and auto)
   } framegenLock;
   float framegenPoseLastSlotDeg=-1.0f;   // the Monitor page: slot_deg's median from the pose probe's last window line (negative: none)
   // Diagnostic only (docs/linux-native-openxr-launch-centre-2026-09-22.md).
@@ -2954,11 +2956,12 @@ class NativeRuntimeHost : public SystemSource, public FrameSink, public Composit
     return features.acquired()&&featureFrameKnown&&featureFrame.version>=EDVR_NATIVE_FRAME_VERSION_12&&
       featureFrame.reservedTerrainGuard[EDVR_NATIVE_FRAME_FRAMEGEN_SHADOW_WORD]==1u;
   }
-  // Frame generation, Phase 2.3: fix.frame_generation (Lock) in word 17 of a version 12 answer (native_frame.h); a d3d11.dll from before 2.3 leaves it zero: off.
-  bool framegenLockKeyOn() const {
-    return features.acquired()&&featureFrameKnown&&featureFrame.version>=EDVR_NATIVE_FRAME_VERSION_12&&
-      featureFrame.reservedTerrainGuard[EDVR_NATIVE_FRAME_FRAMEGEN_LOCK_WORD]==1u;
+  // Frame generation, Phase 2.3: fix.frame_generation (Lock) in word 17 of a version 12 answer (native_frame.h); a d3d11.dll from before 2.3 leaves it zero: off. Phase 2.4: 1 on,
+  // 2 auto with the d3d11 half's gate closed, 3 auto with it open (framegen_gate.h); any of them arms Lock and runs the synthesizer and the slot.
+  uint32_t framegenLockWord() const {
+    return features.acquired()&&featureFrameKnown&&featureFrame.version>=EDVR_NATIVE_FRAME_VERSION_12?featureFrame.reservedTerrainGuard[EDVR_NATIVE_FRAME_FRAMEGEN_LOCK_WORD]:0u;
   }
+  bool framegenLockKeyOn() const {return frameGenWordArmed(framegenLockWord());}
   // Either key runs the synthesizer, its slot pose and S's transfer, and the pose measure (H6).
   bool framegenSynthKeyOn() const {return framegenShadowOn()||framegenLockKeyOn();}
   // Owner thread, at a real frame's second Submit (submitEyeAdmitted, where the pair becomes ready): t0 is now, T and P the frame's display time and period (boundary.frame()),
@@ -3057,6 +3060,7 @@ class NativeRuntimeHost : public SystemSource, public FrameSink, public Composit
     slot.sSlots=fl.lastSSlots;slot.fromS=fl.lastFromS;slot.lateS=fl.lastLateS;slot.lateReal=fl.lastLateReal;
     slot.slotDegMedian=framegenPoseLastSlotDeg;
     slot.xrBytes=fs.eyes[0].xrBytes()+fs.eyes[1].xrBytes();
+    slot.lockMode=uint32_t(frameGenWordMode(framegenLockWord()));   // size 4 (2.4): this runtime reads auto
     fs.channel.hand(slot);
   }
   // After an eye's treat returned (capture()): what the d3d11 half built for this pair's slot. A produced S opens (or keeps) the eye's transfer and waits for the pair's finish.
@@ -3139,7 +3143,7 @@ class NativeRuntimeHost : public SystemSource, public FrameSink, public Composit
     if(fl.window.fromB)nativeTracePuts(formatFrameGenLockReplay(fl.window).c_str());
     fl.gate.reset();fl.delivery=FrameGenSDelivery{};fl.window.reset();
     fl.was=false;fl.windowUs=fl.lastStepUs=0;fl.lastPairSequence=fl.deliveryNotedFor=0;fl.slotRan=false;fl.headFor=0;fl.headValid=false;
-    fl.menuFor=0;fl.unfinishedSaid=~0u;
+    fl.menuFor=0;fl.unfinishedSaid=~0u;fl.armedAuto=false;
     fl.lastValid=false;fl.lastSSlots=fl.lastFromS=fl.lastLateS=fl.lastLateReal=0;
     fl.sCapture.reset();
   }
@@ -3148,14 +3152,20 @@ class NativeRuntimeHost : public SystemSource, public FrameSink, public Composit
   // one-second line are said here.
   void framegenLockPairBoundary() {
     auto& fl=framegenLock;
-    const bool key=framegenLockKeyOn();
+    const uint32_t word=framegenLockWord();
+    const bool key=frameGenWordArmed(word);
     if(!key&&!fl.was)return;
     if(GetCurrentThreadId()!=ownerThread)return;
     if(!key){framegenLockOff();return;}
     const uint64_t nowUs=frameCycleUs();
+    const bool autoMode=frameGenWordMode(word)==FrameGenMode::Auto;
     if(!fl.was) {
       fl.was=true;fl.gate.reset();fl.window.reset();fl.windowUs=fl.lastStepUs=nowUs;
-      nativeTracePuts(kFrameGenLockArmedFmt);
+      fl.armedAuto=autoMode;
+      nativeTracePuts(autoMode?kFrameGenLockArmedAutoFmt:kFrameGenLockArmedFmt);
+    } else if(autoMode!=fl.armedAuto) {   // 2.4: the key moved between on and auto (the gate and the window carry on)
+      fl.armedAuto=autoMode;
+      nativeTracePuts(autoMode?kFrameGenLockArmedAutoFmt:kFrameGenLockArmedFmt);
     }
     auto& fs=framegenSlot;
     framegenSlotConsume();   // an S still pending at the pair's finish is taken now (a zero timeout) before its delivery is noted
@@ -3186,6 +3196,7 @@ class NativeRuntimeHost : public SystemSource, public FrameSink, public Composit
     c.notDeferred=!(featureFrameKnown&&featureFrame.deferredPacing)&&!boundary.deferred();
     c.periodDisplay=frameGenLockPeriodIsDisplay(period,displayNs);
     c.finishDone=!pendingFrameEndFinish;
+    c.admitted=frameGenWordAdmits(word);   // 2.4: on, or auto with the d3d11 half's performance gate open (auto_gate otherwise)
     if(fl.gate.engaged())fl.window.engagedSeconds+=double(nowUs-fl.lastStepUs)/1.0e6;
     fl.lastStepUs=nowUs;
     fl.slotRan=false;

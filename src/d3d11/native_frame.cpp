@@ -64,7 +64,7 @@ uint32_t g_lookReset = 0;   // F25: the reset serial
 float g_eyeAlign[3] = {};
 uint32_t g_eyeAlignSerial = 0;
 std::atomic<bool> g_frameGenShadow{false};   // fix.frame_generation_shadow, carried in version 12 output
-std::atomic<bool> g_frameGenLock{false};     // fix.frame_generation (Phase 2.3), carried in version 12 output's word 17
+std::atomic<uint32_t> g_frameGenLock{0};     // fix.frame_generation (Phase 2.3; 2.4: framegen_gate.h kFrameGenWord*), carried in version 12 output's word 17
 std::atomic<uint32_t> g_nowPoseMode{0};   // F40/F42: fix.now_pose (0 next, 1 render, 2 render_locked), carried in version 9 output
 float g_rotCal[2] = {};   // F61 (TEMPORARY): the rotation calibration's seated yaw and pitch (radians), version 9 output only (guarded by g_mutex)
 float g_adsPitch = 0.0f;  // F62b (TEMPORARY): the ADS head-aim's seated pitch (radians), version 10 output only (guarded by g_mutex)
@@ -435,9 +435,11 @@ HRESULT WINAPI beginFrame(void* context, const EdvrNativeFrameInput* input,
         // Frame generation, Phase 1: fix.frame_generation_shadow, in a version 12 answer only (an older shape leaves the word zero: the runtime reads off).
         if (wantsEyeAlign && output->version == EDVR_NATIVE_FRAME_VERSION_12 && g_frameGenShadow.load(std::memory_order_relaxed))
             result.reservedTerrainGuard[EDVR_NATIVE_FRAME_FRAMEGEN_SHADOW_WORD] = 1u;
-        // Frame generation, Phase 2.3: fix.frame_generation (Lock), in a version 12 answer only, word 17 (an older shape leaves it zero: the runtime reads off).
-        if (wantsEyeAlign && output->version == EDVR_NATIVE_FRAME_VERSION_12 && g_frameGenLock.load(std::memory_order_relaxed))
-            result.reservedTerrainGuard[EDVR_NATIVE_FRAME_FRAMEGEN_LOCK_WORD] = 1u;
+        // Frame generation, Phase 2.3: fix.frame_generation (Lock), in a version 12 answer only, word 17 (an older shape leaves it zero: the runtime reads off). Phase 2.4: 2 or 3 in auto.
+        if (wantsEyeAlign && output->version == EDVR_NATIVE_FRAME_VERSION_12) {
+            const uint32_t lockWord = g_frameGenLock.load(std::memory_order_relaxed);
+            if (lockWord) result.reservedTerrainGuard[EDVR_NATIVE_FRAME_FRAMEGEN_LOCK_WORD] = lockWord;
+        }
     }
     // The old Explorer Cam's headset offset (headOffset, yawRadians,
     // offsetEnabled, offsetGamePoses) is retired: those slots stay zero, so a
@@ -691,7 +693,8 @@ void nativeFrameSetLookYaw(float total, uint32_t gameFrame, uint32_t resetSerial
 }
 
 void nativeFrameSetFrameGenShadow(bool on) { g_frameGenShadow.store(on, std::memory_order_relaxed); }
-void nativeFrameSetFrameGenLock(bool on) { g_frameGenLock.store(on, std::memory_order_relaxed); }
+void nativeFrameSetFrameGenLock(bool on) { g_frameGenLock.store(on ? 1u : 0u, std::memory_order_relaxed); }
+void nativeFrameSetFrameGenLockWord(uint32_t word) { g_frameGenLock.store(word, std::memory_order_relaxed); }
 // F33: the body-align translation the next version 8 beginFrame hands the runtime.
 // F40/F42: fix.now_pose from the config (readKey): 0 next, 1 render, 2 render_locked. Logged at the first value and at each change.
 void nativeFrameSetNowPose(uint32_t mode) {

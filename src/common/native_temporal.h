@@ -95,10 +95,15 @@ struct EdvrNativeFrameGenSlot {
   float slotDegMedian;          // the head pose's miss at S's slot, degrees, median over the pose probe's last window (slot_deg); negative: none
   uint32_t reserved3;
   uint64_t xrBytes;             // the XR device's bytes the S transfers hold now (both eyes)
+  // Size 4 (Phase 2.4, fix.frame_generation = auto): the mode the runtime runs, read from word 17 (framegen_gate.h FrameGenMode: 0 off, 1 auto, 2 on). A smaller slot comes from a
+  // runtime that reads auto as off: the d3d11 half's gate says so once and holds frame generation off. The version stays 1.
+  uint32_t lockMode;
+  uint32_t reserved4;
 };
 #define EDVR_NATIVE_FRAMEGEN_SLOT_SIZE_1 ((uint32_t)offsetof(EdvrNativeFrameGenSlot, lockEngaged))
 #define EDVR_NATIVE_FRAMEGEN_SLOT_SIZE_2 ((uint32_t)offsetof(EdvrNativeFrameGenSlot, lockReason))
-#define EDVR_NATIVE_FRAMEGEN_SLOT_SIZE_3 ((uint32_t)sizeof(EdvrNativeFrameGenSlot))
+#define EDVR_NATIVE_FRAMEGEN_SLOT_SIZE_3 ((uint32_t)offsetof(EdvrNativeFrameGenSlot, lockMode))
+#define EDVR_NATIVE_FRAMEGEN_SLOT_SIZE_4 ((uint32_t)sizeof(EdvrNativeFrameGenSlot))
 // The state of one eye's S after its treat.
 #define EDVR_NATIVE_FRAMEGEN_S_NONE 0u       // no S built for this sequence
 #define EDVR_NATIVE_FRAMEGEN_S_PRODUCED 1u   // S written and published (the producer texture's key released to 1): the runtime consumes it

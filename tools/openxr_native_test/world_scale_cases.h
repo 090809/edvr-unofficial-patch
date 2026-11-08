@@ -125,13 +125,13 @@ template<class Check> void runWorldScaleCases(Check&& check) {
     const size_t afterWait=host.find("    framegenLockAfterWait();   // frame generation 2.3");
     check(boundaryAt!=std::string::npos&&intro<boundaryAt&&boundaryAt<retire&&retire<gameWait&&gameWait<afterWait&&afterWait!=std::string::npos,
           "frame generation lock wiring: the pair boundary runs after WaitGetPoses' early returns and before the game's wait; the late count after it");
-    check(has(host,"    const bool key=framegenLockKeyOn();\n    if(!key&&!fl.was)return;")&&has(host,"  void framegenLockAfterWait() {\n    auto& fl=framegenLock;\n    if(!fl.slotRan)return;")&&
+    check(has(host,"    const uint32_t word=framegenLockWord();\n    const bool key=frameGenWordArmed(word);\n    if(!key&&!fl.was)return;")&&has(host,"  void framegenLockAfterWait() {\n    auto& fl=framegenLock;\n    if(!fl.slotRan)return;")&&
               has(host,"    if(framegenLock.was)framegenLock.lastPairSequence=0;")&&has(host,"    if(framegenLock.was&&result==XR_SUCCESS&&pixels&&!frameWithheld) {")&&
               has(host,"    if(!fl.was||!previousPairValid)return XR_ERROR_FUNCTION_UNSUPPORTED;"),
           "frame generation lock wiring: with the key off (and never on) every hook returns before it touches anything");
     check(has(host,"FrameGenLockConditions c;")&&has(host,"c.notDeferred=!(featureFrameKnown&&featureFrame.deferredPacing)&&!boundary.deferred();")&&
-              has(host,"c.finishDone=!pendingFrameEndFinish;")&&has(host,"c.projection=fl.lastPairSequence!=0&&fl.lastPairSequence==activeFrameSequence&&!state.frameOpen()&&!frameWithheld;"),
-          "frame generation lock wiring: Lock stands aside for deferred pacing, waits for an overlapped finish, and follows only a fresh pair with no frame open");
+              has(host,"c.finishDone=!pendingFrameEndFinish;")&&has(host,"c.admitted=frameGenWordAdmits(word);")&&has(host,"c.projection=fl.lastPairSequence!=0&&fl.lastPairSequence==activeFrameSequence&&!state.frameOpen()&&!frameWithheld;"),
+          "frame generation lock wiring: Lock stands aside for deferred pacing, waits for an overlapped finish, follows only a fresh pair with no frame open, and (2.4) engages in auto only while word 17 admits it");
   }
 }
 } // namespace edvr::openxr::test
