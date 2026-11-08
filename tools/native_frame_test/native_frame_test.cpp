@@ -4600,7 +4600,7 @@ int wmain(int argc, wchar_t** argv) {
                           nf::supportItem("$wpn_rifle_name;") == nf::kSupportNone &&
                           nf::gameAuthoredLeftArm("$humanoid_rechargetool_name;") &&
                           nf::gameAuthoredLeftArm("$humanoid_companalyser_name;") &&
-                          nf::gameAuthoredLeftArm("$humanoid_sampletool_name;") &&
+                          !nf::gameAuthoredLeftArm("$humanoid_sampletool_name;") &&
                           nf::supportItem("$humanoid_sampletool_name;") == nf::kSupportNone &&
                           !nf::gameAuthoredLeftArm("$humanoid_repairtool_name;") &&
                           !nf::gameAuthoredLeftArm("$wpn_s_pistol_name;"),

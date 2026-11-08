@@ -11106,7 +11106,10 @@ OpticHeldItemPub g_opticHeldItem;
 bool opticItemRead(uint32_t* serial, char name[64]) noexcept;
 std::atomic<uint8_t> g_supportCupMode{nofoot::kSupportNone};
 std::atomic<bool> g_arcCutterHeld{false};          // F221: the held item is the arc cutter (the left elbow hangs from the body-down pole)
-std::atomic<bool> g_gameAuthoredLeftArm{false};   // Energy Link, Profile Analyser and Genetic Sampler: preserve the game's relaxed left-arm pose
+std::atomic<bool> g_gameAuthoredLeftArm{false};   // Energy Link and Profile Analyser: preserve the game's relaxed left-arm pose
+// F69h's distance rule for the held item (nofoot::offHandLimits): kOffHandMaxM both ways but for the Genetic Sampler. Set with the item, read by the pose hook.
+std::atomic<float> g_offHandAcquireM{static_cast<float>(nofoot::kOffHandMaxM)};
+std::atomic<float> g_offHandReleaseM{static_cast<float>(nofoot::kOffHandMaxM)};
 void pinInPublish(const float cam[3], const float camRaw[3], const float weaponViewWorld[3], const float m3p[16], uint64_t nowMs, double f94SeatedY,
                   uint8_t f94Source, const double f137Seated[3], uint8_t f137Source) noexcept {
     double localPitchRad = 0.0;
@@ -14390,6 +14393,8 @@ void f66ArmedStep(uint64_t now, double dt) noexcept {
     if (!active) {
         g_supportCupMode.store(nofoot::kSupportNone, std::memory_order_relaxed);
         g_gameAuthoredLeftArm.store(false, std::memory_order_relaxed);
+        g_offHandAcquireM.store(static_cast<float>(nofoot::kOffHandMaxM), std::memory_order_relaxed);
+        g_offHandReleaseM.store(static_cast<float>(nofoot::kOffHandMaxM), std::memory_order_relaxed);
         g_arcCutterHeld.store(false, std::memory_order_relaxed);
         g_f66aKindLast = -1;
         g_f66aNameLast[0] = '\0';
@@ -14400,6 +14405,11 @@ void f66ArmedStep(uint64_t now, double dt) noexcept {
                         kind == kHeldUnknown ? " [unknown]" : kind == kHeldNone ? " [fists]" : "", nativePrimary ? " [native primary selection]" : "", journalStatusSamples());
         g_supportCupMode.store(static_cast<uint8_t>(nofoot::supportItem(name)), std::memory_order_relaxed);
         g_gameAuthoredLeftArm.store(nofoot::gameAuthoredLeftArm(name), std::memory_order_relaxed);
+        {
+            const nofoot::OffHandLimits lim = nofoot::offHandLimits(name);
+            g_offHandAcquireM.store(static_cast<float>(lim.acquireM), std::memory_order_relaxed);
+            g_offHandReleaseM.store(static_cast<float>(lim.releaseM), std::memory_order_relaxed);
+        }
         g_arcCutterHeld.store(nofoot::f221::arcCutter(name), std::memory_order_relaxed);
         if (g_f66aKindLast >= 0) f68dFlip(now, static_cast<int>(kind), name);   // F68d: the onset window (not for the first reading)
         g_f66aKindLast = static_cast<int>(kind);
@@ -20917,7 +20927,8 @@ void armIkAfterAnimate(uint64_t x, const PfzSpan& sp, bool froze) noexcept {
         const bool offStaleOnly = armsOk && fpHandsGenerationOk && fpHands.valid[0] && fpHands.valid[1] && fpAge > nofoot::kIkPoseDeviationMaxGapMs;
         offOut = s_off.step(dtOff, armedNow, offInputValid, fpm[0], fpm[1], !(relaxLeftArmForItem && !f83JournalPolicyHold), poseFrame,
                             itemSerialForCall, pl.generation, fpHands.x, fpHands.generation,
-                            f83NativeEpochIdentity ? f83SelectionForCall.epoch : 0, f83SelectionSuspended, offStaleOnly);
+                            f83NativeEpochIdentity ? f83SelectionForCall.epoch : 0, f83SelectionSuspended, offStaleOnly,
+                            nofoot::OffHandLimits{g_offHandAcquireM.load(std::memory_order_relaxed), g_offHandReleaseM.load(std::memory_order_relaxed)});
         if (!armedNow) s_offTwoPrev = false;
     }
     const bool physicalPoleActive = armedNow && armsOk && mode == 3 && writeOk;
@@ -25079,11 +25090,11 @@ void f67fLine(uint64_t now) noexcept {
         journalHeldItemName(nm, sizeof(nm));
         const double on = w.offN ? static_cast<double>(w.offN) : 1.0;
         Log::get().note("native on foot off hand (F69h): item \"%s\": %llu armed calls with both FP attaches read (%llu unread): the FP left handAttach (52) to the right "
-                        "(51) mean %.1f min %.1f max %.1f cm (two-handed within %.0f cm; the rifle's pair is 32.6); 52's orientation against 51 changed at most %.1f deg over "
+                        "(51) mean %.1f min %.1f max %.1f cm (two-handed within %.0f cm, released past %.0f; the rifle's pair is 32.6); 52's orientation against 51 changed at most %.1f deg over "
                         "the last %u frames (steady under %.0f); decision two-handed %llu, off hand free (weight 0: the game's own 3P arm) %llu, ramping %llu; decision "
                         "flips %llu; off arm weight mean %.2f",
                         nm, static_cast<unsigned long long>(w.offN), static_cast<unsigned long long>(w.offUnread), w.offDistSum / on, w.offDistMin, w.offDistMax,
-                        100.0 * nofoot::kOffHandMaxM, w.offChangeMax, nofoot::kOffHandSteadyFrames, nofoot::kOffHandSteadyDeg, static_cast<unsigned long long>(w.offTwo),
+                        100.0 * g_offHandAcquireM.load(std::memory_order_relaxed), 100.0 * g_offHandReleaseM.load(std::memory_order_relaxed), w.offChangeMax, nofoot::kOffHandSteadyFrames, nofoot::kOffHandSteadyDeg, static_cast<unsigned long long>(w.offTwo),
                         static_cast<unsigned long long>(w.offFree), static_cast<unsigned long long>(w.offRamp), static_cast<unsigned long long>(w.offFlips), w.offWSum / on);
     }
 }

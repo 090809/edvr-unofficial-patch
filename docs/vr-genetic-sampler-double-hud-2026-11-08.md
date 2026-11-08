@@ -12,14 +12,17 @@
   the bright HUD (radar, suit energy, the ring) (+607, +69) native px away,
   about 17 deg, with only the HUD's dark backing left at the right place. The
   left eye is right. 30 earlier dumps with other items agree within 5 px.
-- **Its shape:** the right eye's HUD is placed as if from a camera about
-  5.8 cm to the side (the eye separation, 55.1 mm here) through the right
-  eye's own projection. The patched draws line up with it: `marker_bound` in
+- **Its shape:** each eye's composited HUD lands outward of the game's (the
+  right eye's to the right, the left eye's to the left), by a size that varies:
+  607 px, then 288 and 126 (native, right eye). `marker_bound` in
   decisions.json is [3, 0] in R00 (right) and [3, 3] from R01 (displaced).
-- **Fixed, not flown:** the left arm. `gameAuthoredLeftArm` did not name the
-  sampler, so the two-hand detector pulled the left hand (elbow 28 cm over the
-  hand, grip losses to 33 cm). Now it keeps the game's left arm, as the
-  Energylink and Profile Analyser do.
+- **The left arm, two flights.** The two-hand detector acquires within
+  kOffHandMaxM (40 cm), and the sampler's resting left hand sits at 40.0 cm,
+  so it flapped (elbow 28 cm over the hand). ea13030c vetoed it (flown OK: the
+  left arm wrote on 26 of 7131 calls), but the left hand also takes the
+  canister out after the third sample (18 to 26 cm), and that came out with no
+  hand. The build after it gives the sampler its own limits instead: acquire
+  within 32 cm, release past 35 (`offHandLimits`). Not flown.
 - **Held higher: the game's pose.** At level aim the game holds the sampler
   3.6 cm higher and 5.4 cm nearer its camera than the Profile Analyser, and
   EDVR adds the same offsets to both. A per-item correction is Sean's call.
@@ -46,10 +49,11 @@ SWAPPED, 0 untold), aim-space reprojection (head 4.6 deg from the aim), the
 viewport remap, the marker fix's logged move (+0.00003 NDC), the label
 features (F95b, F97b, F98b), and F151's place bind (0 bound by place).
 
-**Next flight** (the arm-fix build): native on foot, detail log on, sampler
-in sample mode. Check the left arm and the height. When the HUD doubles, take
-an eye dump, set the marker fix off and dump again, then UI quality off and
-dump again, then put both back.
+**Next flight** (the limits build): native on foot, detail log on. Take three
+samples: the left hand should take the canister out, and rest otherwise (the
+F69h line: `decision two-handed` only around the canister). When the HUD
+doubles, take an eye dump, set the marker fix off and dump again, then UI
+quality off and dump again, then put both back.
 
 ## Journal
 
@@ -195,4 +199,42 @@ third term differs (+0.2014 against -0.1548). The right eye's shift,
 which is the eye separation (Elite's 55.1 mm at world scale 110%). Swapping in
 the left eye's row 4 would give 0.356 instead. So the right eye's redirected
 HUD is placed as if from the left eye's camera position, through the right
-eye's own projection.
+eye's own projection. (Retracted the same day: see the next entry, where the
+size varies.)
+
+### 2026-11-08: the second flight (ea13030c, Frontier)
+
+Log `edvr_gfx_20261108_142644`, build v0.22.0-rc.7-241-gea13030c (main
+merged, the sampler in `gameAuthoredLeftArm`), recording `20261108_143436`,
+dumps `143515440001` (approaching a site) and `143543183003` (the canister),
+each with an airborne companion. Journal offset about 21.5 s again. Six
+samples over three sites; the third sample of the last site at about
+14:35:45.5, its Analyse at about 14:35:52.5. F9 at 14:35:42.55.
+
+The left arm at rest: fixed. The arm wrote on 26 of 7131 calls (2479 of 5353
+in the first flight), and F218/F219/F221 found nothing.
+
+The canister: `143543183003` shows it floating beside the sampler with no
+hand. F69h's line gives the FP left handAttach to the right as 40.0 cm at
+rest (37.9 to 40.7 over the flight, on kOffHandMaxM), 18 to 26 cm from
+14:35:41.6 to 14:35:51 (held at 25.8), then 40 again. `armed arms (F67f)`
+reads `L solved 0 ... the off hand is free (F69h)` through all of it. The
+veto kept the 3P left arm out of the game's canister animation.
+
+- ruled out: the sampler as a tool whose left hand never holds anything,
+  because its FP left hand comes to 18-26 cm and holds the canister after the
+  third sample.
+
+The double: `143515440001` shows it in both eyes. L00, composited, has two
+radars, two top bars, two vitals panels and two "READY TO SAMPLE" rings, the
+bright copy about 105 px (overview scale, about 420 native) left of the dark
+one. R00 had its composite skipped and is single; R01 to R15 sit 288 px right
+and about 50 px up of it. So both eyes' composited HUDs land outward, and by
+a different size from the first flight's 607 px. That rules out a fixed
+eye-separation error (a 0.19 m point from the other eye). The A/B switches
+were not flown.
+
+The readout in `143543183003`'s overviews looks vertically apart between the
+eyes (about 60 overview px). R00 is a composite-skipped frame, so its readout
+is the game's unpinned one. This is not evidence until a composited pair is
+compared, and the readout lies outside the dump's centre crops.
