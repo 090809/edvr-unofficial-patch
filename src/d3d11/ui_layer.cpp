@@ -1124,8 +1124,8 @@ void appendPrice(std::string& s, size_t stat) {
         s += "-";
         return;
     }
-    const double p95 = uiLayerPercentile(r.v, r.n, 0.95);  // sorts; the median reads the same order
-    const double med = uiLayerSortedPercentile(r.v, r.n, 0.5);
+    const double p95 = uiLayerPercentileSelect(r.v, r.n, 0.95);  // selection, not a sort: same numbers, O(n)
+    const double med = uiLayerPercentileSelect(r.v, r.n, 0.5);
     char buf[64];
     _snprintf_s(buf, sizeof(buf), _TRUNCATE, "%.3f/%.3f (%u)", med, p95, r.n);
     s += buf;
@@ -1134,9 +1134,9 @@ void appendPrice(std::string& s, size_t stat) {
 uint64_t g_winStartMs = 0;
 uint64_t g_sessionRedirected = 0;
 // Phase-0 timing (src/common/periodic_work.h) of the 30 s totals and price
-// lines, built on Elite's thread at the frame boundary: appendPrice sorts up
+// lines, built on Elite's thread at the frame boundary: appendPrice selects the median and p95 of up
 // to kRouteSamples floats for each of the price stats. Context: the samples
-// held then (what the sorts had to order). One run per window that logs, so
+// held then (what the selection had to scan). One run per window that logs, so
 // nothing is written while fix.ui_quality is off and nothing was redirected.
 PeriodicWork g_workTotals{"ui_layer_totals", "samples"};
 

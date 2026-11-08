@@ -945,6 +945,50 @@ void testGate() {
                   uiLayerSortedPercentile(nullptr, 0, 0.5) == 0.0 &&
                   uiLayerSortedPercentile(one, 1, 0.5) == 0.25,
               "full 8192-sample route window reuses its sort with unchanged interpolation");
+        {
+            // The price line's median/p95 by selection must print the very text the sorted definition printed. Fixtures: empty, 1, 2,
+            // odd and even counts, ties, all-equal, ascending/descending, a full 8192 window, and a pseudo-random one. (No NaN: a
+            // route sum is a finite timer difference, and std::sort on NaN is undefined anyway.)
+            auto priceText = [](double med, double p95, uint32_t n) {
+                char buf[64];
+                _snprintf_s(buf, sizeof(buf), _TRUNCATE, "%.3f/%.3f (%u)", med, p95, n);
+                return std::string(buf);
+            };
+            std::vector<std::vector<float>> sets;
+            sets.push_back({});
+            sets.push_back({0.25f});
+            sets.push_back({0.9f, 0.1f});
+            sets.push_back({3.f, 1.f, 2.f});
+            sets.push_back({4.f, 1.f, 3.f, 2.f});
+            sets.push_back({1.f, 1.f, 1.f, 2.f, 2.f, 9.f, 9.f});
+            sets.push_back(std::vector<float>(100, 0.5f));
+            {
+                std::vector<float> a, d, r;
+                uint32_t x = 12345u;
+                for (uint32_t i = 0; i < 8192; ++i) {
+                    a.push_back(static_cast<float>(i) * 0.001f);
+                    d.push_back(static_cast<float>(8191 - i) * 0.001f);
+                    x = x * 1664525u + 1013904223u;
+                    r.push_back(static_cast<float>(x >> 12) * 1e-5f);
+                }
+                sets.push_back(a);
+                sets.push_back(d);
+                sets.push_back(r);
+                for (uint32_t n : {5u, 6u, 19u, 20u, 21u, 99u, 100u, 101u, 1000u, 4097u})
+                    sets.push_back(std::vector<float>(r.begin(), r.begin() + n));
+            }
+            bool same = true;
+            for (const auto& s : sets) {
+                std::vector<float> oldV = s, newV = s;
+                const uint32_t n = static_cast<uint32_t>(s.size());
+                const double op95 = uiLayerPercentile(oldV.data(), n, 0.95);
+                const double omed = uiLayerSortedPercentile(oldV.data(), n, 0.5);
+                const double np95 = uiLayerPercentileSelect(newV.data(), n, 0.95);
+                const double nmed = uiLayerPercentileSelect(newV.data(), n, 0.5);
+                if (priceText(omed, op95, n) != priceText(nmed, np95, n) || omed != nmed || op95 != np95) same = false;
+            }
+            check(same, "price line text by selection equals the sorted text on every fixture");
+        }
         check(std::strcmp(uiRouteStageName(UiRouteStage::kSeed), "depth-stencil seed") == 0 &&
                   std::strcmp(uiRouteStageName(UiRouteStage::kComposite), "composite") == 0,
               "the price line's stage names");
