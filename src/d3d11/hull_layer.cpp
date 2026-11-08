@@ -293,7 +293,11 @@ constexpr char kTaaHlsl[] =
     "            int2 q = clamp(c + int2(dx, dy), int2(0, 0), rsz - 1);\n"
     "            float4 s = cover.Load(int3(origin.xy + q, 0));\n"
     "            float2 dd = float2(q) - jit.xy - pr;\n"
-    "            float wt = exp(-2.29 * dot(dd, dd));\n"
+    // exp(-5.0 d^2) in render pixels: sigma 0.32 render, about 0.42 output pixels at 1.33x. The temporal pass's
+    // exp(-2.29 d^2) (0.62 output pixels) left the hull visibly softer than DLSS's own hull (the pilot, 22:30). The
+    // jitter moves the samples every frame and the history (weight 0.9) averages them, so the narrow kernel's
+    // per-frame aliasing averages out while its detail stays.
+    "            float wt = exp(-5.0 * dot(dd, dd));\n"
     "            cur += s * wt;\n"
     "            wsum += wt;\n"
     "            lo = min(lo, s);\n"
