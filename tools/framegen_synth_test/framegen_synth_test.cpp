@@ -35,9 +35,11 @@
 //      a step read off a texel rings nowhere outside its two levels
 //   15 the disocclusion fill (FG_FILL_REPROJ): a world plane, farther up the image, uncovered beside a near bar carries on its texture row for row (the hole carried back by the
 //      plane's motion and stretched along it past the bar), where the background pull read each row from a different neighbour
+//   16 an orphan (FG_ORPHAN): fgSynSrc's offer withheld from one pixel of a still plane (an edit of the rig's own build) leaves a key and no read offer; the resolve counts it and
+//      makes it a hole the fill reads right, not the all-ones read 2047 px off; the production build makes none
 // Mutations (each replaces one of the shader's #define switches, or the host's f, and the case it guards must fail): f ignored, the head turn not taken out of the
 // vector, the guard off, the fill from the nearer side, the score's turn not applied, the score's turn applied the wrong way round, an edge pixel on its own vector, the
-// sentinel as a vector, S resampled bilinear, the cubic without its clamp (FG_SHARP=3), the hole fill by the background pull alone (FG_FILL_REPROJ).
+// sentinel as a vector, S resampled bilinear, the cubic without its clamp (FG_SHARP=3), the hole fill by the background pull alone (FG_FILL_REPROJ), an orphan read as its all-ones (FG_ORPHAN).
 #include <windows.h>
 #include <d3d11.h>
 #include <wrl/client.h>
@@ -194,16 +196,27 @@ struct Gpu {
     }
 };
 
-// The production text with one or more of its switches turned off, compiled for every entry; `defineName` is "FG_GUARD", or "FG_GUARD,FG_DILATE_MV", and so on.
-bool compileMutated(Gpu& g, const char* defineName, ComPtr<ID3D11ComputeShader> out[kEntries]) {
+// Case 16's forced orphan: fgSynSrc's offer withheld from the S pixel (kOrphanX, kOrphanY), which keeps its key and no read offer, as a landing fgSynSrc recomputed differently
+// from fgSynSplat's would leave it. An edit of the text the rig compiles (compileMutated's `orphan`), never of the production text.
+constexpr int kOrphanX = 40, kOrphanY = 30;
+const char* const kSrcOfferAnchor = "InterlockedMin(ReadOut[uint2(c)], ";
+
+// The production text with one or more of its switches turned off, compiled for every entry; `defineName` is "FG_GUARD", or "FG_GUARD,FG_DILATE_MV", and so on, or "" for
+// none. `orphan`: fgSynSrc never offers a read to the pixel (kOrphanX, kOrphanY) (case 16).
+bool compileMutated(Gpu& g, const char* defineName, ComPtr<ID3D11ComputeShader> out[kEntries], bool orphan = false) {
     HMODULE lib = LoadLibraryA("d3dcompiler_47.dll");
     if (!lib) { std::printf("  d3dcompiler_47.dll did not load\n"); return false; }
     using CompileFn = HRESULT(WINAPI*)(LPCVOID, SIZE_T, LPCSTR, const D3D_SHADER_MACRO*, ID3DInclude*, LPCSTR, LPCSTR, UINT, UINT, ID3DBlob**, ID3DBlob**);
     const CompileFn compile = reinterpret_cast<CompileFn>(GetProcAddress(lib, "D3DCompile"));
     if (!compile) return false;
     std::string text = frameGenSynthShaderSource();
+    if (orphan) {
+        const size_t at = text.find(kSrcOfferAnchor);
+        if (at == std::string::npos || text.find(kSrcOfferAnchor, at + 1) != std::string::npos) return false;   // exactly one offer
+        text.insert(at, "if (any(c != int2(" + std::to_string(kOrphanX) + ", " + std::to_string(kOrphanY) + "))) ");
+    }
     std::string names = defineName;   // one switch, or several separated by commas, all turned off
-    for (size_t start = 0; start <= names.size();) {
+    for (size_t start = 0; !names.empty() && start <= names.size();) {
         const size_t comma = names.find(',', start);
         std::string name = names.substr(start, comma == std::string::npos ? std::string::npos : comma - start), value = "0";
         const size_t eq = name.find('=');   // NAME=V: the switch set to V instead of 0
@@ -1731,6 +1744,53 @@ void swapOut(Gpu& g, const ComPtr<ID3D11ComputeShader> saved[kEntries]) {
     for (int i = 0; i < kEntries; ++i) g.cs[i] = saved[i];
 }
 
+// Case 16 (FG_ORPHAN, 2026-11-08): a pixel with a key and no read offer. A still world plane at 50 m (every pixel lands on itself, so S is B). The production build makes no
+// orphan there; the build with fgSynSrc's offer withheld from (kOrphanX, kOrphanY) leaves that pixel keyed with the splat's all-ones, which the resolve must make a hole: counted
+// as an orphan, filled from its neighbours (B there is their surface, so the fill reads the pixel itself), and not read 2047 px off as the all-ones unpacks. `define`: the
+// switches the forced build turns off ("" none; the mutation's "FG_ORPHAN").
+struct Orphan { bool ran = false; unsigned orphan = 0, filled = 0, left = 0, guard = 0; float err = 0.0f; };
+
+Orphan case16Orphan(Gpu& g, Scope& sc, bool report, const char* define = "") {
+    Orphan e;
+    char label[300];
+    Scene S;
+    S.gradient();
+    std::fill(S.depth.begin(), S.depth.end(), depthOf(50.0f));
+    FrameGenSynthCb cb;
+    frameGenSynthFillCb(cb, RW, RH, RW, RH, kTan, 0.0f, kDepthB, 10.0f, 0.5f, Deltas(0.0f, 0.0f, 0.0f, 0.0f).d);
+    const auto errAt = [&](const Run& r) { return std::hypot(r.at(kOrphanX, kOrphanY, 0, RW) - kOrphanX, r.at(kOrphanX, kOrphanY, 1, RW) - kOrphanY); };
+    {
+        const Run r = runSynth(g, S, cb);
+        sc.ok(r.ok, "case 16: the synthesizer ran (production)");
+        if (!r.ok) return e;
+        std::snprintf(label, sizeof(label), "case 16: the production build leaves no orphan on a still plane (orphan %u, holes %u, S at the pixel %.3f px off)",
+                      r.stats[kFrameGenSynthStatsOrphan], r.stats[kFrameGenSynthStatsFilled] + r.stats[kFrameGenSynthStatsLeft], errAt(r));
+        sc.ok(r.stats[kFrameGenSynthStatsOrphan] == 0 && r.stats[kFrameGenSynthStatsFilled] + r.stats[kFrameGenSynthStatsLeft] == 0 && errAt(r) < 1e-3f, label);
+    }
+    ComPtr<ID3D11ComputeShader> forced[kEntries], saved[kEntries];
+    const bool built = compileMutated(g, define, forced, true);
+    sc.ok(built, "case 16: the build with fgSynSrc's offer withheld from one pixel compiled (is the offer's InterlockedMin still there, once?)");
+    if (!built) return e;
+    swapIn(g, saved, forced);
+    const Run r = runSynth(g, S, cb);
+    swapOut(g, saved);
+    sc.ok(r.ok, "case 16: the synthesizer ran (the offer withheld)");
+    if (!r.ok) return e;
+    e.ran = true;
+    e.orphan = r.stats[kFrameGenSynthStatsOrphan];
+    e.filled = r.stats[kFrameGenSynthStatsFilled];
+    e.left = r.stats[kFrameGenSynthStatsLeft];
+    e.guard = r.stats[kFrameGenSynthStatsGuard];
+    e.err = errAt(r);
+    std::snprintf(label, sizeof(label), "case 16: a pixel with a key and no read offer is counted as an orphan and made a filled hole (orphan %u, filled %u, left %u, guarded %u)",
+                  e.orphan, e.filled, e.left, e.guard);
+    sc.ok(e.orphan == 1 && e.filled == 1 && e.left == 0 && e.guard == 0, label);
+    std::snprintf(label, sizeof(label), "case 16: the orphan's S reads B at its own surface, not 2047 px off (%.3f px from the pixel)", e.err);
+    sc.ok(e.err < 0.05f, label);
+    if (g_verbose && report) std::printf("  case 16: orphan %u, filled %u, left %u, guarded %u, read %.4f px off\n", e.orphan, e.filled, e.left, e.guard, e.err);
+    return e;
+}
+
 int run() {
     Gpu g;
     if (!g.init()) {
@@ -1752,7 +1812,8 @@ int run() {
     case13HullEdge(g, sc, true);
     case14Sharp(g, sc, true);
     case15Uncover(g, sc, true);
-    if (!alive("cases 1 to 5 and 13 to 15")) return 1;
+    case16Orphan(g, sc, true);
+    if (!alive("cases 1 to 5 and 13 to 16")) return 1;
     case6Module(g, sc);
     if (!alive("case 6")) return 1;
     case7Check(g, sc);
@@ -1785,7 +1846,7 @@ int run() {
 
     // The mutations: each must break its case.
     struct Mutation { const char* define; const char* what; std::function<void(Scope&)> run; unsigned fails = 0; };
-    Mutation muts[11] = {
+    Mutation muts[12] = {
         {"FG_USE_F", "f ignored (the landing uses f = 1 whatever the block says)", [&](Scope& s) { case2World(g, s); }},
         {"FG_REMOVE_HEAD", "the head turn not taken out of the vector", [&](Scope& s) { case2World(g, s); }},
         // Since the edge pixels move by the vector of the pixel whose depth they took (FG_DILATE_MV), the guard has nothing to move in case 5: it is checked on the
@@ -1801,6 +1862,7 @@ int run() {
         {"FG_SHARP", "S resampled bilinear", [&](Scope& s) { case14Sharp(g, s, false); }},
         {"FG_SHARP=3", "S's cubic resample without its ringing clamp", [&](Scope& s) { case14Sharp(g, s, false); }},
         {"FG_FILL_REPROJ", "the hole fill by the background pull alone (no reprojection, no stretch)", [&](Scope& s) { case15Uncover(g, s, false); }},
+        {"FG_ORPHAN", "an orphan (a key and no read offer) read as its all-ones, not made a hole", [&](Scope& s) { case16Orphan(g, s, false, "FG_ORPHAN"); }},
     };
     for (Mutation& m : muts) {
         ComPtr<ID3D11ComputeShader> mutated[kEntries], saved[kEntries];
@@ -1819,9 +1881,9 @@ int run() {
         if (ms.fails == 0) { ++g_failures; std::printf("FAIL: mutation: %s still passes\n", m.what); }
     }
     // Case 3 reads the head's part the same way as case 2: the head-turn mutation must break it too (a second look, not a second count).
-    std::printf("%s: %u checks, %u failures (mutations: f ignored broke %u checks, head turn not removed broke %u, guard off broke %u, fill from the nearer side broke %u, turn not applied broke %u, turn the wrong way round broke %u, own vector at an edge broke %u, sentinel as a vector broke %u, bilinear resample broke %u, unclamped cubic broke %u, background pull alone broke %u, slot pose ignored broke %u, slot step inverted broke %u)\n",
+    std::printf("%s: %u checks, %u failures (mutations: f ignored broke %u checks, head turn not removed broke %u, guard off broke %u, fill from the nearer side broke %u, turn not applied broke %u, turn the wrong way round broke %u, own vector at an edge broke %u, sentinel as a vector broke %u, bilinear resample broke %u, unclamped cubic broke %u, background pull alone broke %u, orphan not a hole broke %u, slot pose ignored broke %u, slot step inverted broke %u)\n",
                 g_failures ? "FAIL" : "PASS", g_checks, g_failures, muts[0].fails, muts[1].fails, muts[2].fails, muts[3].fails, muts[4].fails, muts[5].fails, muts[6].fails, muts[7].fails,
-                muts[8].fails, muts[9].fails, muts[10].fails, poseIgnored, poseInverted);
+                muts[8].fails, muts[9].fails, muts[10].fails, muts[11].fails, poseIgnored, poseInverted);
     return g_failures ? 1 : 0;
 }
 

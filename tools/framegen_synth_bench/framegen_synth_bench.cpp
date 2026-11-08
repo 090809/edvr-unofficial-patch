@@ -12,7 +12,7 @@
 //       output exactly as the DLL scores it (raw, and turned by the residual head rotation, per class; the |id: fields of the line are the no-warp baseline); the f = 0.5 S is built
 //       from B too. B, S(f = 0.5) and S(f = 1) are written as PNGs (8-bit, clamped to 0..1, sRGB encoded) into DIR (default FOLDER\bench_out); --dry-run writes nothing.
 //       Each pair also prints S's sharpness against B's (Sharpness: the mean |Laplacian| of luma per class, S over B) for both S, with the count of render pixels that got a key
-//       but no read offer (orphan: fgSynSrc's recompute of a landing disagreeing with fgSynSplat's; 0 so far), and the hole region's error (HoleError: the mean |luma| of the
+//       but no read offer (orphan: fgSynSrc's recompute of a landing disagreeing with fgSynSplat's, the resolve's stats word that makes them holes; 0 so far), and the hole region's error (HoleError: the mean |luma| of the
 //       f = 1 S against C over the output pixels whose render pixel was a hole, the fill's, with B against C beside it).
 //   --define NAME=V (with --bench or --replay): the shader's `#define NAME 1` compiled as V instead, for a comparison (FG_SHARP 0 bilinear, 2 Lanczos-2, 3 unclamped, 5 the
 //       Catmull-Rom as 16 loads, 6 with its corners in 12 fetches).
@@ -721,7 +721,7 @@ bool uploadFrame(Gpu& g, const FrameData& fd, GpuFrame& gf) {
 // in all: a torn fill's false edges read as sharpness there, so the fill is judged by the hole region's error and the resample by the rest.
 struct Sharpness {
     double s[5] = {}, b[5] = {};   // far, cockpit, world, all, holes
-    uint64_t orphan = 0;           // render pixels with a key but no read offer (the splat's all-ones still there): fgSynSrc's recompute of the splat's landing disagreeing with it; 0 on every replay of 2026-11-08
+    uint64_t orphan = 0;           // render pixels with a key but no read offer, made holes (the stats word kFrameGenSynthStatsOrphan): fgSynSrc's recompute of the splat's landing disagreeing with it; 0 on every replay of 2026-11-08
     void add(const Sharpness& o) { for (int i = 0; i < 5; ++i) { s[i] += o.s[i]; b[i] += o.b[i]; } orphan += o.orphan; }
     double ratio(int i) const { return b[i] > 0.0 ? s[i] / b[i] : -1.0; }
     double restRatio() const { return b[3] - b[4] > 0.0 ? (s[3] - s[4]) / (b[3] - b[4]) : -1.0; }   // all but the holes
@@ -770,7 +770,6 @@ bool measureSharpness(const std::vector<uint8_t>& sRaw, const std::vector<uint8_
     const uint32_t* rd = reinterpret_cast<const uint32_t*>(reads.data());
     const uint32_t* key = keys && keys->size() >= static_cast<size_t>(sy.rw) * sy.rh * 4 ? reinterpret_cast<const uint32_t*>(keys->data()) : nullptr;
     const auto lap = [&](const std::vector<float>& l, size_t i) { return std::fabs(4.0f * l[i] - l[i - 1] - l[i + 1] - l[i - sy.ow] - l[i + sy.ow]); };
-    if (key) for (size_t i = 0; i < static_cast<size_t>(sy.rw) * sy.rh; ++i) if (key[i] != 0u && rd[i] == 0xFFFFFFFFu) ++out.orphan;
     for (uint32_t y = 1; y + 1 < sy.oh; ++y) {
         const double ry = (y + 0.5) * sy.rh / sy.oh - 0.5;
         const uint32_t py = std::min(static_cast<uint32_t>(ry + 0.5), sy.rh - 1);
@@ -889,6 +888,8 @@ bool replayFolder(Gpu& g, const std::string& dir, const ReplayOptions& opt, Repl
         // f = 0.5 from B: the picture the later phases would show.
         g.setCb(fillCb(bm, 0.5f, nullptr, nullptr));
         runCall(g, sy, gb.in(), false, false, false, nullptr);
+        uint32_t st05[kFrameGenSynthStatsUints] = {};
+        sy.readStats(g, st05);
         png(stem + "_S05.png", sy.s.t.Get(), bm.outFmt);
         const std::vector<uint8_t> s05 = g.readTex(sy.s.t.Get()), r05 = g.readTex(sy.read.t.Get()), key05 = g.readTex(sy.key.t.Get());
 
@@ -904,6 +905,8 @@ bool replayFolder(Gpu& g, const std::string& dir, const ReplayOptions& opt, Repl
             const std::vector<uint8_t> s1 = g.readTex(sy.s.t.Get()), r1 = g.readTex(sy.read.t.Get()), info = g.readTex(sy.bInfo.t.Get());
             s1Kept = s1;
             key1 = g.readTex(sy.key.t.Get());
+            pr.sharp05.orphan = st05[kFrameGenSynthStatsOrphan];
+            pr.sharp1.orphan = stB[kFrameGenSynthStatsOrphan];
             if (measureSharpness(s05, cur.out, info, r05, sy, pr.sharp05, &key05) && measureSharpness(s1, cur.out, info, r1, sy, pr.sharp1, &key1)) {
                 sum.sharp05.add(pr.sharp05);
                 sum.sharp1.add(pr.sharp1);

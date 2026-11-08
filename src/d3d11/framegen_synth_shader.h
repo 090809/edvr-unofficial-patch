@@ -13,7 +13,8 @@
 //                  guard says so (a nearer 3x3 neighbour on the side the offset points to would be read across the edge), then an integer pair stored exactly with the guard's
 //                  mark (synPackGuarded, larger than any unguarded value, so a tie keeps the unguarded read); a read past kMaxOffset is clamped and counted;
 //   fgSynResolve   every S pixel no key reached is a hole: kNoRead written, counted as left, its index listed in the hole list (u0, an eighth of the render pixels; the count in the
-//                  stats words); the S pixels whose stored offset carries the guard's mark are counted as guarded, one each;
+//                  stats words); so is a pixel with a key and no read offer (an orphan, the splat's all-ones still there: fgSynSrc's landing disagreeing with fgSynSplat's,
+//                  FG_ORPHAN), counted as an orphan too; the S pixels whose stored offset carries the guard's mark are counted as guarded, one each;
 //   fgSynHoles     one thread per listed hole, in full 64-thread groups: the farthest key found within 8 px of it is the background, and the hole is carried back into B by that
 //                  key's read offset (its motion); B there the background: read there (reprojected); occluded there too: a stretch along the background's motion relative to the
 //                  occluder to the first background texel (stretched); neither: the neighbour's read 2 px further into its own surface (the background pull, the fill before
@@ -37,7 +38,7 @@
 //
 // The key: 0 a hole, 4 the far plane, else (max(asuint(1 / metres), 8) & ~7) | 4 when the pixel is its own nearest | class (1 cockpit, 2 world). A larger key is a nearer surface.
 //
-// The ten #defines at the top of kFrameGenSynthCs are the rig's mutation points (tools\framegen_synth_test replaces one with 0 and the case it guards must fail); production
+// The eleven #defines at the top of kFrameGenSynthCs are the rig's mutation points (tools\framegen_synth_test replaces one with 0 and the case it guards must fail); production
 // compiles them all 1.
 #include <cstring>
 #include <string>
@@ -56,6 +57,7 @@ inline constexpr char kFrameGenSynthCs[] = R"HLSL(
 #define FG_SENTINEL 1   // a rejected-history vector (the size * 2 sentinel) borrows its background's (0: taken as motion)
 #define FG_TURN 1        // the score turns S by the residual head rotation (0: it scores it unturned)
 #define FG_TURN_SIGN 1   // the residual is applied the right way round (0: its transpose)
+#define FG_ORPHAN 1      // a pixel with a key and no read offer is a hole, filled (0: its all-ones read as a guarded offset, 2047 px off)
 #define FG_SHARP 1       // S's resample is Catmull-Rom in 8 fetches, its corners dropped, its ringing clamped to the 2x2 around the read (0: bilinear; the bench's comparisons: 2 Lanczos-2 clamped, 3 Catmull-Rom unclamped, 4 clamped to the 4x4, 5 the Catmull-Rom as 16 loads, 6 with its corners in 12 fetches)
 cbuffer P : register(b0) {
     int4   sz;       // render width, height, output width, height
@@ -92,7 +94,9 @@ static const uint  kCountBase = 299;      // filled, left, guard, clamped
 static const uint  kTurnBase = 303;       // the turned score block
 static const uint  kHoleCount = 602;      // the holes listed in Holes (kFrameGenSynthStatsHoles)
 static const uint  kFillReproj = 603;     // the holes filled reprojected, then stretched (kFrameGenSynthStatsFillReproj)
-static const uint  kStatsUints = 605;     // src\common\framegen_synth_math.h kFrameGenSynthStatsUints
+static const uint  kOrphan = 605;         // the pixels with a key and no read offer, made holes (kFrameGenSynthStatsOrphan)
+static const uint  kStatsUints = 606;     // src\common\framegen_synth_math.h kFrameGenSynthStatsUints
+static const uint  kNoOffer = 0xFFFFFFFFu;   // fgSynSplat's clear of the read offsets: never an offer (the largest guarded value is 0xFCFFFFFF)
 static const float kGuardMargin = 0.9;    // a 3x3 neighbour nearer by more than a tenth of the pixel's own distance
 static const int   kFillRadius = 8;
 static const float kFillShift = 2.0;
@@ -372,7 +376,7 @@ bool synGuarded(float m9[9], float2 off) {
 [numthreads(8, 8, 1)]
 void fgSynSplat(uint3 id : SV_DispatchThreadID) {
     if (id.x >= uint(sz.x) || id.y >= uint(sz.y)) return;
-    ReadOut[id.xy] = 0xFFFFFFFFu;   // the read offsets cleared for fgSynSrc's InterlockedMin (the S grid is the render grid)
+    ReadOut[id.xy] = kNoOffer;   // the read offsets cleared for fgSynSrc's InterlockedMin (the S grid is the render grid)
     float2 pp;
     uint key;
     if (!fgSynTarget(id.xy, pp, key)) return;
@@ -557,24 +561,29 @@ uint fgSynFill(int2 c, out float2 rd) {
 
 uint fgSynHoleCapacity() { return uint(sz.x) * uint(sz.y) / 8u; }   // src\common\framegen_synth_math.h frameGenSynthHoleCapacity
 
-groupshared uint gCount[3];   // left, guard; the holes of this group
+groupshared uint gCount[4];   // left, guard; the holes of this group; the orphans
 groupshared uint gHoleBase;   // where this group's holes start in Holes
 
 // Every S pixel no key reached is a hole: kNoRead for now, counted as left, and its index listed in Holes for fgSynHoles (the group reserves one run of the list; a hole past
-// the list's capacity stays left). A pixel whose stored offset carries the guard's mark is counted as guarded.
+// the list's capacity stays left). So is a pixel with a key and no read offer (FG_ORPHAN: fgSynSrc's recompute of the landing disagreed with the splat's, so no source offered
+// it, and its all-ones would unpack as a guarded read 2047 px off), counted as an orphan too. A pixel whose stored offset carries the guard's mark is counted as guarded.
 [numthreads(8, 8, 1)]
 void fgSynResolve(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
-    if (gi < 3) gCount[gi] = 0u;
+    if (gi < 4) gCount[gi] = 0u;
     GroupMemoryBarrierWithGroupSync();
     bool hole = false;
     uint rank = 0u;
     if (id.x < uint(sz.x) && id.y < uint(sz.y)) {
-        if (KeyT.Load(int3(id.x, id.y, 0)) == 0u) {
+        bool keyed = KeyT.Load(int3(id.x, id.y, 0)) != 0u;
+        uint rd = ReadOut[id.xy];
+        bool orphan = FG_ORPHAN && keyed && rd == kNoOffer;
+        if (!keyed || orphan) {
             hole = true;
             ReadOut[id.xy] = synPackOffset(float2(kNoRead, 0.0));
             InterlockedAdd(gCount[0], 1u);
             InterlockedAdd(gCount[2], 1u, rank);
-        } else if (synIsGuarded(ReadOut[id.xy])) {
+            if (orphan) InterlockedAdd(gCount[3], 1u);
+        } else if (synIsGuarded(rd)) {
             InterlockedAdd(gCount[1], 1u);
         }
     }
@@ -582,6 +591,7 @@ void fgSynResolve(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
     if (gi == 0 && gCount[2] != 0u) InterlockedAdd(Stats[kHoleCount], gCount[2], gHoleBase);
     if (gi == 1 && gCount[0] != 0u) InterlockedAdd(Stats[kCountBase + 1], gCount[0]);
     if (gi == 2 && gCount[1] != 0u) InterlockedAdd(Stats[kCountBase + 2], gCount[1]);
+    if (gi == 3 && gCount[3] != 0u) InterlockedAdd(Stats[kOrphan], gCount[3]);
     GroupMemoryBarrierWithGroupSync();
     if (hole) {
         uint slot = gHoleBase + rank;

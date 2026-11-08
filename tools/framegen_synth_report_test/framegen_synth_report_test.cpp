@@ -74,6 +74,7 @@ void caseLines() {
     w.cls[2].hist[31] = 600;       // about 0.193
     w.cls[2].sumErr1024 = 600u * 200u;
     w.clamped = 500;
+    w.orphan = 30;
     w.tcells = 960;                // 40 cells fell outside S when it was turned
     w.tout = 40;
     w.tcls[0].pixels = 300;
@@ -90,10 +91,10 @@ void caseLines() {
     w.busy = 3;
     const std::string line = formatFrameGenSynthReport(w);
     checkText(line,
-              "frame generation (synth): frames=40/39 scored=38 skipped=2 gpu_ms=0.31/0.80(n=40)/-(n=0) holes=0.25%/0.01% guard=1.50% clamp=0.050% fill_reproj=80.0% fill_stretch=15.0%"
+              "frame generation (synth): frames=40/39 scored=38 skipped=2 gpu_ms=0.31/0.80(n=40)/-(n=0) holes=0.25%/0.01% guard=1.50% clamp=0.050% orphan=0.003% fill_reproj=80.0% fill_stretch=15.0%"
               " far=30.0%,0,0,0,0.0%,0.0%|id:0,0 cockpit=10.0%,50,48,48,100.0%,0.0%|id:100,115 world=60.0%,195,193,193,100.0%,100.0%|id:0,0"
               " turned: far=31.2%,0,0,0,0.0%,0.0%|id:0,0 cockpit=0.0%,0,0,0,0.0%,0.0%|id:0,0 world=68.8%,4,2,2,0.0%,0.0%|id:0,0 rot_res_deg=0.400/1.235 out=4.00% pose=18/22 s=uav busy=3",
-              "the report line: counts, the two gpu fields, the hole, guard and clamp shares, the fill's kinds, the scorer's three class fields, then the same turned with the residual rotation and the share outside S, then the slot's pose counts, where S was written and the busy builds (Phase 2.2)");
+              "the report line: counts, the two gpu fields, the hole, guard, clamp and orphan shares, the fill's kinds, the scorer's three class fields, then the same turned with the residual rotation and the share outside S, then the slot's pose counts, where S was written and the busy builds (Phase 2.2)");
     check(line.size() < 700, "the report line is well under Log::note's 1165 characters");
     {   // the widest the line can be: every number at its widest. One line must still fit.
         FrameGenSynthWindow x;
@@ -101,7 +102,7 @@ void caseLines() {
         x.gpuSamples[0] = x.gpuSamples[1] = 4000000000u;
         x.gpuMedian[0] = x.gpuMedian[1] = x.gpuMax[0] = x.gpuMax[1] = 99999.99f;
         x.pixels = 1;
-        x.filled = x.left = x.guard = x.clamped = 1000000000000ull;
+        x.filled = x.left = x.guard = x.clamped = x.orphan = 1000000000000ull;
         x.fillReproj = x.fillStretch = 1000000000000ull;   // 100.0% each, the widest shares
         x.cells = x.tcells = 1;
         for (int c = 0; c < kFrameGenShadowClasses; ++c) {
@@ -150,7 +151,7 @@ void caseLines() {
     FrameGenSynthWindow idle;
     idle.skipped = 7;
     checkText(formatFrameGenSynthReport(idle),
-              "frame generation (synth): frames=0/0 scored=0 skipped=7 gpu_ms=-(n=0)/-(n=0) holes=0.00%/0.00% guard=0.00% clamp=0.000% fill_reproj=0.0% fill_stretch=0.0%"
+              "frame generation (synth): frames=0/0 scored=0 skipped=7 gpu_ms=-(n=0)/-(n=0) holes=0.00%/0.00% guard=0.00% clamp=0.000% orphan=0.000% fill_reproj=0.0% fill_stretch=0.0%"
               " far=0.0%,0,0,0,0.0%,0.0%|id:0,0 cockpit=0.0%,0,0,0,0.0%,0.0%|id:0,0 world=0.0%,0,0,0,0.0%,0.0%|id:0,0"
               " turned: far=0.0%,0,0,0,0.0%,0.0%|id:0,0 cockpit=0.0%,0,0,0,0.0%,0.0%|id:0,0 world=0.0%,0,0,0,0.0%,0.0%|id:0,0 rot_res_deg=-/- out=0.00% pose=0/0 s=none busy=0",
               "a window that called the module and built nothing still says so (frames=0/0, the skips), so a synth that never ran reads differently from one that did");
@@ -223,11 +224,13 @@ void caseMerge() {
     built.clamped = 3;
     built.fillReproj = 6;
     built.fillStretch = 1;
+    built.orphan = 4;
     frameGenSynthMergeFrame(w, 0, 100, built);
     frameGenSynthMergeFrame(w, 1, 100, built);
     frameGenSynthMergeFrame(w, 1, 100, built);
-    check(w.frames[0] == 1 && w.frames[1] == 2 && w.pixels == 300 && w.filled == 30 && w.left == 6 && w.guard == 21 && w.clamped == 9 && w.fillReproj == 18 && w.fillStretch == 3,
-          "frames are counted by kind and the counters (the fill's kinds too) and pixels add");
+    check(w.frames[0] == 1 && w.frames[1] == 2 && w.pixels == 300 && w.filled == 30 && w.left == 6 && w.guard == 21 && w.clamped == 9 && w.fillReproj == 18 && w.fillStretch == 3 &&
+              w.orphan == 12,
+          "frames are counted by kind and the counters (the fill's kinds and the orphans too) and pixels add");
     FrameGenSynthEyeResult sc;
     sc.cells = 12;
     sc.cls[2].pixels = 12;
@@ -256,6 +259,7 @@ void caseDecode() {
     words[kFrameGenSynthStatsClamp] = 4;
     words[kFrameGenSynthStatsFillReproj] = 30;
     words[kFrameGenSynthStatsFillStretch] = 8;
+    words[kFrameGenSynthStatsOrphan] = 11;
     words[kFrameGenSynthStatsTurned + 2 * kFrameGenShadowBins] = 6;                             // turned far pixels
     words[kFrameGenSynthStatsTurned + kFrameGenShadowStatsHoles] = 2;                           // turned: outside S
     words[kFrameGenSynthStatsTurned + kFrameGenShadowStatsCells] = 6;
@@ -265,9 +269,11 @@ void caseDecode() {
           "the stats words decode: the score block as the scorer's, then filled, left and guard");
     check(r.clamped == 4 && r.tcls[0].pixels == 6 && r.tout == 2 && r.tcells == 6 && r.tcls[2].pixels == 0, "and the clamp count and the turned block (its holes word is the cells outside S)");
     check(r.fillReproj == 30 && r.fillStretch == 8, "and the fill's kinds (reprojected, stretched)");
-    check(kFrameGenSynthStatsUints == 605 && kFrameGenSynthStatsFilled == 299 && kFrameGenSynthStatsClamp == 302 && kFrameGenSynthStatsTurned == 303 && kFrameGenSynthStatsHoles == 602 &&
-              kFrameGenSynthStatsFillReproj == 603 && kFrameGenSynthStatsFillStretch == 604,
-          "the stats layout is 299 score words, four counters, the turned block of 299, the hole list's count, then the fill's kinds");
+    check(r.orphan == 11, "and the orphans (a key and no read offer, made holes)");
+    check(kFrameGenSynthStatsUints == 606 && kFrameGenSynthStatsFilled == 299 && kFrameGenSynthStatsClamp == 302 && kFrameGenSynthStatsTurned == 303 && kFrameGenSynthStatsHoles == 602 &&
+              kFrameGenSynthStatsFillReproj == 603 && kFrameGenSynthStatsFillStretch == 604 &&
+              kFrameGenSynthStatsOrphan == 605,
+          "the stats layout is 299 score words, four counters, the turned block of 299, the hole list's count, the fill's kinds, then the orphans");
     check(frameGenSynthHoleCapacity(2817, 2448) == 862002 && frameGenSynthHoleCapacity(8, 8) == 8, "the hole list holds an eighth of the render pixels");
 }
 
