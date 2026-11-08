@@ -741,6 +741,27 @@ should read `per_eye_frame=3.00`, `applied` equal to `eye_frames`, and
   occluder beyond the hull: no contact darkening from the cockpit or the
   terrain. This is intended for a layer composited over the world.
 
+## AO flown, decals found missing (2026-11-08 22:50, build 20ad8719)
+
+Log `edvr_gfx_20261108_225009.log`. The AO chain ran in full:
+`per_eye_frame=3.00`, applied on every eye-frame. But the pilot saw no
+change: the panel "bumps" of the game's own hull were still missing.
+
+The main-pass line says `decal_draws=0 decals_reissued=0`. The own hull
+decals (`BBE5`/`DB3E`, the panel details with their normals) were neither
+discarded nor re-issued. The game draws them after the eye's depth copy
+(census 3 of 215951: the copy at q1040, the decals at q1042-1065), and the
+layer's G-buffer window ended at the copy.
+- ruled out: AO as the main missing "bumps", because with AO applied in
+  full the hull looked the same.
+- Fix: a decal window per eye, from the depth copy to the eye's next stage
+  (AO apply, shadow mask or light). In it, own decals take the
+  own-discard variant in the main pass and are re-issued into the private
+  G-buffer.
+
+A blink at the start remains: `failed=composite:2` in the first separate
+window, a lost frame each. Open.
+
 ## Optimisation debt (recorded 2026-11-08 at the pilot's request)
 
 The layer was built to work first. Before it ships as anything but a

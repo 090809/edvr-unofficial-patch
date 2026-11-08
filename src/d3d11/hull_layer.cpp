@@ -423,6 +423,10 @@ struct Eye {
     Gb gb = Gb::Before;
     uint32_t hull = 0, noSlotDraws = 0, lightDraws = 0, lightSpan = 0;
     bool lightOpen = false;        // between the shadow mask and the sky
+    // Between the eye's depth copy and its next stage: the hull decals (BBE5) are drawn there, after the copy that ends the
+    // G-buffer window (census 3 of 215951: the depth copy at q1040, the decals at q1042-1065). Without this window the own
+    // decals were neither discarded from the main pass nor re-issued into the layer (decal_draws=0, 22:51).
+    bool decalOpen = false;
     uint8_t stagesDone = 0;
     const void* hdrGame = nullptr;   // the G-buffer's RT3: the game's HDR (identity)
     const void* slotGame = nullptr;  // engine motion's slot target, the seed's RT6 (identity)
@@ -759,6 +763,7 @@ void resetFrame(Eye& e) {
     e.gb = Gb::Before;
     e.hull = e.noSlotDraws = e.lightDraws = e.lightSpan = 0;
     e.lightOpen = false;
+    e.decalOpen = false;
     e.stagesDone = 0;
     e.hdrGame = e.slotGame = nullptr;
     for (auto& g : e.gbufGame) g = nullptr;
@@ -1549,6 +1554,8 @@ bool beginHullDraw(ID3D11DeviceContext* ctx, UINT instances, UINT startInstance,
         // A hull draw before this eye's shell is not the own ship's pass; a decal never seeds; separate mode seeds before the issue.
         if (decal || !e.shell || detail::g_hullLayerSeparate) return decline();
         if (!seedEye(ctx, rtv, dsv, ei, instances, startInstance)) return decline();
+    } else if (decal && e.gb == Gb::Done && e.decalOpen) {
+        // the own decals after the depth copy (decalOpen): into the private G-buffer as well
     } else if (e.gb != Gb::In || g_inEye != ei) {
         return decline();
     }
@@ -1601,6 +1608,7 @@ void finishGbuffer(ID3D11DeviceContext* ctx, int ei, End why) {
     if (g_inEye == ei) g_inEye = -1;
     if (e.gb != Gb::In) return;
     e.gb = Gb::Done;
+    e.decalOpen = why == kEndCopy;   // the hull decals follow the depth copy (decalOpen)
     ++g_win.ended[why];
     if (!e.privDsv || !e.privSlot || !e.maskSrv || !e.stats) return;
     ID3D11Resource* slotRes = nullptr;
@@ -1754,6 +1762,7 @@ bool beginStage(ID3D11DeviceContext* ctx, Stage stage, uint8_t bit) {
     Eye& e = g_eyes[ei];
     if (stage == kAo) e.aoSeen |= kAoApplyBit;
     if (e.gb == Gb::In) finishGbuffer(ctx, ei, stage == kCopy ? kEndCopy : kEndLight);   // the eye's G-buffer is over; the game's state is back
+    if (stage != kCopy) e.decalOpen = false;   // the decals are over once the eye's AO, shadow mask or lighting starts
     if (stage == kAo) {
         // Not a lighting stage: it does not open the lighting window or move the stage eye. It needs the eye's whole AO
         // chain this frame, or the private AO it would read is last frame's.
@@ -2569,7 +2578,8 @@ bool hullLayerBeforeMainDraw(ID3D11DeviceContext* ctx, UINT instances, UINT star
     if (hull && e.gb == Gb::Before && e.shell && !seedEye(ctx, rtv, dsv, ei, instances, startInstance)) return decline();
     // Step 3's safety: on a frame decided as a fallback (decideNext) the layer is still made, and the ship stays in the main pass.
     if (!g_discard) return decline();
-    if (e.gb != Gb::In || g_inEye != ei || !e.maskSrv) return decline();   // no mask this eye-frame: the draw is the game's
+    const bool decalWindow = decal && e.gb == Gb::Done && e.decalOpen;   // the decals after the depth copy (decalOpen)
+    if ((!decalWindow && (e.gb != Gb::In || g_inEye != ei)) || !e.maskSrv) return decline();   // no mask this eye-frame: the draw is the game's
     // The draw must be engine motion's substitute: its slot target at RT6, and its patched pixel shader bound.
     if (!(rtv[kSlotTarget] && resourceOf(rtv[kSlotTarget]) == e.slotGame)) {
         ++g_win.noVariant;
