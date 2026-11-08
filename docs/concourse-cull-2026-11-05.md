@@ -634,6 +634,17 @@ VR, Steam, 7bc497b5, log `edvr_gfx_20261108_064006` (06:40 to 06:44), with the r
 - `ruled out: refusing a camera stub call whose pose lies on the stack, because Flight 50's head pose came on 0x2845730's stack on every frame's first call, and the heap call after it was the identity.`
 - **Fixed after it (4b74d75c, installed on Steam 2026-11-08):** the probe writes a frame's first call wherever it lies, never an identity pose, and logs all six calls. The tone lines take the eye from the draw's order in the frame when the table has not seen the target, and name the target.
 
+## Flight 51 results
+
+VR, Steam, 4b74d75c, log `edvr_gfx_20261108_065519` (06:55 to 06:57), runtime log `edvr_openxr_20261108_065521_109_41700`; Pimax Crystal Super at 4032 per eye, DLSS. Sean: "I saw the flashes, no carrier yet, otherwise menu looks fine". Only a `Dodec`, again left to the game in VR.
+
+- **The camera route works.** Two presses, `5 of 5 frames wrote a pose` each. Each frame has 6 stub calls in one order. Calls 0, 2 and 4 are at stack addresses and carry the head pose, `t(1.363 -0.787 0.000)`, rows rotated. Calls 1, 3 and 5 are the identity on the heap. On every probe frame call 0 was written from `t(1.363 -0.787 0.000)` to `t(1.363 29.213 0.000)`, and Sean saw the flashes. The pose is in its own space, not the store's world: the store's camera at the same time was tens of metres off.
+- **The capture point works.** Two tonemap draws a frame, eye 0 then eye 1, on stable targets (`...930D20`, `...931DA0`). Each has H, format 26 (R11G11B10_FLOAT), and depth, format 19 (R32G8X24_TYPELESS), both 2016x2017.
+- **The hold works again.** 10 of 10 latched; the runtime trace has `withheld=14,replayed=14,empty=0`.
+- **The per-eye camera reader is not usable for this.** `temporal eye rows` gave the two eyes identical positions and axes on every line (an IPD should part them), switched between a camera near the head pose and an axis-aligned one at (11.6 6.0 -45.5), and never showed the 30 m raise that was seen. So the VR bake cannot read each eye's camera back. It has to build each eye's matrices from what EDVR tells the game: the head pose it writes, and the runtime's eye-to-head transforms and projections.
+- `ruled out: temporalPassEyeRows as the VR bake's per-eye camera, because in Flight 51 both eyes read the same rows, switching between two cameras, and missed a 30 m move that was drawn.`
+- **Still open for the VR bake:** how the pose's space maps to the store's world, so the room's centre can be written as a pose; where the d3d11 half can read each eye's eye-to-head transform and projection for the frame; whether the headsets' fields of view cover the bake's directions, or a square 90 is needed after all; and the display shader's `cb1` rows in VR. A carrier in VR is still unflown.
+
 ## Flight 51, the list as written
 
 VR, Steam, 4b74d75c, DLSS on. Read with `python tools\edvr_log.py --target steam --expect-build 4b74d75c --grep "concourse"`.
