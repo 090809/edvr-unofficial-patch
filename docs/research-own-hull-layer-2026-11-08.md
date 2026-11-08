@@ -30,6 +30,11 @@ The smear is terrain that is newly uncovered at the hull edge every frame
 * **Step 3** (sections "Step 3 build", "Step 3 flight (21:45)"): tonemap
   re-issue, own TAA, composite onto dlSubmit after the UI resolve (before it,
   the resolve's raw-input clamp held the hull to the background).
+* **AO** (section "AO on the hull layer", compile-only, not flown): the
+  game's AO chain (CS `FB277B33`, `9347F8FC`, `D31E7812`) is re-dispatched
+  on the private depth copy and RT0, and its apply re-issued into the
+  private RT2. Next: one dump. The `ao:` line should read 3.00 an
+  eye-frame, and the HullHdr/GameHdrLit p95 residue should shrink.
 * **Temporary keys of this arc:** `diag.hull_layer` (off | dump | separate).
 * **Background:** option (e), the hole-fill, fails (section "Result"). The
   own ship is one block of hull draws seeded after the cockpit shell, but
@@ -651,6 +656,90 @@ lit terrain, and invisible looking into black space.
   against UI ghosts, which is right: the raw has no hull to bound it by.
 * Unverified: the fix in the headset. As before, anything the game drew
   into its own eye over the hull (not the UI layer) ends up under it.
+
+## AO on the hull layer (2026-11-08, compile-only, not flown)
+
+The private layer had no ambient occlusion: the hull looked flat, without
+the darkening around its panels, and AO was half of the Step 1 v2 residue
+(p95 ratio 1.013-1.090).
+
+**The chain, mapped** from census 3 of `edvr_gfx_20261108_215951.log`
+(capture 220517898003), with the ids resolved from its `DC id` lines.
+Frames 0-2 have the same order; frame 1's q:
+
+| Step | CS (`ch=`) | Groups | Reads | Writes | Eye 0 q | Eye 1 q |
+|---|---|---|---|---|---|---|
+| depth copy (draw) | `DEF19B03`/`CB95394B` | | eye depth | f39 2817x2448 | 1040 | 1265 |
+| A | `B49A50B5` | 23x20 | depth copy | f39 353x306 | 1041 | 1266 |
+| B | `4FD03C16` | 353x306 | depth copy, eye depth | f39 2817x2448 | 1065 | 1290 |
+| C | `CBAAD243` | 353x306 | B's output | **the eye's G-buffer RT0-3** as UAVs | 1066 | 1291 |
+| D | `FB277B33` | 44x39 | depth copy (t0, t1) | f39 176x153 | 1293 | 1318 |
+| E | `9347F8FC` | 11x10x16 | RT0, D's output, a 768-byte kernel (stride 48) | f60 176x153 | 1294 | 1319 |
+| F | `D31E7812` | 44x39 | D's and E's outputs | f60 704x612 | 1295 | 1320 |
+| apply (draw) | `DEF19B03`/`06CD42A9` | | F's output | RT2 (blend) | 1296 | 1321 |
+
+Eye 0's D-F and apply run after eye 1's G-buffer and A-C; eye 1's follow
+eye 0's lighting. Correction to the brief: C is not a deinterleave into
+four quarter-res targets. Its four UAVs are the eye's own full-size
+G-buffer RT0-3 (`BBA60`, `BB220`, `B93E0`, `BBD20` for eye 0). The AO
+proper is D (a 4x4 deinterleave of the depth copy into 16 slices), E (HBAO
+a slice) and F (the slices put back into the 704x612 AO).
+
+**Design.** A, B and C are not re-issued. Nothing in D-F or the apply
+reads their outputs, and C would write the private G-buffer by a rule not
+yet known. The doubt is recorded below. D, E and F are re-issued, both
+modes:
+
+- `exposure_fix.cpp hookedDispatch` calls `hullLayerAfterDispatch` after
+  the game's dispatch: one bool load while the key is off.
+  `hullLayerBeginDispatch` matches the CS content hash (`hashOf`) against
+  `kAoCs` and names the step's eye. It reads the eye's depth copy (recorded
+  at the copy stage), its G-buffer RT0-3 (recorded at the seed), or an
+  earlier step's output (recorded as each step runs). A step runs only
+  when the eye has a private G-buffer this frame, its depth copy was
+  re-issued and every earlier step was re-issued. Otherwise a private
+  input is last frame's.
+- Every bound UAV gets a private copy, made at first use
+  (`privateView(ViewKind::Uav)`, with the game view's own desc, so an
+  array slice range comes across). If one cannot be made, the step is
+  declined, so the game's own target is never written. Every SRV whose
+  texture has a private copy is swapped. The kernel buffer, the constant
+  buffers, the samplers and the shader stay the game's. The same groups
+  are dispatched raw. `hullLayerEndDispatch` puts t0-t15 and u0-u7 back,
+  with the UAV counters kept (-1). The swap is one to one and the game's
+  dispatch was hazard-free, so no private view is bound as an SRV and a
+  UAV at once.
+- The apply is a stage (`kAo`, bit 8). It names its eye by RT2 or by F's
+  output and declines unless all three steps ran for that eye this frame
+  and its AO SRV was swapped. It binds the private RT2 and does not open
+  the lighting window. The game issues it before the shadow mask and the
+  lighting, so the private RT2 has AO before the private lighting reads it.
+- `kMaxMirrors` 32 → 48: the chain adds three private copies an eye.
+
+**Counters**: a new 30 s line, `hull layer: ao: eye_frames= full=
+dispatches= per_eye_frame= applied= missed=deinterleave:,hbao:,interleave:,apply:
+no_eye=`. `per_eye_frame` is 3 when every step ran. `missed` counts
+eye-frames where the game ran the step for an eye with a private G-buffer
+and the layer did not. `edvr_log.py --health` reads it, and gives PARTIAL
+when the chain ran and no eye-frame had it in full. The same commit fixes
+the rule's composite pattern, which had missed the `site=` field since
+4e252a32, so the self-test failed.
+
+**What one dump should show** (`hull_layer_compare.py`, HullHdr against
+GameHdrLit on the hull pixels the game shows). The p95 ratio residue
+(1.013-1.090 before) should shrink to the decal residue. Where the game's
+AO darkens a panel seam, HullHdr should now be dark too. The `ao:` line
+should read `per_eye_frame=3.00`, `applied` equal to `eye_frames`, and
+`missed` all 0.
+
+**Open:**
+
+- C's effect on hull pixels is not copied. E reads RT0 after C wrote it.
+  If C changes RT0 on the hull, the private HBAO sees other normals. A
+  dump residue that stays at the seams would point here.
+- The private depth copy is far (0) off the hull, so HBAO sees no
+  occluder beyond the hull: no contact darkening from the cockpit or the
+  terrain. This is intended for a layer composited over the world.
 
 ## Night vision on the hull (2026-11-08 ~22:15, build 1a1b6c60)
 

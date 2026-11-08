@@ -10641,8 +10641,12 @@ H_HULL_COMPOSITE = (r"hull layer: composite: separate_frames=(?P<sep>\d+) compos
                     r"fallback=framegen:(?P<fb_fg>\d+),outside:(?P<fb_out>\d+),mask_pending:(?P<fb_pend>\d+),mask_large:(?P<fb_large>\d+),"
                     r"streak:(?P<fb_streak>\d+) failed=seed:(?P<f_seed>\d+),lit:(?P<f_lit>\d+),tone:(?P<f_tone>\d+),composite:(?P<f_comp>\d+) "
                     r"declined=stale:(?P<d_stale>\d+),size:(?P<d_size>\d+),gpu:(?P<d_gpu>\d+) toned=(?P<toned>\d+) tone_declined=(?P<tone_declined>\d+) "
-                    r"history_resets=(?P<resets>\d+) matched_by_index=(?P<by_index>\d+) own_max=(?P<own_max>\d+) aa=(?P<aa>\w+) "
+                    r"history_resets=(?P<resets>\d+) matched_by_index=(?P<by_index>\d+) own_max=(?P<own_max>\d+) "
+                    r"(?:site=after_ui_resolve:(?P<site_after>\d+),upscaler_out:(?P<site_up>\d+) )?aa=(?P<aa>\w+) "
                     r"gpu_ms=tone:(?P<tone_ms>-?[\d.]+),composite:(?P<comp_ms>-?[\d.]+)")
+# The AO chain on the private G-buffer: its 30 s line, after the report line (both modes; a build before it has none).
+H_HULL_AO = (r"hull layer: ao: eye_frames=(?P<eye_frames>\d+) full=(?P<full>\d+) dispatches=(?P<dispatches>\d+) per_eye_frame=(?P<per>[\d.]+) "
+             r"applied=(?P<applied>\d+) missed=deinterleave:(?P<m0>\d+),hbao:(?P<m1>\d+),interleave:(?P<m2>\d+),apply:(?P<m3>\d+) no_eye=(?P<no_eye>\d+)")
 # The rest of its lines (the dump armed, a private copy made or dropped, a cap or a create failure said once, an unknown key value, the seed's facts and
 # refusals, the shaders): matched, not judged.
 H_HULL_OTHER = (r"hull layer: (?:dump \S+ armed|private copy (?:made|of a)|\d+ private (?:copies|views) held|a \d+x\d+ format \d+ target is multisampled|"
@@ -17014,6 +17018,19 @@ def _hj_hull_layer(rows, ctx=None):
         return ("PARTIAL", text + ": seeded, but no own-mask readback came back (mask-pending)")
     if total["s_light"] == 0:
         return ("PARTIAL", text + ": seeded and filtered, but no lighting draw got its private counterpart")
+    # The AO chain on the private G-buffer (both modes). A build before it has no 'ao' line and is not judged on it.
+    aos = rows.get("ao", [])
+    ao_broken = False
+    if aos:
+        a = {k: sum(int(r[k]) for r in aos) for k in ("eye_frames", "full", "dispatches", "applied", "m0", "m1", "m2", "m3", "no_eye")}
+        ran = a["dispatches"] + a["m0"] + a["m1"] + a["m2"] + a["m3"] + a["no_eye"]
+        text += ("; AO: %d of %d lit eye-frame(s) with the whole chain and apply re-issued, %d step dispatch(es) (%.2f an eye-frame, 3 when every step ran), "
+                 "%d apply draw(s); missed deinterleave %d, hbao %d, interleave %d, apply %d; %d chain dispatch(es) with no eye"
+                 % (a["full"], a["eye_frames"], a["dispatches"], a["dispatches"] / a["eye_frames"] if a["eye_frames"] else 0.0, a["applied"], a["m0"], a["m1"],
+                    a["m2"], a["m3"], a["no_eye"]))
+        if ran == 0:
+            text += " (the game ran no AO chain: its ambient occlusion setting may be off)"
+        ao_broken = ran > 0 and a["full"] == 0
     # Separate mode (Step 2): the own ship out of the main pass. OK only when main-pass draws took the own discard.
     mains = rows.get("main", [])
     if keys and keys[-1]["mode"] == "separate":
@@ -17042,6 +17059,9 @@ def _hj_hull_layer(rows, ctx=None):
         if c["comp"] == 0:
             return ("PARTIAL", text + ": separate mode, but no eye-frame was composited (the ship was taken out and never put back; the misses and fallbacks "
                                       "say why)")
+    if ao_broken:
+        return ("PARTIAL", text + ": the game's AO chain ran, but no eye-frame had it re-issued in full on the private G-buffer (the hull has no AO; the "
+                                  "missed counts say at which step)")
     return ("OK", text)
 
 def _hj_framegen_shadow(rows, ctx=None):
@@ -18490,6 +18510,7 @@ HEALTH_RULES = (
         ("unknown", H_HULL_UNKNOWN),
         ("main", H_HULL_MAIN),
         ("composite", H_HULL_COMPOSITE),
+        ("ao", H_HULL_AO),
         ("_", H_HULL_OTHER),
     ), _hj_hull_layer),
     # The SRV turret view (issue 140): lines of the graphics log that carry no build tag (health_scan reads them, as it reads the desktop window's, before it drops the untagged lines).
@@ -25953,7 +25974,20 @@ def self_test_health():
 
         def hl_comp(sep=2700, comp=5300, ready=60, fb=(0, 0, 0, 0, 30), fail=(16, 0, 0, 2), declined=(0, 0, 0), toned=5400, own_max=0, ms=(0.042, 0.181)):
             return RH("hull layer: composite: separate_frames=%u", sep, comp, ready, fb[0], fb[1], fb[2], fb[3], fb[4], fail[0], fail[1], fail[2], fail[3],
-                      declined[0], declined[1], declined[2], toned, 0, 4, 0, own_max, ms[0], ms[1], 16)
+                      declined[0], declined[1], declined[2], toned, 0, 4, 0, own_max, comp, 0, ms[0], ms[1], 16)
+
+        def hl_ao(eye_frames=5400, full=5400, disp=16200, applied=5400, missed=(0, 0, 0, 0), no_eye=0):
+            return RH("hull layer: ao: eye_frames=%u", eye_frames, full, disp, disp / eye_frames if eye_frames else 0.0, applied, missed[0], missed[1],
+                      missed[2], missed[3], no_eye, 3)
+
+        check("hull layer: the AO chain re-issued in full is OK and says so", hl_base + [hl_key(), hl_report(), hl_ao()], 0, [("OK", HL)],
+              has=["AO: 5400 of 5400 lit eye-frame(s) with the whole chain and apply re-issued, 16200 step dispatch(es) (3.00 an eye-frame",
+                   "missed deinterleave 0, hbao 0, interleave 0, apply 0; 0 chain dispatch(es) with no eye"], lacks=["UNPARSED", "do not match"])
+        check("hull layer: no AO chain in the game is OK and says why", hl_base + [hl_key(), hl_report(), hl_ao(full=0, disp=0, applied=0)], 0, [("OK", HL)],
+              has=["the game ran no AO chain"], lacks=["UNPARSED"])
+        check("hull layer: the AO chain seen and never re-issued is PARTIAL", hl_base + [hl_key(), hl_report(),
+                                                                                       hl_ao(full=0, disp=0, applied=0, missed=(5400, 5400, 5400, 5400))], 0,
+              [("PARTIAL", HL)], has=["no eye-frame had it re-issued in full", "missed deinterleave 5400, hbao 5400"])
 
         check("hull layer: separate, the own discard taken and composited, is OK and says so",
               hl_base + [hl_key("separate"), RH("hull layer: separate mode takes the own ship out"), hl_report(), hl_main(),

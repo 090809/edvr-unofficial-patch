@@ -56,7 +56,8 @@ constexpr uint32_t kMaxSeedInstances = 4096;
 constexpr uint32_t kMaxRecords = 1u << 20;
 constexpr float kOwnRadius = 120.0f;      // metres about the seed records' centroid (the five ledgers: object A at 120 m)
 constexpr UINT kSrvSlots = 16;            // PS resource slots a stage is searched and restored over
-constexpr size_t kMaxMirrors = 32;
+// 48, not 32: the AO chain adds three private copies an eye (its deinterleaved depth, its HBAO slices, the 704x612 AO).
+constexpr size_t kMaxMirrors = 48;
 constexpr size_t kMaxViews = 128;
 constexpr uint32_t kEvictFrames = 120;    // a private copy whose game texture was not seen for longer goes
 constexpr uint32_t kRing = 4;             // readback staging buffers an eye
@@ -81,7 +82,22 @@ constexpr float kTaaCurrent = 0.1f;       // the hull layer's TAA: this frame's 
 constexpr UINT kTimerRing = 8;            // timestamp sets a timer keeps in flight
 constexpr int kToneStage = 10;            // Pending::stage of the tonemap re-issue (not a Stage)
 
-enum Stage : int { kCopy = 0, kMask = 1, kLight = 2, kStages = 3 };
+// The ambient occlusion chain (docs "AO on the hull layer"; census 3 of 2026-11-08 21:59, capture 220517898003): per eye, after
+// the eye's depth copy, three compute steps make the 704x612 AO, and the apply draw (DEF19B03/06CD42A9, kAo) blends it into
+// G-buffer RT2 before the shadow mask. Eye 0's steps run after eye 1's G-buffer. Each step is re-issued right after the
+// game's with every texture that has a private copy swapped for it and its own targets given private copies, so the chain
+// runs on the private depth copy and RT0. In step order (the cascade: a step runs only after the eye's steps before it).
+constexpr uint64_t kAoCs[3] = {0xFB277B33F0865348ull,    // the depth copy deinterleaved into 16 slices of 176x153 (44x39 groups)
+                               0x9347F8FC2DCE0248ull,    // the HBAO a slice (11x10x16): the slices, G-buffer RT0, the kernel buffer
+                               0xD31E7812990B19A6ull};   // the slices put back together: the 704x612 AO the apply draw reads
+constexpr int kAoSteps = 3;
+constexpr uint8_t kAoApplyBit = static_cast<uint8_t>(1u << kAoSteps);
+constexpr uint8_t kAoAllSteps = static_cast<uint8_t>(kAoApplyBit - 1u);
+constexpr UINT kCsSrvSlots = 16;                               // CS resource slots a step is searched and restored over (it uses t0-t2)
+constexpr UINT kCsUavSlots = D3D11_PS_CS_UAV_REGISTER_COUNT;  // u0-u7 (it uses u0)
+constexpr size_t kAoOwned = 8;                                 // an eye's AO step outputs remembered this frame (it has three)
+
+enum Stage : int { kCopy = 0, kMask = 1, kLight = 2, kAo = 3, kStages = 4 };
 struct StagePair {
     uint64_t vs, ps;
     Stage stage;
@@ -92,6 +108,7 @@ constexpr StagePair kStagePairs[] = {
     {0xDEF19B035D5EDEDCull, 0xCB95394B50D737D6ull, kCopy, 1},   // the depth copy into f39: the end of the eye's G-buffer
     {0x53211E8C072CD02Eull, 0x7EAC71963E66C5FEull, kMask, 2},   // the shadow mask, first draw
     {0x53211E8C072CD02Eull, 0xB403F48CB35D9739ull, kMask, 4},   // ...and second
+    {0xDEF19B035D5EDEDCull, 0x06CD42A941C4C7C9ull, kAo, 8},     // the AO apply into G-buffer RT2 (after the AO chain, before the shadow mask)
 };
 
 // How an eye's private G-buffer window closed.
@@ -367,11 +384,12 @@ struct Mirror {
     ID3D11Texture2D* priv = nullptr;
     uint32_t lastSeen = 0;   // the layer's frame the game texture was last bound or cleared
 };
-enum class ViewKind : uint8_t { Rtv, Dsv, Srv };
+enum class ViewKind : uint8_t { Rtv, Dsv, Srv, Uav };
 union ViewDesc {
     D3D11_RENDER_TARGET_VIEW_DESC rtv;
     D3D11_DEPTH_STENCIL_VIEW_DESC dsv;
     D3D11_SHADER_RESOURCE_VIEW_DESC srv;
+    D3D11_UNORDERED_ACCESS_VIEW_DESC uav;   // the AO chain's targets (a Texture2DArray slice range comes across as the game's view has it)
 };
 // A private view over a mirror, made with the game's own view desc (so a read-only depth view, an array slice or a
 // typed format comes across as the game bound it).
@@ -408,6 +426,13 @@ struct Eye {
     uint8_t stagesDone = 0;
     const void* hdrGame = nullptr;   // the G-buffer's RT3: the game's HDR (identity)
     const void* slotGame = nullptr;  // engine motion's slot target, the seed's RT6 (identity)
+    // The AO chain (identities this frame): the G-buffer RT0-3 (the seed's), the depth copy (its stage's target) and the
+    // chain's own outputs, by which a step or the apply draw names its eye; the steps re-issued (bit a step, kAoApplyBit
+    // the apply) and those the game ran for this eye.
+    const void* gbufGame[4] = {};
+    const void* copyGame = nullptr;
+    const void* aoOut[kAoOwned] = {};
+    uint8_t aoOutCount = 0, aoDone = 0, aoSeen = 0;
     float clearDepth = 0.0f;
     uint32_t records = 0, seedInstances = 0;
     // The seed's private views (references held from the seed to the filter).
@@ -520,6 +545,10 @@ struct Window {
     uint32_t declined[kDeclines] = {};
     uint32_t toned = 0, toneDeclined = 0, historyResets = 0, byIndex = 0, ownMax = 0;
     uint32_t siteAfterResolve = 0, siteUpscalerOut = 0;   // applied composites by where they landed (HullLayerCompositeInputs)
+    // The AO chain (the "ao" line): eye-frames with a private G-buffer, and those whose whole chain and apply were re-issued;
+    // step dispatches and apply draws re-issued; eye-frames where the game ran a step (or the apply) for the eye and it was
+    // not re-issued, by step; chain dispatches whose eye could not be named (none of its resources is an eye's).
+    uint32_t aoEyeFrames = 0, aoFull = 0, aoDispatches = 0, aoApplied = 0, aoMissed[kAoSteps + 1] = {}, aoNoEye = 0;
 };
 
 // Separate mode: what hullLayerBeforeMainDraw bound over the game's issue, which hullLayerAfterMainDraw puts back.
@@ -540,6 +569,13 @@ struct Pending {
     bool srvSwapped = false;
     const void* hdrGame = nullptr;   // a lighting draw's RT0 (the game's HDR), for the dump
     const void* toneOut = nullptr;   // the tonemap re-issue (stage kToneStage): the game's tonemap output (identity)
+};
+
+// The pending AO step re-issue: the compute slots Begin bound over, which End puts back.
+struct DispatchPending {
+    bool active = false;
+    ID3D11ShaderResourceView* srv[kCsSrvSlots] = {};
+    ID3D11UnorderedAccessView* uav[kCsUavSlots] = {};
 };
 
 // The device objects the passes need, made once at the first seed.
@@ -583,6 +619,7 @@ int g_inEye = -1;      // the eye whose private G-buffer window is open
 int g_stageEye = -1;   // the eye whose screen-space stage ran last this frame
 Pending g_pending;
 MainPending g_main;
+DispatchPending g_dispatch;
 Gpu g_gpu;
 Window g_win;
 bool g_noCpFrame[kStages] = {};
@@ -724,6 +761,10 @@ void resetFrame(Eye& e) {
     e.lightOpen = false;
     e.stagesDone = 0;
     e.hdrGame = e.slotGame = nullptr;
+    for (auto& g : e.gbufGame) g = nullptr;
+    e.copyGame = nullptr;
+    for (auto& o : e.aoOut) o = nullptr;
+    e.aoOutCount = e.aoDone = e.aoSeen = 0;
     e.clearDepth = 0.0f;
     e.records = e.seedInstances = 0;
     e.ownDraws = e.ownDecals = e.decals = 0;
@@ -888,6 +929,7 @@ ID3D11View* privateView(ViewKind kind, ID3D11View* gameView, bool make) {
     case ViewKind::Rtv: static_cast<ID3D11RenderTargetView*>(gameView)->GetDesc(&vd.rtv); break;
     case ViewKind::Dsv: static_cast<ID3D11DepthStencilView*>(gameView)->GetDesc(&vd.dsv); break;
     case ViewKind::Srv: static_cast<ID3D11ShaderResourceView*>(gameView)->GetDesc(&vd.srv); break;
+    case ViewKind::Uav: static_cast<ID3D11UnorderedAccessView*>(gameView)->GetDesc(&vd.uav); break;
     }
     for (auto& v : g_views)
         if (v.game == game && v.kind == kind && std::memcmp(&v.desc, &vd, sizeof vd) == 0) return v.priv;
@@ -904,6 +946,7 @@ ID3D11View* privateView(ViewKind kind, ID3D11View* gameView, bool make) {
     case ViewKind::Rtv: hr = g_device->CreateRenderTargetView(m->priv, &vd.rtv, reinterpret_cast<ID3D11RenderTargetView**>(&out)); break;
     case ViewKind::Dsv: hr = g_device->CreateDepthStencilView(m->priv, &vd.dsv, reinterpret_cast<ID3D11DepthStencilView**>(&out)); break;
     case ViewKind::Srv: hr = g_device->CreateShaderResourceView(m->priv, &vd.srv, reinterpret_cast<ID3D11ShaderResourceView**>(&out)); break;
+    case ViewKind::Uav: hr = g_device->CreateUnorderedAccessView(m->priv, &vd.uav, reinterpret_cast<ID3D11UnorderedAccessView**>(&out)); break;
     }
     if (FAILED(hr) || !out) {
         if (!g_saidCreateFail) {
@@ -957,6 +1000,26 @@ int eyeFor(const void* depth, bool assign) {
         }
     }
     return -1;
+}
+
+// The eye an AO chain resource belongs to this frame: its G-buffer RT0-3, its depth copy, or an output of its chain. -1: none.
+int aoEyeOf(const void* res) {
+    if (!res) return -1;
+    for (int i = 0; i < 2; ++i) {
+        const Eye& e = g_eyes[i];
+        if (res == e.copyGame) return i;
+        for (const void* g : e.gbufGame)
+            if (g && g == res) return i;
+        for (uint8_t k = 0; k < e.aoOutCount; ++k)
+            if (e.aoOut[k] == res) return i;
+    }
+    return -1;
+}
+// Folds one resource's eye into *ei; *both when two resources name different eyes.
+void noteAoEye(int found, int* ei, bool* both) {
+    if (found < 0) return;
+    if (*ei >= 0 && *ei != found) *both = true;
+    *ei = found;
 }
 
 float clearDepthOf(const void* res, uint8_t* stencil) {
@@ -1441,6 +1504,7 @@ bool seedEye(ID3D11DeviceContext* ctx, ID3D11RenderTargetView* const* rtv, ID3D1
         ++g_win.clears;
         e.hdrGame = resourceOf(rtv[3]);
         e.slotGame = resourceOf(rtv[kSlotTarget]);
+        for (int i = 0; i < 4; ++i) e.gbufGame[i] = resourceOf(rtv[i]);   // the AO chain names its eye by them (RT0 the HBAO's, RT2 the apply's)
         // Step 3: the game's eye depth, which the cover pass reads after the tonemap (the cockpit in front of the hull).
         if (detail::g_hullLayerSeparate) {
             ID3D11Resource* res = nullptr;
@@ -1677,11 +1741,27 @@ bool beginStage(ID3D11DeviceContext* ctx, Stage stage, uint8_t bit) {
     for (UINT i = 0; ei < 0 && i < kSrvSlots; ++i)
         if (srv[i]) ei = eyeFor(resourceOf(srv[i]), false);
     if (ei < 0 && stage == kLight && g_stageEye >= 0 && g_eyes[g_stageEye].lightOpen) ei = g_stageEye;
+    // The AO apply binds no depth: its eye is the one whose G-buffer RT2 it writes, or whose AO it reads.
+    if (ei < 0 && stage == kAo) {
+        bool both = false;
+        for (UINT i = 0; i < D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT; ++i)
+            if (rtv[i]) noteAoEye(aoEyeOf(resourceOf(rtv[i])), &ei, &both);
+        for (UINT i = 0; i < kSrvSlots; ++i)
+            if (srv[i]) noteAoEye(aoEyeOf(resourceOf(srv[i])), &ei, &both);
+        if (both) ei = -1;
+    }
     if (ei < 0 || !g_device) return decline(true);
     Eye& e = g_eyes[ei];
+    if (stage == kAo) e.aoSeen |= kAoApplyBit;
     if (e.gb == Gb::In) finishGbuffer(ctx, ei, stage == kCopy ? kEndCopy : kEndLight);   // the eye's G-buffer is over; the game's state is back
-    g_stageEye = ei;
-    if (stage != kCopy) {
+    if (stage == kAo) {
+        // Not a lighting stage: it does not open the lighting window or move the stage eye. It needs the eye's whole AO
+        // chain this frame, or the private AO it would read is last frame's.
+        if (e.gb != Gb::Done || (e.aoDone & kAoAllSteps) != kAoAllSteps) return decline(true);
+    } else {
+        g_stageEye = ei;
+    }
+    if (stage != kCopy && stage != kAo) {
         e.lightOpen = true;   // the shadow mask opens the lighting window; the sky closes it
         e.lightSpan = 0;
     }
@@ -1691,6 +1771,7 @@ bool beginStage(ID3D11DeviceContext* ctx, Stage stage, uint8_t bit) {
         if (e.stagesDone & bit) return decline(false);   // once per eye per frame: a later use of the same pair is not the eye's
         e.stagesDone |= bit;
     }
+    if (stage == kCopy && rtv[0]) e.copyGame = resourceOf(rtv[0]);   // the AO chain's first step reads it: that names its eye
     // Targets: every bound one gets a private counterpart (made now for the stage's own: f39, f60, the scratch R16).
     ID3D11RenderTargetView* bindRtv[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT] = {};
     uint32_t swapped = 0;
@@ -1720,10 +1801,15 @@ bool beginStage(ID3D11DeviceContext* ctx, Stage stage, uint8_t bit) {
         srvSwapped = true;
         ++swapped;
     }
+    if (stage == kAo && !srvSwapped) return decline(true);   // the AO it reads has no private copy: the game's AO is not the hull's
     if (srvSwapped) vScreenPSSetShaderResourcesRaw(ctx, 0, kSrvSlots, bindSrv);
     vScreenSetRenderTargetsRaw(ctx, boundCount(bindRtv), bindRtv, bindDsv);
     g_win.subst[stage] += swapped;
     if (stage == kLight) ++e.lightDraws;
+    if (stage == kAo) {
+        e.aoDone |= kAoApplyBit;
+        ++g_win.aoApplied;
+    }
     g_pending = Pending{};
     g_pending.active = true;
     g_pending.eye = ei;
@@ -1767,6 +1853,87 @@ void noteInLightWindow(ID3D11DeviceContext* ctx, uint64_t vs) {
     Log::get().note("hull layer: unknown lighting pair vs %016llX ps %016llX writes the eye's HDR between the shadow mask and the sky (eye %d, frame %u; "
                     "not re-issued; said once a pair, %u so far)",
                     static_cast<unsigned long long>(vs), static_cast<unsigned long long>(ps), g_stageEye, g_frame, g_unknownCount);
+}
+
+// ---- the AO chain's compute steps ---------------------------------------------------------------------------------------
+
+void releaseCsSlots(ID3D11ShaderResourceView** srv, ID3D11UnorderedAccessView** uav) {
+    for (UINT i = 0; i < kCsSrvSlots; ++i) releaseRef(srv[i]);
+    for (UINT i = 0; i < kCsUavSlots; ++i) releaseRef(uav[i]);
+}
+
+// Right after the game's dispatch of AO step `step`, with its bindings still bound: the step's eye, by what it reads; its
+// targets given private copies and its private-copied inputs swapped. True: the caller dispatches the same groups again
+// and calls hullLayerEndDispatch. The shader, constant buffers and samplers stay the game's; so do inputs with no private
+// copy (the HBAO's kernel buffer).
+bool beginAoStep(ID3D11DeviceContext* ctx, int step) {
+    ID3D11ShaderResourceView* srv[kCsSrvSlots] = {};
+    ID3D11UnorderedAccessView* uav[kCsUavSlots] = {};
+    ctx->CSGetShaderResources(0, kCsSrvSlots, srv);
+    ctx->CSGetUnorderedAccessViews(0, kCsUavSlots, uav);
+    const auto decline = [&] {
+        releaseCsSlots(srv, uav);
+        return false;
+    };
+    int ei = -1;
+    bool both = false;
+    for (UINT i = 0; i < kCsSrvSlots; ++i)
+        if (srv[i]) noteAoEye(aoEyeOf(resourceOf(srv[i])), &ei, &both);
+    if (ei < 0 || both) {
+        // Counted only while an eye has a private G-buffer this frame (off it, every chain dispatch would count).
+        if (g_eyes[0].gb == Gb::Done || g_eyes[1].gb == Gb::Done) ++g_win.aoNoEye;
+        return decline();
+    }
+    Eye& e = g_eyes[ei];
+    const uint8_t bit = static_cast<uint8_t>(1u << step);
+    if (e.aoSeen & bit) return decline();   // once per eye per frame: a later use of the step is not the eye's chain
+    e.aoSeen |= bit;
+    // The eye's private G-buffer this frame, its depth copy re-issued, and each earlier step re-issued: otherwise a private
+    // input is last frame's (the boundary counts the step as missed).
+    const uint8_t before = static_cast<uint8_t>(bit - 1u);
+    if (e.gb != Gb::Done || !(e.stagesDone & 1u) || (e.aoDone & before) != before) return decline();
+    // Targets: every bound UAV gets a private copy (made at first use: the chain's own outputs). One that cannot (not a 2D
+    // texture, multisampled, the cap) declines the step: the re-issue would write the game's own target.
+    ID3D11UnorderedAccessView* bindUav[kCsUavSlots] = {};
+    bool anyUav = false;
+    for (UINT i = 0; i < kCsUavSlots; ++i) {
+        if (!uav[i]) continue;
+        bindUav[i] = static_cast<ID3D11UnorderedAccessView*>(privateView(ViewKind::Uav, uav[i], true));
+        if (!bindUav[i]) return decline();
+        anyUav = true;
+    }
+    if (!anyUav) return decline();
+    // Inputs: those with a private copy (the depth copy, RT0, an earlier step's output) are swapped.
+    ID3D11ShaderResourceView* bindSrv[kCsSrvSlots] = {};
+    bool srvSwapped = false;
+    for (UINT i = 0; i < kCsSrvSlots; ++i) {
+        bindSrv[i] = srv[i];
+        if (!srv[i] || !findMirror(resourceOf(srv[i]))) continue;
+        auto* p = static_cast<ID3D11ShaderResourceView*>(privateView(ViewKind::Srv, srv[i], false));
+        if (!p) return decline();
+        bindSrv[i] = p;
+        srvSwapped = true;
+    }
+    if (!srvSwapped) return decline();   // nothing private read: the re-issue would repeat the game's own result
+    // The outputs name this eye for the steps after it and the apply draw.
+    for (UINT i = 0; i < kCsUavSlots; ++i) {
+        const void* out = uav[i] ? resourceOf(uav[i]) : nullptr;
+        if (!out || aoEyeOf(out) == ei) continue;
+        if (e.aoOutCount < kAoOwned) e.aoOut[e.aoOutCount++] = out;
+    }
+    // The game's dispatch was hazard-free and the swap is one to one, so no private view is bound twice; the inputs go first
+    // (the game's UAVs, still bound, are none of the private copies).
+    UINT keep[kCsUavSlots];
+    for (auto& k : keep) k = ~0u;   // -1: a counter stays as it is
+    ctx->CSSetShaderResources(0, kCsSrvSlots, bindSrv);
+    ctx->CSSetUnorderedAccessViews(0, kCsUavSlots, bindUav, keep);
+    g_dispatch = DispatchPending{};
+    g_dispatch.active = true;
+    for (UINT i = 0; i < kCsSrvSlots; ++i) g_dispatch.srv[i] = srv[i];   // the references pass to End
+    for (UINT i = 0; i < kCsUavSlots; ++i) g_dispatch.uav[i] = uav[i];
+    e.aoDone |= bit;
+    ++g_win.aoDispatches;
+    return true;
 }
 
 // ---- Step 3: the tonemap re-issue, the cover, the composite -----------------------------------------------------------
@@ -2330,6 +2497,13 @@ void report() {
                     g_win.subst[kMask], g_win.subst[kLight], ld[0], ld[1], ld[2], g_win.noCounterpart[kCopy], g_win.noCounterpart[kMask],
                     g_win.noCounterpart[kLight], g_win.unknownPairs, g_win.ended[kEndCopy], g_win.ended[kEndShell], g_win.ended[kEndLight],
                     g_win.ended[kEndFrame], g_win.terrainFrames, g_win.autoDumps);
+    Log::get().note("hull layer: ao: eye_frames=%u full=%u dispatches=%u per_eye_frame=%.2f applied=%u missed=deinterleave:%u,hbao:%u,interleave:%u,"
+                    "apply:%u no_eye=%u (the game's AO chain re-issued on the private G-buffer: eye-frames with a private G-buffer, and those whose "
+                    "three compute steps and apply draw all were; per_eye_frame is dispatches over eye-frames, %d when every step ran; missed: "
+                    "eye-frames where the game ran a step for the eye and it was not re-issued; no_eye: chain dispatches no eye's resources named)",
+                    g_win.aoEyeFrames, g_win.aoFull, g_win.aoDispatches,
+                    g_win.aoEyeFrames ? static_cast<double>(g_win.aoDispatches) / g_win.aoEyeFrames : 0.0, g_win.aoApplied, g_win.aoMissed[0],
+                    g_win.aoMissed[1], g_win.aoMissed[2], g_win.aoMissed[kAoSteps], g_win.aoNoEye, kAoSteps);
     if (detail::g_hullLayerSeparate)
         Log::get().note("hull layer: main pass: own_draws=%u decal_draws=%u no_variant_draws=%u fallback_frames=%u decals_reissued=%u decal_no_slot=%u "
                         "(separate mode: draws issued with the own discard; window draws that could not take it; eye-frames whose main pass kept the own "
@@ -2486,6 +2660,26 @@ void hullLayerEnd(ID3D11DeviceContext* ctx) {
     releaseTargets(p.rtv, p.dsv);
     for (auto*& s : p.srv) releaseRef(s);
     p = Pending{};
+}
+
+bool hullLayerBeginDispatch(ID3D11DeviceContext* ctx, uint64_t cs) {
+    if (!detail::g_hullLayerOn || !ctx || !g_device || g_pending.active || g_main.active || g_dispatch.active) return false;
+    for (int s = 0; s < kAoSteps; ++s)
+        if (kAoCs[s] == cs) return beginAoStep(ctx, s);
+    return false;
+}
+
+void hullLayerEndDispatch(ID3D11DeviceContext* ctx) {
+    if (!g_dispatch.active) return;
+    if (ctx) {
+        // The game's inputs first (none is a private copy still bound as a UAV), then its UAVs with their counters kept.
+        UINT keep[kCsUavSlots];
+        for (auto& k : keep) k = ~0u;
+        ctx->CSSetShaderResources(0, kCsSrvSlots, g_dispatch.srv);
+        ctx->CSSetUnorderedAccessViews(0, kCsUavSlots, g_dispatch.uav, keep);
+    }
+    releaseCsSlots(g_dispatch.srv, g_dispatch.uav);
+    g_dispatch = DispatchPending{};
 }
 
 void hullLayerNoteClearRtv(ID3D11DeviceContext* ctx, ID3D11RenderTargetView* rtv, const float colour[4]) {
@@ -2646,6 +2840,7 @@ void hullLayerFrameBoundary(ID3D11DeviceContext* ctx) {
         return;
     }
     if (g_pending.active && ctx) hullLayerEnd(ctx);   // never: Begin and End are one call chain
+    if (g_dispatch.active && ctx) hullLayerEndDispatch(ctx);   // never, likewise
     {
         VrWorldInternalScope internal;   // the passes, copies and maps here are the layer's own
         // The frame that just ended: an eye whose G-buffer window is still open is filtered now.
@@ -2669,6 +2864,12 @@ void hullLayerFrameBoundary(ID3D11DeviceContext* ctx) {
         if (e.gb == Gb::Done) {
             g_win.hullDraws.push_back(e.hull);
             g_win.lightDraws.push_back(e.lightDraws);
+            ++g_win.aoEyeFrames;
+            if (e.aoDone == (kAoAllSteps | kAoApplyBit)) ++g_win.aoFull;
+            for (int s = 0; s <= kAoSteps; ++s) {
+                const uint8_t bit = static_cast<uint8_t>(1u << s);
+                if ((e.aoSeen & bit) && !(e.aoDone & bit)) ++g_win.aoMissed[s];
+            }
         }
     }
     ++g_win.frames;
@@ -2719,6 +2920,7 @@ void hullLayerFrameBoundary(ID3D11DeviceContext* ctx) {
 void hullLayerShutdown() {
     g_pending = Pending{};   // references, if any, die with the device
     g_main = MainPending{};
+    g_dispatch = DispatchPending{};
     releaseAll();
     detail::g_hullLayerOn = false;
 }

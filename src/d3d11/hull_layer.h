@@ -34,6 +34,9 @@
 //      No seed, no slot target, no variant: the draw is issued as the game made it (the ship stays).
 //   7. The own decals are re-issued into the private layer too (filtered like the hull), when they export the slot.
 //   8. The dump adds the game's G-buffer RT0 and main depth after the eye's G-buffer (_GameGbuf0, _GameDepth).
+//   8a. The ambient occlusion (both modes; "AO on the hull layer"): the game's AO chain (three compute steps an eye after
+//      its depth copy) is dispatched once more after each game dispatch on the private depth copy and RT0, into private
+//      copies of its targets, and its apply draw (DEF19B03/06CD42A9) is re-issued into the private RT2 before the shadow mask.
 //   The own forward draws after the lighting (VS 88DCF116, 025B4B9F, 0B5981F2, F464E27C, 6DB587D2, 2B3F53DD) are not
 //   engine-motion families: they still draw into the main pass (an open item of the doc).
 //
@@ -90,6 +93,13 @@ void hullLayerAfterMainDraw(ID3D11DeviceContext* ctx);
 // passes, with the game's state put back).
 bool hullLayerBegin(ID3D11DeviceContext* ctx, char kind, UINT count, UINT instances, UINT startInstance);
 void hullLayerEnd(ID3D11DeviceContext* ctx);
+
+// Right after the game's own issue of an owner-context Dispatch (exposure_fix.cpp hookedDispatch), with its bindings still
+// bound and the bound compute shader's content hash: a step of the game's AO chain (kAoCs in hull_layer.cpp) whose eye has a
+// private G-buffer gets private UAV targets and its private-copied inputs. True: the caller dispatches the same groups once
+// more (raw), then calls hullLayerEndDispatch, which puts the game's compute views back. Both modes (dump and separate).
+bool hullLayerBeginDispatch(ID3D11DeviceContext* ctx, uint64_t csHash);
+void hullLayerEndDispatch(ID3D11DeviceContext* ctx);
 
 // From the clear hooks (owner context, the game's own clears): a clear of a target that has a private counterpart is
 // made on the counterpart too, and the value an eye depth is cleared to is remembered for the private depth's clear.
