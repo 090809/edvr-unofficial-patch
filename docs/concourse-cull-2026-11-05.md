@@ -662,7 +662,7 @@ Flown 2026-11-08 in VR on 194805e2, log `edvr_gfx_20261108_092319`, at a `Dodec`
 
 ## Flight 55, the list as written
 
-VR, Steam, the source of a1e8a4c8 (the DLLs are promoted by `--dll-only` at the doc commit on top of it; the version line names that commit). It is Flight 54's list again: the Dodec or this Orbis, on foot in the room, by a ride up or a load in the room. Look at the window, then at the room's far end.
+VR, Steam, e9e3e1f3 (a1e8a4c8's source with a doc commit on top, promoted by `--dll-only`). Read with `python tools\edvr_log.py --target steam --expect-build e9e3e1f3 --grep "concourse bake: (vr|dump)"`. It is Flight 54's list again: the Dodec or this Orbis, on foot in the room, by a ride up or a load in the room. Look at the window, then at the room's far end.
 
 - **The log:** the stub lines in aimed windows read `written 0x15` with `0 foreign`, and show the `pads` values. Every face's capture lines say `writes`, each `dump` line reads `unwritten 0.0%`, and the `vr draw diff` lines name the band's draws.
 - **If the stub writes nothing again,** the bake should stop after six windows with "the stub wrote no call", not hold the headset for a second.
