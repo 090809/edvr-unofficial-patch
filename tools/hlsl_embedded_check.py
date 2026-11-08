@@ -60,8 +60,9 @@ def blob_text(p):
     vt = ctypes.cast(p, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p)))[0]
     ptr = ctypes.WINFUNCTYPE(ctypes.c_void_p, ctypes.c_void_p)(vt[3])(p)
     size = ctypes.WINFUNCTYPE(ctypes.c_size_t, ctypes.c_void_p)(vt[4])(p)
+    text = ctypes.string_at(ptr, size).decode('latin1') if ptr else ''   # read before the Release frees it
     ctypes.WINFUNCTYPE(ctypes.c_ulong, ctypes.c_void_p)(vt[2])(p)   # Release
-    return ctypes.string_at(ptr, size).decode('latin1') if ptr else ''
+    return text
 
 
 def compile_one(fn, name, src, entry, target):

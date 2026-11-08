@@ -666,6 +666,19 @@ A possible change, not made: widen the cover to pixels around the hull
 where the private HDR received night-vision light. Deferred while the
 pilot is content.
 
+**The blink is gone** with the 120-frame hold. **The hull's textures look
+soft** (the pilot, 22:20). The layer's TAA read its history with one
+bilinear tap at a current weight of 0.1, so a little blur accumulated every
+frame. Before separate mode, DLSS reconstructed the hull from the jitter.
+Fix: the history is read through a 9-tap Catmull-Rom, then clamped to the
+3x3 range as before. If the hull is still softer than the world, the next
+lever is the current-frame kernel (exp(-2.29 d^2) over 3x3 render pixels)
+or a sharpen on the layer only.
+
+`tools\hlsl_embedded_check.py` read a compiler blob after releasing it. The
+larger TAA shader made that fail with an access violation. It now reads the
+blob first.
+
 ## Separate mode flown (2026-11-08 ~22:00, build 4e252a32): works; night vision, load blink
 
 Log `edvr_gfx_20261108_215951.log`, FG off. The pilot: the ship is drawn,
