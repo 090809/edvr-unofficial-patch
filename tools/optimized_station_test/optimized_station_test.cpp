@@ -233,6 +233,40 @@ void testVrBake() {
         for (int k = 0; k < 3; ++k) expect[k] = centre[k] - 0.032f * faces[2].r[k];
         check(vecNear(p, expect, 5e-3f), "vr bake: which is the centre less half the eyes' separation along the face's right");
     }
+    // The eye stub's write fence (native_preview_camera.cpp bakeEye, the branch review 2026-11-08): a call is written only if its own pose is the base Elite is using.
+    {
+        const Pose base = cvb::aimBase(hg, cvb::faceRows(faces[2], centre, 1.0f));   // any proper pose with a translation will do as Elite's base
+        Pose same = base, moved = base, turned = base, ident = cvb::identityPose(), nan = base;
+        check(cvb::baseMatches(base.v, base.v), "vr bake: the fence takes the base Elite is using");
+        same.v[12] += 0.2f;   // inside the 0.25 m
+        check(cvb::baseMatches(same.v, base.v), "vr bake: and the same base a step later (0.2 m)");
+        moved.v[13] += 0.3f;
+        check(!cvb::baseMatches(moved.v, base.v), "vr bake: but not one 0.3 m away");
+        // a rotation of about 6 degrees about up: the forward axis's dot is cos 6 = 0.9945, under 0.995
+        const float c6 = std::cos(6.0f * 3.14159265f / 180.0f), s6 = std::sin(6.0f * 3.14159265f / 180.0f);
+        for (int r = 0; r < 3; ++r) {
+            const float x = base.v[r * 4], z = base.v[r * 4 + 2];
+            turned.v[r * 4] = c6 * x + s6 * z;
+            turned.v[r * 4 + 2] = -s6 * x + c6 * z;
+        }
+        check(!cvb::baseMatches(turned.v, base.v), "vr bake: nor one turned 6 degrees");
+        const float c3 = std::cos(3.0f * 3.14159265f / 180.0f), s3 = std::sin(3.0f * 3.14159265f / 180.0f);
+        Pose slight = base;
+        for (int r = 0; r < 3; ++r) {
+            const float x = base.v[r * 4], z = base.v[r * 4 + 2];
+            slight.v[r * 4] = c3 * x + s3 * z;
+            slight.v[r * 4 + 2] = -s3 * x + c3 * z;
+        }
+        check(cvb::baseMatches(slight.v, base.v), "vr bake: but one turned 3 degrees is still it");
+        Pose distant = cvb::identityPose();
+        distant.v[12] = 5.0f;
+        check(!cvb::baseMatches(ident.v, distant.v) && cvb::baseMatches(ident.v, ident.v), "vr bake: the heap calls' identity at the origin is not a base 5 m away, and is itself");
+        nan.v[5] = std::nanf("");
+        check(!cvb::baseMatches(nan.v, base.v) && !cvb::baseMatches(base.v, nan.v), "vr bake: a pose with a NaN never matches, either way round");
+        Pose zeroAxes = base;
+        for (int k = 0; k < 4; ++k) zeroAxes.v[k] = 0.0f;
+        check(!cvb::baseMatches(zeroAxes.v, base.v), "vr bake: a pose whose axis cannot be normalised never matches");
+    }
     // A canted eye: the camera's forward is the face's turned by the eye's own rotation, read through S (the true eye in OpenVR's head axes, z negated, over the face's rows).
     {
         const Pose rows = cvb::faceRows(faces[0], centre, 1.0f);

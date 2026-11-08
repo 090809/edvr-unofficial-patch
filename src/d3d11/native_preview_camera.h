@@ -22,14 +22,16 @@ bool nativeCameraProbeWrote(unsigned frame) noexcept;
 struct NativeCameraBakeWindow {
     static constexpr unsigned kCalls = 6;
     bool armed = false;
-    unsigned calls = 0, stackCalls = 0, wroteMask = 0, stackMask = 0, torn = 0;
+    unsigned calls = 0, stackCalls = 0, wroteMask = 0, stackMask = 0, torn = 0, foreign = 0;   // foreign: calls refused, their own pose is not the base the aim expects
     bool firstSeen = false, firstStack = false, firstReadable = false;
     float firstBefore[16] = {};      // the window's first call, as Elite left it (its base)
     float callT[kCalls][3] = {};     // each of the first calls' translation before
 };
 bool nativeCameraBakeAvailable(const char** why);
 void nativeCameraBakeObserve(bool on) noexcept;
-void nativeCameraBakeAim(const float pose[16]) noexcept;
+// expected: the base Elite is using (the latest window's first call before); a call is written only if its own pose matches it. Null writes nothing. Each Aim is a lease for one
+// window: nativeCameraBakeTick ends it, so the caller aims again every tick it wants written.
+void nativeCameraBakeAim(const float pose[16], const float expected[16]) noexcept;
 void nativeCameraBakeStopWriting() noexcept;
 bool nativeCameraBakeWriting() noexcept;
 void nativeCameraBakeTick(NativeCameraBakeWindow* out) noexcept;

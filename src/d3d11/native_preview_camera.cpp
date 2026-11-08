@@ -1,5 +1,6 @@
 #include "native_preview_camera.h"
 #include "native_preview_camera_core.h"
+#include "concourse_vr_bake_core.h"   // baseMatches: the bake's write fence (pure)
 #include <windows.h>
 #include <atomic>
 #include <cstdio>
@@ -178,12 +179,20 @@ __declspec(noinline) bool probeEye(uintptr_t pose) noexcept {
 // and every call of a window that carries Elite's base is written with it: a call at a stack address (0x2845730's copy of W+0x3330) whose pose is not the identity (Flight 51:
 // calls 0, 2 and 4 of each frame carried the base, the heap calls 1, 3 and 5 the identity). Observing, it writes nothing and records what Elite left there. Wait-free in the
 // stub: a seqlock guards the published pose, and a torn read is not written.
+// Two fences keep a write to Elite's own base calls (the branch review, 2026-11-08). Match: a call is written only when its own pose, read before the write, is the base the tick
+// expects (the latest window's first call, Elite's own; concourse_vr_bake_core.h baseMatches); the rest count as `foreign`. Lease: an aim is valid for one window:
+// nativeCameraBakeTick (the window's close) ends it and the next aim renews it, so a tick that stalls cannot leave writing on; kBakeLeaseMs bounds even a window that never closes.
 constexpr unsigned kBakeCalls = 8;
+constexpr uint64_t kBakeLeaseMs = 500;
 struct BakeAim {
     std::atomic<bool> armed{false};      // the stub's one test while the bake is idle
     std::atomic<bool> writing{false};    // a pose is published: the window's base calls are written with it
+    std::atomic<uint64_t> leaseUntilMs{0};   // GetTickCount64 past which the aim is no longer valid
     std::atomic<uint32_t> seq{0};        // even: the pose is whole
     previewcam::Pose pose;
+    previewcam::Pose expected;           // the base Elite is expected to hold in a call this aim may write (published with pose, under seq)
+    bool expectedValid=false;
+    std::atomic<uint32_t> foreignCalls{0};   // calls refused: their own pose is not the expected base, or none was published
     std::atomic<uint32_t> calls{0}, stackCalls{0}, wroteMask{0}, tornCalls{0};
     std::atomic<uint32_t> firstReady{0};
     bool firstStack=false,firstReadable=false;
@@ -191,10 +200,12 @@ struct BakeAim {
     float callT[kBakeCalls][3]{};        // each call's translation before (for the log)
     std::atomic<uint32_t> callStackMask{0};
 } g_bakeAim;
-bool bakeReadPublished(previewcam::Pose& out) noexcept {
+bool bakeReadPublished(previewcam::Pose& out,previewcam::Pose& expected,bool& expectedValid) noexcept {
     const uint32_t s1=g_bakeAim.seq.load(std::memory_order_acquire);
     if(s1&1u)return false;
     std::memcpy(&out,&g_bakeAim.pose,sizeof(out));
+    std::memcpy(&expected,&g_bakeAim.expected,sizeof(expected));
+    expectedValid=g_bakeAim.expectedValid;
     std::atomic_thread_fence(std::memory_order_acquire);
     return g_bakeAim.seq.load(std::memory_order_relaxed)==s1;
 }
@@ -216,8 +227,12 @@ __declspec(noinline) bool bakeEye(uintptr_t pose) noexcept {
         g_bakeAim.firstReady.store(1,std::memory_order_release);
     }
     if(!g_bakeAim.writing.load(std::memory_order_acquire)||!stack||!readable||probeIdentity(before))return false;
-    previewcam::Pose p;
-    if(!bakeReadPublished(p)||!previewcam::finite(p)){g_bakeAim.tornCalls.fetch_add(1,std::memory_order_relaxed);return false;}
+    if(GetTickCount64()>g_bakeAim.leaseUntilMs.load(std::memory_order_acquire))return false;   // the lease ran out: no aim is current
+    previewcam::Pose p,expected;
+    bool expectedValid=false;
+    if(!bakeReadPublished(p,expected,expectedValid)||!previewcam::finite(p)){g_bakeAim.tornCalls.fetch_add(1,std::memory_order_relaxed);return false;}
+    // `before` is Elite's own pose: nothing has been written into this call yet. Only the base the tick expects is overwritten.
+    if(!expectedValid||!concourse_vr::baseMatches(before.v,expected.v)){g_bakeAim.foreignCalls.fetch_add(1,std::memory_order_relaxed);return false;}
     const bool wrote=g_previewMemory.write(g_previewMemory.context,pose,&p,sizeof(p));
     if(wrote&&n<32)g_bakeAim.wroteMask.fetch_or(1u<<n,std::memory_order_relaxed);
     return wrote;
@@ -380,21 +395,27 @@ void nativeCameraBakeObserve(bool on) noexcept {
     if(!g_previewInstalled)return;
     g_bakeAim.armed.store(true,std::memory_order_release);
 }
-void nativeCameraBakeAim(const float pose[16]) noexcept {
+void nativeCameraBakeAim(const float pose[16],const float expected[16]) noexcept {
     if(!g_previewInstalled||!pose)return;
     g_bakeAim.seq.fetch_add(1,std::memory_order_acq_rel);   // odd: a reader in the stub refuses the pose until it is whole again
     std::atomic_thread_fence(std::memory_order_release);
     std::memcpy(g_bakeAim.pose.v,pose,sizeof(g_bakeAim.pose.v));
+    g_bakeAim.expectedValid=expected!=nullptr;
+    if(expected)std::memcpy(g_bakeAim.expected.v,expected,sizeof(g_bakeAim.expected.v));
     g_bakeAim.seq.fetch_add(1,std::memory_order_release);
+    g_bakeAim.leaseUntilMs.store(GetTickCount64()+kBakeLeaseMs,std::memory_order_release);
     g_bakeAim.armed.store(true,std::memory_order_release);
-    g_bakeAim.writing.store(true,std::memory_order_release);
+    g_bakeAim.writing.store(true,std::memory_order_release);   // the lease: one window, until nativeCameraBakeTick closes it
 }
 void nativeCameraBakeStopWriting() noexcept {g_bakeAim.writing.store(false,std::memory_order_release);}
 bool nativeCameraBakeWriting() noexcept {return g_bakeAim.writing.load(std::memory_order_acquire);}
 // Present thread, once a frame: the window since the last call, then a fresh one.
 void nativeCameraBakeTick(NativeCameraBakeWindow* out) noexcept {
     NativeCameraBakeWindow w;
+    // The window closes, so its aim's lease ends: the next window is written only if the tick aims again (nativeCameraBakeAim).
+    g_bakeAim.writing.store(false,std::memory_order_release);
     w.armed=g_bakeAim.armed.load(std::memory_order_acquire);
+    w.foreign=g_bakeAim.foreignCalls.exchange(0,std::memory_order_relaxed);
     w.calls=g_bakeAim.calls.exchange(0,std::memory_order_acq_rel);
     w.stackCalls=g_bakeAim.stackCalls.exchange(0,std::memory_order_relaxed);
     w.wroteMask=g_bakeAim.wroteMask.exchange(0,std::memory_order_relaxed);

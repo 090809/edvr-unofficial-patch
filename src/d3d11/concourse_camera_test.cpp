@@ -195,22 +195,31 @@ constexpr float kCtNearValue=0.025f;
 std::atomic<float*> g_ctNearAt{nullptr};
 std::atomic<bool> g_ctNearRaised{false};
 
+// The value a raise replaced, remembered on the transition from not raised to raised (the producer raises it again every frame, and those calls must not remember the raised value);
+// a restore puts exactly that back. kCtNearValue is only what resolve checks the address against.
+std::atomic<float> g_ctNearReplaced{kCtNearValue};
+std::atomic<float> g_ctNearWritten{0.0f};   // the last value a raise wrote: a read of it is not the game's value
 void ctNearRaise(float nearM) noexcept {
     float* at=g_ctNearAt.load(std::memory_order_relaxed);
     if(!at)return;
     __try {
+        const bool was=g_ctNearRaised.load(std::memory_order_relaxed);
+        const float cur=*static_cast<volatile float*>(at);
+        // A restore racing this raise may not have written its value back yet: what is read is then our own earlier write, and the value remembered stays.
+        if(!was&&cur!=g_ctNearWritten.load(std::memory_order_relaxed))g_ctNearReplaced.store(cur,std::memory_order_relaxed);
+        g_ctNearWritten.store(nearM,std::memory_order_relaxed);
         *static_cast<volatile float*>(at)=nearM;
-        g_ctNearRaised.store(true,std::memory_order_relaxed);
+        g_ctNearRaised.store(true,std::memory_order_release);
     } __except(EXCEPTION_EXECUTE_HANDLER) {
         g_ctFaults.fetch_add(1,std::memory_order_relaxed);
     }
 }
 void ctNearRestore() noexcept {
-    if(!g_ctNearRaised.exchange(false,std::memory_order_relaxed))return;
+    if(!g_ctNearRaised.exchange(false,std::memory_order_acq_rel))return;
     float* at=g_ctNearAt.load(std::memory_order_relaxed);
     if(!at)return;
     __try {
-        *static_cast<volatile float*>(at)=kCtNearValue;
+        *static_cast<volatile float*>(at)=g_ctNearReplaced.load(std::memory_order_relaxed);
     } __except(EXCEPTION_EXECUTE_HANDLER) {
         g_ctFaults.fetch_add(1,std::memory_order_relaxed);
     }
@@ -424,7 +433,7 @@ bool concourseNearValueRestore() noexcept {
     ctNearRestore();
     return was;
 }
-float concourseNearValueRestoredTo() noexcept {return kCtNearValue;}
+float concourseNearValueRestoredTo() noexcept {return g_ctNearReplaced.load(std::memory_order_relaxed);}
 
 void concourseCameraTestSnapshot(ConcourseCameraTestSnap* out) noexcept {
     if(!out)return;

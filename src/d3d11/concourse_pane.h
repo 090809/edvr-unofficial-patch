@@ -50,8 +50,10 @@ struct ConcoursePaneCalls {
 
 class ConcoursePaneScope {
 public:
-    ConcoursePaneScope(ID3D11DeviceContext* ctx, UINT indexCount, UINT startIndex, INT baseVertex, const ConcoursePaneCalls& calls) noexcept {
-        if (detail::g_concoursePaneArmed.load(std::memory_order_relaxed)) begin(ctx, indexCount, startIndex, baseVertex, calls);
+    // kind: the draw call that built it, for the VR bake's draw diff: D Draw, I DrawIndexed, N DrawInstanced, X DrawIndexedInstanced, Y DrawInstancedIndirect, Z
+    // DrawIndexedInstancedIndirect, A DrawAuto. The indirect kinds pass 0 for the counts (they are on the GPU), and never ask for a mirror pass.
+    ConcoursePaneScope(ID3D11DeviceContext* ctx, UINT indexCount, UINT startIndex, INT baseVertex, char kind, const ConcoursePaneCalls& calls) noexcept {
+        if (detail::g_concoursePaneArmed.load(std::memory_order_relaxed)) begin(ctx, indexCount, startIndex, baseVertex, kind, calls);
     }
     ~ConcoursePaneScope() {
         if (flags_ != 0) end();
@@ -67,7 +69,7 @@ public:
     bool nextMirrorPass() noexcept { return family_ && nextMirrorPassSlow(); }
 
 private:
-    void begin(ID3D11DeviceContext* ctx, UINT indexCount, UINT startIndex, INT baseVertex, const ConcoursePaneCalls& calls) noexcept;
+    void begin(ID3D11DeviceContext* ctx, UINT indexCount, UINT startIndex, INT baseVertex, char kind, const ConcoursePaneCalls& calls) noexcept;
     void beginBody(ID3D11DeviceContext* ctx, UINT indexCount, UINT startIndex, INT baseVertex, const ConcoursePaneCalls& calls) noexcept;
     bool nextMirrorPassSlow() noexcept;
     void bindPsCb(ID3D11Buffer* own) noexcept;   // constant buffer 2 of the pixel stage, the previous one kept for end()

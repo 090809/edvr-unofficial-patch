@@ -85,6 +85,25 @@ inline bool normalize3(float v[3]) noexcept {
     return true;
 }
 
+// The eye stub's fence (native_preview_camera.cpp bakeEye): a call is the base Elite is using, and so may be written, when its own pose (read before any write) is within
+// kBaseMatchM of the expected base in translation and each of its three axes (rows 0 to 2, normalised) has a dot above kBaseMatchDot with the expected one. A pose that is not
+// finite, or whose axes cannot be normalised, never matches. Pure: the stub reads the pose, this decides.
+constexpr float kBaseMatchM = 0.25f;
+constexpr float kBaseMatchDot = 0.995f;
+inline bool baseMatches(const float have[16], const float expect[16]) noexcept {
+    for (int i = 0; i < 16; ++i)
+        if (!std::isfinite(have[i]) || !std::isfinite(expect[i])) return false;
+    const float d[3] = {have[12] - expect[12], have[13] - expect[13], have[14] - expect[14]};
+    if (!(dot3(d, d) <= kBaseMatchM * kBaseMatchM)) return false;
+    for (int r = 0; r < 3; ++r) {
+        float a[3] = {have[r * 4], have[r * 4 + 1], have[r * 4 + 2]};
+        float b[3] = {expect[r * 4], expect[r * 4 + 1], expect[r * 4 + 2]};
+        if (!normalize3(a) || !normalize3(b)) return false;
+        if (!(dot3(a, b) > kBaseMatchDot)) return false;
+    }
+    return true;
+}
+
 // A face's rows: right, up, forward, unit and orthogonal, right = up x forward (Elite's order, see the header).
 struct Face {
     float r[3] = {}, u[3] = {}, f[3] = {};

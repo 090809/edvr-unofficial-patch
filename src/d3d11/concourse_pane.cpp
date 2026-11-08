@@ -2187,36 +2187,45 @@ bool ensureMarked(ID3D11DeviceContext* ctx, const ConcoursePaneCalls& calls) noe
 }
 
 // ---- TEMPORARY (H62 instrument, Flight 54): the VR bake's draw diff ---------------------------------------------------------------------------------------------------------
-// During the VR bake's aim frames every draw the scope sees that is not withheld and has a depth-stencil view bound is keyed (vertex shader, pixel shader, index count, start index)
-// and kept per frame. When a face's frames are over (the next face's first aim, or the bake's end) the keys whose count is not the same on all of the face's frames are logged,
+// During the VR bake's aim frames every draw the scope sees that is not withheld and has a depth-stencil view bound is keyed (vertex shader, pixel shader, index count, start index,
+// base vertex, and the draw's kind: D Draw, I DrawIndexed, N DrawInstanced, X DrawIndexedInstanced, Y DrawInstancedIndirect, Z DrawIndexedInstancedIndirect, A DrawAuto) and kept per
+// frame. When a face's frames are over (the next face's first aim has begun, or the bake's end) the keys whose count is not the same on all of the face's frames are logged,
 // largest index count first: the draws behind the band of the room's upper structure that Flight 53 saw on some frames and not others, with the camera unchanged.
+// The draw thread only appends a key to its frame's buffer under g_diffMutex. The present thread's tick (vrDrawDiffTick) takes a finished face's group out under the mutex and
+// sorts and logs it outside; the bake's end takes whatever is left (vrDrawDiffFlush). For an indirect draw the counts live on the GPU: its index count and start are 0 and its
+// kind says so.
 std::atomic<bool> g_vrDiffOn{false};
 uint64_t vrAimEntry(uint32_t frame) noexcept;   // the aim ring's packed entry for the frame (0 when none), defined with the ring
 constexpr uint32_t kDiffFrames = 3;             // the frames of a face compared (kVrBakeDwell)
 constexpr uint32_t kDiffKeyCap = 16384;         // draws kept a frame; the rest are counted as dropped
 constexpr uint32_t kDiffLines = 30;
+constexpr size_t kDiffGroupCap = 64;            // groups waiting for the tick (a bake aims 15 times at most); the rest are dropped
 struct DiffKey {
     uint64_t vs, ps;
     uint32_t idx, start;
+    int32_t base;
+    char kind;
 };
 bool diffLess(const DiffKey& a, const DiffKey& b) noexcept {
     if (a.vs != b.vs) return a.vs < b.vs;
     if (a.ps != b.ps) return a.ps < b.ps;
     if (a.idx != b.idx) return a.idx < b.idx;
-    return a.start < b.start;
+    if (a.start != b.start) return a.start < b.start;
+    if (a.base != b.base) return a.base < b.base;
+    return a.kind < b.kind;
 }
-bool diffSame(const DiffKey& a, const DiffKey& b) noexcept { return a.vs == b.vs && a.ps == b.ps && a.idx == b.idx && a.start == b.start; }
+bool diffSame(const DiffKey& a, const DiffKey& b) noexcept { return a.vs == b.vs && a.ps == b.ps && a.idx == b.idx && a.start == b.start && a.base == b.base && a.kind == b.kind; }
 struct DiffFrame {
     uint32_t frame = 0, draws = 0, dropped = 0;
     std::vector<DiffKey> keys;
 };
 struct DiffGroup {
-    bool active = false;
     uint32_t face = 0, n = 0;
     DiffFrame fr[kDiffFrames];
 };
-std::mutex g_diffMutex;   // the draw threads and the tick both touch the group
-DiffGroup g_diff;
+std::mutex g_diffMutex;   // the draw threads and the tick both touch the groups
+std::vector<DiffGroup> g_diffGroups;   // oldest first; the last is the one the draws append to. Under g_diffMutex.
+uint32_t g_diffGroupsDropped = 0;      // draws of a group that found the list full (under g_diffMutex)
 
 // Counts of a key in a sorted list.
 uint32_t diffCount(const std::vector<DiffKey>& sorted, const DiffKey& k) noexcept {
@@ -2224,11 +2233,8 @@ uint32_t diffCount(const std::vector<DiffKey>& sorted, const DiffKey& k) noexcep
     return static_cast<uint32_t>(r.second - r.first);
 }
 
-// Logs the group's diff and empties it. The caller holds g_diffMutex.
-void vrDrawDiffFlushLocked() noexcept {
-    if (!g_diff.active) return;
-    DiffGroup& g = g_diff;
-    g.active = false;
+// Sorts and logs one finished group. No lock is held: the group is the caller's own.
+void vrDrawDiffLog(DiffGroup& g) noexcept {
     std::vector<DiffKey> all;
     uint32_t distinct[kDiffFrames] = {}, dropped = 0;
     for (uint32_t f = 0; f < kDiffFrames; ++f) {
@@ -2262,18 +2268,46 @@ void vrDrawDiffFlushLocked() noexcept {
     Log::get().note("concourse bake: vr draw diff: face %u, frames %u %u %u: draws %u %u %u, distinct keys %u %u %u, keys that differ %u (dropped %u)", g.face, g.fr[0].frame, g.fr[1].frame,
                     g.fr[2].frame, g.fr[0].draws, g.fr[1].draws, g.fr[2].draws, distinct[0], distinct[1], distinct[2], static_cast<unsigned>(diffs.size()), dropped);
     for (size_t i = 0; i < diffs.size() && i < kDiffLines; ++i)
-        Log::get().note("concourse bake: vr draw diff: face %u: vs %016llX ps %016llX indices %u start %u: counts %u %u %u", g.face, static_cast<unsigned long long>(diffs[i].k.vs),
-                        static_cast<unsigned long long>(diffs[i].k.ps), diffs[i].k.idx, diffs[i].k.start, diffs[i].c[0], diffs[i].c[1], diffs[i].c[2]);
-    for (DiffFrame& f : g.fr) f = DiffFrame{};
-    g.n = 0;
+        Log::get().note("concourse bake: vr draw diff: face %u: vs %016llX ps %016llX indices %u start %u base vertex %d kind %c%s: counts %u %u %u", g.face,
+                        static_cast<unsigned long long>(diffs[i].k.vs), static_cast<unsigned long long>(diffs[i].k.ps), diffs[i].k.idx, diffs[i].k.start, diffs[i].k.base,
+                        diffs[i].k.kind, diffs[i].k.kind == 'Y' || diffs[i].k.kind == 'Z' || diffs[i].k.kind == 'A' ? " (indirect: the counts are on the GPU)" : "", diffs[i].c[0],
+                        diffs[i].c[1], diffs[i].c[2]);
 }
+// The bake's end: every group still waiting is logged, then the list is empty. Present thread.
 void vrDrawDiffFlush() noexcept {
-    std::lock_guard<std::mutex> lock(g_diffMutex);
-    vrDrawDiffFlushLocked();
+    std::vector<DiffGroup> take;
+    uint32_t lost = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_diffMutex);
+        take.swap(g_diffGroups);
+        lost = g_diffGroupsDropped;
+        g_diffGroupsDropped = 0;
+    }
+    for (DiffGroup& g : take) vrDrawDiffLog(g);
+    if (lost) Log::get().note("concourse bake: vr draw diff: %u draw(s) found %u groups waiting and were not kept", lost, static_cast<unsigned>(kDiffGroupCap));
+}
+// Once a tick during the bake: one finished group, if there is one, taken out under the mutex and logged outside it. Finished: not the group the draws append to, and its last
+// frame is two ticks or more behind (a late draw of an earlier frame has landed by then).
+void vrDrawDiffTick(uint32_t frame) noexcept {
+    DiffGroup take;
+    bool have = false;
+    {
+        std::lock_guard<std::mutex> lock(g_diffMutex);
+        if (g_diffGroups.size() >= 2) {
+            DiffGroup& g = g_diffGroups.front();
+            const uint32_t last = g.n > 0 ? g.fr[g.n - 1].frame : 0;
+            if (frame - last < 0x80000000u && frame - last >= 2) {
+                take = std::move(g);
+                g_diffGroups.erase(g_diffGroups.begin());
+                have = true;
+            }
+        }
+    }
+    if (have) vrDrawDiffLog(take);
 }
 
-// One draw the scope saw and did not withhold. Cheap out of the VR bake (one flag); in it, only an aim frame's draws are looked at.
-void vrDrawDiffNote(ID3D11DeviceContext* ctx, UINT indexCount, UINT startIndex) noexcept {
+// One draw the scope saw and did not withhold. Cheap out of the VR bake (one flag); in it, only an aim frame's draws are looked at. Appends, nothing else.
+void vrDrawDiffNote(ID3D11DeviceContext* ctx, UINT indexCount, UINT startIndex, INT baseVertex, char kind) noexcept {
     const uint32_t frame = g_frameNow.load(std::memory_order_relaxed);
     const uint64_t e = vrAimEntry(frame);
     if ((e >> 63) == 0 || static_cast<uint32_t>((e >> 32) & 0x7FFFFFFFu) != (frame & 0x7FFFFFFFu) || (e & 0x100u) == 0) return;   // not an aim frame that writes
@@ -2288,14 +2322,19 @@ void vrDrawDiffNote(ID3D11DeviceContext* ctx, UINT indexCount, UINT startIndex) 
     k.ps = followed ? bindingShaderHash(BindSlot::Ps) : pixelShaderHash(ctx);
     k.idx = indexCount;
     k.start = startIndex;
+    k.base = baseVertex;
+    k.kind = kind;
     std::lock_guard<std::mutex> lock(g_diffMutex);
-    DiffGroup& g = g_diff;
-    if (g.active && (g.face != face || (dwell == 0 && g.n > 0 && g.fr[g.n - 1].frame != frame))) vrDrawDiffFlushLocked();
-    if (!g.active) {
-        g.active = true;
-        g.face = face;
-        g.n = 0;
+    // A new group when the face changes, or an aim of the same face starts again (dwell 0 on a frame the group has not got).
+    if (g_diffGroups.empty() || g_diffGroups.back().face != face || (dwell == 0 && g_diffGroups.back().n > 0 && g_diffGroups.back().fr[g_diffGroups.back().n - 1].frame != frame)) {
+        if (g_diffGroups.size() >= kDiffGroupCap) {
+            ++g_diffGroupsDropped;
+            return;
+        }
+        g_diffGroups.emplace_back();
+        g_diffGroups.back().face = face;
     }
+    DiffGroup& g = g_diffGroups.back();
     uint32_t slot = kDiffFrames;
     for (uint32_t i = 0; i < g.n; ++i)
         if (g.fr[i].frame == frame) slot = i;
@@ -2314,10 +2353,10 @@ void vrDrawDiffNote(ID3D11DeviceContext* ctx, UINT indexCount, UINT startIndex) 
 
 // begin() changes no state. It runs the capture path, the withheld check, the family match, the one-shot material read and the share query, then only DECIDES the
 // plan (a mirror draw or none, marked or not, opaque or fading) and opens the side test's first query when one is due.
-void ConcoursePaneScope::begin(ID3D11DeviceContext* ctx, UINT indexCount, UINT startIndex, INT baseVertex, const ConcoursePaneCalls& calls) noexcept {
+void ConcoursePaneScope::begin(ID3D11DeviceContext* ctx, UINT indexCount, UINT startIndex, INT baseVertex, char kind, const ConcoursePaneCalls& calls) noexcept {
     beginBody(ctx, indexCount, startIndex, baseVertex, calls);
     // TEMPORARY (H62 instrument, Flight 53): the VR bake's draw diff sees every draw of the scene pass, after the decisions above (a draw withheld here is not drawn).
-    if (ctx && !withheld_ && g_vrDiffOn.load(std::memory_order_relaxed)) vrDrawDiffNote(ctx, indexCount, startIndex);
+    if (ctx && !withheld_ && g_vrDiffOn.load(std::memory_order_relaxed)) vrDrawDiffNote(ctx, indexCount, startIndex, baseVertex, kind);
 }
 
 void ConcoursePaneScope::beginBody(ID3D11DeviceContext* ctx, UINT indexCount, UINT startIndex, INT baseVertex, const ConcoursePaneCalls& calls) noexcept {
@@ -3369,6 +3408,9 @@ uint32_t g_bakeWantMask = 0, g_bakeCapMask = 0;   // the directions wanted, and 
 float g_bakeNearM = cc::kBakeNearDefaultM;
 uint32_t g_bakeCaps = 0, g_bakeSeenAtCentre = 0, g_bakeSeenAway = 0, g_bakeHoldPresents = 0, g_bakeReleaseTicks = 0, g_bakeHeldW = 0, g_bakeHeldH = 0;
 uint64_t g_bakeHoldStartMs = 0;
+void dumpAbandon(const char* why) noexcept;   // the pending cube dump (defined with it, below, in the same unnamed namespace)
+uint32_t g_bakeHeldMismatches = 0;             // presents whose back buffer no longer matched the kept image (counted, the copy skipped)
+bool g_bakeSaidHeldMismatch = false;
 DXGI_FORMAT g_bakeHeldFmt = DXGI_FORMAT_UNKNOWN;
 ID3D11Device* g_bakeDevice = nullptr;          // not held: compared only
 ID3D11ComputeShader* g_csBake = nullptr;
@@ -3534,6 +3576,7 @@ bool concoursePaneBakeBegin(const float centre[3], float nearM, float cutM) noex
         Log::get().note("concourse bake: begin: the cube is not ready: nothing is captured or held");
         return false;
     }
+    dumpAbandon("abandoned: a new bake began");
     for (int k = 0; k < 3; ++k) g_bakeCentre[k] = centre[k];
     g_bakeNearM = cutM;   // the compute shader's near limit is the room's cut; the frames' own near plane is nearM
     g_bakePeopleLeft.store(0, std::memory_order_relaxed);
@@ -3544,6 +3587,8 @@ bool concoursePaneBakeBegin(const float centre[3], float nearM, float cutM) noex
     g_bakeAtCentre = false;
     g_bakeReleasing = false;
     g_bakeSaidRefused = false;
+    g_bakeHeldMismatches = 0;
+    g_bakeSaidHeldMismatch = false;
     g_bakeHoldStartMs = GetTickCount64();
     ID3D11Buffer* origin = g_bdOrigin.load(std::memory_order_acquire);
     ID3D11DeviceContext* imm = nullptr;
@@ -3722,7 +3767,23 @@ void concoursePaneBakePresent(IDXGISwapChain* swap) noexcept {
         FlatComputeInternalScope internal;
         if (show) {
             ++g_bakeHoldPresents;
-            if (g_bakeHeld && g_bakeHeldValid) imm->CopyResource(back, g_bakeHeld);
+            if (g_bakeHeld && g_bakeHeldValid) {
+                // CopyResource needs the two to match exactly; the swap chain may have been resized since the image was kept. The held image was made one sample (see below).
+                D3D11_TEXTURE2D_DESC bd{};
+                back->GetDesc(&bd);
+                if (bd.Width == g_bakeHeldW && bd.Height == g_bakeHeldH && bd.Format == g_bakeHeldFmt && bd.SampleDesc.Count == 1) {
+                    imm->CopyResource(back, g_bakeHeld);
+                } else {
+                    g_bakeHeldValid = false;
+                    ++g_bakeHeldMismatches;
+                    if (!g_bakeSaidHeldMismatch) {
+                        g_bakeSaidHeldMismatch = true;
+                        Log::get().note("concourse bake: the kept image was NOT shown: the back buffer is %ux%u format %u, %u sample(s), the kept image %ux%u format %u; it is dropped, so the game's "
+                                        "own frames show (once a bake)",
+                                        bd.Width, bd.Height, static_cast<unsigned>(bd.Format), bd.SampleDesc.Count, g_bakeHeldW, g_bakeHeldH, static_cast<unsigned>(g_bakeHeldFmt));
+                    }
+                }
+            }
         } else {
             D3D11_TEXTURE2D_DESC bd{};
             back->GetDesc(&bd);
@@ -4365,6 +4426,7 @@ bool concoursePaneVrBakeBegin() noexcept {
         Log::get().note("concourse bake: vr: begin: the cube is %s and the VR shader %s: nothing is captured", g_bakeReady ? "ready" : "NOT READY", g_vrReady ? "ready" : "NOT READY");
         return false;
     }
+    dumpAbandon("abandoned: a new bake began");
     for (uint32_t& f : g_vrSnapFrame) f = 0xFFFFFFFFu;
     for (int e = 0; e < 2; ++e) {
         g_vrDisp[e].store(0, std::memory_order_relaxed);
@@ -4422,7 +4484,8 @@ void concoursePaneVrBakeCapture(const float origin[3], const float faces[5][9], 
     g_vrCapturing.store(true, std::memory_order_release);
     {
         std::lock_guard<std::mutex> lock(g_diffMutex);
-        g_diff = DiffGroup{};
+        g_diffGroups.clear();
+        g_diffGroupsDropped = 0;
     }
     g_vrDiffOn.store(true, std::memory_order_release);   // TEMPORARY (H62 instrument, Flight 54)
     Log::get().note("concourse bake: vr: capture: origin %.2f %.2f %.2f, faces 0x%X, near %.0f m, the room's cut %.0f m (nearer is not written), the people left out; a frame is taken "
@@ -4527,8 +4590,35 @@ uint8_t dumpTone(float x) noexcept {
 }
 }  // namespace
 
+namespace {
+// The pending dump (one at a time): the two staging copies, queued at the publish, and where the tick has got to. Present thread only.
+struct DumpJob {
+    bool active = false;
+    ID3D11Texture2D* stC = nullptr;
+    ID3D11Texture2D* stD = nullptr;
+    char kind[16] = {};
+    uint32_t mask = 0, next = 0, done = 0, ticks = 0;
+    LARGE_INTEGER q0{}, qf{};
+    SYSTEMTIME stm{};
+    std::wstring dir;
+};
+DumpJob g_dump;
+constexpr uint32_t kDumpGiveUpTicks = 120;
+void dumpRelease() noexcept {
+    if (g_dump.stC) g_dump.stC->Release();
+    if (g_dump.stD) g_dump.stD->Release();
+    g_dump = DumpJob{};
+}
+void dumpAbandon(const char* why) noexcept {
+    if (!g_dump.active) return;
+    Log::get().note("concourse bake: dump: %s: %u direction(s) of %s were written, the rest are not", why, g_dump.done, g_dump.kind);
+    dumpRelease();
+}
+}  // namespace
+
 void concoursePaneBakeDump(const char* kind, const float faces[5][9], uint32_t mask) noexcept {
-    LARGE_INTEGER q0{}, qf{}, q1{};
+    dumpAbandon("abandoned: a newer dump was published");
+    LARGE_INTEGER q0{}, qf{};
     QueryPerformanceCounter(&q0);
     QueryPerformanceFrequency(&qf);
     ID3D11Device* device = g_bakeDevice;
@@ -4668,35 +4758,74 @@ void concoursePaneBakeDump(const char* kind, const float faces[5][9], uint32_t m
         imm.p->CopyResource(stC.p, texC.p);
         imm.p->CopyResource(stD.p, texD.p);
     }
-    const std::wstring dir = Log::get().dir() + L"\\concourse_bake";
-    CreateDirectoryW(dir.c_str(), nullptr);
-    SYSTEMTIME stm{};
-    GetLocalTime(&stm);
-    const float farM = cc::kBackdropFarM;
-    const float logFar = std::log(farM);
-    uint32_t done = 0;
-    std::vector<uint8_t> imgC(static_cast<size_t>(kDumpSize) * kDumpSize * 3u), imgD(imgC.size());
-    std::vector<float> written;
-    written.reserve(static_cast<size_t>(kDumpSize) * kDumpSize);
-    for (uint32_t d = 0; d < 5; ++d) {
-        if ((mask & (1u << d)) == 0) continue;
+    // The copies are queued; nothing here waits for them. The tick (vrDumpTick) maps them without waiting, a direction a tick, and writes its two files.
+    DumpJob& j = g_dump;
+    j.active = true;
+    j.stC = stC.p;
+    j.stC->AddRef();
+    j.stD = stD.p;
+    j.stD->AddRef();
+    std::snprintf(j.kind, sizeof(j.kind), "%s", kind ? kind : "?");
+    j.mask = mask;
+    j.next = j.done = j.ticks = 0;
+    j.q0 = q0;
+    j.qf = qf;
+    j.dir = Log::get().dir() + L"\\concourse_bake";
+    CreateDirectoryW(j.dir.c_str(), nullptr);
+    GetLocalTime(&j.stm);
+}
+
+// The pane tick, once a frame: the pending dump's next step. Never waits: a staging copy still in flight is tried again next tick (DXGI_ERROR_WAS_STILL_DRAWING), a tick converts
+// and writes one wanted direction's two files, and a dump not done in kDumpGiveUpTicks ticks is given up with a line.
+void vrDumpTick() noexcept {
+    DumpJob& j = g_dump;
+    if (!j.active) return;
+    if (++j.ticks > kDumpGiveUpTicks) {
+        dumpAbandon("given up: the staging copy did not come back in 120 ticks");
+        return;
+    }
+    ID3D11Device* dev = nullptr;
+    j.stC->GetDevice(&dev);
+    const bool sameDevice = dev && dev == g_bakeDevice;
+    DumpRel<ID3D11DeviceContext> imm;
+    if (sameDevice) dev->GetImmediateContext(&imm.p);
+    if (dev) dev->Release();
+    if (!imm.p) {
+        dumpAbandon("abandoned: the device it was copied on is gone");
+        return;
+    }
+    while (j.next < 5 && (j.mask & (1u << j.next)) == 0) ++j.next;
+    if (j.next < 5) {
+        const uint32_t d = j.next;
+        const UINT sub = D3D11CalcSubresource(0, d, 1);
         D3D11_MAPPED_SUBRESOURCE mc{}, md{};
-        if (FAILED(imm.p->Map(stC.p, D3D11CalcSubresource(0, d, 1), D3D11_MAP_READ, 0, &mc))) continue;
-        if (FAILED(imm.p->Map(stD.p, D3D11CalcSubresource(0, d, 1), D3D11_MAP_READ, 0, &md))) {
-            imm.p->Unmap(stC.p, D3D11CalcSubresource(0, d, 1));
-            continue;
+        HRESULT hr = imm.p->Map(j.stC, sub, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &mc);
+        if (hr == DXGI_ERROR_WAS_STILL_DRAWING) return;   // the GPU has not reached the copy yet: next tick
+        if (FAILED(hr)) {
+            ++j.next;
+            return;
         }
-        written.clear();
+        hr = imm.p->Map(j.stD, sub, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &md);
+        if (FAILED(hr)) {
+            imm.p->Unmap(j.stC, sub);
+            if (hr != DXGI_ERROR_WAS_STILL_DRAWING) ++j.next;
+            return;
+        }
+        const float farM = cc::kBackdropFarM;
+        const float logFar = std::log(farM);
+        std::vector<uint8_t> imgC(static_cast<size_t>(kDumpSize) * kDumpSize * 3u), imgD(imgC.size());
+        std::vector<float> written;
+        written.reserve(static_cast<size_t>(kDumpSize) * kDumpSize);
         uint32_t unwritten = 0, farN = 0;
-        for (uint32_t j = 0; j < kDumpSize; ++j) {
-            const float* rc = reinterpret_cast<const float*>(static_cast<const uint8_t*>(mc.pData) + static_cast<size_t>(j) * mc.RowPitch);
-            const float* rd = reinterpret_cast<const float*>(static_cast<const uint8_t*>(md.pData) + static_cast<size_t>(j) * md.RowPitch);
-            const size_t row = static_cast<size_t>(kDumpSize - 1u - j) * kDumpSize * 3u;   // BMP rows run bottom-up
+        for (uint32_t row = 0; row < kDumpSize; ++row) {
+            const float* rc = reinterpret_cast<const float*>(static_cast<const uint8_t*>(mc.pData) + static_cast<size_t>(row) * mc.RowPitch);
+            const float* rd = reinterpret_cast<const float*>(static_cast<const uint8_t*>(md.pData) + static_cast<size_t>(row) * md.RowPitch);
+            const size_t at = static_cast<size_t>(kDumpSize - 1u - row) * kDumpSize * 3u;   // BMP rows run bottom-up
             for (uint32_t i = 0; i < kDumpSize; ++i) {
                 const float* c = rc + i * 4u;
                 const float dist = rd[i];
-                uint8_t* oc = imgC.data() + row + static_cast<size_t>(i) * 3u;
-                uint8_t* od = imgD.data() + row + static_cast<size_t>(i) * 3u;
+                uint8_t* oc = imgC.data() + at + static_cast<size_t>(i) * 3u;
+                uint8_t* od = imgD.data() + at + static_cast<size_t>(i) * 3u;
                 if (!(c[3] >= 0.5f)) {
                     ++unwritten;
                     oc[0] = od[0] = 255;
@@ -4719,25 +4848,31 @@ void concoursePaneBakeDump(const char* kind, const float faces[5][9], uint32_t m
                 od[0] = od[1] = od[2] = static_cast<uint8_t>((g < 0.0f ? 0.0f : g > 1.0f ? 1.0f : g) * 255.0f + 0.5f);
             }
         }
-        imm.p->Unmap(stD.p, D3D11CalcSubresource(0, d, 1));
-        imm.p->Unmap(stC.p, D3D11CalcSubresource(0, d, 1));
+        imm.p->Unmap(j.stD, sub);
+        imm.p->Unmap(j.stC, sub);
         float median = 0.0f;
         if (!written.empty()) {
             std::nth_element(written.begin(), written.begin() + written.size() / 2, written.end());
             median = written[written.size() / 2];
         }
         wchar_t nameC[96], nameD[96];
-        _snwprintf_s(nameC, 96, _TRUNCATE, L"%04u%02u%02u_%02u%02u%02u_%hs_dir%u_colour.bmp", stm.wYear, stm.wMonth, stm.wDay, stm.wHour, stm.wMinute, stm.wSecond, kind ? kind : "x", d);
-        _snwprintf_s(nameD, 96, _TRUNCATE, L"%04u%02u%02u_%02u%02u%02u_%hs_dir%u_dist.bmp", stm.wYear, stm.wMonth, stm.wDay, stm.wHour, stm.wMinute, stm.wSecond, kind ? kind : "x", d);
-        const bool okC = dumpWriteBmp(dir + L"\\" + nameC, imgC), okD = dumpWriteBmp(dir + L"\\" + nameD, imgD);
+        _snwprintf_s(nameC, 96, _TRUNCATE, L"%04u%02u%02u_%02u%02u%02u_%hs_dir%u_colour.bmp", j.stm.wYear, j.stm.wMonth, j.stm.wDay, j.stm.wHour, j.stm.wMinute, j.stm.wSecond, j.kind, d);
+        _snwprintf_s(nameD, 96, _TRUNCATE, L"%04u%02u%02u_%02u%02u%02u_%hs_dir%u_dist.bmp", j.stm.wYear, j.stm.wMonth, j.stm.wDay, j.stm.wHour, j.stm.wMinute, j.stm.wSecond, j.kind, d);
+        const bool okC = dumpWriteBmp(j.dir + L"\\" + nameC, imgC), okD = dumpWriteBmp(j.dir + L"\\" + nameD, imgD);
         const double total = static_cast<double>(kDumpSize) * kDumpSize;
         Log::get().note("concourse bake: dump: dir %u: %ls: unwritten %.1f%%, far %.1f%%, written median distance %.0f m%s", d, nameC, static_cast<double>(unwritten) * 100.0 / total,
                         static_cast<double>(farN) * 100.0 / total, static_cast<double>(median), okC && okD ? "" : " (A FILE WAS NOT WRITTEN)");
-        ++done;
+        ++j.done;
+        ++j.next;
+        while (j.next < 5 && (j.mask & (1u << j.next)) == 0) ++j.next;   // the last wanted direction ends the dump on this tick
     }
-    QueryPerformanceCounter(&q1);
-    Log::get().note("concourse bake: dump: %u direction(s) of %s to %ls in %.0f ms", done, kind ? kind : "?", dir.c_str(),
-                    static_cast<double>(q1.QuadPart - q0.QuadPart) * 1000.0 / static_cast<double>(qf.QuadPart ? qf.QuadPart : 1));
+    if (j.next >= 5) {
+        LARGE_INTEGER q1{};
+        QueryPerformanceCounter(&q1);
+        Log::get().note("concourse bake: dump: %u direction(s) of %s to %ls in %.0f ms (from the publish to the last file written, over %u ticks)", j.done, j.kind, j.dir.c_str(),
+                        static_cast<double>(q1.QuadPart - j.q0.QuadPart) * 1000.0 / static_cast<double>(j.qf.QuadPart ? j.qf.QuadPart : 1), j.ticks);
+        dumpRelease();
+    }
 }
 
 ConcourseVrBakeStats concoursePaneVrBakeStats() noexcept {
@@ -4862,6 +4997,8 @@ void concoursePaneTick(ID3D11Device* device, uint32_t frame, uint64_t nowMs) noe
     backdropTick(device, frame);
     bakeTick(device, nowMs);
     vrBakeTick(device, frame);   // TEMPORARY (the VR bake): its prepare and read-backs; nothing while it was never armed
+    vrDumpTick();   // TEMPORARY (H58-H61 instrument): the pending cube dump's next step, one direction at most, never waiting
+    if (g_vrDiffOn.load(std::memory_order_acquire)) vrDrawDiffTick(frame);   // TEMPORARY (H62 instrument): a finished face's draw diff, sorted and logged here, not in the draw hook
     // A backstop: a bake takes about 110 ms, and every end of one clears the people's flag. A bake ended some other way (its mode stepped by the key mid-bake) would leave the
     // people out for good, so past 2 s they come back, and the log says so.
     if (g_bakePeopleOff.load(std::memory_order_acquire) && nowMs - g_bakeHoldStartMs > 2000 && g_bakePeopleOff.exchange(false, std::memory_order_acq_rel))
