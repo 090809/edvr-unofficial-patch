@@ -10,7 +10,8 @@
 //   --replay FOLDER [--png-dir DIR] [--no-png] [--adapter N] [--json FILE] [--dry-run]
 //       FOLDER is an fgreplay_<stamp> capture (.agents/framegen-replay-format.md). For each consecutive pair (B = k, C = k + 1): the f = 1 S is built from B, kept, and scored against C's
 //       output exactly as the DLL scores it (raw, and turned by the residual head rotation, per class; the |id: fields of the line are the no-warp baseline); the f = 0.5 S is built
-//       from B too. B, S(f = 0.5) and S(f = 1) are written as PNGs (8-bit, clamped to 0..1, sRGB encoded) into DIR (default FOLDER\bench_out); --dry-run writes nothing.
+//       from B too. B, S(f = 0.5) and S(f = 1) are written as PNGs (8-bit, clamped to 0..1, sRGB encoded) into DIR, its missing parents made (default %TEMP%\edvr_bench_out\<FOLDER's
+//       name>, else .\bench_out\<that name>, never inside FOLDER: a capture sits in the game's folder); --dry-run writes nothing.
 //       Each pair also prints S's sharpness against B's (Sharpness: the mean |Laplacian| of luma per class, S over B) for both S, with the count of render pixels that got a key
 //       but no read offer (orphan: fgSynSrc's recompute of a landing disagreeing with fgSynSplat's, the resolve's stats word that makes them holes; 0 so far), and the hole region's error (HoleError: the mean |luma| of the
 //       f = 1 S against C over the output pixels whose render pixel was a hole, the fill's, with B against C beside it).
@@ -832,6 +833,50 @@ struct PairResult {
     std::string line;
 };
 
+// A directory and every missing parent (CreateDirectoryA makes only the last). True when it exists afterwards.
+bool makeDirs(const std::string& dir) {
+    for (size_t i = 1; i < dir.size(); ++i) {
+        if ((dir[i] != '\\' && dir[i] != '/') || dir[i - 1] == ':' || dir[i - 1] == '\\' || dir[i - 1] == '/') continue;   // a drive's root, or a UNC prefix's slashes
+        CreateDirectoryA(dir.substr(0, i).c_str(), nullptr);
+    }
+    CreateDirectoryA(dir.c_str(), nullptr);
+    const DWORD a = GetFileAttributesA(dir.c_str());
+    return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY);
+}
+
+// A path made absolute (against the current directory), its slashes backslashes, no trailing one, lower case: for comparing two paths.
+std::string pathKey(const std::string& p) {
+    char full[MAX_PATH * 4] = {};
+    const DWORD n = GetFullPathNameA(p.c_str(), sizeof(full), full, nullptr);
+    std::string s = n && n < sizeof(full) ? std::string(full, n) : p;
+    for (char& c : s) c = c == '/' ? '\\' : static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    while (s.size() > 3 && s.back() == '\\') s.pop_back();
+    return s;
+}
+
+bool insideDir(const std::string& path, const std::string& dir) {
+    const std::string p = pathKey(path), d = pathKey(dir);
+    return p == d || (p.size() > d.size() && p.compare(0, d.size(), d) == 0 && (d.back() == '\\' || p[d.size()] == '\\'));
+}
+
+// The default PNG folder of a replay: %TEMP%\edvr_bench_out\<the capture's folder name>, else .\bench_out\<that name>; never inside the capture (it sits in the game's folder),
+// so "" when both would be (the caller then asks for --png-dir).
+std::string defaultPngDir(const std::string& capture) {
+    std::string leaf = pathKey(capture);
+    leaf = leaf.substr(leaf.find_last_of('\\') + 1);
+    if (leaf.empty() || leaf.back() == ':') leaf = "capture";
+    char tmp[MAX_PATH + 1] = {};
+    const DWORD n = GetTempPathA(sizeof(tmp), tmp);
+    std::vector<std::string> bases;
+    if (n && n < sizeof(tmp)) bases.push_back(std::string(tmp, n) + "edvr_bench_out");
+    bases.push_back("bench_out");
+    for (const std::string& b : bases) {
+        const std::string d = pathKey(b + "\\" + leaf);
+        if (!insideDir(d, capture)) return d;
+    }
+    return "";
+}
+
 struct ReplayOptions {
     std::string pngDir;
     bool png = true;
@@ -853,7 +898,7 @@ bool replayFolder(Gpu& g, const std::string& dir, const ReplayOptions& opt, Repl
     sum.frames = n;
     if (n < 2) { err = fmtStr("%s holds %d frame(s); a replay needs at least 2 consecutive ones", dir.c_str(), n); return false; }
     std::printf("replay %s: %d frames%s%s\n", dir.c_str(), n, note.empty() ? "" : "  (", note.empty() ? "" : (note + ")").c_str());
-    if (opt.png && !opt.dry) CreateDirectoryA(opt.pngDir.c_str(), nullptr);
+    if (opt.png && !opt.dry && !makeDirs(opt.pngDir)) { err = fmtStr("the PNG folder %s could not be created", opt.pngDir.c_str()); return false; }
 
     FrameData cur;
     if (!loadFrame(dir, 0, cur, err)) return false;
@@ -1362,13 +1407,26 @@ int selfTest() {
         check(!loadFrame(root, 3, bad, e) && e.find("mv.bin") != std::string::npos, "a .bin of the wrong size is refused");
         writeFile(root + "\\f3_mv.bin", frames[3].mv.data(), frames[3].mv.size());
     }
+    {   // the default PNG folder is never inside the capture: not for this capture, nor for one that is the temp folder, the default's base or the default itself
+        const std::string d = defaultPngDir(root);
+        check(!d.empty() && !insideDir(d, root) && insideDir(d, std::string(tmp)), "the default PNG folder is under %TEMP%, not inside the capture (" + d + ")");
+        bool never = true;
+        const std::string leaf = root.substr(root.find_last_of('\\') + 1);
+        for (const std::string& c : {std::string(tmp), std::string(tmp) + "edvr_bench_out", std::string(tmp) + "edvr_bench_out\\" + leaf, std::string("bench_out"), std::string(".")}) {
+            const std::string dc = defaultPngDir(c);
+            if (!dc.empty() && insideDir(dc, c)) { never = false; std::printf("  the default for %s is %s, inside it\n", c.c_str(), dc.c_str()); }
+        }
+        check(never, "the default PNG folder never resolves inside the capture (a capture that is the temp folder, the default's base, the default itself, the current directory)");
+        check(insideDir(root + "\\a\\b", root) && insideDir(root, root) && !insideDir(root + "x", root) && insideDir(root + "/A/../a", root + "\\"),
+              "the inside test: a child, the folder itself, a sibling sharing a prefix, slashes, dot-dot and case");
+    }
     Gpu g;
     std::string err;
     if (!g.init(-1, true, err)) {
         std::printf("SKIP: WARP is unavailable (%s); the GPU parts of the self-test did not run\n", err.c_str());
     } else {
         ReplayOptions ro;
-        ro.pngDir = root + "\\png";
+        ro.pngDir = root + "\\png\\nested\\deeper";   // --png-dir makes its missing parents
         ReplaySummary sum;
         const bool ok = replayFolder(g, root, ro, sum, err);
         check(ok, "the synthetic capture replays on WARP (" + err + ")");
@@ -1382,7 +1440,7 @@ int selfTest() {
             const FrameGenShadowClassStats& wt = sum.agg.tcls[2];
             check(wt.pixels > 0 && wt.sumErr1024 == w.sumErr1024, "an identity residual head rotation scores the turned S the same as the raw one");
             check(GetFileAttributesA((ro.pngDir + "\\f0_S05.png").c_str()) != INVALID_FILE_ATTRIBUTES && GetFileAttributesA((ro.pngDir + "\\f1_B.png").c_str()) != INVALID_FILE_ATTRIBUTES,
-                  "the f = 0.5 S and the B pictures are written as PNGs");
+                  "the f = 0.5 S and the B pictures are written as PNGs, into a --png-dir whose parents did not exist");
         }
         // the bench machinery, tiny
         BenchOptions bo;
@@ -1484,7 +1542,11 @@ int main(int argc, char** argv) {
         if (!json.empty() && !writeText(json, benchJson(bopt, out, g))) { std::printf("FAIL: cannot write %s\n", json.c_str()); return 1; }
         return 0;
     }
-    if (ropt.pngDir.empty()) ropt.pngDir = replay + "\\bench_out";
+    if (ropt.pngDir.empty() && ropt.png) {
+        ropt.pngDir = defaultPngDir(replay);
+        if (ropt.pngDir.empty()) { std::printf("FAIL: every default PNG folder is inside the capture %s; give --png-dir or --no-png\n", replay.c_str()); return 1; }
+        if (!ropt.dry) std::printf("png: %s\n", ropt.pngDir.c_str());
+    }
     ReplaySummary sum;
     std::printf("adapter: %s\n", g.adapterName.c_str());
     if (!replayFolder(g, replay, ropt, sum, err)) { std::printf("FAIL: %s\n", err.c_str()); return 1; }
