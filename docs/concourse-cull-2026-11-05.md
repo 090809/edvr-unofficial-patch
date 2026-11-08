@@ -623,6 +623,10 @@ Flat, Steam, 35aa1d87, no keys, at the `CraterPort` (now automatic): arrive in t
 4. If the sky is pale white instead, H57's fix cut it: say so, and the cut needs to leave the sky alone.
 5. Any other station type on the way (a Coriolis or Orbis): the same checks, as its bake changed too.
 
+## Flight 49 results
+
+35aa1d87, log `edvr_gfx_20261108_054121`, flat, Steam, the `CraterPort` with no keys (`the cull and its bake run`, 05:43:13). The bake at 05:43:16: `near 5 m, the room's cut 50 m`, 171 ms, 5 frames captured, `the people's draws left out over its frames: 1123`. Sean: "Bake looks good, let's move on to VR so we can release this feature". H57's fix holds: the sky and the sun are in the bake, and the sky was not cut.
+
 ## VR, next (Sean, 2026-11-08)
 
 "After we fix this bake issue, let's pivot to VR so it works just as well as flat." His first VR look at the `CraterPort`: "it did not automatically take a bake, when I pressed F2, it culled it seemed but left a grey haze on the bay window". Expected for now: `concourseAutoOn` is flat only, and the bake needs a camera route VR does not have (0x283FA20, the transition flash's mailbox, moves the picture in VR; see "Rendering from the concourse's centre"). With F2 and no bake, the panes fall back to the steady treatment, which is INFERRED to be the haze.
