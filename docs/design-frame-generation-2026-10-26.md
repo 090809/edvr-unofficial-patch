@@ -51,7 +51,7 @@
   own smoothing off and then on. This is the visual reference to beat.
 - **Next:** fly `auto` in a ship below headset rate and at full rate: the
   `frame generation gate:` line is H1 (budget, margin) and says each
-  second why Lock is or is not allowed (2026-11-08 gate entry).
+  second why Lock is or is not allowed (2026-11-08 gate and cost entries).
 - **Temporary keys:** `fix.frame_generation_shadow` (off | on, hidden), and
   `fix.frame_generation`'s `on` (forces Lock, for A/B flights; `auto` is
   the value meant to stay).
@@ -1768,6 +1768,39 @@ Environment: OpenXR (EDVR's runtime), left eye, render 2817x2448, output
   period_ms= gpu_ms=med/max cpu_ms=med/max synth_ms= budget_ms= margin_ms=
   late_real= context= cut= lock=` once a second (auto and on), the edges in
   auto. Never admitted reads `state=waiting reason=<why>`; `--health` says it.
+
+### 2026-11-08: Phase 2.4, the synthesizer's cost with the gate closed (built, not flown)
+
+- **Measured (flight log, this build's parent):** the synthesizer cost
+  1.1-1.5 ms of GPU a game frame (both eyes) and ran on every frame in
+  `auto` with the gate closed, and with `fix.frame_generation = off` under
+  the shadow key, where nobody shows S. EDVR's total was 8.5-10 ms against
+  5.3-5.5 ms in v0.21.1; about 2 ms of that is upstream rc.7 changes, not
+  frame generation. The gate line read `state=waiting
+  reason=over_budget_gpu ... gpu_ms=17.68/21.26 synth_ms=1.58
+  budget_ms=18.89 margin_ms=-0.37`: the synthesizer's own cost pushed Elite
+  under 90 fps and made the gate want frame generation.
+- **Fix 1 (`a89c7834`):** in `auto` with the gate closed the treat builds S
+  once per eye per one-second synth window (the first call after each
+  report), so `synth_ms` stays measured; the other eye-frames dispatch
+  nothing and keep every resource. `on`, `auto` admitted, the shadow key and
+  the eye dump build on every frame. The f = 0.5 S needs no history, so
+  there is no warm-up: Lock's delivery clears on the first consumed pair and
+  its 1 s dwell runs from there. Lock's `no_s` is now a blocker only once
+  the gate admits, so a closed gate reads `auto_gate`.
+- **Fix 2 (`55ae3107`), the double count:** the treat lies inside both GPU
+  TIME sources (the application segment closes after the treat; the work
+  span ends after the door), so the GPU median already held the synthesizer
+  when it ran on most frames, and "adding its cost again errs safe" (gate
+  entry above) counted it twice. The gate now takes `synth_ms` out of the
+  median when more than half the window's frames built S, and adds it back
+  once. `gpu_ms` stays raw; `margin_ms` is corrected.
+- **Confirm in flight:** with the gate waiting, the census's `frame
+  generation synth` section runs twice a second (one call per eye: about
+  0.02-0.05 a frame at 90-45 fps) and the synth
+  report says `frames=2/0` a second; `synth_ms` stays a number (not `-`,
+  not `no_synth_cost`); the runtime's lock line reads `auto_gate`, not
+  `no_s`. EDVR's GPU total drops by about the synthesizer's cost.
 ### 2026-11-07: Phase 2.3, flight 11, the first Lock flight (same build)
 
 `fix.frame_generation = on`, about 12 minutes. Pilot: "a slight flicker",
