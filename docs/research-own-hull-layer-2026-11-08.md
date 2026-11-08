@@ -28,8 +28,10 @@ The smear is terrain that is newly uncovered at the hull edge every frame
   100% of the keyed hull pixels at 10-150 m are the block's records, and
   the ship has 6 forward draws an eye. Atmosphere and sky are in the forward
   pass. The composite needs a re-issued tonemap, since DLSS runs after it.
-  Next: a compile-only binding census of the block, lighting, atmosphere
-  and tonemap draws, then one terrain flight.
+  The binding map comes from the 13:14 flight's census 7 (section "The
+  binding map"). Every input except AO (a compute chain) and the tonemap's
+  exposure is made inside the eye pass. Next: carry 6727f7ff (`mt=` on
+  census lines) into any flight build, then take one eye dump over terrain.
 * **Finding 1, the hull is a deferred G-buffer object.** It is drawn by the
   pool families vs_66DE/ps_864F, 61AE/FC43, AACF/CF53 and DE54/E46E, plus the
   BBE5/DB3E decal overlay (depth writes off), into the same four-target
@@ -419,9 +421,10 @@ What it settles:
 - The atmosphere writes depth, so in the hull layer it must run after the
   own forward draws or with depth writes off.
 
-**Next, the first build (compile-only, a measurement):** an instrument with
-no visual change. Per eye, it finds the block (the hull families' run after
-the cockpit shell), takes its records, and logs the block's length, its
-records, and the full bindings of the light, atmosphere and tonemap draws
-(SRVs, RTVs, DSV). One flight over terrain then fixes the slot list for the
-re-issue.
+**Next: no flight of its own.** Every eye dump (`[hotkey] dump_eyes`)
+already arms a three-frame census with offscreen draws (`DC eye capture
+link`). Commit 6727f7ff adds `mt=` to the census, and it compiles (compile-only,
+2026-11-08). Carried into the next flight build of any arc, one eye dump over
+terrain names G-buffer RT1-3 and the lighting's second target. Read the dump
+with `census_hull.py <log> --census N`. The open design items are then the
+AO re-dispatch and the hull layer's anti-aliasing.
