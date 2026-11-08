@@ -299,6 +299,9 @@ armed and never reported, or when it reported only calls that built nothing (fra
 Lock (fix.frame_generation = on, Phase 2.3) is "frame generation lock": the graphics log's untagged key line and the runtime log's "frame generation lock:" lines (armed, each engage
 and disengage with its reason, one line a second). It says OK when Lock engaged, PARTIAL when late_s or late_real passes 5% of the S slots, NEVER APPLIED when the key is on and the
 runtime log (read) has no lock line, when it armed and never reported, or when it reported and never engaged (the reasons it gave are said), and nothing at all with the key off.
+With fix.frame_generation = auto (Phase 2.4) the same rule reads the performance gate's "frame generation gate:" lines first (the graphics log, untagged): NEVER APPLIED with no gate
+line, or when the runtime cannot read auto (its once-a-session line); OK, saying so, when the gate ran and never admitted Lock (its reasons and the H1 margin are said); otherwise
+Lock is judged as above with the gate's summary in front.
 The SRV turret view (experimental.srv_turret_camera_back, experimental.srv_turret_hud_forward, experimental.srv_turret_radar_forward, experimental.srv_turret_panels_back, experimental.srv_turret_radar_back, experimental.srv_turret_hud_gap, experimental.srv_turret_hud_depth, experimental.srv_turret_hud_scissor) is the third: the graphics log's "srv turret ..." lines. The settings lines and the vehicle latch's lines
 ("srv turret: the vehicle is the Scorpion|not the Scorpion (event X)", written by the journal watcher) are kept whatever --since says; the last vehicle line is said in the detail, and
 vehicle lines alone are not the rule's lines (nothing is said for them). The pass acts in the Scorpion only: when the turret view bit is on in an SRV the journal does not call the Scorpion
@@ -10691,8 +10694,20 @@ H_FRAMEGEN_SLOT_NOCHANNEL = r"frame generation \(synth\) transfer: the d3d11 hal
 H_FRAMEGEN_LOCK = "frame generation lock"
 H_FRAMEGEN_LOCK_LABEL = "frame generation lock:"
 H_FRAMEGEN_LOCK_KEY_LABEL = "frame generation: fix.frame_generation="
-H_FRAMEGEN_LOCK_KEY = r"frame generation: fix\.frame_generation=(?P<key>on|off) \("
-H_FRAMEGEN_LOCK_ARMED = r"frame generation lock: armed \(fix\.frame_generation = on"
+H_FRAMEGEN_LOCK_KEY = r"frame generation: fix\.frame_generation=(?P<key>on|auto|off) \("
+H_FRAMEGEN_LOCK_ARMED = r"frame generation lock: armed \(fix\.frame_generation = (?P<mode>on|auto)"
+# Frame generation, Phase 2.4 (fix.frame_generation = auto; src\common\framegen_gate.h, written by the d3d11 half): the performance gate's lines in the graphics log, untagged events
+# (cut by the window): once a second while auto or on, each edge in auto, and once a session when the runtime cannot read auto. The H1 evidence (budget_ms, margin_ms).
+H_FRAMEGEN_GATE_LABEL = "frame generation gate:"
+_HFGG_N = r"(?:[\d.]+|-)"
+H_FRAMEGEN_GATE_REPORT = (r"frame generation gate: state=(?P<state>off|waiting|engaged) reason=(?P<reason>[a-z_]+) mode=(?P<mode>auto|on) real_fps=(?P<fps>" + _HFGG_N + r")/(?P<hz>"
+                          + _HFGG_N + r") period_ms=(?P<pp>" + _HFGG_N + r")/(?P<pd>" + _HFGG_N + r") gpu_ms=(?P<gmed>" + _HFGG_N + r")/(?P<gmax>" + _HFGG_N + r") cpu_ms=(?P<cmed>"
+                          + _HFGG_N + r")/(?P<cmax>" + _HFGG_N + r") synth_ms=(?P<synth>" + _HFGG_N + r") budget_ms=(?P<budget>" + _HFGG_N + r") margin_ms=(?P<margin>-?[\d.]+|-) "
+                          r"late_real=(?P<late>\d+)/(?P<pairs>\d+) context=(?P<context>[a-z_]+) cut=(?P<cut>[a-z_]+) lock=(?P<lock>[a-z_]+)$")
+H_FRAMEGEN_GATE_ENGAGE = r"frame generation gate: engage reason=held_2s margin_ms=(?P<margin>-?[\d.]+)$"
+H_FRAMEGEN_GATE_DISENGAGE = r"frame generation gate: disengage reason=(?P<reason>[a-z_]+) cut=(?P<cut>[a-z_]+)$"
+H_FRAMEGEN_GATE_OLD = r"frame generation gate: auto needs this release's openvr_api\.dll \(the runtime handed no frame generation slot that knows auto in (?P<secs>\d+) s of VR frames\)"
+H_FRAMEGEN_GATE_KINDS = ("gate", "gate_engage", "gate_disengage", "gate_old")
 H_FRAMEGEN_LOCK_ENGAGE = r"frame generation lock: engage reason=(?P<reason>[a-z_0-9]+) period_ms=(?P<period>[\d.]+)$"
 H_FRAMEGEN_LOCK_DISENGAGE = r"frame generation lock: disengage reason=(?P<reason>[a-z_]+) period_ms=(?P<period>[\d.]+)(?P<note> \(Lock stands aside for deferred pacing in 2\.3\))?$"
 H_FRAMEGEN_LOCK_REPORT = (r"frame generation lock: engaged=(?P<engaged>[\d.]+) slots=(?P<real>\d+)/(?P<s>\d+) late_real=(?P<late_real>\d+) late_s=(?P<late_s>\d+) "
@@ -17060,11 +17075,45 @@ def _hj_framegen_lock(rows, ctx=None):
     keys = rows.get("key", [])
     armed, reports = rows.get("armed", []), rows.get("report", [])
     engages, disengages = rows.get("engage", []), rows.get("disengage", [])
-    key_on = bool(keys) and keys[-1]["key"] == "on"
+    gates, gate_old = rows.get("gate", []), rows.get("gate_old", [])
+    gate_engages, gate_disengages = rows.get("gate_engage", []), rows.get("gate_disengage", [])
+    key_on = bool(keys) and keys[-1]["key"] in ("on", "auto")
+    key_auto = (bool(keys) and keys[-1]["key"] == "auto") or any(g["mode"] == "auto" for g in gates)
     runtime_read = bool(_hrows(ctx or {}, H_FRAMEGEN_RUNTIME_READ, "read"))
-    if not key_on and not armed and not reports and not engages and not disengages:
+    if not key_on and not armed and not reports and not engages and not disengages and not gates and not gate_old:
         return None
+    # Phase 2.4, auto: the performance gate (the graphics log) is judged first. Its one-second line names the state and the reason, so a gate that never admitted Lock is told
+    # from one that never ran (no line: NEVER APPLIED) and from an older runtime (its line: NEVER APPLIED, named).
+    gate_text = ""
+    if key_auto:
+        if gate_old:
+            return ("NEVER APPLIED", "fix.frame_generation is auto but the runtime cannot read it (an openvr_api.dll older than 2.4: no slot that knows auto in %s s of VR "
+                                     "frames); frame generation stayed off" % gate_old[-1]["secs"])
+        if not gates:
+            return ("NEVER APPLIED", "fix.frame_generation is auto but there is no 'frame generation gate:' line: the performance gate never ran (the d3d11.dll is older than 2.4, "
+                                     "or its once-a-second line is dead)")
+        auto_lines = [g for g in gates if g["mode"] == "auto"]
+        engaged_lines = [g for g in auto_lines if g["state"] == "engaged"]
+        waiting = {}
+        for g in auto_lines:
+            if g["state"] != "engaged":
+                waiting[g["reason"]] = waiting.get(g["reason"], 0) + 1
+        for d in gate_disengages:
+            waiting[d["reason"]] = waiting.get(d["reason"], 0) + 1
+        why_gate = ", ".join("%s %d" % kv for kv in sorted(waiting.items(), key=lambda kv: -kv[1])) or "none"
+        margins = sorted(float(g["margin"]) for g in auto_lines if g["margin"] != "-")
+        budgets = [g["budget"] for g in auto_lines if g["budget"] != "-"]
+        contexts = sorted(set(g["context"] for g in auto_lines))
+        h1 = ("H1 margin median %.2f ms (min %.2f) against a budget of %s ms" % (margins[len(margins) // 2], margins[0], budgets[-1])) if margins and budgets else "H1 not measured"
+        gate_text = ("gate: %d line(s) in auto, engaged in %d, %d engage / %d disengage edge(s); reasons when waiting (lines/edges): %s; %s; context %s"
+                     % (len(auto_lines), len(engaged_lines), len(gate_engages), len(gate_disengages), why_gate, h1, "/".join(contexts) or "-"))
+        if not engaged_lines and not gate_engages:
+            return ("OK", "the gate ran and never admitted Lock (frame generation stayed off by its decision): " + gate_text)
     if not armed and not reports and not engages and not disengages:
+        if gate_text:
+            if not runtime_read:
+                return ("OK", gate_text + "; the runtime log was not read, so Lock is not judged")
+            return ("NEVER APPLIED", gate_text + "; but the runtime log has no 'frame generation lock:' line: the runtime never read the key (an openvr_api.dll older than 2.3)")
         if not runtime_read:
             return ("OK", "fix.frame_generation is on (the graphics log); the runtime log was not read, so Lock is not judged")
         return ("NEVER APPLIED", "fix.frame_generation is on (the graphics log) but the runtime log has no 'frame generation lock:' line: the runtime never read the key (an "
@@ -17084,8 +17133,9 @@ def _hj_framegen_lock(rows, ctx=None):
         reasons[d["reason"]] = reasons.get(d["reason"], 0) + 1
     why = ", ".join("%s %d" % kv for kv in sorted(reasons.items(), key=lambda kv: -kv[1])) or "none given"
     if engaged <= 0.0 and not engages:
-        return ("NEVER APPLIED", "Lock never engaged: %d lock line(s), engaged 0.00 s, no engage edge; the reasons it gave (lines/edges): %s" % (len(reports), why))
-    text = ("%d lock line(s), engaged %.2f s, %d engage / %d disengage edge(s); %d real pair(s) and %d S slot(s) while engaged, S shown %d / B replayed %d, late_s %d, late_real %d; "
+        return ("NEVER APPLIED", ("%s; but " % gate_text if gate_text else "") +
+                "Lock never engaged: %d lock line(s), engaged 0.00 s, no engage edge; the reasons it gave (lines/edges): %s" % (len(reports), why))
+    text = (("%s; " % gate_text if gate_text else "") + "%d lock line(s), engaged %.2f s, %d engage / %d disengage edge(s); %d real pair(s) and %d S slot(s) while engaged, S shown %d / B replayed %d, late_s %d, late_real %d; "
             "wait %s ms median (last line), period %s ms; reasons when off: %s" % (len(reports), engaged, len(engages), len(disengages), real, s, from_s, from_b, late_s, late_real,
                                                                                reports[-1]["wait_med"], reports[-1]["period"], why))
     if any(d.get("note") for d in disengages):
@@ -18312,6 +18362,10 @@ HEALTH_RULES = (
         ("format", H_FRAMEGEN_LOCK_FORMAT),
         ("unfinished", H_FRAMEGEN_LOCK_UNFINISHED),
         ("replayed", H_FRAMEGEN_LOCK_REPLAYED),
+        ("gate", H_FRAMEGEN_GATE_REPORT),
+        ("gate_engage", H_FRAMEGEN_GATE_ENGAGE),
+        ("gate_disengage", H_FRAMEGEN_GATE_DISENGAGE),
+        ("gate_old", H_FRAMEGEN_GATE_OLD),
     ), _hj_framegen_lock),
     # The SRV turret view (issue 140): lines of the graphics log that carry no build tag (health_scan reads them, as it reads the desktop window's, before it drops the untagged lines).
     _hrule(H_SRV_TURRET, (), H_SRV_TURRET_LABELS, (
@@ -18410,6 +18464,23 @@ def health_scan(text, since=None, until=None):
             g = re.compile(H_FRAMEGEN_LOCK_KEY).search(raw)
             if g:
                 rows[H_FRAMEGEN_LOCK].setdefault("key", []).append(dict(g.groupdict(), _t=None))
+            else:
+                u = unparsed[H_FRAMEGEN_LOCK]
+                u[0] += 1
+                u[1] = u[1] or raw.strip()[:160]
+            continue
+        if H_FRAMEGEN_GATE_LABEL in raw:
+            # Frame generation 2.4: the performance gate's lines (no build tag): events, cut by the window.
+            sm = HEALTH_STAMP_RE.match(raw)
+            tod = int(sm.group(1)) * 3600 + int(sm.group(2)) * 60 + int(sm.group(3)) + int(sm.group(4)) / 1000.0 if sm else None
+            body = raw[sm.end():] if sm else raw
+            gate_kinds = dict(lock.kinds)
+            for kind in H_FRAMEGEN_GATE_KINDS:
+                g = gate_kinds[kind].search(body)
+                if g:
+                    if _health_in_window(tod, since, until):
+                        rows[H_FRAMEGEN_LOCK].setdefault(kind, []).append(dict(g.groupdict(), _t=tod))
+                    break
             else:
                 u = unparsed[H_FRAMEGEN_LOCK]
                 u[0] += 1
@@ -25641,6 +25712,35 @@ def self_test_health():
         check("frame generation lock: the key off, no lock line, nothing said", fg_off + [fl_key(on=False)], 0, [("OK", F90S)], lacks=["frame generation lock", "NEVER APPLIED"],
               extra=["--runtime-file", runtime(["native_frame: unrelated runtime line"])])
         check("frame generation lock: no key line and no lock line, nothing said", fg_off, 0, [("OK", F90S)], lacks=["frame generation lock"])
+        # Phase 2.4: auto and the performance gate (src\common\framegen_gate.h, the graphics log's untagged lines).
+        fgsrc = read_text(os.path.join(repo_root(), "src", "common", "framegen_gate.h"))
+
+        def fl_key_auto():
+            return RL(tpsrc, "frame generation: fix.frame_generation=%s", "auto", "Lock 2:1 only while the performance gate admits it")
+
+        def fl_gate(state="waiting", reason="full_rate", mode="auto", margin="5.69", context="vehicle", cut="none", lock="auto_gate"):
+            return RL(fgsrc, "frame generation gate: state=", state, reason, mode, "60.00", "90.00", "11.11", "11.11", "12.00", "14.00", "9.00", "10.50", "1.20", "18.89", margin,
+                      0, 0, context, cut, lock)
+
+        fl_auto = fg_off + [fl_key_auto()]
+        check("frame generation gate: auto, gate lines that never engage are OK and name the gate's reasons and the H1 margin", fl_auto + [fl_gate(), fl_gate(reason="on_foot",
+              context="on_foot"), fl_gate(reason="dwell")], 0, [("OK", FL)], lacks=["UNPARSED", "NEVER APPLIED"],
+              has=["the gate ran and never admitted Lock", "reasons when waiting (lines/edges): full_rate 1, on_foot 1, dwell 1", "H1 margin median 5.69 ms (min 5.69) against a budget of 18.89 ms",
+                   "context on_foot/vehicle"])
+        check("frame generation gate: auto and no gate line is NEVER APPLIED", fl_auto, 3, [("NEVER APPLIED", FL)], has=["there is no 'frame generation gate:' line"])
+        check("frame generation gate: auto with an older runtime says so (NEVER APPLIED)", fl_auto + [fl_gate(reason="no_runtime", lock="unknown"),
+              RL(fgsrc, "frame generation gate: auto needs", 10)], 3, [("NEVER APPLIED", FL)], lacks=["UNPARSED"], has=["the runtime cannot read it", "in 10 s of VR frames"])
+        check("frame generation gate: the gate engaged and Lock engaged is OK and says both", fl_auto + [fl_gate(reason="dwell"), RL(fgsrc, "frame generation gate: engage reason=", 5.69),
+              fl_gate(state="engaged", reason="none", lock="none"), RL(fgsrc, "frame generation gate: disengage reason=", "cut", "tunnel"), fl_gate(reason="cut", cut="tunnel")],
+              0, [("OK", FL)], lacks=["UNPARSED"], extra=["--runtime-file", runtime([RL(flsrc, "frame generation lock: armed (fix.frame_generation = auto"), fl_engage(), fl_report()])],
+              has=["gate: 3 line(s) in auto, engaged in 1, 1 engage / 1 disengage edge(s)", "cut 2, dwell 1", "1 lock line(s), engaged 1.00 s"])
+        check("frame generation gate: the gate engaged and Lock never did is NEVER APPLIED", fl_auto + [fl_gate(state="engaged", reason="none", lock="no_s")], 3, [("NEVER APPLIED", FL)],
+              extra=["--runtime-file", runtime([RL(flsrc, "frame generation lock: armed (fix.frame_generation = auto"), fl_report(engaged=0.0, real=0, s=0, from_s=0, reason="no_s")])],
+              has=["Lock never engaged"])
+        check("frame generation gate: on prints the gate line (forced) and Lock is judged as before", fl_gfx + [fl_gate(state="engaged", reason="forced", mode="on", lock="none")],
+              0, [("OK", FL)], lacks=["UNPARSED", "line(s) in auto"], extra=["--runtime-file", runtime([fl_armed(), fl_engage(), fl_report()])], has=["1 lock line(s), engaged 1.00 s"])
+        check("frame generation gate: a drifted gate line is counted as unparsed", fl_auto + [fl_gate().replace("margin_ms=", "margin=")], 3, [("NEVER APPLIED", FL)],
+              has=["line(s) the rule's patterns do not match"])
         # H6 at the slot: the pose line's slot tail is read and summarised; a line without it (before 2.3) still parses.
         check("frame generation shadow: a pose line with the slot tail says the slot pose's miss", fg_all, 0, [("OK", FG)], lacks=["UNPARSED"],
               extra=["--runtime-file", runtime([health_render(fmts["fgp:pose"], (4, 14.1, 4.11, 4.11, 4.11, 0.471, 0.471, 0.471, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 3, 0, 1, 0, 0, 0,
