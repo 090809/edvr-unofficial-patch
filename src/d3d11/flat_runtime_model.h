@@ -321,7 +321,7 @@ inline void flatRuntimeNoteFamilyVeto(FlatRuntimePrefix& p, const FlatContractOb
         FlatFamilyVeto& v = p.familyVetoes[at];
         v = FlatFamilyVeto{};
         v.vs = k.vs; v.ps = k.ps; v.depth = k.depth;
-        v.count = k.count; v.width = k.width; v.height = k.height;
+        v.width = k.width; v.height = k.height;
         v.color = k.color != nullptr; v.camera = k.camera != nullptr;
         ++p.familyVetoKinds;
     }

@@ -456,12 +456,13 @@ inline bool flatHdrRouteEvaluatesAtRender(FlatMonoResolveMode mode, uint32_t rW,
 
 // What the route adds to a frame's stand-down verdict at its trigger (key auto; flat_standdown.h). That verdict is
 // about the SHAPE of the game's chain, so the route speaks only where it recognised the frame and will resolve it:
-// Treatable, whatever the copy stage makes of the bloom or tone variant. Every other answer adds nothing. A refusal
-// merged as itself would outrank the copy stage's structural one (the order is None < Structural < Transient <
-// Treatable), and the stand-down that stops an unrecognised chain from costing CPU, and the F8 warning that says why,
-// would never start: render below the output (R < D), where the copy route and its whitelist serve the frame and every
-// trigger says hdr-route-needs-render-at-least-output, and EDVR's TAA above D, which stays on the copy route, are
-// both that case. The key off merges nothing, so none of this reaches it.
+// Treatable, whatever the copy stage makes of the bloom or tone variant. Every other answer from this function adds
+// nothing; the one refusal the route does speak for is flatHdrTriggerRefusalSeen's, below. A refusal merged as itself
+// would outrank the copy stage's structural one (the order is None < Structural < Transient < Treatable), and the
+// stand-down that stops an unrecognised chain from costing CPU, and the F8 warning that says why, would never start:
+// render below the output (R < D), where the copy route and its whitelist serve the frame and every trigger says
+// hdr-route-needs-render-at-least-output, and EDVR's TAA above D, which stays on the copy route, are both that case.
+// The key off merges nothing, so none of this reaches it.
 inline FlatFrameSeen flatHdrTriggerSeen(const FlatMonoFrame& selection, FlatMonoResolveMode mode) {
     return selection.selected() && flatHdrRouteEvaluatesAtRender(mode, selection.renderWidth, selection.renderHeight,
                                                                  selection.outputWidth, selection.outputHeight)

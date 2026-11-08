@@ -4197,9 +4197,10 @@ static void hdrSelectAtTrigger(State& s) {
     if (autoKey && !s.hdrLatch.tripped) {
         // The route speaks for the frame's stand-down verdict only where it will resolve the frame (flatHdrTriggerSeen: a
         // selected frame the mode's route evaluates at the render size for, not one below the output and not EDVR's TAA above
-        // it; those are the copy's, by its whitelist or by its structure). Its refusals add nothing: merged as themselves they
-        // outrank the copy stage's structural one, and at R < D every frame the copy route refuses would read as transient, so
-        // the stand-down and the F8 warning would never start.
+        // it; those are the copy's, by its whitelist or by its structure). Its refusals add nothing but one: merged as themselves
+        // they outrank the copy stage's structural one, and at R < D every frame the copy route refuses would read as transient,
+        // so the stand-down and the F8 warning would never start. The exception is below: no motion source, where the route
+        // itself resolves the frame (flatHdrTriggerRefusalSeen).
         const FlatFrameSeen routeSeen = flatHdrTriggerSeen(sel,
             s.engine);
         if (routeSeen == FlatFrameSeen::Treatable) { s.frameSeen = FlatFrameSeen::Treatable; s.frameReason = sel.reason; }

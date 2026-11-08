@@ -148,9 +148,10 @@ struct FlatSourceVetoWindow {
     }
 };
 
-// One line (about 900 characters at the widest digits, under kFlatLogLineBudget): the window, then the last refused frame's causes and the stock
-// draws that frame held. depth=hdr says the draw wrote the HDR's own depth (and so the summary above should list it), depth=other a different
-// scene-shaped depth; target is the colour target's size (0x0 for a depth-only draw); index-count is the first such draw's count.
+// One line (under 850 characters at the widest digits, inside kFlatLogLineBudget): the window, then the last refused frame's causes and the
+// stock draws that frame held. depth=hdr says the draw wrote the HDR's own depth, depth=other a different scene-shaped depth. A depth=hdr draw
+// can still be missing from the source line's pairs: that summary walks only the records the selector assembled (the targets' writes, the
+// tone, the sources), and a G-buffer draw is none of them (Sean's 11:03 trace). target is the colour target's size (0x0 for a depth-only draw).
 inline int flatSourceVetoLine(char* out, size_t n, const FlatSourceVetoWindow& w, const FlatMonoSourceless& last, uint64_t lastFrame,
                               const FlatFamilyVeto (&v)[kFlatFamilyVetoKinds], uint32_t kinds, uint32_t overflowDraws) {
     char draws[760];
@@ -160,8 +161,8 @@ inline int flatSourceVetoLine(char* out, size_t n, const FlatSourceVetoWindow& w
     for (uint32_t i = 0; i < kinds; ++i) {
         const auto& e = v[i];
         const int k = std::snprintf(draws + at, sizeof(draws) - at,
-            "%s[VS=%016llX PS=%016llX draws=%u index-count=%u depth=%s target=%ux%u color=%u camera=%u]", i ? " " : "",
-            static_cast<unsigned long long>(e.vs), static_cast<unsigned long long>(e.ps), e.draws, e.count,
+            "%s[VS=%016llX PS=%016llX draws=%u depth=%s target=%ux%u color=%u camera=%u]", i ? " " : "",
+            static_cast<unsigned long long>(e.vs), static_cast<unsigned long long>(e.ps), e.draws,
             e.depth && e.depth == last.depth ? "hdr" : "other", e.width, e.height, e.color ? 1u : 0u, e.camera ? 1u : 0u);
         if (k < 0 || at + static_cast<size_t>(k) >= sizeof(draws)) break;
         at += static_cast<size_t>(k);

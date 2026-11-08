@@ -97,14 +97,14 @@ inline int flatSourceFreeTests() {
         int hdrDepth = 0, otherDepth = 0;
         last.depth = &hdrDepth; last.vetoFamilyDraws = 2;
         FlatFamilyVeto v[kFlatFamilyVetoKinds]{};
-        v[0].vs = 0x11; v[0].ps = 0x22; v[0].depth = &hdrDepth; v[0].draws = 3; v[0].count = 600; v[0].width = 1664; v[0].height = 702; v[0].color = true; v[0].camera = true;
-        v[1].vs = 0x33; v[1].ps = 0x44; v[1].depth = &otherDepth; v[1].draws = 1; v[1].count = 6;
+        v[0].vs = 0x11; v[0].ps = 0x22; v[0].depth = &hdrDepth; v[0].draws = 3; v[0].width = 1664; v[0].height = 702; v[0].color = true; v[0].camera = true;
+        v[1].vs = 0x33; v[1].ps = 0x44; v[1].depth = &otherDepth; v[1].draws = 1;
         flatSourceVetoLine(line, sizeof(line), w, last, 4305, v, 2, 0);
         expect(std::strstr(line, "flat source veto 5s: frames=4 with-stock-family=2 of-those-selected=1 refused-by-family=1 refused-by-pool=1; "
                                  "last refused frame=4305: stock-family-draws=2 unsupported-pool-draws=0 kinds=2 past-the-kinds=0; stock draws: ") == line,
                "the veto line keeps its key and prints the window and the last refusal's causes");
-        expect(std::strstr(line, "[VS=0000000000000011 PS=0000000000000022 draws=3 index-count=600 depth=hdr target=1664x702 color=1 camera=1]") != nullptr &&
-                   std::strstr(line, "[VS=0000000000000033 PS=0000000000000044 draws=1 index-count=6 depth=other target=0x0 color=0 camera=0]") != nullptr,
+        expect(std::strstr(line, "[VS=0000000000000011 PS=0000000000000022 draws=3 depth=hdr target=1664x702 color=1 camera=1]") != nullptr &&
+                   std::strstr(line, "[VS=0000000000000033 PS=0000000000000044 draws=1 depth=other target=0x0 color=0 camera=0]") != nullptr,
                "each stock draw says whether it wrote the HDR's own depth or another");
         flatSourceVetoLine(line, sizeof(line), FlatSourceVetoWindow{}, FlatMonoSourceless{}, 0, v, 0, 0);
         expect(std::strstr(line, "frames=0 with-stock-family=0") != nullptr && std::strstr(line, "stock draws: none") != nullptr,

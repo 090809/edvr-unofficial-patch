@@ -253,7 +253,7 @@ inline std::vector<Case> buildCases() {
                {{"frames=", 'q', false}, {"with-stock-family=", 'q', false}, {"of-those-selected=", 'q', false}, {"refused-by-family=", 'q', false},
                 {"refused-by-pool=", 'q', false}, {"last refused frame=", 'q', false}, {"stock-family-draws=", 'd', false},
                 {"unsupported-pool-draws=", 'd', false}, {"kinds=", 'x', false}, {"past-the-kinds=", 'd', false},
-                {"[VS=", 'n', true}, {" PS=", 'n', true}, {"draws=", 'n', true}, {"index-count=", 'n', true}, {"depth=", 'n', true},
+                {"[VS=", 'n', true}, {" PS=", 'n', true}, {"draws=", 'n', true}, {"depth=", 'n', true},
                 {"target=", 'n', true}, {"color=", 'n', true}, {"camera=", 'n', true}},
                [](char* out, size_t n, unsigned part, int l) {
                    if (part) return 0;
@@ -267,7 +267,7 @@ inline std::vector<Case> buildCases() {
                        last.vetoFamilyDraws = last.vetoPoolDraws = ~0u;
                        kinds = kFlatFamilyVetoKinds;
                        // depth stays null against a null HDR depth: "other", the longer word
-                       for (auto& e : vetoes) { e.vs = e.ps = ~0ull; e.draws = e.count = e.width = e.height = ~0u; e.color = e.camera = true; }
+                       for (auto& e : vetoes) { e.vs = e.ps = ~0ull; e.draws = e.width = e.height = ~0u; e.color = e.camera = true; }
                    }
                    return flatSourceVetoLine(out, n, w, last, v, vetoes, kinds, levelD(l));
                },

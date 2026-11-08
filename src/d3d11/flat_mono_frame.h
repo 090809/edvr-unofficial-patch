@@ -107,7 +107,7 @@ struct FlatMonoSourceless {
 struct FlatFamilyVeto {
     uint64_t vs = 0, ps = 0;
     const void* depth = nullptr;
-    uint32_t draws = 0, count = 0, width = 0, height = 0;   // draws of this key; the first draw's index or vertex count; its colour target's size
+    uint32_t draws = 0, width = 0, height = 0;   // draws of this key; the first draw's colour target's size (0x0 depth-only)
     bool color = false, camera = false;                     // it wrote a colour target; it carried a camera constant buffer
 };
 inline constexpr uint32_t kFlatFamilyVetoKinds = 4;
