@@ -67,6 +67,9 @@ constexpr unsigned kEngineVelocitySceneSlot = 1;
 constexpr unsigned kEngineVelocitySlotsSrv = 21;
 constexpr unsigned kEngineVelocityPoolSrv = 22;
 constexpr unsigned kEngineVelocitySkinSrv = 23;   // F2: target 7, the skinned characters' E (temporal_shader_source.h SK)
+// diag.hull_layer = separate (TEMPORARY): the PS slot the own-discard variant reads the own mask at (dxbc_engine_velocity.h kEngineVelocityOwnMaskSlot;
+// engine_velocity.cpp asserts they agree), here for hull_layer.cpp, which does not take the patcher's header.
+constexpr unsigned kEngineVelocityOwnMaskPsSlot = 127;
 constexpr unsigned kEngineVelocitySceneNowCb = 1;
 constexpr unsigned kEngineVelocityScenePrevCb = 2;
 

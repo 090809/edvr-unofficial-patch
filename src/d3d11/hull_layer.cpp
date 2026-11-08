@@ -15,8 +15,7 @@
 #include "../common/config.h"
 #include "../common/log.h"
 #include "binding_shadow.h"
-#include "dxbc_engine_velocity.h"   // kEngineVelocityOwnMaskSlot: where the own-discard variant reads the own mask (separate mode)
-#include "engine_velocity.h"  // engineVelocityLiveNow: the patched shaders that export the slot at MRT6
+#include "engine_velocity.h"  // engineVelocityLiveNow, engineVelocityOwnDiscardPs and its mask slot (kEngineVelocityOwnMaskPsSlot)
 #include "temporal_pass.h"    // temporalPassArmEyeDump: the auto dump arms the eye dump the hotkey arms
 #include "vr_world_route.h"   // VrWorldInternalScope: the layer's own clears, copies and passes step past the game-facing hooks
 #include "vscreen.h"          // the raw setters: the binding shadow keeps describing the game's bindings
@@ -1653,8 +1652,8 @@ bool hullLayerBeforeMainDraw(ID3D11DeviceContext* ctx, UINT instances, UINT star
     }
     g_main.active = true;
     g_main.ps = ps;   // the reference passes to AfterMainDraw
-    ctx->PSGetShaderResources(kEngineVelocityOwnMaskSlot, 1, &g_main.srv);
-    vScreenPSSetShaderResourcesRaw(ctx, kEngineVelocityOwnMaskSlot, 1, &e.maskSrv);
+    ctx->PSGetShaderResources(kEngineVelocityOwnMaskPsSlot, 1, &g_main.srv);
+    vScreenPSSetShaderResourcesRaw(ctx, kEngineVelocityOwnMaskPsSlot, 1, &e.maskSrv);
     vScreenPSSetShaderRaw(ctx, variant, nullptr, 0);
     if (decal) {
         ++e.ownDecals;
@@ -1671,7 +1670,7 @@ void hullLayerAfterMainDraw(ID3D11DeviceContext* ctx) {
     if (!g_main.active) return;
     if (ctx) {
         vScreenPSSetShaderRaw(ctx, g_main.ps, nullptr, 0);
-        vScreenPSSetShaderResourcesRaw(ctx, kEngineVelocityOwnMaskSlot, 1, &g_main.srv);
+        vScreenPSSetShaderResourcesRaw(ctx, kEngineVelocityOwnMaskPsSlot, 1, &g_main.srv);
     }
     releaseRef(g_main.ps);
     releaseRef(g_main.srv);

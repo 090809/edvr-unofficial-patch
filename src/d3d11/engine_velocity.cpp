@@ -3785,6 +3785,8 @@ void engineVelocityNoteSelfMarkingPs(uint64_t psHash) noexcept {
     if (engine_velocity_family::selfMarkingPs(psHash)) ++g_draw.selfMarkBinds;
 }
 
+static_assert(kEngineVelocityOwnMaskPsSlot == kEngineVelocityOwnMaskSlot, "hull_layer.cpp binds the own mask where the variant reads it");
+
 ID3D11PixelShader* engineVelocityOwnDiscardPs(ID3D11DeviceContext* ctx, ID3D11PixelShader* bound, const char** why) {
     const auto say = [&](const char* reason) -> ID3D11PixelShader* {
         if (why) *why = reason;
