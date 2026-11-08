@@ -10621,12 +10621,12 @@ H_HULL_LABEL = "hull layer: "
 H_HULL_KEY = r"hull layer: diag\.hull_layer=(?P<mode>\w+) \(TEMPORARY"
 H_HULL_REPORT = (r"hull layer: state=(?P<state>[\w-]+) frames=(?P<frames>\d+) eye_frames=(?P<eye_frames>\d+) seeds=(?P<seeds>\d+) no_seed=(?P<no_seed>\d+) "
                  r"no_slot=(?P<no_slot>\d+) refused=(?P<refused>\d+) own=(?P<own_lo>\d+)/(?P<own_mid>\d+)/(?P<own_hi>\d+) readbacks=(?P<readbacks>\d+) "
-                 r"filtered_px=(?P<f_lo>\d+)/(?P<f_mid>\d+)/(?P<f_hi>\d+) hull_draws=(?P<lo>\d+)/(?P<mid>\d+)/(?P<hi>\d+) reissued=(?P<reissued>\d+) "
+                 r"filtered_px=(?P<f_lo>\d+)/(?P<f_mid>\d+)/(?P<f_hi>\d+) (?:culled_draws=(?P<culled>\d+) filter_draws=(?P<filter_draws>\d+) )?hull_draws=(?P<lo>\d+)/(?P<mid>\d+)/(?P<hi>\d+) reissued=(?P<reissued>\d+) "
                  r"no_slot_draws=(?P<no_slot_draws>\d+) clears=(?P<clears>\d+) filters=(?P<filters>\d+) "
                  r"subst=copy:(?P<s_copy>\d+),mask:(?P<s_mask>\d+),light:(?P<s_light>\d+) light_draws=(?P<l_lo>\d+)/(?P<l_mid>\d+)/(?P<l_hi>\d+) "
                  r"no_counterpart=copy:(?P<n_copy>\d+),mask:(?P<n_mask>\d+),light:(?P<n_light>\d+) unknown_light_pairs=(?P<unknown>\d+) "
                  r"ended=copy:(?P<e_copy>\d+),shell:(?P<e_shell>\d+),light:(?P<e_light>\d+),frame:(?P<e_frame>\d+) terrain_frames=(?P<terrain>\d+) "
-                 r"auto_dumps=(?P<auto>\d+)")
+                 r"auto_dumps=(?P<auto>\d+)(?: busy=(?P<busy>\d+) offscreen=(?P<offscreen>\d+) null_rt1=(?P<null_rt1>\d+))?")
 H_HULL_DUMP = (r"hull layer: dump (?P<stamp>\S+) eye (?P<eye>\d) frame (?P<frame>\d+): HullHdr (?P<w>\d+)x(?P<h>\d+) format (?P<fmt>\d+) (?P<hull>[\w ]+), "
                r"GameHdrLit (?P<game>[\w ]+), HullDepth (?P<depth>[\w ]+); own=(?P<own>-?\d+) filtered_px=(?P<filtered>-?\d+) "
                r"seed=(?P<seed_read>-?\d+)/(?P<seed_inst>-?\d+) hull_draws=(?P<hull_draws>\d+) light_draws=(?P<light_draws>\d+)")
@@ -10668,7 +10668,11 @@ H_HULL_OTHER = (r"hull layer: (?:dump \S+ armed|private copy (?:made|of a)|\d+ p
                 r"separate mode (?:takes the own ship out|stands aside|falls back)|tonemap re-issue declined|composite declined for eye|"
                 r"the tone cover and composite shaders|the composite's sampler|(?:tone|composite) targets made|dump \S+ eye \d: HullTone|"
                 # Dump v2: separate mode's reference frame, and a dump that could not start its TAA sequence.
-                r"dump \S+ eye \d: reference frame|dump \S+: no HullSeq)")
+                r"dump \S+ eye \d: reference frame|dump \S+: no HullSeq|" +
+                # Station fixes: the keep-own VS made or declined, a re-issue that could not take it, the busy governor's entry and exit,
+                # the slot target's private copy dropped, a stage draw not at the eye's render size.
+                r"keep-own vertex shader (?:made|declined)|a \w+ re-issue could not take the keep-own|busy(?: over)?:|"
+                r"the private copy of eye \d's slot target dropped|a [\w ]+ stage draw into a)")
 # Frame generation, Phase 1 (fix.frame_generation_shadow, TEMPORARY; src\common\framegen_shadow_report.h): two lines of the graphics log with no build tag, read the way the desktop
 # window's are. The armed line is said once per change to on (so health_scan keeps it whatever --since says); the report line every second.
 H_FRAMEGEN = "frame generation shadow"
@@ -17020,6 +17024,19 @@ def _hj_hull_layer(rows, ctx=None):
                                                                 for d in dumps if d["stamp"] == dumps[-1]["stamp"]))
     if nothing:
         text += "; %d dump(s) captured nothing" % len(nothing)
+    # Station fixes: the keep-own VS's culled re-issues against those that needed the filter, and the busy governor's frames. A build
+    # before them has none of these fields.
+    if any(r["culled"] is not None for r in reports):
+        culled = sum(int(r["culled"] or 0) for r in reports)
+        need = sum(int(r["filter_draws"] or 0) for r in reports)
+        text += "; %d re-issue(s) culled to the own ship in the vertex shader, %d needed the neighbour filter" % (culled, need)
+    if any(r["busy"] is not None for r in reports):
+        busy = sum(int(r["busy"] or 0) for r in reports)
+        text += "; asleep (busy) %d frame(s), %d offscreen stage draw(s) declined, %d lighting re-issue(s) without the scratch R16" % (
+            busy, sum(int(r["offscreen"] or 0) for r in reports), sum(int(r["null_rt1"] or 0) for r in reports))
+    if total["seeds"] == 0 and last["state"] == "busy":
+        return ("PARTIAL", text + ": the busy governor slept the whole window (too many hull-family draws an eye: a station or a crowd); the game drew "
+                                  "the ship")
     if total["seeds"] == 0:
         why = {"no-eye-pass": "no hull-family G-buffer draw and no cockpit shell", "no-shell": "hull-family G-buffer draws but no cockpit shell",
                "no-seed": "the eye passes drew the cockpit shell but no hull-family draw followed", "no-slot-target":
@@ -25952,10 +25969,10 @@ def self_test_health():
             return RH("hull layer: diag.hull_layer=%s (TEMPORARY", mode)
 
         def hl_report(state="applied", eye_frames=5400, seeds=5400, no_seed=0, no_slot=0, own=(54, 54, 55), readbacks=5400, filt=(0, 1200, 9000),
-                      hd=(70, 84, 92), reissued=453600, light=59400, ld=(11, 11, 11), nocp=(0, 0, 0)):
+                      hd=(70, 84, 92), reissued=453600, light=59400, ld=(11, 11, 11), nocp=(0, 0, 0), culled=453000, filter_draws=600, busy=0):
             return RH("hull layer: state=%s", state, 2700, eye_frames, seeds, no_seed, no_slot, 0, own[0], own[1], own[2], readbacks, filt[0], filt[1], filt[2],
-                      hd[0], hd[1], hd[2], reissued, 0, seeds, seeds, 10800, 32400, light, ld[0], ld[1], ld[2], nocp[0], nocp[1], nocp[2], 0, seeds, 0, 0, 0,
-                      2700, 0)
+                      culled, filter_draws, hd[0], hd[1], hd[2], reissued, 0, seeds, seeds, 10800, 32400, light, ld[0], ld[1], ld[2], nocp[0], nocp[1], nocp[2],
+                      0, seeds, 0, 0, 0, 2700, 0, busy, 12, 59400)
 
         def hl_idle(state, eye_frames=5400, no_seed=0, no_slot=0):
             return hl_report(state, eye_frames=eye_frames, seeds=0, no_seed=no_seed, no_slot=no_slot, own=(0, 0, 0), readbacks=0, filt=(0, 0, 0), hd=(0, 0, 0),
@@ -25994,6 +26011,22 @@ def self_test_health():
         check("hull layer: a report inside --since is read, the key before it is kept", hl_base + [(1, hl_key()), (70, hl_report())], 0, [("OK", HL)], extra=["--since", "10:01:00"])
         check("hull layer: a drifted report line is counted as unparsed and is no report", hl_base + [hl_key(), hl_report().replace(" reissued=", " reissues=")], 3,
               [("NEVER APPLIED", HL)], has=["line(s) the rule's patterns do not match"])
+        # Station fixes: the keep-own VS's and the busy governor's fields and lines are parsed and said; a whole window asleep is PARTIAL.
+        check("hull layer: the station fixes' fields and lines are parsed and said",
+              hl_base + [hl_key(), RH("hull layer: busy: eye %d drew", 0, 1650, 2400, "x", 120), RH("hull layer: busy over:", 120, 2400, 300, ""),
+                         RH("hull layer: a %s re-issue could not take the keep-own", "hull", "x"),
+                         RH("hull layer: the private copy of eye %d's slot target dropped", 1, 120, 30),
+                         RH("hull layer: a %s stage draw into a", "lighting", 256, 256, 10, 0, 2816, 2448), hl_report(busy=240)], 0, [("OK", HL)],
+              has=["453000 re-issue(s) culled to the own ship in the vertex shader, 600 needed the neighbour filter",
+                   "asleep (busy) 240 frame(s), 12 offscreen stage draw(s) declined, 59400 lighting re-issue(s) without the scratch R16"],
+              lacks=["UNPARSED", "do not match"])
+        check("hull layer: a window the busy governor slept through is PARTIAL and says why",
+              hl_base + [hl_key(), hl_report("busy", seeds=0, own=(0, 0, 0), readbacks=0, filt=(0, 0, 0), hd=(0, 0, 0), reissued=0, light=0, ld=(0, 0, 0),
+                                             culled=0, filter_draws=0, busy=2700)], 0,
+              [("PARTIAL", HL)], has=["the busy governor slept the whole window"])
+        check("hull layer: a report line from before the station fixes still parses",
+              hl_base + [hl_key(), hl_report().replace(" culled_draws=453000 filter_draws=600", "").replace(" busy=0 offscreen=12 null_rt1=59400", "")], 0,
+              [("OK", HL)], lacks=["UNPARSED", "do not match", "culled to the own ship"])
 
         def hl_main(own=5400, decals=1800, no_variant=0, fallback=0, reissued=1800, no_slot=0):
             return RH("hull layer: main pass: own_draws=%u", own, decals, no_variant, fallback, reissued, no_slot)

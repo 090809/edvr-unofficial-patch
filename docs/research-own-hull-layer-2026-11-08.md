@@ -17,30 +17,28 @@ The smear is terrain that is newly uncovered at the hull edge every frame
   because the hull is composited after the game's image. Next: one
   dump with night vision on and one off, at the same spot, to find the
   night-vision draws in the census, then re-issue them on the hull layer.
-* **Step 1 CONFIRMED (2026-11-08 20:30, build cfa4e5f5):** section
-  "Step 1 v2 flight (... 20:30 ...)". The private hull layer, picked per
-  record by the GPU own mask and re-lit by re-issuing the game's lighting,
-  equals the game's HDR where the game shows the hull. Median ratio 1.000;
-  85-98% of those pixels are bit-exact; AO and decals are the residue. The
-  neighbour filter is built but not yet exercised.
+* **Step 1 CONFIRMED (2026-11-08 20:30, build cfa4e5f5):** the private
+  layer, picked per record by the GPU own mask and re-lit by re-issuing the
+  game's lighting, equals the game's HDR where the game shows the hull
+  (median ratio 1.000, 85-98% bit-exact; AO and decals the residue).
 * **Step 2** (section "Step 2 build"): `separate` discards the own records in
-  the main pass with an own-discard variant of the engine-motion patched hull
-  and decal PS (mask at t127). **Open:** the 6 own forward draws are not
-  engine-motion families and still draw into the world layer.
+  the main pass with an own-discard variant of the patched hull and decal PS
+  (mask at PS t127). **Open:** the 6 own forward draws still draw in the world.
 * **Step 3** (sections "Step 3 build", "Step 3 flight (21:45)"): tonemap
-  re-issue, own TAA, composite onto dlSubmit after the UI resolve (before it,
-  the resolve's raw-input clamp held the hull to the background).
-* **AO** (section "AO on the hull layer", compile-only, not flown): the
-  game's AO chain (CS `FB277B33`, `9347F8FC`, `D31E7812`) is re-dispatched
-  on the private depth copy and RT0, and its apply re-issued into the
-  private RT2. Next: one dump. The `ao:` line should read 3.00 an
-  eye-frame, and the HullHdr/GameHdrLit p95 residue should shrink.
-* **Dump v2** (section "Dump v2", compile-only, not flown): one dump now
-  holds the whole census, the game's passes timed, a reference frame
-  (separate), the lighting windows' draws and a 16-frame TAA sequence for
-  `tools\hull_taa_sim.py`; `hull layer: gpu_ms` times the layer by stage
-  every 30 s. Next: one separate-mode dump at a station, lights on.
+  re-issue, own TAA, composite onto dlSubmit after the UI resolve.
+* **AO** (section "AO on the hull layer"; not flown): the game's AO chain
+  re-dispatched on the private depth copy and RT0. The `ao:` line: 3.00.
+* **Dump v2** (section "Dump v2"; not flown): census whole, passes timed,
+  reference frame, `HullLights.json`, TAA sequence, `gpu_ms` every 30 s.
+* **Station fixes** (section "Station fixes", compile-only, not flown): the
+  re-issue culls foreign instances in a keep-own VS (mask at VS t127; the
+  filter only as a fallback), a busy governor, the two station light pairs,
+  unknown pairs only before a later lighting draw, stages at eye size only,
+  no scratch R16. Scissoring skipped. **Next:** one docking flight, one dump
+  inside the station and one in flight: `culled_draws` high, `filter_draws`
+  0, `busy=` 0, the station's light on the hull in `HullLights.json`.
 * **Temporary keys of this arc:** `diag.hull_layer` (off | dump | separate).
+  Temporary code: the busy governor (`kBusyDraws`, `kBusyDrawsCulled`).
 * **Background:** option (e), the hole-fill, fails (section "Result"). The
   own ship is one block of hull draws seeded after the cockpit shell, but
   neighbours interleave, so ownership is per record on the GPU (sections
@@ -906,6 +904,132 @@ MATCH on a real sequence (the bilinear filter's fixed-point weights may
 cost a little); that the eye run's `Z` frame and the hull capture frame
 are the same (no longer needed for the compare); and the pass profile
 next to the eye run.
+
+## Station fixes (2026-11-09, compile-only, not flown)
+
+**The analysis** (read-only, the 23:35 docking dumps: ledgers 233520921004,
+233536735005, 233545646006; log `edvr_gfx_20261108_231250.log`):
+- At the station the layer re-issued 600-1,700 hull-family draws an eye,
+  only 7-15% of them the own ship's. The station and other ships draw with
+  the same families, and the CPU cannot tell them apart: the signatures
+  are shared and unstable, the own draws are scattered over 40-48 runs,
+  and 4-12 draws mix own and foreign instances. The neighbour filter then
+  cleared 3.3-4.9 M pixels an eye.
+- The extra cost is the foreign re-issue and the filter (est. +2-3.5 ms
+  GPU, about 1-1.5 ms CPU); the rest of the layer's cost is fixed.
+- The station's lights missed the hull: two light-volume pairs were not
+  in `kLightVs`, VS `A1B7CFCD0BE7493E` / PS `2DB678B6B558B604` (box
+  volumes, 198-226 instances) and `CE24A73943632F55` / `1F64463B15189104`
+  (45-54 instances). Their state is like the other volumes'; no stencil
+  marker draw is missing.
+- `unknown_light_pairs` was a false negative: the 16-pair cap was spent on
+  forward draws (`2CECEC30`, `925ACEDA`) logged while no sky closed the
+  lighting window.
+- Mirror churn: 131 depth and 81 RG32F mirrors made, 263 dropped, the
+  48 cap hit. Offscreen targets (256x256, 512x512, 612x404, 904x404) got
+  mirrors, because stages matched offscreen lighting passes (A1B7CFCD in
+  DCO lines at 256x256).
+- The scratch R16 lighting RT1 (2817x2448 f53) is read by nothing: 27.6 MB.
+- The filter and count passes and the slot-target mirror (RG32F, 55 MB an
+  eye) exist only to remove foreign pixels.
+
+**What changed** (`hull_layer.cpp`, `engine_velocity.cpp`
+`engineVelocityKeepOwnVs`, `dxbc_engine_velocity.h`
+`engineVelocityPatchVsKeepOwn`; `hull_layer.h` items 15-18):
+1. *Foreign instances culled in the vertex shader.* A keep-own variant of
+   the vertex shader bound for the re-issue (the game's, or engine
+   motion's slot or second-skin patch of it): `and` v0.x (the instance
+   stream's record index, the value the PS's slot input carries) to 23
+   bits, `ld_raw` the own mask at **VS t127**, and before every `ret`, when
+   the record is not own, SV_Position = (2, 2, 2, 1): every vertex of the
+   instance on one point outside the clip volume. t127: the families' VS
+   declare t33 (and the second skin t108-t110); the patch refuses a shader
+   that names t127, an indexed register range, a position that is not an
+   xyzw SV_Position. The re-issue of every hull-family draw and own decal
+   (BBE5) binds it with the eye's mask at VS t127; End puts the VS and the
+   game's t127 back. A geometry or tessellation stage bound, or a shader
+   that declines (said once a shader: `hull layer: keep-own vertex shader
+   declined for ...`), is re-issued whole as before.
+2. *The filter as the fallback only.* The private slot target is made at
+   the first re-issue of an eye-frame that could not take the variant
+   (cleared to -1; every later slot-exporting re-issue binds it, so an own
+   draw over a neighbour's pixel replaces its slot). The filter and count
+   run only when it was made. After 120 eye-frames without it its private
+   copy is dropped (`the private copy of eye N's slot target dropped`).
+   The report line gains `culled_draws=` and `filter_draws=`;
+   `filtered_px` stays and reads 0 when nothing needed the filter.
+3. *The busy governor* (temporary code, no key). At the frame boundary:
+   an eye with more hull-family G-buffer draws than `kBusyDraws` = 400
+   (when a re-issue of that frame needed the filter) or `kBusyDrawsCulled`
+   = 2400 (when every re-issue was culled: the station measured 600-1,700)
+   puts the layer to sleep: only a count of G-buffer hull draws (RT3 with
+   a DSV) runs; no seed, discard, re-issue, stage, AO step, mirror copy or
+   composite, and the game draws the ship. 120 calm frames wake it; in
+   separate mode the 120-frame hold follows. Lines `hull layer: busy:` and
+   `hull layer: busy over:`; `busy=` (frames asleep) on the report line,
+   and `state=busy` for a window asleep throughout (`--health`: PARTIAL).
+4. *Station lights.* VS `A1B7CFCD0BE7493E` and `CE24A73943632F55` join
+   `kLightVs`. The unknown pairs: an HDR writer in the window waits; it is
+   said only when a later lighting draw of the same eye follows (the cap
+   is spent only on those). A forward draw (writing the HDR with depth
+   writes on) or the sky or the span closes that window. `HullLights.json`
+   still records from the shadow mask to the sky, unchanged.
+5. *Eye size only.* A stage draw (copy, shadow mask, lighting, night
+   vision, AO apply) whose targets are not the eye's render size (the
+   private depth's) is declined before it opens, ends or counts anything,
+   and no private copy is made (said once a stage; `offscreen=` on the
+   report line). The tonemap was already matched by the HDR's identity;
+   the AO compute steps' own targets are quarter size by design and are
+   named by the eye's resources, so they are unchanged.
+6. *No scratch R16.* A lighting re-issue binds no RT1 when the game's RT1 is
+   a one-channel 16-bit target: a null RTV is legal and drops the writes
+   (`null_rt1=` on the report line). No shared scratch was needed.
+7. *Scissor to the hull's rectangle:* **skipped.** It needs a cloned
+   rasterizer state per game state (scissor enable) for the lighting,
+   shadow mask and AO, a dispatch region for TAA, sharpen and composite,
+   and a rectangle from the previous frame's private depth (a reduction
+   pass); with the foreign re-issue gone it is the smaller cost, and a
+   wrong rectangle cuts the hull. Left in "Optimisation debt" item 3.
+
+**Proof** (`engine_velocity_test`, WARP, `keep_own_vs_tests.h`; 19,174
+checks pass): a synthetic family-shaped VS (INSTANCEANDMODELDATAINDEX at
+v0, the t33 pool read by v0.x), four instances of slots 3, 7, 1000 (past
+the mask) and 9, 7 and 9 own: 256 own pixels bit-identical to the plain VS
+(colour and depth), 256 foreign pixels never written, depth clip off;
+with no record own nothing is drawn. Stream output (a pass-through GS
+made from the VS bytecode): 12 own vertices bit-identical in every
+output, 12 foreign at the culled point. The real fixtures `vs_66DE` and
+`vs_AACF`, driven with a layout from their own signature and patterned
+resources, two data sets: 6 own vertices bit-identical, 6 foreign culled,
+each. Refused: a VS naming t127, a position register that is not
+SV_Position. The lifecycle rig: the bound family VS gets its variant once.
+`--corpus` (also run on the local dump, `--partial`: only `vs_BBE5` with
+the candidate `ps_7311054A` present) proves `vs_BBE5` the same way; DE54,
+61AE (and its second skin) were not in that dump and stay unproven
+offline, though the patch takes any family VS and says when it declines.
+
+**One docking flight** (separate, fix.temporal_aa on, FG off; one dump
+inside the station, one in flight):
+- `edvr_log.py --expect-build HEAD --health`: the hull layer OK;
+  `hull layer: keep-own vertex shader made for the game's vs_66DE...`
+  (and AACF, DE54, 61AE's second skin, BBE5) and no `declined`.
+- The report line: `culled_draws` about the station's 600-1,700 an
+  eye-frame, `filter_draws=0`, `filters=0`, `busy=0` (or rare), and
+  `offscreen` > 0 at the station.
+- `hull layer: gpu_ms`: `gbuffer` near the flight's own-ship-only cost
+  (the foreign draws are culled before rasterisation; their vertex work
+  remains), `mask_filter` the seed alone, `total` some 2-3 ms below the
+  23:35 station.
+- In the station dump: `HullLights.json` lists A1B7CFCD and CE24A739 as
+  known and re-issued; `hull_layer_compare.py` shows the station's light on
+  the hull (HullHdr against GameHdrLit on the reference frame).
+
+**Unverified:** that the GPU drivers drop the culled triangles as WARP does
+(by the clip rules they must); that v0.x is per instance for every family
+(the layout is not visible to the shader; the seed relies on the same);
+the R16 being read by nothing (from the census, not checked at run time);
+that every station light is now known (a new unknown pair says so); that
+offscreen passes never use the eye's own size.
 
 ## Optimisation debt (recorded 2026-11-08 at the pilot's request)
 

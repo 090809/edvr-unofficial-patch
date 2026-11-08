@@ -46,6 +46,13 @@ constexpr uint32_t kEngineVelocityOverlaySnapshotSlot = 3;
 // PS slot: the hull families' shaders declare t0..t9 (66DE/BBDE4E71) and t0..t5 (AACF/CF534B32), EDHM reads t120 and
 // 3Dmigoto's defaults are t120/t125; the patch refuses a shader that names it all the same.
 constexpr uint32_t kEngineVelocityOwnMaskSlot = 127;
+// The keep-own vertex shader variant (diag.hull_layer, TEMPORARY; docs "Station fixes") reads the same mask at this VS slot.
+// The hull families' vertex shaders declare t33 (the pool) and EDVR's second skin t108..t110; EDHM reads t120 and 3Dmigoto's
+// defaults are t120/t125. The patch refuses a shader that names it.
+constexpr uint32_t kEngineVelocityKeepOwnMaskSlot = 127;
+// Where a foreign instance's every vertex is put: x = y = 2w, outside the clip volume on two planes, and the same point for
+// all three vertices (a triangle of zero area). The rasterizer drops it whatever the depth clip says.
+constexpr float kEngineVelocityCulledPosition[4] = {2.0f, 2.0f, 2.0f, 1.0f};
 // The slot bits kept before the odd encoding (2 * slot + 1 stays below 2^24,
 // where float is still exact).
 constexpr uint32_t kEngineVelocitySlotMask = 0x007fffffu;
@@ -430,6 +437,96 @@ inline std::vector<BYTE> patchPsProgram(const std::vector<BYTE>& bytes, const En
     return programBytes(std::move(out));
 }
 
+// The keep-own VS (diag.hull_layer, TEMPORARY): every original instruction stays; one temp, the mask at t127, and
+//   ahead of the original code:                      before every ret:
+//     and    rN.x, v0.x, l(0x007fffff)  the slot       if_z rN.x
+//     ishl   rN.x, rN.x, l(2)                            mov o<pos>.xyzw, l(2, 2, 2, 1)
+//     ld_raw rN.x, rN.x, t127.xxxx      (past the end: 0, foreign)   endif
+// v0.x is the instance stream's record index (INSTANCEANDMODELDATAINDEX, per instance: every vertex of an instance reads the
+// same word), the value the pixel shader's slot input carries (bfi(31, 0, v0.x, flag), masked to 23 bits). A foreign
+// instance's every vertex lands on the same point outside the clip volume, so its triangles are dropped; an own instance's
+// outputs are the original's, bit for bit (engine_velocity_test proves both on WARP).
+inline std::vector<BYTE> patchKeepOwnVsProgram(const std::vector<BYTE>& bytes, uint32_t positionRegister) {
+    const auto t = programWords(bytes);
+    size_t firstOutput = 0, tempAt = 0, firstExecutable = 0;
+    uint32_t tempCount = 0, returns = 0;
+    bool v0x = false, position = false;
+    for (size_t at = 2; at < t.size();) {
+        const uint32_t opcode = t[at] & 0x7ffu;
+        const uint32_t length = instructionLength(t, at);
+        declineUnsupported(opcode);
+        for (size_t i = at + 1; i + 1 < at + length; ++i)
+            if (operandType(t[i]) == 7 && t[i + 1] == kEngineVelocityKeepOwnMaskSlot) throw std::runtime_error("own mask t127 occupied");
+        if (opcode == 91) throw std::runtime_error("indexed register range (the position could be written by index)");
+        const bool declaration = (opcode >= 88 && opcode <= 106) || opcode == 143 || (opcode >= 147 && opcode <= 163) || opcode == 53;
+        if (!firstExecutable && !declaration) firstExecutable = at;
+        if (!firstOutput && opcode >= kOpDclOutput && opcode <= kOpDclOutputSiv) firstOutput = at;
+        if (opcode == kOpDclInput && length == 3 && operandType(t[at + 1]) == 1 && t[at + 2] == 0 && (operandMask(t[at + 1]) & 1u)) v0x = true;
+        if (opcode >= kOpDclOutput && opcode <= kOpDclOutputSiv && length >= 3 && operandType(t[at + 1]) == 2 && t[at + 2] == positionRegister) {
+            if (opcode != kOpDclOutputSiv || length != 4 || t[at + 3] != 1u) throw std::runtime_error("position register not SV_Position");
+            if (operandMask(t[at + 1]) != 15u) throw std::runtime_error("SV_Position not declared xyzw");
+            position = true;
+        }
+        if (opcode == kOpDclTemps) {
+            if (tempAt || length != 2 || t[at + 1] > 4092) throw std::runtime_error("temps");
+            tempAt = at;
+            tempCount = t[at + 1];
+        }
+        if (opcode == kOpRet) ++returns;
+        at += length;
+    }
+    if (!position) throw std::runtime_error("SV_Position output not declared");
+    if (!v0x) throw std::runtime_error("v0.x not declared");
+    if (!returns) throw std::runtime_error("no return");
+    if (!firstExecutable) throw std::runtime_error("no executable instructions");
+    if (!firstOutput) throw std::runtime_error("no output declarations");
+    const uint32_t temp = tempCount;
+    const uint32_t maskDecl[] = {0x030000A1u, 0x00107000u, kEngineVelocityKeepOwnMaskSlot};   // dcl_resource_raw t127
+    const uint32_t head[] = {
+        0x07000001u, 0x00100012u, temp, 0x0010100Au, 0u, 0x00004001u, kEngineVelocitySlotMask,              // and rN.x, v0.x, l(0x7fffff)
+        0x07000029u, 0x00100012u, temp, 0x0010000Au, temp, 0x00004001u, 2u,                                // ishl rN.x, rN.x, l(2)
+        0x070000A5u, 0x00100012u, temp, 0x0010000Au, temp, 0x00107006u, kEngineVelocityKeepOwnMaskSlot,   // ld_raw rN.x, rN.x, t127.xxxx
+    };
+    uint32_t culled[4];
+    std::memcpy(culled, kEngineVelocityCulledPosition, sizeof culled);
+    const uint32_t tail[] = {
+        0x0300001Fu, 0x0010000Au, temp,                                                                     // if_z rN.x
+        0x08000036u, 0x001020F2u, positionRegister, 0x00004002u, culled[0], culled[1], culled[2], culled[3],  // mov o<pos>.xyzw, l(2, 2, 2, 1)
+        0x01000015u,                                                                                        // endif
+    };
+    std::vector<uint32_t> out;
+    out.reserve(t.size() + 48);
+    out.push_back(t[0]);
+    out.push_back(0);
+    bool tempsPlaced = false, headPlaced = false;
+    for (size_t at = 2; at < t.size();) {
+        const uint32_t opcode = t[at] & 0x7ffu;
+        const uint32_t length = instructionLength(t, at);
+        if (at == firstOutput) out.insert(out.end(), std::begin(maskDecl), std::end(maskDecl));
+        if (tempAt && at == tempAt) {
+            out.push_back(t[at]);
+            out.push_back(tempCount + 1u);
+            tempsPlaced = true;
+            at += length;
+            continue;
+        }
+        if (at == firstExecutable) {
+            if (!tempAt) {
+                out.push_back(0x02000068u);   // dcl_temps 1
+                out.push_back(1u);
+                tempsPlaced = true;
+            }
+            out.insert(out.end(), std::begin(head), std::end(head));
+            headPlaced = true;
+        }
+        if (opcode == kOpRet) out.insert(out.end(), std::begin(tail), std::end(tail));
+        out.insert(out.end(), t.begin() + at, t.begin() + at + length);
+        at += length;
+    }
+    if (!tempsPlaced || !headPlaced) throw std::runtime_error("keep-own head not placed");
+    return programBytes(std::move(out));
+}
+
 } // namespace dxbc_engine_velocity_detail
 
 // From the VERTEX shader's signatures: where the slot and SV_POSITION reach the
@@ -734,6 +831,38 @@ inline bool engineVelocityPatchPs(const void* data, size_t bytes, const EngineVe
         if (!isgn || !osgn || !program) throw std::runtime_error("missing pixel shader chunks");
         output = makeContainer(chunks);
         if(provenance)*tokenSlot=selectedToken;
+        return true;
+    } catch (const std::exception& e) {
+        reason = e.what();
+        output.clear();
+        return false;
+    }
+}
+
+// diag.hull_layer (TEMPORARY; docs\research-own-hull-layer-2026-11-08.md "Station fixes"): the keep-own variant of a pool
+// family's vertex shader, as bound (the game's, or engine motion's slot or skin patch of it): a foreign instance (its record
+// not in the own mask at VS t127) is culled, an own one is drawn exactly as before. `inputs` are the family's derived ones
+// (positionRegister). The signatures are unchanged. Declines with a reason and no bytecode.
+inline bool engineVelocityPatchVsKeepOwn(const void* data, size_t bytes, const EngineVelocityInputs& inputs, std::vector<BYTE>& output,
+                                         std::string& reason) {
+    using namespace dxbc_engine_velocity_detail;
+    output.clear();
+    reason.clear();
+    if (inputs.positionRegister >= 32) {
+        reason = "invalid shader inputs";
+        return false;
+    }
+    try {
+        auto chunks = parseContainer(data, bytes, kVs50);
+        bool program = false;
+        for (auto& chunk : chunks) {
+            if (!isProgram(chunk.tag)) continue;
+            if (program) throw std::runtime_error("duplicate program");
+            program = true;
+            chunk.bytes = patchKeepOwnVsProgram(chunk.bytes, inputs.positionRegister);
+        }
+        if (!program) throw std::runtime_error("missing vertex shader program");
+        output = makeContainer(chunks);
         return true;
     } catch (const std::exception& e) {
         reason = e.what();

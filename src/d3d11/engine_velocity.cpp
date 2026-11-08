@@ -170,6 +170,8 @@ struct FamilyState {
     std::unordered_map<ID3D11PixelShader*, Ptr<ID3D11PixelShader>> guardedPs;
     // diag.hull_layer = separate (TEMPORARY): the own-discard variant of a substitute (plain or guarded), keyed by the substitute; null: declined
     std::unordered_map<ID3D11PixelShader*, Ptr<ID3D11PixelShader>> ownDiscardPs;
+    // diag.hull_layer (TEMPORARY): the keep-own variant of a vertex shader as bound (the game's, or the slot or skin patch), keyed by it; null: declined
+    std::unordered_map<ID3D11VertexShader*, Ptr<ID3D11VertexShader>> keepOwnVs;
     std::unordered_map<ID3D11PixelShader*, std::string> psFailed;
     std::unordered_map<ID3D11PixelShader*, bool> psExports;   // F2: the patched pixel shader writes E to target 7
     std::unordered_map<ID3D11PixelShader*, bool> psZeroes;    // F2: ...or writes "no history" there (exactly zero, valid 0): a skinned family's pixel shader that exports no E
@@ -783,7 +785,7 @@ void deriveFamily(int f) {
     // (armSkinForProfileLocked), and a family derived in VR just ahead of that must take it too.
     const bool skinArmed = !runtimeFlatProfile() && g_skinWanted.load(std::memory_order_acquire);
     if (s.derived && (s.derivedFlat != runtimeFlatProfile() || (kFamilies[f].skinned && s.derivedSkin != skinArmed))) {
-        s.patchedVs.clear(); s.patchedPs.clear(); s.guardedPs.clear(); s.ownDiscardPs.clear(); s.psFailed.clear();
+        s.patchedVs.clear(); s.patchedPs.clear(); s.guardedPs.clear(); s.ownDiscardPs.clear(); s.keepOwnVs.clear(); s.psFailed.clear();
         s.psExports.clear(); s.psZeroes.clear();
         s.derived = s.valid = false; s.skin = false; s.skinWhy.clear(); s.reason.clear(); s.inputs = EngineVelocityInputs{};
     }
@@ -2643,7 +2645,7 @@ void clearLocked() {
     for (auto& w : watch) w.store(nullptr);
     for (auto& w : g_watchInfo) w = WatchInfo{};
     for (auto& s : g_families) {
-        s.patchedVs.clear(); s.patchedPs.clear(); s.guardedPs.clear(); s.ownDiscardPs.clear(); s.psFailed.clear();
+        s.patchedVs.clear(); s.patchedPs.clear(); s.guardedPs.clear(); s.ownDiscardPs.clear(); s.keepOwnVs.clear(); s.psFailed.clear();
         s.derived = s.valid = false; s.reason.clear(); s.binds = 0; s.unkeyedPsDraws = 0; s.selfMarked = 0; s.selfMarkedLatched = 0;
         s.skin = false; s.skinWhy.clear(); s.psExports.clear(); s.psZeroes.clear();
     }
@@ -3840,6 +3842,68 @@ ID3D11PixelShader* engineVelocityOwnDiscardPs(ID3D11DeviceContext* ctx, ID3D11Pi
                         kFamilies[f].name, info == g_ps.end() ? 0ull : static_cast<unsigned long long>(info->second.hash), reason.c_str());
     s.ownDiscardPs.emplace(bound, variant);
     return variant ? variant.Get() : say("the own-discard variant was declined (said once)");
+}
+
+static_assert(kEngineVelocityOwnMaskVsSlot == kEngineVelocityKeepOwnMaskSlot, "hull_layer.cpp binds the own mask where the keep-own VS reads it");
+
+ID3D11VertexShader* engineVelocityKeepOwnVs(ID3D11DeviceContext* ctx, ID3D11VertexShader* bound, const char** why) {
+    const auto say = [&](const char* reason) -> ID3D11VertexShader* {
+        if (why) *why = reason;
+        return nullptr;
+    };
+    if (!ctx || !bound || runtimeFlatProfile() || !live.load(std::memory_order_acquire)) return say("engine motion is not live in VR");
+    std::lock_guard<std::recursive_mutex> lock(g_mutex);
+    // The game's own vertex shader of a keyed family, or engine motion's slot or skin patch of it still bound for this draw.
+    auto info = g_vs.find(bound);
+    const bool patched = info == g_vs.end() && g_bound.patchedVs == bound && g_bound.originalVs;
+    if (patched) info = g_vs.find(g_bound.originalVs);
+    if (info == g_vs.end() || info->second.family < 0 || info->second.family >= kFamilyCount) return say("the bound vertex shader is not a keyed family's");
+    const int f = info->second.family;
+    FamilyState& s = g_families[f];
+    if (!s.valid) return say("the family's inputs were not derived");
+    const auto found = s.keepOwnVs.find(bound);
+    if (found != s.keepOwnVs.end()) return found->second ? found->second.Get() : say("the keep-own variant was declined (said once)");
+    emcpu::Scope patch(emcpu::kPatch);   // a cache miss only: the DXBC patches and CreateVertexShader
+    std::string reason = info->second.linked ? "class linkage" : "";
+    std::vector<BYTE> source;
+    if (reason.empty()) {
+        if (!patched) {
+            source = info->second.bytes;
+        } else {
+            // The bytes of the patch bound: made again exactly as patchedVsFor made them.
+            const bool made = s.inputs.slotFromVsPatch
+                                  ? engineVelocityPatchVs(info->second.bytes.data(), info->second.bytes.size(), s.inputs, source, reason)
+                                  : engineVelocityPatchVsSkin(info->second.bytes.data(), info->second.bytes.size(), s.inputs.skinRegister, source, reason);
+            if (!made && reason.empty()) reason = "the bound patch could not be made again";
+            if (!made) source.clear();
+        }
+    }
+    Ptr<ID3D11VertexShader> variant;
+    if (reason.empty()) {
+        std::vector<BYTE> out;
+        if (engineVelocityPatchVsKeepOwn(source.data(), source.size(), s.inputs, out, reason)) {
+            Ptr<ID3D11Device> dev;
+            ctx->GetDevice(&dev);
+            t_creating = true;
+            const HRESULT hr = dev->CreateVertexShader(out.data(), out.size(), nullptr, &variant);
+            t_creating = false;
+            if (FAILED(hr)) {
+                char t[64];
+                _snprintf_s(t, _TRUNCATE, "CreateVertexShader 0x%08X", unsigned(hr));
+                reason = t;
+                variant.Reset();
+            }
+        }
+    }
+    const char* kind = !patched ? "the game's" : s.inputs.slotFromVsPatch ? "the slot patch of" : "the second skin of";
+    if (variant)
+        Log::get().note("hull layer: keep-own vertex shader made for %s %s (foreign instances culled; the own mask at VS t%u)", kind, kFamilies[f].name,
+                        kEngineVelocityKeepOwnMaskSlot);
+    else
+        Log::get().note("hull layer: keep-own vertex shader declined for %s %s: %s; its re-issued draws need the neighbour filter (said once a shader)", kind,
+                        kFamilies[f].name, reason.c_str());
+    s.keepOwnVs.emplace(bound, variant);
+    return variant ? variant.Get() : say("the keep-own variant was declined (said once)");
 }
 
 } // namespace edvr

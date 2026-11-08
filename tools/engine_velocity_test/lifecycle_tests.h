@@ -752,6 +752,14 @@ inline void run(const Harness& h) {
         h.check(own && own != bound.Get() && own != g.ps.Get(), "life: the substituted pixel shader has an own-discard variant");
         h.check(edvr::engineVelocityOwnDiscardPs(h.context, bound.Get(), nullptr) == own, "life: the own-discard variant is made once and kept");
         h.check(!edvr::engineVelocityOwnDiscardPs(h.context, g.ps.Get(), &why) && why, "life: the game's own pixel shader has no own-discard variant");
+        // diag.hull_layer (TEMPORARY): the keyed family's vertex shader as bound has a keep-own variant, made once and kept.
+        ComPtr<ID3D11VertexShader> boundVs;
+        h.context->VSGetShader(&boundVs, nullptr, nullptr);
+        ID3D11VertexShader* keep = edvr::engineVelocityKeepOwnVs(h.context, boundVs.Get(), &why);
+        if (!keep) std::printf("  life: no keep-own vertex shader: %s\n", why ? why : "?");
+        h.check(keep && keep != boundVs.Get(), "life: the keyed family's vertex shader has a keep-own variant");
+        h.check(edvr::engineVelocityKeepOwnVs(h.context, boundVs.Get(), nullptr) == keep, "life: the keep-own variant is made once and kept");
+        h.check(!edvr::engineVelocityKeepOwnVs(h.context, nullptr, &why) && why, "life: no vertex shader, no keep-own variant");
         edvr::engineVelocityBeforeDraw(h.context, false);   // a draw into something that is not an eye
         bound.Reset();
         h.context->PSGetShader(&bound, nullptr, nullptr);

@@ -46,9 +46,11 @@ constexpr uint64_t kSkyVs = 0xF8FA801F2CB1E27Cull;       // the sky, the first f
 // The lighting: the full-screen sun and ambient, then the instanced volumes (the doc's "The binding map", the mt= census).
 // The last is the game's night vision (2026-11-08 census 3 against 4: one draw an eye into the HDR after the lighting,
 // reading the depth copy and G-buffer RT0); re-issued like a light so the own hull gets it in separate mode.
-constexpr uint64_t kLightVs[7] = {0x7E38A6AA1269C901ull, 0x8289669D93A18C1Dull, 0x963B52C73B4143ACull,
+// The last two are a station's lights (docs "Station fixes"; the 23:35 docking dumps): A1B7CFCD with PS 2DB678B6 (box volumes,
+// 198-226 instances) and CE24A739 with PS 1F64463B (45-54 instances), drawn like the other volumes and missing from the hull.
+constexpr uint64_t kLightVs[9] = {0x7E38A6AA1269C901ull, 0x8289669D93A18C1Dull, 0x963B52C73B4143ACull,
                                   0x24DE25E496342EB8ull, 0xB121A79E457669E8ull, 0x0357BBB2DEE43C1Full,
-                                  0xFCF7BD2896751D96ull};
+                                  0xFCF7BD2896751D96ull, 0xA1B7CFCD0BE7493Eull, 0xCE24A73943632F55ull};
 constexpr UINT kPoolSlot = 33;            // VS t33: the pool a pool draw reads
 constexpr UINT kSlotTarget = 6;           // engine motion's MRT6 (dxbc_engine_velocity.h kEngineVelocityTarget): float2(2*slot+1, depth)
 constexpr uint32_t kRecordBytes = 336;    // a pool record (tools\eye_run_ledger.py REC)
@@ -64,6 +66,15 @@ constexpr uint32_t kRing = 4;             // readback staging buffers an eye
 constexpr uint32_t kReadbackLag = 2;      // frames before a readback is tried (DO_NOT_WAIT)
 constexpr uint32_t kLightSpan = 64;       // draws after the shadow mask that may pass with no sky before the lighting window closes
 constexpr uint32_t kMaxUnknownPairs = 16;
+constexpr uint32_t kMaxPendingPairs = 16; // an eye's HDR writers waiting for a later lighting draw before they count as unknown lighting
+// Station fixes (docs "Station fixes"). The busy governor, a temporary safety: an eye drawing more hull-family G-buffer draws than
+// the limit puts the layer to sleep for the scene (the game draws the ship), until kCalmFrames frames in a row are under it. 400
+// while the re-issue needs the neighbour filter (some draw could not take the keep-own VS); 2400 when every draw was culled in the
+// VS, since the re-issue then costs little (the station: 600-1,700 an eye, 7-15% of them the own ship's).
+constexpr uint32_t kBusyDraws = 400;
+constexpr uint32_t kBusyDrawsCulled = 2400;
+constexpr uint32_t kCalmFrames = 120;
+constexpr UINT kKeepOwnVsSlot = kEngineVelocityOwnMaskVsSlot;   // the keep-own VS reads the eye's own mask here
 // kAutoMax 0: the auto dumps are off (the pilot, 2026-11-08 22:25: each dump's hitch in the headset is too disruptive);
 // the dump_eyes key still arms one by hand. Raise it to bring them back for an unattended measurement flight.
 constexpr uint32_t kAutoFrames = 600, kAutoMax = 0, kAutoOwnLo = 20, kAutoOwnHi = 200;
@@ -448,6 +459,16 @@ struct Eye {
     Gb gb = Gb::Before;
     uint32_t hull = 0, noSlotDraws = 0, lightDraws = 0, lightSpan = 0;
     bool lightOpen = false;        // between the shadow mask and the sky
+    // Station fixes. This frame: re-issues culled to the own instances by the keep-own VS, and those that needed the neighbour
+    // filter; the hull-family G-buffer draws into this eye (the busy governor's count); the unknown-pair window (the shadow mask
+    // to the sky, the span, or the first forward draw) and the HDR writers in it waiting for a later lighting draw.
+    uint32_t culled = 0, filterDraws = 0, gbufHull = 0;
+    bool unknownOpen = false;
+    uint64_t pending[kMaxPendingPairs][2] = {};
+    uint32_t pendingCount = 0;
+    // Across frames: the private G-buffer's size (the seed's depth, the eye's render size: stages and mirrors are made at it only),
+    // and the eye-frames since the private slot target was last needed (its private copy goes after kEvictFrames of them).
+    uint32_t w = 0, h = 0, slotIdle = 0;
     // Between the eye's depth copy and its next stage: the hull decals (BBE5) are drawn there, after the copy that ends the
     // G-buffer window (census 3 of 215951: the depth copy at q1040, the decals at q1042-1065). Without this window the own
     // decals were neither discarded from the main pass nor re-issued into the layer (decal_draws=0, 22:51).
@@ -558,6 +579,9 @@ struct Window {
     uint32_t frames = 0, eyeFrames = 0, hullSeen = 0, seeds = 0, noSeed = 0, noSlot = 0, noShader = 0, refused = 0;
     uint32_t reissued = 0, noSlotDraws = 0, clears = 0, filters = 0, readbacks = 0, readbackBusy = 0, terrainFrames = 0;
     uint32_t unknownPairs = 0, autoDumps = 0;
+    // Station fixes: re-issues culled by the keep-own VS and those that needed the filter; frames the busy governor slept; stage
+    // draws declined for targets not at the eye's render size; lighting draws whose scratch R16 RT1 was left unbound.
+    uint32_t culledDraws = 0, filterDraws = 0, busyFrames = 0, offscreen = 0, nullRt1 = 0;
     uint32_t subst[kStages] = {}, noCounterpart[kStages] = {}, ended[kEnds] = {};
     std::vector<uint32_t> own, filtered, hullDraws, lightDraws;
     // Separate mode (the "main pass" line): main-pass draws given the own discard (hull, decals), draws in the window that
@@ -599,6 +623,10 @@ struct Pending {
     bool srvSwapped = false;
     const void* hdrGame = nullptr;   // a lighting draw's RT0 (the game's HDR), for the dump
     const void* toneOut = nullptr;   // the tonemap re-issue (stage kToneStage): the game's tonemap output (identity)
+    // A hull re-issue with the keep-own VS: the vertex shader bound before it and the game's VS t127 (references), put back by End.
+    ID3D11VertexShader* vs = nullptr;
+    ID3D11ShaderResourceView* vsMask = nullptr;
+    bool keepOwn = false;
 };
 
 // The pending AO step re-issue: the compute slots Begin bound over, which End puts back.
@@ -676,6 +704,11 @@ Comp g_comp[2];
 CompGpu g_cgpu;
 GpuTimer g_toneTimer, g_compTimer;
 bool g_saidFrameGen = false, g_saidMaskLarge = false, g_saidToneDecline = false, g_saidDecline[kDeclines] = {};
+// Station fixes: the busy governor (decided at the frame boundary, before the next frame's draws), the calm frames counted while it
+// sleeps and the limit it slept at; the keep-own VS's refusals said once.
+bool g_busy = false;
+uint32_t g_calm = 0, g_busyLimit = kBusyDraws;
+bool g_saidKeepOwn = false, g_saidOffscreen[kStages] = {};
 
 // ---- dump v2 (docs "Dump v2"): the stage times, the lighting window's draws, the reference frame, the TAA sequence -----------
 
@@ -884,6 +917,9 @@ void resetFrame(Eye& e) {
     e.gb = Gb::Before;
     e.hull = e.noSlotDraws = e.lightDraws = e.lightSpan = 0;
     e.lightOpen = false;
+    e.culled = e.filterDraws = e.gbufHull = 0;
+    e.unknownOpen = false;
+    e.pendingCount = 0;
     e.decalOpen = false;
     e.stagesDone = 0;
     e.hdrGame = e.slotGame = nullptr;
@@ -955,6 +991,8 @@ void releaseAll() {
     g_haveOwn = false;
     g_discard = false;
     g_hold = 0;
+    g_busy = false;
+    g_calm = 0;
     g_lights.clear();
     g_lightsCapped = false;
     g_refFrame = false;
@@ -1829,10 +1867,11 @@ bool seedEye(ID3D11DeviceContext* ctx, ID3D11RenderTargetView* const* rtv, ID3D1
             ++g_win.noShader;
             return false;
         }
-        ID3D11View* priv[6] = {};
+        // The private slot target is not made here (Station fixes): only an eye-frame with a re-issue the keep-own VS could not
+        // take needs it, for the neighbour filter, and activateSlot makes it at that draw.
+        ID3D11View* priv[5] = {};
         for (int i = 0; i < 4; ++i) priv[i] = privateView(ViewKind::Rtv, rtv[i], true);
-        priv[4] = privateView(ViewKind::Rtv, rtv[kSlotTarget], true);
-        priv[5] = privateView(ViewKind::Dsv, dsv, true);
+        priv[4] = privateView(ViewKind::Dsv, dsv, true);
         for (auto* p : priv)
             if (!p) {
                 ++g_win.refused;
@@ -1848,19 +1887,25 @@ bool seedEye(ID3D11DeviceContext* ctx, ID3D11RenderTargetView* const* rtv, ID3D1
             sayRefused(why ? why : "?");
             return false;
         }
-        // The private G-buffer, cleared: colour to 0, the slot to -1 (no slot), depth and stencil to the game's.
+        // The private G-buffer, cleared: colour to 0, depth and stencil to the game's.
         static const float zero[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-        static const float noSlot[4] = {-1.0f, 0.0f, 0.0f, 0.0f};
         for (int i = 0; i < 4; ++i) {
             e.privRtv[i] = static_cast<ID3D11RenderTargetView*>(priv[i]);
             e.privRtv[i]->AddRef();
             vScreenClearRenderTargetViewRaw(ctx, e.privRtv[i], zero);
         }
-        e.privSlot = static_cast<ID3D11RenderTargetView*>(priv[4]);
-        e.privSlot->AddRef();
-        vScreenClearRenderTargetViewRaw(ctx, e.privSlot, noSlot);
-        e.privDsv = static_cast<ID3D11DepthStencilView*>(priv[5]);
+        e.privDsv = static_cast<ID3D11DepthStencilView*>(priv[4]);
         e.privDsv->AddRef();
+        {
+            // The eye's render size: the stages and their private copies are made at it only.
+            ID3D11Resource* res = nullptr;
+            e.privDsv->GetResource(&res);
+            D3D11_TEXTURE2D_DESC dd{};
+            if (res) static_cast<ID3D11Texture2D*>(res)->GetDesc(&dd);
+            releaseRef(res);
+            e.w = dd.Width;
+            e.h = dd.Height;
+        }
         uint8_t stencil = 0;
         e.clearDepth = clearDepthOf(depthRes, &stencil);
         ctx->ClearDepthStencilView(e.privDsv, D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, e.clearDepth, stencil);
@@ -1909,6 +1954,7 @@ bool beginHullDraw(ID3D11DeviceContext* ctx, UINT instances, UINT startInstance,
     const int ei = eyeFor(resourceOf(dsv), false);
     if (ei < 0) return decline();
     Eye& e = g_eyes[ei];
+    if (!decal) ++e.gbufHull;   // the busy governor's count
     if (e.gb == Gb::Before) {
         // A hull draw before this eye's shell is not the own ship's pass; a decal never seeds; separate mode seeds before the issue.
         if (decal || !e.shell || detail::g_hullLayerSeparate) return decline();
@@ -1924,9 +1970,8 @@ bool beginHullDraw(ID3D11DeviceContext* ctx, UINT instances, UINT startInstance,
         ++g_win.decalNoSlot;
         return decline();
     }
-    // Every hull-family G-buffer draw of the window: into the private RT0-3, the private slot target when the draw exports
-    // the slot (engine motion substituted it: its slot target is bound at RT6), and the private depth. Every other state is
-    // the game's, still bound from its draw.
+    // Every hull-family G-buffer draw of the window: into the private RT0-3 and the private depth. Every other state is the
+    // game's, still bound from its draw.
     ID3D11RenderTargetView* bind[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT] = {};
     for (int i = 0; i < 4; ++i) {
         bind[i] = static_cast<ID3D11RenderTargetView*>(privateView(ViewKind::Rtv, rtv[i], false));
@@ -1934,14 +1979,61 @@ bool beginHullDraw(ID3D11DeviceContext* ctx, UINT instances, UINT startInstance,
     }
     auto* bindDsv = static_cast<ID3D11DepthStencilView*>(privateView(ViewKind::Dsv, dsv, false));
     if (!bindDsv) return decline();
+    // Station fixes: the keep-own VS culls the foreign instances (other ships, the station: the same families) before they are
+    // rasterised, so the re-issue draws the own ship alone and needs no filter. A draw it cannot take (no variant, a geometry or
+    // tessellation stage bound) is re-issued whole and needs the neighbour filter: the private slot target is made for the eye-frame.
+    ID3D11VertexShader* gameVs = nullptr;
+    ID3D11VertexShader* keepVs = nullptr;
+    const char* keepWhy = "no own mask this eye-frame";
+    if (e.maskSrv) {
+        ctx->VSGetShader(&gameVs, nullptr, nullptr);
+        ID3D11GeometryShader* gs = nullptr;
+        ID3D11HullShader* hs = nullptr;
+        ID3D11DomainShader* ds = nullptr;
+        ctx->GSGetShader(&gs, nullptr, nullptr);
+        ctx->HSGetShader(&hs, nullptr, nullptr);
+        ctx->DSGetShader(&ds, nullptr, nullptr);
+        const bool vsLast = !gs && !hs && !ds;   // the VS's SV_Position is what the rasterizer sees
+        releaseRef(gs);
+        releaseRef(hs);
+        releaseRef(ds);
+        keepWhy = !gameVs ? "no vertex shader bound" : !vsLast ? "a geometry or tessellation stage is bound" : nullptr;
+        if (!keepWhy) keepVs = engineVelocityKeepOwnVs(ctx, gameVs, &keepWhy);
+        if (!keepVs) releaseRef(gameVs);
+    }
+    // The private slot target: bound on every re-issue that exports the slot once the eye-frame needs the filter (from the first
+    // draw that could not take the keep-own VS), so a later own draw over a neighbour's pixel replaces its slot too. Before that
+    // draw the private layer holds only own pixels, whose slot the clear (-1, none) leaves unfiltered, as it should.
+    const bool exportsSlot = rtv[kSlotTarget] && resourceOf(rtv[kSlotTarget]) == e.slotGame;
+    if (!keepVs && exportsSlot && !e.privSlot) {
+        if (auto* p = static_cast<ID3D11RenderTargetView*>(privateView(ViewKind::Rtv, rtv[kSlotTarget], true))) {
+            static const float noSlot[4] = {-1.0f, 0.0f, 0.0f, 0.0f};
+            e.privSlot = p;
+            e.privSlot->AddRef();
+            vScreenClearRenderTargetViewRaw(ctx, e.privSlot, noSlot);
+        }
+    }
     UINT n = 4;
-    if (rtv[kSlotTarget] && resourceOf(rtv[kSlotTarget]) == e.slotGame) {
+    if (exportsSlot && e.privSlot) {
         bind[kSlotTarget] = static_cast<ID3D11RenderTargetView*>(privateView(ViewKind::Rtv, rtv[kSlotTarget], false));
         if (bind[kSlotTarget]) n = kSlotTarget + 1;
     }
-    if (n <= kSlotTarget) {
-        ++e.noSlotDraws;
-        ++g_win.noSlotDraws;
+    if (keepVs) {
+        ++e.culled;
+        ++g_win.culledDraws;
+    } else {
+        ++e.filterDraws;
+        ++g_win.filterDraws;
+        if (n <= kSlotTarget) {
+            ++e.noSlotDraws;
+            ++g_win.noSlotDraws;
+        }
+        if (!g_saidKeepOwn) {
+            g_saidKeepOwn = true;
+            Log::get().note("hull layer: a %s re-issue could not take the keep-own vertex shader (%s); such draws are re-issued whole and filtered "
+                            "(said once)",
+                            decal ? "decal" : "hull", keepWhy ? keepWhy : "?");
+        }
     }
     // A decal reads the game's copy of G-buffer RT0 as its base (t0); in the layer it reads the private copy of that copy
     // (hullLayerAfterCopy), else it blends over the main pass's RT0, which no longer holds the own hull.
@@ -1964,6 +2056,13 @@ bool beginHullDraw(ID3D11DeviceContext* ctx, UINT instances, UINT startInstance,
         }
     }
     vScreenSetRenderTargetsRaw(ctx, n, bind, bindDsv);
+    ID3D11ShaderResourceView* gameVsMask = nullptr;
+    if (keepVs) {
+        // The keep-own VS and the eye's own mask at VS t127; End puts the game's (or engine motion's) VS and the game's t127 back.
+        ctx->VSGetShaderResources(kKeepOwnVsSlot, 1, &gameVsMask);
+        ctx->VSSetShaderResources(kKeepOwnVsSlot, 1, &e.maskSrv);
+        vScreenVSSetShaderRaw(ctx, keepVs, nullptr, 0);
+    }
     if (decal) {
         ++e.decals;
         ++g_win.decalsReissued;
@@ -1974,6 +2073,9 @@ bool beginHullDraw(ID3D11DeviceContext* ctx, UINT instances, UINT startInstance,
     g_pending.active = true;
     g_pending.eye = ei;
     g_pending.stage = -1;
+    g_pending.keepOwn = keepVs != nullptr;
+    g_pending.vs = keepVs ? gameVs : nullptr;   // the reference passes to End
+    g_pending.vsMask = gameVsMask;
     for (UINT i = 0; i < kSrvSlots; ++i) g_pending.srv[i] = srv[i];   // the references pass to End, which restores when swapped
     g_pending.srvSwapped = srvSwapped;
     for (UINT i = 0; i < D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT; ++i) g_pending.rtv[i] = rtv[i];   // the references pass to End
@@ -1992,24 +2094,36 @@ void finishGbuffer(ID3D11DeviceContext* ctx, int ei, End why) {
     e.gb = Gb::Done;
     e.decalOpen = why == kEndCopy;   // the hull decals follow the depth copy (decalOpen)
     ++g_win.ended[why];
-    if (!e.privDsv || !e.privSlot || !e.maskSrv || !e.stats) return;
+    if (!e.privDsv || !e.maskSrv || !e.stats) return;
     ID3D11Resource* slotRes = nullptr;
-    e.privSlot->GetResource(&slotRes);
+    if (e.privSlot) e.privSlot->GetResource(&slotRes);
     ID3D11Resource* depthRes = nullptr;
     e.privDsv->GetResource(&depthRes);
-    if (!slotRes || !depthRes) {
+    if (!depthRes) {
         releaseRef(slotRes);
-        releaseRef(depthRes);
         return;
     }
-    if (e.slotSrvOf != slotRes) {
-        releaseRef(e.slotSrv);
+    // Station fixes: the filter and count run only on an eye-frame that needed them (a re-issue the keep-own VS could not take
+    // made the private slot target). An eye whose re-issues were all culled in the VS for kEvictFrames eye-frames in a row lets
+    // the slot target's private copy go (55 MB an eye at 2816x2448).
+    if (slotRes) {
+        e.slotIdle = 0;
+        if (e.slotSrvOf != slotRes) {
+            releaseRef(e.slotSrv);
+            e.slotSrvOf = nullptr;
+            if (SUCCEEDED(g_device->CreateShaderResourceView(slotRes, nullptr, &e.slotSrv)) && e.slotSrv) e.slotSrvOf = slotRes;
+        }
+    } else if (++e.slotIdle == kEvictFrames && e.slotGame && findMirror(e.slotGame)) {
+        releaseRef(e.slotSrv);   // it holds the copy's texture
         e.slotSrvOf = nullptr;
-        if (SUCCEEDED(g_device->CreateShaderResourceView(slotRes, nullptr, &e.slotSrv)) && e.slotSrv) e.slotSrvOf = slotRes;
+        dropMirror(e.slotGame);
+        Log::get().note("hull layer: the private copy of eye %d's slot target dropped: no re-issue needed the neighbour filter for %u eye-frames (%u "
+                        "copies held)",
+                        ei, kEvictFrames, static_cast<unsigned>(g_mirrors.size()));
     }
     D3D11_TEXTURE2D_DESC dd{};
     static_cast<ID3D11Texture2D*>(depthRes)->GetDesc(&dd);
-    if (e.slotSrv) {
+    if (slotRes && e.slotSrv) {
         stageOpen(ctx, kTsMask, false);   // dump v2: the filter and the count
         uint32_t cb[4] = {e.records, 0u, dd.Width, dd.Height};
         std::memcpy(&cb[1], &e.clearDepth, sizeof e.clearDepth);
@@ -2114,6 +2228,32 @@ void stageGameHdr(ID3D11DeviceContext* ctx, Eye& e, ID3D11RenderTargetView* rt0)
     releaseRef(hdr);
 }
 
+// Station fixes: the HDR writers waiting in eye `ei`'s unknown-pair window, now that a lighting draw followed them, are said as
+// unknown lighting pairs (once a pair, kMaxUnknownPairs at most); the cap is spent only on these.
+void commitPending(Eye& e, int ei) {
+    for (uint32_t k = 0; k < e.pendingCount; ++k) {
+        const uint64_t vs = e.pending[k][0], ps = e.pending[k][1];
+        bool said = false;
+        for (uint32_t i = 0; i < g_unknownCount && !said; ++i) said = g_unknownPairs[i][0] == vs && g_unknownPairs[i][1] == ps;
+        if (said) continue;
+        if (g_unknownCount >= kMaxUnknownPairs) {
+            if (!g_saidUnknownCap) {
+                g_saidUnknownCap = true;
+                Log::get().note("hull layer: %u unknown lighting pairs said; no more are (said once)", kMaxUnknownPairs);
+            }
+            break;
+        }
+        g_unknownPairs[g_unknownCount][0] = vs;
+        g_unknownPairs[g_unknownCount][1] = ps;
+        ++g_unknownCount;
+        ++g_win.unknownPairs;
+        Log::get().note("hull layer: unknown lighting pair vs %016llX ps %016llX writes the eye's HDR between the shadow mask and a later lighting draw "
+                        "(eye %d, frame %u; not re-issued; said once a pair, %u so far)",
+                        static_cast<unsigned long long>(vs), static_cast<unsigned long long>(ps), ei, g_frame, g_unknownCount);
+    }
+    e.pendingCount = 0;
+}
+
 bool beginStage(ID3D11DeviceContext* ctx, Stage stage, uint8_t bit) {
     QueryPerformanceCounter(&g_entryQpc);   // dump v2: the item's CPU time starts here
     ID3D11RenderTargetView* rtv[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT] = {};
@@ -2145,6 +2285,49 @@ bool beginStage(ID3D11DeviceContext* ctx, Stage stage, uint8_t bit) {
     }
     if (ei < 0 || !g_device) return decline(true);
     Eye& e = g_eyes[ei];
+    // Station fixes: a stage is the eye's only at the eye's render size (the private G-buffer's). An offscreen pass of the same
+    // shaders (a station's lights into 256x256, 512x512, 612x404 or 904x404 targets) gets no private copies and opens, ends and
+    // counts nothing. A lighting draw's scratch R16 at RT1 is left unbound in the re-issue (read by nothing after the lighting;
+    // a null target drops the writes), so its size is not asked.
+    bool nullRt1 = false;
+    if (e.w) {
+        const auto eyeSized = [&](ID3D11View* v, bool* r16) {
+            ID3D11Resource* res = nullptr;
+            v->GetResource(&res);
+            D3D11_RESOURCE_DIMENSION dim = D3D11_RESOURCE_DIMENSION_UNKNOWN;
+            if (res) res->GetType(&dim);
+            D3D11_TEXTURE2D_DESC d{};
+            if (dim == D3D11_RESOURCE_DIMENSION_TEXTURE2D) static_cast<ID3D11Texture2D*>(res)->GetDesc(&d);
+            releaseRef(res);
+            if (r16) *r16 = d.Format == DXGI_FORMAT_R16_TYPELESS || d.Format == DXGI_FORMAT_R16_FLOAT || d.Format == DXGI_FORMAT_R16_UNORM;
+            if (dim == D3D11_RESOURCE_DIMENSION_TEXTURE2D && d.Width == e.w && d.Height == e.h) return true;
+            if (!g_saidOffscreen[stage]) {
+                g_saidOffscreen[stage] = true;
+                Log::get().note("hull layer: a %s stage draw into a %ux%u format %u target is not at eye %d's render size %ux%u: no private copy, not "
+                                "re-issued (said once a stage)",
+                                stage == kCopy ? "depth copy" : stage == kMask ? "shadow mask" : stage == kLight ? "lighting" : "AO apply", d.Width,
+                                d.Height, static_cast<unsigned>(d.Format), ei, e.w, e.h);
+            }
+            return false;
+        };
+        for (UINT i = 0; i < D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT; ++i) {
+            if (!rtv[i]) continue;
+            bool r16 = false;
+            const bool sized = eyeSized(rtv[i], &r16);
+            if (stage == kLight && i == 1 && r16) {
+                nullRt1 = true;
+                continue;
+            }
+            if (!sized) {
+                ++g_win.offscreen;
+                return decline(false);
+            }
+        }
+        if (dsv && !eyeSized(dsv, nullptr)) {
+            ++g_win.offscreen;
+            return decline(false);
+        }
+    }
     if (stage == kAo) e.aoSeen |= kAoApplyBit;
     if (e.gb == Gb::In) finishGbuffer(ctx, ei, stage == kCopy ? kEndCopy : kEndLight);   // the eye's G-buffer is over; the game's state is back
     if (stage != kCopy) e.decalOpen = false;   // the decals are over once the eye's AO, shadow mask or lighting starts
@@ -2153,12 +2336,20 @@ bool beginStage(ID3D11DeviceContext* ctx, Stage stage, uint8_t bit) {
         // chain this frame, or the private AO it would read is last frame's.
         if (e.gb != Gb::Done || (e.aoDone & kAoAllSteps) != kAoAllSteps) return decline(true);
     } else {
+        if (g_stageEye >= 0 && g_stageEye != ei) g_eyes[g_stageEye].pendingCount = 0;   // the other eye's lighting is over: its waiting writers were not lighting
         g_stageEye = ei;
     }
     if (stage != kCopy && stage != kAo) {
         e.lightOpen = true;   // the shadow mask opens the lighting window; the sky closes it
         e.lightSpan = 0;
     }
+    // Station fixes: the unknown-pair window opens at the shadow mask; a lighting draw in it makes the HDR writers before it unknown
+    // lighting (they lit between the shadow mask and a later lighting draw); writers no lighting draw follows were forward draws.
+    if (stage == kMask) {
+        e.unknownOpen = true;
+        e.pendingCount = 0;
+    }
+    if (stage == kLight && e.unknownOpen) commitPending(e, ei);
     if (stage == kLight) stageGameHdr(ctx, e, rtv[0]);   // the game's HDR after this lighting draw: the last one is the comparison
     if (e.gb != Gb::Done) return decline(true);
     if (bit) {
@@ -2170,11 +2361,12 @@ bool beginStage(ID3D11DeviceContext* ctx, Stage stage, uint8_t bit) {
     ID3D11RenderTargetView* bindRtv[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT] = {};
     uint32_t swapped = 0;
     for (UINT i = 0; i < D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT; ++i) {
-        if (!rtv[i]) continue;
+        if (!rtv[i] || (nullRt1 && i == 1)) continue;   // the scratch R16: unbound (Station fixes)
         bindRtv[i] = static_cast<ID3D11RenderTargetView*>(privateView(ViewKind::Rtv, rtv[i], true));
         if (!bindRtv[i]) return decline(true);
         ++swapped;
     }
+    if (nullRt1) ++g_win.nullRt1;
     // The depth target must be the eye's (mirrored at the seed); it is never made here.
     ID3D11DepthStencilView* bindDsv = nullptr;
     if (dsv) {
@@ -2217,37 +2409,52 @@ bool beginStage(ID3D11DeviceContext* ctx, Stage stage, uint8_t bit) {
     return true;
 }
 
-// A draw inside an eye's lighting window that is no lighting or stage draw: the sky closes the window; one that writes
-// the eye's HDR is an unknown lighting pair, said once a pair.
+// A draw inside an eye's lighting window that is no lighting or stage draw: the sky (or kLightSpan draws with no lighting draw)
+// closes the window. Station fixes: one that writes the eye's HDR waits in the unknown-pair window; it is said as an unknown
+// lighting pair only when a later lighting draw follows (commitPending), so the forward draws after the lighting (2CECEC30,
+// 925ACEDA at the station, while no sky came) no longer spend the cap. A forward draw -- one writing the HDR with depth writes
+// on: geometry, where light volumes and full-screen passes write no depth -- closes the unknown-pair window.
 void noteInLightWindow(ID3D11DeviceContext* ctx, uint64_t vs) {
     Eye& e = g_eyes[g_stageEye];
     if (vs == kSkyVs || ++e.lightSpan > kLightSpan) {
         e.lightOpen = false;
+        e.unknownOpen = false;
+        e.pendingCount = 0;
         return;
     }
-    if (!e.hdrGame) return;
+    if (!e.hdrGame || !e.unknownOpen) return;
     ID3D11RenderTargetView* rt0 = nullptr;
-    ctx->OMGetRenderTargets(1, &rt0, nullptr);
+    ID3D11DepthStencilView* dsv = nullptr;
+    ctx->OMGetRenderTargets(1, &rt0, &dsv);
     const bool hdr = rt0 && resourceOf(rt0) == e.hdrGame;
     releaseRef(rt0);
+    bool depthWrites = false;
+    if (hdr && dsv) {
+        ID3D11DepthStencilState* ds = nullptr;
+        UINT ref = 0;
+        ctx->OMGetDepthStencilState(&ds, &ref);
+        D3D11_DEPTH_STENCIL_DESC dd{};
+        if (ds) ds->GetDesc(&dd);
+        else dd.DepthEnable = TRUE, dd.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ALL;   // the default state writes depth
+        depthWrites = dd.DepthEnable && dd.DepthWriteMask == D3D11_DEPTH_WRITE_MASK_ALL;
+        releaseRef(ds);
+    }
+    releaseRef(dsv);
     if (!hdr) return;
-    const uint64_t ps = bindingShaderHash(BindSlot::Ps);
-    for (uint32_t i = 0; i < g_unknownCount; ++i)
-        if (g_unknownPairs[i][0] == vs && g_unknownPairs[i][1] == ps) return;
-    if (g_unknownCount >= kMaxUnknownPairs) {
-        if (!g_saidUnknownCap) {
-            g_saidUnknownCap = true;
-            Log::get().note("hull layer: %u unknown lighting pairs said; no more are (said once)", kMaxUnknownPairs);
-        }
+    if (depthWrites) {
+        e.unknownOpen = false;   // a forward draw: the lighting is over
+        e.pendingCount = 0;
         return;
     }
-    g_unknownPairs[g_unknownCount][0] = vs;
-    g_unknownPairs[g_unknownCount][1] = ps;
-    ++g_unknownCount;
-    ++g_win.unknownPairs;
-    Log::get().note("hull layer: unknown lighting pair vs %016llX ps %016llX writes the eye's HDR between the shadow mask and the sky (eye %d, frame %u; "
-                    "not re-issued; said once a pair, %u so far)",
-                    static_cast<unsigned long long>(vs), static_cast<unsigned long long>(ps), g_stageEye, g_frame, g_unknownCount);
+    const uint64_t ps = bindingShaderHash(BindSlot::Ps);
+    for (uint32_t i = 0; i < g_unknownCount; ++i)
+        if (g_unknownPairs[i][0] == vs && g_unknownPairs[i][1] == ps) return;   // said already
+    for (uint32_t i = 0; i < e.pendingCount; ++i)
+        if (e.pending[i][0] == vs && e.pending[i][1] == ps) return;
+    if (e.pendingCount >= kMaxPendingPairs) return;
+    e.pending[e.pendingCount][0] = vs;
+    e.pending[e.pendingCount][1] = ps;
+    ++e.pendingCount;
 }
 
 // ---- the AO chain's compute steps ---------------------------------------------------------------------------------------
@@ -2705,9 +2912,53 @@ void judgeFrame() {
 
 bool frameGenOn() { return temporalPassFrameGenMode() != 0 || frameGenShadowOn(); }
 
+// Station fixes: the busy governor, a temporary safety (kBusyDraws), decided at the frame boundary from the frame that just ended,
+// before the next frame's draws. Awake: an eye that drew more hull-family G-buffer draws than the limit (kBusyDraws when a re-issue
+// needed the neighbour filter, else kBusyDrawsCulled) puts the layer to sleep: no seed, discard, re-issue, stage or composite, and
+// the game draws the ship. Asleep: kCalmFrames frames in a row at or under the limit it slept at wake it; separate mode's hold
+// (kHoldFrames, re-armed by decideNext while asleep) then runs as after any fallback.
+void governBusy() {
+    uint32_t busiest = 0;
+    int eye = -1;
+    bool filtered = false;
+    for (int i = 0; i < 2; ++i) {
+        if (g_eyes[i].gbufHull > busiest) {
+            busiest = g_eyes[i].gbufHull;
+            eye = i;
+        }
+        filtered = filtered || g_eyes[i].filterDraws > 0;
+    }
+    if (!g_busy) {
+        const uint32_t limit = filtered ? kBusyDraws : kBusyDrawsCulled;
+        if (busiest > limit) {
+            g_busy = true;
+            g_calm = 0;
+            g_busyLimit = limit;
+            Log::get().note("hull layer: busy: eye %d drew %u hull-family G-buffer draws, over %u (%s); the layer sleeps (no seed, discard, re-issue, "
+                            "stages or composite; the game draws the own ship) until %u calm frames",
+                            eye, busiest, limit, filtered ? "a re-issue needed the neighbour filter" : "every re-issue culled in the vertex shader",
+                            kCalmFrames);
+        }
+    } else {
+        g_calm = busiest <= g_busyLimit ? g_calm + 1 : 0;
+        if (g_calm >= kCalmFrames) {
+            g_busy = false;
+            Log::get().note("hull layer: busy over: %u calm frames at or under %u hull-family G-buffer draws an eye (the last frame's busiest: %u); the "
+                            "layer wakes%s",
+                            g_calm, g_busyLimit, busiest, detail::g_hullLayerSeparate ? " (separate mode holds the discard off its usual hold first)" : "");
+            g_calm = 0;
+        }
+    }
+    if (g_busy) ++g_win.busyFrames;
+}
+
 // The next frame's decision, made before any of its draws.
 void decideNext() {
     g_discard = false;
+    if (g_busy) {
+        g_hold = kHoldFrames;   // asleep: no discard, and the hold runs from the wake (counted as busy=, not as a fallback)
+        return;
+    }
     Fallback why = kFallbacks;
     if (!runtimeVrProfile() || nativeOnFootActive()) {
         why = kFbOutside;
@@ -3262,21 +3513,26 @@ void report() {
     loMidHi(g_win.hullDraws, &hd[0], &hd[1], &hd[2]);
     loMidHi(g_win.lightDraws, &ld[0], &ld[1], &ld[2]);
     const char* state = g_win.seeds ? (g_win.readbacks == 0 ? "mask-pending" : g_win.subst[kLight] == 0 ? "partial" : "applied")
+                        : g_win.busyFrames  ? "busy"   // Station fixes: the governor slept the whole window
                         : g_win.noShader    ? "no-shader"
                         : g_win.noSlot      ? "no-slot-target"
                         : g_win.refused     ? "seed-refused"
                         : g_win.eyeFrames   ? "no-seed"
                         : g_win.hullSeen    ? "no-shell"
                                             : "no-eye-pass";
+    // Station fixes: culled_draws (re-issues the keep-own VS culled to the own instances) and filter_draws (re-issues that needed
+    // the neighbour filter); busy (frames the busy governor slept), offscreen (stage draws declined for a target not at the eye's
+    // render size) and null_rt1 (lighting re-issues with the scratch R16 left unbound).
     Log::get().note("hull layer: state=%s frames=%u eye_frames=%u seeds=%u no_seed=%u no_slot=%u refused=%u own=%u/%u/%u readbacks=%u "
-                    "filtered_px=%u/%u/%u hull_draws=%u/%u/%u reissued=%u no_slot_draws=%u clears=%u filters=%u "
+                    "filtered_px=%u/%u/%u culled_draws=%u filter_draws=%u hull_draws=%u/%u/%u reissued=%u no_slot_draws=%u clears=%u filters=%u "
                     "subst=copy:%u,mask:%u,light:%u light_draws=%u/%u/%u no_counterpart=copy:%u,mask:%u,light:%u unknown_light_pairs=%u "
-                    "ended=copy:%u,shell:%u,light:%u,frame:%u terrain_frames=%u auto_dumps=%u",
+                    "ended=copy:%u,shell:%u,light:%u,frame:%u terrain_frames=%u auto_dumps=%u busy=%u offscreen=%u null_rt1=%u",
                     state, g_win.frames, g_win.eyeFrames, g_win.seeds, g_win.noSeed, g_win.noSlot, g_win.refused, o[0], o[1], o[2], g_win.readbacks,
-                    f[0], f[1], f[2], hd[0], hd[1], hd[2], g_win.reissued, g_win.noSlotDraws, g_win.clears, g_win.filters, g_win.subst[kCopy],
-                    g_win.subst[kMask], g_win.subst[kLight], ld[0], ld[1], ld[2], g_win.noCounterpart[kCopy], g_win.noCounterpart[kMask],
-                    g_win.noCounterpart[kLight], g_win.unknownPairs, g_win.ended[kEndCopy], g_win.ended[kEndShell], g_win.ended[kEndLight],
-                    g_win.ended[kEndFrame], g_win.terrainFrames, g_win.autoDumps);
+                    f[0], f[1], f[2], g_win.culledDraws, g_win.filterDraws, hd[0], hd[1], hd[2], g_win.reissued, g_win.noSlotDraws, g_win.clears,
+                    g_win.filters, g_win.subst[kCopy], g_win.subst[kMask], g_win.subst[kLight], ld[0], ld[1], ld[2], g_win.noCounterpart[kCopy],
+                    g_win.noCounterpart[kMask], g_win.noCounterpart[kLight], g_win.unknownPairs, g_win.ended[kEndCopy], g_win.ended[kEndShell],
+                    g_win.ended[kEndLight], g_win.ended[kEndFrame], g_win.terrainFrames, g_win.autoDumps, g_win.busyFrames, g_win.offscreen,
+                    g_win.nullRt1);
     Log::get().note("hull layer: ao: eye_frames=%u full=%u dispatches=%u per_eye_frame=%.2f applied=%u missed=deinterleave:%u,hbao:%u,interleave:%u,"
                     "apply:%u no_eye=%u (the game's AO chain re-issued on the private G-buffer: eye-frames with a private G-buffer, and those whose "
                     "three compute steps and apply draw all were; per_eye_frame is dispatches over eye-frames, %d when every step ran; missed: "
@@ -3335,7 +3591,7 @@ void hullLayerConfigure(Config& cfg) {
 }
 
 bool hullLayerBeforeMainDraw(ID3D11DeviceContext* ctx, UINT instances, UINT startInstance) {
-    if (!detail::g_hullLayerSeparate || !ctx || g_pending.active || g_main.active) return false;
+    if (!detail::g_hullLayerSeparate || !ctx || g_pending.active || g_main.active || g_busy) return false;   // asleep: no seed, no discard
     const uint64_t vs = bindingShaderHash(BindSlot::Vs);
     const bool hull = isHullVs(vs), decal = vs == kDecalVs;
     if (!hull && !decal) return false;
@@ -3404,8 +3660,29 @@ void hullLayerAfterMainDraw(ID3D11DeviceContext* ctx) {
 
 static bool beginDraw(ID3D11DeviceContext* ctx, char kind, UINT count, UINT instances, UINT startInstance);
 
+// Station fixes: while the busy governor sleeps, a draw is only counted: the cockpit shell names its eye, and a hull-family draw
+// into the G-buffer (RT3 bound with a depth target) counts for that eye. Nothing is bound or issued.
+static bool busyDraw(ID3D11DeviceContext* ctx) {
+    const uint64_t vs = bindingShaderHash(BindSlot::Vs);
+    if (vs == kShellVs) {
+        noteShell(ctx);   // no eye's G-buffer window is open while asleep: it only names the eye
+    } else if (isHullVs(vs)) {
+        ID3D11RenderTargetView* rtv[4] = {};
+        ID3D11DepthStencilView* dsv = nullptr;
+        ctx->OMGetRenderTargets(4, rtv, &dsv);
+        if (rtv[3] && dsv) {
+            const int ei = eyeFor(resourceOf(dsv), false);
+            if (ei >= 0) ++g_eyes[ei].gbufHull;
+        }
+        for (auto*& r : rtv) releaseRef(r);
+        releaseRef(dsv);
+    }
+    return false;
+}
+
 bool hullLayerBegin(ID3D11DeviceContext* ctx, char kind, UINT count, UINT instances, UINT startInstance) {
     if (!detail::g_hullLayerOn || !ctx || g_pending.active) return false;
+    if (g_busy) return busyDraw(ctx);
     if (g_dump != Dump::Capturing) return beginDraw(ctx, kind, count, instances, startInstance);
     // Dump v2, the dump frame: the draw's bindings before the hook (it may bind the private ones), and after it the lighting
     // window's record (HullLights.json).
@@ -3442,6 +3719,12 @@ void hullLayerEnd(ID3D11DeviceContext* ctx) {
     if (!g_pending.active) return;
     Pending& p = g_pending;
     if (p.stage != kToneStage) stageClose(ctx);   // dump v2: right after the re-issue (the tonemap's closes after its cover pass)
+    if (p.keepOwn) {
+        vScreenVSSetShaderRaw(ctx, p.vs, nullptr, 0);
+        ctx->VSSetShaderResources(kKeepOwnVsSlot, 1, &p.vsMask);
+    }
+    releaseRef(p.vs);
+    releaseRef(p.vsMask);
     if (p.srvSwapped) vScreenPSSetShaderResourcesRaw(ctx, 0, kSrvSlots, p.srv);
     vScreenSetRenderTargetsRaw(ctx, boundCount(p.rtv), p.rtv, p.dsv);
     if (p.stage < 0) ++g_win.reissued;
@@ -3464,7 +3747,7 @@ void hullLayerEnd(ID3D11DeviceContext* ctx) {
 }
 
 bool hullLayerBeginDispatch(ID3D11DeviceContext* ctx, uint64_t cs) {
-    if (!detail::g_hullLayerOn || !ctx || !g_device || g_pending.active || g_main.active || g_dispatch.active) return false;
+    if (!detail::g_hullLayerOn || !ctx || !g_device || g_pending.active || g_main.active || g_dispatch.active || g_busy) return false;
     for (int s = 0; s < kAoSteps; ++s)
         if (kAoCs[s] == cs) return beginAoStep(ctx, s);
     return false;
@@ -3485,7 +3768,7 @@ void hullLayerEndDispatch(ID3D11DeviceContext* ctx) {
 }
 
 void hullLayerAfterCopy(ID3D11DeviceContext* ctx, ID3D11Resource* dst, ID3D11Resource* src) {
-    if (!detail::g_hullLayerOn || !ctx || !dst || !src || !g_device) return;
+    if (!detail::g_hullLayerOn || !ctx || !dst || !src || !g_device || g_busy) return;
     Mirror* ms = findMirror(src);
     if (!ms) return;   // only a copy out of a texture the layer mirrors (the G-buffer, depth, HDR) has a private twin
     D3D11_RESOURCE_DIMENSION dim = D3D11_RESOURCE_DIMENSION_UNKNOWN;
@@ -3510,7 +3793,7 @@ void hullLayerAfterCopy(ID3D11DeviceContext* ctx, ID3D11Resource* dst, ID3D11Res
 }
 
 void hullLayerNoteClearRtv(ID3D11DeviceContext* ctx, ID3D11RenderTargetView* rtv, const float colour[4]) {
-    if (!detail::g_hullLayerOn || !rtv || !colour || !g_device || !findMirror(resourceOf(rtv))) return;
+    if (!detail::g_hullLayerOn || !rtv || !colour || !g_device || g_busy || !findMirror(resourceOf(rtv))) return;   // asleep: the copies age out
     auto* priv = static_cast<ID3D11RenderTargetView*>(privateView(ViewKind::Rtv, rtv, false));
     if (priv) vScreenClearRenderTargetViewRaw(ctx, priv, colour);
 }
@@ -3529,7 +3812,7 @@ void hullLayerNoteClearDsv(ID3D11DeviceContext* ctx, ID3D11DepthStencilView* dsv
     }
     if (flags & D3D11_CLEAR_DEPTH) slot->depth = depth;
     if (flags & D3D11_CLEAR_STENCIL) slot->stencil = stencil;
-    if (!g_device || !findMirror(res)) return;
+    if (!g_device || g_busy || !findMirror(res)) return;
     auto* priv = static_cast<ID3D11DepthStencilView*>(privateView(ViewKind::Dsv, dsv, false));
     if (priv) {
         VrWorldInternalScope internal;   // the hook forwards this clear raw and does not see it as the game's
@@ -3545,7 +3828,8 @@ void hullLayerArmDump(const wchar_t* stamp) {
 }
 
 void hullLayerCompositeEye(ID3D11DeviceContext* ctx, int eye, const HullLayerCompositeInputs& in) {
-    if (!detail::g_hullLayerSeparate || !ctx || eye < 0 || eye > 1 || !g_device || !in.output || !in.outputSrv || !in.source || !in.tanNow) return;
+    if (!detail::g_hullLayerSeparate || !ctx || eye < 0 || eye > 1 || !g_device || !in.output || !in.outputSrv || !in.source || !in.tanNow || g_busy)
+        return;   // asleep (Station fixes): no composite
     VrWorldInternalScope internal;   // the layer's own dispatch and copy
     // The hull eye: the one whose tonemap wrote the submitted texture this frame (the same index first, should both eyes share one
     // texture); else the eye of the same index, toned this frame.
@@ -3736,6 +4020,7 @@ void hullLayerFrameBoundary(ID3D11DeviceContext* ctx) {
             g_autoStreak = 0;
         }
     }
+    governBusy();   // Station fixes: from this frame's counts, before they reset; decideNext below reads it
     // The next frame's eyes: the depth identities stay, so an eye keeps its index.
     for (auto& e : g_eyes) resetFrame(e);
     g_inEye = g_stageEye = -1;

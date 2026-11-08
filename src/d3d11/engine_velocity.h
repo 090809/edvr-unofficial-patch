@@ -70,6 +70,9 @@ constexpr unsigned kEngineVelocitySkinSrv = 23;   // F2: target 7, the skinned c
 // diag.hull_layer = separate (TEMPORARY): the PS slot the own-discard variant reads the own mask at (dxbc_engine_velocity.h kEngineVelocityOwnMaskSlot;
 // engine_velocity.cpp asserts they agree), here for hull_layer.cpp, which does not take the patcher's header.
 constexpr unsigned kEngineVelocityOwnMaskPsSlot = 127;
+// diag.hull_layer (TEMPORARY): the VS slot the keep-own vertex shader reads the same mask at (dxbc_engine_velocity.h
+// kEngineVelocityKeepOwnMaskSlot; engine_velocity.cpp asserts they agree).
+constexpr unsigned kEngineVelocityOwnMaskVsSlot = 127;
 constexpr unsigned kEngineVelocitySceneNowCb = 1;
 constexpr unsigned kEngineVelocityScenePrevCb = 2;
 
@@ -397,6 +400,12 @@ void engineVelocityNoteSelfMarkingPs(uint64_t psHash) noexcept;
 // `bound` is not engine motion's, or the variant could not be made (`why`, when given, says why; a decline is said once
 // per shader in the graphics log). Owner thread; the caller binds it raw and puts `bound` back after the draw.
 ID3D11PixelShader* engineVelocityOwnDiscardPs(ID3D11DeviceContext* ctx, ID3D11PixelShader* bound, const char** why);
+// diag.hull_layer (TEMPORARY; hull_layer.h, docs "Station fixes"): the keep-own variant of the vertex shader bound now, when it
+// is a keyed pool family's (the game's own, or engine motion's slot or skin patch of it for the current draw): the same
+// shader, and an instance whose record is not in the own mask at kEngineVelocityOwnMaskVsSlot is culled. Made once per
+// shader and kept; null when `bound` is not a family's or the variant could not be made (`why`; a decline is said once per
+// shader). Owner thread; the caller binds it raw with the mask and puts `bound` back after the draw.
+ID3D11VertexShader* engineVelocityKeepOwnVs(ID3D11DeviceContext* ctx, ID3D11VertexShader* bound, const char** why);
 // On foot (docs/kinematic-motion-injection-2026-09-19.md, 2026-09-23 "On
 // foot"): the world is drawn into a flat SOURCE image that the 2D screen
 // shows in each eye, and no pool draw targets an eye. screen_motion names the

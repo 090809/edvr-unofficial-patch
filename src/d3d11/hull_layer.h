@@ -13,7 +13,8 @@
 //   2. The private G-buffer: from the seed until the eye's G-buffer ends (its depth copy DEF19B03/CB95394B, or the next
 //      eye's shell), every hull-family G-buffer draw is issued again into private RT0-3, a private slot target at RT6
 //      (cleared to -1, no slot) and a private depth. Then a full-screen filter pass clears RT0-3 and the depth wherever
-//      the private slot names a record outside the own mask (neighbour ships), and a count pass counts those pixels.
+//      the private slot names a record outside the own mask (neighbour ships), and a count pass counts those pixels
+//      (since the Station fixes, 15 below: only for re-issues the keep-own VS could not take).
 //      The hull decals (BBE5/DB3E) are not re-issued.
 //   3. The screen-space stages after it: the depth copy, the shadow mask (53211E8C with 7EAC7196, then B403F48C) and
 //      every lighting draw (VS 7E38A6AA, 8289669D, 963B52C7, 24DE25E4, B121A79E, 0357BBB2, any PS). Every bound target
@@ -64,6 +65,18 @@
 //      is made, not applied), and the TAA sequence: eye 0's cover, cover depth and composite for 16 frames from it, its constants
 //      and frame 0's history, to eye_<stamp>_HullSeq_<nn>_*.bin and _HullSeq.json (tools\hull_taa_sim.py).
 //  The eye dump also lifts its census to the line ceiling (draw_census.cpp) and arms the GPU pass profile for 4 frames.
+//
+// Station fixes (both modes unless said; docs "Station fixes"):
+//  15. The re-issue into the private G-buffer (2 and 7) binds the keep-own variant of the draw's vertex shader
+//      (engineVelocityKeepOwnVs) with the eye's own mask at VS t127: a foreign instance (the station, another ship: the same
+//      families) is culled before it is rasterised. The private slot target, the filter and the count run only on an eye-frame
+//      with a re-issue that could not take the variant (from that draw on); its private copy goes after 120 eye-frames unused.
+//  16. The busy governor (temporary): an eye drawing more hull-family G-buffer draws than kBusyDraws (kBusyDrawsCulled when every
+//      re-issue was culled in the VS) puts the layer to sleep for the scene -- only the count runs, the game draws the ship -- until
+//      120 calm frames; decided at the frame boundary.
+//  17. Two station light volumes join the lighting (A1B7CFCD, CE24A739). An HDR writer in the lighting window is said as an
+//      unknown lighting pair only when a later lighting draw follows it; a forward draw (depth writes on) closes that window.
+//  18. Stages and their private copies only at the eye's render size; the lighting re-issue leaves the scratch R16 at RT1 unbound.
 //
 // Cost with the key off: one bool load per draw (hullLayerWanted). VR owner context only.
 #pragma once

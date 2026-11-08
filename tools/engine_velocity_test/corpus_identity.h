@@ -336,7 +336,7 @@ inline unsigned texelBytes(DXGI_FORMAT f) {
 // its slot. Textures are 16x16 (3D: 8^3) with full mips, patterned per level
 // and slice; arrays have 4 slices; buffers 16 structures, 64 typed elements
 // or 1 KB raw; samplers are linear wrap (comparison: LESS_EQUAL).
-inline bool bind(ID3D11Device* dev, ID3D11DeviceContext* ctx, const Decl& d, unsigned seed, std::string& why) {
+inline bool bind(ID3D11Device* dev, ID3D11DeviceContext* ctx, const Decl& d, unsigned seed, std::string& why, bool vertexStage = false) {
     const uint32_t salt = uint32_t(d.space) * 64u + d.slot;
     why = std::string("dummy for ") + d.space + std::to_string(d.slot) + " not created";
     if (d.space == 'b') {
@@ -348,7 +348,8 @@ inline bool bind(ID3D11Device* dev, ID3D11DeviceContext* ctx, const Decl& d, uns
         const D3D11_SUBRESOURCE_DATA init{data.data(), 0, 0};
         ComPtr<ID3D11Buffer> b;
         if (!d.size || d.size > 4096 || FAILED(dev->CreateBuffer(&bd, &init, &b))) return false;
-        ctx->PSSetConstantBuffers(d.slot, 1, b.GetAddressOf());
+        if (vertexStage) ctx->VSSetConstantBuffers(d.slot, 1, b.GetAddressOf());
+        else ctx->PSSetConstantBuffers(d.slot, 1, b.GetAddressOf());
         return true;
     }
     if (d.space == 's') {
@@ -361,7 +362,8 @@ inline bool bind(ID3D11Device* dev, ID3D11DeviceContext* ctx, const Decl& d, uns
         sd.MaxLOD = D3D11_FLOAT32_MAX;
         ComPtr<ID3D11SamplerState> s;
         if (FAILED(dev->CreateSamplerState(&sd, &s))) return false;
-        ctx->PSSetSamplers(d.slot, 1, s.GetAddressOf());
+        if (vertexStage) ctx->VSSetSamplers(d.slot, 1, s.GetAddressOf());
+        else ctx->PSSetSamplers(d.slot, 1, s.GetAddressOf());
         return true;
     }
     ComPtr<ID3D11Resource> res;
@@ -440,7 +442,8 @@ inline bool bind(ID3D11Device* dev, ID3D11DeviceContext* ctx, const Decl& d, uns
     }
     ComPtr<ID3D11ShaderResourceView> srv;
     if (FAILED(dev->CreateShaderResourceView(res.Get(), &vd, &srv))) return false;
-    ctx->PSSetShaderResources(d.slot, 1, srv.GetAddressOf());
+    if (vertexStage) ctx->VSSetShaderResources(d.slot, 1, srv.GetAddressOf());
+    else ctx->PSSetShaderResources(d.slot, 1, srv.GetAddressOf());
     why.clear();
     return true;
 }
