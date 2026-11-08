@@ -5642,8 +5642,12 @@ inline double supportCupBlendStep(double current, bool requested, bool targetVal
     const double w = current - s;
     return w > 0.0 ? w : 0.0;
 }
+// The one-handed tools: the Energylink, the Profile Analyser and the Genetic Sampler. The left hand holds nothing, so the two-hand detector is vetoed and
+// the left arm keeps the game's own pose. The sampler was missing until 2026-11-08: recording 20261108_132840 (build 4e7aefde) had its left elbow up to
+// 28 cm over the hand at the hip and left-hand grip losses out to 33 cm (docs\vr-genetic-sampler-double-hud-2026-11-08.md).
 inline bool gameAuthoredLeftArm(const char* name) noexcept {
-    return name && (std::strcmp(name, "$humanoid_rechargetool_name;") == 0 || std::strcmp(name, "$humanoid_companalyser_name;") == 0);
+    return name && (std::strcmp(name, "$humanoid_rechargetool_name;") == 0 || std::strcmp(name, "$humanoid_companalyser_name;") == 0 ||
+                    std::strcmp(name, "$humanoid_sampletool_name;") == 0);
 }
 
 // Anatomical hand transfer primitives. IDs are interned joint names from the

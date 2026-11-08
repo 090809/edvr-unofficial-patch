@@ -2,63 +2,54 @@
 
 ## Status
 
-- **State: OPEN.** One report, from a user on v0.22.0-rc.7 in VR with native
-  on foot: "Double vision hud when using genetic scanner". Issue #200.
-- **The screenshot shows the whole HUD twice in one eye.** The sampler is in
-  hand in SAMPLE MODE. The scene and the tool are single. Every HUD element
-  has a second copy of the same size, offset by one vector: about 200 px left
-  and 115 px down in the 1362 x 904 image. That covers the radar, the top info
-  panel, suit energy, the vitals, the green OFF circle, and the sampler's ring
-  with its three bars. The copies differ by draw. The radar, ring, OFF circle
-  and suit energy are bright in the upper copy, with only a dark disc or bar
-  in the lower. The top panel's labels are bright in the lower copy and its
-  values in the upper. The desktop window on this rig shows the right eye
-  (the log's `desktop window` line: setting right_eye).
-- **The report's log can't show it.** `edvr_gfx_20261106_115201` (build
-  6AED3509, game build 334925) hit the 16 MB cap at 12:20:05, 28 minutes in,
-  before the sampler was held (#199).
-- **Environment:** SteamVR OpenXR, a lighthouse headset, RTX 4080, DLSS model
-  K at 1234x1370 into 2468x2740 per eye, world scale 100. HUD settings: follow
-  body, distance 0.19, size 1.00.
-- **No EDVR flight has held the sampler** (probably
-  `$humanoid_sampletool_name;`). F91 C keeps EDVR's ADS off for tools.
+- **State: OPEN, two parts.** Issue #200. A user on v0.22.0-rc.7 (VR, native
+  on foot) reported "Double vision hud when using genetic scanner". Sean
+  reproduced it on Frontier on 2026-11-08 and also found the sampler's pose
+  wrong.
+- **The double is the right eye's UI layer, with the sampler only.** In eye
+  dump `132928432001` (sampler in SAMPLE MODE), R00 had its composite skipped
+  and shows the whole HUD where the game drew it. R01 to R15, composited, show
+  the bright HUD (radar, suit energy, the ring) (+607, +69) native px away,
+  about 17 deg, with only the HUD's dark backing left at the right place. The
+  left eye is right. 30 earlier dumps with other items agree within 5 px.
+- **Its shape:** the right eye's HUD is placed as if from a camera about
+  5.8 cm to the side (the eye separation, 55.1 mm here) through the right
+  eye's own projection. The patched draws line up with it: `marker_bound` in
+  decisions.json is [3, 0] in R00 (right) and [3, 3] from R01 (displaced).
+- **Fixed, not flown:** the left arm. `gameAuthoredLeftArm` did not name the
+  sampler, so the two-hand detector pulled the left hand (elbow 28 cm over the
+  hand, grip losses to 33 cm). Now it keeps the game's left arm, as the
+  Energylink and Profile Analyser do.
+- **Held higher: the game's pose.** At level aim the game holds the sampler
+  3.6 cm higher and 5.4 cm nearer its camera than the Profile Analyser, and
+  EDVR adds the same offsets to both. A per-item correction is Sean's call.
+- **Environment (Sean):** Frontier, game build 334925, OpenXR, DLSS at
+  2016x2017 into 4032x4034, world scale 110%. Reporter: SteamVR lighthouse,
+  RTX 4080, DLSS K.
 
-**Open hypotheses**, each with the line or capture that would confirm it:
+**Open hypotheses** for the double, with the A/B that splits them:
 
-- H5: in sample mode the game renders the HUD a second time (another HUD
-  component or view), and EDVR's HUD placement covers only one of them. F12
-  and F13 keep their state for one HRC (`g_f12Hrc`, `native_on_foot.cpp`).
-  Confirmed by F116's `HRC calls` exceeding one a frame in sample mode, by a
-  second `hrc=` address in the `native on foot hud part:` lines, or by the
-  game's own eye frame in a dump already holding two HUDs.
-- H6: EDVR splits the HUD's draws between its UI layer and the game's frame,
-  and in sample mode the two halves land in different places. This fits the
-  per-draw split of bright and dark between the copies. Confirmed by the
-  game's frame in a dump holding one copy where the door's output holds two,
-  by the `ui quality: layer:` redirect counts and `composites left in the
-  scene` changing in sample mode, and by the double going away with AA off,
-  which leaves no layer.
+- H7: a per-draw constant patch bound only on layered draws (the marker
+  fix's private b0, which F85b also binds through) is applied to the HUD
+  canvas draw in the right eye with the wrong camera. Confirmed if the double
+  goes with `fix.native_on_foot_marker_fix = off` (live; it stands down F85b's
+  binds too).
+- H8: the layer's own take of the HUD places the right eye's draws wrong
+  without any patch. Confirmed if the double survives H7's switch and goes
+  with `fix.ui_quality = off` (live), which leaves the HUD in the game's
+  frame.
 
-**Ruled out** by the screenshot, given that it is one eye's image:
+**Ruled out** (evidence in the journal): one unpinned tool part, true stereo
+at close range, a DLSS ghost of one overlay, a world marker missing the fix,
+a second unplaced HUD (frame 0 shows one HUD), the layer's eye table (0
+SWAPPED, 0 untold), aim-space reprojection (head 4.6 deg from the aim), the
+viewport remap, the marker fix's logged move (+0.00003 NDC), the label
+features (F95b, F97b, F98b), and F151's place bind (0 bound by place).
 
-- ruled out: H1 (one tool readout part left unpinned), because the whole HUD
-  doubles, the radar and the vitals included.
-- ruled out: H2 (true stereo of a screen held close to the eye), because the
-  doubling is inside one eye's image.
-- ruled out: H3 as first stated (one overlay ghosting in DLSS), because the
-  whole HUD is copied with one offset and no trail. Its composite part is
-  folded into H6.
-- ruled out: H4 (a world marker without the marker fix), because the
-  head-locked HUD doubles.
-
-**Next flight (no build).** Native on foot with `log.on_foot_detail = on`, on
-a planet with organics. Hold the sampler 20 s outside sample mode, then 20 s
-in sample mode. Press F9 and take an eye dump while it doubles. Do the same
-with AA off, then 20 s with the Energylink for comparison. Read `--health`,
-then F116, the `hud part` lines, `ui quality: layer:` and `composites left`.
-
-**Ask the reporter:** does it still double with AA off in the EDVR menu? Does
-it double with the sampler in hand outside sample mode, or with other tools?
+**Next flight** (the arm-fix build): native on foot, detail log on, sampler
+in sample mode. Check the left arm and the height. When the HUD doubles, take
+an eye dump, set the marker fix off and dump again, then UI quality off and
+dump again, then put both back.
 
 ## Journal
 
@@ -106,3 +97,102 @@ measured on it. The upper copy is A and the lower copy is B, with B about A +
 
 Not established from the image: which copy is the one EDVR placed, and
 whether the other eye shows the same pair.
+
+### 2026-11-08: Sean's flight on Frontier (build 4e7aefde)
+
+Log `edvr_gfx_20261108_131702` (v0.22.0-rc.7-61-g4e7aefde, the flat DLSS
+dropout branch, which has no on-foot change against d460e785), detail log on,
+recording `20261108_132840`, eye dump `132928432001` (13:29:28.4) and its
+airborne companion `132937599002` (13:29:37). The sampler's item name is
+`$humanoid_sampletool_name;`.
+
+Timeline. Elite's journal clock runs 21.5 s ahead of the PC's: Disembark
+20:29:01Z against the recorder starting at 13:28:40.7, and Embark 20:30:13Z
+against F115's boarding at 13:29:51.0. ScanOrganic (Log, Bacterium Cerbrus) at
+20:29:54Z is therefore about 13:29:32.5 on the PC. The dump's own write froze
+the game from 13:29:29.6 to 13:29:33.0 (`monitor: FREEZE -- 3386.7 ms`), so
+the sample completed inside that freeze. The 16 dump frames are from about
+4 s before it, with the sampler in SAMPLE MODE. The companion frames show
+"PARTIAL SAMPLE OBTAINED - 1/3".
+
+The dump shows the double, in the right eye only:
+
+- R00 has `composite_applied: false` in `eye_132928432001_FinalCrisp.json`.
+  Its HUD (radar, suit energy, the sampler's ring around the SRV's marker) is
+  where the game drew it.
+- R01 to R15 have the composite applied. The whole bright HUD sits
+  (+607, +69) native px from R00's, by FFT registration of the HUD's cyan
+  pixels over the 1400 px centre crop: the ring's bars at +16.5 deg, against
+  -0.4 deg in R00. Only a dark ring and three dark bars (the HUD's backing,
+  left in the game's frame) remain at R00's place. The readout part F85b pins
+  ("GENETIC SAMPLER / SAMPLE MODE") moves about 40 px, not 600.
+- The left eye's HUD is the same in all 16 frames (L00 to L01: (-3, +2) px),
+  with the ring near the view's centre at (+1.1, +2.6) deg.
+- The right eye's layer is live, not stale: elements that appear during the
+  16 frames ("Discovered", the ring's centre icon) appear in it.
+- The companion (13:29:37, sampler still held): R01 skipped, the next frame
+  (+126, +25) px from it.
+- 30 earlier FinalCrisp dumps on this install with a composite-skipped frame
+  (other items, unarmed, aboard): the skipped frame and the next agree within
+  5 px in all but one (about 70 px, likely head motion). The displacement
+  needs the sampler.
+
+The log at the dump: `ui quality: layer: interface composite (vs
+B10B032BDFD46700 ps DB899F4BD577F2E5) into a 2016x2017 R8G8B8A8_UNORM target:
+eye unknown` and the same for a new pair, VS C4B4B334B26E81A9 /
+PS 0146ABCC53240479, both at 13:29:28.53. Over 13:29:03 to 13:29:33,
+`composites left in the scene` lists VS 025B4B9FF54622ED / PS
+46F92DC71BF8DFA5 at 2.00 a frame (one per eye, not taken). The on-foot marker
+fix was 100% applied in both eyes with no refusals.
+
+The left arm with the sampler (recording, item serial 2 = the sampler):
+F221 found the left elbow 27.0 to 27.9 cm over the hand at the hip four
+times in 15 s, and F218/F219 found the left elbow stepping over 5 cm against
+the chest 5.1 times a second while walking. The IK events include 26
+`grip_loss/pole_change` (left-hand grip error out to 33 cm). `left elbow
+(F98a)` with the sampler: the swivel off the stance plane 67-89 deg mean (max
+102), over 45 deg in nearly every call; flexion animated 19-25 deg, solved
+72-117 deg. The cause: `gameAuthoredLeftArm` (`native_on_foot_core.h`) named
+the Energylink and the Profile Analyser, but not the sampler. So the two-hand
+detector ran for a one-handed tool and pulled the left hand toward the
+first-person left hand.
+
+Held higher. EDVR treats the sampler as it treats the Profile Analyser:
+weapon weight 1.00, the eye 10 cm forward (F88), the neck lowered about 10 cm
+(F97a), the armed eye level 1.670 m against 1.657 m (F98c). The eye-to-rig
+line (F87h, `eye to weapon root`, hip, median over Sean's recent logs) puts
+the first-person rig's root 3.0 cm above the eye and 1.4 cm behind it for the
+sampler. For the Profile Analyser it is 5.2 cm below and 9.3 cm behind, for
+the pistol 4.0 and 10.9, for the rifle 8.1 and 12.7. Matched for aim pitch
+(|pitch| under 8 deg, the pitch from F137's line in the same second), the
+eye is 1.2 cm over the sampler's root and 3.9 cm ahead of it (n 13), against
+4.8 and 9.3 for the Profile Analyser (n 16). So at level aim the game holds
+the sampler 3.6 cm higher and 5.4 cm nearer its camera than the analyser, and
+EDVR adds the same offsets to both.
+
+Ruled out for the right eye's displaced HUD (the flight's own lines):
+
+- ruled out: the UI layer filing the right eye's draws under the wrong eye,
+  because the eye check against the game's Submit read 4948 matched,
+  0 SWAPPED, 0 could not be told (13:29:03) and 4563, 0, 0 (13:29:33). The
+  only no-eye draw was one dust draw in the dump's first frame.
+- ruled out: aim-space content skipping the game's reprojection, because
+  F85b put the head 4.6 deg from the aim at the dump (yaw -1.32, pitch -3.06)
+  and 5.2 deg at the companion, against offsets of 16.9 and about 3.5 deg.
+- ruled out: the layer dropping a viewport origin, because
+  `uiLayerMapViewport` maps the origin (`ui_layer_math.h`).
+- ruled out: the on-foot marker fix moving the HUD, because its patched rows'
+  translation in the right eye was x +0.00003, y -0.00166 NDC (13:29:20,
+  F66f/F67d line).
+- ruled out: the label features (F95b, F97b, F98b), because the eyes agreed
+  to 0.18 px and the SRV's nameplate stays put between R00 and R01.
+
+The displacement's shape. The HUD-plane draws' b0 rows (decisions.json) carry
+no translation, and their rows 5 and 7 are the same in both eyes. Only row 4's
+third term differs (+0.2014 against -0.1548). The right eye's shift,
++0.285 NDC across and +0.034 down at 2016x2017, is what a point at the HUD's
+0.19 m shows from a camera about 5.8 cm to the side and 0.7 cm up or down,
+which is the eye separation (Elite's 55.1 mm at world scale 110%). Swapping in
+the left eye's row 4 would give 0.356 instead. So the right eye's redirected
+HUD is placed as if from the left eye's camera position, through the right
+eye's own projection.

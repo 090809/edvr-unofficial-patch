@@ -11106,7 +11106,7 @@ OpticHeldItemPub g_opticHeldItem;
 bool opticItemRead(uint32_t* serial, char name[64]) noexcept;
 std::atomic<uint8_t> g_supportCupMode{nofoot::kSupportNone};
 std::atomic<bool> g_arcCutterHeld{false};          // F221: the held item is the arc cutter (the left elbow hangs from the body-down pole)
-std::atomic<bool> g_gameAuthoredLeftArm{false};   // Energy Link and Profile Analyser: preserve the game's relaxed left-arm pose
+std::atomic<bool> g_gameAuthoredLeftArm{false};   // Energy Link, Profile Analyser and Genetic Sampler: preserve the game's relaxed left-arm pose
 void pinInPublish(const float cam[3], const float camRaw[3], const float weaponViewWorld[3], const float m3p[16], uint64_t nowMs, double f94SeatedY,
                   uint8_t f94Source, const double f137Seated[3], uint8_t f137Source) noexcept {
     double localPitchRad = 0.0;
