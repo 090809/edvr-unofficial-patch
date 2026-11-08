@@ -308,7 +308,8 @@ jobs:
           $names = @(
             "ed-up-$env:PACKAGE_VERSION.zip",
             "ed-up-installer-$env:PACKAGE_VERSION.zip",
-            "ed-up-installer-linux-$env:PACKAGE_VERSION.zip"
+            "ed-up-installer-linux-$env:PACKAGE_VERSION.zip",
+            "ed-up-launcher-linux-$env:PACKAGE_VERSION.zip"
           )
           # The split assets: whatever the unsigned manifest names. The workflow never
           # signs; the maintainer signs the manifest locally and uploads the .sig.

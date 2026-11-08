@@ -3986,7 +3986,7 @@ struct DirectRig {
     std::thread::id windowThread = std::this_thread::get_id();
     std::wstring loginPath;
 
-    explicit DirectRig(const std::string& name, const std::string& ini, bool frontierStore = false) {
+    explicit DirectRig(const std::string& name, const std::string& ini, bool frontierStore = false, bool directOffered = true) {
         base = fresh(name);
         game = frontierStore ? makeFrontierStore(base) : makeGame(base);
         loginPath = P(base, L"launcher\\frontier-login.dat");
@@ -3998,6 +3998,7 @@ struct DirectRig {
         e.roots.dataRoot = base;
         e.roots.canonical = false;
         e.selfExe = P(base, L"self.exe");
+        e.directLaunchOffered = directOffered;
         e.keys = g_testKeys;
         e.makeHttp = [this]() { return std::unique_ptr<HttpClient>(new Share(&http)); };
         e.post = [this](std::function<void()> f) { ui.post(std::move(f)); };
@@ -4094,6 +4095,24 @@ void testDirectSession() {
             check(!other.session->directLaunch(), std::string("direct_launch=") + value + " is off");
         }
         check(others == 6, "every other value was tried");
+    }
+
+    // Not offered (the launcher under Wine): direct_launch=on in launcher.ini changes nothing. The setting
+    // reads false, Play on a Steam install opens steam://rungameid/359320 and starts no game directly, and
+    // the window has no checkbox to show (directLaunchOffered() is what it asks). The saved key is untouched.
+    {
+        DirectRig rig("direct-not-offered", "direct_launch=on\n", false, false);
+        check(!rig.session->directLaunchOffered(), "the session reports direct launch as not offered");
+        check(!rig.session->directLaunch(), "with direct launch not offered, direct_launch=on reads as off");
+        rig.play(L"Steam", true, false);
+        check(rig.ui.pump([&]() { return !rig.session->playing(); }), "the Steam route's watcher ends when direct launch is not offered");
+        check(uris(rig.rec) == std::vector<std::string>{steamUri} && rig.started.empty() && rig.http.requests.empty() && eventTags().empty(),
+              "Play on Steam opens steam://rungameid/359320 and starts no game directly, contacts nothing, loads nothing");
+        LauncherState state;
+        state.load(P(P(rig.base, L"launcher"), L"launcher.ini"), nullptr);
+        check(state.directLaunch(), "the saved direct_launch=on is left as it was");
+        DirectRig offered("direct-offered", "direct_launch=on\n");
+        check(offered.session->directLaunchOffered() && offered.session->directLaunch(), "offered is the default, and then the saved setting stands");
     }
 
     // On: direct. The game is started by the launcher, the window steps aside and comes back and stays open,

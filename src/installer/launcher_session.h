@@ -73,6 +73,11 @@ struct SessionEnv {
     // runs and comes back when it exits, and stays open for another Play.
     std::function<void(bool aside)> windowAside;
 
+    // False where direct launch is not offered (the launcher under Wine on Linux): directLaunch() is then false
+    // even if launcher.ini says direct_launch=on, Play never takes the direct path, and the window hides the
+    // checkbox. The saved setting itself is left alone.
+    bool directLaunchOffered = true;
+
     // Direct launch's seams. Empty or default means the real one; the rig uses its own.
     std::string frontierBase;                  // empty means api.zaonce.net
     std::function<std::unique_ptr<SteamSession>(const std::wstring& dllPath)> makeSteam;
@@ -127,7 +132,9 @@ public:
     // launcher.ini's direct_launch: off unless it says on. Turning it on calls `confirm` first (the
     // window's question), and a false from it leaves the setting as it was. Turning it off deletes the
     // stored Frontier login. Returns the setting after.
-    bool directLaunch() const { return directLaunch_; }
+    // The saved setting, unless this platform does not offer direct launch (SessionEnv::directLaunchOffered).
+    bool directLaunch() const { return directLaunch_ && env_.directLaunchOffered; }
+    bool directLaunchOffered() const { return env_.directLaunchOffered; }
     bool setDirectLaunch(bool on, const std::function<bool()>& confirm);
 
     // The elevated apply, waited for on a worker. `done` runs on the window's thread.

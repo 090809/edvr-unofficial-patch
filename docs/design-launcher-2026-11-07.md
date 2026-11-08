@@ -54,8 +54,8 @@
     Proton on the Deck.
   - T6: a Windows exe inside the Proton prefix can get a Steam ticket.
   - T7: the same launch works in a CrossOver bottle on the Mac.
-- **Also next:** T5 to T7 on the Deck and the Mac, before step 8 of the build order.
-  Steps 4 to 7 do not wait for them.
+- **Linux package built 2026-11-08, never run on a Deck:** `ed-up-launcher-linux-<version>.zip`
+  runs the launcher in Elite's Proton prefix (Linux and Mac). T5 and T6 are open for it.
 - **Issues:** [#196](https://github.com/characterecho-sean/ed-unofficial-patch/issues/196).
 
 ## Why this repo
@@ -526,8 +526,24 @@ exe in the same prefix or bottle sees the same files, registry and Steam bridge.
 through Proton and FEX like the game. A native app would need its own prefix code on
 Linux, an Arm build, and could not reach the Windows Steam inside a Mac bottle.
 
-- **Starting it on Linux:** a small script swaps `EDLaunch.exe` for the launcher in
-  Steam's `%command%`, so Proton starts it in the prefix with Steam's environment.
+- **Starting it on Linux, as built (2026-11-08):** `ed-up-launcher.sh` runs `install_proton.py
+  --launcher`, which finds Elite's Proton prefix as the installer wrapper does and runs
+  `proton runinprefix ed-up-launcher.exe --dir <game>`. Arguments after a lone `--` go to the
+  launcher. `package_native.py` packs it as `ed-up-launcher-linux-<version>.zip` (the same
+  exe as the Windows asset, the wrapper, the script, `README-launcher-linux.txt`); it is a
+  convenience package, outside the signed manifest. Swapping `EDLaunch.exe` for the launcher
+  in Steam's `%command%` is not built.
+- **What the launcher does differently under Wine:** it runs where it is, with no copy to
+  the canonical folder, no Start menu entry and no restart, because a process it starts may
+  be ended with Steam's runtime container when the first one exits (unverified). A
+  self-update replaces the exe and shows "close this window and start ED-UP again". Direct
+  launch is not offered: the checkbox is hidden and a saved `direct_launch=on` is ignored, so
+  Play on a Steam install opens `steam://rungameid/359320`. `--direct-dry-run` stays, as the
+  way to find out whether the prefix can get a ticket.
+- **Unverified on a Deck:** the window under Proton; the GitHub check and the manifest
+  signature from inside the prefix; Play through `steam://` leaving Wine for the host's
+  Steam; the watcher seeing the game's process; a self-update; and Gaming Mode, which the
+  package does not touch.
 - **Gaming Mode:** the window needs a mouse, so a launch from Steam runs silently with
   the saved mode and shows a window only on an error.
 - **Stored logins:** as far as we know, DPAPI under Wine is not real protection. This

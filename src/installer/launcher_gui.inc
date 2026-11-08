@@ -119,7 +119,7 @@ void updateLauncherControls() {
         const bool anyGame = g.survey.gameRunningHere || g.survey.gameRunningElsewhere;
         playEnabled = !lg.session->playing() && !busy && !anyGame && !g.survey.gameRunStateUnknown;
         const bool frontierStore = route.kind == RouteKind::Frontier && _wcsicmp(g.survey.game.source.c_str(), L"Frontier launcher") == 0;
-        showDirect = route.kind == RouteKind::Steam || frontierStore;
+        showDirect = (route.kind == RouteKind::Steam || frontierStore) && lg.session->directLaunchOffered();
         const bool directOn = showDirect && lg.session->directLaunch();
         if (route.kind == RouteKind::Frontier || directOn) {
             showPair = true;
@@ -259,7 +259,14 @@ void launcherBegin() {
         ShowWindow(window, aside ? SW_MINIMIZE : SW_RESTORE);
         if (!aside) SetForegroundWindow(window);
     };
+    // Direct launch is not offered under Wine yet: the Steam ticket and the game start have not been shown to
+    // work inside a Proton prefix. --direct-dry-run stays, as the way to find out.
+    env.directLaunchOffered = !runningUnderWine();
     env.startNewLauncher = [](const std::wstring& exe) {
+        // Under Wine there is no restart: the session then shows "The launcher was updated. Close this window and
+        // start ED-UP again", as it does when a restart fails. A process the launcher starts may be ended with
+        // Steam's runtime container when the first one exits (unverified).
+        if (runningUnderWine()) return false;
         releaseInstanceMutex();  // the replacement waits for it, but not forever
         const bool started = startLauncherProcess(exe, restartArguments(true));
         if (!started) takeInstanceMutex(0);

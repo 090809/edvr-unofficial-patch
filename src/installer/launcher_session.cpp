@@ -275,7 +275,7 @@ void LauncherSession::rememberPlay(const std::wstring& gameDir, const char* mode
 void LauncherSession::beginPlay(const std::wstring& source, const std::wstring& gameDir, bool vr, bool elevated,
                                 const RouteOps& ops, const WatchNames& names, const WatchTiming& timing) {
     if (playing_) return;
-    if (directLaunch_ && goesDirect(source)) {
+    if (directLaunch() && goesDirect(source)) {
         // Refused before anything is contacted, as the routes are.
         if (elevated) {
             playLine_ = elevatedRefusal();

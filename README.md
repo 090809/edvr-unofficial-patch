@@ -177,6 +177,15 @@ anything or writing files. See `README-linux.txt` in the ZIP for options. The
 shell launcher forwards all options to the Python wrapper; you can also run
 `python3 edvr-installer-linux.py` directly.
 
+The launcher runs the same way. Download `ed-up-launcher-linux-<version>.zip`,
+unzip it, run Elite once from Steam and close it, then run `./ed-up-launcher.sh`
+(`--dry-run` shows what would run; options for the launcher itself go after a
+lone `--`). It runs inside Elite's Proton prefix and keeps its downloads and
+settings there, under `drive_c/users/steamuser/AppData/Local/EDVR`. Play starts
+Elite through Steam; direct launch is not offered on Linux yet. This is new and
+untested on Linux, so the window, updates and Play may not work yet; logs and
+reports are welcome. See `README-launcher-linux.txt` in the ZIP.
+
 ### Checking it worked
 
 Logs appear in `edvr_logs\` next to the game, and there are two of them. Once

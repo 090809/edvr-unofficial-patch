@@ -47,7 +47,7 @@ Visual Studio 2022, Python 3.12, and all four pinned dependencies. It invokes
 the full `build.bat --wait-lock --jobs 4`, including every test rig and the
 installer gate, then calls `package.bat`. The packages contain the exact
 version stamp checked by `package_native.py`. Each successful run uploads the
-full build receipt, installer, native DLLs, three release ZIPs, and
+full build receipt, installer, native DLLs, four release ZIPs, and
 `SHA256SUMS`. Build logs, phase timings, and failed flat pixel fixtures are
 uploaded separately even when a gate fails. The workflow does not create a
 GitHub release or use signing secrets.
@@ -213,7 +213,7 @@ Only merged PR authors are named, plus anyone the maintainer approved by name
 in `tools/release_credits_approved.json` for a commit in the release. Issue and
 log reporters get the tool's general line. Review the final notes file.
 
-Besides the three ZIPs, the package artifact carries the split assets the
+Besides the four ZIPs, the package artifact carries the split assets the
 launcher updates from: `ed-up-core-<version>.zip`, an `ed-up-dlss-<hash>.zip`
 and an `ed-up-xess-<hash>.zip` when the build has those runtimes,
 `ed-up-launcher.exe` when the build has one, and `ed-up-manifest.json`, which
@@ -234,7 +234,8 @@ python tools/sign_manifest.py verify "edvr-artifacts/$runId"
 if ($LASTEXITCODE -ne 0) { throw 'The signed release folder did not verify' }
 ```
 
-Then attach the three verified ZIPs, the split assets, the manifest with its
+Then attach the four verified ZIPs (the fourth, `ed-up-launcher-linux-<version>.zip`,
+is a convenience package outside the signed manifest), the split assets, the manifest with its
 `.sig`, and `SHA256SUMS` to a draft release. A release with no `.sig` is simply
 not offered to the launcher as an update:
 
@@ -247,6 +248,7 @@ $assets = @(
     "$folder/ed-up-$version.zip"
     "$folder/ed-up-installer-$version.zip"
     "$folder/ed-up-installer-linux-$version.zip"
+    "$folder/ed-up-launcher-linux-$version.zip"
     "$folder/ed-up-manifest.json"
     "$folder/ed-up-manifest.json.sig"
     "$folder/SHA256SUMS"

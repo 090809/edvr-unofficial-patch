@@ -15,6 +15,7 @@
 #include "launcher_plan.h"
 #include "launcher_register.h"
 #include "launcher_state.h"
+#include "logbundle.h"
 #include "mirror.h"
 #include "probe.h"
 #include "product_title.h"
@@ -321,7 +322,11 @@ bool launcherStartup(const AppArgs& args, int* exitCode) {
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     const std::wstring home = roots.exePath();
     bool carryOn = true;
-    if (!samePath(self, home)) {
+    if (runningUnderWine()) {
+        // Run in place: no copy to the canonical home, no registerLauncher, no restart. A process the launcher
+        // starts may be ended with Steam's runtime container when the first one exits (unverified), and a Start
+        // menu entry inside a Proton prefix serves nobody.
+    } else if (!samePath(self, home)) {
         // Copy there, unless the copy there is already newer, then run that one.
         const bool newerThere = fileExists(home) && compareVersions(narrowUtf8(fileVersionOf(home)), EDUP_LAUNCHER_VERSION) > 0;
         const bool ready = newerThere || (createDirectories(roots.launcherDir()) && CopyFileW(self.c_str(), home.c_str(), FALSE));
