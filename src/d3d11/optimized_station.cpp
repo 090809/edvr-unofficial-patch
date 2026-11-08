@@ -4695,7 +4695,8 @@ void concourseTick(uint64_t now, uint32_t frame) {
             g_camLookValid = anchor && concourseAnchorFrame(g_camLookCentre, g_camLookAxes);
             g_camBakeTick = 0;
             if (baking && g_camLookValid) {
-                concoursePaneBakeBegin(g_camLookCentre, g_camBakeNear);
+                // The frames at g_camBakeNear (5 m), and the room's cut at kBakeRoomCutM, never nearer than the frames' own near plane (H57: the two were one value, 50 m).
+                concoursePaneBakeBegin(g_camLookCentre, g_camBakeNear, g_camBakeNear > cc::kBakeRoomCutM ? g_camBakeNear : cc::kBakeRoomCutM);
                 float forwards[cc::kBakeDirs][3] = {};
                 for (uint32_t d = 0; d < cc::kBakeDirs; ++d) bakeForward(g_camLookAxes, d, forwards[d]);
                 concoursePaneBakeExpect(forwards, cc::kBakeDirs, g_camBakeMask);

@@ -4417,6 +4417,16 @@ int main(int argc, char** argv) {
                     check(cc::bakePlanFor(T::kOutpost).run && cc::bakePlanFor(T::kOutpost).dirs == cc::kBakeDirsAll, "bake plan: and an orbital outpost, flown");
                     check(cc::bakePlanFor(T::kFleetCarrier).run && cc::bakePlanFor(T::kFleetCarrier).dirs == cc::kBakeDirsAll, "bake plan: and a fleet carrier, flown");
                     check(cc::bakePlanFor(T::kCraterPort).run && cc::bakePlanFor(T::kCraterPort).dirs == cc::kBakeDirsAll, "bake plan: and a large surface port, flown");
+                    // H57: the frames at 5 m, so the sky, stars and sunlight are drawn; the room's cut at 50 m, as the near plane was.
+                    check(cc::kBakeNearDefaultM == 5.0f && cc::kBakeRoomCutM == 50.0f && cc::kBakeNearMinM <= cc::kBakeNearDefaultM, "bake: frames at 5 m, the room cut at 50 m");
+                    bool people = cc::bakePeopleVs(cc::kBakeHairPrepassVs);
+                    for (uint64_t vs : {0x8B589D25B2A0ADDCull, 0x7B0DC42D383F694Cull, 0x114AF608F86D9ED8ull, 0xD99AFDC250D19A3Full, 0x61AE8EB05FDC18DDull, 0xA6A39338C06E03A1ull,
+                                        0x01DA82F8D0EA0C99ull})
+                        people = people && cc::bakePeopleVs(vs);
+                    check(people, "bake: the people's families are left out (the NPC's body and skin, the hair and its prepass, the suit)");
+                    check(!cc::bakePeopleVs(0) && !cc::bakePeopleVs(0xEB5234DB6ADB491Dull) && !cc::bakePeopleVs(0x66DE2CADB1F4AE6Bull) && !cc::bakePeopleVs(0x98397963AAEC45D3ull) &&
+                              !cc::bakePeopleVs(0x7E38A6AA1269C901ull) && !cc::bakePeopleVs(0x8BD7C37ABCEE7E45ull),
+                          "bake: the station's moving records, a hull, the glass and the sun are not people");
                     check(!cc::bakePlanFor(T::kUnknown).run &&
                               !cc::bakePlanFor(T::kSurfaceStation).run && !cc::bakePlanFor(T::kAsteroidBase).run && !cc::bakePlanFor(T::kMegaShip).run &&
                               !cc::bakePlanFor(T::kOnFootSettlement).run && !cc::bakePlanFor(T::kOther).run,

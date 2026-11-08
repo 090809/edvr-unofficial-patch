@@ -138,6 +138,9 @@ float g_glowLoggedLv[4] = {};
 std::atomic<uint32_t> g_clearN{cc::kBayIndexCount};
 std::atomic<uint32_t> g_bayN{cc::kBayIndexCount};   // this room's bay window (the feed's, from its anchor)
 std::atomic<bool> g_realSkyNow{false};                // this room's windows show the real sky (the feed's): skySide families are issued with the cull on
+// While the bake captures (concoursePaneBakeBegin to its finish or cancel): the people's draws are not issued (cc::bakePeopleVs), and how many were left out, for the finish line.
+std::atomic<bool> g_bakePeopleOff{false};
+std::atomic<uint64_t> g_bakePeopleLeft{0};
 std::atomic<float> g_radiusFed{cc::kBackdropRadiusDefaultM};   // this room's sphere, unless the key says
 std::atomic<float> g_enterShareFed{0.0f};
 
@@ -2196,6 +2199,12 @@ void ConcoursePaneScope::begin(ID3D11DeviceContext* ctx, UINT indexCount, UINT s
     // Every draw of the frame passes here while the gate holds. On the immediate context (the one the binding shadow follows) the shadow answers with no COM
     // call: 0 is no pixel shader (a depth-only draw), and the draw has none to name. Any other context asks the context for its pixel shader.
     const bool followed = ctx == g_immediate.load(std::memory_order_relaxed);
+    // The bake's frames: the people (an NPC, the commander's arms and suit) are not issued, so what is behind them is captured. By vertex shader, on any context.
+    if (g_bakePeopleOff.load(std::memory_order_relaxed) && cc::bakePeopleVs(followed ? bindingShaderHash(BindSlot::Vs) : vertexShaderHash(ctx))) {
+        withheld_ = true;
+        g_bakePeopleLeft.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
     const uint64_t ps = followed ? bindingShaderHash(BindSlot::Ps) : pixelShaderHash(ctx);
     const bool cullOn = g_effectsNow.load(std::memory_order_relaxed);   // the outside is not issued: the plain phase, or the backdrop capture's lift
     const bool sealedOn = g_withholdSealedNow.load(std::memory_order_relaxed);
@@ -3011,7 +3020,9 @@ void updateArmed() noexcept {
     g_effectsNow.store(effects, std::memory_order_release);
     g_washOffNow.store(treat && mode == kModeBackdrop && g_bakeBaked.load(std::memory_order_acquire), std::memory_order_release);
     g_withholdSealedNow.store(sealed, std::memory_order_release);
-    detail::g_concoursePaneArmed.store(treat || effects || sealed || shares || g_capturing.load(std::memory_order_relaxed) || g_bdArmed.load(std::memory_order_relaxed), std::memory_order_release);
+    detail::g_concoursePaneArmed.store(treat || effects || sealed || shares || g_capturing.load(std::memory_order_relaxed) || g_bdArmed.load(std::memory_order_relaxed) ||
+                                           g_bakePeopleOff.load(std::memory_order_relaxed),
+                                       std::memory_order_release);
 }
 
 }  // namespace
@@ -3379,14 +3390,17 @@ void concoursePaneBakeArm(bool on) noexcept {
     g_bakeArmedNow = on;
 }
 
-bool concoursePaneBakeBegin(const float centre[3], float nearM) noexcept {
+bool concoursePaneBakeBegin(const float centre[3], float nearM, float cutM) noexcept {
     g_bakeHoldSave.store(false, std::memory_order_release);
     if (!g_bakeReady || !g_bakeDevice) {
         Log::get().note("concourse bake: begin: the cube is not ready: nothing is captured or held");
         return false;
     }
     for (int k = 0; k < 3; ++k) g_bakeCentre[k] = centre[k];
-    g_bakeNearM = nearM;
+    g_bakeNearM = cutM;   // the compute shader's near limit is the room's cut; the frames' own near plane is nearM
+    g_bakePeopleLeft.store(0, std::memory_order_relaxed);
+    g_bakePeopleOff.store(true, std::memory_order_release);
+    detail::g_concoursePaneArmed.store(true, std::memory_order_release);   // the next draw, not the next tick: updateArmed keeps it while the flag holds
     g_bakeCaps = g_bakeSeenAtCentre = g_bakeSeenAway = g_bakeHoldPresents = g_bakeReleaseTicks = 0;
     g_bakeWantMask = g_bakeCapMask = 0;
     g_bakeAtCentre = false;
@@ -3405,8 +3419,9 @@ bool concoursePaneBakeBegin(const float centre[3], float nearM) noexcept {
     g_bakeCapturing.store(true, std::memory_order_release);
     g_bakeWatch.store(true, std::memory_order_release);
     if (g_bakeHeldValid) g_bakeHoldShow.store(true, std::memory_order_release);
-    Log::get().note("concourse bake: begin: centre %.2f %.2f %.2f, near %.0f m, the kept image %s", static_cast<double>(centre[0]), static_cast<double>(centre[1]), static_cast<double>(centre[2]),
-                    static_cast<double>(nearM), g_bakeHeldValid ? "is held" : "IS NOT THERE: no hold");
+    Log::get().note("concourse bake: begin: centre %.2f %.2f %.2f, near %.0f m, the room's cut %.0f m (nearer is not written), the people left out; the kept image %s",
+                    static_cast<double>(centre[0]), static_cast<double>(centre[1]), static_cast<double>(centre[2]), static_cast<double>(nearM), static_cast<double>(cutM),
+                    g_bakeHeldValid ? "is held" : "IS NOT THERE: no hold");
     return true;
 }
 
@@ -3421,6 +3436,7 @@ uint32_t concoursePaneBakeCaptured() noexcept { return g_bakeCapMask; }
 
 void concoursePaneBakeFinish() noexcept {
     g_bakeCapturing.store(false, std::memory_order_release);
+    const bool peopleWere = g_bakePeopleOff.exchange(false, std::memory_order_acq_rel);
     if (!g_bakeWatch.load(std::memory_order_acquire)) return;
     const uint64_t now = GetTickCount64();
     ID3D11DeviceContext* imm = nullptr;
@@ -3434,8 +3450,10 @@ void concoursePaneBakeFinish() noexcept {
         setMode(kModeBackdrop, "the bake", false);
     }
     if (imm) imm->Release();
-    Log::get().note("concourse bake: finished after %llu ms: %u frames captured, of %u seen at the centre; %s", static_cast<unsigned long long>(now - g_bakeHoldStartMs), g_bakeCaps, g_bakeSeenAtCentre,
-                    g_bakeCaps > 0 ? "the windows show it now" : "NOTHING CAPTURED, the cube is as it was (is an anti-aliasing mode on? the capture sits in its path)");
+    Log::get().note("concourse bake: finished after %llu ms: %u frames captured, of %u seen at the centre; %s; the people's draws left out over its frames: %llu%s",
+                    static_cast<unsigned long long>(now - g_bakeHoldStartMs), g_bakeCaps, g_bakeSeenAtCentre,
+                    g_bakeCaps > 0 ? "the windows show it now" : "NOTHING CAPTURED, the cube is as it was (is an anti-aliasing mode on? the capture sits in its path)",
+                    static_cast<unsigned long long>(g_bakePeopleLeft.load(std::memory_order_relaxed)), peopleWere ? "" : " (the people were not being left out: no begin)");
     g_bakeReleaseTicks = 0;
     g_bakeSeenAway = 0;
     g_bakeReleasing = true;
@@ -3445,6 +3463,7 @@ void concoursePaneBakeFinish() noexcept {
 void concoursePaneBakeCancel() noexcept {
     g_bakeHoldSave.store(false, std::memory_order_release);
     g_bakeCapturing.store(false, std::memory_order_release);
+    g_bakePeopleOff.store(false, std::memory_order_release);
     g_bakeArmedNow = false;
     if (g_bakeHoldShow.load(std::memory_order_acquire)) {
         g_bakeReleaseTicks = 0;
@@ -3701,6 +3720,11 @@ void concoursePaneTick(ID3D11Device* device, uint32_t frame, uint64_t nowMs) noe
     }
     backdropTick(device, frame);
     bakeTick(device, nowMs);
+    // A backstop: a bake takes about 110 ms, and every end of one clears the people's flag. A bake ended some other way (its mode stepped by the key mid-bake) would leave the
+    // people out for good, so past 2 s they come back, and the log says so.
+    if (g_bakePeopleOff.load(std::memory_order_acquire) && nowMs - g_bakeHoldStartMs > 2000 && g_bakePeopleOff.exchange(false, std::memory_order_acq_rel))
+        Log::get().note("concourse bake: the people's draws are issued again: the bake did not end within 2 s of its begin (%llu left out)",
+                        static_cast<unsigned long long>(g_bakePeopleLeft.load(std::memory_order_relaxed)));
     updateArmed();
 }
 

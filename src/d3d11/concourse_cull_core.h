@@ -18,6 +18,7 @@
 #include <cstdlib>
 #include <cstring>
 
+#include "engine_velocity_families.h"
 #include "journal_station.h"
 
 namespace edvr::concourse {
@@ -660,7 +661,23 @@ inline bool lightTestLeavesOut(uint64_t test, uint64_t ps) noexcept {
 // Straight down is not one of them: Flight 24's look that way was stars through the floor, and no window faces it.
 constexpr uint32_t kBakeDirs = 5, kBakeTailTicks = 8, kBakeDirsAll = 0x1Fu;
 constexpr float kBakeFovRad = 1.5707963f;      // camera+0x260, the vertical field of view in radians (READ, 0x4F30F0): 90 degrees, so about 121 across at 16:9, of which the capture keeps the middle 90
-constexpr float kBakeNearDefaultM = 50.0f, kBakeNearMinM = 5.0f, kBakeNearMaxM = 400.0f;   // diag.concourse_bake_near: the bake frames' near plane, and a captured point nearer the centre than this is the room's
+// The bake frames' near plane (diag.concourse_bake_near) and the room's cut are two values (2026-11-08). The near plane was 50 m and was both: it kept the room out of the frames, and it
+// clipped what Elite draws close to the camera on purpose. H57, confirmed: a 50 m bake at a CraterPort had a navy sky, no stars, unlit walls and no ground, and a 5 m one had all of them
+// (Flight 48). So the frames are drawn at 5 m, and the room is kept out by identity (the look's judgement, and bakePeopleVs for the people the store never judges); what is left of it
+// within kBakeRoomCutM of the centre is not written (the bake's compute shader), and that texel keeps whatever another frame gave it.
+constexpr float kBakeNearDefaultM = 5.0f, kBakeNearMinM = 5.0f, kBakeNearMaxM = 400.0f;
+constexpr float kBakeRoomCutM = 50.0f;
+// The people: an NPC, the commander's own arms and suit. Their draws do not pass the store (Flight 23: "NPCs were left" by the look), so in the bake's frames they are left out by vertex
+// shader, the skinned families engine_velocity_families.h names (the NPC's rigid body 8B58 and its skin 7B0D, 114A, D99A, 61AE, the hair A6A3, the suit 01DA) and the hair's depth-only
+// prepass, 3186 with 4EBA (flat_projection_recipes.h). Not drawn, what is behind them is captured. A family not named here is cut at kBakeRoomCutM, as a hole.
+constexpr uint64_t kBakeHairPrepassVs = 0x318693134643131Aull;
+inline bool bakePeopleVs(uint64_t vs) noexcept {
+    if (vs == 0) return false;
+    if (vs == kBakeHairPrepassVs) return true;
+    for (const engine_velocity_family::Family& f : engine_velocity_family::kFamilies)
+        if (f.skinned && f.vs == vs) return true;
+    return false;
+}
 // What the bake does at each type of station, from the journal (journal_station.h). A row is added when its layout has been flown: the keep list's names and the anchor were read at one
 // Orbis, and another room could lose its own objects or have no anchor. Everything else, and a type not known, stays the game's own; diag.concourse_cull = on, or the hotkey, forces it
 // for a test. Once a type's windows are known, its row can name only the directions they need.
