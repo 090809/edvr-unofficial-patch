@@ -551,6 +551,12 @@ void caseGateTerms() {
         {"GPU + synth over 0.85 x 2P (18.89 ms)", [](FrameGenGateInputs& i) { i.gpuMedMs = 17.8; }, false, FrameGenGateReason::OverGpu},
         {"GPU alone under, synth puts it over", [](FrameGenGateInputs& i) { i.gpuMedMs = 17.7; i.synthMs = 1.3; }, false, FrameGenGateReason::OverGpu},
         {"GPU + synth just under", [](FrameGenGateInputs& i) { i.gpuMedMs = 17.6; }, false, FrameGenGateReason::None},
+        // 2.4, the synthesizer inside the GPU figure (the treat lies in the application segment and the work span): counted once, by synth_ms.
+        {"synth on every frame: GPU 18.8 holds it, 17.6 + 1.2 is under", [](FrameGenGateInputs& i) { i.gpuMedMs = 18.8; i.synthShare = 1.0; }, false, FrameGenGateReason::None},
+        {"synth on 60% of frames: the median holds it", [](FrameGenGateInputs& i) { i.gpuMedMs = 18.8; i.synthShare = 0.6; }, false, FrameGenGateReason::None},
+        {"synth on 60% of frames, GPU 19.0: 17.8 + 1.2 is over", [](FrameGenGateInputs& i) { i.gpuMedMs = 19.0; i.synthShare = 0.6; }, false, FrameGenGateReason::OverGpu},
+        {"synth on half the frames: the median is not taken to hold it", [](FrameGenGateInputs& i) { i.gpuMedMs = 18.8; i.synthShare = 0.5; }, false, FrameGenGateReason::OverGpu},
+        {"auto closed, one sample a second (share 0.02): nothing taken out", [](FrameGenGateInputs& i) { i.gpuMedMs = 17.8; i.synthShare = 0.02; }, false, FrameGenGateReason::OverGpu},
         {"CPU over 0.85 x 2P", [](FrameGenGateInputs& i) { i.cpuMedMs = 19.0; }, false, FrameGenGateReason::OverCpu},
         {"engaged: the rate term is not the engaged test", [](FrameGenGateInputs& i) { i.realFps = 45.0; i.gpuMedMs = 30.0; }, true, FrameGenGateReason::None},
         {"engaged: a missing measurement still blocks", [](FrameGenGateInputs& i) { i.cpuN = 0; }, true, FrameGenGateReason::NoCpu},
@@ -572,6 +578,21 @@ void caseGateTerms() {
     check(frameGenGateTerms(fit, true).fitsFull, "gate terms: GPU 8.0 and CPU 8.2 are under 0.75 of 11.11 ms");
     fit.cpuMedMs = 8.4;
     check(!frameGenGateTerms(fit, true).fitsFull, "gate terms: CPU 8.4 is not under 0.75 of 11.11 ms");
+    {
+        FrameGenGateInputs in = gateBase();
+        in.synthShare = 1.0;
+        const FrameGenGateTerms s = frameGenGateTerms(in, true);
+        check(std::fabs(frameGenGateEliteGpuMs(in) - 10.8) < 1e-9 && std::fabs(s.workMs - 12.0) < 1e-9,
+              "gate terms: synth on every frame: Elite's GPU is 12.0 - 1.2, the work 10.8 + 1.2 (not 12.0 + 1.2)");
+        in.gpuMedMs = 9.0; in.cpuMedMs = 8.0;
+        check(frameGenGateTerms(in, true).fitsFull, "gate terms: fits_full_rate judges Elite's GPU without the synth (9.0 - 1.2 = 7.8 under 8.33)");
+        in.synthShare = 0.0;
+        check(!frameGenGateTerms(in, true).fitsFull, "gate terms: ...and with the synth not in the median, 9.0 is not under 8.33");
+        in.synthShare = 1.0; in.synthKnown = false;
+        check(std::fabs(frameGenGateEliteGpuMs(in) - 9.0) < 1e-9, "gate terms: an unmeasured synth is not taken out");
+        in.synthKnown = true; in.gpuMedMs = 1.0; in.synthMs = 5.0;
+        check(frameGenGateEliteGpuMs(in) == 0.0, "gate terms: Elite's GPU never goes under 0");
+    }
     FrameGenGateInputs slow = gateBase();
     slow.pairs = 90; slow.lateReal = 5;
     check(frameGenGateTerms(slow, true).tooSlow, "gate terms: 5 late of 90 pairs is over 5%");

@@ -146,6 +146,9 @@ struct FrameGenGateInputs {
     double cpuMedMs = 0.0, cpuMaxMs = 0.0;
     bool synthKnown = false;         // the synthesizer built S in its last window
     double synthMs = 0.0;            // its cost a pair: both eyes, the build plus the finish (medians)
+    // The share of Elite's frames in the GPU window on which the synthesizer ran (0..1). It runs inside the treat, which lies inside the GPU figure (the application segment
+    // closes after the treat; the work span ends after the door), so on a frame that built S the GPU figure already holds synthMs: frameGenGateEliteGpuMs takes it out again.
+    double synthShare = 0.0;
     uint32_t pairs = 0, lateReal = 0;   // Lock's last two one-second windows: S slots run while engaged, and the display periods Elite's frame missed (late_real)
     FrameGenGateContext context = FrameGenGateContext::Unknown;
     FrameGenGateCut cut = FrameGenGateCut::None;   // a cut this frame
@@ -160,14 +163,22 @@ struct FrameGenGateTerms {
     bool fitsFull = false;   // GPU and CPU medians under 0.75 of one period
     bool tooSlow = false;    // late_real over 5% of at least 10 pairs
 };
+// Elite's own GPU frame: the GPU median less the synthesizer's cost when the median is a frame that built S (more than half the window's frames did: on, auto engaged, the
+// shadow key), so the synthesizer is counted once, by synthMs. A window where it ran on few frames (auto closed: one a second) has a median without it, taken as it is.
+inline double frameGenGateEliteGpuMs(const FrameGenGateInputs& in) {
+    if (!in.synthKnown || !(in.synthShare > 0.5)) return in.gpuMedMs;
+    const double g = in.gpuMedMs - in.synthMs;
+    return g > 0.0 ? g : 0.0;
+}
 inline FrameGenGateTerms frameGenGateTerms(const FrameGenGateInputs& in, bool engaged) {
     FrameGenGateTerms t;
+    const double eliteGpu = frameGenGateEliteGpuMs(in);
     if (in.displayMs > 0.0) {
         t.budgetMs = kFrameGenGateBudget * 2.0 * in.displayMs;
-        const double gpu = in.gpuMedMs + (in.synthKnown ? in.synthMs : 0.0);
+        const double gpu = eliteGpu + (in.synthKnown ? in.synthMs : 0.0);
         t.workMs = gpu > in.cpuMedMs ? gpu : in.cpuMedMs;
         t.marginMs = t.budgetMs - t.workMs;
-        t.fitsFull = in.gpuN && in.cpuN && in.gpuMedMs < kFrameGenGateFull * in.displayMs && in.cpuMedMs < kFrameGenGateFull * in.displayMs;
+        t.fitsFull = in.gpuN && in.cpuN && eliteGpu < kFrameGenGateFull * in.displayMs && in.cpuMedMs < kFrameGenGateFull * in.displayMs;
     }
     t.tooSlow = in.pairs >= kFrameGenGateLateMinPairs && static_cast<double>(in.lateReal) > kFrameGenGateLateShare * static_cast<double>(in.pairs);
     if (!in.runtime) t.blocker = FrameGenGateReason::NoRuntime;
@@ -181,7 +192,7 @@ inline FrameGenGateTerms frameGenGateTerms(const FrameGenGateInputs& in, bool en
         const bool slow = in.realFps < kFrameGenGateRate * 1000.0 / in.displayMs;
         const bool halved = in.predictedMs > kFrameGenGateHalved * in.displayMs;
         if (!slow && !halved) t.blocker = FrameGenGateReason::FullRate;
-        else if (!(in.gpuMedMs + in.synthMs < t.budgetMs)) t.blocker = FrameGenGateReason::OverGpu;
+        else if (!(eliteGpu + in.synthMs < t.budgetMs)) t.blocker = FrameGenGateReason::OverGpu;
         else if (!(in.cpuMedMs < t.budgetMs)) t.blocker = FrameGenGateReason::OverCpu;
     }
     return t;

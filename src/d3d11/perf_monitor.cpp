@@ -388,6 +388,7 @@ struct FrameGenGateWiring {
     FrameGenGateInputs measured;         // as last refreshed
     uint32_t cameraJumps = 0;            // temporalPassFrameGenCameraJumps at the last frame
     uint32_t curPairs = 0, curLate = 0, prevPairs = 0, prevLate = 0;   // Lock's last window from the slot, at this refresh and the one before
+    uint32_t synthFrames = 0, curSynth = 0, prevSynth = 0;              // temporalPassFrameGenSynthFrames at the last refresh; its growth over this second and the one before
     uint32_t noRuntimeS = 0;             // refreshes in a row with VR frames and no slot of 2.4's size
     bool hold = false, oldSaid = false;  // the synthesizer held for an older runtime; its line said (once a session)
 };
@@ -428,6 +429,16 @@ void frameGenGateFrame(State& s) {
         const FrameGenMonitorSynth sy = frameGenSynthMonitor();
         m.synthKnown = sy.valid && sy.built && sy.gpuN;
         m.synthMs = m.synthKnown ? 2.0 * (static_cast<double>(sy.gpuMs) + (sy.finishN ? static_cast<double>(sy.finishMs) : 0.0)) : 0.0;
+        // The share of the GPU window's frames that built S (the left eye's builds over the last two refreshes against the CPU series' count over the same 2 s): the GPU
+        // median holds the synthesizer when it ran on most of them (framegen_gate.h frameGenGateEliteGpuMs).
+        {
+            const uint32_t built = temporalPassFrameGenSynthFrames();
+            w.prevSynth = w.curSynth;
+            w.curSynth = w.synthFrames && built >= w.synthFrames ? built - w.synthFrames : 0;
+            w.synthFrames = built;
+            const double share = m.cpuN ? static_cast<double>(w.curSynth + w.prevSynth) / static_cast<double>(m.cpuN) : 0.0;
+            m.synthShare = share > 1.0 ? 1.0 : share;
+        }
         w.prevPairs = w.curPairs; w.prevLate = w.curLate;
         w.curPairs = rtFresh && rt.lastSecond ? rt.sSlots : 0;
         w.curLate = rtFresh && rt.lastSecond ? rt.lateReal : 0;

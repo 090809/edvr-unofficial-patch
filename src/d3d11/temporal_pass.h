@@ -313,6 +313,9 @@ uint8_t temporalPassFrameGenMode();
 void temporalPassFrameGenGate(bool admit, bool hold);
 // How many treats the camera gate dropped or carried the rows of, or the origin jumped on, while the synthesizer ran (the left eye): the gate's camera cut. Any thread.
 uint32_t temporalPassFrameGenCameraJumps();
+// How many treats built S (the left eye's calls of the synthesizer, all time): every frame under on, auto with the gate open and the shadow key; once a second in auto with it
+// closed. The treat lies inside Elite's GPU figure, so the gate reads the share of frames that held the synthesizer (framegen_gate.h frameGenGateEliteGpuMs). Any thread.
+uint32_t temporalPassFrameGenSynthFrames();
 
 // probe.w bits 64 and 256 of the temporal shader: t6 (the smoke's depth) / t7
 // (the private UI depth) NOT bound, so zSceneAt skips the fetch and uses the

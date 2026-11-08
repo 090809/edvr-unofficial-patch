@@ -1302,6 +1302,7 @@ inline bool frameGenSynthEveryFrame() {
     return frameGenShadowOn() || g_frameGenMode.load(std::memory_order_relaxed) != static_cast<uint8_t>(FrameGenMode::Auto) ||
            g_frameGenAdmit.load(std::memory_order_relaxed);
 }
+std::atomic<uint32_t> g_frameGenSynthFrames{0};   // Phase 2.4: left-eye builds of S, all time (temporalPassFrameGenSynthFrames)
 ID3D11Texture2D* g_eyeSynthStaging[kEyeRun] = {};   // the frame-generation synthesizer's f = 0.5 S of frame k (fix.frame_generation_shadow on; S<k> beside the P<k> pre-interface output and the next frame's P<k+1>)
 ID3D11Texture2D* g_eyeSynthBStaging[kEyeRun] = {};  // Phase 2.3b: B of frame k as its door finished it, in S<k>'s crop (SB<k>), staged with the finished S
 int              g_eyeRunLeft = 0;    // captures still to take
@@ -5303,6 +5304,7 @@ void* temporalInner(void* srcTex, int eye, const float* bounds,
                                 };
                                 sy.shownSinkContext = &e;
                             }
+                            if (eye == 0) g_frameGenSynthFrames.fetch_add(1, std::memory_order_relaxed);   // 2.4: the gate's share of frames whose GPU span holds S
                             gpuCensusBegin(ctx, GpuCensusSection::DoorFrameGenSynth);
                             frameGenSynthEyeFrame(dev, ctx, static_cast<uint32_t>(eye), g_rowsFrame, sy);
                             gpuCensusEnd(ctx, GpuCensusSection::DoorFrameGenSynth);
@@ -6470,7 +6472,8 @@ void temporalPassFrameGenGate(bool admit, bool hold) {
     g_frameGenAutoHeld.store(hold, std::memory_order_relaxed);
     nativeFrameSetFrameGenLockWord(frameGenLockWord(FrameGenMode::Auto, admit && !hold));
 }
-uint32_t temporalPassFrameGenCameraJumps() { return g_frameGenCameraJumps.load(std::memory_order_relaxed); }void temporalPassStageFrameGenDump(ID3D11DeviceContext* ctx, int k, ID3D11Texture2D* finishedS, ID3D11Texture2D* finishedB) {
+uint32_t temporalPassFrameGenCameraJumps() { return g_frameGenCameraJumps.load(std::memory_order_relaxed); }
+uint32_t temporalPassFrameGenSynthFrames() { return g_frameGenSynthFrames.load(std::memory_order_relaxed); }void temporalPassStageFrameGenDump(ID3D11DeviceContext* ctx, int k, ID3D11Texture2D* finishedS, ID3D11Texture2D* finishedB) {
     if (!ctx || k < 0 || k >= kEyeRun) return;
     uint32_t wantW = 0, wantH = 0, cw = 0, ch = 0;
     if (finishedS) {
