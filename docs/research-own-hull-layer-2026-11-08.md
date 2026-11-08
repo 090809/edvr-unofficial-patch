@@ -37,6 +37,8 @@ The smear is terrain that is newly uncovered at the hull edge every frame
   no scratch R16. Scissoring skipped. **Next:** one docking flight, one dump
   inside the station and one in flight: `culled_draws` high, `filter_draws`
   0, `busy=` 0, the station's light on the hull in `HullLights.json`.
+* **Dump gaps fixed** (section "Dump gaps fixed", compile-only, not flown):
+  a dump wakes the busy layer; the stage timer holds 4,096 pairs.
 * **Temporary keys of this arc:** `diag.hull_layer` (off | dump | separate).
   Temporary code: the busy governor (`kBusyDraws`, `kBusyDrawsCulled`).
 * **Background:** option (e), the hole-fill, fails (section "Result"). The
@@ -1030,6 +1032,42 @@ inside the station, one in flight):
 the R16 being read by nothing (from the census, not checked at run time);
 that every station light is now known (a new unknown pair says so); that
 offscreen passes never use the eye's own size.
+
+## Dump gaps fixed (2026-11-09, compile-only, not flown)
+
+A pre-flight review of the station dump plan found four gaps (code
+commit 6a86d10e):
+- **The busy governor emptied a dump.** Asleep, the layer only counts
+  draws, so a station dump had no HullHdr, GameHdrLit, HullDepth, Ref*
+  or HullSeq files and an empty `HullLights.json`. Now a dump armed while
+  asleep wakes the layer: one warm-up frame (the private copies, aged out
+  while asleep, are made again and see the game's clears), then the
+  capture frame, then in separate mode the 16-frame TAA sequence. No
+  dump is put to sleep while it runs. A dump that woke the layer puts it
+  back to sleep after, at the limit it slept at. Lines: `hull layer:
+  busy: woken for dump S` and `hull layer: busy: dump S done`. The hold
+  (`kHoldFrames`) is unchanged, so after a wake the main pass keeps the
+  ship and the sequence records composites made and not applied
+  (`applied=false` in `HullSeq.json`). That is the safe choice: the
+  discard is not forced on at a station without the hold's clean frames.
+- **The stage timer's cap.** `kStagePairCap` is 4,096 timestamp pairs a
+  timed frame (was 1,024; a station re-issues 1,200-3,400 items). A pair
+  per run of one stage was rejected: the game's draws between the
+  layer's items would be timed with them. `edvr_log --health` now gives
+  the median by stage over every `gpu_ms` line of the window, and
+  `overflow=` with a warning when it is over 0.
+- **A refused press** logs `eye dump: press refused, the previous run is
+  still writing`.
+- **Format 23** (R10G10B10A2_UNORM, RefGbuf0 and GameGbuf0) is read by
+  `eye_inputs.read`. And `hull_layer_compare.py <prefix> --lights` lists
+  `HullLights.json`'s HDR writers by eye and VS, with re-issued and
+  unknown counts.
+
+**Unverified:** that the capture frame after a wake lights the hull like
+an ordinary capture (the warm-up frame is the only preparation); that the
+eye dump's census still covers the capture frame, which is now one frame
+later when the layer slept (the census keeps at least two frames); that
+4,096 pairs is enough at the densest station (`overflow=` says).
 
 ## Optimisation debt (recorded 2026-11-08 at the pilot's request)
 
