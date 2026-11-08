@@ -264,9 +264,6 @@ void concoursePaneVrBakeCapture(const float origin[3], const float faces[5][9], 
 bool concoursePaneVrBakeEnd(bool publish, const char* line) noexcept;   // publish: the cube becomes the windows' view, as flat's finish; `line` is the tick's finish text; true when it published
 // TEMPORARY (H58-H61 instrument, Flight 53): which face and dwell a frame was aimed at, and whether it writes the cube. A frame with no entry, or not a write frame, only counts.
 void concoursePaneVrBakeAimFrame(uint32_t frame, int face, uint32_t dwell, bool write) noexcept;
-// TEMPORARY (H58-H61 instrument, Flight 53): each wanted direction of the cube just published, as a 512 square image of a 90 degree field (faces[d][0..8] = right, up, forward),
-// colour and distance, to <log folder>\concourse_bake\<stamp>_<kind>_dir<d>_colour.bmp and _dist.bmp, with a line each. kind: "vr" or "flat".
-void concoursePaneBakeDump(const char* kind, const float faces[5][9], uint32_t mask) noexcept;
 struct ConcourseVrBakeRows {
     uint32_t frame = 0;
     int eye = -1;

@@ -3475,17 +3475,7 @@ void vrBakeEnd(bool publish, const char* why, uint64_t now, uint32_t frame) {
                   static_cast<unsigned long long>(g_vr.status[4]), static_cast<unsigned long long>(g_vr.written[0]), static_cast<unsigned long long>(g_vr.written[1]), st.firstOrder[0],
                   st.firstOrder[1], st.firstOrder[2], st.firstOrder[3], g_vr.aimTicks, g_vr.headMissing,
                   !aimed ? "; it never aimed" : any ? "" : "; NOTHING CAPTURED, the cube is as it was");
-    const bool published = concoursePaneVrBakeEnd(publish && aimed && any, line);
-    if (published) {   // TEMPORARY (H58-H61 instrument, Flight 53): the cube just published, one image a wanted direction
-        float f9[cvb::kFaces][9] = {};
-        for (uint32_t d = 0; d < cvb::kFaces; ++d)
-            for (int k = 0; k < 3; ++k) {
-                f9[d][k] = g_vr.faces[d].r[k];
-                f9[d][3 + k] = g_vr.faces[d].u[k];
-                f9[d][6 + k] = g_vr.faces[d].f[k];
-            }
-        concoursePaneBakeDump("vr", f9, g_vr.plan.want() & g_vr.faceMask);
-    }
+    concoursePaneVrBakeEnd(publish && aimed && any, line);
     if (g_vr.aimTicks > 0) {
         g_vr.holdFollow = true;
         g_vr.holdFollowFrame = frame + kVrHoldFollowTicks;
@@ -5415,8 +5405,22 @@ void concourseTick(uint64_t now, uint32_t frame) {
     // TEMPORARY (the VR bake): in VR the bake's camera is the eye stub's, and its mode is the bake whenever it is available. Flat: vrBake is false, camMode is g_camMode, and
     // bakeMode is what it was.
     const bool vrBake = !runtimeFlatProfile() && vrBakeAvail();
-    const uint32_t camMode = vrBake ? cc::kCamTestModeBake : g_camMode;
-    const bool bakeMode = (g_camHooked || vrBake) && camMode == cc::kCamTestModeBake && !realSky;
+    // Flat with its camera hooks not bound (a session that started in VR, then switched): no bake is armed or begun, and nothing holds a Present or moves the camera; the windows keep
+    // whatever cube was published before. The mode reads 0 on this path, so neither a ride up nor the room in view arms the camera test.
+    const bool camHooksBound = concourseCameraTestHooked();
+    {
+        static bool saidNoHooks = false;
+        if (runtimeFlatProfile() && !camHooksBound) {
+            if (!saidNoHooks) {
+                saidNoHooks = true;
+                Log::get().note("concourse bake: flat: no bake: the flat camera hooks are not bound in this session (it started in VR), so the windows keep the bake they have");
+            }
+        } else {
+            saidNoHooks = false;
+        }
+    }
+    const uint32_t camMode = vrBake ? cc::kCamTestModeBake : (camHooksBound ? g_camMode : 0u);
+    const bool bakeMode = ((g_camHooked && camHooksBound) || vrBake) && camMode == cc::kCamTestModeBake && !realSky;
     {
         static const char* saidRealSky = nullptr;
         if (realSky && anchor && saidRealSky != g_concLayout->name) {
@@ -5486,7 +5490,7 @@ void concourseTick(uint64_t now, uint32_t frame) {
         if (g_camTimer.stop()) camEnd = cc::CamTestEnd::kModeOff;
     }
     bool lookOn = false;
-    if (g_camHooked && !vrBake) {   // flat's camera (vrBake is never true in flat)
+    if (g_camHooked && camHooksBound && !vrBake) {   // flat's camera (vrBake is never true in flat); not at all while its hooks are not bound
         if (g_camMode != 0 && !runtimeFlatProfile()) {
             Log::get().note("concourse camera test: the profile is not flat any more: the mode is off");
             g_camMode = 0;
@@ -5539,21 +5543,6 @@ void concourseTick(uint64_t now, uint32_t frame) {
         concourseCameraTestControl(g_camMode, lookOn, g_camTimer.armed() || g_camTimer.active());
         if (camEnd == cc::CamTestEnd::kDone) {
             concoursePaneBakeFinish();
-            if (baking) {   // TEMPORARY (H58-H61 instrument, Flight 53): the cube just published, one image a wanted direction
-                float f9[cvb::kFaces][9] = {};
-                uint32_t dumpMask = 0;
-                for (uint32_t d = 0; d < cvb::kFaces; ++d) {
-                    cvb::Face fc;
-                    if (!cvb::faceOf(g_camLookAxes, d, &fc)) continue;
-                    dumpMask |= 1u << d;
-                    for (int k = 0; k < 3; ++k) {
-                        f9[d][k] = fc.r[k];
-                        f9[d][3 + k] = fc.u[k];
-                        f9[d][6 + k] = fc.f[k];
-                    }
-                }
-                concoursePaneBakeDump("flat", f9, dumpMask & g_camBakeMask);
-            }
         } else if (camEnd != cc::CamTestEnd::kNone && baking) concoursePaneBakeCancel();
         if (g_camTimer.armed() && !camWasArmed)
             Log::get().note("concourse camera test: armed: %s (cabin %.2f m, gaps %.2f %.2f, camera %.2f %.2f %.2f); waiting for the anchor; bake directions 0x%X, near %.0f m",
