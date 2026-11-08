@@ -30,8 +30,10 @@ The smear is terrain that is newly uncovered at the hull edge every frame
   pass. The composite needs a re-issued tonemap, since DLSS runs after it.
   The binding map comes from the 13:14 flight's census 7 (section "The
   binding map"). Every input except AO (a compute chain) and the tonemap's
-  exposure is made inside the eye pass. Next: carry 6727f7ff (`mt=` on
-  census lines) into any flight build, then take one eye dump over terrain.
+  exposure is made inside the eye pass. The `mt=` flight closed the map:
+  G-buffer RT3 is the HDR target itself (emissive), and the lighting's
+  second output is an R16 target nothing reads in-frame. Open design
+  items: the AO re-dispatch and the hull layer's anti-aliasing.
 * **Finding 1, the hull is a deferred G-buffer object.** It is drawn by the
   pool families vs_66DE/ps_864F, 61AE/FC43, AACF/CF53 and DE54/E46E, plus the
   BBE5/DB3E decal overlay (depth writes off), into the same four-target
@@ -397,10 +399,24 @@ The pilot's flight at 13:14 already carries a full draw census: census 7 in
 
 What it settles:
 
-- The G-buffer is at least three targets: `E76C20` (f23), `E75BA0` and
-  `E771A0` (f27). Nothing in the census writes the last two as RT0, so
-  they are the block's RT1 and RT2. The flight with `mt=` confirms that and
-  names RT3.
+- **Closed by the `mt=` flight** (build 639c02a9 = 6727f7ff
+  cherry-picked, `edvr_gfx_20261108_173723.log`, census 1 = capture
+  180353328001, complete: 1,955 ids interned, no overflow):
+  - The hull block and its decals write four targets: RT0 f23
+    (normal or material), RT1 and RT2 f27, and **RT3 = the HDR target
+    itself** (f26, the one the lighting then adds into), plus depth f19.
+    The G-buffer's emissive goes straight into the HDR image. A hull layer
+    therefore needs its own HDR target as RT3, cleared to zero. The
+    lighting adds into it, and the world's HDR gets no hull emissive.
+  - The lighting draws (now 11 an eye: `7E38A6AA`, `8289669D`, `963B52C7`,
+    `24DE25E4`, `B121A79E`, `0357BBB2` x3+) write RT0 = HDR and RT1 = an
+    eye-size f53 (R16) target. No recorded draw or dispatch in the census
+    reads that R16 target (PS t0-7, VS t32-39, compute SRVs). For the
+    re-issue a scratch R16 target is enough; whatever reads it later keeps
+    the world's.
+  - Census 2 (capture 180426745002, docking) stopped at the default
+    4,096-line cap after frame 0 (26,231 draws). For station dumps set
+    `advanced.census_lines = 16384`.
 - Every screen-space input the hull layer needs is made inside the eye
   pass from depth and the G-buffer: the depth copy, the shadow mask and the
   lighting. All of them can be re-issued against a private G-buffer.
