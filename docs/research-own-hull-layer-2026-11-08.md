@@ -23,38 +23,18 @@ The smear is terrain that is newly uncovered at the hull edge every frame
   equals the game's HDR where the game shows the hull. Median ratio 1.000;
   85-98% of those pixels are bit-exact; AO and decals are the residue. The
   neighbour filter is built but not yet exercised.
-* **Step 2 built (compile-only, not flown):** section "Step 2 build".
-  `separate` discards the own records in the main pass with an own-discard
-  variant of the engine-motion patched hull and decal PS (mask at t127),
-  proven on WARP. **Open:** the 6 own forward draws are not engine-motion
-  families, so they still draw over the terrain.
-* **Step 3 flown 21:45 (3bcb06e7): hull held to the background** by the UI
-  resolve's raw-input clamp (section "Step 3 flight (21:45)"). Fixed: it now
-  composites onto dlSubmit after the resolve. **Next flight:** FG off; hull
-  solid over black space; `site=after_ui_resolve` = the applied composites.
+* **Step 2** (section "Step 2 build"): `separate` discards the own records in
+  the main pass with an own-discard variant of the engine-motion patched hull
+  and decal PS (mask at t127). **Open:** the 6 own forward draws are not
+  engine-motion families and still draw into the world layer.
+* **Step 3** (sections "Step 3 build", "Step 3 flight (21:45)"): tonemap
+  re-issue, own TAA, composite onto dlSubmit after the UI resolve (before it,
+  the resolve's raw-input clamp held the hull to the background).
 * **Temporary keys of this arc:** `diag.hull_layer` (off | dump | separate).
-* **Option (e), the hull hole-fill, fails** for the case the pilot reported
-  (section "Result"): in dump 132100543006 only 5.8% of the band was visible
-  in the previous 8 frames; 88% was still behind the ship after 8. Layering
-  may still help frame generation and DLSS.
-* **Draw order (section "The eye pass's draw order"):** option (a) is
-  cheaper than Finding 3 says. The own ship is one contiguous block of 37-40
-  G-buffer draws (54-57 records) in all six captures; the terrain is drawn
-  after it and fills its pixels once the block is left out. The five offline
-  checks passed: 100% of the keyed hull pixels at 10-150 m are the block's
-  records, and the ship has 6 forward draws an eye. The composite needs a
-  re-issued tonemap, since DLSS runs after it.
-* **Binding map (section "The binding map"):** G-buffer RT3 is the HDR target
-  itself (emissive); the lighting's second output is an R16 target nothing
-  reads in-frame. Every input except AO (a compute chain) and the tonemap's
-  exposure is made inside the eye pass. Open design items: the AO
-  re-dispatch and the hull layer's anti-aliasing.
-* **Findings 1-2:** the hull is a deferred G-buffer object (pool families
-  vs_66DE, 61AE, AACF, DE54, plus the BBE5/DB3E decals) in the world's
-  four-target G-buffer and D32 depth; the cockpit shell is vs_BFE5 / ps_DB79.
-  EDVR's engine motion path already marks these pixels (MRT6).
-* **Finding 3** (re-rendering costs several GPU ms) was wrong for (a): ~80
-  immediate re-issues an eye and about one lighting pass.
+* **Background:** option (e), the hole-fill, fails (section "Result"). The
+  own ship is one block of hull draws seeded after the cockpit shell, but
+  neighbours interleave, so ownership is per record on the GPU (sections
+  "The eye pass's draw order", "Step 1 flight", "The binding map").
 * **Open questions for Sean (need `analysis\`):** where the own ship's rig is
   reachable each frame outside a station, and whether its records carry a
   stable "player ship" flag (`optimized_station_core.h:787-809` finds it by
