@@ -745,6 +745,13 @@ inline void run(const Harness& h) {
         ComPtr<ID3D11PixelShader> bound;
         h.context->PSGetShader(&bound, nullptr, nullptr);
         h.check(bound && bound.Get() != g.ps.Get(), "life: the keyed draw ran the substituted pixel shader");
+        // diag.hull_layer = separate (TEMPORARY): the substitute's own-discard variant is made once and kept; the game's own shader has none.
+        const char* why = nullptr;
+        ID3D11PixelShader* own = edvr::engineVelocityOwnDiscardPs(h.context, bound.Get(), &why);
+        if (!own) std::printf("  life: no own-discard variant: %s\n", why ? why : "?");
+        h.check(own && own != bound.Get() && own != g.ps.Get(), "life: the substituted pixel shader has an own-discard variant");
+        h.check(edvr::engineVelocityOwnDiscardPs(h.context, bound.Get(), nullptr) == own, "life: the own-discard variant is made once and kept");
+        h.check(!edvr::engineVelocityOwnDiscardPs(h.context, g.ps.Get(), &why) && why, "life: the game's own pixel shader has no own-discard variant");
         edvr::engineVelocityBeforeDraw(h.context, false);   // a draw into something that is not an eye
         bound.Reset();
         h.context->PSGetShader(&bound, nullptr, nullptr);
@@ -1570,6 +1577,15 @@ inline void run(const Harness& h) {
                 g.ctx->PSGetShaderResources(3, 1, &bound);
                 if (!(bound && bound.Get() != sentinel.Get())) std::printf("  VR overlay lifecycle: overlay draw #%d has no private t3 (bound %p, game %p)\n", eyeOverlayNo, static_cast<void*>(bound.Get()), static_cast<void*>(sentinel.Get()));
                 h.check(bound && bound.Get() != sentinel.Get(), "VR overlay lifecycle: the guarded pixel shader has the private snapshot at t3");
+                if (eyeOverlayNo == 1) {
+                    // diag.hull_layer = separate (TEMPORARY): the guarded decal substitute has its own own-discard variant.
+                    ComPtr<ID3D11PixelShader> guarded;
+                    g.ctx->PSGetShader(&guarded, nullptr, nullptr);
+                    const char* why = nullptr;
+                    ID3D11PixelShader* own = edvr::engineVelocityOwnDiscardPs(g.ctx, guarded.Get(), &why);
+                    if (!own) std::printf("  VR overlay lifecycle: no own-discard variant: %s\n", why ? why : "?");
+                    h.check(own && own != guarded.Get() && own != overlayPs.Get(), "VR overlay lifecycle: the guarded decal substitute has an own-discard variant");
+                }
                 g.ctx->DrawInstanced(4, 1, 0, 0);
             };
             auto eyeUnderlay = [&] {

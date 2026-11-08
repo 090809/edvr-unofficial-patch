@@ -10633,11 +10633,16 @@ H_HULL_DUMP = (r"hull layer: dump (?P<stamp>\S+) eye (?P<eye>\d) frame (?P<frame
 H_HULL_NOTHING = r"hull layer: dump (?P<stamp>\S+) frame (?P<frame>\d+): nothing captured"
 H_HULL_AUTO = r"hull layer: auto dump armed \(reason: (?P<why>[^)]*)\)"
 H_HULL_UNKNOWN = r"hull layer: unknown lighting pair vs (?P<vs>[0-9A-F]{16}) ps (?P<ps>[0-9A-F]{16})"
+# Separate mode (diag.hull_layer = separate, Step 2): the main pass's 30 s line, after the report line.
+H_HULL_MAIN = (r"hull layer: main pass: own_draws=(?P<own>\d+) decal_draws=(?P<decals>\d+) no_variant_draws=(?P<no_variant>\d+) "
+               r"fallback_frames=(?P<fallback>\d+) decals_reissued=(?P<reissued>\d+) decal_no_slot=(?P<no_slot>\d+)")
 # The rest of its lines (the dump armed, a private copy made or dropped, a cap or a create failure said once, an unknown key value, the seed's facts and
 # refusals, the shaders): matched, not judged.
 H_HULL_OTHER = (r"hull layer: (?:dump \S+ armed|private copy (?:made|of a)|\d+ private (?:copies|views) held|a \d+x\d+ format \d+ target is multisampled|"
                 r"the private copy of|a private view|diag\.hull_layer=\S+ is not off or dump|no-slot-target:|a seed was refused|the seed reads the pool|"
-                r"the \w+ shader|the seed, filter and count shaders|the passes' states|\d+ unknown lighting pairs said|a stats readback)")
+                r"the \w+ shader|the seed, filter and count shaders|the passes' states|\d+ unknown lighting pairs said|a stats readback|" +
+                r"diag\.hull_layer=\S+ is not off, dump or separate|separate mode hides the own ship|own-discard variant (?:made|declined)|"
+                r"a \w+ draw in the window got no own-discard variant|dump \S+ eye \d: GameGbuf0)")
 # Frame generation, Phase 1 (fix.frame_generation_shadow, TEMPORARY; src\common\framegen_shadow_report.h): two lines of the graphics log with no build tag, read the way the desktop
 # window's are. The armed line is said once per change to on (so health_scan keeps it whatever --since says); the report line every second.
 H_FRAMEGEN = "frame generation shadow"
@@ -16999,6 +17004,17 @@ def _hj_hull_layer(rows, ctx=None):
         return ("PARTIAL", text + ": seeded, but no own-mask readback came back (mask-pending)")
     if total["s_light"] == 0:
         return ("PARTIAL", text + ": seeded and filtered, but no lighting draw got its private counterpart")
+    # Separate mode (Step 2): the own ship out of the main pass. OK only when main-pass draws took the own discard.
+    mains = rows.get("main", [])
+    if keys and keys[-1]["mode"] == "separate":
+        if not mains:
+            return ("PARTIAL", text + ": separate mode, but no 'hull layer: main pass:' line follows (the main-pass report is dead)")
+        m = {k: sum(int(r[k]) for r in mains) for k in ("own", "decals", "no_variant", "fallback", "reissued", "no_slot")}
+        text += ("; main pass (separate): the own discard on %d hull and %d decal draw(s), %d window draw(s) without it, %d eye-frame(s) fell back "
+                 "(no mask), %d own decal(s) re-issued (%d without the slot)"
+                 % (m["own"], m["decals"], m["no_variant"], m["fallback"], m["reissued"], m["no_slot"]))
+        if m["own"] == 0:
+            return ("PARTIAL", text + ": separate mode, but no main-pass hull draw took the own discard (the ship was never taken out)")
     return ("OK", text)
 
 def _hj_framegen_shadow(rows, ctx=None):
@@ -18445,6 +18461,7 @@ HEALTH_RULES = (
         ("nothing", H_HULL_NOTHING),
         ("auto", H_HULL_AUTO),
         ("unknown", H_HULL_UNKNOWN),
+        ("main", H_HULL_MAIN),
         ("_", H_HULL_OTHER),
     ), _hj_hull_layer),
     # The SRV turret view (issue 140): lines of the graphics log that carry no build tag (health_scan reads them, as it reads the desktop window's, before it drops the untagged lines).
@@ -25902,6 +25919,19 @@ def self_test_health():
         check("hull layer: a report inside --since is read, the key before it is kept", hl_base + [(1, hl_key()), (70, hl_report())], 0, [("OK", HL)], extra=["--since", "10:01:00"])
         check("hull layer: a drifted report line is counted as unparsed and is no report", hl_base + [hl_key(), hl_report().replace(" reissued=", " reissues=")], 3,
               [("NEVER APPLIED", HL)], has=["line(s) the rule's patterns do not match"])
+
+        def hl_main(own=5400, decals=1800, no_variant=0, fallback=0, reissued=1800, no_slot=0):
+            return RH("hull layer: main pass: own_draws=%u", own, decals, no_variant, fallback, reissued, no_slot)
+
+        check("hull layer: separate, the own discard taken, is OK and says so",
+              hl_base + [hl_key("separate"), RH("hull layer: separate mode hides the own ship"), hl_report(), hl_main(),
+                         RH("hull layer: dump %ls eye %d: GameGbuf0", "123456789001", 0, "written", "written", 40, 22, 22)], 0, [("OK", HL)],
+              has=["main pass (separate): the own discard on 5400 hull and 1800 decal draw(s), 0 window draw(s) without it, 0 eye-frame(s) fell back"],
+              lacks=["UNPARSED", "do not match"])
+        check("hull layer: separate with no main-pass line is PARTIAL", hl_base + [hl_key("separate"), hl_report()], 0, [("PARTIAL", HL)],
+              has=["no 'hull layer: main pass:' line follows"])
+        check("hull layer: separate, nothing discarded, is PARTIAL", hl_base + [hl_key("separate"), hl_report(), hl_main(own=0, decals=0, no_variant=5400)], 0,
+              [("PARTIAL", HL)], has=["no main-pass hull draw took the own discard"])
         # ---- the SRV turret view: the graphics log's untagged lines, rendered from the C format strings in src\d3d11\srv_turret.cpp and (the geometry shader's creation line) shader_swap.cpp ----
         stsrc = read_text(os.path.join(repo_root(), "src", "d3d11", "srv_turret.cpp"))
 

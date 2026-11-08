@@ -4124,6 +4124,16 @@ __declspec(noinline) void hullLayerAfterDraw(ID3D11DeviceContext* self, char kin
     }
 }
 
+// diag.hull_layer = separate (hull_layer.h; TEMPORARY): right before the game's own issue of an owner-context draw, after engine motion's
+// substitution. The eye's seed draw makes the own mask first; a hull-family or hull decal draw in the eye's G-buffer window gets the own-discard
+// variant and the mask at PS t127, which hullLayerAfterMainDraw puts back right after the game's issue. A withheld draw is not touched.
+// NOINLINE: the draw path pays two bool loads while the mode is off.
+__declspec(noinline) bool hullLayerBeforeMain(ID3D11DeviceContext* self, UINT instances, const DrawArgs& args, DrawVerdict v) {
+    if (v == DrawVerdict::kSkip || v == DrawVerdict::kQuadSkip || uiLayerIssueBlocked()) return false;
+    VrWorldInternalScope internal;   // the seed's clears, copies and dispatch are the layer's own
+    return hullLayerBeforeMainDraw(self, instances, args.startInstance);
+}
+
 // The blend probe's offer (blend_probe.h; TEMPORARY): one eye draw of a collecting capture, with everything its routing decided. Called
 // from forwardWithVerdict only while blendProbeWantsDraws(); NOINLINE so the draw path pays nothing else for it. The replay is the draw
 // again through the real entry point, below every hook (pureDrawReissue), which blend_probe.cpp issues with a scissor and no writes.
@@ -5577,6 +5587,7 @@ void STDMETHODCALLTYPE hookedDraw(ID3D11DeviceContext* self, UINT count, UINT st
     if (g_vrWorldWants && self == g_state->ownerCtx) vrWorldRouteDraw(self);   // the VR world route's detector; at the tone, its resolve
     const bool starGlow = vrStarGlowWanted() && self == g_state->ownerCtx;   // visual.star_glow (vr_star_glow.h): one relaxed load while off
     if (starGlow) vrStarGlowBeforeDraw(self);
+    const bool hullMain = hullLayerWanted() && hullLayerSeparateWanted() && self == g_state->ownerCtx && hullLayerBeforeMain(self, 1, args, v);   // diag.hull_layer = separate (TEMPORARY)
     if (fast) {
         uiLayerMapRunEnd(self);   // the fast path skips forwardWithVerdict's brackets: the draw is the game's, into the game's targets
         // forwardWithVerdict's own return for the owner's blocked UI layer is kept; the game's draw otherwise as it is issued there.
@@ -5591,10 +5602,12 @@ void STDMETHODCALLTYPE hookedDraw(ID3D11DeviceContext* self, UINT count, UINT st
             GpuCensusAlteredScope timed(self, altered);   // the game's own draw, and only it (gpu_census.h)
             g_state->realDraw(self, count, start);
         }
+        if (hullMain) hullLayerAfterMainDraw(self);   // the patched shader and t127 back before anything re-issues this draw
         srvTurretHudCountIssue(self);   // issue 140: the game's own issue; a family's first scope says its state (one relaxed load otherwise)
         if (clock.on) clock.realCall(r0);
         return true;
     });
+    if (hullMain) hullLayerAfterMainDraw(self);   // (the fast path, or a forward that did not issue: a no-op once put back)
     if (cockpitGlassLegacyLive() && self == g_state->ownerCtx && cockpitGlassOverlayBegin(self)) { g_state->realDraw(self, count, start); cockpitGlassOverlayEnd(self); }
     if (v == DrawVerdict::kPanel) endPanelOverride(self);
     if (starGlow && vrStarGlowAfterMayAct()) starGlowAfterDraw(self, 'D', count, 1, args, v);
@@ -5673,6 +5686,7 @@ void STDMETHODCALLTYPE hookedDrawIndexed(ID3D11DeviceContext* self, UINT count,
     if (g_vrWorldWants && self == g_state->ownerCtx) vrWorldRouteDraw(self);
     const bool starGlow = vrStarGlowWanted() && self == g_state->ownerCtx;   // visual.star_glow (vr_star_glow.h): one relaxed load while off
     if (starGlow) vrStarGlowBeforeDraw(self);
+    const bool hullMain = hullLayerWanted() && hullLayerSeparateWanted() && self == g_state->ownerCtx && hullLayerBeforeMain(self, 1, args, v);   // diag.hull_layer = separate (TEMPORARY)
     if (fast) {
         uiLayerMapRunEnd(self);   // as in hookedDraw
         if (!(self == g_state->ownerCtx && uiLayerIssueBlocked())) {
@@ -5686,10 +5700,12 @@ void STDMETHODCALLTYPE hookedDrawIndexed(ID3D11DeviceContext* self, UINT count,
             GpuCensusAlteredScope timed(self, altered);   // the game's own draw, and only it (gpu_census.h)
             g_state->realDrawIndexed(self, count, startIndex, baseVertex);
         }
+        if (hullMain) hullLayerAfterMainDraw(self);   // as in hookedDraw
         srvTurretHudCountIssue(self);   // issue 140: the game's own issue; a family's first scope says its state (one relaxed load otherwise)
         if (clock.on) clock.realCall(r0);
         return true;
     });
+    if (hullMain) hullLayerAfterMainDraw(self);   // as in hookedDraw
     if (cockpitGlassLegacyLive() && self == g_state->ownerCtx && cockpitGlassOverlayBegin(self)) { g_state->realDrawIndexed(self, count, startIndex, baseVertex); cockpitGlassOverlayEnd(self); }
     if (v == DrawVerdict::kPanel) endPanelOverride(self);
     if (starGlow && vrStarGlowAfterMayAct()) starGlowAfterDraw(self, 'I', count, 1, args, v);
@@ -5774,6 +5790,7 @@ void STDMETHODCALLTYPE hookedDrawInstanced(ID3D11DeviceContext* self, UINT perIn
                            : instances;
     const bool starGlow = vrStarGlowWanted() && self == g_state->ownerCtx;   // visual.star_glow (vr_star_glow.h): one relaxed load while off
     if (starGlow) vrStarGlowBeforeDraw(self);
+    const bool hullMain = hullLayerWanted() && hullLayerSeparateWanted() && self == g_state->ownerCtx && hullLayerBeforeMain(self, drawn, args, v);   // diag.hull_layer = separate (TEMPORARY)
     if (fast) {
         uiLayerMapRunEnd(self);   // as in hookedDraw
         if (!(self == g_state->ownerCtx && uiLayerIssueBlocked())) {
@@ -5788,10 +5805,12 @@ void STDMETHODCALLTYPE hookedDrawInstanced(ID3D11DeviceContext* self, UINT perIn
             g_state->realDrawInstanced(self, perInstance, drawn, startVertex,
                                        startInstance);
         }
+        if (hullMain) hullLayerAfterMainDraw(self);   // as in hookedDraw
         srvTurretHudCountIssue(self);   // issue 140: the game's own issue; a family's first scope says its state (one relaxed load otherwise)
         if (clock.on) clock.realCall(r0);
         return true;
     });
+    if (hullMain) hullLayerAfterMainDraw(self);   // as in hookedDraw
     if (cockpitGlassLegacyLive() && self == g_state->ownerCtx && cockpitGlassOverlayBegin(self)) { g_state->realDrawInstanced(self, perInstance, drawn, startVertex, startInstance); cockpitGlassOverlayEnd(self); }
     if (v == DrawVerdict::kPanel) endPanelOverride(self);
     if (starGlow && vrStarGlowAfterMayAct()) starGlowAfterDraw(self, 'N', perInstance, drawn, args, v);
@@ -5877,6 +5896,7 @@ void STDMETHODCALLTYPE hookedDrawIndexedInstanced(ID3D11DeviceContext* self,
     if (g_vrWorldWants && self == g_state->ownerCtx) vrWorldRouteDraw(self);
     const bool starGlow = vrStarGlowWanted() && self == g_state->ownerCtx;   // visual.star_glow (vr_star_glow.h): one relaxed load while off
     if (starGlow) vrStarGlowBeforeDraw(self);
+    const bool hullMain = hullLayerWanted() && hullLayerSeparateWanted() && self == g_state->ownerCtx && hullLayerBeforeMain(self, instances, args, v);   // diag.hull_layer = separate (TEMPORARY)
     forwardWithVerdict(self, v, flags, 'X', perInstance, instances, args, [&](AlteredDraw altered) {
         const int64_t r0 = clock.on ? qpcNow() : 0;
         {
@@ -5886,6 +5906,7 @@ void STDMETHODCALLTYPE hookedDrawIndexedInstanced(ID3D11DeviceContext* self,
             g_state->realDrawIndexedInstanced(self, perInstance, instances, startIndex,
                                               baseVertex, startInstance);
         }
+        if (hullMain) hullLayerAfterMainDraw(self);   // as in hookedDraw: before the weapon and screen motion re-issues below
         // Stop the draw-hook clock here: the weapon-motion re-issue below is EDVR's own work, counted under "draw reissue CPU:" and not inside "draw hook CPU:".
         if (clock.on) clock.realCall(r0);
         srvTurretHudCountIssue(self);   // issue 140: the game's own issue; a family's first scope says its state (one relaxed load otherwise)
@@ -5965,6 +5986,7 @@ void STDMETHODCALLTYPE hookedDrawIndexedInstanced(ID3D11DeviceContext* self,
         }
         return true;  // the original draw was issued
     });
+    if (hullMain) hullLayerAfterMainDraw(self);   // as in hookedDraw
     if (bodyCull) nativeOnFootBodyCullEnd(self);   // F18 (TEMPORARY): the game's rasterizer state back
     if (cockpitGlassLegacyLive() && self == g_state->ownerCtx && cockpitGlassOverlayBegin(self)) { g_state->realDrawIndexedInstanced(self, perInstance, instances, startIndex, baseVertex, startInstance); cockpitGlassOverlayEnd(self); }
     if (v == DrawVerdict::kPanel) endPanelOverride(self);

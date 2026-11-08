@@ -15,11 +15,14 @@ The smear is terrain that is newly uncovered at the hull edge every frame
   record by the GPU own mask and re-lit by re-issuing the game's lighting,
   equals the game's HDR where the game shows the hull. Median ratio 1.000;
   85-98% of those pixels are bit-exact; AO and decals are the residue. The
-  neighbour filter is built but not yet exercised. **Next:** Step 2 (the
-  own ship out of the main pass, a discard in the engine-motion patched
-  hull PS) together with Step 3 (tonemap, composite after DLSS, AA), so
-  that the next flight shows the result instead of measuring a piece.
-* **Temporary keys of this arc:** `diag.hull_layer` (off | dump).
+  neighbour filter is built but not yet exercised.
+* **Step 2 built (compile-only, not flown):** section "Step 2 build".
+  `separate` discards the own records in the main pass with an own-discard
+  variant of the engine-motion patched hull and decal PS (mask at t127),
+  proven on WARP. It hides the ship until Step 3 (tonemap, composite after
+  DLSS, AA) lands. **Open:** the 6 own forward draws are not engine-motion
+  families, so they still draw over the terrain.
+* **Temporary keys of this arc:** `diag.hull_layer` (off | dump | separate).
 * **Option (e), the hull hole-fill, fails** for the case the pilot reported
   (section "Result"): in dump 132100543006 only 5.8% of the band was visible
   in the previous 8 frames; 88% was still behind the ship after 8. Layering
@@ -607,6 +610,81 @@ ledgers and census; the clear values are the game's as the clear hook sees
 them; that the shell and the block draw with four targets bound; and that no
 third pass draws the shell into a G-buffer of its own (`eye_frames` would be
 more than twice `frames`).
+
+## Step 2 build (2026-11-08, compile-only, not flown)
+
+The own ship out of the game's main G-buffer, so the terrain behind it is drawn. New value
+`diag.hull_layer = separate` (TEMPORARY): everything `dump` does, plus the items below.
+**It hides the own ship**: nothing puts it back until Step 3 (the composite after DLSS).
+`off` and `dump` are unchanged. Source: `hull_layer.cpp` (hull_layer.h says what it does),
+`dxbc_engine_velocity.h`, `engine_velocity.cpp` (`engineVelocityOwnDiscardPs`), the four
+draw hooks in `vscreen.cpp`.
+
+1. *The seed before the seed draw.* In `separate` the seed (instance window, pool copy, mask
+   dispatch, private clears) runs in the pre-draw path of the seed draw, after engine
+   motion's substitution, so the seed draw itself is discarded too. `dump` still seeds
+   after the draw.
+2. *The own discard.* A variant of engine motion's patched pixel shader: the same patch,
+   plus, ahead of the original code, `and` the slot, `ld_raw` the own mask at **PS t127**
+   (one uint a record; past its end reads 0, not own), `discard_nz`. The patch refuses a
+   shader that names t127 or forces the early depth test. t127: the hull PS fixtures declare
+   t0-t9 (66DE/BBDE4E71) and t0-t5 (AACF/CF534B32); EDHM reads t120, 3Dmigoto t120/t125;
+   EDVR binds nothing above t110. From the seed to the end of the eye's G-buffer, every
+   hull-family draw and every hull decal (BBE5/DB3E, the guarded variant in VR eye passes:
+   these are patched pool draws) that engine motion substituted is issued with the variant
+   and the eye's mask at t127. The patched shader and the game's t127 go back right after
+   the game's issue, before the private re-issue (which draws normally). No seed, no slot
+   target at RT6, or no variant: the draw is the game's, the ship stays.
+3. *Decals into the private layer* (separate only): own decals that export the slot are
+   re-issued like the hull and filtered by the same pass.
+4. *The own forward draws* (VS `88DCF116`, `025B4B9F`, `0B5981F2`, `F464E27C`, `6DB587D2`,
+   `2B3F53DD`) are **not** engine-motion families (not in `engine_velocity_families.h`), so
+   they have no slot and no variant. They still draw into the main HDR with the depth test;
+   with the hull gone from the main depth they draw over the terrain. **Open item** for
+   Step 3: they are not emitted twice and no CPU ownership test is used.
+5. *The dump* (separate only) adds `eye_<stamp>_GameGbuf0.bin` (the game's G-buffer RT0) and
+   `_GameDepth.bin` (the eye depth), copied when the eye's G-buffer ends.
+   `hull_layer_compare.py` reads a dump with `_GameDepth` as a separate-mode dump: on the
+   private hull pixels it reports the share where the main depth is farther (filled in),
+   at the clear value (holes), equal (the hull still there) and nearer (cockpit in front).
+   TAKEN OUT (exit 0) at most 5% equal, else NOT TAKEN OUT (3).
+
+**Proof (engine_velocity_test, WARP):** synthetic four strips (slots 3, 7, 1000 past the
+mask, 9; 7 and 9 own): every non-own pixel's RT0-3, depth and MRT6 bit-identical to the
+patched shader, every own pixel keeps all clears, plain and guarded; with no record own the
+frame is the patched one bit for bit. The two real hull PS fixtures (66DE + BBDE4E71, AACF +
+CF534B32) through the corpus harness, two data sets: 49,152 texels each, 0 differ, 0
+written when own. `--corpus` runs the same on every hull-family pair of a dump. The
+lifecycle rig checks the variant of a live substitute (plain and guarded) is made once.
+
+**The log lines** (separate only):
+
+```
+hull layer: main pass: own_draws=N decal_draws=N no_variant_draws=N fallback_frames=N
+  decals_reissued=N decal_no_slot=N (...)                            every 30 s
+hull layer: separate mode hides the own ship: ...                    at the key change
+hull layer: own-discard variant made for vs_66DE... + ps_... (plain patch; ...)
+hull layer: own-discard variant declined for ...: <why>; ...         once a shader
+hull layer: dump <stamp> eye N: GameGbuf0 written, GameDepth written (...; own_draws=N
+  decal_draws=N decals_reissued=N)                                   per eye, per dump
+```
+
+`fallback_frames` counts eye-frames whose seed failed (the ship stayed in the main pass);
+`no_variant_draws` counts window draws that could not take the variant. `--health` is
+PARTIAL in separate mode when no main-pass line comes or `own_draws` is 0.
+
+**Flight plan:** with `fix.temporal_aa` on and `diag.hull_layer = separate`, fly low over
+terrain; expect the own ship gone and terrain behind it, the six forward draws (laser,
+lights) floating. Then `edvr_log.py --health` ("hull layer" OK, `own_draws` > 0,
+`fallback_frames` near 0) and `hull_layer_compare.py <eyes>\eye_<stamp>` (and `--eye 1`):
+TAKEN OUT, with the filled share high over terrain.
+
+**Not verified before the flight:** that hull-family draws of the own ship after the depth
+copy (none in the ledgers) or own decals before the seed do not occur; that every own pool
+draw in the window reads the same pool view the seed copied (the mask is indexed by slot);
+that the three keyed PS families not on this machine (61AE, DE54, DB3E) take the variant
+(the patch declines cleanly and says so); the R10G10B10A2 read of GameGbuf0 (f23 assumed
+DXGI 23); a neighbour within 120 m is discarded as own too (untested, as in Step 1).
 
 ## Step 1 v2 flight (2026-11-08 20:30, build cfa4e5f5): CONFIRMED
 

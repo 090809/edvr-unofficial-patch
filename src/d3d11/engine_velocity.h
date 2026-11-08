@@ -387,6 +387,13 @@ void engineVelocityNoteSkinPixels(uint32_t joined, uint32_t masked, const uint32
 // binds of the self-marking detail shaders, so the draw-path census can tell
 // "never bound through the hook" from "bound but never drawn through it".
 void engineVelocityNoteSelfMarkingPs(uint64_t psHash) noexcept;
+// diag.hull_layer = separate (TEMPORARY; hull_layer.h): the own-discard variant of the pixel shader engine motion has bound
+// for this draw. `bound` is the pixel shader bound now (after engineVelocityBeforeDraw); when it is engine motion's patched
+// or guarded substitute for the current draw (the VR profile), the same patch plus the own discard at
+// kEngineVelocityOwnMaskSlot (dxbc_engine_velocity.h) is returned, made once per substitute and kept with it. Null when
+// `bound` is not engine motion's, or the variant could not be made (`why`, when given, says why; a decline is said once
+// per shader in the graphics log). Owner thread; the caller binds it raw and puts `bound` back after the draw.
+ID3D11PixelShader* engineVelocityOwnDiscardPs(ID3D11DeviceContext* ctx, ID3D11PixelShader* bound, const char** why);
 // On foot (docs/kinematic-motion-injection-2026-09-19.md, 2026-09-23 "On
 // foot"): the world is drawn into a flat SOURCE image that the 2D screen
 // shows in each eye, and no pool draw targets an eye. screen_motion names the

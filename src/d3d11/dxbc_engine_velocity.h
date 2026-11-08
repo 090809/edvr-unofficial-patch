@@ -41,6 +41,11 @@ namespace edvr {
 constexpr uint32_t kEngineVelocityTarget = 6;
 // The guarded flat decal variant alone reads a private copy of MRT6 here.
 constexpr uint32_t kEngineVelocityOverlaySnapshotSlot = 3;
+// The own-discard variant (diag.hull_layer = separate, TEMPORARY; docs\research-own-hull-layer-2026-11-08.md "Step 2
+// build") reads the hull layer's own mask here: a raw buffer, one uint a pool record, nonzero for the own ship. The last
+// PS slot: the hull families' shaders declare t0..t9 (66DE/BBDE4E71) and t0..t5 (AACF/CF534B32), EDHM reads t120 and
+// 3Dmigoto's defaults are t120/t125; the patch refuses a shader that names it all the same.
+constexpr uint32_t kEngineVelocityOwnMaskSlot = 127;
 // The slot bits kept before the odd encoding (2 * slot + 1 stays below 2^24,
 // where float is still exact).
 constexpr uint32_t kEngineVelocitySlotMask = 0x007fffffu;
@@ -221,8 +226,10 @@ inline std::vector<BYTE> relocateNullPoolInput(const void* data,size_t size,uint
 
 inline std::vector<BYTE> patchPsProgram(const std::vector<BYTE>& bytes, const EngineVelocityInputs& in,
                                         bool guardOverlayDepth = false, FlatMarkerKind flatMarker = FlatMarkerKind::None,
-                                        uint32_t primitiveRegister = ~0u, uint32_t tokenSlot = ~0u, uint32_t primitiveComponent = 0) {
+                                        uint32_t primitiveRegister = ~0u, uint32_t tokenSlot = ~0u, uint32_t primitiveComponent = 0,
+                                        bool ownDiscard = false) {
     auto t = programWords(bytes);
+    if (ownDiscard && flatMarker != FlatMarkerKind::None) throw std::runtime_error("flat ownership cannot take the own discard");
     const bool provenance = flatMarker == FlatMarkerKind::ForeignPoolProvenance;
     const bool rgba = provenance || flatMarker == FlatMarkerKind::World || flatMarker == FlatMarkerKind::WorldPool;
     if(provenance && (primitiveRegister>=32 || tokenSlot>=14 || primitiveComponent>=4))throw std::runtime_error("invalid foreign provenance inputs");
@@ -246,6 +253,15 @@ inline std::vector<BYTE> patchPsProgram(const std::vector<BYTE>& bytes, const En
             for (size_t i = at + 1; i + 1 < at + length; ++i)
                 if (operandType(t[i]) == 7 && t[i + 1] == kEngineVelocityOverlaySnapshotSlot)
                     throw std::runtime_error("overlay snapshot t3 occupied");
+        }
+        // The own discard: the mask's slot must be the patch's alone, and a forced early depth test would write the
+        // depth of a discarded pixel all the same (the main depth must not keep the own hull).
+        if (ownDiscard) {
+            for (size_t i = at + 1; i + 1 < at + length; ++i)
+                if (operandType(t[i]) == 7 && t[i + 1] == kEngineVelocityOwnMaskSlot)
+                    throw std::runtime_error("own mask t127 occupied");
+            if (opcode == kOpDclGlobalFlags && (t[at] & (1u << 13)))
+                throw std::runtime_error("forced early depth test: a discard would keep the depth write");
         }
         const bool declaration = (opcode >= 88 && opcode <= 106) || opcode == 143 ||
                                  (opcode >= 147 && opcode <= 163) || opcode == 53;
@@ -344,16 +360,31 @@ inline std::vector<BYTE> patchPsProgram(const std::vector<BYTE>& bytes, const En
         0x09000037u, 0x00102022u, kEngineVelocityTarget, 0x0010002Au, temp + 1,
         0x0010001Au, temp + 1, 0x0010102Au, in.positionRegister,
     };
+    // The own discard, ahead of the original code (a discard in SM5 only marks the pixel: the quad's derivatives and every
+    // other pixel's results are unchanged, which engine_velocity_test proves on WARP):
+    //   dcl_resource_raw t127
+    //   and        rN.x, v<id>.<c>, l(0x007fffff)    the slot, as the tail exports it
+    //   ishl       rN.x, rN.x, l(2)                  its uint in the mask
+    //   ld_raw     rN.x, rN.x, t127.xxxx             (past the mask's end: 0, not own)
+    //   discard_nz rN.x
+    const uint32_t ownMaskDecl[] = {0x030000A1u, 0x00107000u, kEngineVelocityOwnMaskSlot};
+    const uint32_t ownHead[] = {
+        0x07000001u, 0x00100012u, temp, identitySelect, in.identityRegister, 0x00004001u, kEngineVelocitySlotMask,
+        0x07000029u, 0x00100012u, temp, 0x0010000Au, temp, 0x00004001u, 2u,
+        0x070000A5u, 0x00100012u, temp, 0x0010000Au, temp, 0x00107006u, kEngineVelocityOwnMaskSlot,
+        0x0304000Du, 0x0010000Au, temp,
+    };
     std::vector<uint32_t> out;
     out.reserve(t.size() + 64);
     out.push_back(t[0]);
     out.push_back(0);
-    bool outputDeclared = false;
+    bool outputDeclared = false, ownPlaced = !ownDiscard;
     for (size_t at = 2; at < t.size();) {
         const uint32_t opcode = t[at] & 0x7ffu;
         const uint32_t length = instructionLength(t, at);
         if (at == firstOutput) {
             if (guardOverlayDepth) out.insert(out.end(), std::begin(overlayResource), std::end(overlayResource));
+            if (ownDiscard) out.insert(out.end(), std::begin(ownMaskDecl), std::end(ownMaskDecl));
             if (!positionDeclared) out.insert(out.end(), posDecl, posDecl + 4);
             if (in.slotFromVsPatch) out.insert(out.end(), slotDecl, slotDecl + 3);
             if (in.skinExport) out.insert(out.end(), skinInDecl, skinInDecl + 3);
@@ -376,6 +407,10 @@ inline std::vector<BYTE> patchPsProgram(const std::vector<BYTE>& bytes, const En
                 out.push_back(guardOverlayDepth ? 2u : 1u);
                 outputDeclared = true;
             }
+            if (ownDiscard && at == firstExecutable) {
+                out.insert(out.end(), std::begin(ownHead), std::end(ownHead));
+                ownPlaced = true;
+            }
             if (opcode == kOpRet) {
                 if (flatMarker == FlatMarkerKind::ForeignPool || provenance) out.insert(out.end(), std::begin(foreignTail), std::end(foreignTail));
                 else if (flatMarker == FlatMarkerKind::World) out.insert(out.end(), std::begin(worldTail), std::end(worldTail));
@@ -391,6 +426,7 @@ inline std::vector<BYTE> patchPsProgram(const std::vector<BYTE>& bytes, const En
         at += length;
     }
     if (!outputDeclared) throw std::runtime_error("output declaration not placed");
+    if (!ownPlaced) throw std::runtime_error("own discard not placed");
     return programBytes(std::move(out));
 }
 
@@ -507,11 +543,15 @@ inline bool engineVelocityPatchVs(const void* data, size_t bytes, const EngineVe
 inline bool engineVelocityPatchPs(const void* data, size_t bytes, const EngineVelocityInputs& inputs,
                                   std::vector<BYTE>& output, std::string& reason, bool guardOverlayDepth = false,
                                   dxbc_engine_velocity_detail::FlatMarkerKind flatMarker = dxbc_engine_velocity_detail::FlatMarkerKind::None,
-                                  unsigned* tokenSlot = nullptr) {
+                                  unsigned* tokenSlot = nullptr, bool ownDiscard = false) {
     using namespace dxbc_engine_velocity_detail;
     output.clear();
     reason.clear();
     if(tokenSlot)*tokenSlot=~0u;
+    if (ownDiscard && flatMarker != dxbc_engine_velocity_detail::FlatMarkerKind::None) {
+        reason = "flat ownership cannot take the own discard";
+        return false;
+    }
     if (inputs.identityRegister >= 32 || inputs.identityComponent >= 4 || inputs.positionRegister >= 32 ||
         inputs.identityRegister == inputs.positionRegister) {
         reason = "invalid shader inputs";
@@ -687,7 +727,8 @@ inline bool engineVelocityPatchPs(const void* data, size_t bytes, const EngineVe
             } else if (isProgram(chunk.tag)) {
                 if (program) throw std::runtime_error("duplicate program");
                 program = true;
-                chunk.bytes = patchPsProgram(chunk.bytes, psInputs, guardOverlayDepth, flatMarker,primitiveRegister,selectedToken,primitiveComponent);
+                chunk.bytes = patchPsProgram(chunk.bytes, psInputs, guardOverlayDepth, flatMarker,primitiveRegister,selectedToken,primitiveComponent,
+                                             ownDiscard);
             }
         }
         if (!isgn || !osgn || !program) throw std::runtime_error("missing pixel shader chunks");

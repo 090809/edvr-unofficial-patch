@@ -15,6 +15,7 @@
 #include "../common/config.h"
 #include "../common/log.h"
 #include "binding_shadow.h"
+#include "dxbc_engine_velocity.h"   // kEngineVelocityOwnMaskSlot: where the own-discard variant reads the own mask (separate mode)
 #include "engine_velocity.h"  // engineVelocityLiveNow: the patched shaders that export the slot at MRT6
 #include "temporal_pass.h"    // temporalPassArmEyeDump: the auto dump arms the eye dump the hotkey arms
 #include "vr_world_route.h"   // VrWorldInternalScope: the layer's own clears, copies and passes step past the game-facing hooks
@@ -24,12 +25,15 @@ namespace edvr {
 
 namespace detail {
 bool g_hullLayerOn = false;
+bool g_hullLayerSeparate = false;
 }  // namespace detail
 
 namespace {
 
 // The own ship's families (engine_velocity_families.h kFamilies: vs_66DE..., vs_61AE..., vs_AACF..., vs_DE54...).
 constexpr uint64_t kHullVs[4] = {0x66DE2CADB1F4AE6Bull, 0x61AE8EB05FDC18DDull, 0xAACFDCF2FB9AD809ull, 0xDE545DC8EE4FBB87ull};
+// The hull decals (engine_velocity_families.h: vs_BBE5 with ps_DB3E, the guarded overlay pair in the VR eye passes).
+constexpr uint64_t kDecalVs = 0xBBE58E40FE88EC80ull;
 constexpr uint64_t kShellVs = 0xBFE51414CC3024B4ull;     // the cockpit shell (engine_velocity_families.h)
 constexpr uint64_t kTerrainVs = 0x72BDD292154158ADull;   // the terrain's colour pass (celestial_motion.h kCelestialPatchVs)
 constexpr uint32_t kTerrainVsHigh = 0x6C320453u;         // the other terrain family, known by its prefix only (the ledgers)
@@ -247,6 +251,14 @@ struct Eye {
     ID3D11Texture2D* stageDepth = nullptr;
     ID3D11Buffer* stageStats = nullptr;
     uint32_t dumpHull = 0, dumpLight = 0;
+    // Separate mode. This frame: the main-pass draws given the own discard (hull, decals), and the decals re-issued.
+    uint32_t ownDraws = 0, ownDecals = 0, decals = 0;
+    // The capture frame only: the game's G-buffer RT0 and eye depth (references from the seed to the frame's end), and
+    // their staging copies after the eye's G-buffer.
+    ID3D11Texture2D* gameRt0 = nullptr;
+    ID3D11Texture2D* gameDepth = nullptr;
+    ID3D11Texture2D* stageGbuf0 = nullptr;
+    ID3D11Texture2D* stageMainDepth = nullptr;
 };
 
 struct Window {
@@ -256,6 +268,18 @@ struct Window {
     uint32_t unknownPairs = 0, autoDumps = 0;
     uint32_t subst[kStages] = {}, noCounterpart[kStages] = {}, ended[kEnds] = {};
     std::vector<uint32_t> own, filtered, hullDraws, lightDraws;
+    // Separate mode (the "main pass" line): main-pass draws given the own discard (hull, decals), draws in the window that
+    // could not take it (no slot target, no variant), eye-frames whose main pass kept the own ship (no mask: the seed was
+    // refused, or had no slot target or shader), and the own decals re-issued into the private layer (and those declined:
+    // no slot exported).
+    uint32_t ownDraws = 0, ownDecals = 0, noVariant = 0, fallbackFrames = 0, decalsReissued = 0, decalNoSlot = 0;
+};
+
+// Separate mode: what hullLayerBeforeMainDraw bound over the game's issue, which hullLayerAfterMainDraw puts back.
+struct MainPending {
+    bool active = false;
+    ID3D11PixelShader* ps = nullptr;          // the substitute engine motion had bound (a reference)
+    ID3D11ShaderResourceView* srv = nullptr;  // the game's PS t127 (a reference, or null)
 };
 
 // The pending re-issue: what Begin bound over, which End puts back.
@@ -298,6 +322,7 @@ Eye g_eyes[2];
 int g_inEye = -1;      // the eye whose private G-buffer window is open
 int g_stageEye = -1;   // the eye whose screen-space stage ran last this frame
 Pending g_pending;
+MainPending g_main;
 Gpu g_gpu;
 Window g_win;
 bool g_noCpFrame[kStages] = {};
@@ -308,7 +333,7 @@ bool g_haveOwn = false;
 uint64_t g_unknownPairs[kMaxUnknownPairs][2] = {};
 uint32_t g_unknownCount = 0;
 bool g_saidMirrorCap = false, g_saidViewCap = false, g_saidCreateFail = false, g_saidMsaa = false, g_saidNoSlot = false, g_saidRefused = false,
-     g_saidPool = false, g_saidUnknownCap = false, g_saidReadback = false;
+     g_saidPool = false, g_saidUnknownCap = false, g_saidReadback = false, g_saidNoVariant = false;
 // The dump: armed -> the next frame is captured -> written at the boundary after it.
 enum class Dump : uint8_t { Idle, Armed, Capturing };
 Dump g_dump = Dump::Idle;
@@ -348,6 +373,8 @@ void releaseStaging(Eye& e) {
     releaseRef(e.stageGame);
     releaseRef(e.stageDepth);
     releaseRef(e.stageStats);
+    releaseRef(e.stageGbuf0);
+    releaseRef(e.stageMainDepth);
     e.dumpHull = e.dumpLight = 0;
 }
 
@@ -355,6 +382,8 @@ void releaseSeedViews(Eye& e) {
     for (auto*& v : e.privRtv) releaseRef(v);
     releaseRef(e.privSlot);
     releaseRef(e.privDsv);
+    releaseRef(e.gameRt0);
+    releaseRef(e.gameDepth);
 }
 
 void releaseEyeGpu(Eye& e) {
@@ -386,6 +415,7 @@ void resetFrame(Eye& e) {
     e.hdrGame = e.slotGame = nullptr;
     e.clearDepth = 0.0f;
     e.records = e.seedInstances = 0;
+    e.ownDraws = e.ownDecals = e.decals = 0;
 }
 
 void releaseGpu() {
@@ -1015,23 +1045,14 @@ bool seedOwnMask(ID3D11DeviceContext* ctx, Eye& e, UINT instances, UINT startIns
 void noteShell(ID3D11DeviceContext* ctx);
 void finishGbuffer(ID3D11DeviceContext* ctx, int ei, End why);
 
-bool beginHullDraw(ID3D11DeviceContext* ctx, UINT instances, UINT startInstance) {
-    ID3D11RenderTargetView* rtv[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT] = {};
-    ID3D11DepthStencilView* dsv = nullptr;
-    ctx->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, rtv, &dsv);
-    const auto decline = [&] {
-        releaseTargets(rtv, dsv);
-        return false;
-    };
-    if (!(rtv[0] && rtv[1] && rtv[2] && rtv[3] && dsv)) return decline();   // the G-buffer's four targets: not a shadow map or another pass
-    ++g_win.hullSeen;
-    const void* depthRes = resourceOf(dsv);
-    const int ei = eyeFor(depthRes, false);
-    if (ei < 0) return decline();
+// The seed: eye `ei`'s first hull-family G-buffer draw after the shell, with that draw's targets (`rtv`, `dsv`: the
+// caller's references) and instance window bound. The own mask is dispatched, the private G-buffer made and cleared, and
+// the eye's window opened (Gb::In); false leaves the eye Off for this frame (no slot target, no shader, refused).
+// Dump mode runs it right after the seed draw's issue, separate mode right before it (hullLayerBeforeMainDraw).
+bool seedEye(ID3D11DeviceContext* ctx, ID3D11RenderTargetView* const* rtv, ID3D11DepthStencilView* dsv, int ei, UINT instances, UINT startInstance) {
     Eye& e = g_eyes[ei];
-    if (e.gb == Gb::Before) {
-        if (!e.shell) return decline();   // a hull draw before this eye's shell: not the own ship's pass
-        // The seed: this eye's first hull-family G-buffer draw after the shell.
+    const void* depthRes = resourceOf(dsv);
+    {
         if (g_inEye >= 0 && g_inEye != ei) finishGbuffer(ctx, g_inEye, kEndShell);
         e.gb = Gb::Off;   // until the seed has run
         bool slotOk = false;
@@ -1055,11 +1076,11 @@ bool beginHullDraw(ID3D11DeviceContext* ctx, UINT instances, UINT startInstance)
                                 "layer does nothing on such an eye-frame (said once)",
                                 engineVelocityLiveNow() ? "live" : "not live: it comes with fix.temporal_aa");
             }
-            return decline();
+            return false;
         }
         if (!ensureDevice(ctx) || !ensureGpu()) {
             ++g_win.noShader;
-            return decline();
+            return false;
         }
         ID3D11View* priv[6] = {};
         for (int i = 0; i < 4; ++i) priv[i] = privateView(ViewKind::Rtv, rtv[i], true);
@@ -1069,13 +1090,13 @@ bool beginHullDraw(ID3D11DeviceContext* ctx, UINT instances, UINT startInstance)
             if (!p) {
                 ++g_win.refused;
                 sayRefused("a private target could not be made");
-                return decline();
+                return false;
             }
         const char* why = nullptr;
         if (!seedOwnMask(ctx, e, instances, startInstance, &why)) {
             ++g_win.refused;
             sayRefused(why ? why : "?");
-            return decline();
+            return false;
         }
         // The private G-buffer, cleared: colour to 0, the slot to -1 (no slot), depth and stencil to the game's.
         static const float zero[4] = {0.0f, 0.0f, 0.0f, 0.0f};
@@ -1096,11 +1117,50 @@ bool beginHullDraw(ID3D11DeviceContext* ctx, UINT instances, UINT startInstance)
         ++g_win.clears;
         e.hdrGame = resourceOf(rtv[3]);
         e.slotGame = resourceOf(rtv[kSlotTarget]);
+        // Separate mode's dump: the game's G-buffer RT0 and eye depth, copied after the eye's G-buffer (finishGbuffer).
+        if (detail::g_hullLayerSeparate && g_dump == Dump::Capturing) {
+            ID3D11Resource* res = nullptr;
+            rtv[0]->GetResource(&res);
+            if (res && FAILED(res->QueryInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&e.gameRt0)))) e.gameRt0 = nullptr;
+            releaseRef(res);
+            dsv->GetResource(&res);
+            if (res && FAILED(res->QueryInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&e.gameDepth)))) e.gameDepth = nullptr;
+            releaseRef(res);
+        }
         e.gb = Gb::In;
         g_inEye = ei;
         g_seededFrame = true;
         ++g_win.seeds;
+    }
+    return true;
+}
+
+// After the game's issue of a hull-family G-buffer draw (or, separate mode, a hull decal): the private re-issue's
+// bindings. Dump mode seeds here; separate mode seeded before the seed draw's issue, and re-issues the decals too.
+bool beginHullDraw(ID3D11DeviceContext* ctx, UINT instances, UINT startInstance, bool decal) {
+    ID3D11RenderTargetView* rtv[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT] = {};
+    ID3D11DepthStencilView* dsv = nullptr;
+    ctx->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, rtv, &dsv);
+    const auto decline = [&] {
+        releaseTargets(rtv, dsv);
+        return false;
+    };
+    if (!(rtv[0] && rtv[1] && rtv[2] && rtv[3] && dsv)) return decline();   // the G-buffer's four targets: not a shadow map or another pass
+    if (!decal) ++g_win.hullSeen;
+    const int ei = eyeFor(resourceOf(dsv), false);
+    if (ei < 0) return decline();
+    Eye& e = g_eyes[ei];
+    if (e.gb == Gb::Before) {
+        // A hull draw before this eye's shell is not the own ship's pass; a decal never seeds; separate mode seeds before the issue.
+        if (decal || !e.shell || detail::g_hullLayerSeparate) return decline();
+        if (!seedEye(ctx, rtv, dsv, ei, instances, startInstance)) return decline();
     } else if (e.gb != Gb::In || g_inEye != ei) {
+        return decline();
+    }
+    // A decal goes into the private layer only when it exports the slot (its slot target bound): the filter can then
+    // clear it where it is a neighbour's, and an unpatched decal would paint wherever the private depth lets it.
+    if (decal && !(rtv[kSlotTarget] && resourceOf(rtv[kSlotTarget]) == e.slotGame)) {
+        ++g_win.decalNoSlot;
         return decline();
     }
     // Every hull-family G-buffer draw of the window: into the private RT0-3, the private slot target when the draw exports
@@ -1123,7 +1183,12 @@ bool beginHullDraw(ID3D11DeviceContext* ctx, UINT instances, UINT startInstance)
         ++g_win.noSlotDraws;
     }
     vScreenSetRenderTargetsRaw(ctx, n, bind, bindDsv);
-    ++e.hull;
+    if (decal) {
+        ++e.decals;
+        ++g_win.decalsReissued;
+    } else {
+        ++e.hull;
+    }
     g_pending = Pending{};
     g_pending.active = true;
     g_pending.eye = ei;
@@ -1223,6 +1288,9 @@ void finishGbuffer(ID3D11DeviceContext* ctx, int ei, End why) {
         ++g_win.readbackBusy;
     }
     if (g_dump == Dump::Capturing) {
+        // Separate mode: the game's G-buffer RT0 and main depth as the eye's G-buffer left them (the own ship discarded).
+        if (e.gameRt0) copyToStaging(ctx, e.gameRt0, e.stageGbuf0);
+        if (e.gameDepth) copyToStaging(ctx, e.gameDepth, e.stageMainDepth);
         copyToStaging(ctx, static_cast<ID3D11Texture2D*>(depthRes), e.stageDepth);
         if (!e.stageStats) e.stageStats = makeStagingBuffer(16);
         if (e.stageStats) vScreenCopyResourceRaw(ctx, e.stageStats, e.stats);
@@ -1410,6 +1478,10 @@ const char* writeTexture(ID3D11DeviceContext* ctx, ID3D11Texture2D* staging, con
     case DXGI_FORMAT_R16G16B16A16_FLOAT: bytes = 8; break;
     case DXGI_FORMAT_R32_TYPELESS: case DXGI_FORMAT_D32_FLOAT: case DXGI_FORMAT_R32_FLOAT: bytes = 4; break;
     case DXGI_FORMAT_R24G8_TYPELESS: case DXGI_FORMAT_D24_UNORM_S8_UINT: bytes = 4; break;
+    // The G-buffer's RT0 (GameGbuf0, separate mode): f23 in the census, or another 32-bit colour format.
+    case DXGI_FORMAT_R10G10B10A2_TYPELESS: case DXGI_FORMAT_R10G10B10A2_UNORM: case DXGI_FORMAT_R10G10B10A2_UINT: bytes = 4; break;
+    case DXGI_FORMAT_R8G8B8A8_TYPELESS: case DXGI_FORMAT_R8G8B8A8_UNORM: case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB: bytes = 4; break;
+    case DXGI_FORMAT_B8G8R8A8_TYPELESS: case DXGI_FORMAT_B8G8R8A8_UNORM: case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB: bytes = 4; break;
     default: return "format unsupported";
     }
     D3D11_MAPPED_SUBRESOURCE map{};
@@ -1436,7 +1508,7 @@ void writeDump(ID3D11DeviceContext* ctx) {
     bool any = false;
     for (int i = 0; i < 2; ++i) {
         Eye& e = g_eyes[i];
-        if (!e.stageHull && !e.stageGame && !e.stageDepth) continue;
+        if (!e.stageHull && !e.stageGame && !e.stageDepth && !e.stageGbuf0 && !e.stageMainDepth) continue;
         any = true;
         uint32_t w = 0, h = 0, fmt = 0;
         if (e.stageHull) {
@@ -1464,6 +1536,14 @@ void writeDump(ID3D11DeviceContext* ctx) {
         Log::get().note("hull layer: dump %ls eye %d frame %u: HullHdr %ux%u format %u %s, GameHdrLit %s, HullDepth %s; own=%ld filtered_px=%ld "
                         "seed=%ld/%ld hull_draws=%u light_draws=%u",
                         g_dumpStamp, i, g_dumpFrame, w, h, fmt, hull, game, depth, own, filtered, seedRead, seedInst, e.dumpHull, e.dumpLight);
+        if (detail::g_hullLayerSeparate) {
+            // The main pass with the own ship discarded: the game's G-buffer RT0 and its eye depth after the eye's G-buffer.
+            const char* gbuf = writeTexture(ctx, e.stageGbuf0, dir, L"GameGbuf0", i);
+            const char* mainDepth = writeTexture(ctx, e.stageMainDepth, dir, L"GameDepth", i);
+            Log::get().note("hull layer: dump %ls eye %d: GameGbuf0 %s, GameDepth %s (separate mode: the game's G-buffer RT0 and main depth after the "
+                            "eye's G-buffer; own_draws=%u decal_draws=%u decals_reissued=%u)",
+                            g_dumpStamp, i, gbuf, mainDepth, e.ownDraws, e.ownDecals, e.decals);
+        }
         releaseStaging(e);
     }
     if (!any)
@@ -1504,23 +1584,98 @@ void report() {
                     g_win.subst[kMask], g_win.subst[kLight], ld[0], ld[1], ld[2], g_win.noCounterpart[kCopy], g_win.noCounterpart[kMask],
                     g_win.noCounterpart[kLight], g_win.unknownPairs, g_win.ended[kEndCopy], g_win.ended[kEndShell], g_win.ended[kEndLight],
                     g_win.ended[kEndFrame], g_win.terrainFrames, g_win.autoDumps);
+    if (detail::g_hullLayerSeparate)
+        Log::get().note("hull layer: main pass: own_draws=%u decal_draws=%u no_variant_draws=%u fallback_frames=%u decals_reissued=%u decal_no_slot=%u "
+                        "(separate mode: draws issued with the own discard; window draws that could not take it; eye-frames whose main pass kept the own "
+                        "ship, no mask)",
+                        g_win.ownDraws, g_win.ownDecals, g_win.noVariant, g_win.fallbackFrames, g_win.decalsReissued, g_win.decalNoSlot);
 }
 
 }  // namespace
 
 void hullLayerConfigure(Config& cfg) {
     std::string mode = cfg.getString("diag.hull_layer", "off");
-    if (mode != "off" && mode != "dump") {
-        Log::get().note("hull layer: diag.hull_layer=%s is not off or dump; read as off", mode.c_str());
+    if (mode != "off" && mode != "dump" && mode != "separate") {
+        Log::get().note("hull layer: diag.hull_layer=%s is not off, dump or separate; read as off", mode.c_str());
         mode = "off";
     }
     if (mode != g_mode) {
         g_mode = mode;
-        Log::get().note("hull layer: diag.hull_layer=%s (TEMPORARY; docs\\research-own-hull-layer-2026-11-08.md, Step 1 v2: the own hull, picked per "
-                        "record by a GPU own mask, re-lit into private targets and written into the eye dump, with auto dumps; nothing the game draws changes)",
+        Log::get().note("hull layer: diag.hull_layer=%s (TEMPORARY; docs\\research-own-hull-layer-2026-11-08.md, Steps 1-2: the own hull, picked per "
+                        "record by a GPU own mask, re-lit into private targets and written into the eye dump, with auto dumps; dump changes nothing the game "
+                        "draws, separate also takes the own ship out of the game's main G-buffer)",
                         mode.c_str());
+        if (mode == "separate")
+            Log::get().note("hull layer: separate mode hides the own ship: it is discarded from the game's main pass, and nothing composites it back "
+                            "until Step 3 (a build with the composite)");
     }
-    detail::g_hullLayerOn = mode == "dump";
+    detail::g_hullLayerOn = mode == "dump" || mode == "separate";
+    detail::g_hullLayerSeparate = mode == "separate";
+}
+
+bool hullLayerBeforeMainDraw(ID3D11DeviceContext* ctx, UINT instances, UINT startInstance) {
+    if (!detail::g_hullLayerSeparate || !ctx || g_pending.active || g_main.active) return false;
+    const uint64_t vs = bindingShaderHash(BindSlot::Vs);
+    const bool hull = isHullVs(vs), decal = vs == kDecalVs;
+    if (!hull && !decal) return false;
+    ID3D11RenderTargetView* rtv[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT] = {};
+    ID3D11DepthStencilView* dsv = nullptr;
+    ctx->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, rtv, &dsv);
+    const auto decline = [&] {
+        releaseTargets(rtv, dsv);
+        return false;
+    };
+    if (!(rtv[0] && rtv[1] && rtv[2] && rtv[3] && dsv)) return decline();   // the G-buffer's four targets
+    const int ei = eyeFor(resourceOf(dsv), false);
+    if (ei < 0) return decline();
+    Eye& e = g_eyes[ei];
+    // The seed draw is the own ship's: its mask is made before it is issued, so the seed draw is discarded too.
+    if (hull && e.gb == Gb::Before && e.shell && !seedEye(ctx, rtv, dsv, ei, instances, startInstance)) return decline();
+    if (e.gb != Gb::In || g_inEye != ei || !e.maskSrv) return decline();   // no mask this eye-frame: the draw is the game's
+    // The draw must be engine motion's substitute: its slot target at RT6, and its patched pixel shader bound.
+    if (!(rtv[kSlotTarget] && resourceOf(rtv[kSlotTarget]) == e.slotGame)) {
+        ++g_win.noVariant;
+        return decline();
+    }
+    ID3D11PixelShader* ps = nullptr;
+    ctx->PSGetShader(&ps, nullptr, nullptr);
+    const char* why = nullptr;
+    ID3D11PixelShader* variant = ps ? engineVelocityOwnDiscardPs(ctx, ps, &why) : nullptr;
+    if (!variant) {
+        ++g_win.noVariant;
+        if (!g_saidNoVariant) {
+            g_saidNoVariant = true;
+            Log::get().note("hull layer: a %s draw in the window got no own-discard variant (%s); such draws keep the own ship in the main pass (said once)",
+                            decal ? "decal" : "hull", why ? why : "?");
+        }
+        releaseRef(ps);
+        return decline();
+    }
+    g_main.active = true;
+    g_main.ps = ps;   // the reference passes to AfterMainDraw
+    ctx->PSGetShaderResources(kEngineVelocityOwnMaskSlot, 1, &g_main.srv);
+    vScreenPSSetShaderResourcesRaw(ctx, kEngineVelocityOwnMaskSlot, 1, &e.maskSrv);
+    vScreenPSSetShaderRaw(ctx, variant, nullptr, 0);
+    if (decal) {
+        ++e.ownDecals;
+        ++g_win.ownDecals;
+    } else {
+        ++e.ownDraws;
+        ++g_win.ownDraws;
+    }
+    releaseTargets(rtv, dsv);   // the targets' references go; the variant stays bound for the game's issue
+    return true;
+}
+
+void hullLayerAfterMainDraw(ID3D11DeviceContext* ctx) {
+    if (!g_main.active) return;
+    if (ctx) {
+        vScreenPSSetShaderRaw(ctx, g_main.ps, nullptr, 0);
+        vScreenPSSetShaderResourcesRaw(ctx, kEngineVelocityOwnMaskSlot, 1, &g_main.srv);
+    }
+    releaseRef(g_main.ps);
+    releaseRef(g_main.srv);
+    g_main = MainPending{};
 }
 
 bool hullLayerBegin(ID3D11DeviceContext* ctx, UINT instances, UINT startInstance) {
@@ -1531,7 +1686,8 @@ bool hullLayerBegin(ID3D11DeviceContext* ctx, UINT instances, UINT startInstance
         noteShell(ctx);
         return false;
     }
-    if (isHullVs(vs)) return beginHullDraw(ctx, instances, startInstance);
+    if (isHullVs(vs)) return beginHullDraw(ctx, instances, startInstance, false);
+    if (vs == kDecalVs && detail::g_hullLayerSeparate) return beginHullDraw(ctx, instances, startInstance, true);   // the own decals (Step 2)
     if (isLightVs(vs)) return beginStage(ctx, kLight, 0);
     for (const auto& pair : kStagePairs) {
         if (pair.vs != vs) continue;
@@ -1595,6 +1751,7 @@ void hullLayerArmDump(const wchar_t* stamp) {
 }
 
 void hullLayerFrameBoundary(ID3D11DeviceContext* ctx) {
+    if (g_main.active) hullLayerAfterMainDraw(ctx);   // never: Before and After are one call chain
     if (!detail::g_hullLayerOn) {
         if (g_device || !g_mirrors.empty()) releaseAll();
         g_win = Window{};
@@ -1615,6 +1772,7 @@ void hullLayerFrameBoundary(ID3D11DeviceContext* ctx) {
         if (!e.seen || !e.shell) continue;
         ++g_win.eyeFrames;
         if (e.gb == Gb::Before) ++g_win.noSeed;
+        if (e.gb == Gb::Off && detail::g_hullLayerSeparate) ++g_win.fallbackFrames;   // the seed ran and failed: the main pass drew the own ship
         if (e.gb == Gb::Done) {
             g_win.hullDraws.push_back(e.hull);
             g_win.lightDraws.push_back(e.lightDraws);
@@ -1662,6 +1820,7 @@ void hullLayerFrameBoundary(ID3D11DeviceContext* ctx) {
 
 void hullLayerShutdown() {
     g_pending = Pending{};   // references, if any, die with the device
+    g_main = MainPending{};
     releaseAll();
     detail::g_hullLayerOn = false;
 }

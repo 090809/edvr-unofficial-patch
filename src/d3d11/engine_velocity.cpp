@@ -168,6 +168,8 @@ struct FamilyState {
     std::unordered_map<ID3D11VertexShader*, Ptr<ID3D11VertexShader>> patchedVs;
     std::unordered_map<ID3D11PixelShader*, Ptr<ID3D11PixelShader>> patchedPs;
     std::unordered_map<ID3D11PixelShader*, Ptr<ID3D11PixelShader>> guardedPs;
+    // diag.hull_layer = separate (TEMPORARY): the own-discard variant of a substitute (plain or guarded), keyed by the substitute; null: declined
+    std::unordered_map<ID3D11PixelShader*, Ptr<ID3D11PixelShader>> ownDiscardPs;
     std::unordered_map<ID3D11PixelShader*, std::string> psFailed;
     std::unordered_map<ID3D11PixelShader*, bool> psExports;   // F2: the patched pixel shader writes E to target 7
     std::unordered_map<ID3D11PixelShader*, bool> psZeroes;    // F2: ...or writes "no history" there (exactly zero, valid 0): a skinned family's pixel shader that exports no E
@@ -781,7 +783,7 @@ void deriveFamily(int f) {
     // (armSkinForProfileLocked), and a family derived in VR just ahead of that must take it too.
     const bool skinArmed = !runtimeFlatProfile() && g_skinWanted.load(std::memory_order_acquire);
     if (s.derived && (s.derivedFlat != runtimeFlatProfile() || (kFamilies[f].skinned && s.derivedSkin != skinArmed))) {
-        s.patchedVs.clear(); s.patchedPs.clear(); s.guardedPs.clear(); s.psFailed.clear();
+        s.patchedVs.clear(); s.patchedPs.clear(); s.guardedPs.clear(); s.ownDiscardPs.clear(); s.psFailed.clear();
         s.psExports.clear(); s.psZeroes.clear();
         s.derived = s.valid = false; s.skin = false; s.skinWhy.clear(); s.reason.clear(); s.inputs = EngineVelocityInputs{};
     }
@@ -2641,7 +2643,7 @@ void clearLocked() {
     for (auto& w : watch) w.store(nullptr);
     for (auto& w : g_watchInfo) w = WatchInfo{};
     for (auto& s : g_families) {
-        s.patchedVs.clear(); s.patchedPs.clear(); s.guardedPs.clear(); s.psFailed.clear();
+        s.patchedVs.clear(); s.patchedPs.clear(); s.guardedPs.clear(); s.ownDiscardPs.clear(); s.psFailed.clear();
         s.derived = s.valid = false; s.reason.clear(); s.binds = 0; s.unkeyedPsDraws = 0; s.selfMarked = 0; s.selfMarkedLatched = 0;
         s.skin = false; s.skinWhy.clear(); s.psExports.clear(); s.psZeroes.clear();
     }
@@ -3781,6 +3783,61 @@ void engineVelocityNoteSelfMarkingPs(uint64_t psHash) noexcept {
     // counted for the draw-path census (the seam arc's live question: do their
     // binds come through the hook at all).
     if (engine_velocity_family::selfMarkingPs(psHash)) ++g_draw.selfMarkBinds;
+}
+
+ID3D11PixelShader* engineVelocityOwnDiscardPs(ID3D11DeviceContext* ctx, ID3D11PixelShader* bound, const char** why) {
+    const auto say = [&](const char* reason) -> ID3D11PixelShader* {
+        if (why) *why = reason;
+        return nullptr;
+    };
+    if (!ctx || !bound || runtimeFlatProfile() || !live.load(std::memory_order_acquire)) return say("engine motion is not live in VR");
+    std::lock_guard<std::recursive_mutex> lock(g_mutex);
+    // Only engine motion's own substitute for the draw now bound: the plain patch, or the guarded decal's.
+    const int f = g_bound.family;
+    if (f < 0 || f >= kFamilyCount || g_bound.patchedPs != bound || !g_bound.originalPs) return say("the bound pixel shader is not engine motion's substitute");
+    FamilyState& s = g_families[f];
+    const auto found = s.ownDiscardPs.find(bound);
+    if (found != s.ownDiscardPs.end()) return found->second ? found->second.Get() : say("the own-discard variant was declined (said once)");
+    emcpu::Scope patch(emcpu::kPatch);   // a cache miss only: the DXBC patch and CreatePixelShader
+    ID3D11PixelShader* const original = g_bound.originalPs;
+    const auto guardedIt = s.guardedPs.find(original);
+    const bool guarded = guardedIt != s.guardedPs.end() && guardedIt->second.Get() == bound;
+    const auto info = g_ps.find(original);
+    std::string reason = info == g_ps.end() ? "pixel shader bytecode not kept" : info->second.linked ? "class linkage" : "";
+    Ptr<ID3D11PixelShader> variant;
+    if (reason.empty()) {
+        // The same inputs the substitute was made with (patchedPsFor's skin mode for the plain patch, the family's for the guarded one).
+        EngineVelocityInputs inputs = s.inputs;
+        if (!guarded) {
+            const auto ex = s.psExports.find(original);
+            const auto ze = s.psZeroes.find(original);
+            inputs.skinExport = ex != s.psExports.end() && ex->second;
+            inputs.skinZero = ze != s.psZeroes.end() && ze->second;
+        }
+        std::vector<BYTE> out;
+        if (engineVelocityPatchPs(info->second.bytes.data(), info->second.bytes.size(), inputs, out, reason, guarded,
+                                  dxbc_engine_velocity_detail::FlatMarkerKind::None, nullptr, true)) {
+            Ptr<ID3D11Device> dev;
+            ctx->GetDevice(&dev);
+            t_creating = true;
+            const HRESULT hr = dev->CreatePixelShader(out.data(), out.size(), nullptr, &variant);
+            t_creating = false;
+            if (FAILED(hr)) {
+                char t[64];
+                _snprintf_s(t, _TRUNCATE, "CreatePixelShader 0x%08X", unsigned(hr));
+                reason = t;
+                variant.Reset();
+            }
+        }
+    }
+    if (variant)
+        Log::get().note("hull layer: own-discard variant made for %s + ps_%016llX (%s patch; the own mask at t%u)", kFamilies[f].name,
+                        static_cast<unsigned long long>(info->second.hash), guarded ? "guarded decal" : "plain", kEngineVelocityOwnMaskSlot);
+    else
+        Log::get().note("hull layer: own-discard variant declined for %s + ps_%016llX: %s; its draws keep the own ship in the main pass (said once a shader)",
+                        kFamilies[f].name, info == g_ps.end() ? 0ull : static_cast<unsigned long long>(info->second.hash), reason.c_str());
+    s.ownDiscardPs.emplace(bound, variant);
+    return variant ? variant.Get() : say("the own-discard variant was declined (said once)");
 }
 
 } // namespace edvr

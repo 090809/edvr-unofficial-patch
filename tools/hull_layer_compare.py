@@ -18,6 +18,13 @@ Verdict and exit code: CONFIRMED 0 (median ratio 0.95..1.35 and at least half th
 REFUTED 3 (under 500 hull pixels, more than half black, or a shift that matches 0.2 better than none),
 INCONCLUSIVE 1 (also when the game's HDR is itself mostly black: the comparison point is wrong, not the layer),
 bad input 2.
+
+A separate-mode dump (diag.hull_layer = separate, Step 2: "Step 2 build") also has eye_<stamp>_GameDepth.bin, the game's
+main depth after the eye's G-buffer with the own ship discarded (and _GameGbuf0.bin, its RT0). The game's HDR then has
+no hull to compare, so the tool measures the main pass instead, on the private hull pixels: the share where the main
+depth is farther than the hull's (reversed Z: smaller; the terrain behind it filled in), the share still at the clear
+value (holes: nothing drawn there, or open sky), the share equal to the hull's depth (the hull still in the main pass)
+and the share nearer (the cockpit or a neighbour in front). Verdict: TAKEN OUT 0 (at most 5% equal), NOT TAKEN OUT 3.
 """
 import argparse
 import glob
@@ -29,6 +36,43 @@ import sys
 MIN_HULL = 500
 SHIFT = 3
 MIN_GAME_LIT = 0.05   # the game's HDR lit on less of the hull than this: the comparison point, not the layer
+MAX_STILL_HULL = 0.05   # separate mode: the main depth equal to the hull's on more of its pixels than this, the hull is still there
+
+
+def main_pass(prefix, eye=0, clear_depth=0.0):
+    """Separate mode: the main depth against the private hull depth on the private hull pixels, as a dict."""
+    import numpy as np
+    import eye_inputs
+    suffix = '_e1' if eye else ''
+    paths = {k: '%s_%s%s.bin' % (prefix, k, suffix) for k in ('HullDepth', 'GameDepth')}
+    for k, p in paths.items():
+        if not os.path.exists(p):
+            raise ValueError('missing %s: %s' % (k, p))
+    _, hull = eye_inputs.read(paths['HullDepth'])
+    _, main = eye_inputs.read(paths['GameDepth'])
+    hull, main = np.asarray(hull, np.float32), np.asarray(main, np.float32)
+    if hull.shape != main.shape:
+        raise ValueError('HullDepth %s and GameDepth %s are not one eye size' % (hull.shape, main.shape))
+    clear = np.float32(clear_depth)
+    mask = hull != clear
+    n = int(mask.sum())
+    out = {'eye': eye, 'mode': 'separate', 'hull_pixels': n}
+    if n < MIN_HULL:
+        out.update(verdict='NOT TAKEN OUT', why='the private depth holds %d hull pixels (under %d): nothing to measure' % (n, MIN_HULL))
+        return out
+    h, m = hull[mask], main[mask]
+    holes = m == clear
+    equal = m == h
+    filled = (m < h) & ~holes
+    nearer = m > h
+    out.update(filled=float(filled.mean()), holes=float(holes.mean()), equal=float(equal.mean()), nearer=float(nearer.mean()))
+    if out['equal'] > MAX_STILL_HULL:
+        out.update(verdict='NOT TAKEN OUT', why='the main depth still equals the hull\'s on %.1f%% of its pixels: the own ship is in the main pass'
+                   % (100 * out['equal']))
+    else:
+        out.update(verdict='TAKEN OUT', why='the own ship is out of the main pass: %.1f%% of its pixels now hold something farther, %.1f%% are holes'
+                   % (100 * out['filled'], 100 * out['holes']))
+    return out
 
 
 def luma(rgb):
@@ -130,6 +174,14 @@ def own_from_log(prefix, eye, log=None):
 
 
 def report(r):
+    if r.get('mode') == 'separate':
+        line = 'hull layer compare (separate mode, the main pass): eye %d, %d private hull pixel(s)' % (r['eye'], r['hull_pixels'])
+        if r.get('own') is not None:
+            line += ', own mask %d record(s)' % r['own'][0]
+        if 'filled' in r:
+            line += ('; main depth farther (filled in) %.1f%%, at the clear value (holes) %.1f%%, equal to the hull (still there) %.1f%%, nearer '
+                     '(cockpit or neighbour in front) %.1f%%' % (100 * r['filled'], 100 * r['holes'], 100 * r['equal'], 100 * r['nearer']))
+        return line + '\n%s: %s' % (r['verdict'], r['why'])
     line = 'hull layer compare: eye %d, %d hull pixel(s)' % (r['eye'], r['hull_pixels'])
     if r.get('visible_only'):
         line += ' the game shows (of %d private)' % r['private_pixels']
@@ -221,6 +273,26 @@ def self_test():
             failures.append('the own count from the log: %r, wanted (54, 321)' % (got,))
         if own_from_log(os.path.join(temp, 'eyes', 'eye_123456789001'), 0) is not None:
             failures.append('the own count of eye 0 was read off eye 1\'s line')
+    # Separate mode: the main depth with the hull discarded (terrain farther, sky at the clear value) against one that kept it.
+    def separate_case(name, main_depth, want, eye=0):
+        with tempfile.TemporaryDirectory() as temp:
+            prefix = os.path.join(temp, 'eye_123456789001')
+            sfx = '_e1' if eye else ''
+            for label, plane in (('HullDepth', depth), ('GameDepth', main_depth)):
+                d = np.zeros((h, w, 2), dtype=np.float32)
+                d[..., 0] = plane
+                write(prefix + '_%s%s.bin' % (label, sfx), 19, eye, d.tobytes(), w, h, 8)
+            r = main_pass(prefix, eye=eye)
+            if r['verdict'] != want:
+                failures.append('%s: %s, wanted %s (%r)' % (name, r['verdict'], want, r))
+            return r
+    terrain = np.where(xx < 35, 0.1, 0.0).astype(np.float32)   # the terrain behind the hull's left part, open sky on the right
+    got = separate_case('the hull taken out of the main pass', terrain, 'TAKEN OUT')
+    want = {'filled': float((terrain[8:40, 10:60] > 0).mean()), 'holes': float((terrain[8:40, 10:60] == 0).mean())}
+    if abs(got.get('filled', -1) - want['filled']) > 1e-9 or abs(got.get('holes', -1) - want['holes']) > 1e-9:
+        failures.append('the filled and hole shares: %r, wanted %r' % (got, want))
+    separate_case('the hull taken out, eye 1', terrain, 'TAKEN OUT', eye=1)
+    separate_case('the hull still in the main pass', np.maximum(depth, terrain), 'NOT TAKEN OUT')
     # A missing file is bad input.
     with tempfile.TemporaryDirectory() as temp:
         try:
@@ -231,7 +303,7 @@ def self_test():
     for f in failures:
         print('hull layer compare self-test FAILED: ' + f)
     if not failures:
-        print('hull layer compare self-test passed (11 cases)')
+        print('hull layer compare self-test passed (14 cases)')
     return 1 if failures else 0
 
 
@@ -249,13 +321,14 @@ def main(argv=None):
     if not a.prefix:
         p.error('give the eye run prefix, or --self-test')
     try:
-        r = compare(a.prefix, eye=a.eye, tol=a.tol, clear_depth=a.clear_depth)
+        separate = os.path.exists('%s_GameDepth%s.bin' % (a.prefix, '_e1' if a.eye else ''))
+        r = main_pass(a.prefix, eye=a.eye, clear_depth=a.clear_depth) if separate else compare(a.prefix, eye=a.eye, tol=a.tol, clear_depth=a.clear_depth)
         r['own'] = own_from_log(a.prefix, a.eye, a.log)
     except ValueError as e:
         print('hull layer compare: %s' % e)
         return 2
     print(report(r))
-    return {'CONFIRMED': 0, 'REFUTED': 3}.get(r['verdict'], 1)
+    return {'CONFIRMED': 0, 'TAKEN OUT': 0, 'REFUTED': 3, 'NOT TAKEN OUT': 3}.get(r['verdict'], 1)
 
 
 if __name__ == '__main__':

@@ -24,6 +24,19 @@
 //      the game's HDR after the eye's last lighting draw, and the private depth after the filter, go to
 //      edvr_logs\eyes\eye_<stamp>_HullHdr.bin, _GameHdrLit.bin and _HullDepth.bin (eye 1: _e1), EDVRTEX1.
 //
+// Step 2 (diag.hull_layer = separate; "Step 2 build"): everything above, and the own ship is taken out of the game's main
+// G-buffer, so the terrain behind it is drawn. THE OWN SHIP IS THEN NOT SHOWN until the composite (Step 3) lands.
+//   5. The seed runs before the seed draw itself is issued (hullLayerBeforeMainDraw), so the own mask exists for it.
+//   6. From the seed to the end of the eye's G-buffer, every hull-family draw and hull decal (VS BBE5) that engine motion
+//      substituted is issued with the own-discard variant of its patched pixel shader (engineVelocityOwnDiscardPs), with
+//      the eye's own mask at PS t127: a pixel whose record is own is discarded. The patched shader and the game's t127 go
+//      back right after the game's issue (hullLayerAfterMainDraw), before the private re-issue, which draws normally.
+//      No seed, no slot target, no variant: the draw is issued as the game made it (the ship stays).
+//   7. The own decals are re-issued into the private layer too (filtered like the hull), when they export the slot.
+//   8. The dump adds the game's G-buffer RT0 and main depth after the eye's G-buffer (_GameGbuf0, _GameDepth).
+//   The own forward draws after the lighting (VS 88DCF116, 025B4B9F, 0B5981F2, F464E27C, 6DB587D2, 2B3F53DD) are not
+//   engine-motion families: they still draw into the main pass (an open item of the doc).
+//
 // Cost with the key off: one bool load per draw (hullLayerWanted). VR owner context only.
 #pragma once
 
@@ -37,13 +50,23 @@ class Config;
 
 namespace detail {
 extern bool g_hullLayerOn;
+extern bool g_hullLayerSeparate;
 }  // namespace detail
 
 // The draw path's one load.
 inline bool hullLayerWanted() { return detail::g_hullLayerOn; }
+// diag.hull_layer = separate: the draw path's pre-draw load (only read while hullLayerWanted).
+inline bool hullLayerSeparateWanted() { return detail::g_hullLayerSeparate; }
 
-// diag.hull_layer = off | dump. Live; a change is said once.
+// diag.hull_layer = off | dump | separate. Live; a change is said once.
 void hullLayerConfigure(Config& cfg);
+
+// Separate mode, before the game's own issue of an owner-context draw (after engine motion's substitution), with the
+// draw's instance count and StartInstanceLocation: at the eye's seed draw the own mask is made; inside the eye's G-buffer
+// window a hull-family or hull decal draw gets the own-discard variant and the mask at PS t127. True: the caller calls
+// hullLayerAfterMainDraw right after the game's issue (and before hullLayerBegin), which puts the shader and t127 back.
+bool hullLayerBeforeMainDraw(ID3D11DeviceContext* ctx, UINT instances, UINT startInstance);
+void hullLayerAfterMainDraw(ID3D11DeviceContext* ctx);
 
 // Right after the game's own issue of an owner-context draw, with the draw's bindings still bound, and the draw's
 // instance count and StartInstanceLocation (1 and 0 for a draw that is not instanced). True: the private targets and
