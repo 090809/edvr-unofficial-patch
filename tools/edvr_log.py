@@ -10614,6 +10614,21 @@ H_DESKTOP_STOP = r"desktop window: stopped \((?P<reason>.*)\); drawn=(?P<drawn>\
 H_DESKTOP_ACTIVE = r"desktop window: active #(?P<n>\d+)"   # F173: the window took the eye images (an activation): evidence that 3D was on
 H_DESKTOP_DECLINED = r"desktop window: not drawing -- (?P<why>.*)$"   # F173: the draw declined, and why
 H_DESKTOP_OTHER = r"desktop window: (?!setting |10 s: |stopped \()"
+# The hull layer, Step 1 (diag.hull_layer, TEMPORARY; src\d3d11\hull_layer.cpp, docs\research-own-hull-layer-2026-11-08.md): lines of the graphics log with no build tag, read the
+# frame generation shadow's way. The key line is state (said at each change, kept whatever --since says); the 30 s report and the dump lines are events.
+H_HULL = "hull layer"
+H_HULL_LABEL = "hull layer: "
+H_HULL_KEY = r"hull layer: diag\.hull_layer=(?P<mode>\w+) \(TEMPORARY"
+H_HULL_REPORT = (r"hull layer: state=(?P<state>[\w-]+) frames=(?P<frames>\d+) eye_frames=(?P<eye_frames>\d+) blocks=(?P<blocks>\d+) not_found=(?P<not_found>\d+) "
+                 r"hull_draws=(?P<lo>\d+)/(?P<mid>\d+)/(?P<hi>\d+) gap_draws=(?P<gap>\d+) reissued=(?P<reissued>\d+) clears=(?P<clears>\d+) "
+                 r"subst=copy:(?P<s_copy>\d+),mask:(?P<s_mask>\d+),sun:(?P<s_sun>\d+) no_counterpart=copy:(?P<n_copy>\d+),mask:(?P<n_mask>\d+),sun:(?P<n_sun>\d+) "
+                 r"ended=terrain:(?P<e_terrain>\d+),non_pool:(?P<e_nonpool>\d+),gap:(?P<e_gap>\d+),frame:(?P<e_frame>\d+)")
+H_HULL_DUMP = (r"hull layer: dump (?P<stamp>\S+) eye (?P<eye>\d) frame (?P<frame>\d+): HullHdr (?P<w>\d+)x(?P<h>\d+) format (?P<fmt>\d+) (?P<hull>[\w ]+), "
+               r"GameHdrSun (?P<game>[\w ]+), HullDepth (?P<depth>[\w ]+); block (?P<block>\d+) draws")
+H_HULL_NOTHING = r"hull layer: dump (?P<stamp>\S+) frame (?P<frame>\d+): nothing captured"
+# The rest of its lines (the dump armed, a private copy made, a cap or a create failure said once, an unknown key value): matched, not judged.
+H_HULL_OTHER = (r"hull layer: (?:dump \S+ armed|private copy made|\d+ private (?:copies|views) held|a \d+x\d+ format \d+ target is multisampled|the private copy of|"
+                r"a private view|diag\.hull_layer=\S+ is not off or dump)")
 # Frame generation, Phase 1 (fix.frame_generation_shadow, TEMPORARY; src\common\framegen_shadow_report.h): two lines of the graphics log with no build tag, read the way the desktop
 # window's are. The armed line is said once per change to on (so health_scan keeps it whatever --since says); the report line every second.
 H_FRAMEGEN = "frame generation shadow"
@@ -10790,7 +10805,7 @@ H_F125_LABEL = "native on foot log (F125)"
 H_F125_RE = re.compile(r"native on foot log \(F125\): detail (?P<detail>on|off), summary window (?P<wl>\d+) s")
 # Rules whose absence says nothing about a feature, so a log without their lines does not list them as not present: every log written before F125 has no F125
 # line, and its report stays as it was.
-HEALTH_QUIET_WHEN_ABSENT = frozenset((H_F125, H_WORLD, H_DESKTOP, H_SRV_TURRET, H_FRAMEGEN, H_FRAMEGEN_SYNTH, H_FRAMEGEN_LOCK))   # the frame generation shadow is off by default and says nothing then; world scale writes nothing while the value stays 100; the desktop window nothing while the setting is game; the SRV turret view nothing in a log with no VR profile
+HEALTH_QUIET_WHEN_ABSENT = frozenset((H_F125, H_WORLD, H_DESKTOP, H_SRV_TURRET, H_FRAMEGEN, H_FRAMEGEN_SYNTH, H_FRAMEGEN_LOCK, H_HULL))   # the frame generation shadow is off by default and says nothing then; world scale writes nothing while the value stays 100; the desktop window nothing while the setting is game; the SRV turret view nothing in a log with no VR profile
 
 # ---- F125: summary windows (the on-foot log diet) ----
 # By default an on-foot summary line covers a window of 10 s, 1 s with log.on_foot_detail = on, and 1 to 10 s when a window is flushed early (a held-item change,
@@ -16931,6 +16946,41 @@ def _hj_desktop_window(rows, ctx):
     return ("OK", text)
 
 
+def _hj_hull_layer(rows, ctx=None):
+    """The hull layer, Step 1 (diag.hull_layer, TEMPORARY; src\\d3d11\\hull_layer.cpp): ran is the key line naming dump, applied is a 30 s report line with re-issues and
+    the sun stage substituted. OK when the window's reports re-issued the block and substituted the sun; PARTIAL when the block was re-issued but no sun draw got its
+    private counterpart; NEVER APPLIED when the key is on and no report follows (the layer never reported), or the reports say it ran and found nothing (no eye pass, or
+    an eye pass with no block); None with no line, or the key off and no report."""
+    keys = rows.get("key", [])
+    reports = rows.get("report", [])
+    dumps = rows.get("dump", [])
+    nothing = rows.get("nothing", [])
+    on = bool(keys) and keys[-1]["mode"] != "off"
+    if not reports and not dumps and not nothing and not on:
+        return None
+    if not reports:
+        return ("NEVER APPLIED", "diag.hull_layer=%s but no 'hull layer: state=' line follows in the window: the layer never reported (no 30 s window closed, or its "
+                                 "boundary path is dead)" % (keys[-1]["mode"] if keys else "?"))
+    total = {k: sum(int(r[k]) for r in reports) for k in ("frames", "eye_frames", "blocks", "not_found", "reissued", "clears", "s_copy", "s_mask", "s_sun",
+                                                          "n_copy", "n_mask", "n_sun")}
+    last = reports[-1]
+    text = ("%d report line(s): %d frame(s), %d eye-frame(s) with the cockpit shell, the block found in %d (none in %d frame(s)), hull draws an eye %s/%s/%s "
+            "(min/median/max, the last line; the ledgers say 37-40), %d re-issue(s), %d clear(s); substituted copy %d, mask %d, sun %d; no counterpart in "
+            "copy %d, mask %d, sun %d frame(s)" % (len(reports), total["frames"], total["eye_frames"], total["blocks"], total["not_found"], last["lo"], last["mid"],
+                                                   last["hi"], total["reissued"], total["clears"], total["s_copy"], total["s_mask"], total["s_sun"], total["n_copy"],
+                                                   total["n_mask"], total["n_sun"]))
+    if dumps:
+        text += "; dump %s: %s" % (dumps[-1]["stamp"], ", ".join("eye %s HullHdr %s GameHdrSun %s HullDepth %s (block %s)" % (d["eye"], d["hull"], d["game"], d["depth"], d["block"])
+                                                         for d in dumps if d["stamp"] == dumps[-1]["stamp"]))
+    if nothing:
+        text += "; %d dump(s) captured nothing" % len(nothing)
+    if total["reissued"] == 0:
+        why = "no eye pass drew the cockpit shell" if total["eye_frames"] == 0 else "the eye passes drew the cockpit shell but no own-ship block followed"
+        return ("NEVER APPLIED", text + ": it ran and re-issued nothing (%s)" % why)
+    if total["s_sun"] == 0:
+        return ("PARTIAL", text + ": the block was re-issued but no sun draw got its private counterpart")
+    return ("OK", text)
+
 def _hj_framegen_shadow(rows, ctx=None):
     """Frame generation, Phase 1 (fix.frame_generation_shadow, TEMPORARY): ran is the armed line (the first treated eye with the key on), applied is a report line (the
     scorer's one-second line). OK when at least one report line is in the window; NEVER APPLIED when the armed line is there and no report line is (the scorer armed and
@@ -18367,6 +18417,14 @@ HEALTH_RULES = (
         ("gate_disengage", H_FRAMEGEN_GATE_DISENGAGE),
         ("gate_old", H_FRAMEGEN_GATE_OLD),
     ), _hj_framegen_lock),
+    # The hull layer, Step 1 (diag.hull_layer, TEMPORARY): the key, the 30 s report and the dump lines, graphics-log lines with no build tag.
+    _hrule(H_HULL, (), (H_HULL_LABEL,), (
+        ("key", H_HULL_KEY),
+        ("report", H_HULL_REPORT),
+        ("dump", H_HULL_DUMP),
+        ("nothing", H_HULL_NOTHING),
+        ("_", H_HULL_OTHER),
+    ), _hj_hull_layer),
     # The SRV turret view (issue 140): lines of the graphics log that carry no build tag (health_scan reads them, as it reads the desktop window's, before it drops the untagged lines).
     _hrule(H_SRV_TURRET, (), H_SRV_TURRET_LABELS, (
         ("setting", H_SRV_TURRET_SETTING),
@@ -18442,7 +18500,24 @@ def health_scan(text, since=None, until=None):
     synth = next(r for r in HEALTH_RULES if r.name == H_FRAMEGEN_SYNTH)
     lock = next(r for r in HEALTH_RULES if r.name == H_FRAMEGEN_LOCK)
     turret =next(r for r in HEALTH_RULES if r.name == H_SRV_TURRET)
+    hull = next(r for r in HEALTH_RULES if r.name == H_HULL)
     for raw in text.splitlines():
+        if H_HULL_LABEL in raw:
+            # The hull layer's lines carry no build tag. The key line is state, kept whatever --since says; the rest are events and are cut by the window.
+            sm = HEALTH_STAMP_RE.match(raw)
+            tod = int(sm.group(1)) * 3600 + int(sm.group(2)) * 60 + int(sm.group(3)) + int(sm.group(4)) / 1000.0 if sm else None
+            body = raw[sm.end():] if sm else raw
+            for kind, rx in hull.kinds:
+                g = rx.search(body)
+                if g:
+                    if kind != "_" and (kind == "key" or _health_in_window(tod, since, until)):
+                        rows[H_HULL].setdefault(kind, []).append(dict(g.groupdict(), _t=tod))
+                    break
+            else:
+                u = unparsed[H_HULL]
+                u[0] += 1
+                u[1] = u[1] or raw.strip()[:160]
+            continue
         if "srv turret" in raw and any(label in raw for label in H_SRV_TURRET_LABELS):
             # The SRV turret view's lines carry no build tag either. The settings and vehicle lines are state, so every one is kept; the rest are events and are cut by the window.
             sm = HEALTH_STAMP_RE.match(raw)
@@ -25748,6 +25823,46 @@ def self_test_health():
               has=["slot pose: 44 scored, miss max 1.20 mm / 0.150 deg, lead median 21.5 ms (last line)"])
         check("frame generation shadow: a pose line from before the slot tail still parses", fg_all, 0, [("OK", FG)], lacks=["UNPARSED", "slot pose:"],
               extra=["--runtime-file", runtime([fg_pose().split(" slot=")[0]])])
+        # ---- the hull layer (diag.hull_layer, TEMPORARY): the graphics log's untagged lines, rendered from the C format strings in src\d3d11\hull_layer.cpp ----
+        hlsrc = read_text(os.path.join(repo_root(), "src", "d3d11", "hull_layer.cpp"))
+
+        def RH(needle, *vals):
+            key = "hl:" + needle
+            if key not in fmts:
+                fmts[key] = health_c_format(hlsrc, needle)
+            if fmts[key] is None:
+                raise AssertionError("hull layer: no log format holds %r: the --health rule that reads it is out of date" % needle)
+            return health_render(fmts[key], vals)
+
+        def hl_key(mode="dump"):
+            return RH("hull layer: diag.hull_layer=%s (TEMPORARY", mode)
+
+        def hl_report(state="applied", eye_frames=5400, blocks=5400, not_found=0, hd=(37, 39, 40), reissued=232200, sun=21600, nocp=(0, 0, 0)):
+            return RH("hull layer: state=%s", state, 2700, eye_frames, blocks, not_found, hd[0], hd[1], hd[2], 120, reissued, blocks, 10800, 32400, sun,
+                      nocp[0], nocp[1], nocp[2], 0, blocks, 0, 0)
+
+        def hl_dump(eye=0, hull="written"):
+            return RH("hull layer: dump %ls eye %d", "123456789001", eye, 1234, 2016, 2240, 26, hull, "written", "written", 39)
+
+        HL, hl_base = H_HULL, [f90_part()]
+        check("hull layer: no line at all, nothing said (the key off)", hl_base, 0, [("OK", F90S)], lacks=["hull layer"])
+        check("hull layer: the key off and no report says nothing", hl_base + [hl_key("off")], 0, [("OK", F90S)], lacks=[row("NEVER APPLIED", HL), row("OK", HL)])
+        check("hull layer: on, re-issuing and lighting, with a dump, is OK", hl_base + [hl_key(), RH("hull layer: dump %ls armed", "123456789001"), hl_dump(), hl_dump(eye=1),
+                                                                                   RH("hull layer: private copy made", 2016, 2240, 26, 0x28, 5), hl_report()], 0, [("OK", HL)],
+              has=["the block found in 5400 (none in 0 frame(s)), hull draws an eye 37/39/40", "substituted copy 10800, mask 32400, sun 21600",
+                   "dump 123456789001: eye 0 HullHdr written GameHdrSun written HullDepth written (block 39), eye 1 HullHdr written"], lacks=["UNPARSED", "do not match"])
+        check("hull layer: on and never reported is NEVER APPLIED", hl_base + [hl_key()], 3, [("NEVER APPLIED", HL)], has=["the layer never reported"])
+        check("hull layer: an eye pass with no block is NEVER APPLIED, ran and found nothing", hl_base + [hl_key(), hl_report("no-block", blocks=0, not_found=2700, hd=(0, 0, 0),
+                                                                                                                  reissued=0, sun=0, nocp=(2700, 2700, 2700))], 3,
+              [("NEVER APPLIED", HL)], has=["it ran and re-issued nothing (the eye passes drew the cockpit shell but no own-ship block followed)"])
+        check("hull layer: no eye pass at all is NEVER APPLIED, and says so", hl_base + [hl_key(), hl_report("no-eye-pass", eye_frames=0, blocks=0, not_found=2700,
+                                                                                                           hd=(0, 0, 0), reissued=0, sun=0)], 3,
+              [("NEVER APPLIED", HL)], has=["no eye pass drew the cockpit shell"])
+        check("hull layer: the block re-issued and the sun never substituted is PARTIAL", hl_base + [hl_key(), hl_report("partial", sun=0, nocp=(0, 0, 2700))], 0,
+              [("PARTIAL", HL)], has=["no sun draw got its private counterpart"])
+        check("hull layer: a report inside --since is read, the key before it is kept", hl_base + [(1, hl_key()), (70, hl_report())], 0, [("OK", HL)], extra=["--since", "10:01:00"])
+        check("hull layer: a drifted report line is counted as unparsed and is no report", hl_base + [hl_key(), hl_report().replace(" reissued=", " reissues=")], 3,
+              [("NEVER APPLIED", HL)], has=["line(s) the rule's patterns do not match"])
         # ---- the SRV turret view: the graphics log's untagged lines, rendered from the C format strings in src\d3d11\srv_turret.cpp and (the geometry shader's creation line) shader_swap.cpp ----
         stsrc = read_text(os.path.join(repo_root(), "src", "d3d11", "srv_turret.cpp"))
 
