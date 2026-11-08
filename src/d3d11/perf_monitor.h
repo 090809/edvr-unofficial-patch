@@ -23,7 +23,9 @@
 //                                    those passes already keep
 //   FRAME GENERATION (only with      Lock's state and last second from the
 //   fix.frame_generation or its      runtime's last slot; the synthesizer's
-//   shadow key on)                   last window and VRAM; once a second
+//   shadow key on)                   last window and VRAM; once a second;
+//                                    in auto (2.4) the performance gate's state
+//                                    and reason
 //
 // THE COST, by design: the once-a-second samplers run ONLY while the page
 // is showing (a two-second grace so the first numbers are there when it

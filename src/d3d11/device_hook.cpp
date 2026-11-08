@@ -42,6 +42,7 @@ extern "C" IMAGE_DOS_HEADER __ImageBase;
 #include "../common/seat_context.h"   // seatContextPublish: the seat memory's word for the runtime
 #include "../common/guard.h"
 #include "../common/hotkey.h"
+#include "../common/framegen_gate.h"   // frame generation 2.4: the hotkey's off <-> last value (frameGenToggle)
 #include "fss_res.h"
 #include "journal_watch.h"
 #include "native_on_foot.h"  // nativeOnFootFrameBoundary (the render-mode setter hook, flight F0)
@@ -290,6 +291,8 @@ struct State {
     // The frame generation key: flips fix.frame_generation through the
     // Performance page's row (an A/B in the headset). Unbound by default.
     Hotkey frameGenKey;
+    // Phase 2.4: the value the key last turned off (auto, on), which the next press restores; Off: none yet, so auto.
+    FrameGenMode frameGenLastOn = FrameGenMode::Off;
     // What each of those was last bound from (the ini text), so a reload
     // that changes one re-resolves it and one that does not says nothing: the
     // settings menu's Hotkeys page writes them while the game runs.
@@ -1382,11 +1385,15 @@ void tickHotkeys() {
         } else if (!menuRowValue("fix.frame_generation", was, sizeof(was))) {
             Log::get().note("hotkey: frame generation key pressed at frame %llu, but the settings menu has no fix.frame_generation row this session; nothing changed.", frame);
         } else {
-            const bool on = _stricmp(was, "on") != 0;
-            if (menuSetRowValue("fix.frame_generation", on ? "on" : "off")) {
+            // Phase 2.4: off goes back to the value the key last turned off (auto until there is one), anything else goes off and is remembered.
+            const FrameGenMode next = frameGenToggle(frameGenModeParse(was), g_state->frameGenLastOn);
+            const char* nextName = frameGenModeName(next);
+            if (menuSetRowValue("fix.frame_generation", nextName)) {
                 Log::get().note("hotkey: frame generation key: fix.frame_generation %s -> %s at frame %llu (written to the ini like the Performance page's row).",
-                                was[0] ? was : "(unset)", on ? "on" : "off", frame);
-                menuShowNotice(on ? "Frame generation: on" : "Frame generation: off");
+                                was[0] ? was : "(unset)", nextName, frame);
+                static char toast[48];
+                snprintf(toast, sizeof(toast), "Frame generation: %s", nextName);
+                menuShowNotice(toast);
             }
         }
     }
@@ -2160,7 +2167,7 @@ void configureDiagnosticHotkeys() {
          "hotkey.frame_generation", "frame generation",
          "hotkey: frame_generation is set but bound nothing, so the frame generation key is off this session "
          "(the Performance page's row still works).",
-         " Each press flips fix.frame_generation off/on (saved to the ini, like the Performance page's row) and says so in a toast."},
+         " Each press turns fix.frame_generation off, or back to the value it last turned off (auto at first; saved to the ini, like the Performance page's row), and says so in a toast."},
     };
     for (Item& it : items) {
         if (!first && *it.applied == it.value) continue;

@@ -63,6 +63,7 @@
 #include "binding_shadow.h"   // the render target a camera write is drawn into (bindingGet, bindingResolve)
 #include "framegen_shadow.h"   // frame generation Phase 1 (fix.frame_generation_shadow, TEMPORARY)
 #include "framegen_synth.h"    // frame generation Phase 2.1, the synthesizer (the same key; nothing it builds is shown)
+#include "../common/framegen_gate.h"   // frame generation Phase 2.4: fix.frame_generation's off / auto / on and word 17
 #include "../common/native_sharpen.h"   // Phase 2.3b: B's door, which finishes S (nativeSharpenActive, nativeSharpenWillSharpen)
 #include "../common/native_frame.h"   // nativeFrameSetFrameGenShadow: the key, carried to the runtime in a version 12 answer
 #include "sky_ring.h"   // I-2: the sky ring (diag.sky_ring, TEMPORARY; docs/sky-flicker-2026-10-13.md)
@@ -1288,7 +1289,13 @@ ID3D11Texture2D* g_eyeRawStaging[kEyeRun] = {};
 ID3D11Texture2D* g_eyeTreatedStaging[kEyeRun] = {};
 ID3D11Texture2D* g_eyeDecisionStaging[kEyeRun] = {};
 ID3D11Texture2D* g_eyePreUiStaging[kEyeRun] = {};
-std::atomic<bool> g_frameGenLockKey{false};   // fix.frame_generation (Phase 2.3, TEMPORARY): Lock 2:1 forced; set where the keys are read, read by the treat
+std::atomic<bool> g_frameGenLockKey{false};   // fix.frame_generation (Phase 2.3, TEMPORARY): Lock 2:1 forced; set where the keys are read, read by the treat. 2.4: auto or on
+std::atomic<uint8_t> g_frameGenMode{0};       // Phase 2.4: fix.frame_generation as framegen_gate.h FrameGenMode (0 off, 1 auto, 2 on)
+std::atomic<bool> g_frameGenAdmit{false};     // Phase 2.4: the gate admits Lock (auto), so a reload of the keys keeps word 17 as the gate left it
+std::atomic<bool> g_frameGenAutoHeld{false};  // Phase 2.4: auto with a runtime that cannot read it (perf_monitor.cpp's gate): the synthesizer is held, frame generation behaves as off
+std::atomic<uint32_t> g_frameGenCameraJumps{0};   // Phase 2.4: the gate's camera cut (temporalPassFrameGenCameraJumps)
+// The synthesizer runs for Lock: auto or on, unless auto is held for an older runtime.
+inline bool frameGenLockSynth() { return g_frameGenLockKey.load(std::memory_order_relaxed) && !g_frameGenAutoHeld.load(std::memory_order_relaxed); }
 ID3D11Texture2D* g_eyeSynthStaging[kEyeRun] = {};   // the frame-generation synthesizer's f = 0.5 S of frame k (fix.frame_generation_shadow on; S<k> beside the P<k> pre-interface output and the next frame's P<k+1>)
 ID3D11Texture2D* g_eyeSynthBStaging[kEyeRun] = {};  // Phase 2.3b: B of frame k as its door finished it, in S<k>'s crop (SB<k>), staged with the finished S
 int              g_eyeRunLeft = 0;    // captures still to take
@@ -5196,7 +5203,7 @@ void* temporalInner(void* srcTex, int eye, const float* bounds,
                     }
                     // Frame generation, Phase 1 (fix.frame_generation_shadow, TEMPORARY): the key off costs the branch. Phase 2.3: fix.frame_generation (Lock) runs the synthesizer too,
                     // and the scorer only under its own key.
-                    if (usedDlaa && (frameGenShadowOn() || g_frameGenLockKey.load(std::memory_order_relaxed))) {
+                    if (usedDlaa && (frameGenShadowOn() || frameGenLockSynth())) {
                         FrameGenShadowFrame fg;
                         fg.renderW = w; fg.renderH = h; fg.outW = oW; fg.outH = oH;
                         fg.outSrv = e.dlOutSrv;
@@ -5256,6 +5263,7 @@ void* temporalInner(void* srcTex, int eye, const float* bounds,
                             for (int i = 0; i < 3; ++i) sy.deltas.th[i] = p.tvUsed[i];
                             sy.depthWritten = zcWritten;
                             sy.cameraJump = gateJump || jumpedNow;
+                            if (eye == 0 && sy.cameraJump) g_frameGenCameraJumps.fetch_add(1, std::memory_order_relaxed);   // 2.4: the gate's camera cut
                             sy.wantShown = dumpFrame;
                             // Replay capture (.agents/framegen-replay-format.md): the dump's first six left-eye frames, with what the constant block and the bench need beside the Hd and th above.
                             memcpy(sy.deltas.W, fg.deltas.W, sizeof(sy.deltas.W));
@@ -5275,7 +5283,7 @@ void* temporalInner(void* srcTex, int eye, const float* bounds,
                             sy.slotSequence = slotNow ? e.fgSlotSequence : 0;
                             // Phase 2.3: under fix.frame_generation the f = 0.5 S is built on every frame (S is shown in every other slot); the f = 1 S and its score run only
                             // under the shadow key while Lock is not engaged (the 2.2 alternation).
-                            sy.everyHalf = g_frameGenLockKey.load(std::memory_order_relaxed) && (!frameGenShadowOn() || (slotNow && nativeTemporalFrameGenLock()));
+                            sy.everyHalf = frameGenLockSynth() && (!frameGenShadowOn() || (slotNow && nativeTemporalFrameGenLock()));
                             // The dump stages the f = 0.5 S while the module still holds it (on the transfer's path S is the runtime's once it is handed over).
                             if (dumpFrame) {
                                 sy.shownSink = [](void* ctxp, ID3D11DeviceContext* c, ID3D11Texture2D* shown) {
@@ -5837,17 +5845,28 @@ void temporalPassConfigure(Config& cfg) {
         nativeFrameSetFrameGenShadow(frameGenShadowOn());
         // Phase 2.3 (TEMPORARY; on = Lock 2:1 forced, for test flights; a row of the Performance page since 2026-11-07): live, VR only like the shadow key. Carried to the runtime in a version 12 answer's word 17; it
         // runs the synthesizer as the shadow key does.
+        // Phase 2.4: auto, Lock only while the performance gate admits it (perf_monitor.cpp frameGenGateFrame, common/framegen_gate.h): word 17 is 2 (closed) until the gate says
+        // otherwise, 3 while it admits Lock. off is exactly as before (word 0, no synthesizer, no gate line); on is 2.3's forced Lock (word 1).
         {
-            const bool lockKey = cfg.getString("fix.frame_generation", "off") == "on";
+            const std::string text = cfg.getString("fix.frame_generation", "off");
+            const FrameGenMode fgMode = frameGenModeParse(text.c_str());
+            const bool lockKey = fgMode != FrameGenMode::Off;
             static bool lockTold = false;
-            if (!runtimeFlatProfile() && (!lockTold || lockKey != g_frameGenLockKey.load(std::memory_order_relaxed))) {
+            if (!runtimeFlatProfile() && (!lockTold || static_cast<uint8_t>(fgMode) != g_frameGenMode.load(std::memory_order_relaxed))) {
                 lockTold = true;
-                Log::get().note("frame generation: fix.frame_generation=%s (%s).", lockKey ? "on" : "off",
-                                lockKey ? "Lock 2:1 forced: the synthesizer builds S on every frame and the runtime shows it between Elite's frames once Lock engages"
-                                        : "no Lock: the frame loop is today's");
+                Log::get().note("frame generation: fix.frame_generation=%s (%s).", frameGenModeName(fgMode),
+                                fgMode == FrameGenMode::On ? "Lock 2:1 forced: the synthesizer builds S on every frame and the runtime shows it between Elite's frames once Lock engages"
+                                : fgMode == FrameGenMode::Auto ? "Lock 2:1 only while the performance gate admits it: the synthesizer builds S on every frame, and the "
+                                                               "\"frame generation gate:\" line says each second whether Lock is allowed and why not"
+                                                             : "no Lock: the frame loop is today's");
             }
+            if (static_cast<uint8_t>(fgMode) != g_frameGenMode.load(std::memory_order_relaxed)) {
+                g_frameGenAutoHeld.store(false, std::memory_order_relaxed);
+                g_frameGenAdmit.store(false, std::memory_order_relaxed);
+            }
+            g_frameGenMode.store(static_cast<uint8_t>(fgMode), std::memory_order_relaxed);
             g_frameGenLockKey.store(lockKey, std::memory_order_relaxed);
-            nativeFrameSetFrameGenLock(lockKey);
+            nativeFrameSetFrameGenLockWord(frameGenLockWord(fgMode, g_frameGenAdmit.load(std::memory_order_relaxed)));
         }
         frameGenSynthConfigure(frameGenShadowOn() || g_frameGenLockKey.load(std::memory_order_relaxed));   // the synthesizer rides either key (no key of its own)
     }
@@ -6434,6 +6453,14 @@ void temporalPassNoteFrameGenSlot(int eye, const float* rot, const float* t, boo
     e.fgSlotSequence = sequence;
     e.fgSlotFrame = g_rowsFrame;
 }
+uint8_t temporalPassFrameGenMode() { return g_frameGenMode.load(std::memory_order_relaxed); }
+void temporalPassFrameGenGate(bool admit, bool hold) {
+    if (g_frameGenMode.load(std::memory_order_relaxed) != static_cast<uint8_t>(FrameGenMode::Auto)) return;
+    g_frameGenAdmit.store(admit && !hold, std::memory_order_relaxed);
+    g_frameGenAutoHeld.store(hold, std::memory_order_relaxed);
+    nativeFrameSetFrameGenLockWord(frameGenLockWord(FrameGenMode::Auto, admit && !hold));
+}
+uint32_t temporalPassFrameGenCameraJumps() { return g_frameGenCameraJumps.load(std::memory_order_relaxed); }
 void temporalPassStageFrameGenDump(ID3D11DeviceContext* ctx, int k, ID3D11Texture2D* finishedS, ID3D11Texture2D* finishedB) {
     if (!ctx || k < 0 || k >= kEyeRun) return;
     uint32_t wantW = 0, wantH = 0, cw = 0, ch = 0;

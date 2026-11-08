@@ -2196,10 +2196,11 @@ void buildMonitor(MenuContent& c) {
         l.style = kMenuNote;
         l.badge = kBadgeNone;
     }
-    // FRAME GENERATION, only while fix.frame_generation or fix.frame_generation_shadow is on (perf_monitor.h): a heading and up to four lines, once a second.
+    // FRAME GENERATION, only while fix.frame_generation (auto or on) or fix.frame_generation_shadow is on (perf_monitor.h): a heading and up to five lines (2.4: the gate's in
+    // auto), once a second.
     {
-        char fg[4][96];
-        const int fgCount = perfMonitorFrameGenLines(fg, 4);
+        char fg[5][96];
+        const int fgCount = perfMonitorFrameGenLines(fg, 5);
         if (fgCount > 0 && c.lineCount + 1 + fgCount <= kMenuMaxLines) {
             MenuLine& h = c.lines[c.lineCount++];
             strncpy(h.left, "FRAME GENERATION", sizeof(h.left) - 1);

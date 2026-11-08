@@ -305,6 +305,14 @@ bool nativeTemporalFrameGenLock();
 // smaller one reads as unknown), with that slot's age. Any thread; the slot's own lock.
 struct FrameGenMonitorRuntime;
 FrameGenMonitorRuntime nativeTemporalFrameGenMonitor();
+// Frame generation, Phase 2.4 (fix.frame_generation = off | auto | on; common/framegen_gate.h): the mode as the keys were last read (off in the flat profile), as framegen_gate.h's
+// FrameGenMode values (0 off, 1 auto, 2 on). Frame thread.
+uint8_t temporalPassFrameGenMode();
+// The gate's decision in auto (perf_monitor.cpp, once a frame): word 17 says whether Lock is admitted (framegen_gate.h frameGenLockWord), and hold stops the synthesizer while
+// the runtime cannot read auto (an older openvr_api.dll: frame generation then behaves as off). Ignored unless the mode is auto. Frame thread.
+void temporalPassFrameGenGate(bool admit, bool hold);
+// How many treats the camera gate dropped or carried the rows of, or the origin jumped on, while the synthesizer ran (the left eye): the gate's camera cut. Any thread.
+uint32_t temporalPassFrameGenCameraJumps();
 
 // probe.w bits 64 and 256 of the temporal shader: t6 (the smoke's depth) / t7
 // (the private UI depth) NOT bound, so zSceneAt skips the fetch and uses the

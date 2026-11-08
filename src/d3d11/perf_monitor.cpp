@@ -41,6 +41,8 @@
 #include "framegen_shadow.h"  // frameGenShadowVramBytes: the FRAME GENERATION block's game-side bytes
 #include "framegen_synth.h"   // frameGenSynthMonitor: the block's synthesizer line
 #include "../common/framegen_monitor_text.h"
+#include "../common/framegen_gate.h"   // frame generation 2.4: the performance gate
+#include "journal_watch.h"             // the gate's context and cuts (Status.json: on foot, in a vehicle, GuiFocus; the jump tunnel)
 #include <mutex>
 // fsr3_engine.h is deliberately NOT included: the EDVR PASSES tile reaches
 // AMD's price through temporal_pass.h's temporalPassTrainedTotals, which
@@ -375,10 +377,112 @@ std::mutex g_fgMu;
 char g_fgLines[kFrameGenMonitorMaxLines][kFrameGenMonitorLineChars] = {};
 int g_fgCount = 0;
 
+// FRAME GENERATION, Phase 2.4: the performance gate (common/framegen_gate.h) while fix.frame_generation is auto or on. Once a frame on this thread, after the native
+// history's observe: the measurements (the GPU TIME and CPU TIME series' median and maximum over 2 s, the display and predicted periods, Elite's real rate as the CPU series'
+// count, the synthesizer's last window, Lock's last windows from the runtime's slot) are refreshed once a second, the context and the cuts read every frame. In auto its decision
+// goes to the runtime in word 17 (temporalPassFrameGenGate). Off: one load and a return, nothing said.
+struct FrameGenGateWiring {
+    FrameGenGate gate;
+    bool active = false;                 // auto or on at the last frame
+    uint64_t measureMs = 0;              // the last refresh of the measurements (and the one-second line)
+    FrameGenGateInputs measured;         // as last refreshed
+    uint32_t cameraJumps = 0;            // temporalPassFrameGenCameraJumps at the last frame
+    uint32_t curPairs = 0, curLate = 0, prevPairs = 0, prevLate = 0;   // Lock's last window from the slot, at this refresh and the one before
+    uint32_t noRuntimeS = 0;             // refreshes in a row with VR frames and no slot of 2.4's size
+    bool hold = false, oldSaid = false;  // the synthesizer held for an older runtime; its line said (once a session)
+};
+FrameGenGateWiring g_fgGate;
+
+void frameGenGateFrame(State& s) {
+    FrameGenGateWiring& w = g_fgGate;
+    const FrameGenMode mode = static_cast<FrameGenMode>(temporalPassFrameGenMode());
+    if (mode == FrameGenMode::Off) {
+        if (w.active) {
+            const bool said = w.oldSaid;
+            w = FrameGenGateWiring{};
+            w.oldSaid = said;
+        }
+        return;
+    }
+    const uint64_t now = GetTickCount64();
+    const FrameGenMonitorRuntime rt = nativeTemporalFrameGenMonitor();
+    const bool rtFresh = rt.known == kFrameGenMonitorSlot && rt.ageMs <= kFrameGenMonitorStaleMs;
+    const uint32_t jumps = temporalPassFrameGenCameraJumps();
+    if (!w.active) {
+        w.active = true;
+        w.cameraJumps = jumps;
+    }
+    const bool refresh = !w.measureMs || now - w.measureMs >= 1000;
+    if (refresh) {
+        w.measureMs = now;
+        FrameGenGateInputs m;
+        if (nativeMenuActive()) {
+            m.displayMs = s.nativeHistory.basePeriodMs(now);
+            m.predictedMs = s.nativeHistory.predictedPeriod(now);
+            const NativePerfSpread g = s.nativeHistory.applicationGpuSpread(now, kFrameGenGateWindowMs);
+            const NativePerfSpread c = s.nativeHistory.applicationCpuSpread(now, kFrameGenGateWindowMs);
+            m.gpuN = g.count; m.gpuMedMs = g.medianMs; m.gpuMaxMs = g.maxMs;
+            m.cpuN = c.count; m.cpuMedMs = c.medianMs; m.cpuMaxMs = c.maxMs;
+            m.realFps = static_cast<double>(c.count) * 1000.0 / static_cast<double>(kFrameGenGateWindowMs);
+        }
+        const FrameGenMonitorSynth sy = frameGenSynthMonitor();
+        m.synthKnown = sy.valid && sy.built && sy.gpuN;
+        m.synthMs = m.synthKnown ? 2.0 * (static_cast<double>(sy.gpuMs) + (sy.finishN ? static_cast<double>(sy.finishMs) : 0.0)) : 0.0;
+        w.prevPairs = w.curPairs; w.prevLate = w.curLate;
+        w.curPairs = rtFresh && rt.lastSecond ? rt.sSlots : 0;
+        w.curLate = rtFresh && rt.lastSecond ? rt.lateReal : 0;
+        m.pairs = w.curPairs + w.prevPairs;
+        m.lateReal = w.curLate + w.prevLate;
+        w.measured = m;
+    }
+    FrameGenGateInputs in = w.measured;
+    in.mode = mode;
+    in.runtime = rtFresh && rt.autoKnown;
+    if (journalOnFootKnown() && journalOnFoot()) in.context = FrameGenGateContext::OnFoot;
+    else if (journalVehicleKnown() && journalVehicle()) in.context = FrameGenGateContext::Vehicle;
+    uint32_t focus = 0;
+    if (journalGuiFocus(&focus) && focus >= 5) in.cut = FrameGenGateCut::Screen;
+    else if (journalInJumpTunnel()) in.cut = FrameGenGateCut::Tunnel;
+    else if (jumps != w.cameraJumps) in.cut = FrameGenGateCut::Camera;
+    else if (rt.known == kFrameGenMonitorSlot && rt.ageMs > kFrameGenGateStallMs) in.cut = FrameGenGateCut::Stall;
+    else if (rtFresh && rt.reason == static_cast<uint32_t>(FrameGenLockReason::NoProjection)) in.cut = FrameGenGateCut::Projection;
+    w.cameraJumps = jumps;
+    const FrameGenGateStep st = w.gate.step(in, now);
+    if (st.edge) Log::get().note("%s", formatFrameGenGateEdge(st).c_str());
+    if (mode == FrameGenMode::Auto) {
+        // An openvr_api.dll older than 2.4 hands no slot that knows auto (none at all unless the shadow key is on): after 10 s of VR frames without one, the synthesizer is held and
+        // frame generation behaves as off, said once a session. A slot of 2.4's size lets it go again.
+        if (in.runtime) {
+            w.noRuntimeS = 0;
+            w.hold = false;
+        } else if (refresh && in.cpuN) {
+            if (++w.noRuntimeS >= kFrameGenGateOldRuntimeS && !w.hold) {
+                w.hold = true;
+                if (!w.oldSaid) {
+                    w.oldSaid = true;
+                    char line[256];
+                    snprintf(line, sizeof(line), kFrameGenGateOldRuntimeFmt, static_cast<unsigned>(w.noRuntimeS));
+                    Log::get().note("%s", line);
+                }
+            }
+        }
+        temporalPassFrameGenGate(st.state == FrameGenGateState::Engaged, w.hold);
+    }
+    if (refresh) {
+        const char* lock = rtFresh ? frameGenLockReasonName(static_cast<FrameGenLockReason>(rt.reason < static_cast<uint32_t>(FrameGenLockReason::Count) ? rt.reason : 0xFFu))
+                                   : "unknown";
+        Log::get().note("%s", formatFrameGenGateReport(st, in, mode, lock).c_str());
+    }
+}
+
 void sampleFrameGen() {
     auto& cfg = Config::get();
     FrameGenMonitorInput in;
-    in.lockKey = cfg.getString("fix.frame_generation", "off") == "on";
+    const FrameGenMode mode = static_cast<FrameGenMode>(temporalPassFrameGenMode());
+    in.lockKey = mode != FrameGenMode::Off;
+    in.autoMode = mode == FrameGenMode::Auto;
+    in.gateState = g_fgGate.gate.last().state;
+    in.gateReason = g_fgGate.gate.last().reason;
     in.shadowKey = cfg.getString("fix.frame_generation_shadow", "off") == "on";
     char lines[kFrameGenMonitorMaxLines][kFrameGenMonitorLineChars] = {};
     int n = 0;
@@ -1226,6 +1330,7 @@ void perfMonitorFrame(ID3D11Device* dev) {
         s.nativeBenchmarkMetadataMs = 0;
         s.nativeBenchmarkMetadata = {};
     }
+    frameGenGateFrame(s);   // frame generation 2.4: the performance gate (fix.frame_generation auto or on; off returns at once)
     // EDVR's part: the events of the frame just ending.
     const uint32_t ev = s.events.exchange(0);
     f.events = static_cast<uint16_t>(ev & 0xFFFFu);
