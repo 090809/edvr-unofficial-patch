@@ -1722,6 +1722,11 @@ Environment: OpenXR (EDVR's runtime), left eye, render 2817x2448, output
   no dump; every window in this log that printed them held a dump.
 - Crops: scratchpad `gap_P_grid.png`, `gap_C_grid.png`,
   `gap_flags_grid.png`, `path_132100543006_08.png` (white = hidden).
+- ruled out: vendor smoothing (H4), because SteamVR's is off for Elite and
+  the pilot's Pimax setup (SBoys3 on SteamVR) has no smoothing of its own.
+- **Pilot's A/B of the DLSS preset (K, L, M, live):** K gives the best
+  picture; the wing gap is not better under L or M. The band is DLSS's
+  limit at this frame rate; it narrows only with a higher game frame rate.
 
 ### 2026-11-07: Phase 2.3, flight 11, the first Lock flight (same build)
 
