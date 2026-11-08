@@ -685,12 +685,12 @@ bool g_saidFrameGen = false, g_saidMaskLarge = false, g_saidToneDecline = false,
 // The CPU time (bracketing each item, from the hook's entry) and the item counts are kept on every frame.
 enum TStage : int { kTsGbuf = 0, kTsMask, kTsScreen, kTsLight, kTsTone, kTsTaa, kTStages };   // the line's gbuffer, mask_filter, screen, light, tone, taa
 constexpr uint32_t kStageEvery = 8;      // one frame in eight is timed on the GPU
-constexpr uint32_t kStagePairs = 1024;   // timestamp pairs a timed frame may use (a pair an item; two eyes of ~300 G-buffer draws fit)
+constexpr uint32_t kStagePairCap = 1024;   // timestamp pairs a timed frame may use (a pair an item; two eyes of ~300 G-buffer draws fit)
 constexpr uint32_t kStageSets = 3;       // timed frames in flight
 struct StageSet {
     ID3D11Query* disjoint = nullptr;
-    ID3D11Query* q[2 * kStagePairs] = {};   // made on first use, kept
-    uint8_t stage[kStagePairs] = {};
+    ID3D11Query* q[2 * kStagePairCap] = {};   // made on first use, kept
+    uint8_t stage[kStagePairCap] = {};
     uint32_t used = 0, overflow = 0;
     bool open = false, pending = false;
 };
@@ -1440,7 +1440,7 @@ void stageOpen(ID3D11DeviceContext* ctx, TStage ts, bool fromEntry) {
         s.open = true;
         s.used = s.overflow = 0;
     }
-    if (s.used >= kStagePairs) {
+    if (s.used >= kStagePairCap) {
         ++s.overflow;
         return;
     }
