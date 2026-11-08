@@ -86,13 +86,15 @@ inline bool normalize3(float v[3]) noexcept {
 }
 
 // The eye stub's fence (native_preview_camera.cpp bakeEye): a call is the base Elite is using, and so may be written, when its own pose (read before any write) is within
-// kBaseMatchM of the expected base in translation and each of its three axes (rows 0 to 2, normalised) has a dot above kBaseMatchDot with the expected one. A pose that is not
-// finite, or whose axes cannot be normalised, never matches. Pure: the stub reads the pose, this decides.
+// kBaseMatchM of the expected base in translation and each of its three axes (rows 0 to 2, normalised) has a dot above kBaseMatchDot with the expected one. A pose whose
+// interpreted lanes are not finite, or whose axes cannot be normalised, never matches. Only the 12 lanes the game interprets are read (each row's x, y, z, as
+// previewcam::finite does): Flight 54's poses failed every match on the fourth lanes, which the game leaves unset, so nothing was written. Pure: the stub reads the pose, this decides.
 constexpr float kBaseMatchM = 0.25f;
 constexpr float kBaseMatchDot = 0.995f;
 inline bool baseMatches(const float have[16], const float expect[16]) noexcept {
-    for (int i = 0; i < 16; ++i)
-        if (!std::isfinite(have[i]) || !std::isfinite(expect[i])) return false;
+    for (int r = 0; r < 4; ++r)
+        for (int c = 0; c < 3; ++c)
+            if (!std::isfinite(have[r * 4 + c]) || !std::isfinite(expect[r * 4 + c])) return false;
     const float d[3] = {have[12] - expect[12], have[13] - expect[13], have[14] - expect[14]};
     if (!(dot3(d, d) <= kBaseMatchM * kBaseMatchM)) return false;
     for (int r = 0; r < 3; ++r) {

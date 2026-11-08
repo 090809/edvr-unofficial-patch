@@ -3380,6 +3380,9 @@ constexpr uint32_t kVrMeasureMaxTicks = 10;   // no rows back by then: the world
 // Aimed ticks in a row whose every tone draw lacked the frame's rows, past which the aims stop (the headset is held for each aim, so a bake that sees nothing only freezes it: Flight
 // 53 held 969 ms for 66 rowless tone draws of 94). Six is two faces' dwell (kVrBakeDwell is 3): a lull that long is not the one or two late frames a working bake shows.
 constexpr uint32_t kVrRowlessAimsMax = 6;
+// The same for aimed windows in which the stub wrote nothing: the eyes stay where Elite put them, so no frame is at the centre and the hold only freezes the headset. Flight 54
+// held three bakes of 656 to 1234 ms this way, every call refused by the fence, while the rows came back as usual. The same six.
+constexpr uint32_t kVrUnwrittenAimsMax = kVrRowlessAimsMax;
 constexpr uint32_t kVrBakeTicksMax = 96;     // the measure, three rounds of aims (each held kVrBakeDwell ticks) and their read-backs, with room to spare
 constexpr uint32_t kVrHoldLag = 3;            // frames withheld after each aim's tick: the frames still in flight after the last
 constexpr uint32_t kVrHoldFollowTicks = 8;    // the hold's line, this many ticks after the end
@@ -3406,6 +3409,8 @@ struct VrBakeState {
     bool baseValid[kVrRing] = {};
     bool baseStack[kVrRing] = {};          // the window's first call was at a stack address, so its pose is Elite's base (not a heap call's identity)
     uint32_t rowlessRun = 0;               // aimed ticks in a row whose tone draws all lacked the frame's rows (kVrRowlessAimsMax)
+    uint32_t unwrittenRun = 0;             // aimed windows in a row in which the stub wrote no call (kVrUnwrittenAimsMax)
+    bool stoppedUnwritten = false;         // the aims stopped on unwrittenRun, not rowlessRun (the stop line says which)
     uint64_t lastToneDraws = 0, lastNoRows = 0;
     uint32_t aimFrame[kVrRing] = {}, aimFace[kVrRing] = {}, aimDwell[kVrRing] = {};   // aimDwell: TEMPORARY (H58-H61 instrument, Flight 53)
     bool aimWrite[kVrRing] = {};                                                    // the frame writes the cube (the hold's last frame); the rest only count
@@ -4768,9 +4773,20 @@ void vrBakeEveryTick(uint32_t frame, bool social) {
         g_vr.baseValid[i] = true;
         g_vr.baseStack[i] = w.firstStack;
     }
+    // The window an aim covered (the aim made at tick wf, closed by this tick): did the stub write it? A window with no stub call at all counts as unwritten too.
+    if (g_vr.phase == VrBakePhase::kAim) {
+        const uint32_t a = wf % kVrRing;
+        if (g_vr.aimValid[a] && g_vr.aimFrame[a] == wf) g_vr.unwrittenRun = w.wroteMask != 0 ? 0 : g_vr.unwrittenRun + 1;
+    }
     if ((g_vr.phase == VrBakePhase::kAim || w.wroteMask != 0 || wf == g_vr.startFrame) && vrLogTake()) {
         char before[200] = "unreadable";
-        if (w.firstSeen && w.firstReadable) vrPoseText(w.firstBefore, before, sizeof(before));
+        if (w.firstSeen && w.firstReadable) {
+            vrPoseText(w.firstBefore, before, sizeof(before));
+            // The fourth lanes, which the game does not set and the fence no longer reads (Flight 54): shown so a flight confirms what they hold.
+            const size_t at = std::strlen(before);
+            std::snprintf(before + at, sizeof(before) - at, " pads %g %g %g %g", static_cast<double>(w.firstBefore[3]), static_cast<double>(w.firstBefore[7]),
+                          static_cast<double>(w.firstBefore[11]), static_cast<double>(w.firstBefore[15]));
+        }
         Log::get().note("concourse bake: vr stub: frame %u: %u calls (%u at a stack address, stack mask 0x%X), written 0x%X%s, %u torn reads, %u foreign (a call whose own pose was not the "
                         "base Elite is using, so not written); the first call before: %s%s", wf, w.calls, w.stackCalls, w.stackMask, w.wroteMask,
                         w.calls == 0 ? " (THE STUB DID NOT RUN)" : "", w.torn, w.foreign, before, w.firstSeen && !w.firstStack ? " (not on a stack)" : "");
@@ -4886,6 +4902,8 @@ void vrBakeAimStart(uint32_t frame) {
     {
         const ConcourseVrBakeStats st = concoursePaneVrBakeStats();
         g_vr.rowlessRun = 0;
+        g_vr.unwrittenRun = 0;
+        g_vr.stoppedUnwritten = false;
         g_vr.lastToneDraws = st.toneDraws;
         g_vr.lastNoRows = st.noRows;
     }
@@ -4954,6 +4972,11 @@ bool vrBakeAimTick(uint32_t frame) {
         if (dTone > 0) g_vr.rowlessRun = dNo >= dTone ? g_vr.rowlessRun + 1 : 0;   // a tick with no tone draw at all is a stalled game, not missing rows
         if (g_vr.rowlessRun >= kVrRowlessAimsMax) {
             nativeCameraBakeStopWriting();
+            return false;
+        }
+        if (g_vr.unwrittenRun >= kVrUnwrittenAimsMax) {
+            nativeCameraBakeStopWriting();
+            g_vr.stoppedUnwritten = true;
             return false;
         }
     }
@@ -5064,13 +5087,18 @@ bool vrBakeTickBlock(uint64_t now, uint32_t frame, bool anchor, bool camWasActiv
             }
         }
         if (acting && g_vr.phase == VrBakePhase::kAim && !vrBakeAimTick(frame)) {
-            // The rows stopped: the aims and the hold stop with them. Published only when every wanted face was covered before they did.
-            Log::get().note("concourse bake: vr: aiming stopped at frame %u: the tone draws had no frame's rows for %u aimed ticks in a row; faces covered 0x%X of 0x%X", frame,
-                            g_vr.rowlessRun, g_vr.plan.covered(), g_vr.plan.want());
+            // The rows stopped, or the stub wrote nothing: the aims and the hold stop with them. Published only when every wanted face was covered before they did.
+            if (g_vr.stoppedUnwritten)
+                Log::get().note("concourse bake: vr: aiming stopped at frame %u: the stub wrote no call for %u aimed windows in a row (the stub lines' \"foreign\" and \"written\" say "
+                                "why), so the eyes never reached the centre; faces covered 0x%X of 0x%X",
+                                frame, g_vr.unwrittenRun, g_vr.plan.covered(), g_vr.plan.want());
+            else
+                Log::get().note("concourse bake: vr: aiming stopped at frame %u: the tone draws had no frame's rows for %u aimed ticks in a row; faces covered 0x%X of 0x%X", frame,
+                                g_vr.rowlessRun, g_vr.plan.covered(), g_vr.plan.want());
             g_camTimer.stop();
             acting = false;
             camEnd = (g_vr.plan.covered() & g_vr.plan.want()) == g_vr.plan.want() ? cc::CamTestEnd::kDone : cc::CamTestEnd::kModeOff;
-            endWhy = "the rows stopped arriving";
+            endWhy = g_vr.stoppedUnwritten ? "the stub wrote nothing" : "the rows stopped arriving";
             endPublish = camEnd == cc::CamTestEnd::kDone;
         }
     }

@@ -266,6 +266,14 @@ void testVrBake() {
         Pose zeroAxes = base;
         for (int k = 0; k < 4; ++k) zeroAxes.v[k] = 0.0f;
         check(!cvb::baseMatches(zeroAxes.v, base.v), "vr bake: a pose whose axis cannot be normalised never matches");
+        // Flight 54: the game leaves each row's fourth lane unset, and a fence that read it refused every call.
+        Pose padded = base, paddedLater = same;
+        for (int r = 0; r < 4; ++r) {
+            padded.v[r * 4 + 3] = std::nanf("");
+            paddedLater.v[r * 4 + 3] = std::numeric_limits<float>::infinity();
+        }
+        check(cvb::baseMatches(padded.v, base.v) && cvb::baseMatches(base.v, padded.v) && cvb::baseMatches(paddedLater.v, padded.v),
+              "vr bake: the fourth lanes, which the game does not set, are not read (Flight 54)");
     }
     // A canted eye: the camera's forward is the face's turned by the eye's own rotation, read through S (the true eye in OpenVR's head axes, z negated, over the face's rows).
     {
