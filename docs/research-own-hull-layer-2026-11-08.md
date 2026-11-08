@@ -811,6 +811,21 @@ With AO and the decals in, the layer matches the game's HDR closely. The
 shimmer is the layer's TAA. In `dump` mode, where DLSS draws the ship,
 nothing shimmers.
 
+**The shimmer, shown (dump 232023684003, T15):** a thin diagonal panel line
+on the nose block comes out as a dashed staircase. It is thinner than a
+render pixel, so with the jitter it is in a pixel one frame and out the
+next. The tight clamp (min/max ∩ mean ± 1.25 sigma, current weight 0.1)
+reset the history to that frame's broken line every frame.
+
+Fix, inside the hull only (the whole 3x3 is hull, min alpha 1): a loose box
+(mean ± 3 sigma) and half the current weight (0.05). The hull moves
+against the camera only by the head's motion, which the reprojection
+carries exactly, so the history can be trusted, and a sub-pixel line
+converges. The silhouette, where the world behind changes, keeps the
+tight box. The per-frame kernel widens back to exp(-3.5 d^2). Risk to
+watch: a lag on fast lighting changes inside the hull, such as a light
+sweeping across it, about 20 frames to settle.
+
 ## Optimisation debt (recorded 2026-11-08 at the pilot's request)
 
 The layer was built to work first. Before it ships as anything but a

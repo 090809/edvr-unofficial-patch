@@ -316,7 +316,9 @@ constexpr char kTaaHlsl[] =
     // exp(-2.29 d^2) (0.62 output pixels) left the hull visibly softer than DLSS's own hull (the pilot, 22:30). The
     // jitter moves the samples every frame and the history (weight 0.9) averages them, so the narrow kernel's
     // per-frame aliasing averages out while its detail stays.
-    "            float wt = exp(-5.0 * dot(dd, dd));\n"
+    // exp(-3.5 d^2) since 23:25: with the loose interior clamp below, the history carries the detail, and a slightly wider
+    // per-frame kernel feeds it less jitter aliasing.
+    "            float wt = exp(-3.5 * dot(dd, dd));\n"
     "            cur += s * wt;\n"
     "            wsum += wt;\n"
     "            lo = min(lo, s);\n"
@@ -332,8 +334,20 @@ constexpr char kTaaHlsl[] =
     // jumped and those lines flickered as if there were no TAA (the pilot).
     "    m1 /= 9.0;\n"
     "    float4 sd = sqrt(max(m2 / 9.0 - m1 * m1, 0.0));\n"
-    "    lo = max(lo, m1 - 1.25 * sd);\n"
-    "    hi = min(hi, m1 + 1.25 * sd);\n"
+    // Inside the hull (the whole 3x3 is hull) the layer moves only by the head's motion, which the reprojection carries
+    // exactly, so the history may be trusted far more: a loose box (mean +- 3 sigma) and a lower current weight let a
+    // sub-pixel panel line converge to a steady line instead of the staircase the pilot saw flicker (23:20, dump
+    // 232023684003). At the silhouette the tight box stays: there the world behind changes.
+    "    float weight = jit.w;\n"
+    "    if (lo.a > 0.999) {\n"
+    "        lo = m1 - 3.0 * sd;\n"
+    "        hi = m1 + 3.0 * sd;\n"
+    "        lo.a = 1.0; hi.a = 1.0;\n"
+    "        weight = jit.w * 0.5;\n"
+    "    } else {\n"
+    "        lo = max(lo, m1 - 1.25 * sd);\n"
+    "        hi = min(hi, m1 + 1.25 * sd);\n"
+    "    }\n"
     "    float4 res = cur;\n"
     "    if (jit.z != 0.0) {\n"
     "        float3 d;\n"
@@ -348,7 +362,7 @@ constexpr char kTaaHlsl[] =
     "            pp.x = (dp.x / -dp.z - tanPrev.x) / (tanPrev.y - tanPrev.x) * float(rsz.x) - 0.5;\n"
     "            pp.y = (tanPrev.w - dp.y / -dp.z) / (tanPrev.w - tanPrev.z) * float(rsz.y) - 0.5;\n"
     "            float2 uv = (pp + 0.5) / float2(rsz);\n"
-    "            if (all(uv >= 0.0) && all(uv <= 1.0)) res = lerp(clamp(histCatmullRom(uv), lo, hi), cur, jit.w);\n"
+    "            if (all(uv >= 0.0) && all(uv <= 1.0)) res = lerp(clamp(histCatmullRom(uv), lo, hi), cur, weight);\n"
     "        }\n"
     "    }\n"
     "    histOut[id.xy] = res;\n"
