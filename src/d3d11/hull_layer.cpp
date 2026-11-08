@@ -328,6 +328,38 @@ constexpr char kTaaHlsl[] =
     "    compOut[id.xy] = float4(w.rgb * (1.0 - res.a) + res.rgb, w.a);\n"
     "}\n";
 
+// The sharpen and composite, after the TAA (2026-11-08 22:35): the TAA output measured 0.7 output px softer than one frame
+// (dumps 222624596001, 222629772002: 26-29% of the high-frequency energy, no history shift), and the pilot saw the hull
+// softer than DLSS's. A cross unsharp mask on the TAA result, clamped to the cross's range (no halo); only where the whole
+// cross is hull (alpha 1), so the silhouette's anti-aliased edge stays as the TAA left it. The history is not sharpened.
+// hlsl-check: kSharpHlsl hull_layer_sharp_cs cs_5_0
+constexpr float kSharpAmount = 0.8f;   // c + amount * (c - mean of the 4 neighbours)
+constexpr char kSharpHlsl[] =
+    "Texture2D<float4> hist : register(t0);\n"
+    "Texture2D<float4> world : register(t1);\n"
+    "RWTexture2D<float4> compOut : register(u0);\n"
+    "cbuffer HullLayerSharpCb : register(b0) { float4 amount; };\n"
+    "[numthreads(8, 8, 1)] void hull_layer_sharp_cs(uint3 id : SV_DispatchThreadID) {\n"
+    "    uint ow, oh; hist.GetDimensions(ow, oh);\n"
+    "    if (id.x >= ow || id.y >= oh) return;\n"
+    "    int2 p = int2(id.xy);\n"
+    "    int2 mx = int2(ow, oh) - 1;\n"
+    "    float4 c = hist.Load(int3(p, 0));\n"
+    "    float4 l = hist.Load(int3(clamp(p + int2(-1, 0), 0, mx), 0));\n"
+    "    float4 r = hist.Load(int3(clamp(p + int2(1, 0), 0, mx), 0));\n"
+    "    float4 u = hist.Load(int3(clamp(p + int2(0, -1), 0, mx), 0));\n"
+    "    float4 d = hist.Load(int3(clamp(p + int2(0, 1), 0, mx), 0));\n"
+    "    float4 res = c;\n"
+    "    if (min(min(c.a, l.a), min(min(r.a, u.a), d.a)) > 0.999) {\n"
+    "        float3 m = (l.rgb + r.rgb + u.rgb + d.rgb) * 0.25;\n"
+    "        float3 lo = min(c.rgb, min(min(l.rgb, r.rgb), min(u.rgb, d.rgb)));\n"
+    "        float3 hi = max(c.rgb, max(max(l.rgb, r.rgb), max(u.rgb, d.rgb)));\n"
+    "        res.rgb = clamp(c.rgb + amount.x * (c.rgb - m), lo, hi);\n"
+    "    }\n"
+    "    float4 w = world.Load(int3(p, 0));\n"
+    "    compOut[p] = float4(w.rgb * (1.0 - res.a) + res.rgb, w.a);\n"
+    "}\n";
+
 // A private copy of one game texture: the same desc, default usage, nothing shared. `game` is an identity only.
 struct Mirror {
     const void* game = nullptr;
@@ -533,9 +565,11 @@ struct CompGpu {
     bool tried = false, ok = false;
     ID3D11ComputeShader* coverCs = nullptr;
     ID3D11ComputeShader* taaCs = nullptr;
+    ID3D11ComputeShader* sharpCs = nullptr;
     ID3D11SamplerState* linear = nullptr;
     ID3D11Buffer* coverCb = nullptr;
     ID3D11Buffer* taaCb = nullptr;
+    ID3D11Buffer* sharpCb = nullptr;
 };
 
 std::string g_mode = "off";
@@ -711,9 +745,11 @@ void releaseGpu() {
     g_gpu = Gpu{};
     releaseRef(g_cgpu.coverCs);
     releaseRef(g_cgpu.taaCs);
+    releaseRef(g_cgpu.sharpCs);
     releaseRef(g_cgpu.linear);
     releaseRef(g_cgpu.coverCb);
     releaseRef(g_cgpu.taaCb);
+    releaseRef(g_cgpu.sharpCb);
     g_cgpu = CompGpu{};
     for (auto& c : g_comp) releaseComp(c);
     releaseTimer(g_toneTimer);
@@ -1816,8 +1852,9 @@ bool ensureCompGpu() {
         const char* entry;
         ID3D11ComputeShader** out;
     };
-    const Item items[2] = {{kCoverHlsl, sizeof(kCoverHlsl) - 1, "hull_layer_cover_cs", &g_cgpu.coverCs},
-                           {kTaaHlsl, sizeof(kTaaHlsl) - 1, "hull_layer_taa_cs", &g_cgpu.taaCs}};
+    const Item items[3] = {{kCoverHlsl, sizeof(kCoverHlsl) - 1, "hull_layer_cover_cs", &g_cgpu.coverCs},
+                           {kTaaHlsl, sizeof(kTaaHlsl) - 1, "hull_layer_taa_cs", &g_cgpu.taaCs},
+                           {kSharpHlsl, sizeof(kSharpHlsl) - 1, "hull_layer_sharp_cs", &g_cgpu.sharpCs}};
     for (const Item& it : items) {
         ID3DBlob* code = nullptr;
         std::string why;
@@ -1842,7 +1879,8 @@ bool ensureCompGpu() {
     sd.MaxLOD = D3D11_FLOAT32_MAX;
     g_cgpu.coverCb = makeConstantBuffer(16);
     g_cgpu.taaCb = makeConstantBuffer(160);
-    if (FAILED(g_device->CreateSamplerState(&sd, &g_cgpu.linear)) || !g_cgpu.coverCb || !g_cgpu.taaCb) {
+    g_cgpu.sharpCb = makeConstantBuffer(16);
+    if (FAILED(g_device->CreateSamplerState(&sd, &g_cgpu.linear)) || !g_cgpu.coverCb || !g_cgpu.taaCb || !g_cgpu.sharpCb) {
         Log::get().note("hull layer: the composite's sampler or constant buffers could not be made; separate mode keeps the own ship in the main pass this session");
         return false;
     }
@@ -2563,6 +2601,20 @@ void hullLayerCompositeEye(ID3D11DeviceContext* ctx, int eye, const HullLayerCom
         ctx->Dispatch((in.outW + 7u) / 8u, (in.outH + 7u) / 8u, 1);
         ID3D11UnorderedAccessView* none[CsStageSave::kUavs] = {};
         ctx->CSSetUnorderedAccessViews(0, CsStageSave::kUavs, none, nullptr);   // the history and the out off before the caller's views come back
+        // The sharpen and composite over the TAA result just written (kSharpHlsl): it rewrites the out the TAA made.
+        const float sharpCb[4] = {kSharpAmount, 0.0f, 0.0f, 0.0f};
+        vScreenUpdateSubresourceRaw(ctx, g_cgpu.sharpCb, 0, nullptr, sharpCb, 0, 0);
+        ID3D11ShaderResourceView* noSrv[4] = {};
+        ctx->CSSetShaderResources(0, 4, noSrv);   // the history just written comes back as a resource
+        ID3D11ShaderResourceView* sharpSrv[2] = {c.histSrv[c.read ^ 1u], in.outputSrv};
+        ID3D11UnorderedAccessView* sharpUav[CsStageSave::kUavs] = {c.outUav};
+        ctx->CSSetUnorderedAccessViews(0, CsStageSave::kUavs, sharpUav, nullptr);
+        ctx->CSSetShader(g_cgpu.sharpCs, nullptr, 0);
+        ctx->CSSetShaderResources(0, 2, sharpSrv);
+        ctx->CSSetConstantBuffers(0, 1, &g_cgpu.sharpCb);
+        ctx->Dispatch((in.outW + 7u) / 8u, (in.outH + 7u) / 8u, 1);
+        ctx->CSSetShaderResources(0, 4, noSrv);
+        ctx->CSSetUnorderedAccessViews(0, CsStageSave::kUavs, none, nullptr);
         save.restore(ctx);
     }
     // Applied only when this frame's main pass discarded the own ship on this eye; otherwise it is made (the history stays warm,

@@ -675,6 +675,21 @@ Fix: the history is read through a 9-tap Catmull-Rom, then clamped to the
 lever is the current-frame kernel (exp(-2.29 d^2) over 3x3 render pixels)
 or a sharpen on the layer only.
 
+**Still soft after the Catmull-Rom history and a narrower kernel**
+(exp(-5 d^2)). The pilot compares it with the first seconds of a session,
+when the game draws the ship through DLSS. Measured on dumps 222624596001
+and 222629772002 (`taa_blur.py`, shared notes): on the hull interior, the
+TAA output holds 26-29% of the high-frequency energy of the bicubically
+upscaled single frame. That fits a Gaussian of sigma 0.7 output px, with no
+history shift (0 or 1 px). The reprojection is right, and the softness is
+the TAA's own.
+- ruled out: a misregistered head-motion history as the softness, because
+  the best fit has no shift.
+- Fix: a sharpen pass after the TAA. A cross unsharp mask, amount 0.8,
+  clamped to the cross's range (no halo), only where the whole cross is
+  hull, so the silhouette's edge keeps the TAA's anti-aliasing. Then the
+  composite. The history is not sharpened.
+
 `tools\hlsl_embedded_check.py` read a compiler blob after releasing it. The
 larger TAA shader made that fail with an access violation. It now reads the
 blob first.
