@@ -35,6 +35,11 @@ The smear is terrain that is newly uncovered at the hull edge every frame
   on the private depth copy and RT0, and its apply re-issued into the
   private RT2. Next: one dump. The `ao:` line should read 3.00 an
   eye-frame, and the HullHdr/GameHdrLit p95 residue should shrink.
+* **Dump v2** (section "Dump v2", compile-only, not flown): one dump now
+  holds the whole census, the game's passes timed, a reference frame
+  (separate), the lighting windows' draws and a 16-frame TAA sequence for
+  `tools\hull_taa_sim.py`; `hull layer: gpu_ms` times the layer by stage
+  every 30 s. Next: one separate-mode dump at a station, lights on.
 * **Temporary keys of this arc:** `diag.hull_layer` (off | dump | separate).
 * **Background:** option (e), the hole-fill, fails (section "Result"). The
   own ship is one block of hull draws seeded after the cockpit shell, but
@@ -825,6 +830,82 @@ converges. The silhouette, where the world behind changes, keeps the
 tight box. The per-frame kernel widens back to exp(-3.5 d^2). Risk to
 watch: a lag on fast lighting changes inside the hull, such as a light
 sweeping across it, about 20 frames to settle.
+
+## Dump v2 (2026-11-09, compile-only, not flown)
+
+Goal: one `dump_eyes` press answers the open questions offline, so the
+pilot flies less. Everything below runs only with `diag.hull_layer` =
+`dump` or `separate`; `off` is untouched. No new config key.
+
+**What one dump now holds** (`edvr_logs\eyes\eye_<stamp>_*`, and the
+graphics log):
+- **The census, whole.** The eye dump's census ("DC eye capture link")
+  records up to 16,384 eye lines, whatever `advanced.census_lines` says.
+  The station frames of `edvr_gfx_20261108_231250.log` (censuses 4-6) were
+  cut at 4,096. Bounded: when frames 0-1 spend over half the ceiling, the
+  census ends after them, and only three censuses a session are lifted
+  (about 4.6 MB of the 16 MB log at most each). Lines: `DC eye capture
+  link: census=N lines=16384 ...` and `... ends after 2 frames: dense`.
+- **The game's own passes, timed:** the dump arms the GPU pass profile for
+  4 frames with no delay (`gpu pass profile: armed by the eye dump`;
+  refused with a note while a hotkey capture runs).
+- **The layer's own GPU time, by stage, every 30 s** (not only in a
+  dump): `hull layer: gpu_ms gbuffer= mask_filter= screen= light= tone=
+  taa= total=`, the median GPU ms of a timed frame (one frame in eight,
+  a timestamp pair per item), with the items and CPU ms a frame. The
+  stages are: the G-buffer and decal re-issues; the seed, filter and
+  count; the depth copy, shadow mask and AO; the lighting and night
+  vision; the tonemap and cover; and the TAA, sharpen and composite.
+- **A reference frame (separate mode).** On the capture frame the main
+  pass keeps the own ship, as on a fallback frame: the layer runs, and its
+  composite is made but not applied. The ship is shown by the game for one
+  frame. `GameHdrLit` then holds the game's hull beside `HullHdr`, and
+  `_RefDepth` / `_RefGbuf0` (both eyes) replace `_GameDepth` /
+  `_GameGbuf0`. Line: `hull layer: dump S eye N: reference frame: ...`.
+- **`_HullLights.json`:** every draw of the dump frame between an eye's
+  shadow mask and its sky that writes the eye's HDR, plus every
+  stencil-only draw there (a light-volume stencil pass). Each draw has its
+  VS/PS, instances, whether the layer re-issued it, and whether it is
+  unknown. This is for the station lights that did not light the hull.
+  Line: `hull layer: dump S: HullLights written: N draws ...`.
+- **The TAA sequence (separate mode, eye 0, 16 frames from the capture
+  frame).** Each frame `nn` has `_HullSeq_<nn>_Cover.bin` (the cover at
+  render size, RGBA8, coverage in alpha), `_Depth.bin` (R32F) and
+  `_Comp.bin` (the composite the GPU wrote, output size). All three are
+  cropped to the hull. `_HullSeq_00_Hist.bin` is the history frame 0
+  read, and `_HullSeq.json` holds the jitter, tangents, head delta and
+  translation, depth encoding, sizes and crops. Staging is a ring of three
+  sets, written two frames later, at most 768 MB. A frame without eye 0's
+  composite ends the run. Line: `hull layer: dump S: HullSeq 16 of 16
+  frames written ...`.
+
+**Offline commands:**
+```
+python tools\edvr_log.py --target steam --expect-build HEAD --health
+python tools\hull_layer_compare.py <eyes>\eye_<stamp> [--eye 1]
+python tools\hull_taa_sim.py <eyes>\eye_<stamp> --compare
+python tools\hull_taa_sim.py <eyes>\eye_<stamp> --current 0.08 --clip-interior 2.5 --sharpen 0.4
+```
+`hull_layer_compare.py` uses `_RefDepth` in place of the eye run's `Z`
+as the mask of where the game shows the hull, so it works in separate
+mode without switching the ini. `hull_taa_sim.py` is `kTaaHlsl` and
+`kSharpHlsl` in numpy, with every parameter as a flag; its self-test
+fails the build if the shader's literals drift from its defaults. It
+reports the shimmer (luma std over the last N frames on the hull
+interior, simulation and GPU), the sharpness (high-frequency energy
+against the last frame's bicubic upscale), and with `--compare` the
+difference from the GPU's composites (MATCH: mean ≤ 1, p99 ≤ 4, 8-bit).
+
+**Cost when not dumping:** two QPC reads per layer item and, one frame in
+eight, two timestamp queries per item (about 600-800 an eye-frame pair),
+read back without waiting. Nothing else runs outside a dump.
+
+**Unverified (next flight):** that the GPU stage times read sensibly and
+the timed frame's queries fit (`overflow=0`); that `--compare` reports
+MATCH on a real sequence (the bilinear filter's fixed-point weights may
+cost a little); that the eye run's `Z` frame and the hull capture frame
+are the same (no longer needed for the compare); and the pass profile
+next to the eye run.
 
 ## Optimisation debt (recorded 2026-11-08 at the pilot's request)
 

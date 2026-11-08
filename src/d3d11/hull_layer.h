@@ -55,6 +55,16 @@
 //      seeded but was not lit, tonemapped and composited) in the last 16 frames. On every other frame the layer still runs
 //      and its composite is made but not applied, so a miss is seen without the ship being lost.
 //
+// Dump v2 (both modes unless said; docs "Dump v2"):
+//  12. GPU time by stage: one frame in eight brackets each of the layer's own items (re-issued draws, passes, dispatches) with a
+//      timestamp pair, summed by stage; the 30 s line "hull layer: gpu_ms" gives the median a timed frame, with the items and CPU ms.
+//  13. The dump frame's lighting windows (shadow mask to sky, per eye): every draw writing the eye's HDR and every stencil-only draw,
+//      with its pair, instances and whether the layer re-issued it, to eye_<stamp>_HullLights.json.
+//  14. Separate mode: the dump's capture frame is a reference frame (the main pass keeps the own ship; the layer runs; the composite
+//      is made, not applied), and the TAA sequence: eye 0's cover, cover depth and composite for 16 frames from it, its constants
+//      and frame 0's history, to eye_<stamp>_HullSeq_<nn>_*.bin and _HullSeq.json (tools\hull_taa_sim.py).
+//  The eye dump also lifts its census to the line ceiling (draw_census.cpp) and arms the GPU pass profile for 4 frames.
+//
 // Cost with the key off: one bool load per draw (hullLayerWanted). VR owner context only.
 #pragma once
 

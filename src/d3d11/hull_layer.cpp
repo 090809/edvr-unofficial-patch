@@ -677,6 +677,101 @@ CompGpu g_cgpu;
 GpuTimer g_toneTimer, g_compTimer;
 bool g_saidFrameGen = false, g_saidMaskLarge = false, g_saidToneDecline = false, g_saidDecline[kDeclines] = {};
 
+// ---- dump v2 (docs "Dump v2"): the stage times, the lighting window's draws, the reference frame, the TAA sequence -----------
+
+// GPU time by stage, both modes, always: on every kStageEvery-th frame a timestamp pair brackets each piece of the layer's own GPU
+// work (a re-issued draw, a pass, a dispatch), summed by stage and read back a few frames later (never a stall). The pairs time the
+// layer's work in place between the game's, so a stage's sum is the GPU time its items took, overlap with the game's work aside.
+// The CPU time (bracketing each item, from the hook's entry) and the item counts are kept on every frame.
+enum TStage : int { kTsGbuf = 0, kTsMask, kTsScreen, kTsLight, kTsTone, kTsTaa, kTStages };   // the line's gbuffer, mask_filter, screen, light, tone, taa
+constexpr uint32_t kStageEvery = 8;      // one frame in eight is timed on the GPU
+constexpr uint32_t kStagePairs = 1024;   // timestamp pairs a timed frame may use (a pair an item; two eyes of ~300 G-buffer draws fit)
+constexpr uint32_t kStageSets = 3;       // timed frames in flight
+struct StageSet {
+    ID3D11Query* disjoint = nullptr;
+    ID3D11Query* q[2 * kStagePairs] = {};   // made on first use, kept
+    uint8_t stage[kStagePairs] = {};
+    uint32_t used = 0, overflow = 0;
+    bool open = false, pending = false;
+};
+struct StageTimes {
+    StageSet set[kStageSets];
+    int cur = -1;       // the set this frame records into (-1: not a timed frame, or no set free)
+    int scope = -1;     // the open item's pair, or -1
+    int cpuStage = -1;  // the open item's stage, and its CPU start
+    LARGE_INTEGER cpuStart{};
+    // The window: each timed frame's sum by stage, and its total (ms); the items and CPU ticks of every frame.
+    std::vector<float> ms[kTStages + 1];
+    uint32_t items[kTStages] = {};
+    int64_t cpuTicks[kTStages] = {};
+    uint32_t timed = 0, overflow = 0, busy = 0, disjoint = 0;
+};
+StageTimes g_st;
+LARGE_INTEGER g_entryQpc{};   // the hook's entry (hullLayerBegin, hullLayerBeginDispatch): an item's CPU time starts there
+
+// The lighting window's draws on the dump frame (eye_<stamp>_HullLights.json): every draw between an eye's shadow mask and its sky
+// that writes the eye's HDR, and every stencil-only draw there (a light volume's stencil pass), with what the layer did with it.
+struct LightRec {
+    int eye = -1;
+    uint32_t seq = 0;   // the draw's ordinal among the frame's draws the layer saw
+    uint64_t vs = 0, ps = 0;
+    char kind = 0;
+    uint32_t count = 0, instances = 0, startInstance = 0;
+    bool hdr = false, stencilOnly = false, reissued = false, known = false, stagePair = false;
+    uint8_t stencilRef = 0;
+};
+constexpr size_t kMaxLightRecs = 4096;
+std::vector<LightRec> g_lights;
+uint32_t g_drawSeq = 0;
+bool g_lightsCapped = false;
+
+// Separate mode's dump: the capture frame is a reference frame (the main pass keeps the own ship, the layer runs, the composite is
+// made and not applied), so GameHdrLit holds the game's own hull beside HullHdr. g_refWould: that frame would have discarded.
+bool g_refFrame = false, g_refWould = false;
+
+// The TAA sequence (separate mode, eye 0, from the dump's capture frame): per frame the cover and its depth at render size (the
+// eye's region, cropped on the CPU to the cover's extent), the composite at output size (cropped likewise), the TAA's constants,
+// and on the first frame the history it read. Staged into kSeqRing sets and written kSeqLag frames later, so the GPU is not waited
+// on and the memory stays at kSeqRing sets whatever the length.
+constexpr int kSeqFrames = 16;
+constexpr uint32_t kSeqRing = 3;
+constexpr uint32_t kSeqLag = 2;
+constexpr uint64_t kSeqBudgetBytes = 768ull << 20;   // the ring and the history's staging, at most
+constexpr uint32_t kSeqMargin = 4;                    // render pixels about the cover's extent (the TAA's 3x3 and its depth)
+constexpr uint32_t kSeqHistMargin = 64;               // output pixels about frame 0's composite crop (the history's reprojection)
+struct SeqSet {
+    ID3D11Texture2D* cover = nullptr;
+    ID3D11Texture2D* depth = nullptr;
+    ID3D11Texture2D* comp = nullptr;
+    int index = -1;
+    bool pending = false;
+};
+struct SeqFrame {
+    int index = 0;
+    uint32_t frame = 0;
+    uint32_t renderW = 0, renderH = 0, outW = 0, outH = 0, regionX = 0, regionY = 0;
+    float jitter[2] = {}, tanNow[4] = {}, tanPrev[4] = {}, headDelta[9] = {}, headTrans[3] = {}, depthA = 0.0f, depthB = 0.0f;
+    bool havePrev = false, haveDelta = false, useTrans = false, history = false, applied = false, afterUiResolve = false;
+    uint32_t crop[4] = {}, compCrop[4] = {};   // x, y, w, h written
+    const char* status = "staged";
+};
+struct Seq {
+    bool active = false;
+    wchar_t stamp[32] = L"";
+    int staged = 0;
+    uint32_t startFrame = 0, lastFrame = ~0u;
+    SeqSet ring[kSeqRing];
+    ID3D11Texture2D* hist = nullptr;   // frame 0's history in (the TAA's last output), when it had one
+    uint32_t histCrop[4] = {};
+    const char* histStatus = "none";
+    std::vector<SeqFrame> frames;
+    uint64_t bytes = 0;
+    const char* end = nullptr;
+};
+Seq g_seq;
+void releaseStageTimes();   // the stage times' queries (below, with the stage functions)
+void releaseSeq();          // the sequence's staging and frames (below, with the dump)
+
 template <class T>
 void releaseRef(T*& p) {
     if (p) { p->Release(); p = nullptr; }
@@ -826,6 +921,8 @@ void releaseGpu() {
     for (auto& c : g_comp) releaseComp(c);
     releaseTimer(g_toneTimer);
     releaseTimer(g_compTimer);
+    releaseStageTimes();
+    releaseSeq();
 }
 
 void dropViewsOf(const void* game) {
@@ -858,6 +955,9 @@ void releaseAll() {
     g_haveOwn = false;
     g_discard = false;
     g_hold = 0;
+    g_lights.clear();
+    g_lightsCapped = false;
+    g_refFrame = false;
 }
 
 bool ensureDevice(ID3D11DeviceContext* ctx) {
@@ -1312,6 +1412,235 @@ struct GfxSave {
     }
 };
 
+// ---- dump v2: the stage times ---------------------------------------------------------------------------------------------
+
+// An item of stage `ts` begins: its CPU time from the hook's entry (fromEntry) or from now, and on a timed frame its first
+// timestamp. Items never nest (one hook pair is one item); a second open while one is open is ignored.
+void stageOpen(ID3D11DeviceContext* ctx, TStage ts, bool fromEntry) {
+    if (g_st.cpuStage >= 0 || g_st.scope >= 0) return;
+    g_st.cpuStage = ts;
+    if (fromEntry)
+        g_st.cpuStart = g_entryQpc;
+    else
+        QueryPerformanceCounter(&g_st.cpuStart);
+    ++g_st.items[ts];
+    if (g_st.cur < 0 || !g_device || !ctx) return;
+    StageSet& s = g_st.set[g_st.cur];
+    if (!s.open) {
+        if (!s.disjoint) {
+            D3D11_QUERY_DESC qd{};
+            qd.Query = D3D11_QUERY_TIMESTAMP_DISJOINT;
+            if (FAILED(g_device->CreateQuery(&qd, &s.disjoint)) || !s.disjoint) {
+                s.disjoint = nullptr;
+                g_st.cur = -1;
+                return;
+            }
+        }
+        ctx->Begin(s.disjoint);
+        s.open = true;
+        s.used = s.overflow = 0;
+    }
+    if (s.used >= kStagePairs) {
+        ++s.overflow;
+        return;
+    }
+    for (uint32_t k = 0; k < 2; ++k) {
+        ID3D11Query*& q = s.q[2 * s.used + k];
+        if (q) continue;
+        D3D11_QUERY_DESC qt{};
+        qt.Query = D3D11_QUERY_TIMESTAMP;
+        if (FAILED(g_device->CreateQuery(&qt, &q)) || !q) {
+            q = nullptr;
+            ++s.overflow;
+            return;
+        }
+    }
+    ctx->End(s.q[2 * s.used]);
+    s.stage[s.used] = static_cast<uint8_t>(ts);
+    g_st.scope = static_cast<int>(s.used);
+}
+
+// The open item ends: its second timestamp right after its GPU work, and its CPU time.
+void stageClose(ID3D11DeviceContext* ctx) {
+    if (g_st.scope >= 0 && g_st.cur >= 0 && ctx) {
+        StageSet& s = g_st.set[g_st.cur];
+        ctx->End(s.q[2 * g_st.scope + 1]);
+        ++s.used;
+    }
+    g_st.scope = -1;
+    if (g_st.cpuStage >= 0) {
+        LARGE_INTEGER now{};
+        QueryPerformanceCounter(&now);
+        g_st.cpuTicks[g_st.cpuStage] += now.QuadPart - g_st.cpuStart.QuadPart;
+        g_st.cpuStage = -1;
+    }
+}
+
+// At the frame boundary: the timed frame's set closed (its disjoint ended) and pending its readback.
+void stageFrameEnd(ID3D11DeviceContext* ctx) {
+    if (g_st.scope >= 0 || g_st.cpuStage >= 0) stageClose(ctx);   // never: an item opens and closes in one hook pair
+    if (g_st.cur >= 0) {
+        StageSet& s = g_st.set[g_st.cur];
+        if (s.open && ctx) {
+            ctx->End(s.disjoint);
+            s.open = false;
+            s.pending = true;
+        }
+        g_st.cur = -1;
+    }
+}
+
+// The next frame (g_frame): timed when its number says so and a set is free.
+void stageFrameStart() {
+    g_st.cur = -1;
+    if (g_frame % kStageEvery != 0) return;
+    for (uint32_t i = 0; i < kStageSets; ++i)
+        if (!g_st.set[i].pending && !g_st.set[i].open) {
+            g_st.cur = static_cast<int>(i);
+            return;
+        }
+    ++g_st.busy;
+}
+
+// The timed frames the GPU has finished: each stage's sum and the total into the window (DO_NOT_FLUSH, never a stall).
+void stageCollect(ID3D11DeviceContext* ctx) {
+    for (auto& s : g_st.set) {
+        if (!s.pending) continue;
+        D3D11_QUERY_DATA_TIMESTAMP_DISJOINT dj{};
+        if (ctx->GetData(s.disjoint, &dj, sizeof dj, D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK) continue;
+        double sum[kTStages] = {};
+        bool ready = true;
+        for (uint32_t i = 0; i < s.used && ready; ++i) {
+            UINT64 a = 0, b = 0;
+            if (ctx->GetData(s.q[2 * i], &a, sizeof a, D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK ||
+                ctx->GetData(s.q[2 * i + 1], &b, sizeof b, D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK)
+                ready = false;
+            else if (b >= a && dj.Frequency)
+                sum[s.stage[i]] += static_cast<double>(b - a) * 1000.0 / static_cast<double>(dj.Frequency);
+        }
+        if (!ready) continue;
+        s.pending = false;
+        g_st.overflow += s.overflow;
+        if (dj.Disjoint || dj.Frequency == 0) {
+            ++g_st.disjoint;
+            continue;
+        }
+        double total = 0.0;
+        for (int k = 0; k < kTStages; ++k) {
+            g_st.ms[k].push_back(static_cast<float>(sum[k]));
+            total += sum[k];
+        }
+        g_st.ms[kTStages].push_back(static_cast<float>(total));
+        ++g_st.timed;
+    }
+}
+
+// The window's part back to zero (the 30 s line).
+void stageWindowReset() {
+    for (auto& v : g_st.ms) v.clear();
+    for (auto& n : g_st.items) n = 0;
+    for (auto& t : g_st.cpuTicks) t = 0;
+    g_st.timed = g_st.overflow = g_st.busy = g_st.disjoint = 0;
+}
+
+// Field by field, not by assignment: a StageTimes is ~50 KB (its query pointers), too much for a temporary on the render thread.
+void releaseStageTimes() {
+    for (auto& s : g_st.set) {
+        releaseRef(s.disjoint);
+        for (auto*& q : s.q) releaseRef(q);
+        s.used = s.overflow = 0;
+        s.open = s.pending = false;
+    }
+    g_st.cur = g_st.scope = g_st.cpuStage = -1;
+    stageWindowReset();
+}
+
+// ---- dump v2: the lighting window's draws ----------------------------------------------------------------------------------
+
+// A draw's bindings before the layer's hook touched them (the dump frame only): its targets' identities, whether it writes colour,
+// and whether it writes stencil with no colour (a light volume's stencil pass).
+struct DrawSnap {
+    const void* rtv[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT] = {};
+    uint64_t vs = 0, ps = 0;
+    bool stencilOnly = false;
+    uint8_t stencilRef = 0;
+};
+
+DrawSnap snapDraw(ID3D11DeviceContext* ctx) {
+    DrawSnap s;
+    s.vs = bindingShaderHash(BindSlot::Vs);
+    s.ps = bindingShaderHash(BindSlot::Ps);
+    ID3D11RenderTargetView* rtv[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT] = {};
+    ID3D11DepthStencilView* dsv = nullptr;
+    ctx->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, rtv, &dsv);
+    bool colour = false;
+    {
+        ID3D11BlendState* bs = nullptr;
+        float factor[4] = {};
+        UINT mask = 0;
+        ctx->OMGetBlendState(&bs, factor, &mask);
+        D3D11_BLEND_DESC bd{};
+        if (bs) bs->GetDesc(&bd);
+        for (UINT i = 0; i < D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT; ++i) {
+            if (!rtv[i]) continue;
+            s.rtv[i] = resourceOf(rtv[i]);
+            const UINT8 writes = !bs ? D3D11_COLOR_WRITE_ENABLE_ALL : bd.RenderTarget[bd.IndependentBlendEnable ? i : 0].RenderTargetWriteMask;
+            if (writes) colour = true;
+        }
+        releaseRef(bs);
+    }
+    if (dsv && !colour) {
+        ID3D11DepthStencilState* ds = nullptr;
+        UINT ref = 0;
+        ctx->OMGetDepthStencilState(&ds, &ref);
+        if (ds) {
+            D3D11_DEPTH_STENCIL_DESC dd{};
+            ds->GetDesc(&dd);
+            const auto writesOp = [](const D3D11_DEPTH_STENCILOP_DESC& o) {
+                return o.StencilFailOp != D3D11_STENCIL_OP_KEEP || o.StencilDepthFailOp != D3D11_STENCIL_OP_KEEP || o.StencilPassOp != D3D11_STENCIL_OP_KEEP;
+            };
+            s.stencilOnly = dd.StencilEnable && dd.StencilWriteMask && (writesOp(dd.FrontFace) || writesOp(dd.BackFace));
+            s.stencilRef = static_cast<uint8_t>(ref);
+        }
+        releaseRef(ds);
+    }
+    releaseTargets(rtv, dsv);
+    return s;
+}
+
+// After the hook ran for the draw: kept when it is inside an eye's lighting window (the shadow mask opened it, the sky not yet
+// closed it) and writes the eye's HDR, or writes stencil only.
+void recordLight(const DrawSnap& s, char kind, UINT count, UINT instances, UINT startInstance, bool reissued) {
+    if (g_stageEye < 0) return;
+    const Eye& e = g_eyes[g_stageEye];
+    if (!e.lightOpen) return;
+    bool hdr = false;
+    for (const void* r : s.rtv)
+        if (r && r == e.hdrGame) hdr = true;
+    if (!hdr && !s.stencilOnly) return;
+    if (g_lights.size() >= kMaxLightRecs) {
+        g_lightsCapped = true;
+        return;
+    }
+    LightRec r;
+    r.eye = g_stageEye;
+    r.seq = g_drawSeq;
+    r.vs = s.vs;
+    r.ps = s.ps;
+    r.kind = kind;
+    r.count = count;
+    r.instances = instances;
+    r.startInstance = startInstance;
+    r.hdr = hdr;
+    r.stencilOnly = s.stencilOnly;
+    r.stencilRef = s.stencilRef;
+    r.reissued = reissued;
+    r.known = isLightVs(s.vs);
+    for (const auto& pair : kStagePairs)
+        if (pair.vs == s.vs && pair.ps == s.ps) r.stagePair = true;
+    g_lights.push_back(r);
+}
+
 // ---- the seed --------------------------------------------------------------------------------------------------------
 
 void sayRefused(const char* why) {
@@ -1511,7 +1840,10 @@ bool seedEye(ID3D11DeviceContext* ctx, ID3D11RenderTargetView* const* rtv, ID3D1
                 return false;
             }
         const char* why = nullptr;
-        if (!seedOwnMask(ctx, e, instances, startInstance, &why)) {
+        stageOpen(ctx, kTsMask, false);   // dump v2: the seed's copies and dispatch, timed with the filter
+        const bool seeded = seedOwnMask(ctx, e, instances, startInstance, &why);
+        stageClose(ctx);
+        if (!seeded) {
             ++g_win.refused;
             sayRefused(why ? why : "?");
             return false;
@@ -1564,6 +1896,7 @@ bool seedEye(ID3D11DeviceContext* ctx, ID3D11RenderTargetView* const* rtv, ID3D1
 // After the game's issue of a hull-family G-buffer draw (or, separate mode, a hull decal): the private re-issue's
 // bindings. Dump mode seeds here; separate mode seeded before the seed draw's issue, and re-issues the decals too.
 bool beginHullDraw(ID3D11DeviceContext* ctx, UINT instances, UINT startInstance, bool decal) {
+    QueryPerformanceCounter(&g_entryQpc);   // dump v2: the item's CPU time starts here
     ID3D11RenderTargetView* rtv[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT] = {};
     ID3D11DepthStencilView* dsv = nullptr;
     ctx->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, rtv, &dsv);
@@ -1645,6 +1978,7 @@ bool beginHullDraw(ID3D11DeviceContext* ctx, UINT instances, UINT startInstance,
     g_pending.srvSwapped = srvSwapped;
     for (UINT i = 0; i < D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT; ++i) g_pending.rtv[i] = rtv[i];   // the references pass to End
     g_pending.dsv = dsv;
+    stageOpen(ctx, kTsGbuf, true);   // dump v2: hullLayerEnd closes it right after the re-issue
     return true;
 }
 
@@ -1676,6 +2010,7 @@ void finishGbuffer(ID3D11DeviceContext* ctx, int ei, End why) {
     D3D11_TEXTURE2D_DESC dd{};
     static_cast<ID3D11Texture2D*>(depthRes)->GetDesc(&dd);
     if (e.slotSrv) {
+        stageOpen(ctx, kTsMask, false);   // dump v2: the filter and the count
         uint32_t cb[4] = {e.records, 0u, dd.Width, dd.Height};
         std::memcpy(&cb[1], &e.clearDepth, sizeof e.clearDepth);
         vScreenUpdateSubresourceRaw(ctx, g_gpu.passCb, 0, nullptr, cb, 0, 0);
@@ -1719,6 +2054,7 @@ void finishGbuffer(ID3D11DeviceContext* ctx, int ei, End why) {
             ctx->Dispatch((dd.Width + 7u) / 8u, (dd.Height + 7u) / 8u, 1);
             save.restore(ctx);
         }
+        stageClose(ctx);
         ++g_win.filters;
     }
     // The readback, a few frames later (never a stall).
@@ -1779,6 +2115,7 @@ void stageGameHdr(ID3D11DeviceContext* ctx, Eye& e, ID3D11RenderTargetView* rt0)
 }
 
 bool beginStage(ID3D11DeviceContext* ctx, Stage stage, uint8_t bit) {
+    QueryPerformanceCounter(&g_entryQpc);   // dump v2: the item's CPU time starts here
     ID3D11RenderTargetView* rtv[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT] = {};
     ID3D11DepthStencilView* dsv = nullptr;
     ID3D11ShaderResourceView* srv[kSrvSlots] = {};
@@ -1876,6 +2213,7 @@ bool beginStage(ID3D11DeviceContext* ctx, Stage stage, uint8_t bit) {
     for (UINT i = 0; i < kSrvSlots; ++i) g_pending.srv[i] = srv[i];
     g_pending.srvSwapped = srvSwapped;
     g_pending.hdrGame = rtv[0] ? resourceOf(rtv[0]) : nullptr;
+    stageOpen(ctx, stage == kLight ? kTsLight : kTsScreen, true);   // dump v2: hullLayerEnd closes it right after the re-issue
     return true;
 }
 
@@ -1924,6 +2262,7 @@ void releaseCsSlots(ID3D11ShaderResourceView** srv, ID3D11UnorderedAccessView** 
 // and calls hullLayerEndDispatch. The shader, constant buffers and samplers stay the game's; so do inputs with no private
 // copy (the HBAO's kernel buffer).
 bool beginAoStep(ID3D11DeviceContext* ctx, int step) {
+    QueryPerformanceCounter(&g_entryQpc);   // dump v2: the item's CPU time starts here
     ID3D11ShaderResourceView* srv[kCsSrvSlots] = {};
     ID3D11UnorderedAccessView* uav[kCsUavSlots] = {};
     ctx->CSGetShaderResources(0, kCsSrvSlots, srv);
@@ -1990,6 +2329,7 @@ bool beginAoStep(ID3D11DeviceContext* ctx, int step) {
     for (UINT i = 0; i < kCsUavSlots; ++i) g_dispatch.uav[i] = uav[i];
     e.aoDone |= bit;
     ++g_win.aoDispatches;
+    stageOpen(ctx, kTsScreen, true);   // dump v2: hullLayerEndDispatch closes it right after the re-dispatch
     return true;
 }
 
@@ -2256,6 +2596,7 @@ bool beginTone(ID3D11DeviceContext* ctx) {
     if (!ensureTone(ei, od.Width, od.Height, ta.rtvFmt)) return decline("a private tone target could not be made");
     releaseRef(hdrView);
     timerBegin(g_toneTimer, ctx);
+    stageOpen(ctx, kTsTone, false);   // dump v2: the re-issue and the cover pass (hullLayerEnd closes it after the cover)
     g_pending = Pending{};
     ctx->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, g_pending.rtv, &g_pending.dsv);
     ctx->PSGetShaderResources(0, kSrvSlots, g_pending.srv);
@@ -2466,6 +2807,44 @@ const char* writeTexture(ID3D11DeviceContext* ctx, ID3D11Texture2D* staging, con
     return ok ? "written" : "write failed";
 }
 
+// Dump v2: eye_<stamp>_HullLights.json, the lighting windows' draws of the dump frame (recordLight), and their summary line.
+void writeLights(const std::wstring& dir) {
+    wchar_t path[MAX_PATH];
+    _snwprintf_s(path, MAX_PATH, _TRUNCATE, L"%s\\eye_%s_HullLights.json", dir.c_str(), g_dumpStamp);
+    uint32_t reissued = 0, unknown = 0, stencil = 0, known = 0;
+    FILE* f = nullptr;
+    bool ok = false;
+    if (_wfopen_s(&f, path, L"wb") == 0 && f) {
+        ok = std::fprintf(f, "{\"version\": 1, \"stamp\": \"%ls\", \"frame\": %u, \"reference_frame\": %s, \"capped\": %s, \"cap\": %u,\n \"draws\": [",
+                          g_dumpStamp, g_dumpFrame, g_refFrame ? "true" : "false", g_lightsCapped ? "true" : "false",
+                          static_cast<unsigned>(kMaxLightRecs)) > 0;
+        for (size_t i = 0; i < g_lights.size() && ok; ++i) {
+            const LightRec& r = g_lights[i];
+            const bool unk = r.hdr && !r.known && !r.stagePair;
+            reissued += r.reissued ? 1u : 0u;
+            unknown += unk ? 1u : 0u;
+            stencil += r.stencilOnly ? 1u : 0u;
+            known += r.known ? 1u : 0u;
+            ok = std::fprintf(f,
+                              "%s\n  {\"eye\": %d, \"seq\": %u, \"vs\": \"%016llX\", \"ps\": \"%016llX\", \"kind\": \"%c\", \"count\": %u, \"instances\": %u, "
+                              "\"start_instance\": %u, \"writes_hdr\": %s, \"stencil_only\": %s, \"stencil_ref\": %u, \"known_light\": %s, \"stage_pair\": %s, "
+                              "\"reissued\": %s, \"unknown\": %s}",
+                              i ? "," : "", r.eye, r.seq, static_cast<unsigned long long>(r.vs), static_cast<unsigned long long>(r.ps),
+                              r.kind ? r.kind : '?', r.count, r.instances, r.startInstance, r.hdr ? "true" : "false", r.stencilOnly ? "true" : "false",
+                              static_cast<unsigned>(r.stencilRef), r.known ? "true" : "false", r.stagePair ? "true" : "false",
+                              r.reissued ? "true" : "false", unk ? "true" : "false") > 0;
+        }
+        ok = std::fprintf(f, "\n ]\n}\n") > 0 && ok;
+        ok = (std::fclose(f) == 0) && ok;
+    }
+    Log::get().note("hull layer: dump %ls: HullLights %s: %u draws in the eyes' lighting windows (%u known lighting, %u re-issued, %u unknown writing "
+                    "the HDR, %u stencil-only)%s",
+                    g_dumpStamp, ok ? "written" : "write failed", static_cast<unsigned>(g_lights.size()), known, reissued, unknown, stencil,
+                    g_lightsCapped ? " (capped)" : "");
+    g_lights.clear();
+    g_lightsCapped = false;
+}
+
 void writeDump(ID3D11DeviceContext* ctx) {
     const std::wstring dir = Log::get().dir() + L"\\eyes";
     CreateDirectoryW(dir.c_str(), nullptr);
@@ -2500,25 +2879,336 @@ void writeDump(ID3D11DeviceContext* ctx) {
         Log::get().note("hull layer: dump %ls eye %d frame %u: HullHdr %ux%u format %u %s, GameHdrLit %s, HullDepth %s; own=%ld filtered_px=%ld "
                         "seed=%ld/%ld hull_draws=%u light_draws=%u",
                         g_dumpStamp, i, g_dumpFrame, w, h, fmt, hull, game, depth, own, filtered, seedRead, seedInst, e.dumpHull, e.dumpLight);
-        if (detail::g_hullLayerSeparate) {
+        if (detail::g_hullLayerSeparate && g_refFrame) {
+            // Dump v2: the capture frame was a reference frame. The main pass kept the own ship, so GameHdrLit holds the game's own
+            // hull beside HullHdr (tools\hull_layer_compare.py's lighting comparison), and the main depth after the eye's G-buffer
+            // holds it too: RefDepth, the compare's mask of where the game shows the hull (both eyes; the eye run's Z is eye 0's).
+            const char* gbuf = writeTexture(ctx, e.stageGbuf0, dir, L"RefGbuf0", i);
+            const char* mainDepth = writeTexture(ctx, e.stageMainDepth, dir, L"RefDepth", i);
+            Log::get().note("hull layer: dump %ls eye %d: reference frame: the main pass kept the own ship (the frame would have discarded it: %s), the "
+                            "layer ran and its composite was made and not applied; RefGbuf0 %s, RefDepth %s (the game's G-buffer RT0 and main depth "
+                            "after the eye's G-buffer, the own ship drawn; decals_reissued=%u)",
+                            g_dumpStamp, i, g_refWould ? "yes" : "no", gbuf, mainDepth, e.decals);
+        } else if (detail::g_hullLayerSeparate) {
             // The main pass with the own ship discarded: the game's G-buffer RT0 and its eye depth after the eye's G-buffer.
             const char* gbuf = writeTexture(ctx, e.stageGbuf0, dir, L"GameGbuf0", i);
             const char* mainDepth = writeTexture(ctx, e.stageMainDepth, dir, L"GameDepth", i);
             Log::get().note("hull layer: dump %ls eye %d: GameGbuf0 %s, GameDepth %s (separate mode: the game's G-buffer RT0 and main depth after the "
                             "eye's G-buffer; own_draws=%u decal_draws=%u decals_reissued=%u)",
                             g_dumpStamp, i, gbuf, mainDepth, e.ownDraws, e.ownDecals, e.decals);
+        }
+        if (detail::g_hullLayerSeparate) {
             // Step 3: the cover at render size (the tonemapped hull where shown, alpha 1) and the composited eye at output size, after the
             // composite and before the UI layer's door; on a fallback frame it is the composite that was made and not applied.
             const char* tone = writeTexture(ctx, e.stageTone, dir, L"HullTone", i);
             const char* comp = writeTexture(ctx, e.stageComp, dir, L"HullComposite", i);
             Log::get().note("hull layer: dump %ls eye %d: HullTone %s, HullComposite %s (separate mode, Step 3: the composite %s)", g_dumpStamp, i, tone, comp,
-                            !e.stageComp ? "did not run" : e.dumpApplied ? "applied" : "made, not applied (a fallback frame)");
+                            !e.stageComp       ? "did not run"
+                            : e.dumpApplied    ? "applied"
+                            : g_refFrame       ? "made, not applied (the reference frame)"
+                                               : "made, not applied (a fallback frame)");
         }
         releaseStaging(e);
     }
     if (!any)
         Log::get().note("hull layer: dump %ls frame %u: nothing captured (no eye seeded its private G-buffer and drew its lighting in the frame)",
                         g_dumpStamp, g_dumpFrame);
+    writeLights(dir);
+}
+
+// ---- dump v2: the TAA sequence -----------------------------------------------------------------------------------------
+
+void releaseSeq() {
+    for (auto& s : g_seq.ring) {
+        releaseRef(s.cover);
+        releaseRef(s.depth);
+        releaseRef(s.comp);
+        s.pending = false;
+        s.index = -1;
+    }
+    releaseRef(g_seq.hist);
+    g_seq.frames.clear();
+    g_seq.active = false;
+    g_seq.end = nullptr;
+}
+
+// A staging copy of src's (x, y, w, h), made or remade at that size and src's format.
+bool stageRegion(ID3D11DeviceContext* ctx, ID3D11Texture2D* src, uint32_t x, uint32_t y, uint32_t w, uint32_t h, ID3D11Texture2D*& stage) {
+    if (!src || !g_device || !w || !h) return false;
+    D3D11_TEXTURE2D_DESC d{};
+    src->GetDesc(&d);
+    if (d.SampleDesc.Count != 1 || x + w > d.Width || y + h > d.Height) return false;
+    if (stage) {
+        D3D11_TEXTURE2D_DESC s{};
+        stage->GetDesc(&s);
+        if (s.Width != w || s.Height != h || s.Format != d.Format) releaseRef(stage);
+    }
+    if (!stage) {
+        D3D11_TEXTURE2D_DESC sd{};
+        sd.Width = w;
+        sd.Height = h;
+        sd.MipLevels = 1;
+        sd.ArraySize = 1;
+        sd.Format = d.Format;
+        sd.SampleDesc.Count = 1;
+        sd.Usage = D3D11_USAGE_STAGING;
+        sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        if (FAILED(g_device->CreateTexture2D(&sd, nullptr, &stage)) || !stage) {
+            stage = nullptr;
+            return false;
+        }
+    }
+    const D3D11_BOX box{x, y, 0u, x + w, y + h, 1u};
+    vScreenCopySubresourceRegionRaw(ctx, stage, 0, src, &box);
+    return true;
+}
+
+// One EDVRTEX1 file of a mapped staging texture's crop (x, y, w, h): eye_<seq stamp>_<name>.bin, eye 0, the layer frame `frame`.
+bool writeCrop(const std::wstring& dir, const wchar_t* name, uint32_t frame, const D3D11_MAPPED_SUBRESOURCE& map, DXGI_FORMAT fmt, uint32_t bpp,
+               const uint32_t crop[4]) {
+    wchar_t path[MAX_PATH];
+    _snwprintf_s(path, MAX_PATH, _TRUNCATE, L"%s\\eye_%s_%s.bin", dir.c_str(), g_seq.stamp, name);
+    FILE* f = nullptr;
+    bool ok = false;
+    const uint32_t rowBytes = crop[2] * bpp;
+    if (_wfopen_s(&f, path, L"wb") == 0 && f) {
+        const uint32_t header[9] = {1u, crop[2], crop[3], static_cast<uint32_t>(fmt), rowBytes, frame, 0u, 0u, 0u};
+        ok = std::fwrite("EDVRTEX1", 1, 8, f) == 8 && std::fwrite(header, sizeof(header), 1, f) == 1;
+        for (uint32_t y = 0; y < crop[3] && ok; ++y)
+            ok = std::fwrite(static_cast<const char*>(map.pData) + static_cast<size_t>(crop[1] + y) * map.RowPitch + static_cast<size_t>(crop[0]) * bpp, 1,
+                             rowBytes, f) == rowBytes;
+        ok = (std::fclose(f) == 0) && ok;
+    }
+    if (ok) g_seq.bytes += 44ull + static_cast<uint64_t>(rowBytes) * crop[3];
+    return ok;
+}
+
+// A crop grown by `m` on every side, within (0, 0, w, h).
+void growCrop(const uint32_t in[4], uint32_t m, uint32_t w, uint32_t h, uint32_t out[4]) {
+    const uint32_t x0 = in[0] > m ? in[0] - m : 0u, y0 = in[1] > m ? in[1] - m : 0u;
+    const uint32_t x1 = std::min(in[0] + in[2] + m, w), y1 = std::min(in[1] + in[3] + m, h);
+    out[0] = x0;
+    out[1] = y0;
+    out[2] = x1 > x0 ? x1 - x0 : 1u;
+    out[3] = y1 > y0 ? y1 - y0 : 1u;
+}
+
+// A staged set to disk (a blocking map: kSeqLag frames after its copies, the GPU is normally done). The cover is cropped to its
+// extent (alpha above 0) and kSeqMargin, the depth to the same crop; the composite to that crop at the output scale and 8 px;
+// frame 0's history to the composite's crop and kSeqHistMargin. Outside a crop the cover, depth and history are zero.
+void seqWriteSet(ID3D11DeviceContext* ctx, SeqSet& s) {
+    if (!s.pending) return;
+    s.pending = false;
+    if (s.index < 0 || s.index >= static_cast<int>(g_seq.frames.size())) return;
+    SeqFrame& f = g_seq.frames[static_cast<size_t>(s.index)];
+    const std::wstring dir = Log::get().dir() + L"\\eyes";
+    CreateDirectoryW(dir.c_str(), nullptr);
+    wchar_t name[40];
+    bool ok = true;
+    D3D11_MAPPED_SUBRESOURCE map{};
+    if (!s.cover || FAILED(ctx->Map(s.cover, 0, D3D11_MAP_READ, 0, &map))) {
+        f.status = "map failed";
+        return;
+    }
+    uint32_t x0 = f.renderW, y0 = f.renderH, x1 = 0, y1 = 0;
+    for (uint32_t y = 0; y < f.renderH; ++y) {
+        const uint8_t* row = static_cast<const uint8_t*>(map.pData) + static_cast<size_t>(y) * map.RowPitch;
+        for (uint32_t x = 0; x < f.renderW; ++x)
+            if (row[4 * x + 3]) {
+                x0 = std::min(x0, x);
+                x1 = std::max(x1, x);
+                y0 = std::min(y0, y);
+                y1 = std::max(y1, y);
+            }
+    }
+    if (x1 < x0 || y1 < y0) {
+        f.crop[0] = f.crop[1] = 0;
+        f.crop[2] = f.crop[3] = 1;
+    } else {
+        const uint32_t ext[4] = {x0, y0, x1 - x0 + 1, y1 - y0 + 1};
+        growCrop(ext, kSeqMargin, f.renderW, f.renderH, f.crop);
+    }
+    _snwprintf_s(name, 40, _TRUNCATE, L"HullSeq_%02d_Cover", f.index);
+    ok = writeCrop(dir, name, f.frame, map, DXGI_FORMAT_R8G8B8A8_UNORM, 4, f.crop) && ok;
+    ctx->Unmap(s.cover, 0);
+    if (s.depth && SUCCEEDED(ctx->Map(s.depth, 0, D3D11_MAP_READ, 0, &map))) {
+        _snwprintf_s(name, 40, _TRUNCATE, L"HullSeq_%02d_Depth", f.index);
+        ok = writeCrop(dir, name, f.frame, map, DXGI_FORMAT_R32_FLOAT, 4, f.crop) && ok;
+        ctx->Unmap(s.depth, 0);
+    } else {
+        ok = false;
+    }
+    // The composite's crop: the cover's at the output scale.
+    const uint64_t ox0 = static_cast<uint64_t>(f.crop[0]) * f.outW / f.renderW, oy0 = static_cast<uint64_t>(f.crop[1]) * f.outH / f.renderH;
+    const uint64_t ox1 = (static_cast<uint64_t>(f.crop[0] + f.crop[2]) * f.outW + f.renderW - 1) / f.renderW;
+    const uint64_t oy1 = (static_cast<uint64_t>(f.crop[1] + f.crop[3]) * f.outH + f.renderH - 1) / f.renderH;
+    const uint32_t scaled[4] = {static_cast<uint32_t>(ox0), static_cast<uint32_t>(oy0), static_cast<uint32_t>(ox1 - ox0), static_cast<uint32_t>(oy1 - oy0)};
+    growCrop(scaled, 8, f.outW, f.outH, f.compCrop);
+    if (s.comp && SUCCEEDED(ctx->Map(s.comp, 0, D3D11_MAP_READ, 0, &map))) {
+        _snwprintf_s(name, 40, _TRUNCATE, L"HullSeq_%02d_Comp", f.index);
+        ok = writeCrop(dir, name, f.frame, map, DXGI_FORMAT_R8G8B8A8_UNORM, 4, f.compCrop) && ok;
+        ctx->Unmap(s.comp, 0);
+    } else {
+        ok = false;
+    }
+    if (f.index == 0 && g_seq.hist) {
+        growCrop(f.compCrop, kSeqHistMargin, f.outW, f.outH, g_seq.histCrop);
+        if (SUCCEEDED(ctx->Map(g_seq.hist, 0, D3D11_MAP_READ, 0, &map))) {
+            g_seq.histStatus = writeCrop(dir, L"HullSeq_00_Hist", f.frame, map, DXGI_FORMAT_R16G16B16A16_FLOAT, 8, g_seq.histCrop) ? "written" : "write failed";
+            ctx->Unmap(g_seq.hist, 0);
+        } else {
+            g_seq.histStatus = "map failed";
+        }
+        releaseRef(g_seq.hist);
+    }
+    f.status = ok ? "written" : "write failed";
+}
+
+// Right after eye 0's composite (hullLayerCompositeEye), while the sequence runs: the cover and its depth (the eye's region),
+// the composite and the TAA's constants staged; on frame 0, the history it read too.
+void seqStage(ID3D11DeviceContext* ctx, const Eye& e, const Comp& c, const HullLayerCompositeInputs& in, bool history, bool applied) {
+    if (!g_seq.active || g_seq.end || g_seq.staged >= kSeqFrames) return;
+    if (g_seq.staged == 0) {
+        const uint64_t set = static_cast<uint64_t>(in.renderW) * in.renderH * 8u + static_cast<uint64_t>(in.outW) * in.outH * 4u;
+        if (set * kSeqRing + static_cast<uint64_t>(in.outW) * in.outH * 8u > kSeqBudgetBytes) {
+            g_seq.end = "over the memory budget";
+            return;
+        }
+    }
+    // A free set, else the oldest staged one written now.
+    SeqSet* s = nullptr;
+    for (auto& r : g_seq.ring)
+        if (!r.pending) {
+            s = &r;
+            break;
+        }
+    if (!s) {
+        for (auto& r : g_seq.ring)
+            if (!s || r.index < s->index) s = &r;
+        seqWriteSet(ctx, *s);
+    }
+    if (!stageRegion(ctx, e.cover, in.regionX, in.regionY, in.renderW, in.renderH, s->cover) ||
+        !stageRegion(ctx, e.coverZ, in.regionX, in.regionY, in.renderW, in.renderH, s->depth) ||
+        !stageRegion(ctx, c.out, 0, 0, in.outW, in.outH, s->comp)) {
+        g_seq.end = "a staging copy could not be made";
+        return;
+    }
+    if (g_seq.staged == 0 && history) copyToStaging(ctx, c.hist[c.read], g_seq.hist);   // the history this TAA read
+    SeqFrame f;
+    f.index = g_seq.staged;
+    f.frame = g_frame;
+    f.renderW = in.renderW;
+    f.renderH = in.renderH;
+    f.outW = in.outW;
+    f.outH = in.outH;
+    f.regionX = in.regionX;
+    f.regionY = in.regionY;
+    f.jitter[0] = in.jitterX;
+    f.jitter[1] = in.jitterY;
+    std::memcpy(f.tanNow, in.tanNow, sizeof f.tanNow);
+    std::memcpy(f.tanPrev, in.tanPrev ? in.tanPrev : in.tanNow, sizeof f.tanPrev);   // as the TAA's constants have it
+    f.havePrev = in.tanPrev != nullptr;
+    for (int k = 0; k < 9; ++k) f.headDelta[k] = in.headDelta ? in.headDelta[k] : (k % 4 == 0 ? 1.0f : 0.0f);
+    f.haveDelta = in.headDelta != nullptr;
+    f.useTrans = in.headTrans && in.useTrans;
+    if (f.useTrans) std::memcpy(f.headTrans, in.headTrans, sizeof f.headTrans);
+    f.depthA = in.depthA;
+    f.depthB = in.depthB;
+    f.history = history;
+    f.applied = applied;
+    f.afterUiResolve = in.afterUiResolve;
+    s->index = f.index;
+    s->pending = true;
+    g_seq.frames.push_back(f);
+    ++g_seq.staged;
+    g_seq.lastFrame = g_frame;
+}
+
+// eye_<stamp>_HullSeq.json: the per-frame constants the TAA used, the crops, and the TAA's parameters from this build.
+void seqWriteJson() {
+    const std::wstring dir = Log::get().dir() + L"\\eyes";
+    CreateDirectoryW(dir.c_str(), nullptr);
+    wchar_t path[MAX_PATH];
+    _snwprintf_s(path, MAX_PATH, _TRUNCATE, L"%s\\eye_%s_HullSeq.json", dir.c_str(), g_seq.stamp);
+    FILE* f = nullptr;
+    if (_wfopen_s(&f, path, L"wb") != 0 || !f) return;
+    std::fprintf(f, "{\"version\": 1, \"stamp\": \"%ls\", \"eye\": 0, \"start_frame\": %u, \"frames_wanted\": %d, \"end\": \"%s\",\n", g_seq.stamp,
+                 g_seq.startFrame, kSeqFrames, g_seq.end ? g_seq.end : "?");
+    std::fprintf(f, " \"taa\": {\"current_weight\": %.9g, \"sharpen\": %.9g},\n", static_cast<double>(kTaaCurrent), static_cast<double>(kSharpAmount));
+    std::fprintf(f, " \"history\": {\"file\": \"HullSeq_00_Hist\", \"status\": \"%s\", \"crop\": [%u, %u, %u, %u]},\n \"frames\": [", g_seq.histStatus,
+                 g_seq.histCrop[0], g_seq.histCrop[1], g_seq.histCrop[2], g_seq.histCrop[3]);
+    for (size_t i = 0; i < g_seq.frames.size(); ++i) {
+        const SeqFrame& q = g_seq.frames[i];
+        std::fprintf(f,
+                     "%s\n  {\"index\": %d, \"frame\": %u, \"status\": \"%s\", \"render\": [%u, %u], \"output\": [%u, %u], \"region\": [%u, %u], "
+                     "\"crop\": [%u, %u, %u, %u], \"comp_crop\": [%u, %u, %u, %u], \"jitter\": [%.9g, %.9g], ",
+                     i ? "," : "", q.index, q.frame, q.status, q.renderW, q.renderH, q.outW, q.outH, q.regionX, q.regionY, q.crop[0], q.crop[1], q.crop[2],
+                     q.crop[3], q.compCrop[0], q.compCrop[1], q.compCrop[2], q.compCrop[3], static_cast<double>(q.jitter[0]),
+                     static_cast<double>(q.jitter[1]));
+        std::fprintf(f, "\"tan_now\": [%.9g, %.9g, %.9g, %.9g], \"tan_prev\": [%.9g, %.9g, %.9g, %.9g], \"tan_prev_given\": %s, ",
+                     static_cast<double>(q.tanNow[0]), static_cast<double>(q.tanNow[1]), static_cast<double>(q.tanNow[2]), static_cast<double>(q.tanNow[3]),
+                     static_cast<double>(q.tanPrev[0]), static_cast<double>(q.tanPrev[1]), static_cast<double>(q.tanPrev[2]), static_cast<double>(q.tanPrev[3]),
+                     q.havePrev ? "true" : "false");
+        std::fprintf(f, "\"head_delta\": [");
+        for (int k = 0; k < 9; ++k) std::fprintf(f, "%s%.9g", k ? ", " : "", static_cast<double>(q.headDelta[k]));
+        std::fprintf(f,
+                     "], \"head_delta_given\": %s, \"head_trans\": [%.9g, %.9g, %.9g], \"use_trans\": %s, \"depth_ab\": [%.9g, %.9g], \"history\": %s, "
+                     "\"applied\": %s, \"after_ui_resolve\": %s}",
+                     q.haveDelta ? "true" : "false", static_cast<double>(q.headTrans[0]), static_cast<double>(q.headTrans[1]),
+                     static_cast<double>(q.headTrans[2]), q.useTrans ? "true" : "false", static_cast<double>(q.depthA), static_cast<double>(q.depthB),
+                     q.history ? "true" : "false", q.applied ? "true" : "false", q.afterUiResolve ? "true" : "false");
+    }
+    std::fprintf(f, "\n ]\n}\n");
+    std::fclose(f);
+}
+
+// At the frame boundary (g_frame already the next frame's): the sets kSeqLag frames old written; the sequence ends when it is
+// complete, when a frame passed without eye 0's composite (the TAA's frames must follow one another), or when none came.
+void seqBoundary(ID3D11DeviceContext* ctx) {
+    if (!g_seq.active || !ctx) return;
+    if (!g_seq.end) {
+        if (g_seq.staged >= kSeqFrames)
+            g_seq.end = "complete";
+        else if (g_seq.staged > 0 && g_seq.lastFrame + 1 != g_frame)
+            g_seq.end = "a frame without eye 0's composite";
+        else if (g_seq.staged == 0 && g_frame - g_seq.startFrame > 2)
+            g_seq.end = "eye 0 was not composited";
+    }
+    bool pending = false;
+    for (auto& s : g_seq.ring) {
+        if (!s.pending) continue;
+        const uint32_t at = s.index >= 0 && s.index < static_cast<int>(g_seq.frames.size()) ? g_seq.frames[static_cast<size_t>(s.index)].frame : 0u;
+        if (g_seq.end || g_frame - at >= kSeqLag)
+            seqWriteSet(ctx, s);
+        else
+            pending = true;
+    }
+    if (!g_seq.end || pending) return;
+    seqWriteJson();
+    uint32_t written = 0;
+    for (const auto& q : g_seq.frames)
+        if (std::strcmp(q.status, "written") == 0) ++written;
+    Log::get().note("hull layer: dump %ls: HullSeq %u of %d frames written (eye 0 from frame %u, %.1f MB), history %s; end: %s "
+                    "(tools\\hull_taa_sim.py reproduces the TAA from them)",
+                    g_seq.stamp, written, kSeqFrames, g_seq.startFrame, static_cast<double>(g_seq.bytes) / (1024.0 * 1024.0), g_seq.histStatus, g_seq.end);
+    releaseSeq();
+}
+
+// The dump's capture frame begins (separate mode): the sequence starts on it.
+void seqStart() {
+    if (g_seq.active) {
+        Log::get().note("hull layer: dump %ls: no HullSeq (the sequence of dump %ls is still being written)", g_dumpStamp, g_seq.stamp);
+        return;
+    }
+    releaseSeq();
+    g_seq.active = true;
+    wcsncpy_s(g_seq.stamp, g_dumpStamp, _TRUNCATE);
+    g_seq.staged = 0;
+    g_seq.startFrame = g_frame;
+    g_seq.lastFrame = ~0u;
+    g_seq.bytes = 0;
+    g_seq.histStatus = "none (frame 0 had no history)";
+    for (auto& h : g_seq.histCrop) h = 0;
 }
 
 // ---- the window line --------------------------------------------------------------------------------------------------
@@ -2530,6 +3220,39 @@ void loMidHi(std::vector<uint32_t> v, uint32_t* lo, uint32_t* mid, uint32_t* hi)
     *lo = v.front();
     *mid = v[(v.size() - 1) / 2];
     *hi = v.back();
+}
+
+// The median of a window's samples, -1 with none.
+double medianOf(std::vector<float> v) {
+    if (v.empty()) return -1.0;
+    std::sort(v.begin(), v.end());
+    return static_cast<double>(v[(v.size() - 1) / 2]);
+}
+
+// Dump v2: the stage times' line (both modes): the median GPU ms a timed frame by stage and of their total, the items and the
+// CPU ms a frame by stage over the window.
+void reportStages() {
+    double gpu[kTStages + 1];
+    for (int k = 0; k <= kTStages; ++k) gpu[k] = medianOf(g_st.ms[k]);
+    LARGE_INTEGER freq{};
+    QueryPerformanceFrequency(&freq);
+    const double frames = g_win.frames ? static_cast<double>(g_win.frames) : 1.0;
+    double cpu[kTStages], items[kTStages], cpuTotal = 0.0;
+    for (int k = 0; k < kTStages; ++k) {
+        cpu[k] = freq.QuadPart ? static_cast<double>(g_st.cpuTicks[k]) * 1000.0 / static_cast<double>(freq.QuadPart) / frames : 0.0;
+        items[k] = static_cast<double>(g_st.items[k]) / frames;
+        cpuTotal += cpu[k];
+    }
+    Log::get().note("hull layer: gpu_ms gbuffer=%.3f mask_filter=%.3f screen=%.3f light=%.3f tone=%.3f taa=%.3f total=%.3f timed_frames=%u "
+                    "items=gbuffer:%.1f,mask_filter:%.1f,screen:%.1f,light:%.1f,tone:%.1f,taa:%.1f cpu_ms=gbuffer:%.3f,mask_filter:%.3f,screen:%.3f,"
+                    "light:%.3f,tone:%.3f,taa:%.3f,total:%.3f overflow=%u busy=%u disjoint=%u (dump v2: the median GPU ms a timed frame (one in %u) by "
+                    "stage, the layer's own work only: gbuffer the private G-buffer and decal re-issues, mask_filter the seed, filter and count, "
+                    "screen the depth copy, shadow mask, AO steps and apply, light the lighting and night vision, tone the tonemap re-issue and cover, "
+                    "taa the TAA, sharpen and composite; -1 when none was timed; items and cpu_ms a frame over the window)",
+                    gpu[kTsGbuf], gpu[kTsMask], gpu[kTsScreen], gpu[kTsLight], gpu[kTsTone], gpu[kTsTaa], gpu[kTStages], g_st.timed, items[kTsGbuf],
+                    items[kTsMask], items[kTsScreen], items[kTsLight], items[kTsTone], items[kTsTaa], cpu[kTsGbuf], cpu[kTsMask], cpu[kTsScreen],
+                    cpu[kTsLight], cpu[kTsTone], cpu[kTsTaa], cpuTotal, g_st.overflow, g_st.busy, g_st.disjoint, kStageEvery);
+    stageWindowReset();
 }
 
 void report() {
@@ -2561,6 +3284,7 @@ void report() {
                     g_win.aoEyeFrames, g_win.aoFull, g_win.aoDispatches,
                     g_win.aoEyeFrames ? static_cast<double>(g_win.aoDispatches) / g_win.aoEyeFrames : 0.0, g_win.aoApplied, g_win.aoMissed[0],
                     g_win.aoMissed[1], g_win.aoMissed[2], g_win.aoMissed[kAoSteps], g_win.aoNoEye, kAoSteps);
+    reportStages();
     if (detail::g_hullLayerSeparate) {
         Log::get().note("hull layer: main pass: own_draws=%u decal_draws=%u no_variant_draws=%u fallback_frames=%u decals_reissued=%u decal_no_slot=%u "
                         "(separate mode: draws issued with the own discard; window draws that could not take it; eye-frames whose main pass kept the own "
@@ -2678,8 +3402,21 @@ void hullLayerAfterMainDraw(ID3D11DeviceContext* ctx) {
     g_main = MainPending{};
 }
 
+static bool beginDraw(ID3D11DeviceContext* ctx, char kind, UINT count, UINT instances, UINT startInstance);
+
 bool hullLayerBegin(ID3D11DeviceContext* ctx, char kind, UINT count, UINT instances, UINT startInstance) {
     if (!detail::g_hullLayerOn || !ctx || g_pending.active) return false;
+    if (g_dump != Dump::Capturing) return beginDraw(ctx, kind, count, instances, startInstance);
+    // Dump v2, the dump frame: the draw's bindings before the hook (it may bind the private ones), and after it the lighting
+    // window's record (HullLights.json).
+    ++g_drawSeq;
+    const DrawSnap snap = snapDraw(ctx);
+    const bool reissue = beginDraw(ctx, kind, count, instances, startInstance);
+    recordLight(snap, kind, count, instances, startInstance, reissue);
+    return reissue;
+}
+
+static bool beginDraw(ID3D11DeviceContext* ctx, char kind, UINT count, UINT instances, UINT startInstance) {
     // Step 3: the game's tonemap (a 3-vertex, one-instance draw, then admitted by structure and by the HDR it reads).
     if (detail::g_hullLayerSeparate && (kind == 'D' || kind == 'N') && count == 3 && instances == 1 && startInstance == 0 && g_device &&
         (g_eyes[0].gb == Gb::Done || g_eyes[1].gb == Gb::Done) && beginTone(ctx))
@@ -2704,6 +3441,7 @@ bool hullLayerBegin(ID3D11DeviceContext* ctx, char kind, UINT count, UINT instan
 void hullLayerEnd(ID3D11DeviceContext* ctx) {
     if (!g_pending.active) return;
     Pending& p = g_pending;
+    if (p.stage != kToneStage) stageClose(ctx);   // dump v2: right after the re-issue (the tonemap's closes after its cover pass)
     if (p.srvSwapped) vScreenPSSetShaderResourcesRaw(ctx, 0, kSrvSlots, p.srv);
     vScreenSetRenderTargetsRaw(ctx, boundCount(p.rtv), p.rtv, p.dsv);
     if (p.stage < 0) ++g_win.reissued;
@@ -2712,6 +3450,7 @@ void hullLayerEnd(ID3D11DeviceContext* ctx) {
         coverPass(ctx, p.eye, p.toneOut);
         timerEnd(g_toneTimer, ctx);
     }
+    if (p.stage == kToneStage) stageClose(ctx);
     if (p.stage == kLight && p.eye >= 0 && g_dump == Dump::Capturing) {
         // The private HDR right after this private lighting draw: the last one is the comparison.
         Eye& e = g_eyes[p.eye];
@@ -2733,6 +3472,7 @@ bool hullLayerBeginDispatch(ID3D11DeviceContext* ctx, uint64_t cs) {
 
 void hullLayerEndDispatch(ID3D11DeviceContext* ctx) {
     if (!g_dispatch.active) return;
+    stageClose(ctx);   // dump v2: right after the re-dispatch
     if (ctx) {
         // The game's inputs first (none is a private copy still bound as a UAV), then its UAVs with their counters kept.
         UINT keep[kCsUavSlots];
@@ -2867,6 +3607,7 @@ void hullLayerCompositeEye(ID3D11DeviceContext* ctx, int eye, const HullLayerCom
     cb.origin[0] = static_cast<int32_t>(in.regionX);
     cb.origin[1] = static_cast<int32_t>(in.regionY);
     timerBegin(g_compTimer, ctx);
+    stageOpen(ctx, kTsTaa, false);   // dump v2: the TAA, the sharpen and the composite's copy
     vScreenUpdateSubresourceRaw(ctx, g_cgpu.taaCb, 0, nullptr, &cb, 0, 0);
     {
         CsStageSave save;
@@ -2902,12 +3643,14 @@ void hullLayerCompositeEye(ID3D11DeviceContext* ctx, int eye, const HullLayerCom
     // and a miss is seen) and the upscaled eye keeps the game's own ship.
     const bool apply = g_discard && (e.ownDraws + e.ownDecals) > 0;
     if (apply) vScreenCopyResourceRaw(ctx, in.output, c.out);
+    stageClose(ctx);
     timerEnd(g_compTimer, ctx);
     if (g_dump == Dump::Capturing) {
         copyToStaging(ctx, e.cover, e.stageTone);
         copyToStaging(ctx, c.out, e.stageComp);
         e.dumpApplied = apply;
     }
+    if (eye == 0) seqStage(ctx, e, c, in, history, apply);   // dump v2: the TAA sequence (before the history pair flips)
     c.read ^= 1u;
     c.lastFrame = g_frame;
     c.renderW = in.renderW;
@@ -2934,15 +3677,19 @@ void hullLayerFrameBoundary(ID3D11DeviceContext* ctx) {
         if (ctx)
             for (int i = 0; i < 2; ++i)
                 if (g_eyes[i].gb == Gb::In) finishGbuffer(ctx, i, kEndFrame);
+        stageFrameEnd(ctx);   // dump v2: after the last item of the frame (the filter above)
         if (detail::g_hullLayerSeparate) judgeFrame();   // Step 3: before the frame number moves on (the tone and composite marks name it)
         ++g_frame;
         if (ctx) {
             readBacks(ctx);
             timerCollect(g_toneTimer, ctx);
             timerCollect(g_compTimer, ctx);
+            stageCollect(ctx);
+            seqBoundary(ctx);
         }
         if (g_dump == Dump::Capturing && ctx) writeDump(ctx);
     }
+    g_drawSeq = 0;
     for (auto& e : g_eyes) {
         if (!e.seen || !e.shell) continue;
         ++g_win.eyeFrames;
@@ -2973,6 +3720,9 @@ void hullLayerFrameBoundary(ID3D11DeviceContext* ctx) {
     } else if (g_dump == Dump::Armed) {
         g_dump = Dump::Capturing;
         g_dumpFrame = g_frame;
+        g_lights.clear();   // dump v2: the capture frame's lighting windows (HullLights.json)
+        g_lightsCapped = false;
+        if (detail::g_hullLayerSeparate) seqStart();   // dump v2: the TAA sequence starts on the capture frame
     }
     const ULONGLONG now = GetTickCount64();
     if (g_autoStreak >= kAutoFrames && g_autoDumps < kAutoMax && g_dump == Dump::Idle && (g_lastAutoMs == 0 || now - g_lastAutoMs >= kAutoGapMs)) {
@@ -2995,6 +3745,17 @@ void hullLayerFrameBoundary(ID3D11DeviceContext* ctx) {
         decideNext();
     else
         g_discard = false;
+    // Dump v2: separate mode's capture frame is a reference frame: the main pass keeps the own ship (as on a fallback frame, the
+    // layer still runs and its composite is made, not applied), so the dump holds the game's own hull to compare the layer with.
+    // One frame of the ship drawn by the game; the hold and the miss judge are untouched.
+    g_refFrame = false;
+    if (detail::g_hullLayerSeparate && g_dump == Dump::Capturing) {
+        g_refFrame = true;
+        g_refWould = g_discard;
+        if (g_discard) --g_win.separateFrames;   // decideNext counted it as a discard frame
+        g_discard = false;
+    }
+    stageFrameStart();   // dump v2: whether the next frame is timed on the GPU
     evictStale();
     if (!g_win.startMs) g_win.startMs = now;
     if (now - g_win.startMs >= kReportMs) {

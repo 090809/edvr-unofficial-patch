@@ -25,6 +25,10 @@ no hull to compare, so the tool measures the main pass instead, on the private h
 depth is farther than the hull's (reversed Z: smaller; the terrain behind it filled in), the share still at the clear
 value (holes: nothing drawn there, or open sky), the share equal to the hull's depth (the hull still in the main pass)
 and the share nearer (the cockpit or a neighbour in front). Verdict: TAKEN OUT 0 (at most 5% equal), NOT TAKEN OUT 3.
+
+Since dump v2 ("Dump v2") a separate-mode dump's frame is a reference frame: the main pass kept the own ship, the files are
+eye_<stamp>_RefGbuf0.bin and _RefDepth.bin instead of GameGbuf0 and GameDepth, and the tool runs the lighting comparison
+above, with RefDepth (the same frame's main depth, both eyes) in place of the eye run's Z as the mask.
 """
 import argparse
 import glob
@@ -106,8 +110,19 @@ def compare(prefix, eye=0, tol=0.05, clear_depth=0.0):
     # Where the game shows the hull: the eye run's scene depth (eye_<stamp>_Z.bin, written for eye 0) equals the private
     # depth. Elsewhere the cockpit or canopy is in front in the game's image, and the two HDRs differ by design (the
     # 2026-11-08 20:30 flight: 27% of the private pixels visible, 85-98% of those bit-exact).
+    # A separate-mode dump since dump v2 is a reference frame: the main pass kept the own ship, and eye_<stamp>_RefDepth.bin
+    # (_e1 for eye 1) is its main depth after the eye's G-buffer, the same frame as HullDepth. It is the mask when present.
     zpath = '%s_Z.bin' % prefix
-    if os.path.exists(zpath):
+    refpath = '%s_RefDepth%s.bin' % (prefix, suffix)
+    if os.path.exists(refpath):
+        _, z = eye_inputs.read(refpath)
+        z = np.asarray(z, np.float32)
+        if z.shape != depth.shape:
+            raise ValueError('RefDepth %s and HullDepth %s are not one eye size' % (z.shape, depth.shape))
+        mask &= np.abs(z - depth) <= 1e-6 * np.maximum(np.abs(depth), np.float32(1e-9)) + np.float32(1e-9)
+        out['visible_only'] = True
+        out['scene_depth'] = 'RefDepth'
+    elif os.path.exists(zpath):
         zmeta, z = eye_inputs.read(zpath)
         if zmeta.get('eye', 0) == eye and np.asarray(z).shape == depth.shape:
             z = np.asarray(z, np.float32)
@@ -184,7 +199,7 @@ def report(r):
         return line + '\n%s: %s' % (r['verdict'], r['why'])
     line = 'hull layer compare: eye %d, %d hull pixel(s)' % (r['eye'], r['hull_pixels'])
     if r.get('visible_only'):
-        line += ' the game shows (of %d private)' % r['private_pixels']
+        line += ' the game shows (of %d private; mask %s)' % (r['private_pixels'], r.get('scene_depth', 'Z'))
     if r.get('own') is not None:
         line += ', own mask %d record(s), %d pixel(s) filtered as neighbours' % r['own']
     if 'game_lit' in r:
@@ -222,7 +237,7 @@ def self_test():
         with open(path, 'wb') as f:
             f.write(b'EDVRTEX1' + struct.pack('<9I', 1, w, h, fmt, w * px, 7, eye, 0, 0) + payload)
 
-    def case(name, priv_rgb, game_rgb, depth, want, eye=0, scene_z=None):
+    def case(name, priv_rgb, game_rgb, depth, want, eye=0, scene_z=None, ref_depth=None):
         with tempfile.TemporaryDirectory() as temp:
             prefix = os.path.join(temp, 'eye_123456789001')
             sfx = '_e1' if eye else ''
@@ -234,9 +249,15 @@ def self_test():
             write(prefix + '_HullDepth%s.bin' % sfx, 19, eye, d.tobytes(), w, h, 8)
             if scene_z is not None:
                 write(prefix + '_Z.bin', 41, eye, scene_z.astype(np.float32).tobytes(), w, h, 4)
+            if ref_depth is not None:   # dump v2's reference frame: the main depth with the own ship drawn, the D32S8 layout
+                rd = np.zeros((h, w, 2), dtype=np.float32)
+                rd[..., 0] = ref_depth
+                write(prefix + '_RefDepth%s.bin' % sfx, 19, eye, rd.tobytes(), w, h, 8)
             r = compare(prefix, eye=eye)
             if r['verdict'] != want:
                 failures.append('%s: %s, wanted %s (%r)' % (name, r['verdict'], want, r))
+            if ref_depth is not None and r.get('scene_depth') != 'RefDepth':
+                failures.append('%s: the reference depth was not the mask (%r)' % (name, r))
 
     h, w = 48, 64
     yy, xx = np.mgrid[0:h, 0:w]
@@ -262,6 +283,10 @@ def self_test():
     scene_z = np.where(cockpit, depth, 0.9).astype(np.float32)
     case('a cockpit in front, scene depth given', hull, occluded_game, depth, 'CONFIRMED', scene_z=scene_z)
     case('a cockpit in front, no scene depth', hull, occluded_game, depth, 'INCONCLUSIVE')
+    # Dump v2: a separate-mode reference frame gives RefDepth (eye 1 too), and it wins over a scene depth of another frame.
+    case('a cockpit in front, the reference frame\'s depth given', hull, occluded_game, depth, 'CONFIRMED', ref_depth=scene_z)
+    case('a cockpit in front, eye 1, the reference depth', hull, occluded_game, depth, 'CONFIRMED', eye=1, ref_depth=scene_z)
+    case('the reference depth wins over a stale Z', hull, occluded_game, depth, 'CONFIRMED', scene_z=np.full_like(scene_z, 0.9), ref_depth=scene_z)
     # The own-mask count comes from the dump's log line beside the eyes folder.
     with tempfile.TemporaryDirectory() as temp:
         os.makedirs(os.path.join(temp, 'eyes'))
@@ -303,7 +328,7 @@ def self_test():
     for f in failures:
         print('hull layer compare self-test FAILED: ' + f)
     if not failures:
-        print('hull layer compare self-test passed (14 cases)')
+        print('hull layer compare self-test passed (17 cases)')
     return 1 if failures else 0
 
 

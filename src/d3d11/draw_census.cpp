@@ -16,6 +16,7 @@
 #include "draw_gate.h"      // drawGateArm: a census armed mid-frame must not
                             // lose the frame it counts from
 #include "exposure_fix.h"   // lookupShaderHash: the shader hash registry
+#include "hull_layer.h"     // hullLayerWanted: dump v2 lifts an eye dump's census to the line ceiling (diag.hull_layer, TEMPORARY)
 
 namespace edvr {
 
@@ -59,6 +60,12 @@ constexpr uint32_t kCensusFramesMax = 30;
 // on the sessions that ask for it.
 constexpr uint32_t kMaxLines = 4096;
 constexpr uint32_t kMaxLinesCeiling = 16384;
+// Dump v2 (diag.hull_layer, TEMPORARY; docs\research-own-hull-layer-2026-11-08.md "Dump v2"): a census an eye dump arms (the "DC eye
+// capture link") records up to the ceiling whatever advanced.census_lines says, so a station frame is not cut at 4096 eye lines
+// (censuses 4-6 of edvr_gfx_20261108_231250.log). Bounded: when frames 0 and 1 already spent half the ceiling (a dense frame) the
+// census ends after them, and only the first kMaxLiftedCensuses of a session are lifted (at ~140 bytes a line, each lifted census
+// is at most ~4.6 MB of the 16 MB log, and ~2.3 MB of it eye lines).
+constexpr uint32_t kMaxLiftedCensuses = 3;
 
 // Distinct bound objects seen across one census. The first field capture
 // refuted the "a few dozen" estimate this started from: a cockpit census
@@ -136,6 +143,8 @@ bool     g_forceOffscreen = false; // the auto arm's rider: this census records
                                  // because it exists to watch an offscreen build
 uint32_t g_framesWanted = kCensusFrames;  // this census's length, from config
 uint32_t g_maxLines = kMaxLines; // this census's line cap, from config
+bool     g_lifted = false;       // dump v2: this census's cap was lifted to the ceiling (an eye dump's census, diag.hull_layer on)
+uint32_t g_liftedCensuses = 0;   // ... and how many were this session
 // The flat NumLock request (drawCensusFlatRequest): when set, the next census takes its length and cap from these, not from config.
 bool     g_flatRequest = false;
 uint32_t g_flatFrames = 0;
@@ -1683,6 +1692,12 @@ void drawCensusFrameBoundary(uint32_t frameNo) {
         g_unseenThisFrame = 0;
         g_seq = 0;
         ++g_frameOrdinal;
+        // Dump v2: a lifted census whose frames 0 and 1 spent half the ceiling ends after them (the log stays bounded; both are whole).
+        if (g_lifted && g_frameOrdinal == 2 && detail::g_drawCensusFramesLeft > 1 && g_eyeLines > g_maxLines / 2) {
+            Log::get().note("DC eye capture link: census=%u ends after 2 frames: dense, %u eye lines in frames 0-1 (over half of %u; diag.hull_layer, dump v2)",
+                            g_censusNo, g_eyeLines, g_maxLines);
+            detail::g_drawCensusFramesLeft = 1;
+        }
         if (--detail::g_drawCensusFramesLeft == 0) finish();
     }
     if (detail::g_drawCensusPending) {
@@ -1707,6 +1722,22 @@ void drawCensusFrameBoundary(uint32_t frameNo) {
         detail::g_drawCensusFramesLeft = g_framesWanted;
         detail::g_drawCensusCaptureIdActive=detail::g_drawCensusCaptureIdPending;
         detail::g_drawCensusCaptureIdPending=false;
+        // Dump v2 (diag.hull_layer on): an eye dump's census records up to the ceiling (kMaxLiftedCensuses above says the bounds).
+        g_lifted = false;
+        if (detail::g_drawCensusCaptureIdActive && hullLayerWanted()) {
+            if (g_liftedCensuses < kMaxLiftedCensuses) {
+                g_lifted = true;
+                ++g_liftedCensuses;
+                if (g_maxLines < kMaxLinesCeiling) g_maxLines = kMaxLinesCeiling;
+                Log::get().note("DC eye capture link: census=%u lines=%u (diag.hull_layer, dump v2: an eye dump's census records up to the ceiling; %u of %u "
+                                "this session; it ends after 2 frames when they are dense)",
+                                g_censusNo, g_maxLines, g_liftedCensuses, kMaxLiftedCensuses);
+            } else {
+                Log::get().note("DC eye capture link: census=%u lines=%u (diag.hull_layer, dump v2: %u censuses already lifted this session; this one keeps "
+                                "advanced.census_lines)",
+                                g_censusNo, g_maxLines, kMaxLiftedCensuses);
+            }
+        }
         g_frameOrdinal = 0;
         g_draws = 0;
         g_drawsThisFrame = 0;

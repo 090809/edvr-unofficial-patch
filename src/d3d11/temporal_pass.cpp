@@ -42,6 +42,7 @@
 #include "object_probe.h"   // objectProbeArmLedger: the armed frame's draw ledger
 #include "pixel_probe.h"    // pixelProbeArm: who drew this pixel, the same armed frame
 #include "depth_writer_probe.h"   // depthWriterArm: who wrote each pixel's depth, the same armed frame
+#include "gpu_pass_profile.h"     // gpuPassProfileRequestFor: dump v2 times the game's passes on an eye dump's frames (diag.hull_layer, TEMPORARY)
 #include "hull_layer.h"           // hullLayerArmDump: the private hull layer, the same armed frame; hullLayerCompositeEye (diag.hull_layer, TEMPORARY)
 #include "ui_depth.h"   // the interface's coverage mask and resolve tuning
 #include "blend_probe.h"   // TEMPORARY blend probe: asks for eye 0's per-pixel decisions, one relaxed load a frame unarmed
@@ -7122,6 +7123,9 @@ static bool beginEyeRun(bool companion,const edvr::NativeOnFootAirborneSnapshot*
     // changed each pixel's depth, for naming what disowns a pool record's slot.
     if(pixelProbeConfigured())depthWriterArm(g_eyeRunStamp);
     hullLayerArmDump(g_eyeRunStamp);   // diag.hull_layer (TEMPORARY): the private hull layer's HDR and depth beside the game's, one frame; a no-op with the key off
+    // Dump v2 (diag.hull_layer on): the game's own passes timed on the dump's frames too, by the GPU pass profile (no delay). Refused,
+    // with a note, while the profile's hotkey capture is armed or running.
+    if(hullLayerWanted())gpuPassProfileRequestFor(4,"the eye dump (diag.hull_layer, dump v2)");
     mkArm(g_eyeRunStamp);   // F59: the waypoint dump (marker probe on only)
     if(!companion) {
         g_airborneCompanion=AirborneCompanionRequest{};

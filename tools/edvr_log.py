@@ -10647,6 +10647,16 @@ H_HULL_COMPOSITE = (r"hull layer: composite: separate_frames=(?P<sep>\d+) compos
 # The AO chain on the private G-buffer: its 30 s line, after the report line (both modes; a build before it has none).
 H_HULL_AO = (r"hull layer: ao: eye_frames=(?P<eye_frames>\d+) full=(?P<full>\d+) dispatches=(?P<dispatches>\d+) per_eye_frame=(?P<per>[\d.]+) "
              r"applied=(?P<applied>\d+) missed=deinterleave:(?P<m0>\d+),hbao:(?P<m1>\d+),interleave:(?P<m2>\d+),apply:(?P<m3>\d+) no_eye=(?P<no_eye>\d+)")
+# Dump v2 (docs "Dump v2"): the stage times' 30 s line (both modes, after the ao line), and the dump's lighting-window and TAA-sequence lines.
+H_HULL_GPU = (r"hull layer: gpu_ms gbuffer=(?P<g_gbuf>-?[\d.]+) mask_filter=(?P<g_mask>-?[\d.]+) screen=(?P<g_screen>-?[\d.]+) light=(?P<g_light>-?[\d.]+) "
+              r"tone=(?P<g_tone>-?[\d.]+) taa=(?P<g_taa>-?[\d.]+) total=(?P<g_total>-?[\d.]+) timed_frames=(?P<timed>\d+) "
+              r"items=gbuffer:(?P<i_gbuf>[\d.]+),mask_filter:(?P<i_mask>[\d.]+),screen:(?P<i_screen>[\d.]+),light:(?P<i_light>[\d.]+),tone:(?P<i_tone>[\d.]+),"
+              r"taa:(?P<i_taa>[\d.]+) cpu_ms=gbuffer:(?P<c_gbuf>[\d.]+),mask_filter:(?P<c_mask>[\d.]+),screen:(?P<c_screen>[\d.]+),light:(?P<c_light>[\d.]+),"
+              r"tone:(?P<c_tone>[\d.]+),taa:(?P<c_taa>[\d.]+),total:(?P<c_total>[\d.]+) overflow=(?P<overflow>\d+) busy=(?P<busy>\d+) disjoint=(?P<disjoint>\d+)")
+H_HULL_LIGHTS = (r"hull layer: dump (?P<stamp>\S+): HullLights (?P<status>[\w ]+): (?P<draws>\d+) draws in the eyes' lighting windows \((?P<known>\d+) known "
+                 r"lighting, (?P<reissued>\d+) re-issued, (?P<unknown>\d+) unknown writing the HDR, (?P<stencil>\d+) stencil-only\)")
+H_HULL_SEQ = (r"hull layer: dump (?P<stamp>\S+): HullSeq (?P<written>\d+) of (?P<wanted>\d+) frames written \(eye 0 from frame (?P<frame>\d+), "
+              r"(?P<mb>[\d.]+) MB\), history (?P<hist>[^;]+); end: (?P<end>[^(]+?) \(")
 # The rest of its lines (the dump armed, a private copy made or dropped, a cap or a create failure said once, an unknown key value, the seed's facts and
 # refusals, the shaders): matched, not judged.
 H_HULL_OTHER = (r"hull layer: (?:dump \S+ armed|private copy (?:made|of a)|\d+ private (?:copies|views) held|a \d+x\d+ format \d+ target is multisampled|"
@@ -10656,7 +10666,9 @@ H_HULL_OTHER = (r"hull layer: (?:dump \S+ armed|private copy (?:made|of a)|\d+ p
                 r"a \w+ draw in the window got no own-discard variant|dump \S+ eye \d: GameGbuf0|"
                 # Step 3 (separate): the mode's note, its fallbacks said once, the tonemap re-issue's and the composite's facts and refusals.
                 r"separate mode (?:takes the own ship out|stands aside|falls back)|tonemap re-issue declined|composite declined for eye|"
-                r"the tone cover and composite shaders|the composite's sampler|(?:tone|composite) targets made|dump \S+ eye \d: HullTone)")
+                r"the tone cover and composite shaders|the composite's sampler|(?:tone|composite) targets made|dump \S+ eye \d: HullTone|"
+                # Dump v2: separate mode's reference frame, and a dump that could not start its TAA sequence.
+                r"dump \S+ eye \d: reference frame|dump \S+: no HullSeq)")
 # Frame generation, Phase 1 (fix.frame_generation_shadow, TEMPORARY; src\common\framegen_shadow_report.h): two lines of the graphics log with no build tag, read the way the desktop
 # window's are. The armed line is said once per change to on (so health_scan keeps it whatever --since says); the report line every second.
 H_FRAMEGEN = "frame generation shadow"
@@ -17031,6 +17043,17 @@ def _hj_hull_layer(rows, ctx=None):
         if ran == 0:
             text += " (the game ran no AO chain: its ambient occlusion setting may be off)"
         ao_broken = ran > 0 and a["full"] == 0
+    # Dump v2: the stage times (the last line), the dump's lighting windows and TAA sequence. Said, not judged.
+    gpus = rows.get("gpu", [])
+    if gpus:
+        g = gpus[-1]
+        text += ("; GPU ms a timed frame (median, last line, %s timed): gbuffer %s, mask/filter %s, screen %s, light %s, tone %s, taa %s, total %s; "
+                 "CPU ms a frame %s" % (g["timed"], g["g_gbuf"], g["g_mask"], g["g_screen"], g["g_light"], g["g_tone"], g["g_taa"], g["g_total"], g["c_total"]))
+    for l in rows.get("lights", []):
+        text += ("; dump %s lighting windows: %s draw(s), %s re-issued, %s unknown writing the HDR, %s stencil-only (HullLights %s)"
+                 % (l["stamp"], l["draws"], l["reissued"], l["unknown"], l["stencil"], l["status"]))
+    for s in rows.get("seq", []):
+        text += "; dump %s TAA sequence: %s of %s frame(s), %s MB, history %s, end %s" % (s["stamp"], s["written"], s["wanted"], s["mb"], s["hist"], s["end"])
     # Separate mode (Step 2): the own ship out of the main pass. OK only when main-pass draws took the own discard.
     mains = rows.get("main", [])
     if keys and keys[-1]["mode"] == "separate":
@@ -18511,6 +18534,9 @@ HEALTH_RULES = (
         ("main", H_HULL_MAIN),
         ("composite", H_HULL_COMPOSITE),
         ("ao", H_HULL_AO),
+        ("gpu", H_HULL_GPU),
+        ("lights", H_HULL_LIGHTS),
+        ("seq", H_HULL_SEQ),
         ("_", H_HULL_OTHER),
     ), _hj_hull_layer),
     # The SRV turret view (issue 140): lines of the graphics log that carry no build tag (health_scan reads them, as it reads the desktop window's, before it drops the untagged lines).
@@ -25988,6 +26014,24 @@ def self_test_health():
         check("hull layer: the AO chain seen and never re-issued is PARTIAL", hl_base + [hl_key(), hl_report(),
                                                                                        hl_ao(full=0, disp=0, applied=0, missed=(5400, 5400, 5400, 5400))], 0,
               [("PARTIAL", HL)], has=["no eye-frame had it re-issued in full", "missed deinterleave 5400, hbao 5400"])
+
+        # Dump v2: the stage times' line, the dump's lighting windows and TAA sequence, the reference frame: parsed and said, never judged.
+        def hl_gpu(total=1.58):
+            return RH("hull layer: gpu_ms gbuffer=%.3f", 0.41, 0.05, 0.3, 0.6, 0.04, 0.18, total, 168, 168.0, 2.0, 12.0, 22.0, 2.0, 2.0, 0.3, 0.02, 0.05, 0.08,
+                      0.01, 0.02, 0.48, 0, 0, 0, 8)
+
+        hl_v2 = [hl_gpu(), RH("hull layer: dump %ls: HullLights", "123456789001", "written", 40, 30, 28, 2, 6, ""),
+                 RH("hull layer: dump %ls: HullSeq", "123456789001", 16, 16, 1234, 412.5, "written", "complete"),
+                 RH("hull layer: dump %ls eye %d: reference frame", "123456789001", 0, "yes", "written", "written", 22),
+                 RH("hull layer: dump %ls: no HullSeq", "123456789002", "123456789001")]
+        check("hull layer: dump v2's lines are parsed and said, the verdict unchanged", hl_base + [hl_key(), hl_report(), hl_ao()] + hl_v2, 0, [("OK", HL)],
+              has=["GPU ms a timed frame (median, last line, 168 timed): gbuffer 0.410, mask/filter 0.050, screen 0.300, light 0.600, tone 0.040, taa 0.180, "
+                   "total 1.580; CPU ms a frame 0.480",
+                   "dump 123456789001 lighting windows: 40 draw(s), 28 re-issued, 2 unknown writing the HDR, 6 stencil-only (HullLights written)",
+                   "dump 123456789001 TAA sequence: 16 of 16 frame(s), 412.5 MB, history written, end complete"],
+              lacks=["UNPARSED", "do not match"])
+        check("hull layer: a drifted stage-times line is counted as unparsed", hl_base + [hl_key(), hl_report(), hl_gpu().replace(" timed_frames=", " timed=")],
+              0, [("OK", HL)], has=["+1 line(s) the rule's patterns do not match: [10:00:04.000] hull layer: gpu_ms"], lacks=["GPU ms a timed frame"])
 
         check("hull layer: separate, the own discard taken and composited, is OK and says so",
               hl_base + [hl_key("separate"), RH("hull layer: separate mode takes the own ship out"), hl_report(), hl_main(),
