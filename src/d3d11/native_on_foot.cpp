@@ -27186,24 +27186,51 @@ void installF14ProbesOnce() {
 void f9ProbeTick(uint64_t nowMs) {
     if (!g_f9Armed[0] && !g_f9Armed[1] && !g_f9Armed[2]) return;
     const bool due = g_f9LastMs == 0 || nowMs - g_f9LastMs >= 5000;
-    F9CallerRow callers[kF9Callers];
-    F9HrcState hrc[3];
-    F9InstRow insts[kF9Insts];
+    // Frame thread only, so the snapshots are static: nothing is rebuilt per frame. hrc is copied whole every call; callers and insts are read only
+    // after the `due` return below, so they are copied only when due.
+    static F9CallerRow callers[kF9Callers];
+    static F9HrcState hrc[3];
+    static F9InstRow insts[kF9Insts];
     {
         F9Lock lock;
-        for (size_t i = 0; i < kF9Callers; ++i) callers[i] = g_f9Callers[i];
         for (size_t i = 0; i < 3; ++i) hrc[i] = g_f9Hrc[i];
-        for (size_t i = 0; i < kF9Insts; ++i) insts[i] = g_f9Insts[i];
         if (due) {
+            for (size_t i = 0; i < kF9Callers; ++i) callers[i] = g_f9Callers[i];
+            for (size_t i = 0; i < kF9Insts; ++i) insts[i] = g_f9Insts[i];
             for (auto& r : g_f9Callers) r.window = 0;
             for (auto& s : g_f9Hrc) s.window = 0;
             for (auto& r : g_f9Insts) r.window = 0;
         }
     }
     static std::string lastKey[3];   // frame thread only: the HRC values last written, per state
+    // The raw fields f9HrcValues formats, as they were when lastKey[st] was last computed. Equal raw fields format to equal text, so the string
+    // is not built; any difference builds it and lastKey decides, as before (two different raw values can format alike).
+    struct HrcKeyRaw {
+        bool valid = false;
+        uint8_t g291 = 0, g470 = 0, g4C0 = 0;
+        bool ok291 = false, ok470 = false, ok4C0 = false;
+        uint64_t inst[nofoot::kF9Hrc] = {};
+        bool instOk[nofoot::kF9Hrc] = {};
+        uint64_t dep = 0;
+        uint32_t depVt = 0;
+        bool depOk = false, depVtOk = false;
+    };
+    static HrcKeyRaw lastRaw[3];
     bool hrcWritten[3] = {false, false, false};
     for (uint8_t st = 0; st < 3; ++st) {
-        if (!hrc[st].seen) continue;
+        const F9HrcState& cur = hrc[st];
+        if (!cur.seen) continue;
+        HrcKeyRaw& lr = lastRaw[st];
+        bool same = lr.valid && lr.g291 == cur.g291 && lr.g470 == cur.g470 && lr.g4C0 == cur.g4C0 && lr.ok291 == cur.ok291 &&
+                    lr.ok470 == cur.ok470 && lr.ok4C0 == cur.ok4C0 && lr.dep == cur.dep && lr.depVt == cur.depVt &&
+                    lr.depOk == cur.depOk && lr.depVtOk == cur.depVtOk;
+        for (size_t k = 0; same && k < nofoot::kF9Hrc; ++k) same = lr.inst[k] == cur.inst[k] && lr.instOk[k] == cur.instOk[k];
+        if (same) continue;
+        lr.valid = true;
+        lr.g291 = cur.g291; lr.g470 = cur.g470; lr.g4C0 = cur.g4C0;
+        lr.ok291 = cur.ok291; lr.ok470 = cur.ok470; lr.ok4C0 = cur.ok4C0;
+        for (size_t k = 0; k < nofoot::kF9Hrc; ++k) { lr.inst[k] = cur.inst[k]; lr.instOk[k] = cur.instOk[k]; }
+        lr.dep = cur.dep; lr.depVt = cur.depVt; lr.depOk = cur.depOk; lr.depVtOk = cur.depVtOk;
         const std::string key = f9HrcValues(hrc[st]);
         if (key != lastKey[st]) {
             lastKey[st] = key;
