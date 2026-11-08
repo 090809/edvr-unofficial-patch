@@ -3181,6 +3181,7 @@ bool g_camAutoTried = false;           // the automatic install is tried once; o
 uint64_t g_bakeRoomSinceMs = 0;        // on foot with the room in view since then; 0 is not in view
 uint32_t g_bakeNoRideTries = 0;        // bakes started with no ride and not yet followed by a good one (cc::kBakeNoRideTries)
 uint64_t g_bakeLeftMs = 0;             // neither on foot nor docked since then; 0 is in a station
+uint64_t g_bakeAfterJumpMs = 0;        // no bake with no ride starts before this tick: a carrier's jump (cc::kBakeAfterJumpMs)
 cc::CamTestTimer g_camTimer;
 bool g_camLookValid = false;           // the room's centre and up were read when the window opened
 bool g_camLookWasOn = false;
@@ -3225,6 +3226,7 @@ bool g_concNamesOnlyOn = false;    // TEMPORARY: the tick's side of g_concNamesO
 uint32_t g_concNamesOnlyStamp = 0;
 const cc::RoomLayout* g_concLayout = &cc::kRoomStation;   // this room's, from the anchor's name (the tick's)
 uintptr_t g_concLayoutAddr = 0;                           // the anchor record it was read from
+cc::LiveRoomLatch g_concLiveLatch;                        // whether the camera is in the room's live room, through a tick with its record unread
 uint64_t g_concTraceMs = 0;
 uint32_t g_concTraceReason = 0;
 uint64_t g_concTraceReasonMs = 0;
@@ -4193,13 +4195,42 @@ void bakeForward(const float axes[3][3], uint32_t d, float out[3]) noexcept {
 void concourseTick(uint64_t now, uint32_t frame) {
     g_concSettingOffLogged = false;
     concoursePoll(now);
-    const journal_station::Kind stationKind = journalStationKind();
+    // A load on foot aboard a carrier names no carrier in the journal; Status.json says it (journal_station::atCarrier, under the state lock as the sun's reading is).
+    journal_station::Kind stationKind = journalStationKind();
+    const bool carrierByStatus = stationKind == journal_station::Kind::kUnknown && journal_station::atCarrier(stationKind, g_statusFlagsNow, g_statusFlags2Now);
+    if (carrierByStatus) stationKind = journal_station::Kind::kFleetCarrier;
     if (!g_concKindSeen || stationKind != g_concKind) {
         g_concKindSeen = true;
         g_concKind = stationKind;
         if (g_concAuto && g_concKeyOn && stationKind != journal_station::Kind::kUnknown)
-            Log::get().note("concourse cull: a station of type %s: %s", journal_station::kindName(stationKind),
+            Log::get().note("concourse cull: a station of type %s%s: %s", journal_station::kindName(stationKind),
+                            carrierByStatus ? " (Status.json: docked and on foot, neither in a station nor on a planet)" : "",
                             cc::bakePlanFor(stationKind).run ? "the cull and its bake run" : "its layout has not been flown, so it stays the game's own");
+    }
+    // A carrier's jump with the commander aboard: the bake is of the system left. It goes, and the next waits for the arrival to pass. A bake running then is cancelled, and the
+    // release is asked for each tick until the old one is gone: the pane drops a release that comes while a bake is armed or its hold is ending (concourse_pane.cpp, bakeTick).
+    {
+        static bool jumpsSet = false, jumpRelease = false;
+        static uint32_t jumpsSeen = 0;
+        const uint32_t jumps = journalCarrierJumps();
+        if (!jumpsSet) {
+            jumpsSet = true;
+            jumpsSeen = jumps;
+        } else if (jumps != jumpsSeen) {
+            jumpsSeen = jumps;
+            g_bakeAfterJumpMs = now + cc::kBakeAfterJumpMs;
+            g_bakeNoRideTries = 0;
+            const bool running = g_camTimer.armed() || g_camTimer.active();
+            if (g_camTimer.stop()) concoursePaneBakeCancel();
+            concoursePaneBakeArm(false);
+            jumpRelease = true;
+            Log::get().note("concourse bake: the carrier jumped (CarrierJump): %s; a new one is taken after %llu ms", concoursePaneBakeDone() ? "the bake is of the system left, so it goes" : running ? "the bake running is cancelled" : "there was no bake",
+                            static_cast<unsigned long long>(cc::kBakeAfterJumpMs));
+        }
+        if (jumpRelease) {
+            if (concoursePaneBakeDone()) concoursePaneBakeRelease();
+            else jumpRelease = false;
+        }
     }
     bool toggledOn = false;
     if (g_concHotkey && g_concHotkey->pressed()) {
@@ -4260,6 +4291,8 @@ void concourseTick(uint64_t now, uint32_t frame) {
                             static_cast<double>(g_concLayout->roomReachM), g_frameCamValid ? 1 : 0, hubRead ? 1 : 0);
         }
     }
+    bool inLiveRoom = false;
+    if (!anchor || g_concLayout->liveRoomName == nullptr) g_concLiveLatch.reset();
     if (anchor && g_concLayout->liveRoomName != nullptr) {
         // The room's live room (a carrier's bridge): there the cull stands down, as if out of the room. The bake is kept, for the way back. Said once each time it is entered.
         static bool saidLive = false;
@@ -4273,8 +4306,9 @@ void concourseTick(uint64_t now, uint32_t frame) {
         const WorldRead live = liveAddr != 0 ? worldOfRecord(liveAddr) : WorldRead{};
         const bool liveRead = live.source != 4;
         const float liveAway = liveRead && g_frameCamValid ? sealed::distance(live.world, g_frameCam) : 0.0f;
-        if (cc::insideLiveRoom(*g_concLayout, g_frameCamValid, liveRead, liveAway, live.radius)) {
+        if (g_concLiveLatch.step(*g_concLayout, g_frameCamValid, liveRead, liveAway, live.radius, now)) {
             anchor = false;
+            inLiveRoom = true;
             if (!saidLive) {
                 saidLive = true;
                 Log::get().note("concourse cull: the camera is in %s, %.0f m from its centre (its radius %.0f m): the cull stands down there and its windows are the game's own",
@@ -4324,7 +4358,8 @@ void concourseTick(uint64_t now, uint32_t frame) {
             liftOn = g_camTimer.active() ? false : g_liftGate.step(liftRead, cutNow, now);
         } else {
             liftOn = g_liftGate.step(liftRead, cutNow, now);
-            if (bakeMode && roomInView && !camWasArmed && !liftOn) {
+            const bool bakeWaits = now < g_bakeAfterJumpMs;   // a carrier's jump: neither a ride nor the room in view starts a bake yet
+            if (bakeMode && roomInView && !camWasArmed && !liftOn && !bakeWaits) {
                 const cc::BakeNoRide noRide = cc::bakeNoRide(concoursePaneBakeDone(), now - g_bakeRoomSinceMs, bakeSharper, g_bakeNoRideTries);
                 if (noRide != cc::BakeNoRide::kNone) {
                     g_camTimer.armNow(now);
@@ -4332,7 +4367,7 @@ void concourseTick(uint64_t now, uint32_t frame) {
                     camArmedWhy = noRide == cc::BakeNoRide::kFirst ? "no ride, the room in view with no bake" : "no ride, the render size has risen since the bake";
                 }
             }
-            if (g_camTimer.step(g_camMode, liftOn, anchor, now, &camEnd)) {
+            if (g_camTimer.step(g_camMode, liftOn && !bakeWaits, anchor, now, &camEnd)) {
                 liftOn = false;
                 g_liftGate.stop();
             }
@@ -4585,6 +4620,7 @@ void concourseTick(uint64_t now, uint32_t frame) {
                               : cutNow    ? "the camera cut to another room"
                               : !social   ? "no longer on foot in social space"
                               : wantCull  ? "the bay glass was approached: the view is clearing (diag.concourse_clear_share)"
+                              : inLiveRoom ? "the camera is in the room's live room, whose windows are the game's own"
                                           : "the anchor record was not seen for 5 s";
             Log::get().note("concourse cull: off (%s)", why);
         }

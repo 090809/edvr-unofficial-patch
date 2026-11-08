@@ -140,6 +140,8 @@ JournalRawStatus journalRawStatus();
 
 // The type of station the commander is at (journal_station.h), under either profile. kUnknown until the journal has named one, and away from any station.
 journal_station::Kind journalStationKind();
+// CarrierJump events read since the process started: a change is a jump with the commander aboard, whose windows look out on another system now. Under either profile.
+uint32_t journalCarrierJumps();
 
 // The ADS fields from the publication last taken by journalWatchTick. Like the accessors above, callers read this on the Present thread,
 // between its publication boundaries. Profile/active gating matches journalAdsKnown/journalAds; poll-count semantics are unchanged.

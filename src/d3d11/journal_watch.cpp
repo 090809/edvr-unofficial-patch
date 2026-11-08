@@ -364,6 +364,7 @@ void noteVehicle(Session& s, bool scorpion, journal_vehicle::Event cause) {
 }
 
 std::atomic<uint8_t> g_stationKind{0};   // journal_station::Kind, for journalStationKind on the Present thread
+std::atomic<uint32_t> g_carrierJumps{0}; // the latch's CarrierJump count, for journalCarrierJumps
 
 // %LOCALAPPDATA%\EDVR\last-station.txt: the type of the last station the journal named and a hash of its name, so that a load on foot, which names neither, can be told it.
 std::wstring stationFilePath() {
@@ -724,6 +725,10 @@ void scanEvents(Session& s, const char* data, uint32_t len) {
     // Issue 140: the Scorpion latch reads the new bytes themselves, once (a stream: the carry and the stitched head above would feed some bytes twice).
     s.vehicle.feed(data, len, [&s](bool scorpion, journal_vehicle::Event cause) { noteVehicle(s, scorpion, cause); });
     s.station.feed(data, len, noteStationKind);
+    if (s.station.jumps() != g_carrierJumps.load(std::memory_order_relaxed)) {
+        g_carrierJumps.store(s.station.jumps(), std::memory_order_relaxed);
+        Log::get().note("journal: CarrierJump: the commander was aboard a carrier as it jumped (%u this session)", s.station.jumps());
+    }
     uint64_t unmatchedBody = 0;
     if (s.station.takeUnmatched(&unmatchedBody)) stationSearchJournals(s, unmatchedBody);
     if (s.station.takeSavedChanged()) stationSave(s);
@@ -1367,6 +1372,7 @@ uint32_t journalSeatKind() { return runtimeFlatProfile() ? 0u : peek(g_v.seatKin
 uint32_t journalStatusSamples() { return runtimeFlatProfile() ? 0u : peek(g_v.statusSamples); }
 
 journal_station::Kind journalStationKind() { return static_cast<journal_station::Kind>(g_stationKind.load(std::memory_order_relaxed)); }
+uint32_t journalCarrierJumps() { return g_carrierJumps.load(std::memory_order_relaxed); }
 
 JournalRawStatus journalRawStatus() {
     JournalRawStatus r;

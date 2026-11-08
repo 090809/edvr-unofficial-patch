@@ -86,6 +86,16 @@ inline bool atSurfacePort(Kind k, uint32_t flags, uint32_t flags2) noexcept {
     }
 }
 
+// Whether the commander is aboard a fleet carrier. The type says it where the journal has given one. A load on foot there names only the body the carrier is near ("Body":"38 Lyncis 5",
+// "BodyType":"Planet", or a barycentre's "Null"), as a load at a port on a planet does, so with no type Status.json says: docked and on foot, with neither Flags2 bit 3 (on foot in a station)
+// nor bit 4 (on foot on a planet). Every on-foot visit to two carriers on 2026-11-07 read so (0x00000005, 0x00014001, or 0x00016001 in the hangar), where an Orbis, a Coriolis and an Outpost
+// set bit 3 and a CraterOutpost bit 4. A type other than a carrier's says it is not one.
+inline bool atCarrier(Kind k, uint32_t flags, uint32_t flags2) noexcept {
+    if (k == Kind::kFleetCarrier) return true;
+    if (k != Kind::kUnknown) return false;
+    return (flags & 1u) != 0 && (flags2 & 1u) != 0 && (flags2 & ((1u << 3) | (1u << 4))) == 0;
+}
+
 struct Saved {
     uint64_t nameHash = 0;
     Kind kind = Kind::kUnknown;
@@ -118,6 +128,8 @@ public:
     static constexpr uint32_t kLineCap = 4096;   // Location names its Body well inside this; its faction lists, past it, are not read
 
     Kind kind() const noexcept { return kind_; }
+    // CarrierJump events read: the commander was aboard a carrier as it jumped. What the windows looked out on is another system now.
+    uint32_t jumps() const noexcept { return jumps_; }
     const Saved& saved() const noexcept { return saved_; }
     void restore(const Saved& s) noexcept { saved_ = s; }
     // True once after each change of what should be saved.
@@ -201,7 +213,9 @@ private:
             return;
         }
         const bool location = sameText(ev, evLen, "Location");
-        if (!location && !sameText(ev, evLen, "Docked") && !sameText(ev, evLen, "Embark") && !sameText(ev, evLen, "Disembark")) return;
+        const bool jump = sameText(ev, evLen, "CarrierJump");
+        if (jump) ++jumps_;
+        if (!location && !jump && !sameText(ev, evLen, "Docked") && !sameText(ev, evLen, "Embark") && !sameText(ev, evLen, "Disembark")) return;
         const char* type = nullptr;
         const char* name = nullptr;
         uint32_t typeLen = 0, nameLen = 0;
@@ -216,6 +230,8 @@ private:
             set(k, onChange);
             return;
         }
+        // A CarrierJump names the carrier when docked in it ("Docked":true, its StationType; 2025-08-13's journal). One that names none was still written aboard: the type stays.
+        if (jump) return;
         // A load on foot: the station's name is its Body, and the last one saved says what it is.
         const char* body = nullptr;
         uint32_t bodyLen = 0;
@@ -231,8 +247,9 @@ private:
         }
         // At a port on a planet: see the head of this file.
         if (!location && surfaceKind(kind_) && has("\"OnPlanet\":true")) return;
-        // On a fleet carrier, likewise: Disembark and Embark there name neither it nor a planet ("OnStation":false, "OnPlanet":false; Flight 39's journal).
-        if (!location && kind_ == Kind::kFleetCarrier && has("\"OnStation\":false") && has("\"OnPlanet\":false")) return;
+        // On a fleet carrier, likewise: Disembark and Embark there name no station ("OnStation":false). They say "OnPlanet":false at a barycentre (Flight 39's journal, "38 Lyncis 4+5")
+        // and true near a planet (Flight 41's, "38 Lyncis 5"), so that is not read. Leaving a carrier is an Undocked.
+        if (!location && kind_ == Kind::kFleetCarrier && has("\"OnStation\":false")) return;
         if (location && has("\"OnFoot\":true") && has("\"BodyType\":\"Planet\"")) {
             set(surfaceKind(saved_.kind) ? saved_.kind : Kind::kUnknown, onChange);
             return;
@@ -247,6 +264,7 @@ private:
     bool savedChanged_ = false;
     bool unmatched_ = false;
     uint64_t unmatchedHash_ = 0;
+    uint32_t jumps_ = 0;
 };
 
 // The last station a stretch of journal names, and whether it names one. A commander on foot in a station disembarked there, so the newest journal that names any station says which.

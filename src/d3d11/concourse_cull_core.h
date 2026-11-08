@@ -662,6 +662,8 @@ constexpr float kBakeNearDefaultM = 50.0f, kBakeNearMinM = 5.0f, kBakeNearMaxM =
 // for a test. Once a type's windows are known, its row can name only the directions they need.
 // CraterOutpost: flown at one, by Sean's word after Flights 36 and 37. Its room is told by its own anchor (kPortAnchorName), so a type that names another room still gets no cull.
 // Outpost: flown at one with F2, "Outpost looks good, bake it" (Flight 39). The same: its own anchor, kOutpostAnchorName.
+// FleetCarrier: flown at two with F2 (Flights 39, 41, 42), "Carrier looks good, bake it". Its own anchor, kCarrierAnchorName, and its bridge is the game's own (kRoomCarrier's live
+// room). A load on foot there names no carrier, and Status.json says it (journal_station::atCarrier). A jump makes a new bake (kBakeAfterJumpMs).
 struct BakePlan {
     bool run = false;
     uint32_t dirs = kBakeDirsAll;
@@ -669,9 +671,12 @@ struct BakePlan {
 inline BakePlan bakePlanFor(journal_station::Kind k) noexcept {
     BakePlan p;
     p.run = k == journal_station::Kind::kOrbis || k == journal_station::Kind::kCoriolis || k == journal_station::Kind::kOcellus || k == journal_station::Kind::kCraterOutpost ||
-            k == journal_station::Kind::kOutpost;
+            k == journal_station::Kind::kOutpost || k == journal_station::Kind::kFleetCarrier;
     return p;
 }
+// A carrier that jumps with the commander aboard: the bake is of the system left, so it goes, and the next one waits this long from the CarrierJump. The journal writes that event about
+// a minute after the departure (2025-08-13's: departure 18:12:10, CarrierJump 18:13:10), as the carrier arrives; the wait is for the arrival's own light to pass. Not flown.
+constexpr uint64_t kBakeAfterJumpMs = 10000;
 inline uint32_t bakeDirCount(uint32_t mask) noexcept {
     uint32_t n = 0;
     for (uint32_t d = 0; d < kBakeDirs; ++d)
@@ -966,6 +971,31 @@ inline bool anchorMeansRoomHere(const RoomLayout& room, bool cameraKnown, bool a
 inline bool insideLiveRoom(const RoomLayout& room, bool cameraKnown, bool liveRead, float cameraDistM, float liveRadiusM) noexcept {
     return room.liveRoomName != nullptr && cameraKnown && liveRead && std::isfinite(cameraDistM) && std::isfinite(liveRadiusM) && liveRadiusM > 0.0f && cameraDistM <= liveRadiusM;
 }
+// The live room from tick to tick. A tick with its record not read (the address lost and sighted again on the next pass) keeps "inside" for up to kLiveRoomHoldMs: Flight 42 had
+// the cull on for one tick 6 m inside the bridge, its record unread, and the bake on the bridge windows for that frame. A tick that reads it, inside or out, says at once.
+constexpr uint64_t kLiveRoomHoldMs = 500;
+class LiveRoomLatch {
+public:
+    bool step(const RoomLayout& room, bool cameraKnown, bool liveRead, float cameraDistM, float liveRadiusM, uint64_t nowMs) noexcept {
+        if (room.liveRoomName == nullptr) {
+            inside_ = false;
+            return false;
+        }
+        if (cameraKnown && liveRead) {
+            inside_ = insideLiveRoom(room, cameraKnown, liveRead, cameraDistM, liveRadiusM);
+            readMs_ = nowMs;
+            return inside_;
+        }
+        if (inside_ && nowMs - readMs_ <= kLiveRoomHoldMs) return true;
+        inside_ = false;
+        return false;
+    }
+    void reset() noexcept { inside_ = false; }
+
+private:
+    bool inside_ = false;
+    uint64_t readMs_ = 0;
+};
 constexpr float kBackdropNearZ = 0.025f;       // the game's near plane (reversed infinite Z: view depth = this / z)
 constexpr float kBackdropMinDistM = 5.0f;      // a captured pixel nearer than this along its ray is not backdrop and is not written
 constexpr float kBackdropFarM = 60000.0f;      // the distance written for a pixel with no depth (z = 0), and the largest stored distance

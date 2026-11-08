@@ -165,6 +165,17 @@ int main(int argc, char** argv) {
         check(!js::atSurfacePort(js::Kind::kUnknown, kOrbitalFlags, kOrbitalFlags2), "surface port: an orbital station with no type is not one");
         check(!js::atSurfacePort(js::Kind::kUnknown, 0, 0), "surface port: nothing known is not one");
         check(!js::atSurfacePort(js::Kind::kOther, kOrbitalFlags, kOrbitalFlags2) && js::atSurfacePort(js::Kind::kOther, kSurfaceFlags, kSurfaceFlags2), "surface port: a type not listed goes by Status");
+        // A fleet carrier, on foot: neither in a station nor on a planet (Flights 39, 41, 42: the concourse 0x00014001, the hangar 0x00016001).
+        const uint32_t kCarrierFlags = 0x00000005u, kCarrierFlags2 = 0x00014001u, kCarrierHangarFlags2 = 0x00016001u;
+        check(js::atCarrier(js::Kind::kFleetCarrier, 0, 0), "carrier: the type alone says so");
+        check(js::atCarrier(js::Kind::kUnknown, kCarrierFlags, kCarrierFlags2) && js::atCarrier(js::Kind::kUnknown, kCarrierFlags, kCarrierHangarFlags2),
+              "carrier: a load on foot names none, and Status says it, in the concourse and the hangar");
+        check(!js::atCarrier(js::Kind::kUnknown, kOrbitalFlags, kOrbitalFlags2) && !js::atCarrier(js::Kind::kUnknown, kOrbitalFlags, 0x00016009u), "carrier: an orbital station with no type is not one");
+        check(!js::atCarrier(js::Kind::kUnknown, kSurfaceFlags, kSurfaceFlags2), "carrier: nor a port on a planet");
+        check(!js::atCarrier(js::Kind::kUnknown, 0, kCarrierFlags2) && !js::atCarrier(js::Kind::kUnknown, kCarrierFlags, 0) && !js::atCarrier(js::Kind::kUnknown, 0, 0),
+              "carrier: not docked, not on foot, or nothing known is not one");
+        for (js::Kind k : {js::Kind::kOrbis, js::Kind::kCoriolis, js::Kind::kOutpost, js::Kind::kCraterOutpost, js::Kind::kMegaShip, js::Kind::kOther})
+            check(!js::atCarrier(k, kCarrierFlags, kCarrierFlags2), "carrier: another type says it is not one, whatever Status says");
     }
     {
         // A descent: r0 3 (the descent has started) turns the sun off; the pad is not yet in the bay, so no seal.
@@ -3391,6 +3402,23 @@ int main(int argc, char** argv) {
               "concourse layouts: not known is not inside");
         check(!cc::insideLiveRoom(cc::kRoomStation, true, true, 1.0f, 24.8f) && !cc::insideLiveRoom(cc::kRoomPort, true, true, 1.0f, 24.8f) && !cc::insideLiveRoom(cc::kRoomOutpost, true, true, 1.0f, 24.8f),
               "concourse layouts: no other room has one");
+        {
+            // Flight 42: one tick with the bridge's record unread, 6 m inside. The latch holds through it, and lets go when the record stays unread.
+            cc::LiveRoomLatch live;
+            check(!live.step(cc::kRoomCarrier, true, false, 0.0f, 0.0f, 1000), "live room latch: unread with nothing before is not inside");
+            check(live.step(cc::kRoomCarrier, true, true, 6.0f, 24.8f, 2000), "live room latch: read inside is inside");
+            check(live.step(cc::kRoomCarrier, true, false, 0.0f, 0.0f, 2016), "live room latch: one tick unread keeps it");
+            check(live.step(cc::kRoomCarrier, false, true, 6.0f, 24.8f, 2000 + cc::kLiveRoomHoldMs), "live room latch: and the camera unknown, up to the hold");
+            check(!live.step(cc::kRoomCarrier, true, false, 0.0f, 0.0f, 2001 + cc::kLiveRoomHoldMs), "live room latch: past it, not inside");
+            check(!live.step(cc::kRoomCarrier, true, false, 0.0f, 0.0f, 2010 + cc::kLiveRoomHoldMs), "live room latch: and it stays out");
+            check(live.step(cc::kRoomCarrier, true, true, 12.3f, 24.8f, 4000) && !live.step(cc::kRoomCarrier, true, true, 27.4f, 24.8f, 4016), "live room latch: a read outside says at once");
+            check(!live.step(cc::kRoomCarrier, true, false, 0.0f, 0.0f, 4032), "live room latch: and holds nothing after it");
+            check(live.step(cc::kRoomCarrier, true, true, 12.3f, 24.8f, 5000) && !live.step(cc::kRoomStation, true, true, 1.0f, 24.8f, 5016), "live room latch: a room with none is never inside");
+            live.step(cc::kRoomCarrier, true, true, 12.3f, 24.8f, 6000);
+            live.reset();
+            check(!live.step(cc::kRoomCarrier, true, false, 0.0f, 0.0f, 6016), "live room latch: reset forgets it");
+        }
+        check(cc::kBakeAfterJumpMs >= cc::kBakeRoomSettleMs, "carrier jump: the bake waits at least as long as a room settling");
         for (const char* n : {"SA_Carrier_01", "SA_Carrier_01_Bar", "SA_Carrier_01_Bridge", "SA_Carrier_01_Bar_WindowShutters0", "SA_Carrier_DoorA0", "PS_FUI_STAT_BigScreen_Carrier_01",
                               "FUI_Panel_4x2_Carrier_010", "RandomDirt_NarrowRightA0", "Narrow_Door_Left_Tech", "Arm_Base0"})
             check(cc::concourseAllowName(n, nullptr), "concourse carrier: the room's own name is on the list");
@@ -4229,6 +4257,24 @@ int main(int argc, char** argv) {
                         feed(orbis, dockedLoad);
                         feed(orbis, carrierDisembark);
                         check(orbis.kind() == K::kUnknown, "station type: it holds only a carrier's");
+                        // A carrier near a planet: its Disembark says "OnPlanet":true (Flight 41's journal, at 38 Lyncis 5).
+                        js::Latch nearPlanet;
+                        feed(nearPlanet, "{ \"event\":\"Docked\", \"StationName\":\"Q1H-2DZ\", \"StationType\":\"FleetCarrier\" }\n");
+                        feed(nearPlanet, "{ \"timestamp\":\"t\", \"event\":\"Disembark\", \"SRV\":false, \"Taxi\":false, \"Multicrew\":false, \"ID\":136, \"StarSystem\":\"S\", \"Body\":\"S 5\", \"BodyID\":26, \"OnStation\":false, \"OnPlanet\":true }\r\n");
+                        check(nearPlanet.kind() == K::kFleetCarrier, "station type: a carrier near a planet holds through its Disembark too");
+                        feed(nearPlanet, "{ \"timestamp\":\"t\", \"event\":\"Embark\", \"SRV\":false, \"Taxi\":false, \"Multicrew\":false, \"ID\":136, \"StarSystem\":\"S\", \"Body\":\"S 5\", \"BodyID\":26, \"OnStation\":false, \"OnPlanet\":true }\r\n");
+                        check(nearPlanet.kind() == K::kFleetCarrier, "station type: and its Embark");
+                        // A jump aboard: counted, and the type stays, whether or not the event names the carrier.
+                        check(nearPlanet.jumps() == 0u, "carrier jump: none before one");
+                        feed(nearPlanet, "{ \"timestamp\":\"t\", \"event\":\"CarrierJump\", \"Docked\":true, \"StationName\":\"Q1H-2DZ\", \"StationType\":\"FleetCarrier\", \"MarketID\":3706882816, \"StarSystem\":\"T\", \"Body\":\"T A\", \"BodyType\":\"Star\" }\r\n");
+                        check(nearPlanet.jumps() == 1u && nearPlanet.kind() == K::kFleetCarrier, "carrier jump: one that names the carrier is counted, and it is still a carrier");
+                        feed(nearPlanet, "{ \"timestamp\":\"t\", \"event\":\"CarrierJump\", \"Docked\":false, \"OnFoot\":true, \"StarSystem\":\"U\", \"Body\":\"U 1\", \"BodyType\":\"Planet\" }\r\n");
+                        check(nearPlanet.jumps() == 2u && nearPlanet.kind() == K::kFleetCarrier, "carrier jump: one that names none is counted, and the type stays");
+                        nearPlanet.newFile();
+                        check(nearPlanet.jumps() == 2u, "carrier jump: another file of the session keeps the count");
+                        js::Latch jumpIn;
+                        feed(jumpIn, "{ \"timestamp\":\"t\", \"event\":\"CarrierJump\", \"Docked\":true, \"StationName\":\"Q1H-2DZ\", \"StationType\":\"FleetCarrier\" }\r\n");
+                        check(jumpIn.kind() == K::kFleetCarrier && jumpIn.saved().nameHash == js::hashName("Q1H-2DZ", 7), "carrier jump: one that names the carrier says where the commander is, and saves it");
                     }
 
                     js::Latch fresh;
@@ -4284,8 +4330,9 @@ int main(int argc, char** argv) {
                           "bake plan: the large stations run, with every direction");
                     check(cc::bakePlanFor(T::kCraterOutpost).run && cc::bakePlanFor(T::kCraterOutpost).dirs == cc::kBakeDirsAll, "bake plan: so does a CraterOutpost, flown");
                     check(cc::bakePlanFor(T::kOutpost).run && cc::bakePlanFor(T::kOutpost).dirs == cc::kBakeDirsAll, "bake plan: and an orbital outpost, flown");
+                    check(cc::bakePlanFor(T::kFleetCarrier).run && cc::bakePlanFor(T::kFleetCarrier).dirs == cc::kBakeDirsAll, "bake plan: and a fleet carrier, flown");
                     check(!cc::bakePlanFor(T::kUnknown).run && !cc::bakePlanFor(T::kCraterPort).run &&
-                              !cc::bakePlanFor(T::kSurfaceStation).run && !cc::bakePlanFor(T::kAsteroidBase).run && !cc::bakePlanFor(T::kFleetCarrier).run && !cc::bakePlanFor(T::kMegaShip).run &&
+                              !cc::bakePlanFor(T::kSurfaceStation).run && !cc::bakePlanFor(T::kAsteroidBase).run && !cc::bakePlanFor(T::kMegaShip).run &&
                               !cc::bakePlanFor(T::kOnFootSettlement).run && !cc::bakePlanFor(T::kOther).run,
                           "bake plan: everything else, and not knowing, stays the game's own");
 
