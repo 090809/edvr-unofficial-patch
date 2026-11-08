@@ -582,6 +582,15 @@ Build 0448d071, flat, Steam, 3840x2160, log `edvr_gfx_20261107_105506`, NumLocks
 
 **Next, Flight 32:** a key that leaves out one light family a press while the cull is on, the families being the ones a census of the room lists.
 
+## Flight 47, first part: the suspended bar
+
+c841a58b, log `edvr_gfx_20261108_044500`, build matched. Sean suspended the carrier's bar service mid-session: "Interesting bug, I suspended the bar service." A 3.3 s clip from 04:51:50, standing still, flickers every few frames between a grey panelled wall filling the view and the corridor behind it to the bar's dark window. A restart cleared it: "I restarted the game and its not doing the bug anymore".
+
+- **The door rule held still through it:** camera at a2 -5.6 from 04:51:41 to 04:52:21, both doors shut, no door events, no change to the culled stretch, and the producer and store tallies agreed.
+- **His F3 and census** came at 04:50:40 and 04:50:43, a minute before the clip and elsewhere, so they do not name the wall. Candidates from that F3: `SA_Carrier_01_Bar_BlankingPlate` (x2, r=11.2, kept then); the reload's netLog also loads a `carrier01_corridorfalsewall`. The census drew 0 on-screen calls in its 2 frames.
+- **H55** The flicker is Elite's own, from a service suspended mid-session. Discriminator: suspend or restore a service mid-session; at the flicker, F3 there (names the wall and whether it is culled), then F2 off. Flicker with F2 off means Elite's.
+- **The crash:** quitting to the main menu and reloading on the carrier, 04:53:39.5 (`edvr_breadcrumbs.txt`): 0xC0000005 executing address 0x57, called from `EliteDangerous64.exe+0x390A61`, every frame of the stack in Elite (+0x25AD7C to +0x452403), right after the netLog's `Calculated hash of 0 for carrier01_bar`. No EDVR hook lies in that range; the nearest are UI glyph points at 0x30FCBA and 0x3124F0, not on the stack. The signature is new among the file's 11 unhandled crashes. INFERRED to be Elite's own, on loading a carrier whose bar was just suspended; not proven.
+
 ## Flight 47, the list as written
 
 Flat, Steam, on the carrier, on c841a58b, no keys needed. Read with `python tools\edvr_log.py --target steam --expect-build c841a58b --grep "concourse"`.
