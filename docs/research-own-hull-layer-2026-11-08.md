@@ -10,7 +10,14 @@ The smear is terrain that is newly uncovered at the hull edge every frame
 
 ## Status
 
-* **State (Step 1 CONFIRMED, 2026-11-08 20:30, build cfa4e5f5):** section
+* **Separate mode WORKS in the headset (2026-11-08 ~22:00, build
+  4e252a32, FG off).** The pilot's verdict: "the ship is drawn, the terrain
+  smear seems gone, I don't feel it, the HUD is in place and correct".
+  **Bug:** the game's night vision no longer applies to the own ship,
+  because the hull is composited after the game's image. Next: one
+  dump with night vision on and one off, at the same spot, to find the
+  night-vision draws in the census, then re-issue them on the hull layer.
+* **Step 1 CONFIRMED (2026-11-08 20:30, build cfa4e5f5):** section
   "Step 1 v2 flight (... 20:30 ...)". The private hull layer, picked per
   record by the GPU own mask and re-lit by re-issuing the game's lighting,
   equals the game's HDR where the game shows the hull. Median ratio 1.000;
