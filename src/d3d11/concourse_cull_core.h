@@ -687,6 +687,8 @@ inline bool bakePeopleVs(uint64_t vs) noexcept {
 // room). A load on foot there names no carrier, and Status.json says it (journal_station::atCarrier). A jump makes a new bake (kBakeAfterJumpMs).
 // CraterPort: surveyed (the CraterOutpost's room: the same anchor, kPortAnchorName, and bay, n=12) and flown at one with F2 (Flight 48); Sean: "We can add this station type to the
 // bake list as well". The bake's missing sun, sky and ground there (H57) is the bake's, at every type, not this row's.
+// AsteroidBase: the large stations' room (Standard_SocialArea, the bay n=36), flown with F2 on 35aa1d87 (171 ms, 832 people's draws left out); Sean: "it has the same layout as the other
+// orbital large stations (orbis). Tested with F2, let's add it to the same list of automatic ones".
 struct BakePlan {
     bool run = false;
     uint32_t dirs = kBakeDirsAll;
@@ -694,7 +696,7 @@ struct BakePlan {
 inline BakePlan bakePlanFor(journal_station::Kind k) noexcept {
     BakePlan p;
     p.run = k == journal_station::Kind::kOrbis || k == journal_station::Kind::kCoriolis || k == journal_station::Kind::kOcellus || k == journal_station::Kind::kCraterOutpost ||
-            k == journal_station::Kind::kOutpost || k == journal_station::Kind::kFleetCarrier || k == journal_station::Kind::kCraterPort;
+            k == journal_station::Kind::kOutpost || k == journal_station::Kind::kFleetCarrier || k == journal_station::Kind::kCraterPort || k == journal_station::Kind::kAsteroidBase;
     return p;
 }
 // A carrier that jumps with the commander aboard: the bake is of the system left, so it goes, and the next one waits this long from the CarrierJump. The journal writes that event about

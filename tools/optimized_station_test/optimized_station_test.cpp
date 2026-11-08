@@ -4417,6 +4417,7 @@ int main(int argc, char** argv) {
                     check(cc::bakePlanFor(T::kOutpost).run && cc::bakePlanFor(T::kOutpost).dirs == cc::kBakeDirsAll, "bake plan: and an orbital outpost, flown");
                     check(cc::bakePlanFor(T::kFleetCarrier).run && cc::bakePlanFor(T::kFleetCarrier).dirs == cc::kBakeDirsAll, "bake plan: and a fleet carrier, flown");
                     check(cc::bakePlanFor(T::kCraterPort).run && cc::bakePlanFor(T::kCraterPort).dirs == cc::kBakeDirsAll, "bake plan: and a large surface port, flown");
+                    check(cc::bakePlanFor(T::kAsteroidBase).run && cc::bakePlanFor(T::kAsteroidBase).dirs == cc::kBakeDirsAll, "bake plan: and an asteroid base, flown");
                     // H57: the frames at 5 m, so the sky, stars and sunlight are drawn; the room's cut at 50 m, as the near plane was.
                     check(cc::kBakeNearDefaultM == 5.0f && cc::kBakeRoomCutM == 50.0f && cc::kBakeNearMinM <= cc::kBakeNearDefaultM, "bake: frames at 5 m, the room cut at 50 m");
                     bool people = cc::bakePeopleVs(cc::kBakeHairPrepassVs);
@@ -4428,7 +4429,7 @@ int main(int argc, char** argv) {
                               !cc::bakePeopleVs(0x7E38A6AA1269C901ull) && !cc::bakePeopleVs(0x8BD7C37ABCEE7E45ull),
                           "bake: the station's moving records, a hull, the glass and the sun are not people");
                     check(!cc::bakePlanFor(T::kUnknown).run &&
-                              !cc::bakePlanFor(T::kSurfaceStation).run && !cc::bakePlanFor(T::kAsteroidBase).run && !cc::bakePlanFor(T::kMegaShip).run &&
+                              !cc::bakePlanFor(T::kSurfaceStation).run && !cc::bakePlanFor(T::kMegaShip).run &&
                               !cc::bakePlanFor(T::kOnFootSettlement).run && !cc::bakePlanFor(T::kOther).run,
                           "bake plan: everything else, and not knowing, stays the game's own");
 
