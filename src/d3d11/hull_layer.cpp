@@ -540,6 +540,7 @@ struct Window {
     // refused, or had no slot target or shader), and the own decals re-issued into the private layer (and those declined:
     // no slot exported).
     uint32_t ownDraws = 0, ownDecals = 0, noVariant = 0, fallbackFrames = 0, decalsReissued = 0, decalNoSlot = 0;
+    uint32_t copiesMirrored = 0, decalSrvSwaps = 0;   // the decals' base: game copies mirrored, decal re-issues with a swapped SRV
     // Step 3 (the "composite" line): frames decided with the discard on, and kept by reason; eye-frames composited (the
     // discard on) or made ready (a fallback frame); misses by stage (an eye-frame whose seed failed is counted, not held);
     // composites declined; tonemap re-issues made and declined; history restarts; eyes matched by index, not identity;
@@ -1584,6 +1585,26 @@ bool beginHullDraw(ID3D11DeviceContext* ctx, UINT instances, UINT startInstance,
         ++e.noSlotDraws;
         ++g_win.noSlotDraws;
     }
+    // A decal reads the game's copy of G-buffer RT0 as its base (t0); in the layer it reads the private copy of that copy
+    // (hullLayerAfterCopy), else it blends over the main pass's RT0, which no longer holds the own hull.
+    ID3D11ShaderResourceView* srv[kSrvSlots] = {};
+    bool srvSwapped = false;
+    if (decal) {
+        ctx->PSGetShaderResources(0, kSrvSlots, srv);
+        ID3D11ShaderResourceView* bindSrv[kSrvSlots] = {};
+        for (UINT i = 0; i < kSrvSlots; ++i) {
+            bindSrv[i] = srv[i];
+            if (!srv[i] || !findMirror(resourceOf(srv[i]))) continue;
+            if (auto* p = static_cast<ID3D11ShaderResourceView*>(privateView(ViewKind::Srv, srv[i], false))) {
+                bindSrv[i] = p;
+                srvSwapped = true;
+            }
+        }
+        if (srvSwapped) {
+            vScreenPSSetShaderResourcesRaw(ctx, 0, kSrvSlots, bindSrv);
+            ++g_win.decalSrvSwaps;
+        }
+    }
     vScreenSetRenderTargetsRaw(ctx, n, bind, bindDsv);
     if (decal) {
         ++e.decals;
@@ -1595,6 +1616,8 @@ bool beginHullDraw(ID3D11DeviceContext* ctx, UINT instances, UINT startInstance,
     g_pending.active = true;
     g_pending.eye = ei;
     g_pending.stage = -1;
+    for (UINT i = 0; i < kSrvSlots; ++i) g_pending.srv[i] = srv[i];   // the references pass to End, which restores when swapped
+    g_pending.srvSwapped = srvSwapped;
     for (UINT i = 0; i < D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT; ++i) g_pending.rtv[i] = rtv[i];   // the references pass to End
     g_pending.dsv = dsv;
     return true;
@@ -2513,11 +2536,15 @@ void report() {
                     g_win.aoEyeFrames, g_win.aoFull, g_win.aoDispatches,
                     g_win.aoEyeFrames ? static_cast<double>(g_win.aoDispatches) / g_win.aoEyeFrames : 0.0, g_win.aoApplied, g_win.aoMissed[0],
                     g_win.aoMissed[1], g_win.aoMissed[2], g_win.aoMissed[kAoSteps], g_win.aoNoEye, kAoSteps);
-    if (detail::g_hullLayerSeparate)
+    if (detail::g_hullLayerSeparate) {
         Log::get().note("hull layer: main pass: own_draws=%u decal_draws=%u no_variant_draws=%u fallback_frames=%u decals_reissued=%u decal_no_slot=%u "
                         "(separate mode: draws issued with the own discard; window draws that could not take it; eye-frames whose main pass kept the own "
                         "ship, no mask)",
                         g_win.ownDraws, g_win.ownDecals, g_win.noVariant, g_win.fallbackFrames, g_win.decalsReissued, g_win.decalNoSlot);
+        Log::get().note("hull layer: decals: copies_mirrored=%u srv_swaps=%u (the game's copies out of a mirrored target made between the private "
+                        "copies too; decal re-issues whose base texture was the private copy)",
+                        g_win.copiesMirrored, g_win.decalSrvSwaps);
+    }
     if (detail::g_hullLayerSeparate) {
         const double toneMs = timerTake(g_toneTimer), compMs = timerTake(g_compTimer);
         Log::get().note("hull layer: composite: separate_frames=%u composited_eyes=%u ready_eyes=%u fallback=framegen:%u,outside:%u,mask_pending:%u,"
@@ -2690,6 +2717,31 @@ void hullLayerEndDispatch(ID3D11DeviceContext* ctx) {
     }
     releaseCsSlots(g_dispatch.srv, g_dispatch.uav);
     g_dispatch = DispatchPending{};
+}
+
+void hullLayerAfterCopy(ID3D11DeviceContext* ctx, ID3D11Resource* dst, ID3D11Resource* src) {
+    if (!detail::g_hullLayerOn || !ctx || !dst || !src || !g_device) return;
+    Mirror* ms = findMirror(src);
+    if (!ms) return;   // only a copy out of a texture the layer mirrors (the G-buffer, depth, HDR) has a private twin
+    D3D11_RESOURCE_DIMENSION dim = D3D11_RESOURCE_DIMENSION_UNKNOWN;
+    dst->GetType(&dim);
+    if (dim != D3D11_RESOURCE_DIMENSION_TEXTURE2D) return;
+    D3D11_TEXTURE2D_DESC dd{};
+    static_cast<ID3D11Texture2D*>(dst)->GetDesc(&dd);
+    if (dd.Width != ms->desc.Width || dd.Height != ms->desc.Height || dd.ArraySize != ms->desc.ArraySize || dd.MipLevels != ms->desc.MipLevels ||
+        dd.SampleDesc.Count != 1)
+        return;   // a whole-texture copy only (the decals' base copy is one); a partial or resampled one is not mirrored
+    Mirror* md = findMirror(dst);
+    if (md && std::memcmp(&md->desc, &dd, sizeof dd) != 0) {
+        dropMirror(dst);
+        md = nullptr;
+    }
+    if (!md) md = makeMirror(dst, dd);
+    ms = findMirror(src);   // makeMirror may have grown the table
+    if (!md || !ms || !md->priv || !ms->priv) return;
+    VrWorldInternalScope internal;
+    vScreenCopyResourceRaw(ctx, md->priv, ms->priv);
+    ++g_win.copiesMirrored;
 }
 
 void hullLayerNoteClearRtv(ID3D11DeviceContext* ctx, ID3D11RenderTargetView* rtv, const float colour[4]) {

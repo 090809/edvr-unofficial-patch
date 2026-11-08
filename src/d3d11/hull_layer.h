@@ -104,6 +104,11 @@ void hullLayerEndDispatch(ID3D11DeviceContext* ctx);
 // From the clear hooks (owner context, the game's own clears): a clear of a target that has a private counterpart is
 // made on the counterpart too, and the value an eye depth is cleared to is remembered for the private depth's clear.
 void hullLayerNoteClearRtv(ID3D11DeviceContext* ctx, ID3D11RenderTargetView* rtv, const float colour[4]);
+// From the copy hooks (owner context, after the game's own copy): a whole-texture copy whose source has a private
+// counterpart is made between the counterparts too (the destination's made on first use). The game copies G-buffer RT0
+// before the depth copy and the hull decals read that copy as their base; without this the layer's decals read the
+// main pass's RT0, which no longer holds the own hull, and came out dark (2026-11-08 23:00).
+void hullLayerAfterCopy(ID3D11DeviceContext* ctx, ID3D11Resource* dst, ID3D11Resource* src);
 void hullLayerNoteClearDsv(ID3D11DeviceContext* ctx, ID3D11DepthStencilView* dsv, UINT flags, float depth, UINT8 stencil);
 
 // The eye dump's arming (temporal_pass.cpp beginEyeRun): the next whole frame is captured. A no-op with the key off.

@@ -5030,6 +5030,7 @@ void STDMETHODCALLTYPE hookedCopyResource(ID3D11DeviceContext* self,
                        foreignContext(self));
     }
     g_state->realCopyResource(self, dst, src);
+    if (hullLayerWanted() && self == g_state->ownerCtx) hullLayerAfterCopy(self, dst, src);   // diag.hull_layer (TEMPORARY): the hull decals' base
 }
 
 // The depth clear, record-only: the planet's terrain colour landing at all
@@ -5247,6 +5248,10 @@ void STDMETHODCALLTYPE hookedCopySubresourceRegion(
     }
     g_state->realCopySubresourceRegion(self, dst, dstSub, dstX, dstY, dstZ, src, srcSub,
                                        box);
+    // diag.hull_layer (TEMPORARY): a whole-texture copy out of a mirrored target is made between the private copies too
+    // (the hull decals' base, hull_layer.h). One load while off.
+    if (hullLayerWanted() && self == g_state->ownerCtx && !box && dstSub == 0 && srcSub == 0 && dstX == 0 && dstY == 0 && dstZ == 0)
+        hullLayerAfterCopy(self, dst, src);
 }
 
 // The CPU-upload path, recorded as kind 'U' with the destination box and no

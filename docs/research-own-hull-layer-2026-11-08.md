@@ -762,6 +762,19 @@ layer's G-buffer window ended at the copy.
 A blink at the start remains: `failed=composite:2` in the first separate
 window, a lost frame each. Open.
 
+**Decals in, but dark (build 5532477b, ~23:00).** The pilot: the panel
+details appear, but unlit, "a black outline". In census 3 of 215951 the
+game copies G-buffer RT0 just before the depth copy
+(`CopySubresourceRegion`, dst `...ACA0` from RT0 `...BA60`, q1039). Every
+hull decal reads that copy at t0 as the base it blends over. The layer's
+decals read the main pass's copy, which no longer holds the own hull.
+- Fix: `hullLayerAfterCopy`. A whole-texture copy out of a mirrored
+  target is made between the private copies too. A decal re-issue swaps
+  every PS SRV that has a private copy. Counters:
+  `hull layer: decals: copies_mirrored= srv_swaps=`.
+- ruled out: the CS step `CBAAD243` as the dark decals' cause, because it
+  reads only the depth-derived `4FD03C16` output (census 3, resolved ids).
+
 ## Optimisation debt (recorded 2026-11-08 at the pilot's request)
 
 The layer was built to work first. Before it ships as anything but a
