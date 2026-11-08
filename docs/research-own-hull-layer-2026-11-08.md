@@ -432,7 +432,12 @@ from the four draw thunks in `vscreen.cpp` right after the game's own issue.
 **The key:** `diag.hull_layer = off | dump` in `[diag]`, TEMPORARY, default
 off, live, VR only (not in the flat profile's list). With `dump` it runs every
 frame; an eye dump (`hotkey.dump_eyes`) arms the capture for the next whole
-frame. With it off the draw path pays one bool load.
+frame. With it off the draw path pays one bool load. With it on, the private
+mirrors cost video memory. Per eye at 2817x2448 there are nine of them:
+RT0-2, the HDR, depth (8 bytes a texel), the depth copy, the shadow mask
+and the R16. That is about 0.25 GB an eye and 0.5 GB for both. Expect the
+frame time with the key on to be a little worse; that is not the layer's
+production cost.
 
 **What runs, per eye:**
 
