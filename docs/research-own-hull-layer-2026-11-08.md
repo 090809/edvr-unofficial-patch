@@ -789,6 +789,28 @@ Fix:
 `hlsl_embedded_check.py` now skips C++ comment lines between the literals:
 a quoted phrase in one was read as HLSL.
 
+**Build ad1b3906, 23:15-23:18.** The pilot reported:
+- a little shimmer remains;
+- a "shadow bug": a dark band on the hull body under the white wing beam.
+
+A dump in `dump` mode at the same spot (231824436002; the game draws the
+ship, the layer runs beside it) compares the two on the 418,035 hull
+pixels the game shows:
+- 95.0% are within 5%, with a median and a p95 ratio of 1.000;
+- 1.37% are darker by more than 10% and 1.4% brighter, all scattered
+  single pixels along thin edges and panel lines (diff map
+  `diff_231824.png`, shared notes).
+
+The band is in the game's own lighting as well.
+- ruled out: the dark band under the wing beam as a hull-layer bug,
+  because the game's HDR has it at the same pixels. It is the sun's
+  shadow from the beam, more readable now that AO and decals give the
+  hull its relief.
+
+With AO and the decals in, the layer matches the game's HDR closely. The
+shimmer is the layer's TAA. In `dump` mode, where DLSS draws the ship,
+nothing shimmers.
+
 ## Optimisation debt (recorded 2026-11-08 at the pilot's request)
 
 The layer was built to work first. Before it ships as anything but a
