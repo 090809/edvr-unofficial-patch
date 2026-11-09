@@ -120,7 +120,7 @@ uintptr_t actualManager(uintptr_t object) {
     edvr::previewSourceHook(0xABCD,live->at(0x21B0));edvr::previewHmdHook(live->at(0x1000));edvr::previewFinalizerHook(live->at(0x3000));
     return 0x44444444;
 }
-int main(int argc,char** argv) {
+static int testMain(int argc,char** argv) {
     if(argc!=2||std::strcmp(argv[1],"--self-test"))return 2;
     for(unsigned order=0;order<2;++order) {
         Fixture a;const auto result=manager(a.engine,[&]{if(order){a.p();a.h();}else{a.h();a.p();}a.f();return uintptr_t(99);});
@@ -496,11 +496,158 @@ int main(int argc,char** argv) {
             for(auto& th:t)th=std::thread([&]{while(!go.load());for(unsigned i=0;i<2000;++i)f.engine.refusedChild(f.memory,f.game,f.at(0x3000),i&1,Refuse::kCount);});
             std::thread reader([&]{while(!go.load());Refusal r;uint64_t c[size_t(Refuse::kRefuseCount)]{};for(unsigned i=0;i<2000;++i)if(f.engine.takeRefusal(i&1,r,c)&&r.why==Refuse::kCount&&r.count==3)taken.fetch_add(1);});
             go.store(true);for(auto& th:t)th.join();reader.join();
+            {Refusal r;uint64_t c[size_t(Refuse::kRefuseCount)]{};for(unsigned role=0;role<2;++role)if(f.engine.takeRefusal(role,r,c)&&r.why==Refuse::kCount&&r.count==3)taken.fetch_add(1);}   // what the reader missed is still there
             check(f.engine.reasons[0][size_t(Refuse::kCount)].load()+f.engine.reasons[1][size_t(Refuse::kCount)].load()==6000&&taken.load()>0,"F232 concurrent refusals are all counted and snapshots are taken without waiting");
+        }
+    }
+    {   // F233: HeadlookCamera as the head entry, the finalizer accepting the preview's pose, and the eye path's snapshots
+        auto headlook=[&](Fixture& f,bool previewFirst){
+            const uintptr_t hi=f.at(0x8800),ho=f.at(0x8880);
+            f.game.headlookIface.store(hi);f.game.headlookObject.store(ho);
+            f.put(0x8820,f.game.at[Weight]);f.put(0x8828,f.game.at[State]);
+            f.put(0xD000,ho);f.put(0xD020,hi);f.put<uint8_t>(0xD01C,1);f.put(0xD140,f.at(0x3000));
+            f.put(0x6000,previewFirst?f.at(0x2060):f.at(0xD020));f.put(0x6008,previewFirst?f.at(0xD020):f.at(0x2060));
+            f.game.handover.store(true);f.game.headlook.store(true);
+        };
+        auto run=[&](Fixture& f,Identity& id,Refuse& why){return identityWhy(f.memory,f.game,f.at(0x3000),id,why);};
+        // [preview, Headlook]: accepted with both keys on; foreign with the headlook key off; refused by the original check with the handover off
+        {
+            auto fp=std::make_unique<Fixture>();Fixture& f=*fp;headlook(f,true);Identity id;Refuse why=Refuse::kNone;
+            check(run(f,id,why)&&why==Refuse::kNone&&id.hmd==f.at(0xD020)&&id.preview==f.at(0x2060)&&id.headClass==1,"F233 [preview, Headlook] with both keys on is accepted: the head entry is the Headlook one, class 1, the preview the other");
+            Identity again;
+            check(run(f,again,why)&&id==again,"F233 the scan with a Headlook entry is the same for the same memory");
+            Identity as=id;as.headClass=0;
+            check(!(id==as),"F233 the head class is part of the identity's equality");
+            f.game.headlook.store(false);
+            check(!run(f,id,why)&&why==Refuse::kForeignEntry,"F233 with the headlook key off a Headlook entry is a foreign entry");
+            f.game.headlook.store(true);f.game.handover.store(false);
+            check(!run(f,id,why)&&why==Refuse::kIfaceVtable,"F233 with the handover off the roster is refused by the original check");
+            f.game.handover.store(true);f.game.headlookIface.store(0);
+            check(!run(f,id,why)&&why==Refuse::kForeignEntry,"F233 a Headlook entry is foreign until its producer hook has published the vtables");
+        }
+        // [HMD, preview] with the headlook key on: the original's identity
+        {
+            auto fp=std::make_unique<Fixture>();Fixture& f=*fp;headlook(f,true);f.put(0x6000,f.at(0x1020));f.put(0x6008,f.at(0x2060));
+            Identity on,off;Refuse why=Refuse::kNone;f.game.headlook.store(false);f.game.handover.store(false);
+            const bool a=run(f,off,why);f.game.headlook.store(true);f.game.handover.store(true);const bool b=run(f,on,why);
+            check(a&&b&&on==off&&on.headClass==0,"F233 [HMD, preview] with the headlook key on is the original's identity (class 0)");
+        }
+        // the weights of the class present
+        {
+            auto fp=std::make_unique<Fixture>();Fixture& f=*fp;headlook(f,true);Identity id;Refuse why=Refuse::kNone;
+            f.put<uintptr_t>(0x8820,0);
+            check(!run(f,id,why)&&why==Refuse::kWeights,"F233 a Headlook interface whose weight is not the game's is refused");
+            f.put(0x8820,f.game.at[Weight]);f.put<uintptr_t>(0x8828,0);
+            check(!run(f,id,why)&&why==Refuse::kWeights,"F233 a Headlook interface whose state is not the game's is refused");
+            f.put(0x8828,f.game.at[State]);
+            check(run(f,id,why),"F233 ... and accepted with both right");
+        }
+        // two head entries
+        {
+            auto fp=std::make_unique<Fixture>();Fixture& f=*fp;headlook(f,true);Identity id;Refuse why=Refuse::kNone;
+            f.put<uint64_t>(0x3058,3);f.put(0x6000,f.at(0x1020));f.put(0x6008,f.at(0x2060));f.put(0x6010,f.at(0xD020));
+            check(!run(f,id,why)&&why==Refuse::kHmdEntries,"F233 an HMD entry and a Headlook entry are two head entries: refused");
+            f.put<uint64_t>(0x3058,2);f.put(0x6008,f.at(0xD020));
+            check(!run(f,id,why)&&why==Refuse::kHmdEntries,"F233 [HMD, Headlook] is refused too");
+        }
+        // the flow: [preview, Headlook] with idle look; the preview wins the game's finalizer (child+0xB0 is its pose); EDVR applies
+        auto flow=[&](Fixture& f,bool diag){
+            f.engine.diagWanted.store(diag);
+            manager(f.engine,[&]{
+                hmd(f.engine,f.memory,f.game,f.at(0xD000),[&]{Pose base=f.load<Pose>(0x5040);f.put(0xD070,base);f.put(0xD0F0,f.local);return uintptr_t(0x55555555);},true);
+                f.p();
+                finalizer(f.engine,f.memory,f.game,f.at(0x3000),[&]{f.put(0x30B0,f.load<Pose>(0x20B0));return uintptr_t(0x33333333);});
+                return uintptr_t(1);
+            });
+        };
+        {
+            auto fp=std::make_unique<Fixture>();Fixture& f=*fp;headlook(f,true);
+            f.put(0xD270,F3{{1,0,0}});f.put(0xD280,F3{{0,1,0}});f.put(0xD290,F3{{0,0,1}});f.put(0xD2A0,F3{{0.1f,0.2f,0.3f}});
+            flow(f,true);
+            check(f.engine.hmdQualified.load()==1&&f.engine.previewQualified.load()==1,"F233 a Headlook entry with idle look (primary == base) qualifies as the head role");
+            check(f.engine.applied.load()==1&&f.writes==2,"F233 with the handover on the preview-first frame is applied: the output equals the preview's primary");
+            const Pose after=f.load<Pose>(0xD070),out=f.load<Pose>(0x30B0);
+            check(after.v[12]==100&&after.v[13]==200&&after.v[14]==300&&out.v[12]==100&&out.v[14]==300,"F233 ... the Headlook entry's primary and child+0xB0 carry the preview's pose");
+            FinalSnap fin;
+            check(f.engine.takeFinal(fin)&&fin.why==FinalWhy::kApplied&&fin.headClass==1&&fin.out.read&&fin.out.v[0]==100&&fin.head.v[0]==0&&fin.preview.v[2]==300&&fin.base.read&&fin.extraRead&&
+                      fin.extra[3][0]==0.1f&&fin.extra[3][2]==0.3f&&fin.extra[0][0]==1.f&&!f.engine.takeFinal(fin),
+                "F233 the finalization snapshot holds the output, the head's, the preview's and the base's translation and the look rotation and displacement, once");
+            char line[1100];formatFinal(line,sizeof(line),fin);const std::string text=line;
+            check(text.rfind("native preview camera (F233): final child 0x",0)==0&&text.find(" head class Headlook: applied; output (100.000, 200.000, 300.000), head primary (0.000, 0.000, 0.000), preview primary (100.000, 200.000, 300.000), base (0.000, 0.000, 0.000); output to head 374.166 m, output to preview 0.000 m")!=std::string::npos&&
+                      text.find("; headlook R rows (1.000, 0.000, 0.000) (0.000, 1.000, 0.000) (0.000, 0.000, 1.000), d (0.100, 0.200, 0.300)")!=std::string::npos,
+                "F233 the final line names the class, applied or refused, the four translations, the distances and the look values");
+            // the eye stub's snapshot
+            EyeSnapshot published;published.composed=f.previewPose;published.raw[0]=1;published.raw[1]=2;published.raw[2]=3;
+            Pose carried=identityPose();carried.v[12]=3;carried.v[13]=4;carried.v[14]=0;
+            f.engine.eyeSeen(&carried,&published,true);
+            EyeSeen eye;
+            check(f.engine.takeEyeSeen(eye)&&eye.replaced&&eye.published&&eye.head.v[0]==3&&eye.composed.v[0]==100&&!f.engine.takeEyeSeen(eye),"F233 the eye snapshot holds the carried head, the published head and whether it was replaced, once");
+            f.engine.eyeSeen(&carried,&published,true);f.engine.takeEyeSeen(eye);
+            formatEye(line,sizeof(line),eye,&fin);const std::string eyeText=line;
+            check(eyeText.rfind("native preview camera (F233): eye head (3.000, 4.000, 0.000), replaced; published eye head (100.000, 200.000, 300.000), HMD primary (1.000, 2.000, 3.000); distance to published ",0)==0&&
+                      eyeText.find("to output 109.000 m")==std::string::npos&&eyeText.find(", to origin 5.000 m")!=std::string::npos&&eyeText.find(", to base 5.000 m")!=std::string::npos&&eyeText.find(", to head primary 5.000 m")!=std::string::npos,
+                "F233 the eye line names the carried head, whether it was replaced, the published head and the distances in metres to the published head, output, head, preview, base and origin");
+            f.engine.eyeSeen(&carried,nullptr,false);f.engine.takeEyeSeen(eye);
+            formatEye(line,sizeof(line),eye,nullptr);
+            check(std::string(line)=="native preview camera (F233): eye head (3.000, 4.000, 0.000), not replaced; published eye head unreadable, HMD primary unreadable; distance to published n/a m, to output n/a m, to head primary n/a m, to preview primary n/a m, to base n/a m, to origin 5.000 m",
+                "F233 an eye with no published head and no finalization says n/a for what it has not got");
+        }
+        // with the headlook key off the same frame does nothing: the Headlook entry is foreign
+        {
+            auto fp=std::make_unique<Fixture>();Fixture& f=*fp;headlook(f,true);f.game.headlook.store(false);
+            flow(f,false);
+            check(f.engine.applied.load()==0&&f.engine.hmdQualified.load()==0&&f.writes==0,"F233 with the headlook key off a [preview, Headlook] frame is left to the game");
+        }
+        // the finalizer: the output equal to the preview's primary, the standard [HMD, preview] roster
+        auto standard=[&](bool handover,bool outputPreview,Fixture& f,bool diag){
+            f.game.handover.store(handover);f.engine.diagWanted.store(diag);
+            manager(f.engine,[&]{
+                f.h();f.p();
+                finalizer(f.engine,f.memory,f.game,f.at(0x3000),[&]{
+                    if(outputPreview)f.put(0x30B0,f.load<Pose>(0x20B0));else f.finalOriginal();
+                    return uintptr_t(0x33333333);});
+                return uintptr_t(1);
+            });
+        };
+        {
+            auto fp=std::make_unique<Fixture>();Fixture& f=*fp;standard(false,true,f,true);
+            FinalSnap fin;
+            check(f.engine.applied.load()==0&&f.engine.refused.load()==1&&f.writes==0&&f.engine.takeFinal(fin)&&fin.why==FinalWhy::kOutputMismatch&&fin.headClass==0,
+                "F233 the output equal to the preview's primary is refused with the handover key off, as before, and the snapshot says why");
+            auto gp=std::make_unique<Fixture>();Fixture& g=*gp;standard(true,true,g,true);
+            check(g.engine.applied.load()==1&&g.writes==2&&g.engine.takeFinal(fin)&&fin.why==FinalWhy::kApplied,"F233 the same frame with the handover key on is applied");
+            auto hp=std::make_unique<Fixture>();Fixture& h=*hp;standard(true,false,h,false);
+            check(h.engine.applied.load()==1&&h.expected(),"F233 the output equal to the head's primary is applied with the key on, as it always was");
+            auto kp=std::make_unique<Fixture>();Fixture& k=*kp;standard(false,false,k,false);
+            check(k.engine.applied.load()==1&&k.expected(),"F233 ... and with the key off");
+            auto qp=std::make_unique<Fixture>();Fixture& q=*qp;q.put<uint64_t>(0x3058,1);standard(false,false,q,true);
+            check(q.engine.applied.load()==0&&q.engine.refused.load()==0,"F233 a child that is not eligible is neither applied nor refused, and no snapshot is kept for it");
+        }
+        // wait-free: a finalizer's and an eye stub's snapshots taken while the reader takes them, none lost from the counters
+        {
+            auto fp=std::make_unique<Fixture>();Fixture& f=*fp;headlook(f,true);f.engine.diagWanted.store(true);
+            Identity id;Refuse why=Refuse::kNone;run(f,id,why);
+            std::atomic<bool> go{false};std::atomic<unsigned> takenFinal{0},takenEye{0};
+            std::thread writers[2];
+            writers[0]=std::thread([&]{while(!go.load());for(unsigned i=0;i<2000;++i)f.engine.finalSeen(f.memory,id,FinalWhy::kApplied,nullptr,nullptr,nullptr);});
+            writers[1]=std::thread([&]{while(!go.load());Pose c=identityPose();for(unsigned i=0;i<2000;++i)f.engine.eyeSeen(&c,nullptr,false);});
+            std::thread reader([&]{while(!go.load());FinalSnap a;EyeSeen b;for(unsigned i=0;i<4000;++i){if(f.engine.takeFinal(a)&&a.headClass==1)takenFinal.fetch_add(1);if(f.engine.takeEyeSeen(b)&&b.head.read)takenEye.fetch_add(1);}});
+            go.store(true);for(auto& w:writers)w.join();reader.join();
+            {FinalSnap a;EyeSeen b;if(f.engine.takeFinal(a)&&a.headClass==1)takenFinal.fetch_add(1);if(f.engine.takeEyeSeen(b)&&b.head.read)takenEye.fetch_add(1);}   // what the reader missed is still there
+            check(takenFinal.load()>0&&takenEye.load()>0,"F233 snapshots are taken without waiting while the reader takes them, and are consistent");
         }
     }
     check(!edvr::previewInstall()&&edvr::layoutQueries==1&&edvr::unexpected==1,
         "unknown layout refuses before module lookup, resolver or hook installation");
     std::printf("native_preview_camera_test: %u checks, %u failures\n",checks,failures);
     return failures?1:0;
+}
+// The fixtures are 64 KB each and the checks keep many alive in one frame: run them on a thread with a stack that holds them (the default 1 MB does not).
+namespace { struct MainArgs {int argc;char** argv;int result;}; DWORD WINAPI mainThread(void* p){auto* a=static_cast<MainArgs*>(p);a->result=testMain(a->argc,a->argv);return 0;} }
+int main(int argc,char** argv) {
+    MainArgs args{argc,argv,1};
+    HANDLE t=CreateThread(nullptr,32u<<20,mainThread,&args,0,nullptr);
+    if(!t)return 1;
+    WaitForSingleObject(t,INFINITE);CloseHandle(t);
+    return args.result;
 }

@@ -12479,6 +12479,7 @@ H_LIVCAM = "livery camera (F229)"
 H_LIVREP = "livery camera repair (F230)"
 H_PREVCAM = "preview camera (F231)"
 H_PREVROSTER = "preview camera roster (F232)"
+H_PREVEYE = "preview camera eye path (F233)"
 F107_SHOWROOM_MAX_M = 50.0   # F209: a distance-test episode whose first camera stood over F107's 3 m and no farther than this from the neck is the size of a showroom's camera (the suit shop's: 3.6 to 3.7 m)
 
 
@@ -12741,6 +12742,38 @@ def _hj_prevroster(rows, ctx):
     unread = [r for r in refused if r["count"] == "unreadable"]
     if unread:
         return ("PARTIAL", text + "; %d roster(s) could not be read" % len(unread))
+    return ("OK", text)
+
+
+def _hj_preveye(rows, ctx):
+    """F233: the weapon previews' head producer (HeadlookCamera, TEMPORARY key experimental.native_on_foot_preview_headlook) and the eye path's instrument (native_preview_camera_core.h): the producer hook
+    (armed or stood down), the key, once a second while a watched preview screen is open the finalization snapshot (the head class, applied or refused and why, the output, head, preview and base translations
+    and the distances) and the eye stub's (the head it carried, whether EDVR replaced it, the distances to the published head, output, head, preview, base and origin). PARTIAL when the hook stood down
+    with the key on, or finalizations were logged and none was applied."""
+    kinds = ("hook", "key", "final", "eye")
+    if not any(rows.get(k) for k in kinds):
+        return None
+    hooks, keys, finals, eyes = rows.get("hook", []), rows.get("key", []), rows.get("final", []), rows.get("eye", [])
+    parts = []
+    stood = [r for r in hooks if r["st"] == "stood down"]
+    if hooks:
+        parts.append("Headlook producer hook %s" % ("stood down" if stood else "armed"))
+    if keys:
+        parts.append("key %s" % ", ".join(sorted({r["key"] for r in keys})))
+    if finals:
+        by = collections.Counter("%s %s" % (r["cls"], "applied" if r["res"] == "applied" else "refused (%s)" % r["why"]) for r in finals)
+        parts.append("%d final line(s): %s" % (len(finals), ", ".join("%s x%d" % (k, n) for k, n in sorted(by.items()))))
+    if eyes:
+        parts.append("%d eye line(s), %d replaced" % (len(eyes), len([r for r in eyes if r["rep"] == "replaced"])))
+    text = "; ".join(parts)
+    problems = []
+    keyon = bool(keys) and keys[-1]["key"] == "on"
+    if stood and keyon:
+        problems.append("the Headlook producer hook stood down with the key on: weapon previews are not handled")
+    if finals and not [r for r in finals if r["res"] == "applied"]:
+        problems.append("every finalization snapshot was refused")
+    if problems:
+        return ("PARTIAL", text + "; " + "; ".join(problems))
     return ("OK", text)
 
 
@@ -18047,6 +18080,14 @@ HEALTH_RULES = (
                     r"mode (?P<mode>\w+), registered (?P<reg>\w+), stack vtable (?P<stack>\S+), members (?P<members>\w+), name \"(?P<name>[^\"]*)\"(?P<entries>(?:; entry \d+: .*?)*)"
                     r"; refusals by reason:(?P<counts>.*)$"),
     ), _hj_prevroster),
+    _hrule(H_PREVEYE, ("F233",), ("(F233",), (
+        ("hook", r"native preview camera \(F233\): HeadlookCamera producer hook (?P<st>armed|stood down).*"),
+        ("key", r"native on foot preview headlook \(F233, TEMPORARY\): experimental\.native_on_foot_preview_headlook is (?P<key>on|off) -- .*"),
+        ("final", r"native preview camera \(F233\): final child 0x(?P<child>[0-9A-F]+) head class (?P<cls>HMD|Headlook): (?P<res>applied|refused \((?P<why>[^)]*)\)); output (?P<out>.*?), head primary .*"
+                  r"output to head (?P<oh>\S+) m, output to preview (?P<op>\S+) m(?P<extra>.*)$"),
+        ("eye", r"native preview camera \(F233\): eye head (?P<head>.*?), (?P<rep>replaced|not replaced); published eye head .*distance to published (?P<dp>\S+) m, to output (?P<do>\S+) m, "
+                r"to head primary (?P<dh>\S+) m, to preview primary (?P<dpr>\S+) m, to base (?P<db>\S+) m, to origin (?P<dor>\S+) m$"),
+    ), _hj_preveye),
     _hrule(H_F212, ("F212",), ("(F212)",), (
         ("hook", r"avatar hooks: (?P<hook>conversation-look) hook (?P<st>armed|stood down)(?:: (?P<why>.*?)(?:\. the conversation look \(F212\) is not held.*)?)?$"),
         ("began", r"conversation look \(F212\): run (?P<n>\d+) began: .*\|yaw\| (?P<yaw>[\d.]+) and \|pitch\| (?P<pitch>[\d.]+) asked in its first frames"),
@@ -19947,6 +19988,7 @@ def self_test_health():
         c1src = read_text(c1_path)
         shopsrc = read_text(os.path.join(repo_root(), "src", "d3d11", "shop_screen_core.h"))   # F209: the buy screens' event, signal and one-second lines
         rostersrc = read_text(os.path.join(repo_root(), "src", "d3d11", "native_preview_camera_core.h"))   # F232: the refused roster's line
+        camsrc = read_text(os.path.join(repo_root(), "src", "d3d11", "native_preview_camera.cpp"))   # F233: the Headlook hook's arming lines
         previewsrc = read_text(os.path.join(repo_root(), "src", "d3d11", "preview_camera_core.h"))   # F231: the preview camera patch's and the two hooks' lines
         f212src = read_text(os.path.join(repo_root(), "src", "d3d11", "native_on_foot_f212.h"))   # F212: the conversation look's run and summary lines
         probesrc = read_text(probe_path)
@@ -20367,6 +20409,15 @@ def self_test_health():
             fmts[key] = health_c_format(shopsrc, needle)
         if fmts[key] is None:
             raise AssertionError("shop_screen_core.h has no format holding %r: the --health rule that reads it is out of date" % needle)
+        return health_render(fmts[key], vals)
+
+    def RC(needle, *vals):
+        """F233's Headlook hook lines (native_preview_camera.cpp installHeadlook), from their own format literals."""
+        key = "cam:" + needle
+        if key not in fmts:
+            fmts[key] = health_c_format(camsrc, needle)
+        if fmts[key] is None:
+            raise AssertionError("native_preview_camera.cpp has no format holding %r: the --health rule that reads it is out of date" % needle)
         return health_render(fmts[key], vals)
 
     def RN(needle, *vals):
@@ -22833,6 +22884,21 @@ def self_test_health():
         check("F232: no refused roster logged is OK", [neck(), KEY_ON232], 0, [("OK", H_PREVROSTER)], has=["key on", "no refused roster logged"])
         check("F232: a roster that could not be read is PARTIAL", [neck(), KEY_ON232, REFUSED232U], 0, [("PARTIAL", H_PREVROSTER)], has=["1 roster(s) could not be read"])
         check("F232: a line that drifted from its pattern is unparsed", [neck(), "native preview camera (F232): the roster is somewhere else"], 4, [("UNPARSED", H_PREVROSTER)])
+
+        # ---- the weapon previews' head producer and the eye path (F233) ----
+        TAG233 = "native preview camera (F233):"
+        HOOK_UP233 = RC("HeadlookCamera producer hook armed at +0x%X (pin %u bytes)", 0x1074650, 15)
+        HOOK_DOWN233 = RC("HeadlookCamera producer hook stood down: entry pin +0x%X failed on %s;", 0x1074650, "build 334925")
+        FINAL_HMD233 = RN("final child 0x%llX head class %s: %s%s%s%s; output %s", TAG233, 0x4D5E6F70, "HMD", "applied", "", "", "", "(1.000, 2.000, 3.000)", "(1.000, 2.000, 3.000)", "(1.000, 2.000, 3.000)", "(0.000, 0.000, 0.000)", "0.000", "0.000")
+        FINAL_HL233 = RN("final child 0x%llX head class %s: %s%s%s%s; output %s", TAG233, 0x4D5E6F70, "Headlook", "refused", " (", "the output is neither the head's nor the preview's pose", ")", "(1.000, 2.000, 3.000)", "(0.000, 0.000, 0.000)", "(1.000, 2.000, 3.000)", "(0.000, 0.000, 0.000)", "3.742", "0.000") + \
+            RN("; headlook R rows (%.3f, %.3f, %.3f)", 1.0, 0.0, 0.0)
+        EYE233 = RN("eye head %s, %s; published eye head %s, HMD primary %s; distance to published", TAG233, "(3.000, 4.000, 0.000)", "replaced", "(100.000, 200.000, 300.000)", "(1.000, 2.000, 3.000)", "371.248", "5.000", "5.000", "5.000", "5.000", "5.000")
+        KEYLINE233 = "native on foot preview headlook (F233, TEMPORARY): experimental.native_on_foot_preview_headlook is %s -- a HeadlookCamera entry on the Location camera list counts as the head entry"
+        check("F233: the hook armed, the key on, an applied HMD frame, a refused Headlook frame and an eye line are summarised", [neck(), HOOK_UP233, KEYLINE233 % "on", FINAL_HMD233, FINAL_HL233, EYE233], 0, [("OK", H_PREVEYE)],
+              has=["Headlook producer hook armed", "key on", "2 final line(s): HMD applied x1, Headlook refused (the output is neither the head's nor the preview's pose) x1", "1 eye line(s), 1 replaced"], lacks=["UNPARSED"])
+        check("F233: the hook stood down with the key on is PARTIAL", [neck(), HOOK_DOWN233, KEYLINE233 % "on"], 0, [("PARTIAL", H_PREVEYE)], has=["Headlook producer hook stood down", "weapon previews are not handled"])
+        check("F233: finalization snapshots that were all refused are PARTIAL", [neck(), HOOK_UP233, KEYLINE233 % "off", FINAL_HL233], 0, [("PARTIAL", H_PREVEYE)], has=["every finalization snapshot was refused"])
+        check("F233: a line that drifted from its pattern is unparsed", [neck(), "native preview camera (F233): final somewhere else"], 4, [("UNPARSED", H_PREVEYE)])
 
         # ---- the conversation look (F212): the leaf that sets the look springs' targets is held at 0 while native on foot is active ----
         S212 = "conversation look (F212)"

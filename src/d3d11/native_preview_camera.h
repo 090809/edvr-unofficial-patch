@@ -7,6 +7,9 @@ void nativePreviewCameraStop() noexcept;
 // F232 (TEMPORARY key experimental.native_on_foot_preview_handover, set live by native_on_foot.cpp's frame thread; default on): the Location child's roster may hold three to six producers (one HMD, the
 // rest preview entries, the last the preview) instead of exactly two. Off: the roster check is exactly what it was.
 void nativePreviewCameraSetHandover(bool on) noexcept;
+// F233 (TEMPORARY key experimental.native_on_foot_preview_headlook, set live by native_on_foot.cpp's frame thread; default on): with the handover on as well, a HeadlookCamera entry (the weapon
+// screens' head-side producer, hooked at 0x1074650 when the build allows) counts as the head entry of the Location camera list. Off: it is a foreign entry.
+void nativePreviewCameraSetHeadlook(bool on) noexcept;
 // F232, present thread, once a frame: while one of F209's watched preview screens reads open (screenOpen) the producer hooks keep a roster snapshot of the last child they refused, and once a second
 // each role's newest snapshot is logged with the per-reason counts (at most 40 lines in any ten seconds). No effect on the camera.
 void nativePreviewCameraDiagTick(bool screenOpen);

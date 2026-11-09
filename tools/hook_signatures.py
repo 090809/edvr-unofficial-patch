@@ -1982,6 +1982,8 @@ AUDIT_EXACT_ONLY = (
      "prologue bytes before any is placed (native_on_foot_hooks.cpp, in this family, places them); F229 adds the Livery preview client's scene setup (0x12714C0, 16 prologue bytes, "
      "read-only) and the two Livery vtables and the loadout browser's, under the same gate; F230 adds the client's per-frame Update (0x1272780, 16 prologue bytes) and the "
      "game's camera-node test (0x3175B40, called by address once the build identity is known) for the Livery camera repair; making them self-locating needs the signature table regenerated"),
+    ("d3d11/preview_headlook_core.h", "F233's exact-build HeadlookCamera: its producer (0x1074650, 15 pinned bytes) and its two vtables, taken only on the known build and only after the pin matches "
+     "(native_preview_camera.cpp, in the audit, hooks it through the resolver); making them self-locating needs the signature table regenerated"),
     ("d3d11/preview_camera_core.h", "F231's exact-build preview camera patch (three bytes at 0x126FE70, 21 verified from 0x126FE6C, written as one interlocked qword) and the camera controller's SetCamera "
      "(0x1D7BEC0, 20 prologue bytes) and Release (0x1D7C1E0, 13) log-only hooks, checked against the build's PE identity and the bytes before anything is placed or written (native_on_foot.cpp and "
      "native_on_foot_hooks.cpp, in this family, apply them); making them self-locating needs the signature table regenerated"),

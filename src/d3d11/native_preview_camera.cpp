@@ -1,5 +1,6 @@
 #include "native_preview_camera.h"
 #include "native_preview_camera_core.h"
+#include "preview_headlook_core.h"   // F233: HeadlookCamera's producer, vtables and pin (exact-build constants)
 #include "concourse_vr_bake_core.h"   // baseMatches: the bake's write fence (pure)
 #include <windows.h>
 #include <atomic>
@@ -35,8 +36,13 @@ std::atomic<void*> g_previewOriginal[5]{};
 uint8_t* g_previewRelays[5]{};
 void* g_eyeTrampolineSlot=nullptr;
 bool g_previewAttempted=false,g_previewInstalled=false,g_previewLastActive=false;
-previewcam::DiagCap g_diagCap;   // F232: the frame thread's
+previewcam::DiagCap g_diagCap,g_finalCap,g_eyeCap;   // F232/F233: the frame thread's
 uint64_t g_diagAt=0;
+previewcam::FinalSnap g_lastFinal;bool g_haveFinal=false;   // F233: the newest finalization snapshot, the eye line's distances are to it
+CodeHook g_headlookHook;                      // F233: HeadlookCamera's producer (optional: a stand-down loses only the weapon screens)
+std::atomic<void*> g_headlookOriginal{nullptr};
+uint8_t* g_headlookRelay=nullptr;
+bool g_headlookArmed=false;
 uint64_t g_previewReportAt=0,g_previewLastApplied=0;
 #if defined(EDVR_PREVIEW_TEST_READ_PROBE)
 void (*g_previewReadProbe)(uintptr_t,size_t) noexcept=nullptr;
@@ -67,6 +73,10 @@ uintptr_t previewManagerHook(uintptr_t object) {
 uintptr_t previewHmdHook(uintptr_t object) {
     const auto original=reinterpret_cast<One>(g_previewOriginal[0].load(std::memory_order_acquire));
     return previewcam::hmd(g_previewEngine,g_previewMemory,g_previewGame,object,[&]{return original(object);});
+}
+uintptr_t previewHeadlookHook(uintptr_t object) {
+    const auto original=reinterpret_cast<One>(g_headlookOriginal.load(std::memory_order_acquire));
+    return previewcam::hmd(g_previewEngine,g_previewMemory,g_previewGame,object,[&]{return original(object);},true);
 }
 uintptr_t previewSourceHook(uintptr_t context,uintptr_t subscriber) {
     const auto original=reinterpret_cast<Two>(g_previewOriginal[1].load(std::memory_order_acquire));
@@ -259,9 +269,13 @@ void eyeApply(uintptr_t pose) noexcept {
     if(g_probe.armed.load(std::memory_order_acquire)&&probeEye(pose))return;
     // TEMPORARY (the concourse VR bake): while it is armed it sees every call; a pose it wrote is not the ship preview's to overwrite.
     if(g_bakeAim.armed.load(std::memory_order_acquire)&&bakeEye(pose))return;
+    // F233: while a watched preview screen is open the carried head translation, the published head and whether it was replaced are kept for the frame thread's line.
+    const bool seen=g_previewEngine.diagWanted.load(std::memory_order_relaxed);
+    previewcam::Pose carried;const bool carriedRead=seen&&previewcam::get(g_previewMemory,pose,carried);
     previewcam::EyeSnapshot snapshot;
-    if(!g_previewEngine.loadEye(snapshot))return;
-    eyeCommit(pose,snapshot);
+    const bool published=g_previewEngine.loadEye(snapshot);
+    const bool replaced=published&&eyeCommit(pose,snapshot);
+    if(seen)g_previewEngine.eyeSeen(carriedRead?&carried:nullptr,published?&snapshot:nullptr,replaced);
 }
 // Entered by a jump from the patched eye-producer entry, so the game's return
 // address stays on the stack and RSP is 8 mod 16. Eight pushes keep that
@@ -316,6 +330,33 @@ bool eyePrepare(void* trampoline,void*) noexcept {
     g_previewOriginal[4].store(trampoline,std::memory_order_release);
     return true;
 }
+// F233: HeadlookCamera's producer, hooked like the HMD one (the pin is checked first, a relay within two gigabytes) and routed to hmd() as the head role. Optional: any refusal says so in one line and
+// leaves the other five hooks as they are; without it a HeadlookCamera entry stays a foreign entry. The two vtables are published to the roster check only when the hook is armed.
+void installHeadlook(uintptr_t base) {
+    namespace hl=previewcam::headlook;
+    uint8_t bytes[32]{};
+    const uint32_t rvas[]={hl::kProducerRva,hl::kIfaceRva,hl::kObjectRva};
+    if(!gameRvasFound(rvas,std::size(rvas),nullptr)) {
+        Log::get().note("native preview camera (F233): HeadlookCamera producer hook stood down: binding not found on %s; weapon previews (purchase, loadout) are not handled",gameBuildText());return;
+    }
+    const uintptr_t target=base+gameRva(hl::kProducerRva);
+    if(!previewRead(nullptr,target,bytes,hl::kProducerPinBytes)||!gamePinMatches(hl::kProducerRva,bytes,hl::kProducerPin,hl::kProducerPinBytes)) {
+        Log::get().note("native preview camera (F233): HeadlookCamera producer hook stood down: entry pin +0x%X failed on %s; weapon previews (purchase, loadout) are not handled",hl::kProducerRva,gameBuildText());return;
+    }
+    g_headlookRelay=previewRelay(target,reinterpret_cast<void*>(&previewHeadlookHook));
+    if(!g_headlookRelay) {
+        Log::get().note("native preview camera (F233): HeadlookCamera producer hook stood down: near relay allocation/seal failed; weapon previews (purchase, loadout) are not handled");return;
+    }
+    if(!g_headlookHook.install(reinterpret_cast<void*>(target),g_headlookRelay,nullptr,"native-preview-headlook",previewPrepare,&g_headlookOriginal)) {
+        VirtualFree(g_headlookRelay,0,MEM_RELEASE);g_headlookRelay=nullptr;g_headlookOriginal.store(nullptr,std::memory_order_release);
+        Log::get().note("native preview camera (F233): HeadlookCamera producer hook stood down: install refused (%s); weapon previews (purchase, loadout) are not handled",g_headlookHook.refusal());return;
+    }
+    g_previewGame.headlookIface.store(base+gameRva(hl::kIfaceRva),std::memory_order_release);
+    g_previewGame.headlookObject.store(base+gameRva(hl::kObjectRva),std::memory_order_release);
+    g_headlookArmed=true;
+    Log::get().note("native preview camera (F233): HeadlookCamera producer hook armed at +0x%X (pin %u bytes); a HeadlookCamera entry is a head entry while experimental.native_on_foot_preview_headlook and "
+        "experimental.native_on_foot_preview_handover are on",hl::kProducerRva,unsigned(hl::kProducerPinBytes));
+}
 bool previewInstall() {
     // The resolver carries addresses across builds; it does not establish the
     // CameraState offsets or scheduler ownership contract on a new layout.
@@ -358,6 +399,7 @@ bool previewInstall() {
             Log::get().note("native preview camera: unavailable; %s install refused; no camera writes enabled; %s",names[i],g_previewHooks[i].refusal());return false;
         }
     }
+    installHeadlook(base);
     Log::get().note("native preview camera: armed on %s; five pinned callbacks, 16 child slots per synchronous evaluation; "
         "exact HMD/CustomisationVisual Location pair only, exact game head pose, primary XYZ only; overflow or observed overlap before commit refuses",gameBuildText());
     return true;
@@ -381,6 +423,7 @@ void nativePreviewCameraBoundary(bool wanted,bool active) {
     g_previewLastActive=enabled;g_previewLastApplied=applied;
 }
 void nativePreviewCameraSetHandover(bool on) noexcept {g_previewGame.handover.store(on,std::memory_order_relaxed);}
+void nativePreviewCameraSetHeadlook(bool on) noexcept {g_previewGame.headlook.store(on,std::memory_order_relaxed);}
 void nativePreviewCameraDiagTick(bool screenOpen) {
     const bool wanted=screenOpen&&g_previewInstalled;
     g_previewEngine.diagWanted.store(wanted,std::memory_order_relaxed);
@@ -395,6 +438,16 @@ void nativePreviewCameraDiagTick(bool screenOpen) {
         char line[1100];
         previewcam::formatRefusal(line,sizeof(line),r,counts,base,g_previewGame.handover.load(std::memory_order_relaxed));
         Log::get().note("%s",line);
+    }
+    // F233: the finalizer's and the eye stub's newest snapshots (the eye line's distances are to the finalization's poses)
+    previewcam::FinalSnap fin;
+    if(g_previewEngine.takeFinal(fin)) {
+        g_lastFinal=fin;g_haveFinal=true;
+        if(g_finalCap.allow(now)) {char line[1100];previewcam::formatFinal(line,sizeof(line),fin);Log::get().note("%s",line);}
+    }
+    previewcam::EyeSeen eye;
+    if(g_previewEngine.takeEyeSeen(eye)&&g_eyeCap.allow(now)) {
+        char line[1100];previewcam::formatEye(line,sizeof(line),eye,g_haveFinal?&g_lastFinal:nullptr);Log::get().note("%s",line);
     }
 }
 void nativePreviewCameraStop() noexcept {

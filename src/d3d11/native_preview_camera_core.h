@@ -41,18 +41,29 @@ constexpr uint32_t kRvas[AddressCount]={0x5189070,0x5189078,0x5189370,0x5189A18,
     0x518C920,0x518C8B0,0x51AA500,0x51AA388,0x8BEA20,0xF81910,0x5294E0};
 // F232 (TEMPORARY key experimental.native_on_foot_preview_handover): `handover` lets identity() take a roster of two to six producers on the Location child in any order (one HMD entry, any number of preview
 // entries, the last one the preview) instead of exactly two, the HMD first. Written by the frame thread, read by the game's threads; off, identity() is exactly what it was.
+// F233 (TEMPORARY key experimental.native_on_foot_preview_headlook): with the handover on as well, a HeadlookCamera entry (the weapon screens' head-side producer; headlookIface and headlookObject are its
+// two vtables, set when its producer hook is armed, 0 until then) may be the roster's head entry instead of the HMD's.
 struct Game {
     uintptr_t at[AddressCount]{};
-    std::atomic<bool> handover{false};
+    std::atomic<bool> handover{false},headlook{false};
+    std::atomic<uintptr_t> headlookIface{0},headlookObject{0};
     Game()=default;
-    Game(const Game& o):handover(o.handover.load(std::memory_order_relaxed)){std::memcpy(at,o.at,sizeof(at));}
-    Game& operator=(const Game& o){std::memcpy(at,o.at,sizeof(at));handover.store(o.handover.load(std::memory_order_relaxed),std::memory_order_relaxed);return *this;}
+    Game(const Game& o){*this=o;}
+    Game& operator=(const Game& o){
+        std::memcpy(at,o.at,sizeof(at));
+        handover.store(o.handover.load(std::memory_order_relaxed),std::memory_order_relaxed);
+        headlook.store(o.headlook.load(std::memory_order_relaxed),std::memory_order_relaxed);
+        headlookIface.store(o.headlookIface.load(std::memory_order_relaxed),std::memory_order_relaxed);
+        headlookObject.store(o.headlookObject.load(std::memory_order_relaxed),std::memory_order_relaxed);
+        return *this;
+    }
 };
 struct Identity {
     uintptr_t child=0,stack=0,predecessor=0,array=0,hmd=0,preview=0;
+    uint8_t headClass=0;   // F233: 0 the HMD activity's camera, 1 a HeadlookCamera (the head entry `hmd` is of this class)
     bool operator==(const Identity& b) const noexcept {
         return child==b.child&&stack==b.stack&&predecessor==b.predecessor&&
-            array==b.array&&hmd==b.hmd&&preview==b.preview;
+            array==b.array&&hmd==b.hmd&&preview==b.preview&&headClass==b.headClass;
     }
 };
 // F232: the first check identity() failed, one value per check, in the order they run. kForeignEntry..kNoPreview belong to the handover scan; kOtherProducer is not an identity failure (the child
@@ -70,6 +81,11 @@ constexpr uint64_t kMaxRoster = 6;
 inline bool hmdEntry(const Memory& m,const Game& g,uintptr_t e,uintptr_t child) noexcept {
     uintptr_t v=0,hc=0;uint8_t enabled=0;
     return e>=0x20&&get(m,e,v)&&v==g.at[HmdIface]&&get(m,e-0x20,v)&&v==g.at[HmdObject]&&get(m,e-4,enabled)&&enabled&&get(m,e+0x120,hc)&&hc==child;
+}
+inline bool headlookEntry(const Memory& m,const Game& g,uintptr_t e,uintptr_t child) noexcept {
+    uintptr_t v=0,hc=0;uint8_t enabled=0;
+    const uintptr_t iface=g.headlookIface.load(std::memory_order_relaxed),object=g.headlookObject.load(std::memory_order_relaxed);
+    return iface&&object&&e>=0x20&&get(m,e,v)&&v==iface&&get(m,e-0x20,v)&&v==object&&get(m,e-4,enabled)&&enabled&&get(m,e+0x120,hc)&&hc==child;
 }
 inline bool previewEntry(const Memory& m,const Game& g,uintptr_t e,uintptr_t child) noexcept {
     uintptr_t v=0,pc=0;
@@ -98,17 +114,20 @@ inline bool identityWhy(const Memory& m,const Game& g,uintptr_t child,Identity& 
     if(handover) {
         // Scan the roster (a count of two too: the game leaves [preview, HMD] after a handover): exactly one HMD entry, at least one preview entry, nothing else; the preview is the last one. The scan reads the same memory the finalizer reads twice, so the
         // answer is the same for the same memory.
-        unsigned hmds=0,previews=0;uintptr_t hmd=0,preview=0;
+        // F233: with the headlook key on a HeadlookCamera entry is a head entry too; there is still exactly one head entry in all.
+        const bool headlookOn=g.headlook.load(std::memory_order_relaxed)&&g.headlookIface.load(std::memory_order_relaxed)!=0;
+        unsigned hmds=0,previews=0;uintptr_t hmd=0,preview=0;uint8_t headClass=0;
         for(uint64_t i=0;i<count;++i) {
             uintptr_t e=0;
             if(!get(m,q.array+i*8,e)||e<0x60){why=Refuse::kEntryPointers;return false;}
-            if(hmdEntry(m,g,e,child)){++hmds;hmd=e;}
+            if(hmdEntry(m,g,e,child)){++hmds;hmd=e;headClass=0;}
+            else if(headlookOn&&headlookEntry(m,g,e,child)){++hmds;hmd=e;headClass=1;}
             else if(previewEntry(m,g,e,child)){++previews;preview=e;}
             else {why=Refuse::kForeignEntry;return false;}
         }
         if(hmds!=1){why=Refuse::kHmdEntries;return false;}
         if(!previews){why=Refuse::kNoPreview;return false;}
-        q.hmd=hmd;q.preview=preview;
+        q.hmd=hmd;q.preview=preview;q.headClass=headClass;
     } else {
         if(!get(m,q.array,q.hmd)||!get(m,q.array+8,q.preview)||q.hmd<0x20||q.preview<0x60){why=Refuse::kEntryPointers;return false;}
         uintptr_t hc=0,pc=0;uint8_t enabled=0;
@@ -118,9 +137,10 @@ inline bool identityWhy(const Memory& m,const Game& g,uintptr_t child,Identity& 
         if(!get(m,q.hmd+0x120,hc)||hc!=child||!get(m,q.preview+0x120,pc)||pc!=child){why=Refuse::kBackPointer;return false;}
     }
     uintptr_t f=0;
-    if(!get(m,g.at[HmdIface]+0x20,f)||f!=g.at[Weight]||
+    const uintptr_t headIface=q.headClass==1?g.headlookIface.load(std::memory_order_relaxed):g.at[HmdIface];   // F233: the weights of the head class present
+    if(!get(m,headIface+0x20,f)||f!=g.at[Weight]||
        !get(m,g.at[PreviewIface]+0x20,f)||f!=g.at[ConstantWeight]||
-       !get(m,g.at[HmdIface]+0x28,f)||f!=g.at[State]||
+       !get(m,headIface+0x28,f)||f!=g.at[State]||
        !get(m,g.at[PreviewIface]+0x28,f)||f!=g.at[State]){why=Refuse::kWeights;return false;}
     out=q;why=Refuse::kNone;return true;
 }
@@ -187,6 +207,7 @@ inline void numText(char* out,size_t cap,uint64_t value) noexcept {
 }
 inline const char* roleName(unsigned role) noexcept {return role==0?"HMD":"preview";}
 inline const char* diagTag() noexcept {return "native preview camera (F232):";}
+inline const char* eyeTag() noexcept {return "native preview camera (F233):";}
 // "role R refused: <reason>; roster: ..." and the role's per-reason counts. `counts` is indexed by Refuse.
 inline int formatRefusal(char* buf,size_t cap,const Refusal& r,const uint64_t counts[size_t(Refuse::kRefuseCount)],uintptr_t base,bool handover) noexcept {
     char count[24],mode[24],reg[24],stackVt[28],members[24];
@@ -232,6 +253,95 @@ inline bool previewSample(const Memory& m,const Identity& id,Sample& s) noexcept
         get(m,id.preview+0x470,s.base)&&finite(s.primary)&&finite(s.base)&&equal(s.primary,s.base);
 }
 
+// ---- F233: the eye path's evidence (log only) -----------------------------------------------------------------------------------------------------------------------------------------
+// At finalization: the translations of child+0xB0 (the output), the head entry's primary, the preview's primary and the base, and for a HeadlookCamera its look rotation and displacement; whether the
+// frame was applied or refused and why. In the eye stub: the head translation the eye builder carries, whether it was replaced, the published head. The producers' and finalizer's hooks take a
+// try-claim on a fixed slot with an atomic_flag, only while the frame thread wants it (Engine::diagWanted), and skip when it is busy; nothing is logged or allocated there.
+enum class FinalWhy : uint8_t { kApplied = 0, kIncomplete, kIdentity, kSamples, kOutputRead, kOutputMismatch, kNotCommitted, kFinalWhyCount };
+inline const char* finalWhyName(FinalWhy w) noexcept {
+    static const char* const names[] = {"applied", "a producer did not finish", "the roster changed", "a sample changed", "the output could not be read",
+        "the output is neither the head's nor the preview's pose", "not committed"};
+    static_assert(sizeof(names) / sizeof(names[0]) == size_t(FinalWhy::kFinalWhyCount), "one name per reason");
+    return size_t(w) < size_t(FinalWhy::kFinalWhyCount) ? names[size_t(w)] : "?";
+}
+struct Vec3 { float v[3]{}; bool read=false; };
+struct F3 { float v[3]; };
+inline void readTranslation(const Memory& m,uintptr_t pose,Vec3& out) noexcept {
+    Pose p;
+    if(pose&&get(m,pose,p)){out.v[0]=p.v[12];out.v[1]=p.v[13];out.v[2]=p.v[14];out.read=true;}
+}
+inline void fromPose(const Pose* p,Vec3& out) noexcept {
+    if(p){out.v[0]=p->v[12];out.v[1]=p->v[13];out.v[2]=p->v[14];out.read=true;}
+}
+struct FinalSnap {
+    FinalWhy why=FinalWhy::kApplied;
+    uint8_t headClass=0;
+    uint64_t child=0;
+    Vec3 out,head,preview,base;
+    bool extraRead=false;
+    float extra[4][3]{};   // a HeadlookCamera's look rotation rows (+0x250, +0x260, +0x270) and displacement (+0x280)
+};
+// The poses already sampled (the finalizer has them when the frame got that far) are used as they are; anything else is read from the game now.
+inline void snapshotFinal(const Memory& m,const Identity& id,FinalWhy why,const Pose* output,const Pose* head,const Pose* preview,FinalSnap& s) noexcept {
+    s=FinalSnap();s.why=why;s.headClass=id.headClass;s.child=id.child;
+    if(output)fromPose(output,s.out);else readTranslation(m,id.child+0xB0,s.out);
+    if(head)fromPose(head,s.head);else readTranslation(m,id.hmd+0x50,s.head);
+    if(preview)fromPose(preview,s.preview);else readTranslation(m,id.preview+0x50,s.preview);
+    readTranslation(m,id.predecessor+0x40,s.base);
+    if(id.headClass==1) {
+        const uint32_t offs[4]={0x250,0x260,0x270,0x280};bool ok=true;
+        for(unsigned i=0;i<4;++i) {F3 f;if(get(m,id.hmd+offs[i],f)){std::memcpy(s.extra[i],f.v,sizeof(f.v));}else ok=false;}
+        s.extraRead=ok;
+    }
+}
+struct EyeSeen {
+    Vec3 head;               // the translation the eye builder carries before EDVR touches it
+    bool replaced=false;
+    bool published=false;    // a head was published for this evaluation
+    Vec3 composed,raw;       // the published eye head and the HMD primary it was built beside
+};
+inline float distance3(const Vec3& a,const Vec3& b) noexcept {
+    const float dx=a.v[0]-b.v[0],dy=a.v[1]-b.v[1],dz=a.v[2]-b.v[2];
+    return std::sqrt(dx*dx+dy*dy+dz*dz);
+}
+inline void vecText(char* out,size_t cap,const Vec3& v) noexcept {
+    if(!v.read)std::snprintf(out,cap,"unreadable");
+    else std::snprintf(out,cap,"(%.3f, %.3f, %.3f)",static_cast<double>(v.v[0]),static_cast<double>(v.v[1]),static_cast<double>(v.v[2]));
+}
+inline void distText(char* out,size_t cap,const Vec3& a,const Vec3& b) noexcept {
+    if(!a.read||!b.read)std::snprintf(out,cap,"n/a");
+    else std::snprintf(out,cap,"%.3f",static_cast<double>(distance3(a,b)));
+}
+inline int formatFinal(char* buf,size_t cap,const FinalSnap& s) noexcept {
+    char o[64],h[64],p[64],b[64],oh[24],op[24];
+    vecText(o,sizeof(o),s.out);vecText(h,sizeof(h),s.head);vecText(p,sizeof(p),s.preview);vecText(b,sizeof(b),s.base);
+    distText(oh,sizeof(oh),s.out,s.head);distText(op,sizeof(op),s.out,s.preview);
+    size_t at=size_t(std::snprintf(buf,cap,"%s final child 0x%llX head class %s: %s%s%s%s; output %s, head primary %s, preview primary %s, base %s; output to head %s m, output to preview %s m",
+        eyeTag(),static_cast<unsigned long long>(s.child),s.headClass==1?"Headlook":"HMD",s.why==FinalWhy::kApplied?"applied":"refused",s.why==FinalWhy::kApplied?"":" (",
+        s.why==FinalWhy::kApplied?"":finalWhyName(s.why),s.why==FinalWhy::kApplied?"":")",o,h,p,b,oh,op));
+    if(s.headClass==1&&at<cap) {
+        if(!s.extraRead)at+=size_t(std::snprintf(buf+at,cap-at,"; headlook rotation and displacement unreadable"));
+        else at+=size_t(std::snprintf(buf+at,cap-at,"; headlook R rows (%.3f, %.3f, %.3f) (%.3f, %.3f, %.3f) (%.3f, %.3f, %.3f), d (%.3f, %.3f, %.3f)",
+            double(s.extra[0][0]),double(s.extra[0][1]),double(s.extra[0][2]),double(s.extra[1][0]),double(s.extra[1][1]),double(s.extra[1][2]),
+            double(s.extra[2][0]),double(s.extra[2][1]),double(s.extra[2][2]),double(s.extra[3][0]),double(s.extra[3][1]),double(s.extra[3][2])));
+    }
+    return int(at);
+}
+// The eye stub's line: the head it carried, whether it was replaced, and its distances in metres to the published eye head and (from the latest finalization, `last`, null when none) to the output, the head
+// primary, the preview primary, the base, and to the tracking origin.
+inline int formatEye(char* buf,size_t cap,const EyeSeen& e,const FinalSnap* last) noexcept {
+    char head[64],pub[64],raw[64],dPub[24],dOut[24],dHead[24],dPrev[24],dBase[24],dOrigin[24];
+    Vec3 origin;origin.read=true;
+    vecText(head,sizeof(head),e.head);vecText(pub,sizeof(pub),e.published?e.composed:Vec3());vecText(raw,sizeof(raw),e.published?e.raw:Vec3());
+    distText(dPub,sizeof(dPub),e.head,e.published?e.composed:Vec3());
+    const Vec3 none;
+    distText(dOut,sizeof(dOut),e.head,last?last->out:none);distText(dHead,sizeof(dHead),e.head,last?last->head:none);
+    distText(dPrev,sizeof(dPrev),e.head,last?last->preview:none);distText(dBase,sizeof(dBase),e.head,last?last->base:none);
+    distText(dOrigin,sizeof(dOrigin),e.head,origin);
+    return std::snprintf(buf,cap,"%s eye head %s, %s; published eye head %s, HMD primary %s; distance to published %s m, to output %s m, to head primary %s m, to preview primary %s m, to base %s m, to origin %s m",
+        eyeTag(),head,e.replaced?"replaced":"not replaced",pub,raw,dPub,dOut,dHead,dPrev,dBase,dOrigin);
+}
+
 // One synchronous camera-manager evaluation encloses all parallel producers
 // and the later-priority finalizers. Overlap poisons that entire evaluation.
 // Independent producer slots publish immutable samples with release/acquire;
@@ -260,6 +370,16 @@ class Engine {
         Pose composed{};
         float raw[3]{};
     } eye_;
+    struct FinalSlot {
+        std::atomic_flag busy=ATOMIC_FLAG_INIT;
+        uint64_t serial=0,taken=0;
+        FinalSnap snap;
+    } final_;
+    struct EyeSlot {
+        std::atomic_flag busy=ATOMIC_FLAG_INIT;
+        uint64_t serial=0,taken=0;
+        EyeSeen seen;
+    } eyeSeen_;
     struct Diag {
         std::atomic_flag busy=ATOMIC_FLAG_INIT;
         uint64_t serial=0,taken=0;   // serial: written under the claim; taken: the reader's, under the claim
@@ -289,6 +409,41 @@ public:
         snapshotRoster(m,g,child,role,why,d.refusal);
         ++d.serial;
         d.busy.clear(std::memory_order_release);
+    }
+    // F233: the finalizer's snapshot of an eligible child (applied or refused, and why); the poses it already holds are passed so that the values are the ones it judged.
+    void finalSeen(const Memory& m,const Identity& id,FinalWhy why,const Pose* output,const Pose* head,const Pose* preview) noexcept {
+        if(!diagWanted.load(std::memory_order_relaxed))return;
+        if(final_.busy.test_and_set(std::memory_order_acquire))return;
+        snapshotFinal(m,id,why,output,head,preview,final_.snap);
+        ++final_.serial;
+        final_.busy.clear(std::memory_order_release);
+    }
+    bool takeFinal(FinalSnap& out) noexcept {
+        if(final_.busy.test_and_set(std::memory_order_acquire))return false;
+        const bool fresh=final_.serial!=final_.taken;
+        if(fresh){out=final_.snap;final_.taken=final_.serial;}
+        final_.busy.clear(std::memory_order_release);
+        return fresh;
+    }
+    // F233: the eye stub's snapshot: the pose the builder carried (null if unreadable), the published head (null when none), whether it was replaced.
+    void eyeSeen(const Pose* carried,const EyeSnapshot* published,bool replaced) noexcept {
+        if(!diagWanted.load(std::memory_order_relaxed))return;
+        if(eyeSeen_.busy.test_and_set(std::memory_order_acquire))return;
+        EyeSeen& s=eyeSeen_.seen;s=EyeSeen();
+        fromPose(carried,s.head);s.replaced=replaced;
+        if(published) {
+            s.published=true;fromPose(&published->composed,s.composed);
+            s.raw.v[0]=published->raw[0];s.raw.v[1]=published->raw[1];s.raw.v[2]=published->raw[2];s.raw.read=true;
+        }
+        ++eyeSeen_.serial;
+        eyeSeen_.busy.clear(std::memory_order_release);
+    }
+    bool takeEyeSeen(EyeSeen& out) noexcept {
+        if(eyeSeen_.busy.test_and_set(std::memory_order_acquire))return false;
+        const bool fresh=eyeSeen_.serial!=eyeSeen_.taken;
+        if(fresh){out=eyeSeen_.seen;eyeSeen_.taken=eyeSeen_.serial;}
+        eyeSeen_.busy.clear(std::memory_order_release);
+        return fresh;
     }
     // The frame thread: the latest snapshot of a role if there is a new one and its slot is not busy, with the role's counts.
     bool takeRefusal(unsigned role,Refusal& out,uint64_t counts[size_t(Refuse::kRefuseCount)]) noexcept {
@@ -446,7 +601,7 @@ public:
 };
 struct Evaluation {Engine& e;explicit Evaluation(Engine& a):e(a){e.enter();}~Evaluation(){e.leave();}};
 template<class Original> uintptr_t manager(Engine& e,Original original) {Evaluation scope(e);return original();}
-template<class Original> uintptr_t hmd(Engine& e,const Memory& m,const Game& g,uintptr_t object,Original original) {
+template<class Original> uintptr_t hmd(Engine& e,const Memory& m,const Game& g,uintptr_t object,Original original,bool headlook=false) {
     e.hmdCalls.fetch_add(1,std::memory_order_relaxed);
     e.invalidateProducer(object,0);
     uintptr_t child=0;Identity before;Pose baseBefore;
@@ -455,13 +610,14 @@ template<class Original> uintptr_t hmd(Engine& e,const Memory& m,const Game& g,u
     Refuse why=Refuse::kNone;
     const bool known=linked&&identityWhy(m,g,child,before,why);
     if(linked&&!known)e.refusedChild(m,g,child,0,why);
-    else if(known&&before.hmd!=object+0x20)e.refusedChild(m,g,child,0,Refuse::kOtherProducer);
-    const bool eligible=known&&before.hmd==object+0x20&&
+    else if(known&&(before.hmd!=object+0x20||before.headClass!=(headlook?1u:0u)))e.refusedChild(m,g,child,0,Refuse::kOtherProducer);
+    const bool eligible=known&&before.hmd==object+0x20&&before.headClass==(headlook?1u:0u)&&
         get(m,before.predecessor+0x40,baseBefore)&&finite(baseBefore);
     const auto c=eligible?e.begin(child,0,object):Engine::Completion{};const uintptr_t result=original();
     Identity after;Sample s;
     const bool good=eligible&&e.valid(c.epoch)&&identity(m,g,child,after)&&before==after&&
-        hmdSample(m,after,s)&&equal(s.base,baseBefore)&&!equal(s.primary,s.base);
+        hmdSample(m,after,s)&&equal(s.base,baseBefore)&&
+        (headlook?true:!equal(s.primary,s.base));   // F233: HeadlookCamera's primary is the base with idle look input: only the base unchanged and a finite primary (hmdSample) are asked of it
     if(good)e.hmdQualified.fetch_add(1,std::memory_order_relaxed);
     e.finish(c,good?&s:nullptr);return result;
 }
@@ -487,10 +643,19 @@ template<class Original> uintptr_t finalizer(Engine& e,const Memory& m,const Gam
     const uintptr_t result=original();Sample h,p;
     // Consume on every finalizer, including inactive/changed/unsupported rosters.
     const bool complete=e.take(epoch,child,h,p);
-    Identity after;Sample hc,pc;Pose output;
-    const bool good=eligible&&complete&&identity(m,g,child,after)&&before==after&&after==h.id&&after==p.id&&
-        hmdSample(m,after,hc)&&previewSample(m,after,pc)&&equal(h.primary,hc.primary)&&equal(h.local,hc.local)&&
-        equal(h.base,hc.base)&&equal(p.primary,pc.primary)&&get(m,child+0xB0,output)&&finite(output)&&equal(output,h.primary);
+    Identity after;Sample hc,pc;Pose output;bool outputRead=false;
+    // The game's finalizer is a strict first maximum in roster order, so child+0xB0 is the head's pose when the head entry comes first and the preview's when the preview does (F233: with the handover
+    // key on both are accepted; off, only the head's, as before).
+    const bool handover=g.handover.load(std::memory_order_relaxed);
+    FinalWhy why=FinalWhy::kApplied;bool good=false;
+    if(!eligible){}
+    else if(!complete)why=FinalWhy::kIncomplete;
+    else if(!(identity(m,g,child,after)&&before==after&&after==h.id&&after==p.id))why=FinalWhy::kIdentity;
+    else if(!(hmdSample(m,after,hc)&&previewSample(m,after,pc)&&equal(h.primary,hc.primary)&&equal(h.local,hc.local)&&
+              equal(h.base,hc.base)&&equal(p.primary,pc.primary)))why=FinalWhy::kSamples;
+    else if(!((outputRead=get(m,child+0xB0,output))&&finite(output)))why=FinalWhy::kOutputRead;
+    else if(!(equal(output,h.primary)||(handover&&equal(output,p.primary))))why=FinalWhy::kOutputMismatch;
+    else good=true;
     if(good) {
         // The preview pose is the stable exterior camera. Composing the local
         // headset onto it makes the ship follow the head. The 13:48 flight's
@@ -504,10 +669,16 @@ template<class Original> uintptr_t finalizer(Engine& e,const Memory& m,const Gam
         });
         if(wrote) {
             e.publishEye(epoch,changed,h.primary);
-            e.applied.fetch_add(1,std::memory_order_relaxed);return result;
+            e.applied.fetch_add(1,std::memory_order_relaxed);
+            e.finalSeen(m,before,FinalWhy::kApplied,&output,&h.primary,&p.primary);
+            return result;
         }
+        why=FinalWhy::kNotCommitted;
     }
-    if(eligible)e.refused.fetch_add(1,std::memory_order_relaxed);
+    if(eligible) {
+        e.refused.fetch_add(1,std::memory_order_relaxed);
+        e.finalSeen(m,before,why,outputRead?&output:nullptr,complete?&h.primary:nullptr,complete?&p.primary:nullptr);
+    }
     return result;
 }
 // The eye-camera producer multiplies this head by the per-eye offset and

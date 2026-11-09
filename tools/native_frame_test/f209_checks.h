@@ -9,6 +9,7 @@
 
 #include "../../src/d3d11/native_on_foot_f107.h"
 #include "../../src/d3d11/preview_camera_core.h"
+#include "../../src/d3d11/preview_headlook_core.h"
 #include "../../src/d3d11/shop_screen_core.h"
 
 #include <algorithm>
@@ -850,6 +851,35 @@ inline void run209(Check&& check) {
         check(has_(ini, "# ui: Preview handover | choices on, off | recommended on | live\nnative_on_foot_preview_handover = on\n") && has_(ini, "# TEMPORARY (F232): Preview handover") &&
                   has_(ini, "a preview screen opened from another (Livery from the loadout browser) keeps its preview camera") && ini.find("native_on_foot_preview_handover = on") > ini.find("native_on_foot_preview_camera = on"),
               "F232: the shipped key is on, TEMPORARY, with its ui line after F231's and the plain sentence of what the user gets");
+    }
+    // ---- 12. F233: the weapon previews' head producer (TEMPORARY key): the constants, the key's line and the wiring (the roster, the finalizer and the snapshots are run by native_preview_camera_test) -----
+    {
+        namespace hl = edvr::previewcam::headlook;
+        check(hl::kProducerRva == 0x1074650 && hl::kIfaceRva == 0x518C350 && hl::kObjectRva == 0x518C2E0 && hl::kProducerPinBytes == 15 && hl::kProducerPin[0] == 0x48 && hl::kProducerPin[4] == 0x08 &&
+                  hl::kProducerPin[10] == 0x57 && hl::kProducerPin[11] == 0x48 && hl::kProducerPin[14] == 0x60 && hl::kOffRotation0 == 0x250 && hl::kOffRotation1 == 0x260 && hl::kOffRotation2 == 0x270 &&
+                  hl::kOffDisplacement == 0x280 && std::strcmp(hl::kKey, "experimental.native_on_foot_preview_headlook") == 0,
+              "F233: HeadlookCamera's producer 0x1074650 (15 pinned bytes), its vtables 0x518C350 and 0x518C2E0, the look rotation's and displacement's offsets, the key's name");
+        char line[700];
+        hl::formatKey(line, sizeof(line), true);
+        const std::string on = line;
+        hl::formatKey(line, sizeof(line), false);
+        check(on.rfind("native on foot preview headlook (F233, TEMPORARY): experimental.native_on_foot_preview_headlook is on -- ", 0) == 0 && has_(on, "weapon previews (purchase, loadout) keep their camera") &&
+                  has_(std::string(line), "is off -- a HeadlookCamera entry on the Location camera list is a foreign entry, as before"),
+              "F233: the key's line says what each value does");
+        const std::string cpp = slurp("src/d3d11/native_on_foot.cpp"), cam = slurp("src/d3d11/native_preview_camera.cpp"), core = slurp("src/d3d11/native_preview_camera_core.h"), ini = slurp("edvr.ini");
+        check(has_(cpp, "cfg.getString(\"experimental.native_on_foot_preview_headlook\", \"on\") != \"off\"") && has_(cpp, "previewcam::headlook::formatKey(line, sizeof(line), on);") &&
+                  has_(cpp, "nativePreviewCameraSetHeadlook(on);") && has_(cpp, "str(\"experimental.native_on_foot_preview_headlook\""),
+              "F233: the key is read live on the frame thread, default on, logged on a change, set into the preview camera and dumped");
+        check(has_(cam, "void nativePreviewCameraSetHeadlook(bool on) noexcept {g_previewGame.headlook.store(on,std::memory_order_relaxed);}") && has_(cam, "previewcam::hmd(g_previewEngine,g_previewMemory,g_previewGame,object,[&]{return original(object);},true);") &&
+                  has_(cam, "gamePinMatches(hl::kProducerRva,bytes,hl::kProducerPin,hl::kProducerPinBytes)") && has_(cam, "HeadlookCamera producer hook stood down") &&
+                  has_(cam, "g_previewGame.headlookIface.store(base+gameRva(hl::kIfaceRva),std::memory_order_release);") && has_(cam, "if(seen)g_previewEngine.eyeSeen(carriedRead?&carried:nullptr,published?&snapshot:nullptr,replaced);"),
+              "F233: the producer hook is pinned and installed like the HMD one, routed to hmd() as the head role, stands down with one line, publishes the vtables only when armed; the eye stub keeps its snapshot");
+        check(has_(core, "(headlook?true:!equal(s.primary,s.base))") && has_(core, "else if(!(equal(output,h.primary)||(handover&&equal(output,p.primary))))why=FinalWhy::kOutputMismatch;") &&
+                  has_(core, "const uintptr_t headIface=q.headClass==1?g.headlookIface.load(std::memory_order_relaxed):g.at[HmdIface];") && core.find("Log::get()") == std::string::npos,
+              "F233: HeadlookCamera is asked only for the base unchanged and a finite primary, the finalizer accepts the preview's pose only with the handover key on, the weights are those of the class present");
+        check(has_(ini, "# ui: Weapon previews | choices on, off | recommended on | live\nnative_on_foot_preview_headlook = on\n") && has_(ini, "# TEMPORARY (F233): Weapon previews") &&
+                  has_(ini, "weapon previews (purchase, loadout) stand beside the panel instead of below you") && ini.find("native_on_foot_preview_headlook = on") > ini.find("native_on_foot_preview_handover = on"),
+              "F233: the shipped key is on, TEMPORARY, with its ui line after F232's and the plain sentence of what the user gets");
     }
 }
 

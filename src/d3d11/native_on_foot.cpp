@@ -35,6 +35,7 @@
 #include "engine_velocity_families.h"   // F44: the pool families' vertex shaders (the eye's world view)
 #include "native_on_foot_hooks.h"   // localAvatarParts, avatarFadeModeRead, avatarCensusTake: the avatar census (F1, F3)
 #include "preview_camera_core.h"   // F231: the preview camera patch (bytes, rule, lines)
+#include "preview_headlook_core.h"   // F233: the headlook key's line
 #include "shop_screen_core.h"   // F209: the once-a-second shop line (shop::formatSecond), the Pioneer Supplies buy screens' signal
 #include "journal_watch.h"
 #include "mode_watch.h"   // F190: modeWatchStereoValue, the mode a late install takes (the setter call for the switch has passed)
@@ -316,6 +317,7 @@ std::atomic<bool> g_f222Key{true};                            // F222 (TEMPORARY
 bool g_f222KeyLast = true;                                    // the value last logged (frame thread; the first read always logs)
 std::atomic<bool> g_previewCamKey{true};            // experimental.native_on_foot_preview_camera, as the frame thread last read it (F231, TEMPORARY)
 bool g_f231KeyLast = true;                          // frame thread: the value last logged
+bool g_f233KeyLast = true;                                    // F233 (TEMPORARY): experimental.native_on_foot_preview_headlook, on by default, live: the value last logged (frame thread)
 bool g_f232KeyLast = true;                                    // F232 (TEMPORARY): experimental.native_on_foot_preview_handover, on by default, live: the value last logged (frame thread)
 bool g_f230KeyLast = true;                                    // F230 (TEMPORARY): experimental.native_on_foot_livery_camera_repair, on by default, live: the value last logged (frame thread; the first read always logs); the value lives in native_on_foot_hooks.cpp (nativeOnFootSetLiveryRepair)
 bool g_f228KeyLast = true;                                    // F228 (TEMPORARY): experimental.native_on_foot_livery_game_view, on by default, live: the value last logged (frame thread; the first read always logs); the key's value lives in native_on_foot_hooks.cpp (nativeOnFootSetLiveryHold)
@@ -1408,6 +1410,17 @@ void readKey() {
         }
         g_f232KeyLast = on;
         nativePreviewCameraSetHandover(on);
+    }
+    // F233 (TEMPORARY, live, the developer tier's "Weapon previews"): a HeadlookCamera entry counts as the head entry of the Location camera list.
+    {
+        const bool on = cfg.getString("experimental.native_on_foot_preview_headlook", "on") != "off";
+        if (first || on != g_f233KeyLast) {
+            char line[640];
+            previewcam::headlook::formatKey(line, sizeof(line), on);
+            Log::get().note("%s", line);
+        }
+        g_f233KeyLast = on;
+        nativePreviewCameraSetHeadlook(on);
     }
     // F220 (TEMPORARY A/B, live, the developer tier's "HUD stays with view"): with View bob off, the HUD's placement moves with the view's bob term instead of the view moving against it.
     {
@@ -38473,6 +38486,7 @@ static std::string recorderKeysJson() {
     str("experimental.native_on_foot_livery_camera_repair", cfg.getString("experimental.native_on_foot_livery_camera_repair", "on"));   // F230
     str("experimental.native_on_foot_preview_camera", cfg.getString("experimental.native_on_foot_preview_camera", "on"));   // F231
     str("experimental.native_on_foot_preview_handover", cfg.getString("experimental.native_on_foot_preview_handover", "on"));   // F232
+    str("experimental.native_on_foot_preview_headlook", cfg.getString("experimental.native_on_foot_preview_headlook", "on"));   // F233
     str("fix.native_on_foot_view_bob", cfg.getString("fix.native_on_foot_view_bob", "off"));
     num("experimental.native_on_foot_stand_ads_spine_straighten",
         nofoot::f180::clampDial(static_cast<double>(cfg.getFloat("experimental.native_on_foot_stand_ads_spine_straighten", 0.9f))));
