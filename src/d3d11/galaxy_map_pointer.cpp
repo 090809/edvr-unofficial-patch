@@ -78,6 +78,7 @@ struct State {
     std::atomic<uint64_t> passed[kPassCount] = {};
     PointerHold held;                        // the System Map's held answer: the game's update thread only
     SharedPoint rayFrom;                     // the arrow's ray origin in the UI frame (HeadLatch's point; zero before it): written on the frame thread
+    std::atomic<uint64_t> liveFrom{0};       // replaced calls that took the live head, the arrow being on a panel, since the last 30 s line
 
     // Frame thread only.
     HeadLatch latch;
@@ -146,8 +147,10 @@ uint64_t pointerCall(State& s, Project original, void* k, const float* in, int i
     float game[4];
     if (!readMem(reinterpret_cast<uintptr_t>(in), game, sizeof(game))) return pass(s, original, kBadInput, k, in, idx, out);
     alignas(16) float farIn[4];
-    float from[3];
-    s.rayFrom.load(from);
+    // The ray's origin: the head as the map opened while the arrow is at star depth; the live head while it is on a panel, the game's own arrow (galaxy_map_pointer_core.h liveHead).
+    float from[3], eyes[2][3];
+    if (mapui::over() && mapCameraEyes(eyes, nullptr) && liveHead(eyes, from)) s.liveFrom.fetch_add(1, std::memory_order_relaxed);
+    else s.rayFrom.load(from);
     if (farPoint(pose.rows, pose.position, arrow, from, game[3], farIn) != Why::kOk) return pass(s, original, kBadArrow, k, in, idx, out);
     s.replaced.fetch_add(1, std::memory_order_relaxed);
     if (!hold) return original(k, farIn, idx, out);
@@ -349,8 +352,9 @@ void thirtySecondLine(State& s, uint64_t now) {
             std::snprintf(where, sizeof(where), "held at %.4f %.4f %.4f from the tracking origin (the eyes %.4f apart)", s.latch.at[0], s.latch.at[1], s.latch.at[2], s.latch.apart);
         else
             std::snprintf(where, sizeof(where), "%s", s.latchedInWindow ? "none now, held earlier in the window" : "NONE held while the map was open: the ray started at the tracking origin");
-        Log::get().note("map pointer: the arrow's ray origin: %s; points taken %u, after a recentre %u; eye readings refused as not two eyes %llu",
-                        where, s.latch.taken, s.latch.afterRecentre, static_cast<unsigned long long>(s.latch.refused));
+        Log::get().note("map pointer: the arrow's ray origin: %s; points taken %u, after a recentre %u; eye readings refused as not two eyes %llu; hover calls from the live head, the arrow on a panel: %llu of %llu replaced",
+                        where, s.latch.taken, s.latch.afterRecentre, static_cast<unsigned long long>(s.latch.refused), static_cast<unsigned long long>(s.liveFrom.exchange(0, std::memory_order_relaxed)),
+                        static_cast<unsigned long long>(replaced));
         s.latchedInWindow = s.latch.have;
     }
 }

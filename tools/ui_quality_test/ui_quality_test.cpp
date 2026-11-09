@@ -3189,6 +3189,14 @@ void testSupercruiseLines() {
             sp.load(got);
             check(got[0] == put[0] && got[1] == put[1] && got[2] == put[2], "GP32: a stored point reads back bit for bit");
         }
+        // GP34: the live head for the hover while the arrow is on a panel: the eyes of dump 141144750001 give their midpoint; a pair that is one eye twice gives none.
+        {
+            const float eyes[2][3] = {{-0.0977282f, -0.0050083f, -0.0162150f}, {-0.0583167f, -0.0012308f, 0.0235430f}};
+            float head[3] = {};
+            check(edvr::mappointer::liveHead(eyes, head) && std::fabs(head[0] + 0.0780224f) < 1e-6f && std::fabs(head[2] - 0.0036640f) < 1e-6f, "GP34: the dump's eyes give the head at their midpoint");
+            const float oneEye[2][3] = {{0.0019f, 0.0062f, -0.0053f}, {0.0021f, 0.0062f, -0.0053f}};
+            check(!edvr::mappointer::liveHead(oneEye, head), "GP34: a pair 0.2 mm apart is not two eyes and gives no head");
+        }
         // The System Map's click: the arrow's real positions over 19 frames of one dump, with the mouse still, all hold the first frame's answer bit for bit; a mouse step, a moved camera or a position that is not the arrow's does not.
         {
             using namespace edvr::mappointer;
@@ -3267,8 +3275,9 @@ void testSupercruiseLines() {
             check(pointer.find("farPoint(pose.rows, pose.position, arrow, from, game[3], farIn)") != std::string::npos && pointer.find("s.rayFrom.load(from);") != std::string::npos &&
                       pointer.find("arrowDirectionFrom(arrow, s.latch.at, d)") != std::string::npos && pointer.find("if (open) latchFrame(s);") != std::string::npos &&
                       pointer.find("latchOpen(s.latch,") != std::string::npos && pointer.find("mapui::setArrowOrigin(s.latch.at);") != std::string::npos &&
-                      mapUiText.find("std::memcpy(&g_bodies.rows[kMapArrowRow][1], from, sizeof(from));") != std::string::npos,
-                  "GP33: the hover's far point and the System Map's ray take the head as the map opened, the latch runs on every open frame, and the arrow row keeps it across the table's reset");
+                      mapUiText.find("std::memcpy(&g_bodies.rows[kMapArrowRow][1], from, sizeof(from));") != std::string::npos &&
+                      pointer.find("if (mapui::over() && mapCameraEyes(eyes, nullptr) && liveHead(eyes, from))") != std::string::npos,
+                  "GP33: the hover's far point and the System Map's ray take the head as the map opened (the live head while the arrow is on a panel), the latch runs on every open frame, and the arrow row keeps it across the table's reset");
         }
         std::ifstream copyRoute("src/d3d11/map_ui_depth.h", std::ios::binary);
         check(!copyRoute.good() && screen.find("map_ui_depth.h") == std::string::npos && screen.find("mapuidepth") == std::string::npos && pointer.find("mapuidepth") == std::string::npos &&

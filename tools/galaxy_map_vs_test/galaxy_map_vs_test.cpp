@@ -13,7 +13,7 @@
 //      alpha is at or over kMapDepthAlpha and shows where it is under, near over far in either order, a second quad in the same plane draws whole at D16, the bias is four steps farther
 //   G11 the wobble: three steps of float32 noise in the game's eye (at 50000 units) move an icon, a label, a triangle, a ring and a stem 4 units away by at most 2e-5 NDC with the precise parts and
 //       10 times that or more with the game's formula; the right one of the two eyes is picked; with the parts absent, or the game's eye 0.1 units from them, the output is the game's formula
-//   G6 the probe on the GPU: a point at the arrow's tip is counted by an occlusion query where the mask is set, or set on both sides of it along an axis within reach, and not
+//   G6 the probe on the GPU: a point at the arrow's tip is counted by an occlusion query where the mask is set, or set anywhere within the panel zone's reach (an angle), and not
 //      where it is clear or set on one side only, a record with a positive scale rasterizes nothing, and the layer's pixels do not change (write mask 0)
 // The same shaders against the GAME's bytecode (the vs_*.dxbc of the shader dump) are compared by hand, with a one-off program that includes this file (GALAXY_MAP_VS_TEST_NO_MAIN):
 // for the records the transcription leaves as the game draws them, every output agrees. The game's bytecode is not in the repository.
@@ -1246,11 +1246,18 @@ inline void runProbeTest(Rig& rig, const std::vector<uint8_t>& vsCode, const std
     setRow(c.cb0[4], 1, 0, 0, 0); setRow(c.cb0[5], 0, 1, 0, 0); setRow(c.cb0[6], 0, 0, 1, 0); setRow(c.cb0[7], 0, 0, 0, 1);
     setRow(c.cb1[275], 0.5, 0.25, 0, 0);
     ComPtr<ID3D11Buffer> cb0 = makeBuf(rig, c.cb0, 8 * 16, D3D11_BIND_CONSTANT_BUFFER), cb1 = makeBuf(rig, c.cb1, 276 * 16, D3D11_BIND_CONSTANT_BUFFER);
-    auto probe = [&](ID3D11RenderTargetView* target, UINT size, ID3D11ShaderResourceView* maskView, float scale, int px, int py, bool& done) -> UINT64 {
+    // p00: the projection's x and y scale in the clip rows; forward: the w row is the view's forward (w = z = 0.5) rather than (0, 0, 0, 1). Either way the tip lands at (px, py)
+    // and the probe's vertex shader hands the pixel shader p00 as its NDC per tan.
+    auto probe = [&](ID3D11RenderTargetView* target, UINT size, ID3D11ShaderResourceView* maskView, float scale, int px, int py, bool& done, float p00 = 1.0f, bool forward = false) -> UINT64 {
         Rec rec{};
         std::memcpy(&rec.a[1], &scale, 4);
         const float ndcX = ((px + 0.5f) / size) * 2.0f - 1.0f, ndcY2 = 1.0f - ((py + 0.5f) / size) * 2.0f;
-        rec.p[0] = ndcX + 0.5f; rec.p[1] = ndcY2 + 0.25f; rec.p[2] = 0.5f; rec.p[3] = 1;
+        const float w = forward ? 0.5f : 1.0f;
+        rec.p[0] = ndcX * w / p00 + 0.5f; rec.p[1] = ndcY2 * w / p00 + 0.25f; rec.p[2] = 0.5f; rec.p[3] = 1;
+        float rows[8][4] = {};
+        rows[4][0] = p00; rows[5][1] = p00; rows[6][2] = forward ? 0.5f : 1.0f;
+        if (forward) rows[7][2] = 1.0f; else rows[7][3] = 1.0f;
+        ComPtr<ID3D11Buffer> rowsBuf = makeBuf(rig, rows, 8 * 16, D3D11_BIND_CONSTANT_BUFFER);
         ComPtr<ID3D11Buffer> t33 = makeBuf(rig, &rec, sizeof rec, D3D11_BIND_SHADER_RESOURCE, D3D11_RESOURCE_MISC_BUFFER_STRUCTURED, sizeof rec);
         ComPtr<ID3D11ShaderResourceView> s33 = makeSrv(rig, t33.Get(), 1);
         const uint32_t vtx[2] = {0, 0};
@@ -1270,7 +1277,7 @@ inline void runProbeTest(Rig& rig, const std::vector<uint8_t>& vsCode, const std
         rig.ctx->IASetVertexBuffers(0, 1, vbs, &stride, &offset);
         rig.ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_POINTLIST);
         rig.ctx->VSSetShader(vs.Get(), nullptr, 0);
-        ID3D11Buffer* cbs[2] = {cb0.Get(), cb1.Get()};
+        ID3D11Buffer* cbs[2] = {rowsBuf.Get(), cb1.Get()};
         rig.ctx->VSSetConstantBuffers(0, 2, cbs);
         ID3D11ShaderResourceView* r33[1] = {s33.Get()};
         rig.ctx->VSSetShaderResources(33, 1, r33);
@@ -1300,12 +1307,12 @@ inline void runProbeTest(Rig& rig, const std::vector<uint8_t>& vsCode, const std
         std::printf("%s\n", label);
         check(done && samples == k.expect, label);
     }
-    // the gaps: a 1024-pixel mask (reach 0.0235 * 1024 = 24.06 pixels, a step of 3.01) built on the CPU
-    const double reach = 0.0235 * BIG;
+    // THE PANEL ZONE on a 1024-pixel mask built on the CPU: with a projection scale of 1 the reach is kMapProbeReach*Tan * 512 pixels, 56.3 to get on and 66.6 to stay on
+    const double reachOn = edvr::kMapProbeReachOnTan * 0.5 * BIG, reachOff = edvr::kMapProbeReachOffTan * 0.5 * BIG;
     const int TX = 512, TY = 512;
     struct Axis { const char* name; double x, y; };
     const double r2 = std::sqrt(0.5);
-    const Axis axes[4] = {{"horizontal", 1, 0}, {"vertical", 0, 1}, {"diagonal /", r2, r2}, {"diagonal \\", r2, -r2}};
+    const Axis axes[8] = {{"right", 1, 0}, {"down", 0, 1}, {"left", -1, 0}, {"up", 0, -1}, {"down right", r2, r2}, {"up right", r2, -r2}, {"down left", -r2, r2}, {"up left", -r2, -r2}};
     auto makeMask = [&](const std::vector<uint8_t>& px) {
         D3D11_TEXTURE2D_DESC md{};
         md.Width = md.Height = BIG;
@@ -1333,25 +1340,34 @@ inline void runProbeTest(Rig& rig, const std::vector<uint8_t>& vsCode, const std
         return px;
     };
     for (const Axis& a : axes) {
-        struct G { const char* what; double lo; bool both; uint64_t expect; };
+        struct G { const char* what; double lo; uint64_t expect; };
         const G gs[] = {
-            {"a gap of 2 * reach - 10 pixels between two strips", reach - 5.0, true, 1},
-            {"a gap of 2 * reach + 10 pixels between two strips", reach + 5.0, true, 0},
-            {"mask on one side only", reach - 5.0, false, 0},
+            {"a strip 5 pixels inside the reach, on one side", reachOn - 5.0, 1},
+            {"a strip 5 pixels past the reach", reachOn + 5.0, 0},
         };
         for (const G& g : gs) {
-            const ComPtr<ID3D11ShaderResourceView> mv = makeMask(band(a, g.lo, 6.0, g.both));
+            const ComPtr<ID3D11ShaderResourceView> mv = makeMask(band(a, g.lo, 6.0, false));
             bool done = false;
             const UINT64 samples = probe(bigRtv.Get(), BIG, mv.Get(), -0.4f, TX, TY, done);
             char label[200];
-            std::snprintf(label, sizeof label, "G6.probe.%s, %s: %llu sample(s)", a.name, g.what, static_cast<unsigned long long>(samples));
+            std::snprintf(label, sizeof label, "G6.zone.%s, %s: %llu sample(s)", a.name, g.what, static_cast<unsigned long long>(samples));
             std::printf("%s\n", label);
             check(done && samples == g.expect, label);
         }
     }
     {
-        // the tip on the mask: one pixel; and a tip 5 pixels outside the edge of a large panel, which stays off it (a panel on one side only)
-        std::vector<uint8_t> one(static_cast<size_t>(BIG) * BIG, 0), half(static_cast<size_t>(BIG) * BIG, 0), edge(static_cast<size_t>(BIG) * BIG, 0);
+        // The zone is an angle: with the projection's scale doubled a strip at 1.4 times the reach is inside it, and with a forward w row the same holds.
+        const Axis& a = axes[0];
+        const ComPtr<ID3D11ShaderResourceView> mv = makeMask(band(a, reachOn * 1.4, 6.0, false));
+        bool d1 = false, d2 = false, d3 = false;
+        const UINT64 at1 = probe(bigRtv.Get(), BIG, mv.Get(), -0.4f, TX, TY, d1, 1.0f, false);
+        const UINT64 at2 = probe(bigRtv.Get(), BIG, mv.Get(), -0.4f, TX, TY, d2, 2.0f, false);
+        const UINT64 at2f = probe(bigRtv.Get(), BIG, mv.Get(), -0.4f, TX, TY, d3, 2.0f, true);
+        check(d1 && d2 && d3 && at1 == 0 && at2 == 1 && at2f == 1, "G6.zone: the reach is an angle: a strip at 1.4 reaches is outside it at a projection scale of 1 and inside at 2, with or without a forward w row");
+    }
+    {
+        // the tip on the mask: one pixel; a tip 5 pixels outside the edge of a large panel, now inside the zone; a strip with the far side outside the texture
+        std::vector<uint8_t> one(static_cast<size_t>(BIG) * BIG, 0), half(static_cast<size_t>(BIG) * BIG, 0), edge(static_cast<size_t>(BIG) * BIG, 0), none(static_cast<size_t>(BIG) * BIG, 0);
         one[static_cast<size_t>(TY) * BIG + TX] = 255;
         for (int y = 0; y < static_cast<int>(BIG); ++y)
             for (int x = TX + 5; x < static_cast<int>(BIG); ++x) half[static_cast<size_t>(y) * BIG + x] = 255;
@@ -1361,8 +1377,9 @@ inline void runProbeTest(Rig& rig, const std::vector<uint8_t>& vsCode, const std
         struct S { const char* what; const std::vector<uint8_t>* px; int tx, ty; float s; uint64_t expect; };
         const S ss[] = {
             {"the tip on the mask", &one, TX, TY, -0.4f, 1},
-            {"a tip 5 pixels outside a large panel's edge", &half, TX, TY, -0.4f, 0},
-            {"a strip on one side, the other side outside the texture", &edge, 5, TY, -0.4f, 0},
+            {"a tip 5 pixels outside a large panel's edge", &half, TX, TY, -0.4f, 1},
+            {"a strip on one side, the other side outside the texture", &edge, 5, TY, -0.4f, 1},
+            {"no mask anywhere", &none, TX, TY, -0.4f, 0},
             {"a positive scale, the tip on the mask", &one, TX, TY, 0.4f, 0},
         };
         for (const S& s : ss) {
@@ -1375,9 +1392,10 @@ inline void runProbeTest(Rig& rig, const std::vector<uint8_t>& vsCode, const std
             check(done && samples == s.expect, label);
         }
     }
-    // G6b, the sticky edge: the probe while the arrow is on a panel. Mask within reach on either side holds it, along each axis; past the reach it lets go; and it says yes wherever the exact test does, so the two cannot alternate at one place.
+    // G6b, staying on: the probe while the arrow is on a panel reaches kMapProbeReachOffTan; past it it lets go; between the two reaches it holds where getting on does not, and
+    // it says yes wherever getting on does, so the two cannot alternate at one place.
     {
-        const ComPtr<ID3D11PixelShader> exact = ps;   // the lambda above reads ps
+        const ComPtr<ID3D11PixelShader> getOn = ps;   // the lambda above reads ps
         hr(rig.dev->CreatePixelShader(stickyCode.data(), stickyCode.size(), nullptr, &ps), "sticky ps");
         auto sticky = [&](const std::vector<uint8_t>& px, int tx, int ty, float s) {
             const ComPtr<ID3D11ShaderResourceView> mv = makeMask(px);
@@ -1385,15 +1403,13 @@ inline void runProbeTest(Rig& rig, const std::vector<uint8_t>& vsCode, const std
             const UINT64 samples = probe(bigRtv.Get(), BIG, mv.Get(), s, tx, ty, done);
             return done ? samples : UINT64(99);
         };
+        const double between = 0.5 * (reachOn + reachOff);
         for (const Axis& a : axes) {
-            const Axis other{a.name, -a.x, -a.y};
             struct G { const char* what; std::vector<uint8_t> px; uint64_t expect; };
             const G gs[] = {
-                {"mask within reach on the positive side only", band(a, reach - 5.0, 6.0, false), 1},
-                {"mask within reach on the negative side only", band(other, reach - 5.0, 6.0, false), 1},
-                {"mask within reach on both sides", band(a, reach - 5.0, 6.0, true), 1},
-                {"mask 5 pixels past the reach on one side", band(a, reach + 5.0, 6.0, false), 0},
-                {"mask 5 pixels past the reach on both sides", band(a, reach + 5.0, 6.0, true), 0},
+                {"a strip 5 pixels inside the staying reach", band(a, reachOff - 5.0, 6.0, false), 1},
+                {"a strip between the two reaches", band(a, between - 3.0, 6.0, false), 1},
+                {"a strip 5 pixels past the staying reach", band(a, reachOff + 5.0, 6.0, false), 0},
             };
             for (const G& g : gs) {
                 const UINT64 samples = sticky(g.px, TX, TY, -0.4f);
@@ -1403,15 +1419,16 @@ inline void runProbeTest(Rig& rig, const std::vector<uint8_t>& vsCode, const std
                 check(samples == g.expect, label);
             }
         }
-        std::vector<uint8_t> one(static_cast<size_t>(BIG) * BIG, 0), half(static_cast<size_t>(BIG) * BIG, 0), none(static_cast<size_t>(BIG) * BIG, 0);
+        std::vector<uint8_t> one(static_cast<size_t>(BIG) * BIG, 0), none(static_cast<size_t>(BIG) * BIG, 0);
         one[static_cast<size_t>(TY) * BIG + TX] = 255;
-        for (int y = 0; y < static_cast<int>(BIG); ++y)
-            for (int x = TX + 5; x < static_cast<int>(BIG); ++x) half[static_cast<size_t>(y) * BIG + x] = 255;
         check(sticky(one, TX, TY, -0.4f) == 1, "G6b.sticky: the tip on the mask stays on");
-        check(sticky(half, TX, TY, -0.4f) == 1, "G6b.sticky: a tip 5 pixels outside a large panel's edge stays on, where the exact test lets go");
         check(sticky(none, TX, TY, -0.4f) == 0, "G6b.sticky: no mask anywhere lets go");
         check(sticky(one, TX, TY, 0.4f) == 0, "G6b.sticky: a positive scale is still not the arrow");
-        ps = exact;
+        // the band between the reaches: getting on says no there, so the arrow keeps what it was
+        ps = getOn;
+        bool done = false;
+        const ComPtr<ID3D11ShaderResourceView> mv = makeMask(band(axes[0], between - 3.0, 6.0, false));
+        check(probe(bigRtv.Get(), BIG, mv.Get(), -0.4f, TX, TY, done) == 0 && done, "G6b: a strip between the two reaches does not get the arrow on, so the arrow keeps what it was there");
     }
     // the layers are untouched: write mask 0
     for (int which = 0; which < 2; ++which) {

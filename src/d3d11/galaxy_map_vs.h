@@ -56,8 +56,8 @@
 //
 // THE PROBE (galaxy_map_ui.h): one point at the arrow's tip, in the game's own depth (clip = dot(cb0[4..7], float4(W - cb1[275].xyz, 1)), the arrow's record position W
 // being exactly the tip), tested against the panel mask: the pixel shader discards where the mask is clear, an occlusion query counts what stays. The tip is on a panel when the
-// mask covers it, or covers a point within reach on both opposite sides of it along any of four axes: the gaps between panels close and the way onto a panel stays exact. While the arrow is on a panel the probe is kMapProbeStickyPS: mask within reach on
-// either side holds it, so a narrow strip of buttons does not drop it at its outer edge.
+// mask covers it or any point within the panel zone's reach of it (THE PANEL ZONE, at kMapProbePS): about 6 degrees to get on, 7.4 to stay on (kMapProbeStickyPS while the arrow is
+// on a panel), so near a panel the arrow is the game's, exactly where the game tests its buttons, whatever the head has done.
 #pragma once
 
 namespace edvr {
@@ -480,59 +480,66 @@ float4 main(float4 p : SV_POSITION) : SV_Target {
 }
 )HLSL";
 
+// o1 is the projection's x scale, NDC per tan (P00): the clip x row's part across the forward row, over the forward row's length (1 when the rows carry no forward, as in a rig).
 constexpr char kMapProbeVS[] = R"HLSL(
 struct Rec { uint4 a; float4 p; float4 pad[19]; };
 StructuredBuffer<Rec> T33 : register(t33);
 cbuffer CB0 : register(b0) { float4 cb0[8]; };
 cbuffer CB1 : register(b1) { float4 cb1[276]; };
 
-void main(uint2 v0 : INSTANCEANDMODELDATAINDEX, out float4 o0 : SV_POSITION)
+void main(uint2 v0 : INSTANCEANDMODELDATAINDEX, out float4 o0 : SV_POSITION, out float o1 : TEXCOORD0)
 {
     Rec rec = T33[v0.x];
     float s = asfloat(rec.a.y);
     float4 p = float4(rec.p.xyz - cb1[275].xyz, 1.0);
     o0 = (s >= 0.0) ? float4(2.0, 2.0, 2.0, 1.0) : float4(dot(cb0[4], p), dot(cb0[5], p), dot(cb0[6], p), dot(cb0[7], p));
+    float fl = length(cb0[7].xyz);
+    float3 f = fl > 1e-6 ? cb0[7].xyz / fl : float3(0.0, 0.0, 0.0);
+    o1 = length(cb0[4].xyz - dot(cb0[4].xyz, f) * f) / (fl > 1e-6 ? fl : 1.0);
 }
 )HLSL";
 
 
-// kProbeReach is the gap-bridging reach as a fraction of the mask's width: 0.0235 is about 0.05 tan, 106 pixels at 4508. kProbeSteps is the number of samples a side along
-// each axis, so one step is an eighth of the reach (about 13 pixels at 4508).
-// kMapProbePS decides getting on: both sides of the tip. kMapProbeStickyPS decides staying on: either side. Whatever the first says yes to the second does too, so they cannot alternate at one place. The reach is more than half a side button's width, 95 pixels at 4032 against about 165 (docs/galaxy-map-vr-2026-11-03.md, "The side buttons").
+// THE PANEL ZONE (docs/galaxy-map-vr-2026-11-03.md, "Flight, the latched ray"). Near a panel the arrow must be the game's: the arrow at star depth is aimed from a fixed
+// point, and a head turned toward a side column puts it about 0.08 tan off the game's cursor against the panel (measured), so it can show on a button the game's cursor is
+// beside. So the tip is on a panel when the mask covers it or covers any point within the reach of it, sampled along kProbeDirs directions at kProbeSteps steps. The reach
+// is an angle, kProbeReachTan in tan, made pixels by the projection's scale from the vertex shader (o1, NDC per tan) and the mask's width: the same on every headset.
+// kMapProbePS decides getting on, at 0.11 tan (about 6.3 degrees); kMapProbeStickyPS decides staying on, at 0.13 tan (about 7.4 degrees). The second says yes wherever the
+// first does, so the two cannot alternate at one place; between the two reaches the arrow keeps what it was.
 #define EDVR_MAP_PROBE_PS_HEAD R"HLSL(
 Texture2D<float4> Mask : register(t0);
 
-static const float kProbeReach = 0.0235;
-static const int kProbeSteps = 8;
-static const float2 kProbeAxis[4] = { float2(1.0, 0.0), float2(0.0, 1.0), float2(0.7071068, 0.7071068), float2(0.7071068, -0.7071068) };
-
+static const int kProbeSteps = 12;
+static const int kProbeDirs = 16;
+)HLSL"
+#define EDVR_MAP_PROBE_PS_TAIL R"HLSL(
 bool covered(int2 p) { return Mask.Load(int3(p, 0)).a >= 0.1; }
 
-float4 main(float4 pos : SV_POSITION) : SV_TARGET
+float4 main(float4 pos : SV_POSITION, float tanScale : TEXCOORD0) : SV_TARGET
 {
     int2 tip = (int2)pos.xy;
     bool on = covered(tip);
     if (!on) {
         uint w, h;
         Mask.GetDimensions(w, h);
-        float stride = kProbeReach * (float)w / (float)kProbeSteps;
-        [loop] for (int a = 0; a < 4 && !on; ++a) {
-            bool plus = false, minus = false;
-            [loop] for (int k = 1; k <= kProbeSteps; ++k) {
-                int2 o = (int2)round(kProbeAxis[a] * (stride * (float)k));
-                plus = plus || covered(tip + o);
-                minus = minus || covered(tip - o);
-            }
-            on = )HLSL"
-#define EDVR_MAP_PROBE_PS_TAIL R"HLSL(;
+        float stride = kProbeReachTan * tanScale * 0.5 * (float)w / (float)kProbeSteps;
+        [loop] for (int a = 0; a < kProbeDirs && !on; ++a) {
+            float angle = 6.2831853 * (float)a / (float)kProbeDirs;
+            float2 dir = float2(cos(angle), sin(angle));
+            [loop] for (int k = 1; k <= kProbeSteps && !on; ++k)
+                on = covered(tip + (int2)round(dir * (stride * (float)k)));
         }
     }
     if (!on) discard;
     return float4(0.0, 0.0, 0.0, 0.0);
 }
 )HLSL"
-constexpr char kMapProbePS[] = EDVR_MAP_PROBE_PS_HEAD "plus && minus" EDVR_MAP_PROBE_PS_TAIL;
-constexpr char kMapProbeStickyPS[] = EDVR_MAP_PROBE_PS_HEAD "plus || minus" EDVR_MAP_PROBE_PS_TAIL;
+#define EDVR_MAP_PROBE_REACH_ON 0.11
+#define EDVR_MAP_PROBE_REACH_OFF 0.13
+constexpr double kMapProbeReachOnTan = EDVR_MAP_PROBE_REACH_ON;
+constexpr double kMapProbeReachOffTan = EDVR_MAP_PROBE_REACH_OFF;
+constexpr char kMapProbePS[] = EDVR_MAP_PROBE_PS_HEAD "static const float kProbeReachTan = " EDVR_MAP_STR(EDVR_MAP_PROBE_REACH_ON) ";\n" EDVR_MAP_PROBE_PS_TAIL;
+constexpr char kMapProbeStickyPS[] = EDVR_MAP_PROBE_PS_HEAD "static const float kProbeReachTan = " EDVR_MAP_STR(EDVR_MAP_PROBE_REACH_OFF) ";\n" EDVR_MAP_PROBE_PS_TAIL;
 
 // THE DEPTH ISSUE'S PIXEL SHADERS (docs/galaxy-map-vr-2026-11-03.md, "Sprite order"). The sprites' colour issue tests the map's own D16 depth and writes none; a second issue after the
 // colour issue writes it (no stencil write-back comes between them), where the sprite is solid. Each shader below stands in for the game's pixel shader of that issue, bound over the swap scope's vertex shader, and does

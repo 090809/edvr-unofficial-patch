@@ -168,6 +168,20 @@ inline bool latchOffer(HeadLatch& h, bool ok, const float eyes[2][3], uint64_t g
     return true;
 }
 
+// The live head: the midpoint of a pair that is two eyes (the latch's band). While the arrow is on a panel it is the game's own, drawn at the panel's depth from each eye,
+// so the star that shows under it is the one along P - head: the hover takes that (docs/galaxy-map-vr-2026-11-03.md, "Flight, the latched ray"). False when the pair is not two eyes.
+inline bool liveHead(const float eyes[2][3], float out[3]) {
+    float apart2 = 0.0f;
+    for (int i = 0; i < 3; ++i) {
+        if (!finite(eyes[0][i]) || !finite(eyes[1][i])) return false;
+        const float d = eyes[1][i] - eyes[0][i];
+        apart2 += d * d;
+    }
+    if (!(apart2 >= kLatchMinApart * kLatchMinApart && apart2 <= kLatchMaxApart * kLatchMaxApart)) return false;
+    for (int i = 0; i < 3; ++i) out[i] = 0.5f * (eyes[0][i] + eyes[1][i]);
+    return true;
+}
+
 // The point as the other threads read it (the projector's detour runs on the game's update thread): one writer, readers behind a sequence count. A
 // reader that cannot settle in eight tries takes zero, the tracking origin, for that one call.
 class SharedPoint {
