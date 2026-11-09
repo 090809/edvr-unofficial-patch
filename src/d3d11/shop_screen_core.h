@@ -143,18 +143,21 @@ struct Signal {
     bool open[2] = {false, false};   // the suit and the weapon buy screen
     bool kiosk = false;              // ArmouryVendorActivity's session (not a buy screen: the home menu; it does not hold F107 away)
     bool livery[2] = {false, false}; // F228: the suit and the weapon Livery screen (index 0 is kLivery, 1 is kWeaponLivery)
+    bool loadout = false;            // F234: the loadout browser (HumanoidOutfittingInteraction)
     bool buyScreenOpen() const noexcept { return open[0] || open[1]; }
     bool liveryOpen() const noexcept { return livery[0] || livery[1]; }
     // The signal F107 reads: a buy screen, or (F228) a Livery screen while the key says the game's own view holds there.
-    bool holds(bool liveryGameView) const noexcept { return buyScreenOpen() || (liveryGameView && liveryOpen()); }
+    // F234: and the loadout browser while its own key says the game's view holds there.
+    bool holds(bool liveryGameView, bool loadoutGameView = false) const noexcept { return buyScreenOpen() || (liveryGameView && liveryOpen()) || (loadoutGameView && loadout); }
 };
-inline Signal signalOf(Verdict suit, Verdict weapons, Verdict kiosk, Verdict livery = Verdict::kNone, Verdict weaponLivery = Verdict::kNone) noexcept {
+inline Signal signalOf(Verdict suit, Verdict weapons, Verdict kiosk, Verdict livery = Verdict::kNone, Verdict weaponLivery = Verdict::kNone, Verdict loadout = Verdict::kNone) noexcept {
     Signal s;
     s.open[kSuit] = suit == Verdict::kOpen;
     s.open[kWeapons] = weapons == Verdict::kOpen;
     s.kiosk = kiosk == Verdict::kOpen;
     s.livery[0] = livery == Verdict::kOpen;
     s.livery[1] = weaponLivery == Verdict::kOpen;
+    s.loadout = loadout == Verdict::kOpen;
     return s;
 }
 
@@ -206,7 +209,19 @@ inline int formatEvent(char* buf, size_t cap, const Event& e) noexcept {
             return std::snprintf(buf, cap, "%s an event of kind %u", tag(), static_cast<unsigned>(e.kind));
     }
 }
-inline const char* liveryText(const Signal& s) noexcept { return s.livery[0] && s.livery[1] ? "suit and weapon open" : s.livery[0] ? "suit open" : s.livery[1] ? "weapon open" : "closed"; }
+// The Livery screens, and (F234) the loadout browser, that are open: "closed", "suit open", "weapon open", "loadout open", "suit and weapon open", "suit and loadout open", ...
+inline const char* liveryText(const Signal& s) noexcept {
+    switch ((s.livery[0] ? 1 : 0) | (s.livery[1] ? 2 : 0) | (s.loadout ? 4 : 0)) {
+        case 1: return "suit open";
+        case 2: return "weapon open";
+        case 3: return "suit and weapon open";
+        case 4: return "loadout open";
+        case 5: return "suit and loadout open";
+        case 6: return "weapon and loadout open";
+        case 7: return "suit and weapon and loadout open";
+        default: return "closed";
+    }
+}
 inline int formatSignal(char* buf, size_t cap, const Signal& s, bool on, uint32_t seq) noexcept {
     return std::snprintf(buf, cap, "%s the shop signal is %s (suit %s, weapons %s, kiosk %s, livery %s; change %u)", tag(), on ? "ON: F107 holds the camera away" : "OFF", s.open[kSuit] ? "open" : "closed",
                          s.open[kWeapons] ? "open" : "closed", s.kiosk ? "running" : "not running", liveryText(s), seq);
@@ -215,6 +230,17 @@ inline int formatSignal(char* buf, size_t cap, const Signal& s, bool on, uint32_
 inline int formatLiveryOpened(char* buf, size_t cap, int cls, bool holds) noexcept {
     return std::snprintf(buf, cap, "%s %s opened: %s (%s is %s)", tag(), className(cls), holds ? "F107 holds the camera away, the view is the game's own" : "only watched, the camera is not held away",
                          kLiveryKey, holds ? "on" : "off");
+}
+// F234 (TEMPORARY): said once when the loadout browser opens, and when its key changes.
+constexpr char kLoadoutKey[] = "experimental.native_on_foot_loadout_game_view";
+inline int formatLoadoutOpened(char* buf, size_t cap, bool holds) noexcept {
+    return std::snprintf(buf, cap, "%s %s opened: %s (%s is %s)", tag(), className(kOutfitting), holds ? "F107 holds the camera away, the view is the game's own" : "only watched, the camera is not held away",
+                         kLoadoutKey, holds ? "on" : "off");
+}
+inline int formatLoadoutKey(char* buf, size_t cap, bool on) noexcept {
+    return std::snprintf(buf, cap, "native on foot loadout screen (F234, TEMPORARY): %s is %s -- %s", kLoadoutKey, on ? "on" : "off",
+                         on ? "while the loadout browser is open the view is the game's own preview camera and EDVR's on-foot body and view adjustments stand down, as at a buy screen (F107 holds the camera away)"
+                            : "the loadout browser is only watched (Show, Close and the open byte are logged); EDVR's on-foot body and view adjustments run as before F234");
 }
 inline int formatForgotten(char* buf, size_t cap, int cls, Verdict v, uint64_t vtable, uint64_t expected, uint32_t thisLow) noexcept {
     return std::snprintf(buf, cap, "%s the remembered %s (this 0x%08X) is %s (vtable 0x%llX, the class's 0x%llX): the signal does not hold on it", tag(), className(cls), thisLow, verdictText(v),

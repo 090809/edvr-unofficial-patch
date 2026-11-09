@@ -2504,6 +2504,53 @@ void testShopGlue(const CtlPages& p) {
         check(!nativeOnFootShopOpen() && rig.cap.count("shop screens (F209):") == 0, "...the signal stays off and the log silent: F107 has its distance test alone");
         t::reset();
     }
+    {   // F234: the loadout browser joins the hold while its key is on; the buy screens, Livery and the kiosk are as they were
+        Rig rig;
+        start(rig);
+        static ShopObj loadout;
+        loadout.init(base + shop::kOutfittingVtableRva);
+        check(nativeOnFootShopOpen() == false, "F234: nothing open: no signal");
+        const uint64_t r1 = shopShow(&loadout);
+        check(r1 == 0x5A5A && loadout.open() == 1 && nativeOnFootShopOpen() && !nativeOnFootLiveryOpen(), "F234 LOADOUT SHOW, KEY ON (the default): the original ran, +0x79 is set, the signal is on at once and it is not a Livery screen");
+        rig.boundary();
+        check(rig.cap.count(shopEventLine("HumanoidOutfittingInteraction", "Show", 0, 1, &loadout).c_str()) == 1 &&
+                  rig.cap.count("shop screens (F209): HumanoidOutfittingInteraction opened: F107 holds the camera away, the view is the game's own (experimental.native_on_foot_loadout_game_view is on)") == 1 &&
+                  rig.cap.count("the shop signal is ON: F107 holds the camera away (suit closed, weapons closed, kiosk not running, livery loadout open; change 1)") == 1,
+              "...the Show line, one line saying it holds the camera away, and the signal's ON line naming the loadout browser");
+        shopClose(&loadout);
+        check(loadout.open() == 0 && !nativeOnFootShopOpen(), "F234 LOADOUT CLOSE: the signal is off at once");
+        rig.cap.clear();
+        rig.boundary();
+        check(rig.cap.count("the shop signal is OFF (suit closed, weapons closed, kiosk not running, livery closed; change 2)") == 1, "...and says so once");
+        // the key off: watched, not held
+        rig.cap.clear();
+        nativeOnFootSetLoadoutHold(false);
+        shopShow(&loadout);
+        check(loadout.open() == 1 && !nativeOnFootShopOpen(), "F234 LOADOUT SHOW, KEY OFF: the screen reads open but the signal stays off");
+        rig.boundary();
+        check(rig.cap.count("shop screens (F209): HumanoidOutfittingInteraction opened: only watched, the camera is not held away (experimental.native_on_foot_loadout_game_view is off)") == 1 &&
+                  rig.cap.count("the shop signal is") == 0,
+              "...one 'only watched' line and no signal edge");
+        nativeOnFootSetLoadoutHold(true);
+        check(nativeOnFootShopOpen(), "F234: the key turned on while the screen is open holds the signal at once");
+        shopClose(&loadout);
+        // the buy screens and the kiosk are as they were, whatever the loadout key says
+        nativeOnFootSetLoadoutHold(false);
+        shopShow(&suit);
+        check(nativeOnFootShopOpen(), "F234: a buy screen holds the signal with the loadout key off");
+        shopClose(&suit);
+        shopKioskStart(&kiosk);
+        check(!nativeOnFootShopOpen(), "F234: the kiosk does not hold, as before");
+        shopKioskStop(&kiosk);
+        nativeOnFootSetLoadoutHold(true);
+        shopShow(&suit);
+        shopShow(&loadout);
+        shopClose(&suit);
+        check(nativeOnFootShopOpen(), "F234: the loadout browser still holds when a buy screen closes");
+        shopClose(&loadout);
+        check(!nativeOnFootShopOpen(), "F234: and nothing holds when both are closed");
+        t::reset();
+    }
     {   // F229: the Livery camera instrument: the setup hook over a synthetic function, and the once-a-second camera lines
         Rig rig;
         g_withLiveryCam = true;

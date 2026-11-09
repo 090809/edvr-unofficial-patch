@@ -396,8 +396,8 @@ inline void run209(Check&& check) {
         const std::string ini = slurp("edvr.ini");
         check(has_(ini, "# ui: Livery uses game view | choices on, off | recommended on | live\nnative_on_foot_livery_game_view = on\n") && has_(ini, "# TEMPORARY (F228): Livery uses game view"),
               "F228: the shipped key is on, TEMPORARY, with its ui line");
-        check(has_(hooks, "return shop::screenOfVtable(vtable, base);") && has_(hooks, "s.holds(g_liveryHold.load(std::memory_order_relaxed))") &&
-                  has_(hooks, "bool nativeOnFootShopOpen() noexcept { return shopBuyScreenOpen() || (g_liveryHold.load(std::memory_order_relaxed) && nativeOnFootLiveryOpen()); }") &&
+        check(has_(hooks, "return shop::screenOfVtable(vtable, base);") && has_(hooks, "s.holds(g_liveryHold.load(std::memory_order_relaxed)") &&
+                  has_(hooks, "bool nativeOnFootShopOpen() noexcept { return shopBuyScreenOpen() || (g_liveryHold.load(std::memory_order_relaxed) && nativeOnFootLiveryOpen())") &&
                   has_(hooks, "std::atomic<int8_t> g_shopByte[shop::kClassCount] = {{-1}, {-1}, {-1}, {-1}, {-1}, {-1}};"),
               "F228: the Show/Close filter takes the Livery vtables, the frame thread's signal and F107's input hold a Livery screen only with the key on, and every per-class array is sized by kClassCount");
         // every shop callback forwards to the original: the original's result is returned unchanged (nothing is written to the game)
@@ -880,6 +880,48 @@ inline void run209(Check&& check) {
         check(has_(ini, "# ui: Weapon previews | choices on, off | recommended on | live\nnative_on_foot_preview_headlook = on\n") && has_(ini, "# TEMPORARY (F233): Weapon previews") &&
                   has_(ini, "weapon previews (purchase, loadout) stand beside the panel instead of below you") && ini.find("native_on_foot_preview_headlook = on") > ini.find("native_on_foot_preview_handover = on"),
               "F233: the shipped key is on, TEMPORARY, with its ui line after F232's and the plain sentence of what the user gets");
+    }
+    // ---- 13. F234: the loadout browser joins the hold (TEMPORARY key) -----------------------------------------------------------------------------------------------------------------------------
+    {
+        const uint64_t base = 0x7FF600000000ull;
+        const shop::Signal none = shop::signalOf(shop::Verdict::kNone, shop::Verdict::kNone, shop::Verdict::kNone);
+        const shop::Signal load = shop::signalOf(shop::Verdict::kNone, shop::Verdict::kNone, shop::Verdict::kNone, shop::Verdict::kNone, shop::Verdict::kNone, shop::Verdict::kOpen);
+        const shop::Signal buy = shop::signalOf(shop::Verdict::kOpen, shop::Verdict::kNone, shop::Verdict::kNone, shop::Verdict::kNone, shop::Verdict::kNone, shop::Verdict::kNone);
+        const shop::Signal liv = shop::signalOf(shop::Verdict::kNone, shop::Verdict::kNone, shop::Verdict::kNone, shop::Verdict::kOpen, shop::Verdict::kNone, shop::Verdict::kNone);
+        const shop::Signal kiosk = shop::signalOf(shop::Verdict::kNone, shop::Verdict::kNone, shop::Verdict::kOpen);
+        check(!none.holds(true, true) && !none.holds(false, false) && load.loadout && !load.liveryOpen() && !load.buyScreenOpen() && load.holds(false, true) && load.holds(true, true) && !load.holds(true, false) && !load.holds(true) &&
+                  !load.holds(false, false),
+              "F234: the loadout browser open holds the signal only with its own key on; the Livery key does not hold it");
+        check(buy.holds(false, false) && buy.holds(true, false) && liv.holds(true, false) && !liv.holds(false, true) && !liv.holds(false, false) && !kiosk.holds(true, true) && !buy.loadout && !liv.loadout,
+              "F234: a buy screen holds with either key off, Livery only with its own key, and the kiosk never; the loadout verdict is its own");
+        check(shop::vtableRva(shop::kOutfitting) == shop::kOutfittingVtableRva && shop::screenOfVtable(base + shop::kOutfittingVtableRva, base) == shop::kOutfitting && std::strcmp(shop::kLoadoutKey, "experimental.native_on_foot_loadout_game_view") == 0,
+              "F234: the loadout browser is the sixth class, found by its vtable; the key's name");
+        check(std::strcmp(shop::liveryText(none), "closed") == 0 && std::strcmp(shop::liveryText(load), "loadout open") == 0 && std::strcmp(shop::liveryText(liv), "suit open") == 0,
+              "F234: the signal line's screen text names the loadout browser and leaves the Livery wording as it was");
+        char line[600];
+        shop::formatSignal(line, sizeof(line), load, true, 3);
+        check(std::string(line) == "shop screens (F209): the shop signal is ON: F107 holds the camera away (suit closed, weapons closed, kiosk not running, livery loadout open; change 3)", "F234: the ON line names the loadout browser");
+        shop::formatLoadoutOpened(line, sizeof(line), true);
+        const std::string held = line;
+        shop::formatLoadoutOpened(line, sizeof(line), false);
+        check(held == "shop screens (F209): HumanoidOutfittingInteraction opened: F107 holds the camera away, the view is the game's own (experimental.native_on_foot_loadout_game_view is on)" &&
+                  std::string(line) == "shop screens (F209): HumanoidOutfittingInteraction opened: only watched, the camera is not held away (experimental.native_on_foot_loadout_game_view is off)",
+              "F234: the opened line says held or only watched, with the key's value");
+        shop::formatLoadoutKey(line, sizeof(line), true);
+        const std::string on = line;
+        shop::formatLoadoutKey(line, sizeof(line), false);
+        check(on.rfind("native on foot loadout screen (F234, TEMPORARY): experimental.native_on_foot_loadout_game_view is on -- ", 0) == 0 && has_(std::string(line), "is off -- the loadout browser is only watched"),
+              "F234: the key's line says what each value does");
+        const std::string cpp = slurp("src/d3d11/native_on_foot.cpp"), hooks = slurp("src/d3d11/native_on_foot_hooks.cpp"), ini = slurp("edvr.ini");
+        check(has_(cpp, "cfg.getString(\"experimental.native_on_foot_loadout_game_view\", \"on\") != \"off\"") && has_(cpp, "shop::formatLoadoutKey(line, sizeof(line), on);") && has_(cpp, "nativeOnFootSetLoadoutHold(on);") &&
+                  has_(cpp, "str(\"experimental.native_on_foot_loadout_game_view\""),
+              "F234: the key is read live on the frame thread, default on, logged on a change, set into the hooks and dumped");
+        check(has_(hooks, "(g_loadoutHold.load(std::memory_order_relaxed) && g_shopOpen[shop::kOutfitting].load(std::memory_order_acquire) != 0)") &&
+                  has_(hooks, "s.holds(g_liveryHold.load(std::memory_order_relaxed), g_loadoutHold.load(std::memory_order_relaxed))") && has_(hooks, "if (e.kind == shop::kShow && e.cls == shop::kOutfitting && e.after == 1) {"),
+              "F234: F107's shop input and the frame thread's signal take the loadout browser with its key, and its opening is said once");
+        check(has_(ini, "# ui: Loadout uses game view | choices on, off | recommended on | live\nnative_on_foot_loadout_game_view = on\n") && has_(ini, "# TEMPORARY (F234): Loadout uses game view") &&
+                  has_(ini, "the loadout browser shows the game's own preview camera without the view jumping") && ini.find("native_on_foot_loadout_game_view = on") > ini.find("native_on_foot_preview_headlook = on"),
+              "F234: the shipped key is on, TEMPORARY, with its ui line after F233's and the plain sentence of what the user gets");
     }
 }
 

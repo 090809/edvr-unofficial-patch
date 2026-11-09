@@ -12518,7 +12518,7 @@ def _hj_shop(rows, ctx):
     with native on foot begun and no F107 episode by the shop screen (its left line's test, or calls its ended line says the shop screen held) is NEVER APPLIED (the view did not
     change); a signal that did not hold on its object, events the hooks lost or the cap dropped, a Show that left
     the byte unset, a signal that went on more often than it went off, hooks that all stood down, or a Show with no signal are PARTIAL."""
-    kinds = ("hook", "show", "close", "on", "off", "state", "kstart", "kstop", "forgot", "sec", "capped", "lost", "lvopen")
+    kinds = ("hook", "show", "close", "on", "off", "state", "kstart", "kstop", "forgot", "sec", "capped", "lost", "lvopen", "loadopen")
     if not any(rows.get(k) for k in kinds):
         return None
     hooks, shows, closes = rows.get("hook", []), rows.get("show", []), rows.get("close", [])
@@ -12535,6 +12535,10 @@ def _hj_shop(rows, ctx):
     lvheld = [r for r in lvopens if r["how"] != "only watched"]
     if lvopens:   # F228: the Livery screens (HumanoidLiveryActivity, HumanoidWeaponLiveryActivity), held by experimental.native_on_foot_livery_game_view or only watched
         parts.append("%d Livery screen(s) opened (%d held by the camera-away signal, %d only watched; key %s)" % (len(lvopens), len(lvheld), len(lvopens) - len(lvheld), ", ".join(sorted({r["key"] for r in lvopens}))))
+    loadopens = rows.get("loadopen", [])   # F234: the loadout browser (HumanoidOutfittingInteraction), held by experimental.native_on_foot_loadout_game_view or only watched
+    loadheld = [r for r in loadopens if r["how"] != "only watched"]
+    if loadopens:
+        parts.append("%d loadout browser opening(s) (%d held by the camera-away signal, %d only watched; key %s)" % (len(loadopens), len(loadheld), len(loadopens) - len(loadheld), ", ".join(sorted({r["key"] for r in loadopens}))))
     parts.append("the signal on %d, off %d" % (len(ons), len(offs)))
     if states:
         parts.append("%d state change(s), last %s" % (len(states), states[-1]["to"]))
@@ -12563,6 +12567,8 @@ def _hj_shop(rows, ctx):
         problems.append("a buy screen was shown but the signal never went on")
     if lvheld and not ons:
         problems.append("a Livery screen opened with the key on (held) but the signal never went on")
+    if loadheld and not ons:
+        problems.append("the loadout browser opened with the key on (held) but the signal never went on")
     if len(ons) > len(offs) + 1:
         problems.append("the signal went on %d times and off %d: it may have stuck" % (len(ons), len(offs)))
     if hooks and stood and not armed and not ons:
@@ -18033,6 +18039,7 @@ HEALTH_RULES = (
         ("on", r"shop screens \(F209\): the shop signal is ON: F107 holds the camera away \(suit (?P<suit>\w+), weapons (?P<weap>\w+), kiosk (?P<kiosk>[\w ]+?), livery (?P<liv>[\w ]+?); change (?P<n>\d+)\)"),
         ("off", r"shop screens \(F209\): the shop signal is OFF \(suit (?P<suit>\w+), weapons (?P<weap>\w+), kiosk (?P<kiosk>[\w ]+?), livery (?P<liv>[\w ]+?); change (?P<n>\d+)\)"),
         ("lvopen", r"shop screens \(F209\): (?P<cls>Humanoid\w*LiveryActivity) opened: (?P<how>F107 holds the camera away|only watched)[^(]*\(experimental\.native_on_foot_livery_game_view is (?P<key>on|off)\)"),
+        ("loadopen", r"shop screens \(F209\): HumanoidOutfittingInteraction opened: (?P<how>F107 holds the camera away|only watched)[^(]*\(experimental\.native_on_foot_loadout_game_view is (?P<key>on|off)\)"),
         ("show", r"shop screens \(F209\): (?P<cls>\w+) Show: \+0x79 (?P<b>-?\d+) -> (?P<a>-?\d+) \(this 0x(?P<this>[0-9A-F]+), thread (?P<tid>\d+)\)"),
         ("close", r"shop screens \(F209\): (?P<cls>\w+) Close: \+0x79 (?P<b>-?\d+) -> (?P<a>-?\d+) \(this 0x(?P<this>[0-9A-F]+), thread (?P<tid>\d+)\)"),
         ("state", r"shop screens \(F209\): SuitUIStateMachine: \"(?P<from>[^\"]*)\" -> \"(?P<to>[^\"]*)\" \(thread (?P<tid>\d+)\)"),
@@ -22777,6 +22784,20 @@ def self_test_health():
         check("F228: the Livery signal went on and F107 logged no episode by the shop screen: the view did not change",
               [neck(), BEGAN209, LSHOW209, LOPEN_HELD209, LON209, AWAY_LEFT_3M7, AWAY_END_3M7, LCLOSE209, LOFF209, neck()], 3, [("NEVER APPLIED", S209)])
         check("F209: a line that drifted from its pattern is unparsed", [neck(), "shop screens (F209): the buy screen is somewhere else"], 4, [("UNPARSED", S209)])
+
+        # ---- the loadout browser joins the hold (F234) ----
+        OSHOW234 = RS(": +0x79 %d -> %d (this", TAG209, "HumanoidOutfittingInteraction", "Show", 0, 1, 0x6F708192, 7)
+        OCLOSE234 = RS(": +0x79 %d -> %d (this", TAG209, "HumanoidOutfittingInteraction", "Close", 1, 0, 0x6F708192, 7)
+        OON234 = RS("the shop signal is %s (suit", TAG209, "ON: F107 holds the camera away", "closed", "closed", "not running", "loadout open", 1)
+        OOFF234 = RS("the shop signal is %s (suit", TAG209, "OFF", "closed", "closed", "not running", "closed", 2)
+        OOPEN_HELD234 = RS("opened: %s (%s is %s)", TAG209, "HumanoidOutfittingInteraction", "F107 holds the camera away, the view is the game's own", "experimental.native_on_foot_loadout_game_view", "on")
+        OOPEN_WATCH234 = RS("opened: %s (%s is %s)", TAG209, "HumanoidOutfittingInteraction", "only watched, the camera is not held away", "experimental.native_on_foot_loadout_game_view", "off")
+        check("F234: the loadout browser opened and closed with the key on, F107 held the camera away by the shop screen", [neck(), OSHOW234, OOPEN_HELD234, OON234, AWAY_LEFT_SHOP, OCLOSE234, OOFF234, AWAY_END_SHOP, neck()], 0,
+              [("OK", S209), ("OK", F107)], has=["1 loadout browser opening(s) (1 held by the camera-away signal, 0 only watched; key on)", "HumanoidOutfittingInteraction 1"], lacks=["UNPARSED"])
+        check("F234: the loadout browser with the key off is only watched: not a fault", [neck(), OSHOW234, OOPEN_WATCH234, OCLOSE234, neck()], 0, [("OK", S209)],
+              has=["1 loadout browser opening(s) (0 held by the camera-away signal, 1 only watched; key off)"], lacks=["never went on", "UNPARSED"])
+        check("F234: the loadout browser opened with the key on and the signal never went on is PARTIAL", [neck(), OSHOW234, OOPEN_HELD234, OCLOSE234, neck()], 0, [("PARTIAL", S209)],
+              has=["the loadout browser opened with the key on (held) but the signal never went on"])
 
         # ---- the Livery camera instrument (F229): the preview client's camera fields once a second, the setup's calls, and the loadout browser watched beside the Livery screens ----
         TAG229 = "livery camera (F229):"

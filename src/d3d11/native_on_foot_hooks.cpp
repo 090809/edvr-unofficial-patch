@@ -494,6 +494,7 @@ std::atomic<uintptr_t> g_shopObj[shop::kClassCount];       // the object each cl
 std::atomic<uint8_t> g_shopOpen[shop::kClassCount];        // 1 while that class's object reads open: the callbacks set it at once, the frame thread re-derives it every frame
 std::atomic<int8_t> g_shopByte[shop::kClassCount] = {{-1}, {-1}, {-1}, {-1}, {-1}, {-1}};   // the frame thread's last read of each remembered byte (-1 none, 0, 1), for the once-a-second line; one initializer per class
 static_assert(shop::kClassCount == 6, "g_shopByte's initializer lists one -1 per class: extend it with the enum");
+std::atomic<bool> g_loadoutHold{true};                     // F234 (TEMPORARY): experimental.native_on_foot_loadout_game_view, set live by native_on_foot.cpp: the loadout browser open holds the camera away
 std::atomic<bool> g_liveryHold{true};                      // F228 (TEMPORARY): experimental.native_on_foot_livery_game_view, set live by native_on_foot.cpp: a Livery screen open holds the camera away
 std::atomic<bool> g_shopBusy{false};                       // the ring's try-flag: a second concurrent producer drops its event (counted) rather than wait
 std::atomic<uint64_t> g_shopBusyDrops{0};
@@ -3139,6 +3140,10 @@ void shopFrameTick(const avh::Sink& sink) {
             shop::formatLiveryOpened(line, sizeof(line), e.cls, g_liveryHold.load(std::memory_order_relaxed));
             shopWrite(f, sink, now, line);
         }
+        if (e.kind == shop::kShow && e.cls == shop::kOutfitting && e.after == 1) {   // F234: likewise for the loadout browser
+            shop::formatLoadoutOpened(line, sizeof(line), g_loadoutHold.load(std::memory_order_relaxed));
+            shopWrite(f, sink, now, line);
+        }
     }
     const uint64_t lost = g_shopRing.lost() + g_shopBusyDrops.load(std::memory_order_relaxed);
     if (lost != f.lostSeen) {
@@ -3167,8 +3172,8 @@ void shopFrameTick(const avh::Sink& sink) {
         g_shopOpen[c].store(verdict[c] == shop::Verdict::kOpen ? 1u : 0u, std::memory_order_release);
         g_shopByte[c].store(static_cast<int8_t>(verdict[c] == shop::Verdict::kOpen ? 1 : verdict[c] == shop::Verdict::kClosed ? 0 : -1), std::memory_order_relaxed);
     }
-    const shop::Signal s = shop::signalOf(verdict[shop::kSuit], verdict[shop::kWeapons], verdict[shop::kKiosk], verdict[shop::kLivery], verdict[shop::kWeaponLivery]);
-    const bool on = s.holds(g_liveryHold.load(std::memory_order_relaxed));
+    const shop::Signal s = shop::signalOf(verdict[shop::kSuit], verdict[shop::kWeapons], verdict[shop::kKiosk], verdict[shop::kLivery], verdict[shop::kWeaponLivery], verdict[shop::kOutfitting]);
+    const bool on = s.holds(g_liveryHold.load(std::memory_order_relaxed), g_loadoutHold.load(std::memory_order_relaxed));
     if (on != f.signalLogged) {
         ++f.seq;
         f.signalLogged = on;
@@ -3562,9 +3567,10 @@ bool nativeOnFootPreviewScreenOpen() noexcept {
            g_shopOpen[shop::kOutfitting].load(std::memory_order_acquire) != 0;
 }
 void nativeOnFootSetLiveryHold(bool on) noexcept { g_liveryHold.store(on, std::memory_order_relaxed); }
+void nativeOnFootSetLoadoutHold(bool on) noexcept { g_loadoutHold.store(on, std::memory_order_relaxed); }   // F234 (TEMPORARY)
 void nativeOnFootSetLiveryRepair(bool on) noexcept { g_repairKey.store(on, std::memory_order_relaxed); }   // F230 (TEMPORARY)
 // F107's shop input: a buy screen is open (F209), or a Livery screen is open while experimental.native_on_foot_livery_game_view is on (F228). Any thread.
-bool nativeOnFootShopOpen() noexcept { return shopBuyScreenOpen() || (g_liveryHold.load(std::memory_order_relaxed) && nativeOnFootLiveryOpen()); }
+bool nativeOnFootShopOpen() noexcept { return shopBuyScreenOpen() || (g_liveryHold.load(std::memory_order_relaxed) && nativeOnFootLiveryOpen()) || (g_loadoutHold.load(std::memory_order_relaxed) && g_shopOpen[shop::kOutfitting].load(std::memory_order_acquire) != 0); }   // F234: and the loadout browser while its key is on
 // The frame thread's reading for the once-a-second line (the frame thread owns the state text). False when no shop hook is armed.
 bool nativeOnFootShopRead(NativeOnFootShopRead* out) noexcept {
     if (!out) return false;
@@ -4364,6 +4370,7 @@ void reset() {
     {   // F209: the buy screens' objects, flags, ring and frame state start from nothing
         g_shopBase.store(0);
         g_liveryHold.store(true);   // F228: the key's default
+        g_loadoutHold.store(true);  // F234: the key's default
         for (int c = 0; c < shop::kClassCount; ++c) {
             g_shopObj[c].store(0);
             g_shopOpen[c].store(0);

@@ -317,6 +317,7 @@ std::atomic<bool> g_f222Key{true};                            // F222 (TEMPORARY
 bool g_f222KeyLast = true;                                    // the value last logged (frame thread; the first read always logs)
 std::atomic<bool> g_previewCamKey{true};            // experimental.native_on_foot_preview_camera, as the frame thread last read it (F231, TEMPORARY)
 bool g_f231KeyLast = true;                          // frame thread: the value last logged
+bool g_f234KeyLast = true;                                    // F234 (TEMPORARY): experimental.native_on_foot_loadout_game_view, on by default, live: the value last logged (frame thread)
 bool g_f233KeyLast = true;                                    // F233 (TEMPORARY): experimental.native_on_foot_preview_headlook, on by default, live: the value last logged (frame thread)
 bool g_f232KeyLast = true;                                    // F232 (TEMPORARY): experimental.native_on_foot_preview_handover, on by default, live: the value last logged (frame thread)
 bool g_f230KeyLast = true;                                    // F230 (TEMPORARY): experimental.native_on_foot_livery_camera_repair, on by default, live: the value last logged (frame thread; the first read always logs); the value lives in native_on_foot_hooks.cpp (nativeOnFootSetLiveryRepair)
@@ -1421,6 +1422,17 @@ void readKey() {
         }
         g_f233KeyLast = on;
         nativePreviewCameraSetHeadlook(on);
+    }
+    // F234 (TEMPORARY, live, the developer tier's "Loadout uses game view"): the loadout browser open holds F107's camera away, as a buy screen does.
+    {
+        const bool on = cfg.getString("experimental.native_on_foot_loadout_game_view", "on") != "off";
+        if (first || on != g_f234KeyLast) {
+            char line[640];
+            shop::formatLoadoutKey(line, sizeof(line), on);
+            Log::get().note("%s", line);
+        }
+        g_f234KeyLast = on;
+        nativeOnFootSetLoadoutHold(on);
     }
     // F220 (TEMPORARY A/B, live, the developer tier's "HUD stays with view"): with View bob off, the HUD's placement moves with the view's bob term instead of the view moving against it.
     {
@@ -38487,6 +38499,7 @@ static std::string recorderKeysJson() {
     str("experimental.native_on_foot_preview_camera", cfg.getString("experimental.native_on_foot_preview_camera", "on"));   // F231
     str("experimental.native_on_foot_preview_handover", cfg.getString("experimental.native_on_foot_preview_handover", "on"));   // F232
     str("experimental.native_on_foot_preview_headlook", cfg.getString("experimental.native_on_foot_preview_headlook", "on"));   // F233
+    str("experimental.native_on_foot_loadout_game_view", cfg.getString("experimental.native_on_foot_loadout_game_view", "on"));   // F234
     str("fix.native_on_foot_view_bob", cfg.getString("fix.native_on_foot_view_bob", "off"));
     num("experimental.native_on_foot_stand_ads_spine_straighten",
         nofoot::f180::clampDial(static_cast<double>(cfg.getFloat("experimental.native_on_foot_stand_ads_spine_straighten", 0.9f))));
