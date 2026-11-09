@@ -34,6 +34,7 @@
 #include "engine_velocity.h"   // F45: engineVelocityShadowSceneRows, the CB shadow's rows 270..275 (the world view's row 275)
 #include "engine_velocity_families.h"   // F44: the pool families' vertex shaders (the eye's world view)
 #include "native_on_foot_hooks.h"   // localAvatarParts, avatarFadeModeRead, avatarCensusTake: the avatar census (F1, F3)
+#include "preview_camera_core.h"   // F231: the preview camera patch (bytes, rule, lines)
 #include "shop_screen_core.h"   // F209: the once-a-second shop line (shop::formatSecond), the Pioneer Supplies buy screens' signal
 #include "journal_watch.h"
 #include "mode_watch.h"   // F190: modeWatchStereoValue, the mode a late install takes (the setter call for the switch has passed)
@@ -1383,6 +1384,17 @@ void readKey() {
         g_f230KeyLast = on;
         nativeOnFootSetLiveryRepair(on);
     }
+    // F231 (TEMPORARY, live, the developer tier's "Preview screens use their camera"): the preview camera patch (applied by the frame boundary's tick).
+    {
+        const bool on = cfg.getString("experimental.native_on_foot_preview_camera", "on") != "off";
+        if (first || on != g_f231KeyLast) {
+            char line[640];
+            previewcam::formatKey(line, sizeof(line), on);
+            Log::get().note("%s", line);
+        }
+        g_f231KeyLast = on;
+        g_previewCamKey.store(on, std::memory_order_relaxed);
+    }
     // F220 (TEMPORARY A/B, live, the developer tier's "HUD stays with view"): with View bob off, the HUD's placement moves with the view's bob term instead of the view moving against it.
     {
         const bool on = cfg.getString("experimental.native_on_foot_hud_stays_with_view", "on") != "off";
@@ -2715,6 +2727,50 @@ void meshSiteTick(MeshSite& s, bool want, const char* reason) {
     std::snprintf(shape, sizeof(shape), "%02X -> %02X", static_cast<unsigned>(s.writeTo), static_cast<unsigned>(s.writeFrom));
     Log::get().note("native on foot %s: patch EliteDangerous64.exe+0x%llX %s (restored: %s)", s.name, static_cast<unsigned long long>(s.writeRva), shape,
                     reason);
+}
+
+// ---- F231 (TEMPORARY key experimental.native_on_foot_preview_camera): the preview camera patch, 45 33 C0 -> 41 B0 01 at +0x126FE70 (preview_camera_core.h holds the bytes, the rule and the lines) -----
+// Applied while the key is on and native stereo is on foot with the first-person HUD override held (the panel patch's condition); verified (21 bytes) before the write; written as ONE interlocked
+// compare-exchange of the aligned qword holding the three bytes, so another thread executing them never sees a mix; put back while the bytes still read as ours, and at shutdown.
+std::atomic<bool> g_previewCamKey{true};            // experimental.native_on_foot_preview_camera, as the frame thread last read it
+bool g_f231KeyLast = true;                          // frame thread: the value last logged
+previewcam::Patch g_previewPatch;                   // frame thread only
+previewcam::Event g_previewLastRefusal = previewcam::Event::kNone;   // frame thread only: the refusal already said
+__declspec(noinline) bool casCodeQword(uintptr_t address, uint64_t expected, uint64_t desired) noexcept {
+    if (!address || (address & 7u)) return false;
+    DWORD old = 0;
+    if (!VirtualProtect(reinterpret_cast<void*>(address), sizeof(desired), PAGE_EXECUTE_READWRITE, &old)) return false;
+    const LONG64 was = InterlockedCompareExchange64(reinterpret_cast<volatile LONG64*>(address), static_cast<LONG64>(desired), static_cast<LONG64>(expected));
+    DWORD ignored = 0;
+    VirtualProtect(reinterpret_cast<void*>(address), sizeof(desired), old, &ignored);
+    FlushInstructionCache(GetCurrentProcess(), reinterpret_cast<void*>(address), sizeof(desired));
+    return was == static_cast<LONG64>(expected);
+}
+void previewCameraPatchTick(bool want, const char* why) {
+    if (want && g_install != InstallState::Armed) return;
+    bool identityOk = true;
+    if (want && !g_previewPatch.applied) {
+        const char* idWhy = nullptr;
+        identityOk = checkIdentity(g_base, &idWhy);
+    }
+    uint8_t seen[previewcam::kVerifyLen] = {};
+    const previewcam::Event e = previewcam::step(
+        g_previewPatch, want, identityOk, [](uintptr_t rva, uint8_t* out, size_t n) { return guardedRead(g_base + rva, out, n); },
+        [](uintptr_t rva, uint64_t expected, uint64_t desired) { return casCodeQword(g_base + rva, expected, desired); }, seen);
+    const bool refusal = e == previewcam::Event::kRefusedIdentity || e == previewcam::Event::kRefusedUnreadable || e == previewcam::Event::kRefusedBytes || e == previewcam::Event::kRefusedWrite;
+    if (e == previewcam::Event::kNone) {
+        if (!want) g_previewLastRefusal = previewcam::Event::kNone;
+        return;
+    }
+    if (refusal) {
+        if (e == g_previewLastRefusal) return;   // the same reason: already said
+        g_previewLastRefusal = e;
+    } else {
+        g_previewLastRefusal = previewcam::Event::kNone;
+    }
+    char line[512];
+    previewcam::formatEvent(line, sizeof(line), e, why, seen);
+    Log::get().note("%s", line);
 }
 
 // ---- F9: three read-only probes (TEMPORARY) -----------------------------------------------------------------------------------------
@@ -38403,6 +38459,7 @@ static std::string recorderKeysJson() {
     str("experimental.native_on_foot_steady_body_in_turns", cfg.getString("experimental.native_on_foot_steady_body_in_turns", "on"));
     str("experimental.native_on_foot_livery_game_view", cfg.getString("experimental.native_on_foot_livery_game_view", "on"));
     str("experimental.native_on_foot_livery_camera_repair", cfg.getString("experimental.native_on_foot_livery_camera_repair", "on"));   // F230
+    str("experimental.native_on_foot_preview_camera", cfg.getString("experimental.native_on_foot_preview_camera", "on"));   // F231
     str("fix.native_on_foot_view_bob", cfg.getString("fix.native_on_foot_view_bob", "off"));
     num("experimental.native_on_foot_stand_ads_spine_straighten",
         nofoot::f180::clampDial(static_cast<double>(cfg.getFloat("experimental.native_on_foot_stand_ads_spine_straighten", 0.9f))));
@@ -38474,6 +38531,10 @@ void nativeOnFootFrameBoundary(uint32_t frameNo) {
     const char* f9Why = !g_hudOverrideHeld ? "the first-person HUD override is off" : !nativeOnFootActive() ? "native stereo on foot ended" : "the game session ended";
     codePatchTick(g_panelPatch, g_panelsKeyOn.load(std::memory_order_relaxed) && f9Active,
                   g_panelsKeyOn.load(std::memory_order_relaxed) ? f9Why : "fix.native_on_foot_panels is off");
+    {   // F231: the preview camera patch, on the panel patch's condition
+        const char* previewWhy = previewcam::notWantedWhy(g_previewCamKey.load(std::memory_order_relaxed), nativeOnFootActive(), g_hudOverrideHeld, session);
+        previewCameraPatchTick(previewWhy == nullptr, previewWhy ? previewWhy : "");
+    }
     meshSiteTick(g_meshCreate, g_meshKeyOn.load(std::memory_order_relaxed) && f9Active,
                  g_meshKeyOn.load(std::memory_order_relaxed) ? f9Why : "fix.native_on_foot_hud_mesh is off");
     g_meshCreateLive.store(g_meshCreate.applied, std::memory_order_relaxed);   // F12: the HUD distance writes only while the creation patch is in
@@ -38654,6 +38715,7 @@ void nativeOnFootShutdown() {
     gateByteTick(false, "the game is shutting down");
     hudOverrideTick(false, "the game is shutting down");
     codePatchTick(g_panelPatch, false, "the game is shutting down");
+    previewCameraPatchTick(false, "the game is shutting down");   // F231
     meshSiteTick(g_meshCreate, false, "the game is shutting down");
     weaponUiGetterCallTick(false);
     meshSiteTick(g_weaponUiPatch, false, "the game is shutting down");

@@ -48,6 +48,7 @@
 #include "../../src/d3d11/native_on_foot.h"   // the native flag and the camera signal the controller hook publishes (F93d)
 #include "../../src/d3d11/native_on_foot_logwin.h"
 #include "../../src/d3d11/shop_screen_core.h"   // F209: the buy screens' hooks, signal and lines
+#include "../../src/d3d11/preview_camera_core.h"   // F231: the camera controller hooks and the preview camera patch
 #include "../../src/d3d11/native_on_foot_f212.h"   // F212: the conversation look's leaf, decision, counters and lines
 
 using namespace edvr;
@@ -1889,8 +1890,10 @@ void testSkeletonLatch(const CtlPages& p) {
 using FnThis = uint64_t (__fastcall*)(void*);
 using FnState = uint64_t (__fastcall*)(void*, const char*);
 void setupImgInit();   // F229: the Livery setup's synthetic function, below
+void previewImgInit();   // F231: the camera controller's two synthetic functions, below
 void shopImgInit() {
     setupImgInit();
+    previewImgInit();
     const uint8_t nop = 0x90;
     auto rel32 = [](size_t from, size_t to) { return static_cast<int32_t>(static_cast<int64_t>(to) - static_cast<int64_t>(from)); };
     auto put32 = [](uint8_t* p, size_t at, int32_t v) { std::memcpy(p + at, &v, 4); };
@@ -1990,6 +1993,25 @@ void setupImgInit() {
     const uint8_t utail[] = {0x57, 0x41, 0x5F, 0x48, 0x81, 0xC4, 0x90, 0x00, 0x00, 0x00, 0x5E, 0x49, 0x8B, 0x5B, 0x18, 0xB8, 0x70, 0x5A, 0x00, 0x00, 0xC3};
     std::memcpy(u + n, utail, sizeof(utail));
 }
+// F231: the camera controller's SetCamera (20 prologue bytes, balanced tail, returns 0x5A80) and Release (13 bytes, returns 0x5A90): they write nothing.
+void previewImgInit() {
+    cimgCommit(previewcam::kSetCameraRva, 0x80);
+    uint8_t* p = g_cimg + previewcam::kSetCameraRva;
+    std::memset(p, 0xCC, 0x80);
+    size_t n = 0;
+    for (uint8_t b : previewcam::kSetCameraPrologue) p[n++] = b;   // mov [rsp+18h],rbx; push rbp; push rsi; push r12; push r14; push r15; mov rbp,rsp; sub rsp,50h
+    const uint8_t setTail[] = {0x48, 0x83, 0xC4, 0x50, 0x41, 0x5F, 0x41, 0x5E, 0x41, 0x5C, 0x5E, 0x5D, 0x48, 0x8B, 0x5C, 0x24, 0x18, 0xB8, 0x80, 0x5A, 0x00, 0x00, 0xC3};
+    std::memcpy(p + n, setTail, sizeof(setTail));
+    cimgCommit(previewcam::kReleaseRva, 0x80);
+    uint8_t* r = g_cimg + previewcam::kReleaseRva;
+    std::memset(r, 0xCC, 0x80);
+    n = 0;
+    for (uint8_t b : previewcam::kReleasePrologue) r[n++] = b;     // mov [rsp+10h],rbx; push rdi; sub rsp,20h; mov rdi,rcx
+    const uint8_t relTail[] = {0x48, 0x83, 0xC4, 0x20, 0x5F, 0x48, 0x8B, 0x5C, 0x24, 0x10, 0xB8, 0x90, 0x5A, 0x00, 0x00, 0xC3};
+    std::memcpy(r + n, relTail, sizeof(relTail));
+}
+uint64_t previewSetCamera(const void* name, uint64_t force) { return reinterpret_cast<FnSetup>(g_cimg + previewcam::kSetCameraRva)(nullptr, const_cast<void*>(name), reinterpret_cast<void*>(force), nullptr); }
+uint64_t previewRelease() { return reinterpret_cast<FnSetup>(g_cimg + previewcam::kReleaseRva)(nullptr, nullptr, nullptr, nullptr); }
 void setupFix(uint8_t v) { g_cimg[shop::kSetupRva + kSetupFixAt] = v; }
 uint64_t livUpdate(void* client) { return reinterpret_cast<uint64_t (__fastcall*)(void*)>(g_cimg + shop::kUpdateRva)(client); }
 bool g_withLiveryCam = false;   // installShopTargets also gives the F229 hook its synthetic function
@@ -2048,6 +2070,8 @@ void installShopTargets(const CtlPages& p, int badShop = -1) {
     if (g_withLiveryCam) {   // F229, F230
         tt.liveryCameraSetup = b + shop::kSetupRva;
         tt.liveryCameraUpdate = b + shop::kUpdateRva;
+        tt.previewSetCamera = b + previewcam::kSetCameraRva;   // F231
+        tt.previewRelease = b + previewcam::kReleaseRva;
     }
     nofoothookstest::setTargets(tt);
     nofoothookstest::setHeadImage(b, kCImgSize);
@@ -2705,6 +2729,50 @@ void testShopGlue(const CtlPages& p) {
         livUpdate(cl);
         rig.boundary();
         check(countRepairs() == 0, "F230: with the Livery screen closed the Update runs nothing");
+        t::shopClock(0);
+        t::reset();
+    }
+    {   // F231: the camera controller's SetCamera and Release hooks over synthetic functions: log only, forwarded unchanged
+        Rig rig;
+        g_withLiveryCam = true;
+        start(rig);
+        g_withLiveryCam = false;
+        check(t::hookState(t::kPreviewSetCamera) == 1 && t::hookState(t::kPreviewRelease) == 1 && t::stolenBytes(t::kPreviewSetCamera) == 5 && t::stolenBytes(t::kPreviewRelease) == 5 &&
+                  t::gateOpen(t::kPreviewSetCamera) && t::gateOpen(t::kPreviewRelease),
+              "F231: both hooks are armed over their synthetic functions (five bytes stolen from each), their gates open while the native key is on");
+        t::shopClock(300000);
+        const char* camName = "Livery Camera";
+        check(previewSetCamera(camName, 1) == 0x5A80 && previewRelease() == 0x5A90, "F231: the originals run and their results are returned unchanged (0x5A80, 0x5A90)");
+        rig.boundary();
+        const std::string tid = std::to_string(GetCurrentThreadId());
+        check(rig.cap.count(("preview camera (F231): SetCamera at 300000 ms, thread " + tid + ", called from +0x0 (another caller), camera name \"Livery Camera\", force 1").c_str()) == 1 &&
+                  rig.cap.count(("preview camera (F231): Release at 300000 ms, thread " + tid + ", called from +0x0").c_str()) == 1,
+              "F231: each call is logged once with its time, thread, return address (outside the image here: +0x0), the camera name and the force byte");
+        // a name that is a string object (the state machine handle's shape) is read through it
+        static ShopHandle handle;
+        handle.init("Cockpit Camera");
+        rig.cap.clear();
+        check(previewSetCamera(&handle, 0x101) == 0x5A80, "F231: the original runs for a string-object name too");
+        rig.boundary();
+        check(rig.cap.count("camera name \"Cockpit Camera\" (read through a string object), force 1") == 1, "F231: a name that is a string object is read through it, and the force is r8's low byte alone");
+        // a name that cannot be read is '?'
+        rig.cap.clear();
+        previewSetCamera(reinterpret_cast<const void*>(0x10), 0);
+        rig.boundary();
+        check(rig.cap.count("camera name \"?\", force 0") == 1, "F231: an unreadable name is logged as '?' and the call is forwarded");
+        // the cap: 40 SetCamera lines in ten seconds, the rest counted
+        rig.cap.clear();
+        for (int batch = 0; batch < 5; ++batch) {   // 20 calls a frame, under the ring's 32
+            for (int i = 0; i < 20; ++i) previewSetCamera(camName, 0);
+            rig.boundary();
+        }
+        check(rig.cap.count("preview camera (F231): SetCamera at") == 40, "F231: at most 40 SetCamera lines in ten seconds are written");
+        rig.cap.clear();
+        t::shopClock(311000);
+        previewSetCamera(camName, 0);
+        rig.boundary();
+        check(rig.cap.count("preview camera (F231): 60 SetCamera lines in the last 10 s were not written (at most 40 in any ten seconds)") == 1,
+              "F231: the next window says how many the last one dropped, once");
         t::shopClock(0);
         t::reset();
     }

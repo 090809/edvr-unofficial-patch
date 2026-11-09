@@ -12477,6 +12477,7 @@ H_SHOP = "shop screens (F209)"
 H_SHOP_BUY_CLASSES = ("SuitVendorInteraction", "WeaponsVendorInteraction")   # the buy screens: the Livery screens (F228) and the loadout browser (F229) are watched, and never hold the signal
 H_LIVCAM = "livery camera (F229)"
 H_LIVREP = "livery camera repair (F230)"
+H_PREVCAM = "preview camera (F231)"
 F107_SHOWROOM_MAX_M = 50.0   # F209: a distance-test episode whose first camera stood over F107's 3 m and no farther than this from the neck is the size of a showroom's camera (the suit shop's: 3.6 to 3.7 m)
 
 
@@ -12661,6 +12662,52 @@ def _hj_livrep(rows, ctx):
     if keyon and invalid_setups and not retries and not stood:
         problems.append("%d Livery setup(s) left the camera node INVALID and no repair ran (the Update did not reach the gates)" % len(invalid_setups))
     text = "; ".join(parts)
+    if problems:
+        return ("PARTIAL", text + "; " + "; ".join(problems))
+    return ("OK", text)
+
+
+def _hj_prevcam(rows, ctx):
+    """F231: the preview camera patch (preview_camera_core.h, TEMPORARY key experimental.native_on_foot_preview_camera): `45 33 C0 -> 41 B0 01` at +0x126FE70 forces every preview client's
+    camera request, applied while native on foot VR is active with the HUD override held; plus the two log-only hooks on SetCamera and Release. The summary counts the patch's edges, the SetCamera
+    calls from a preview client (return address +0x126FE81) by name and force byte, and the Releases. PARTIAL when a hook stood down, the patch was refused, not restored or could not be restored,
+    calls were lost or capped, or the key was on and a preview client asked for a camera with force 0 and the patch never applied."""
+    kinds = ("hook", "key", "applied", "restored", "refused", "notrestored", "retry", "setcam", "release", "capped", "lost")
+    if not any(rows.get(k) for k in kinds):
+        return None
+    hooks, keys = rows.get("hook", []), rows.get("key", [])
+    applied, restored, refused = rows.get("applied", []), rows.get("restored", []), rows.get("refused", [])
+    setcams, releases = rows.get("setcam", []), rows.get("release", [])
+    preview = [r for r in setcams if r["who"] == "a preview client"]
+    parts = []
+    stood = sorted({r["hook"] for r in hooks if r["st"] == "stood down"})
+    if hooks:
+        parts.append("hooks: %d armed%s" % (len({r["hook"] for r in hooks if r["st"] == "armed"}), (", stood down: " + ", ".join(stood)) if stood else ""))
+    if keys:
+        parts.append("key %s" % ", ".join(sorted({r["key"] for r in keys})))
+    parts.append("patch applied %d, restored %d" % (len(applied), len(restored)))
+    if setcams:
+        names = collections.Counter(r["name"] for r in preview)
+        forces = sorted({r["force"] for r in preview})
+        parts.append("%d SetCamera call(s), %d from a preview client (names %s; force %s)" % (
+            len(setcams), len(preview), ", ".join("\"%s\" x%d" % (n, c) for n, c in sorted(names.items())) or "none", ", ".join(forces) or "none"))
+    if releases:
+        parts.append("%d Release call(s)" % len(releases))
+    text = "; ".join(parts)
+    problems = []
+    if stood:
+        problems.append("hook(s) stood down: %s" % ", ".join(stood))
+    if refused:
+        problems.append("the patch was refused %d time(s) (%s)" % (len(refused), refused[-1]["why"][:80]))
+    if rows.get("notrestored") or rows.get("retry"):
+        problems.append("the patch could not be put back cleanly (%d not restored, %d retried)" % (len(rows.get("notrestored", [])), len(rows.get("retry", []))))
+    if rows.get("lost"):
+        problems.append("%d call(s) were not recorded" % _hsum(rows["lost"], "n"))
+    if rows.get("capped"):
+        problems.append("%d line(s) were not written (the cap of 40 in ten seconds)" % _hsum(rows["capped"], "n"))
+    keyon = bool(keys) and keys[-1]["key"] == "on"
+    if keyon and not applied and not refused and any(r["force"] == "0" for r in preview):
+        problems.append("a preview client asked for its camera with force 0 and the patch never applied")
     if problems:
         return ("PARTIAL", text + "; " + "; ".join(problems))
     return ("OK", text)
@@ -17949,6 +17996,20 @@ HEALTH_RULES = (
                   r"thread (?P<tid>\d+)\), camera node INVALID before, (?P<after>valid|INVALID|unreadable|the call faulted) after"),
         ("lost", r"livery camera repair \(F230\): (?P<n>\d+) repair line\(s\) were not recorded"),
     ), _hj_livrep),
+    _hrule(H_PREVCAM, ("F231",), ("(F231",), (
+        ("hook", r"avatar hooks: (?P<hook>preview-camera-(?:set|release)) hook (?P<st>armed|stood down)"),
+        ("key", r"native on foot preview camera \(F231, TEMPORARY\): experimental\.native_on_foot_preview_camera is (?P<key>on|off) -- .*"),
+        ("applied", r"native on foot preview camera \(F231, TEMPORARY\): patch EliteDangerous64\.exe\+0x126FE70 45 33 C0 -> 41 B0 01 \(.*"),
+        ("restored", r"native on foot preview camera \(F231, TEMPORARY\): patch EliteDangerous64\.exe\+0x126FE70 41 B0 01 -> 45 33 C0 \(restored: (?P<why>.*)\)$"),
+        ("refused", r"native on foot preview camera \(F231, TEMPORARY\): patch EliteDangerous64\.exe\+0x126FE70 NOT patched -- (?P<why>.*)$"),
+        ("notrestored", r"native on foot preview camera \(F231, TEMPORARY\): patch EliteDangerous64\.exe\+0x126FE70 NOT restored -- .*"),
+        ("retry", r"native on foot preview camera \(F231, TEMPORARY\): patch EliteDangerous64\.exe\+0x126FE70 could not be restored .*"),
+        ("setcam", r"preview camera \(F231\): SetCamera at (?P<ms>\d+) ms, thread (?P<tid>\d+), called from \+0x(?P<ret>[0-9A-F]+) \((?P<who>a preview client|another caller)\), "
+                   r"camera name \"(?P<name>[^\"]*)\"(?P<via> \(read through a string object\))?, force (?P<force>\d+)$"),
+        ("release", r"preview camera \(F231\): Release at (?P<ms>\d+) ms, thread (?P<tid>\d+), called from \+0x(?P<ret>[0-9A-F]+)$"),
+        ("capped", r"preview camera \(F231\): (?P<n>\d+) (?P<what>SetCamera|Release) lines in the last 10 s were not written"),
+        ("lost", r"preview camera \(F231\): (?P<n>\d+) call\(s\) were not recorded"),
+    ), _hj_prevcam),
     _hrule(H_F212, ("F212",), ("(F212)",), (
         ("hook", r"avatar hooks: (?P<hook>conversation-look) hook (?P<st>armed|stood down)(?:: (?P<why>.*?)(?:\. the conversation look \(F212\) is not held.*)?)?$"),
         ("began", r"conversation look \(F212\): run (?P<n>\d+) began: .*\|yaw\| (?P<yaw>[\d.]+) and \|pitch\| (?P<pitch>[\d.]+) asked in its first frames"),
@@ -19848,6 +19909,7 @@ def self_test_health():
         f205src = read_text(os.path.join(repo_root(), "src", "d3d11", "native_on_foot_f205.h"))   # F205: the ADS view circle's press, runtime and override lines
         c1src = read_text(c1_path)
         shopsrc = read_text(os.path.join(repo_root(), "src", "d3d11", "shop_screen_core.h"))   # F209: the buy screens' event, signal and one-second lines
+        previewsrc = read_text(os.path.join(repo_root(), "src", "d3d11", "preview_camera_core.h"))   # F231: the preview camera patch's and the two hooks' lines
         f212src = read_text(os.path.join(repo_root(), "src", "d3d11", "native_on_foot_f212.h"))   # F212: the conversation look's run and summary lines
         probesrc = read_text(probe_path)
     except OSError as e:
@@ -20267,6 +20329,15 @@ def self_test_health():
             fmts[key] = health_c_format(shopsrc, needle)
         if fmts[key] is None:
             raise AssertionError("shop_screen_core.h has no format holding %r: the --health rule that reads it is out of date" % needle)
+        return health_render(fmts[key], vals)
+
+    def RP(needle, *vals):
+        """F231's lines (the patch's events, the key and the two hooks' calls in preview_camera_core.h), from their own format literals."""
+        key = "preview:" + needle
+        if key not in fmts:
+            fmts[key] = health_c_format(previewsrc, needle)
+        if fmts[key] is None:
+            raise AssertionError("preview_camera_core.h has no format holding %r: the --health rule that reads it is out of date" % needle)
         return health_render(fmts[key], vals)
 
     def R212(needle, *vals):
@@ -22669,6 +22740,36 @@ def self_test_health():
         check("F230: the Update hook stood down with the key on is PARTIAL", [neck(), HOOK_DOWN230, KEY_ON230], 0, [("PARTIAL", H_LIVREP)], has=["Update hook stood down", "the repair did not run"])
         check("F230: retry lines that were not recorded are PARTIAL", [neck(), HOOK_UP230, KEY_ON230, RETRY_OK230, LOST230], 0, [("PARTIAL", H_LIVREP)], has=["2 retry line(s) were not recorded"])
         check("F230: a line that drifted from its pattern is unparsed", [neck(), "livery camera repair (F230): the setup is somewhere else"], 4, [("UNPARSED", H_LIVREP)])
+
+        # ---- the preview camera patch (F231): the key, the patch's edges, the two hooks' calls ----
+        TAG231P = "native on foot preview camera (F231, TEMPORARY):"
+        TAG231H = "preview camera (F231):"
+        HOOK_UP231 = RH("hook armed: EliteDangerous64.exe+0x%llX", "avatar hooks:", "preview-camera-set", 0x1D7BEC0, "local camera controller SetCamera(name, force) (slot +0x30)", 0x7FF601D7BEC0, 5, 20, 20, 0x7FF700000000,
+                        RHT("the preview camera evidence (F231)"))
+        HOOK_DOWN231 = RH("hook stood down: %s. %s", "avatar hooks:", "preview-camera-release", "the game build differs (the PE timestamp or image size is not build 334925's); EliteDangerous64.exe+0x1D7C1E0 was not touched",
+                          RHT("the camera controller's SetCamera and Release calls (F231) are not logged"))
+        KEY_ON231 = RP("%s %s is %s -- %s", TAG231P, "experimental.native_on_foot_preview_camera", "on", "while native stereo is on foot every preview client's camera request is forced")
+        KEY_OFF231 = RP("%s %s is %s -- %s", TAG231P, "experimental.native_on_foot_preview_camera", "off", "the game's camera request is left as it is")
+        APPLIED231 = RP("45 33 C0 -> 41 B0 01 (every preview client", TAG231P, 0x126FE70)
+        RESTORED231 = RP("41 B0 01 -> 45 33 C0 (restored: %s)", TAG231P, 0x126FE70, "the game session ended")
+        REFUSED231 = RP("NOT patched -- the %u bytes at", TAG231P, 0x126FE70, 21, 0x126FE6C, "48 8B 53 50 44 33 C0", "48 8B 53 50 45 33 C0")
+        SETCAM_PREV231 = RP("SetCamera at %llu ms", TAG231H, 123456, 7, 0x126FE81, "a preview client", "Livery Camera", "", 1)
+        SETCAM_PREV0_231 = RP("SetCamera at %llu ms", TAG231H, 123456, 7, 0x126FE81, "a preview client", "Livery Camera", "", 0)
+        SETCAM_OTHER231 = RP("SetCamera at %llu ms", TAG231H, 123500, 7, 0x2889F95, "another caller", "Cockpit Camera", " (read through a string object)", 0)
+        RELEASE231 = RP("Release at %llu ms", TAG231H, 124000, 7, 0x126FE90)
+        CAPPED231 = RP("%s lines in the last 10 s were not written", TAG231H, 12, "SetCamera", 40)
+        LOST231 = RP("call(s) were not recorded", TAG231H, 3)
+        check("F231: the key on, the patch applied and put back, a preview client's SetCamera forced and a Release is OK",
+              [neck(), HOOK_UP231, KEY_ON231, APPLIED231, SETCAM_PREV231, SETCAM_OTHER231, RELEASE231, RESTORED231, neck()], 0, [("OK", H_PREVCAM)],
+              has=["hooks: 1 armed", "key on", "patch applied 1, restored 1", "2 SetCamera call(s), 1 from a preview client (names \"Livery Camera\" x1; force 1)", "1 Release call(s)"], lacks=["UNPARSED"])
+        check("F231: the key off with only the evidence lines is OK", [neck(), HOOK_UP231, KEY_OFF231, SETCAM_PREV0_231, RELEASE231], 0, [("OK", H_PREVCAM)], has=["key off", "force 0"], lacks=["never applied"])
+        check("F231: the key on, a preview client asked with force 0 and the patch never applied is PARTIAL", [neck(), HOOK_UP231, KEY_ON231, SETCAM_PREV0_231], 0, [("PARTIAL", H_PREVCAM)],
+              has=["a preview client asked for its camera with force 0 and the patch never applied"])
+        check("F231: a refused patch is PARTIAL and says why", [neck(), HOOK_UP231, KEY_ON231, REFUSED231], 0, [("PARTIAL", H_PREVCAM)], has=["the patch was refused 1 time(s)", "the 21 bytes at +0x126FE6C"])
+        check("F231: a hook that stood down is PARTIAL", [neck(), HOOK_DOWN231, KEY_ON231, APPLIED231], 0, [("PARTIAL", H_PREVCAM)], has=["stood down: preview-camera-release"])
+        check("F231: calls that were not recorded and lines the cap dropped are PARTIAL", [neck(), HOOK_UP231, KEY_ON231, APPLIED231, LOST231, CAPPED231], 0, [("PARTIAL", H_PREVCAM)],
+              has=["3 call(s) were not recorded", "12 line(s) were not written (the cap of 40 in ten seconds)"])
+        check("F231: a line that drifted from its pattern is unparsed", [neck(), "preview camera (F231): SetCamera somewhere else"], 4, [("UNPARSED", H_PREVCAM)])
 
         # ---- the conversation look (F212): the leaf that sets the look springs' targets is held at 0 while native on foot is active ----
         S212 = "conversation look (F212)"

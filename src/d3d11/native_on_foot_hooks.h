@@ -266,6 +266,7 @@ struct NativeOnFootHooksTestTargets {
     uintptr_t conversationLook = 0;   // F212: the conversation look's hook is tried only when a target is given here
     uintptr_t liveryCameraSetup = 0;  // F229: the preview client's scene setup hook is tried only when a target is given here
     uintptr_t liveryCameraUpdate = 0; // F230: the preview client's Update hook (the repair), likewise
+    uintptr_t previewSetCamera = 0, previewRelease = 0;   // F231: the camera controller's SetCamera and Release hooks (log only), likewise
 };
 namespace nofoothookstest {
 constexpr int kController = 0, kFade = 1, kFind = 2;   // the hooks, in the order stolenBytes, hookState and gateOpen take them
@@ -273,6 +274,7 @@ constexpr int kShopShow = 3, kShopClose = 4, kShopSetState = 5, kKioskStart = 6,
 constexpr int kConversationLook = 8;   // F212
 constexpr int kLiveryCameraSetup = 9;  // F229
 constexpr int kLiveryCameraUpdate = 10; // F230
+constexpr int kPreviewSetCamera = 11, kPreviewRelease = 12;   // F231
 void setTargets(const NativeOnFootHooksTestTargets& targets);
 void setFadeGlobal(int32_t* mode, float* amount);   // the synthetic dither-fade global and its amount float (null: the build's real addresses)
 void setHeadImage(uintptr_t base, size_t size);     // the rig's synthetic game image for the skeleton reads' arming (base 0: the real module)

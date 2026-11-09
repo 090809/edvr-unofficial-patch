@@ -8,6 +8,7 @@
 #pragma once
 
 #include "../../src/d3d11/native_on_foot_f107.h"
+#include "../../src/d3d11/preview_camera_core.h"
 #include "../../src/d3d11/shop_screen_core.h"
 
 #include <algorithm>
@@ -624,6 +625,202 @@ inline void run209(Check&& check) {
         check(has_(ini, "# ui: Livery camera repair | choices on, off | recommended on | live\nnative_on_foot_livery_camera_repair = on\n") && has_(ini, "# TEMPORARY (F230): Livery camera repair") &&
                   has_(ini, "The preview stands beside the panel instead of around you.") && ini.find("native_on_foot_livery_camera_repair = on") > ini.find("native_on_foot_livery_game_view = on"),
               "F230: the shipped key is on, TEMPORARY, with its ui line after the F228 row and the plain sentence of what the user gets");
+    }
+    // ---- 10. F231: the preview camera patch (TEMPORARY key): the bytes, when it is wanted, the step against synthetic bytes, the lines ---------------------------------------------------------------
+    {
+        namespace pc = edvr::previewcam;
+        check(pc::kPatchRva == 0x126FE70 && pc::kVerifyRva == 0x126FE6C && pc::kVerifyLen == 21 && pc::kPatchLen == 3 && (pc::kPatchRva & 7u) == 0 && pc::kSetCameraRva == 0x1D7BEC0 && pc::kReleaseRva == 0x1D7C1E0 &&
+                  pc::kPreviewCallerRva == 0x126FE81 && std::strcmp(pc::kKey, "experimental.native_on_foot_preview_camera") == 0,
+              "F231: the patch's address 0x126FE70 (an aligned qword), the 21 verified bytes from 0x126FE6C, SetCamera 0x1D7BEC0, Release 0x1D7C1E0, the preview client's return address 0x126FE81, the key's name");
+        bool onlyThree = true;
+        for (size_t i = 0; i < pc::kVerifyLen; ++i) {
+            const bool inPatch = i >= 4 && i < 7;
+            onlyThree = onlyThree && (inPatch ? pc::kVerifyFrom[i] != pc::kVerifyTo[i] : pc::kVerifyFrom[i] == pc::kVerifyTo[i]);
+        }
+        check(onlyThree && pc::kVerifyFrom[4] == 0x45 && pc::kVerifyFrom[5] == 0x33 && pc::kVerifyFrom[6] == 0xC0 && pc::kVerifyTo[4] == 0x41 && pc::kVerifyTo[5] == 0xB0 && pc::kVerifyTo[6] == 0x01 &&
+                  pc::kFrom3[0] == 0x45 && pc::kTo3[2] == 0x01 && pc::kVerifyFrom[20] == 0x30,
+              "F231: xor r8d,r8d (45 33 C0) becomes mov r8b,1 (41 B0 01) and nothing else of the 21 bytes differs");
+        check(pc::kSetCameraPrologueBytes == 20 && pc::kSetCameraPrologue[0] == 0x48 && pc::kSetCameraPrologue[4] == 0x18 && pc::kSetCameraPrologue[13] == 0x48 && pc::kSetCameraPrologue[19] == 0x50 &&
+                  pc::kReleasePrologueBytes == 13 && pc::kReleasePrologue[0] == 0x48 && pc::kReleasePrologue[4] == 0x10 && pc::kReleasePrologue[12] == 0xF9,
+              "F231: SetCamera's 20 and Release's 13 prologue bytes are the exe's (five bytes stolen from each: a whole first instruction)");
+        // when it is wanted: the key, native on foot, the HUD override held and the session, all four
+        bool onlyAll = true, reasonsRight = true;
+        for (int m = 0; m < 16; ++m) {
+            const bool k = (m & 1) != 0, n = (m & 2) != 0, h = (m & 4) != 0, s = (m & 8) != 0;
+            const char* why = pc::notWantedWhy(k, n, h, s);
+            onlyAll = onlyAll && ((why == nullptr) == (k && n && h && s));
+            if (!k) reasonsRight = reasonsRight && why && std::strcmp(why, "experimental.native_on_foot_preview_camera is off") == 0;
+            else if (!n) reasonsRight = reasonsRight && why && std::strcmp(why, "native stereo on foot ended") == 0;
+            else if (!h) reasonsRight = reasonsRight && why && std::strcmp(why, "the first-person HUD override is off") == 0;
+            else if (!s) reasonsRight = reasonsRight && why && std::strcmp(why, "the game session ended") == 0;
+        }
+        check(onlyAll && reasonsRight, "F231: of the sixteen combinations of the key, native on foot, the HUD override and the session only all four want the patch; each other says which one is missing, in that order");
+        // the step against a synthetic image of the 21 bytes and the qword they sit in
+        struct Fake {
+            uint8_t mem[32] = {};
+            bool readable = true, casWorks = true;
+            int casCalls = 0, interfere = 0;   // interfere: the first n compare-exchanges find the qword changed under them
+            uint64_t lastExpected = 0, lastDesired = 0;
+            void seed(const uint8_t* bytes) { std::memset(mem, 0xEE, sizeof(mem)); std::memcpy(mem, bytes, pc::kVerifyLen); const uint8_t extra[4] = {0x11, 0x22, 0x33, 0x44}; std::memcpy(mem + 21, extra, 4); }
+            bool read(uintptr_t rva, uint8_t* out, size_t n) { if (!readable) return false; std::memcpy(out, mem + (rva - pc::kVerifyRva), n); return true; }
+            bool cas(uintptr_t rva, uint64_t expected, uint64_t desired) {
+                ++casCalls;
+                lastExpected = expected;
+                lastDesired = desired;
+                if (!casWorks || interfere > 0) { if (interfere > 0) --interfere; return false; }
+                uint64_t cur;
+                std::memcpy(&cur, mem + (rva - pc::kVerifyRva), 8);
+                if (cur != expected) return false;
+                std::memcpy(mem + (rva - pc::kVerifyRva), &desired, 8);
+                return true;
+            }
+        };
+        auto run = [](Fake& f, pc::Patch& p, bool want, bool id, uint8_t* seen) {
+            return pc::step(p, want, id, [&](uintptr_t r, uint8_t* o, size_t n) { return f.read(r, o, n); }, [&](uintptr_t r, uint64_t e, uint64_t d) { return f.cas(r, e, d); }, seen);
+        };
+        uint8_t seen[pc::kVerifyLen] = {};
+        {
+            Fake f;
+            f.seed(pc::kVerifyFrom);
+            pc::Patch p;
+            check(run(f, p, false, true, seen) == pc::Event::kNone && !p.applied && f.casCalls == 0, "F231: not wanted and not applied: nothing is read or written");
+            const pc::Event e = run(f, p, true, true, seen);
+            check(e == pc::Event::kApplied && p.applied && f.casCalls == 1 && std::memcmp(f.mem, pc::kVerifyTo, pc::kVerifyLen) == 0 && f.mem[21] == 0x11 && f.mem[24] == 0x44,
+                  "F231: wanted with the 21 bytes as the exe has them: applied in ONE compare-exchange, the 21 bytes now read mov r8b,1 and the bytes after them are untouched");
+            check((f.lastDesired & 0xFFFFFFull) == 0x01B041ull && ((f.lastDesired >> 24) == (f.lastExpected >> 24)),
+                  "F231: the qword written is the qword read with only its first three bytes replaced (41 B0 01): the other five are carried through");
+            check(run(f, p, true, true, seen) == pc::Event::kNone && f.casCalls == 1, "F231: wanted and already applied: nothing more is written");
+            f.mem[21] = 0x99;
+            check(run(f, p, false, true, seen) == pc::Event::kRestored && !p.applied && std::memcmp(f.mem, pc::kVerifyFrom, pc::kVerifyLen) == 0 && f.casCalls == 2 && f.mem[21] == 0x99,
+                  "F231: no longer wanted: the verified bytes still read as ours, so xor r8d,r8d is written back in one compare-exchange and a byte outside the three is not touched");
+            check(run(f, p, false, true, seen) == pc::Event::kNone && f.casCalls == 2, "F231: and put back once only");
+        }
+        {   // every state combination from a clean image and from an applied one
+            bool right = true;
+            for (int m = 0; m < 16; ++m) {
+                const bool want = pc::notWantedWhy((m & 1) != 0, (m & 2) != 0, (m & 4) != 0, (m & 8) != 0) == nullptr;
+                Fake f;
+                f.seed(pc::kVerifyFrom);
+                pc::Patch p;
+                right = right && (run(f, p, want, true, seen) == (want ? pc::Event::kApplied : pc::Event::kNone)) && p.applied == want;
+                Fake g;
+                g.seed(pc::kVerifyFrom);
+                pc::Patch q;
+                run(g, q, true, true, seen);
+                right = right && (run(g, q, want, true, seen) == (want ? pc::Event::kNone : pc::Event::kRestored)) && q.applied == want &&
+                        std::memcmp(g.mem, want ? pc::kVerifyTo : pc::kVerifyFrom, pc::kVerifyLen) == 0;
+            }
+            check(right, "F231: for every combination of the key, native on foot, the HUD override and the session: applied exactly when all four hold, and an applied patch is restored exactly when one stops holding");
+        }
+        {   // refusals
+            Fake f;
+            f.seed(pc::kVerifyFrom);
+            pc::Patch p;
+            check(run(f, p, true, false, seen) == pc::Event::kRefusedIdentity && !p.applied && f.casCalls == 0, "F231: a build whose identity differs: refused, nothing read or written");
+            f.readable = false;
+            check(run(f, p, true, true, seen) == pc::Event::kRefusedUnreadable && !p.applied && f.casCalls == 0, "F231: bytes that cannot be read: refused");
+            f.readable = true;
+            f.mem[4] = 0x44;   // someone else's byte inside the instruction
+            std::memset(seen, 0, sizeof(seen));
+            check(run(f, p, true, true, seen) == pc::Event::kRefusedBytes && !p.applied && f.casCalls == 0 && seen[4] == 0x44, "F231: a byte that is not the exe's: refused with the bytes found, nothing written");
+            f.seed(pc::kVerifyFrom);
+            f.mem[20] = 0x31;   // the last byte of the call instruction
+            check(run(f, p, true, true, seen) == pc::Event::kRefusedBytes && f.casCalls == 0, "F231: the whole 21 bytes are checked, the last one too");
+            f.seed(pc::kVerifyFrom);
+            f.interfere = 1;
+            check(run(f, p, true, true, seen) == pc::Event::kRefusedWrite && !p.applied && std::memcmp(f.mem, pc::kVerifyFrom, pc::kVerifyLen) == 0, "F231: the qword changed under the write: the compare-exchange fails, nothing is written, not applied");
+            check(run(f, p, true, true, seen) == pc::Event::kApplied && p.applied, "F231: ... and the next tick applies it");
+            f.interfere = 1;
+            check(run(f, p, false, true, seen) == pc::Event::kRestoreRetry && p.applied && std::memcmp(f.mem, pc::kVerifyTo, pc::kVerifyLen) == 0, "F231: a restore whose compare-exchange fails stays applied and is retried");
+            check(run(f, p, false, true, seen) == pc::Event::kRestored && !p.applied, "F231: ... and succeeds next tick");
+            f.seed(pc::kVerifyFrom);
+            pc::Patch q;
+            run(f, q, true, true, seen);
+            f.mem[5] = 0x77;   // another writer changed the patched bytes
+            const int calls = f.casCalls;
+            check(run(f, q, false, true, seen) == pc::Event::kNotRestoredBytes && !q.applied && f.casCalls == calls, "F231: bytes that no longer read as ours are not written back: the patch is let go");
+            f.seed(pc::kVerifyFrom);
+            pc::Patch r;
+            run(f, r, true, true, seen);
+            f.readable = false;
+            check(run(f, r, false, true, seen) == pc::Event::kNone && r.applied, "F231: an unreadable restore is retried next frame, the patch stays ours");
+        }
+        char line[1100];
+        uint8_t shown[pc::kVerifyLen];
+        std::memcpy(shown, pc::kVerifyFrom, sizeof(shown));
+        shown[4] = 0x44;
+        pc::formatEvent(line, sizeof(line), pc::Event::kApplied, "", shown);
+        const std::string applied = line;
+        pc::formatEvent(line, sizeof(line), pc::Event::kRestored, "the game session ended", shown);
+        const std::string restored = line;
+        pc::formatEvent(line, sizeof(line), pc::Event::kRefusedBytes, "", shown);
+        const std::string refusedBytes = line;
+        pc::formatEvent(line, sizeof(line), pc::Event::kNotRestoredBytes, "native stereo on foot ended", shown);
+        const std::string notRestored = line;
+        check(applied == "native on foot preview camera (F231, TEMPORARY): patch EliteDangerous64.exe+0x126FE70 45 33 C0 -> 41 B0 01 (every preview client's camera request is forced; written as one interlocked qword)" &&
+                  restored == "native on foot preview camera (F231, TEMPORARY): patch EliteDangerous64.exe+0x126FE70 41 B0 01 -> 45 33 C0 (restored: the game session ended)" &&
+                  has_(refusedBytes, "NOT patched -- the 21 bytes at +0x126FE6C are 48 8B 53 50 44 33 C0") && has_(refusedBytes, "not 48 8B 53 50 45 33 C0 4C 8B 08") && has_(refusedBytes, "someone else's and are left alone") &&
+                  has_(notRestored, "NOT restored -- the bytes are 48 8B 53 50 44 33 C0") && has_(notRestored, "not ours (restore: native stereo on foot ended)"),
+              "F231: the applied, restored, refused and not-restored lines name the address, the shape, the bytes found and expected, and why");
+        pc::formatEvent(line, sizeof(line), pc::Event::kRefusedIdentity, "", shown);
+        const std::string ident = line;
+        pc::formatEvent(line, sizeof(line), pc::Event::kRestoreRetry, "the game session ended", shown);
+        check(has_(ident, "NOT patched -- the game build differs") && has_(std::string(line), "could not be restored (the game session ended); retrying each frame."), "F231: the identity refusal and the restore retry say so");
+        pc::formatKey(line, sizeof(line), true);
+        const std::string keyOn = line;
+        pc::formatKey(line, sizeof(line), false);
+        check(keyOn.rfind("native on foot preview camera (F231, TEMPORARY): experimental.native_on_foot_preview_camera is on -- ", 0) == 0 && has_(keyOn, "show the preview from their own camera") &&
+                  has_(std::string(line), "experimental.native_on_foot_preview_camera is off -- the game's camera request is left as it is"),
+              "F231: the key's line says what each value does");
+        pc::CallEvent ev;
+        ev.kind = pc::kSetCamera;
+        ev.tid = 7;
+        ev.atMs = 123456;
+        ev.retRva = 0x126FE81;
+        ev.force = 1;
+        std::snprintf(ev.name, sizeof(ev.name), "Livery Camera");
+        pc::formatCall(line, sizeof(line), ev);
+        const std::string setCam = line;
+        ev.retRva = 0x1234;
+        ev.viaObject = true;
+        ev.force = 0;
+        pc::formatCall(line, sizeof(line), ev);
+        const std::string setOther = line;
+        ev.kind = pc::kRelease;
+        pc::formatCall(line, sizeof(line), ev);
+        check(setCam == "preview camera (F231): SetCamera at 123456 ms, thread 7, called from +0x126FE81 (a preview client), camera name \"Livery Camera\", force 1" &&
+                  has_(setOther, "called from +0x1234 (another caller)") && has_(setOther, "(read through a string object), force 0") &&
+                  std::string(line) == "preview camera (F231): Release at 123456 ms, thread 7, called from +0x1234",
+              "F231: the SetCamera line names the time, thread, return address (a preview client at +0x126FE81), the name and the force byte; the Release line the time, thread and return address");
+        char name[pc::kNameCopy];
+        std::memset(name, 'A', sizeof(name));
+        std::memcpy(name, "ok\x01\"\xFF" "z", 6);
+        name[sizeof(name) - 1] = 0;
+        pc::sanitizeName(name, sizeof(name));
+        char empty[4] = {0, 0, 0, 0};
+        char text[4] = {'a', 0, 0, 0};
+        check(std::strncmp(name, "ok???z", 6) == 0 && std::strlen(name) == sizeof(name) - 1 && !pc::looksLikeText(empty) && pc::looksLikeText(text) && pc::isPreviewCaller(0x126FE81) && !pc::isPreviewCaller(0x126FE80),
+              "F231: a name copy shows control characters, quotes and high bytes as '?', stays bounded, and an empty or non-text copy is not text");
+        pc::formatCapped(line, sizeof(line), "SetCamera", 12, 40);
+        const std::string capped = line;
+        pc::formatLost(line, sizeof(line), 3);
+        check(capped == "preview camera (F231): 12 SetCamera lines in the last 10 s were not written (at most 40 in any ten seconds)" &&
+                  std::string(line) == "preview camera (F231): 3 call(s) were not recorded (the ring was full or a second hook thread was in it)",
+              "F231: the cap's note and the lost-calls note name what was dropped");
+        // the wiring, read as text
+        const std::string hooks = slurp("src/d3d11/native_on_foot_hooks.cpp"), cpp = slurp("src/d3d11/native_on_foot.cpp"), ini = slurp("edvr.ini");
+        check(has_(hooks, "case kHkSetCamera: return reinterpret_cast<const void*>(&previewSetCameraHooked);") && has_(hooks, "case kHkReleaseCam: return reinterpret_cast<const void*>(&previewReleaseHooked);") &&
+                  has_(hooks, "{\"preview-camera-set\"") && has_(hooks, "{\"preview-camera-release\"") && has_(hooks, "g_gate[kHkSetCamera].store(armed(kHkSetCamera) && capture ? 1u : 0u, std::memory_order_release);") &&
+                  has_(hooks, "tryHook(kHkSetCamera, sink);") && has_(hooks, "tryHook(kHkReleaseCam, sink);") && has_(hooks, "reinterpret_cast<uintptr_t>(_ReturnAddress())") &&
+                  countOf(hooks, "return forward(a, b, c, d);") >= 3,
+              "F231: the two log-only hooks are in the hook table, gated and tried with the others, read the caller's return address and forward every call");
+        check(has_(cpp, "cfg.getString(\"experimental.native_on_foot_preview_camera\", \"on\") != \"off\"") && has_(cpp, "previewcam::formatKey(line, sizeof(line), on);") && has_(cpp, "InterlockedCompareExchange64(") &&
+                  has_(cpp, "previewcam::notWantedWhy(g_previewCamKey.load(std::memory_order_relaxed), nativeOnFootActive(), g_hudOverrideHeld, session);") &&
+                  has_(cpp, "previewCameraPatchTick(false, \"the game is shutting down\");") && has_(cpp, "str(\"experimental.native_on_foot_preview_camera\""),
+              "F231: the key is read live, the patch is written by one interlocked compare-exchange on the panel patch's condition, put back at shutdown, and the key is dumped");
+        check(has_(ini, "# ui: Preview screens use their camera | choices on, off | recommended on | live\nnative_on_foot_preview_camera = on\n") && has_(ini, "# TEMPORARY (F231): Preview screens use their camera") &&
+                  has_(ini, "the preview screens (Livery, the shops, the loadout) show the preview from their own camera") && ini.find("native_on_foot_preview_camera = on") > ini.find("native_on_foot_livery_camera_repair = on"),
+              "F231: the shipped key is on, TEMPORARY, with its ui line after F230's and the plain sentence of what the user gets");
     }
 }
 

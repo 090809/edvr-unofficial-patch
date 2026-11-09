@@ -24,6 +24,7 @@
 #include "avatar_hooks_core.h"
 #include "avatar_skeleton_core.h"
 #include "shop_screen_core.h"   // F209: the Pioneer Supplies buy screens' hooks, signal and lines
+#include "preview_camera_core.h"   // F231: the preview camera patch's constants and the two log-only hooks' lines
 #include "native_on_foot_f212.h"   // F212: the conversation look's leaf, its decision, counters and lines
 #include "native_on_foot.h"   // nativeOnFootActive, nativeOnFootCameraExternal and the pose freeze's hand-off (pfz)
 #include "native_on_foot_f95c.h"   // F95c: the head's shadow-only class through the visibility call, the fade hook's action
@@ -54,7 +55,8 @@ namespace {
 // F212 adds one more: the leaf that sets the look springs' targets (the conversation look).
 // F229 adds a read-only one: the Livery preview client's scene setup (the instrument that watches the Livery camera).
 // F230 adds the client's per-frame Update (the Livery camera repair, TEMPORARY key).
-enum Hk : int { kHkCtl = 0, kHkFade, kHkFind, kHkShow, kHkClose, kHkSetState, kHkKioskStart, kHkKioskStop, kHkLook, kHkLiveryCam, kHkLiveryUpdate, kHkCount };
+// F231 adds two log-only ones: the local camera controller's SetCamera and Release (the preview camera patch's evidence).
+enum Hk : int { kHkCtl = 0, kHkFade, kHkFind, kHkShow, kHkClose, kHkSetState, kHkKioskStart, kHkKioskStop, kHkLook, kHkLiveryCam, kHkLiveryUpdate, kHkSetCamera, kHkReleaseCam, kHkCount };
 constexpr bool isShopHook(int id) { return id >= kHkShow && id <= kHkKioskStop; }
 struct HookSpec {
     const char* label;      // the log's name for it
@@ -85,6 +87,10 @@ const HookSpec kSpec[kHkCount] = {
      shop::kSetupPrologue, shop::kSetupPrologueBytes},
     {"livery-camera-update", "CustomisationVisual preview client's per-frame Update (the Livery camera repair runs the setup again from it)", "avatar-hooks-livery-camera-update", shop::kUpdateRva,
      shop::kUpdatePrologue, shop::kUpdatePrologueBytes},
+    {"preview-camera-set", "local camera controller SetCamera(name, force) (slot +0x30)", "avatar-hooks-preview-camera-set", previewcam::kSetCameraRva, previewcam::kSetCameraPrologue,
+     previewcam::kSetCameraPrologueBytes},
+    {"preview-camera-release", "local camera controller Release (back to the first-person camera)", "avatar-hooks-preview-camera-release", previewcam::kReleaseRva, previewcam::kReleasePrologue,
+     previewcam::kReleasePrologueBytes},
 };
 
 // ---- state shared between the threads --------------------------------------------------------------------------------------
@@ -623,6 +629,59 @@ __declspec(noinline) uint64_t shopKiosk(bool start, void* a, void* b, void* c, v
 }
 __declspec(noinline) uint64_t __fastcall shopKioskStartHooked(void* a, void* b, void* c, void* d) noexcept { return shopKiosk(true, a, b, c, d); }
 __declspec(noinline) uint64_t __fastcall shopKioskStopHooked(void* a, void* b, void* c, void* d) noexcept { return shopKiosk(false, a, b, c, d); }
+
+// F231 (log only): SetCamera (the local camera controller's slot +0x30; rdx the camera name, r8's low byte the force flag) and Release. Each call is described (time, thread, the return address as an RVA,
+// the name as a bounded guarded copy, the force byte) and queued, then forwarded unchanged: no game call, no write. The callback is entered by a jump from the relay, so _ReturnAddress() is the
+// caller's.
+avh::Ring<previewcam::CallEvent, 32> g_previewRing;
+std::atomic<bool> g_previewBusy{false};
+std::atomic<uint64_t> g_previewDrops{0};
+std::atomic<uintptr_t> g_previewBase{0};   // the game image's base, set when either hook arms
+inline void previewPush(const previewcam::CallEvent& e) noexcept {
+    if (g_previewBusy.exchange(true, std::memory_order_acquire)) {
+        g_previewDrops.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    g_previewRing.push(e);
+    g_previewBusy.store(false, std::memory_order_release);
+}
+inline uint64_t previewRetRva(uintptr_t ret) noexcept {
+    const uintptr_t base = g_previewBase.load(std::memory_order_relaxed);
+    return base && ret >= base && ret - base < 0x10000000u ? static_cast<uint64_t>(ret - base) : 0;
+}
+__declspec(noinline) uint64_t __fastcall previewSetCameraHooked(void* a, void* b, void* c, void* d) noexcept {
+    const auto forward = reinterpret_cast<ForwardFn>(g_forward[kHkSetCamera].load(std::memory_order_acquire));
+    if (!forward) return 0;
+    previewcam::CallEvent e;
+    e.kind = previewcam::kSetCamera;
+    e.tid = GetCurrentThreadId();
+    e.atMs = shopNowMs();
+    e.retRva = previewRetRva(reinterpret_cast<uintptr_t>(_ReturnAddress()));
+    e.force = static_cast<uint8_t>(reinterpret_cast<uintptr_t>(c) & 0xFF);
+    const uintptr_t name = reinterpret_cast<uintptr_t>(b);
+    bool text = plausibleUserPointer(name) && sehCopyCString(name, e.name, previewcam::kNameCopy) && previewcam::looksLikeText(e.name);
+    uint64_t str = 0;
+    if (!text && plausibleUserPointer(name) && sehReadU64At(name + shop::kOffHandleName, &str) && plausibleUserPointer(str) &&
+        sehCopyCString(static_cast<uintptr_t>(str) + shop::kOffStringChars, e.name, previewcam::kNameCopy) && previewcam::looksLikeText(e.name)) {
+        text = true;
+        e.viaObject = true;   // the argument was a string object, as the state machine's handle is
+    }
+    if (!text) std::snprintf(e.name, sizeof(e.name), "?");
+    previewcam::sanitizeName(e.name, sizeof(e.name));
+    previewPush(e);
+    return forward(a, b, c, d);
+}
+__declspec(noinline) uint64_t __fastcall previewReleaseHooked(void* a, void* b, void* c, void* d) noexcept {
+    const auto forward = reinterpret_cast<ForwardFn>(g_forward[kHkReleaseCam].load(std::memory_order_acquire));
+    if (!forward) return 0;
+    previewcam::CallEvent e;
+    e.kind = previewcam::kRelease;
+    e.tid = GetCurrentThreadId();
+    e.atMs = shopNowMs();
+    e.retRva = previewRetRva(reinterpret_cast<uintptr_t>(_ReturnAddress()));
+    previewPush(e);
+    return forward(a, b, c, d);
+}
 
 // F229 (read-only): the Livery preview client's scene setup. rcx is the client + 0x58, rdx a scene handle, r8 a pointer to the mode qword (client+0x2E8 gets all eight bytes, client+0x398 the low
 // dword). The call is described (rcx, rcx - 0x58 and r8's low 32 bits, the qword at r8 read under SEH, the thread, which watched screen's object rcx - 0x58 lies in), forwarded unchanged (the original's
@@ -2837,6 +2896,8 @@ const void* callbackFor(int id) {
         case kHkLook: return reinterpret_cast<const void*>(&conversationLookHooked);
         case kHkLiveryCam: return reinterpret_cast<const void*>(&livCamSetupHooked);
         case kHkLiveryUpdate: return reinterpret_cast<const void*>(&livUpdateHooked);
+        case kHkSetCamera: return reinterpret_cast<const void*>(&previewSetCameraHooked);
+        case kHkReleaseCam: return reinterpret_cast<const void*>(&previewReleaseHooked);
         default: return nullptr;
     }
 }
@@ -2912,6 +2973,10 @@ const char* armedRole(int id) {
         case kHkLiveryUpdate:
             return "the Livery camera repair (F230, TEMPORARY key experimental.native_on_foot_livery_camera_repair): the original runs unchanged every time; with the key on, a Livery preview client whose camera node reads "
                    "invalid has the game's own setup run again from here (at most 5 times an open, 0.5 s after the last setup, on the thread that ran it)";
+        case kHkSetCamera:
+        case kHkReleaseCam:
+            return "the preview camera evidence (F231): the original runs and its result is returned unchanged; each call's time, thread, return address and (SetCamera) camera name and force byte are logged; "
+                   "no game call, nothing is written";
         default:
             return "the original runs untouched and the mode byte is read after it, for native on foot's camera signal; nothing is written";
     }
@@ -2930,6 +2995,8 @@ const char* downConsequence(int id) {
         case kHkKioskStop: return "the armoury kiosk's start and stop (F209) are not logged.";
         case kHkLook: return "the conversation look (F212) is not held: the game's conversation may turn the commander's look toward the NPC, as before.";
         case kHkLiveryCam: return "the Livery preview client's setup calls (F229) are not logged; the camera fields are still read once a second.";
+        case kHkSetCamera:
+        case kHkReleaseCam: return "the camera controller's SetCamera and Release calls (F231) are not logged.";
         case kHkLiveryUpdate: return "the Livery camera repair (F230) does not run: a Livery preview whose camera node is invalid stays at the commander, as before.";
         default: return "native on foot's body changes stay on in every camera (the game's third-person camera is not told apart).";
     }
@@ -2948,6 +3015,7 @@ void tryHook(int id, const avh::Sink& sink, bool quiet = false) {
 #endif
             g_shopBase.store(base, std::memory_order_release);
         }
+        if (id == kHkSetCamera || id == kHkReleaseCam) g_previewBase.store(entry.target - spec.rva, std::memory_order_release);   // F231: the return addresses are logged as RVAs
         if (id == kHkLiveryCam || id == kHkLiveryUpdate) g_liveryBase.store(entry.target - spec.rva, std::memory_order_release);   // F229/F230: the node test and the setup are called at base + RVA
         if (id == kHkFind) {
             // The image base is the target minus its RVA (production: target = base + RVA; the rigs place their synthetic functions the same way).
@@ -2991,6 +3059,8 @@ void updateGates() {
     // F229: the Livery setup's callback is open while the native key is on (it is a rare call: a preview scene being set up).
     g_gate[kHkLiveryCam].store(armed(kHkLiveryCam) && capture ? 1u : 0u, std::memory_order_release);
     g_gate[kHkLiveryUpdate].store(armed(kHkLiveryUpdate) && capture ? 1u : 0u, std::memory_order_release);   // F230
+    g_gate[kHkSetCamera].store(armed(kHkSetCamera) && capture ? 1u : 0u, std::memory_order_release);          // F231
+    g_gate[kHkReleaseCam].store(armed(kHkReleaseCam) && capture ? 1u : 0u, std::memory_order_release);
 }
 
 // ---- F209: the frame thread's half of the buy screens --------------------------------------------------------------------------------------------
@@ -3008,6 +3078,8 @@ struct ShopFrame {
     uint64_t setupLostSeen = 0;          // setup calls the ring or the try-flag dropped, already said
     shop::LineCap repairCap;             // F230: the repair's lines
     uint64_t repairLostSeen = 0;
+    shop::LineCap setCameraCap, releaseCap;   // F231: the two hooks' lines, at most 40 in ten seconds each
+    uint64_t previewLostSeen = 0;
 };
 ShopFrame g_shopFrame;   // frame thread only (nativeOnFootShopRead is the frame thread's too)
 
@@ -3143,6 +3215,25 @@ void liveryCameraTick(const avh::Sink& sink) {
         f.setupLostSeen = lost;
         camWrite(f.setupCap, "setup", sink, now, line);
     }
+    previewcam::CallEvent call231;   // F231: the camera controller's calls
+    while (g_previewRing.take(&call231)) {
+        previewcam::formatCall(line, sizeof(line), call231);
+        shop::LineCap& cap = call231.kind == previewcam::kSetCamera ? f.setCameraCap : f.releaseCap;
+        uint32_t summary = 0;
+        const bool ok = cap.allow(now, &summary);
+        if (summary) {
+            char note[avh::kLineBytes];
+            previewcam::formatCapped(note, sizeof(note), call231.kind == previewcam::kSetCamera ? "SetCamera" : "Release", summary, shop::kLinesPer10s);
+            say(sink, "%s", note);
+        }
+        if (ok) say(sink, "%s", line);
+    }
+    const uint64_t previewLost = g_previewRing.lost() + g_previewDrops.load(std::memory_order_relaxed);
+    if (previewLost != f.previewLostSeen) {
+        previewcam::formatLost(line, sizeof(line), previewLost - f.previewLostSeen);
+        f.previewLostSeen = previewLost;
+        say(sink, "%s", line);
+    }
     shop::RepairEvent rep;   // F230
     while (g_repairRing.take(&rep)) {
         shop::formatRepair(line, sizeof(line), rep);
@@ -3187,6 +3278,14 @@ bool liveryCamWanted() {
 #endif
 }
 // F230: the Update hook.
+// F231: the two log-only hooks.
+bool previewHooksWanted() {
+#ifdef EDVR_NATIVE_ON_FOOT_HOOKS_TEST
+    return g_testLiveryCamReal || g_testTargets[kHkSetCamera] != 0 || g_testTargets[kHkReleaseCam] != 0;
+#else
+    return true;
+#endif
+}
 bool liveryUpdateWanted() {
 #ifdef EDVR_NATIVE_ON_FOOT_HOOKS_TEST
     return g_testLiveryCamReal || g_testTargets[kHkLiveryUpdate] != 0;
@@ -3425,6 +3524,10 @@ void boundaryAt(const avh::Sink& sink) {
         if (g_hooks[kHkCtl].state == kHookStateNotTried) tryHook(kHkCtl, sink);
         tryShopHooks(sink);   // F209: optional; a stand-down leaves F107 on its distance test alone
         if (g_hooks[kHkLook].state == kHookStateNotTried && convLookWanted()) tryHook(kHkLook, sink);   // F212: optional; a stand-down leaves the game's conversation look as it was
+        if (previewHooksWanted()) {   // F231: optional, log only; a stand-down says so in one line and loses only the lines
+            if (g_hooks[kHkSetCamera].state == kHookStateNotTried) tryHook(kHkSetCamera, sink);
+            if (g_hooks[kHkReleaseCam].state == kHookStateNotTried) tryHook(kHkReleaseCam, sink);
+        }
         if (g_hooks[kHkLiveryUpdate].state == kHookStateNotTried && liveryUpdateWanted()) tryHook(kHkLiveryUpdate, sink);   // F230: optional; a stand-down loses only the repair
         if (g_hooks[kHkLiveryCam].state == kHookStateNotTried && liveryCamWanted()) tryHook(kHkLiveryCam, sink);   // F229: optional, read-only; a stand-down says so in one line and loses only the setup lines
         checkPartNames(sink);
@@ -3484,6 +3587,8 @@ void nativeOnFootHooksShutdown() {
     g_gate[kHkLook].store(0, std::memory_order_release);
     g_gate[kHkLiveryCam].store(0, std::memory_order_release);   // F229: a call after this goes down the relay's original path
     g_gate[kHkLiveryUpdate].store(0, std::memory_order_release);   // F230: likewise
+    g_gate[kHkSetCamera].store(0, std::memory_order_release);      // F231: likewise
+    g_gate[kHkReleaseCam].store(0, std::memory_order_release);
 }
 
 bool avatarHooksBuildKnown(uintptr_t* baseOut, char* why, size_t whyCap) {
@@ -4133,6 +4238,8 @@ void setTargets(const NativeOnFootHooksTestTargets& t) {
     g_testTargets[kHkLook] = t.conversationLook;   // F212
     g_testTargets[kHkLiveryCam] = t.liveryCameraSetup;   // F229
     g_testTargets[kHkLiveryUpdate] = t.liveryCameraUpdate;   // F230
+    g_testTargets[kHkSetCamera] = t.previewSetCamera;        // F231
+    g_testTargets[kHkReleaseCam] = t.previewRelease;
 }
 void setFadeGlobal(int32_t* mode, float* amount) {
     g_testFadeMode = mode;
@@ -4279,6 +4386,11 @@ void reset() {
             g_memoNext.store(0);
             g_repairKey.store(true);
             g_liveryBase.store(0);
+            previewcam::CallEvent callGone;   // F231
+            while (g_previewRing.take(&callGone)) {}
+            g_previewBusy.store(false);
+            g_previewDrops.store(0);
+            g_previewBase.store(0);
         }
         g_testShopBase = 0;
         g_testShopReal = false;
