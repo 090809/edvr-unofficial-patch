@@ -59,9 +59,9 @@ inline void run209(Check&& check) {
         check(shop::kShowRva == 0x9C3960 && shop::kCloseRva == 0x9C22A0 && shop::kSetStateRva == 0xA237B0 && shop::kKioskStartRva == 0x1973820 && shop::kKioskStopRva == 0x1916440 &&
                   shop::kSuitVtableRva == 0x5255D20 && shop::kWeaponsVtableRva == 0x5255A20 && shop::kKioskVtableRva == 0x51E9770 && shop::kOffOpen == 0x79 && shop::kOffKiosk == 0x1F8,
               "F209: the addresses are build 334925's (Show 0x9C3960, Close 0x9C22A0, SetState 0xA237B0, kiosk start 0x1973820 and stop 0x1916440; vtables suit 0x5255D20, weapons 0x5255A20, kiosk 0x51E9770; bytes +0x79 and +0x1F8)");
-        check(shop::kLiveryVtableRva == 0x5612F30 && shop::kWeaponLiveryVtableRva == 0x5614328 && shop::kClassCount == 5 && shop::kLivery == 3 && shop::kWeaponLivery == 4 &&
+        check(shop::kLiveryVtableRva == 0x5612F30 && shop::kWeaponLiveryVtableRva == 0x5614328 && shop::kClassCount == 6 && shop::kLivery == 3 && shop::kWeaponLivery == 4 && shop::kOutfitting == 5 &&
                   std::strcmp(shop::kLiveryKey, "experimental.native_on_foot_livery_game_view") == 0,
-              "F228: the Livery screens' vtables are build 334925's (HumanoidLiveryActivity 0x5612F30, HumanoidWeaponLiveryActivity 0x5614328; their Show, IsOpen and Close slots hold the buy screens' functions), five classes, the key's name");
+              "F228: the Livery screens' vtables are build 334925's (HumanoidLiveryActivity 0x5612F30, HumanoidWeaponLiveryActivity 0x5614328; their Show, IsOpen and Close slots hold the buy screens' functions), six classes (F229 adds the loadout browser), the key's name");
         check(shop::kShowPrologueBytes == 14 && shop::kShowPrologue[0] == 0x40 && shop::kShowPrologue[1] == 0x53 && shop::kShowPrologue[13] == 0xE8 && shop::kClosePrologueBytes == 15 &&
                   shop::kClosePrologue[6] == 0x80 && shop::kClosePrologue[7] == 0x79 && shop::kClosePrologue[8] == 0x79 && shop::kSetStatePrologueBytes == 10 && shop::kSetStatePrologue[9] == 0xE8 &&
                   shop::kKioskStartPrologueBytes == 16 && shop::kKioskStartPrologue[0] == 0x48 && shop::kKioskStartPrologue[2] == 0xC4 && shop::kKioskStopPrologueBytes == 16 &&
@@ -396,7 +396,7 @@ inline void run209(Check&& check) {
               "F228: the shipped key is on, TEMPORARY, with its ui line");
         check(has_(hooks, "return shop::screenOfVtable(vtable, base);") && has_(hooks, "s.holds(g_liveryHold.load(std::memory_order_relaxed))") &&
                   has_(hooks, "bool nativeOnFootShopOpen() noexcept { return shopBuyScreenOpen() || (g_liveryHold.load(std::memory_order_relaxed) && nativeOnFootLiveryOpen()); }") &&
-                  has_(hooks, "std::atomic<int8_t> g_shopByte[shop::kClassCount] = {{-1}, {-1}, {-1}, {-1}, {-1}};"),
+                  has_(hooks, "std::atomic<int8_t> g_shopByte[shop::kClassCount] = {{-1}, {-1}, {-1}, {-1}, {-1}, {-1}};"),
               "F228: the Show/Close filter takes the Livery vtables, the frame thread's signal and F107's input hold a Livery screen only with the key on, and every per-class array is sized by kClassCount");
         // every shop callback forwards to the original: the original's result is returned unchanged (nothing is written to the game)
         const size_t at = hooks.find("// ---- F209: the Pioneer Supplies buy screens");
@@ -406,6 +406,113 @@ inline void run209(Check&& check) {
                   block.find("Log::get()") == std::string::npos && block.find("= new ") == std::string::npos && block.find("std::vector") == std::string::npos && block.find("std::string") == std::string::npos &&
                   block.find("malloc(") == std::string::npos && block.find("lock_guard") == std::string::npos && block.find("std::mutex") == std::string::npos,
               "F209: the hook threads' code forwards every call and writes nothing to the game, takes no lock, allocates nothing and logs nothing");
+    }
+    // ---- 8. F229: the Livery camera instrument (read-only): the client offsets, the field reader's formatting, the setup call's lines --------------------------------------------------------
+    {
+        const uint64_t base = 0x7FF600000000ull;
+        check(shop::kOutfittingVtableRva == 0x524D908 && shop::kSetupRva == 0x12714C0 && shop::kSetupPrologueBytes == 16 && shop::kSetupPrologue[0] == 0x4C && shop::kSetupPrologue[1] == 0x8B &&
+                  shop::kSetupPrologue[2] == 0xDC && shop::kSetupPrologue[3] == 0x55 && shop::kSetupPrologue[4] == 0x41 && shop::kSetupPrologue[5] == 0x54 && shop::kSetupPrologue[10] == 0xAB &&
+                  shop::kSetupPrologue[11] == 0x98 && shop::kSetupPrologue[12] == 0xF8 && shop::kSetupPrologue[15] == 0x48 && shop::kOffMode == 0x398 && shop::kOffKind == 0x39C &&
+                  shop::kOffStep == 0x570 && shop::kOffDist == 0x580 && shop::kOffMax == 0x590 && shop::kOffMin == 0x5A0 && shop::kOffRetry == 0x5B0 && shop::kOffPose == 0x5E0 && shop::kClientInterface == 0x58,
+              "F229: the setup's address and 16 prologue bytes, the loadout browser's vtable and the camera fields' offsets are the RE note's");
+        check(shop::clientOffset(shop::kSuit) == 0x448 && shop::clientOffset(shop::kWeapons) == 0x448 && shop::clientOffset(shop::kLivery) == 0x680 && shop::clientOffset(shop::kWeaponLivery) == 0x630 &&
+                  shop::clientOffset(shop::kOutfitting) == 0xC0 && shop::clientOffset(shop::kKiosk) == 0 && shop::clientOffset(shop::kNotOurs) == 0,
+              "F229: each class's preview client lies where its constructor's `lea rcx,[object+X]` before the call to 0x126B670 puts it (the kiosk has none)");
+        const uint64_t out = base + shop::kOutfittingVtableRva;
+        check(shop::screenOfVtable(out, base) == shop::kOutfitting && shop::buyScreenOfVtable(out, base) == shop::kNotOurs && shop::vtableRva(shop::kOutfitting) == shop::kOutfittingVtableRva &&
+                  std::strcmp(shop::className(shop::kOutfitting), "HumanoidOutfittingInteraction") == 0 && !shop::isLivery(shop::kOutfitting) && shop::screenOfVtable(out, base + 0x1000) == shop::kNotOurs,
+              "F229: the loadout browser joins the Show/Close filter as a class of its own (not a buy screen, not a Livery screen)");
+        {   // the loadout browser has no input into the signal: signalOf takes five verdicts and none is its own
+            const shop::Signal s = shop::signalOf(shop::Verdict::kNone, shop::Verdict::kNone, shop::Verdict::kNone, shop::Verdict::kNone, shop::Verdict::kNone);
+            check(!s.holds(true) && !s.holds(false) && !s.liveryOpen() && !s.buyScreenOpen(), "F229: with no buy screen, kiosk or Livery screen open the signal is off (the loadout browser has no input into it)");
+        }
+        // the reader: the mode and kind words, four floats, the retry byte and the 64-byte pose in, a CamFields out
+        uint8_t mk[8], st4[4], di4[4], mx4[4], mn4[4], pose[64];
+        const int32_t mode = 3, kind = 1;
+        std::memcpy(mk, &mode, 4);
+        std::memcpy(mk + 4, &kind, 4);
+        const float step = 0.25f, dist = 4.0f, maxD = 9.0f, minD = 0.0f;
+        std::memcpy(st4, &step, 4);
+        std::memcpy(di4, &dist, 4);
+        std::memcpy(mx4, &maxD, 4);
+        std::memcpy(mn4, &minD, 4);
+        float m[16];
+        for (int i = 0; i < 16; ++i) m[i] = static_cast<float>(i) * 0.5f - 1.0f;
+        m[12] = 3.0f;
+        m[13] = 4.0f;
+        m[14] = 0.0f;    // the last row's translation: length 5
+        m[3] = 0.0f;
+        m[7] = 0.0f;
+        m[11] = 12.0f;   // the last column's: length 12
+        std::memcpy(pose, m, 64);
+        const shop::CamFields f = shop::camFromBytes(mk, st4, di4, mx4, mn4, 1, pose);
+        check(f.mode == 3 && f.kind == 1 && f.step == 0.25f && f.dist == 4.0f && f.maxDist == 9.0f && f.minDist == 0.0f && f.retry == 1 && f.pose[0] == -1.0f && f.pose[15] == 6.5f && f.pose[12] == 3.0f &&
+                  shop::camFinite(f),
+              "F229: the reader splits its blocks into the mode and kind, the zoom step, the current, maximum and minimum distances, the retry byte and the 16 pose floats, in order");
+        char line[1100];
+        const int n = shop::formatCamera(line, sizeof(line), shop::kLivery, 0x1A2B3C4Du, 0x1A2B42CDu, f);
+        const std::string text = line;
+        check(n > 0 && static_cast<size_t>(n) < sizeof(line) && text.rfind("livery camera (F229): HumanoidLiveryActivity 1 s: this 0x1A2B3C4D, client 0x1A2B42CD: ", 0) == 0 &&
+                  has_(text, "mode 3, kind 1, step 0.2500, dist 4.0000, max 9.0000, min 0.0000, retry 1, pose rows [-1.0000 -0.5000 0.0000 0.0000]") &&
+                  has_(text, "[3.0000 4.0000 0.0000 6.5000], translation length last row 5.0000, last column 12.0000") && std::count(text.begin(), text.end(), '[') == 4 && std::count(text.begin(), text.end(), ']') == 4,
+              "F229: the once-a-second line names the class, the object and the client, the named fields (mode, kind, step, dist, max, min, retry), the pose as four rows and both translation lengths");
+        shop::CamFields wild = f;
+        wild.dist = std::numeric_limits<float>::quiet_NaN();
+        wild.pose[5] = 3.0e30f;
+        wild.pose[6] = -std::numeric_limits<float>::infinity();
+        shop::formatCamera(line, sizeof(line), shop::kWeaponLivery, 1u, 2u, wild);
+        const std::string wtext = line;
+        check(!shop::camFinite(wild) && has_(wtext, "dist nan") && has_(wtext, "3.000e+30") && has_(wtext, "-inf") && wtext.size() < 1000,
+              "F229: a value that is not a number reads 'nan' or 'inf', a huge one takes an exponent, and none of them swells the line");
+        shop::formatCameraUnreadable(line, sizeof(line), shop::kOutfitting, 0x11u, 0xD1u, true);
+        const std::string un = line;
+        shop::formatCameraUnreadable(line, sizeof(line), shop::kOutfitting, 0x11u, 0xD1u, false);
+        check(has_(un, "livery camera (F229): HumanoidOutfittingInteraction (this 0x00000011) client 0x000000D1: the camera fields could not be read") && has_(std::string(line), "hold a value that is not a number"),
+              "F229: the one-time line says whether the client could not be read or holds a value that is not a number");
+        // the setup call: where rcx lies
+        int32_t delta = -1;
+        check(shop::locateInObject(0x10680, 0x10000, &delta) && delta == 0x680 && shop::locateInObject(0x10000, 0x10000, &delta) && delta == 0 && !shop::locateInObject(0xFFFF, 0x10000, &delta) &&
+                  !shop::locateInObject(0x10000 + shop::kSetupObjectSpan, 0x10000, &delta) && !shop::locateInObject(0x10680, 0, &delta),
+              "F229: rcx is 'in' a watched screen's object from its start to 0x1000 past it, and in none when nothing is remembered");
+        shop::SetupCall c;
+        c.tid = 7;
+        c.rcxLow = 0x1A2B42CDu;
+        c.objLow = 0x1A2B4275u;
+        c.r8Low = 0x00FF0010u;
+        c.modeRead = true;
+        c.mode = 3;
+        c.cls = static_cast<int8_t>(shop::kLivery);
+        c.delta = 0x680;
+        shop::formatSetup(line, sizeof(line), c);
+        const std::string setup = line;
+        check(setup == "livery camera (F229): setup call 0x12714C0: rcx 0x1A2B42CD, object (rcx - 0x58) 0x1A2B4275, r8 0x00FF0010, mode 3 (thread 7), the object is HumanoidLiveryActivity object +0x680, which is client +0x0",
+              "F229: the setup call's line names rcx, rcx - 0x58 as the object, r8, the mode int, the thread, and the object as the watched screen's client");
+        c.cls = static_cast<int8_t>(shop::kNotOurs);
+        c.modeRead = false;
+        shop::formatSetup(line, sizeof(line), c);
+        check(has_(std::string(line), "mode unreadable (thread 7), the object is in no watched screen's object"), "F229: an unreadable mode and an object in no watched screen say so");
+        c.cls = static_cast<int8_t>(shop::kSuit);
+        c.delta = 0x40;   // below the client
+        shop::formatSetup(line, sizeof(line), c);
+        check(has_(std::string(line), "SuitVendorInteraction object +0x40, which is client -0x408"), "F229: an object before the client reads as a negative offset from it");
+        shop::formatCamCapped(line, sizeof(line), "camera", 12);
+        const std::string capped = line;
+        shop::formatSetupLost(line, sizeof(line), 3);
+        check(capped == "livery camera (F229): 12 camera lines in the last 10 s were not written (at most 40 in any ten seconds)" &&
+                  std::string(line) == "livery camera (F229): 3 setup call(s) were not recorded (the ring was full or a second hook thread was in it)",
+              "F229: the cap's note and the lost-calls note name what was dropped");
+        // the wiring, read as text
+        const std::string hooks = slurp("src/d3d11/native_on_foot_hooks.cpp");
+        const size_t at = hooks.find("avh::Ring<shop::SetupCall, 32> g_setupRing;");
+        const size_t end = hooks.find("// ---- hiding the head parts", at);
+        const std::string block = at != std::string::npos && end != std::string::npos ? hooks.substr(at, end - at) : std::string();
+        check(!block.empty() && countOf(block, "return forward(a, b, c, d);") == 1 && block.find("VirtualProtect") == std::string::npos && block.find("WriteProcessMemory") == std::string::npos &&
+                  block.find("Log::get()") == std::string::npos && block.find("std::string") == std::string::npos && block.find("lock_guard") == std::string::npos && block.find("= new ") == std::string::npos,
+              "F229: the setup callback forwards the call unchanged, writes nothing to the game, takes no lock, allocates nothing and logs nothing");
+        check(has_(hooks, "case kHkLiveryCam: return reinterpret_cast<const void*>(&livCamSetupHooked);") && has_(hooks, "{\"livery-camera-setup\"") && has_(hooks, "shop::kSetupRva,") &&
+                  has_(hooks, "liveryCameraTick(sink);   // F229") && has_(hooks, "g_gate[kHkLiveryCam].store(armed(kHkLiveryCam) && capture ? 1u : 0u, std::memory_order_release);") &&
+                  has_(hooks, "if (g_hooks[kHkLiveryCam].state == kHookStateNotTried && liveryCamWanted()) tryHook(kHkLiveryCam, sink);"),
+              "F229: the setup hook is in the hook table, tried at the frame boundary while the native key is on, gated with it, and the camera fields are read every frame");
     }
 }
 

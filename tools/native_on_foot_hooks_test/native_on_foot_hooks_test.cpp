@@ -1888,7 +1888,9 @@ void testSkeletonLatch(const CtlPages& p) {
 // (0x5A5E). The objects carry the buy screens' vtable VALUES (base + RVA; the hooks only compare them).
 using FnThis = uint64_t (__fastcall*)(void*);
 using FnState = uint64_t (__fastcall*)(void*, const char*);
+void setupImgInit();   // F229: the Livery setup's synthetic function, below
 void shopImgInit() {
+    setupImgInit();
     const uint8_t nop = 0x90;
     auto rel32 = [](size_t from, size_t to) { return static_cast<int32_t>(static_cast<int64_t>(to) - static_cast<int64_t>(from)); };
     auto put32 = [](uint8_t* p, size_t at, int32_t v) { std::memcpy(p + at, &v, 4); };
@@ -1957,6 +1959,26 @@ void shopImgInit() {
         std::memcpy(p + n, body, sizeof(body));
     }
 }
+// F229: the Livery preview client's scene setup, with the game's first 16 prologue bytes and a balanced tail (`add rsp,0 | pop r15 | pop r12 | pop rbp | mov eax,5A60h | ret`): it writes nothing.
+using FnSetup = uint64_t (__fastcall*)(void*, void*, void*, void*);
+void setupImgInit() {
+    cimgCommit(shop::kSetupRva, 0x80);
+    uint8_t* p = g_cimg + shop::kSetupRva;
+    std::memset(p, 0xCC, 0x80);
+    size_t n = 0;
+    for (uint8_t b : shop::kSetupPrologue) p[n++] = b;   // mov r11,rsp; push rbp; push r12; push r15; lea rbp,[r11-768h]; 48h (the first byte of the add that follows)
+    const uint8_t tail[] = {0x83, 0xC4, 0x00, 0x41, 0x5F, 0x41, 0x5C, 0x5D, 0xB8, 0x60, 0x5A, 0x00, 0x00, 0xC3};
+    std::memcpy(p + n, tail, sizeof(tail));
+}
+bool g_withLiveryCam = false;   // installShopTargets also gives the F229 hook its synthetic function
+// A Livery or loadout screen's object with room for its preview client (the largest offset is 0x680 + 0x620).
+struct CamObj {
+    alignas(16) uint8_t b[0x1000] = {};
+    void init(uint64_t vtable) {
+        std::memset(b, 0, sizeof(b));
+        std::memcpy(b, &vtable, 8);
+    }
+};
 uint64_t shopShow(void* o) { return reinterpret_cast<FnThis>(g_cimg + shop::kShowRva)(o); }
 uint64_t shopClose(void* o) { return reinterpret_cast<FnThis>(g_cimg + shop::kCloseRva)(o); }
 uint64_t shopSetState(void* handle, const char* s) { return reinterpret_cast<FnState>(g_cimg + shop::kSetStateRva)(handle, s); }
@@ -2001,6 +2023,7 @@ void installShopTargets(const CtlPages& p, int badShop = -1) {
     tt.shopSetState = at(2, shop::kSetStateRva);
     tt.kioskStart = at(3, shop::kKioskStartRva);
     tt.kioskStop = at(4, shop::kKioskStopRva);
+    if (g_withLiveryCam) tt.liveryCameraSetup = b + shop::kSetupRva;   // F229
     nofoothookstest::setTargets(tt);
     nofoothookstest::setHeadImage(b, kCImgSize);
 }
@@ -2430,6 +2453,117 @@ void testShopGlue(const CtlPages& p) {
         shopShow(&suit);
         rig.boundary();
         check(!nativeOnFootShopOpen() && rig.cap.count("shop screens (F209):") == 0, "...the signal stays off and the log silent: F107 has its distance test alone");
+        t::reset();
+    }
+    {   // F229: the Livery camera instrument: the setup hook over a synthetic function, and the once-a-second camera lines
+        Rig rig;
+        g_withLiveryCam = true;
+        start(rig);
+        g_withLiveryCam = false;
+        check(t::hookState(t::kLiveryCameraSetup) == 1 && t::stolenBytes(t::kLiveryCameraSetup) == 6 && t::gateOpen(t::kLiveryCameraSetup),
+              "F229: the setup hook is armed over the synthetic function (the whole instructions covering five bytes: six), its gate open while the native key is on");
+        static CamObj liv, outf;
+        liv.init(base + shop::kLiveryVtableRva);
+        outf.init(base + shop::kOutfittingVtableRva);
+        const uintptr_t livClient = reinterpret_cast<uintptr_t>(liv.b) + shop::clientOffset(shop::kLivery);
+        uint8_t* cl = liv.b + shop::clientOffset(shop::kLivery);
+        const int32_t modeKind[2] = {3, 1};
+        const float step = 0.25f, dist = 4.0f, maxD = 9.0f, minD = 0.5f;
+        const uint8_t retry = 1;
+        float pose[16];
+        for (int i = 0; i < 16; ++i) pose[i] = static_cast<float>(i) * 0.25f;
+        std::memcpy(cl + shop::kOffMode, modeKind, 8);
+        std::memcpy(cl + shop::kOffStep, &step, 4);
+        std::memcpy(cl + shop::kOffDist, &dist, 4);
+        std::memcpy(cl + shop::kOffMax, &maxD, 4);
+        std::memcpy(cl + shop::kOffMin, &minD, 4);
+        cl[shop::kOffRetry] = retry;
+        std::memcpy(cl + shop::kOffPose, pose, 64);
+        uint8_t mk8[8], s4[4], d4[4], x4[4], n4[4], p64[64];
+        std::memcpy(mk8, modeKind, 8);
+        std::memcpy(s4, &step, 4);
+        std::memcpy(d4, &dist, 4);
+        std::memcpy(x4, &maxD, 4);
+        std::memcpy(n4, &minD, 4);
+        std::memcpy(p64, pose, 64);
+        const shop::CamFields want = shop::camFromBytes(mk8, s4, d4, x4, n4, retry, p64);
+        char expect[1100];
+        shop::formatCamera(expect, sizeof(expect), shop::kLivery, static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&liv)), static_cast<uint32_t>(livClient), want);
+        t::shopClock(100000);
+        shopShow(&liv);
+        rig.boundary();
+        check(rig.cap.count(expect) == 1 && rig.cap.count("livery camera (F229):") == 1, "F229: an open Livery screen's camera fields are read from its client (object +0x680) and written once, as the formatter says");
+        rig.boundary();
+        check(rig.cap.count("livery camera (F229):") == 1, "...and not again within the second");
+        t::shopClock(101000);
+        rig.boundary();
+        check(rig.cap.count(expect) == 2, "...but once more when the second has passed");
+        // the setup call through the hook: the original runs (0x5A60), the line names rcx as the Livery client's interface
+        rig.cap.clear();
+        int32_t mode = 3;
+        const uint64_t r = reinterpret_cast<FnSetup>(g_cimg + shop::kSetupRva)(reinterpret_cast<void*>(livClient + shop::kClientInterface), nullptr, &mode, nullptr);
+        shop::SetupCall sc;
+        sc.tid = GetCurrentThreadId();
+        sc.rcxLow = static_cast<uint32_t>(livClient + shop::kClientInterface);
+        sc.objLow = static_cast<uint32_t>(livClient);
+        sc.r8Low = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&mode));
+        sc.modeRead = true;
+        sc.mode = 3;
+        sc.cls = static_cast<int8_t>(shop::kLivery);
+        sc.delta = static_cast<int32_t>(shop::clientOffset(shop::kLivery));
+        shop::formatSetup(expect, sizeof(expect), sc);
+        rig.boundary();
+        check(r == 0x5A60 && mode == 3 && rig.cap.count(expect) == 1 && has(expect, "which is client +0x0"), "F229: the setup call is forwarded (its result 0x5A60, the mode int untouched) and logged with rcx - 0x58 as the Livery client");
+        rig.cap.clear();
+        const uint64_t r2 = reinterpret_cast<FnSetup>(g_cimg + shop::kSetupRva)(&mode, nullptr, nullptr, nullptr);   // an rcx in no watched screen, a null r8
+        sc.rcxLow = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&mode));
+        sc.objLow = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&mode) - shop::kClientInterface);
+        sc.r8Low = 0;
+        sc.modeRead = false;
+        sc.cls = static_cast<int8_t>(shop::kNotOurs);
+        sc.delta = 0;
+        shop::formatSetup(expect, sizeof(expect), sc);
+        rig.boundary();
+        check(r2 == 0x5A60 && rig.cap.count(expect) == 1 && has(expect, "mode unreadable") && has(expect, "in no watched screen's object"), "F229: an object in no watched screen and an unreadable r8 are logged as such, and the call is still forwarded");
+        // the loadout browser is watched beside it and never joins the signal
+        rig.cap.clear();
+        shopShow(&outf);
+        rig.boundary();
+        check(!nativeOnFootShopOpen() && !nativeOnFootLiveryOpen() && rig.cap.count(shopEventLine("HumanoidOutfittingInteraction", "Show", 0, 1, &outf).c_str()) == 1 &&
+                  rig.cap.count("HumanoidOutfittingInteraction 1 s: this 0x") == 1,
+              "F229: the loadout browser's Show is logged and its client's camera line written, and neither the shop signal nor the Livery reading moves");
+        // closed screens are not read
+        shopClose(&liv);
+        shopClose(&outf);
+        rig.boundary();
+        rig.cap.clear();
+        t::shopClock(103000);
+        rig.boundary();
+        check(rig.cap.count("livery camera (F229):") == 0, "F229: a screen that reads closed is not read: no camera line");
+        // an unreadable client is said once: the object's first 0x100 bytes end a readable page, its client (+0x680) lies in the next, which cannot be read
+        {
+            uint8_t* pages = static_cast<uint8_t*>(VirtualAlloc(nullptr, 0x2000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+            DWORD oldProtect = 0;
+            check(pages && VirtualProtect(pages + 0x1000, 0x1000, PAGE_NOACCESS, &oldProtect), "F229: (the rig's two pages, the second not readable)");
+            if (pages) {
+                uint8_t* obj = pages + 0x1000 - 0x100;
+                const uint64_t vt = base + shop::kLiveryVtableRva;
+                std::memcpy(obj, &vt, 8);
+                rig.cap.clear();
+                shopShow(obj);
+                rig.boundary();
+                t::shopClock(104000);
+                rig.boundary();
+                t::shopClock(105000);
+                rig.boundary();
+                check(rig.cap.count("HumanoidLiveryActivity (this 0x") == 1 && rig.cap.count("the camera fields could not be read") == 1 && rig.cap.count("1 s: this 0x") == 0,
+                      "F229: a client that cannot be read is said once for the class (no camera line, however many seconds pass)");
+                shopClose(obj);
+                rig.boundary();
+                VirtualFree(pages, 0, MEM_RELEASE);
+            }
+        }
+        t::shopClock(0);
         t::reset();
     }
     t::reset();

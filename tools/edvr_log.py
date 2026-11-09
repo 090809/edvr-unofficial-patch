@@ -12474,6 +12474,8 @@ def _hj_f107_away(rows, ctx):
 
 
 H_SHOP = "shop screens (F209)"
+H_SHOP_BUY_CLASSES = ("SuitVendorInteraction", "WeaponsVendorInteraction")   # the buy screens: the Livery screens (F228) and the loadout browser (F229) are watched, and never hold the signal
+H_LIVCAM = "livery camera (F229)"
 F107_SHOWROOM_MAX_M = 50.0   # F209: a distance-test episode whose first camera stood over F107's 3 m and no farther than this from the neck is the size of a showroom's camera (the suit shop's: 3.6 to 3.7 m)
 
 
@@ -12553,7 +12555,7 @@ def _hj_shop(rows, ctx):
     unset = [r for r in shows if r["a"] != "1"]
     if unset:
         problems.append("%d Show(s) left the byte +0x79 not set (read %s)" % (len(unset), ", ".join(sorted({r["a"] for r in unset}))))
-    if any(r["a"] == "1" and "Livery" not in r["cls"] for r in shows) and not ons:
+    if any(r["a"] == "1" and r["cls"] in H_SHOP_BUY_CLASSES for r in shows) and not ons:
         problems.append("a buy screen was shown but the signal never went on")
     if lvheld and not ons:
         problems.append("a Livery screen opened with the key on (held) but the signal never went on")
@@ -12561,6 +12563,65 @@ def _hj_shop(rows, ctx):
         problems.append("the signal went on %d times and off %d: it may have stuck" % (len(ons), len(offs)))
     if hooks and stood and not armed and not ons:
         problems.append("every shop hook stood down: F107 holds a showroom camera by its distance test alone")
+    if problems:
+        return ("PARTIAL", text + "; " + "; ".join(problems))
+    return ("OK", text)
+
+
+def _hflt(text):
+    """A float the DLL wrote (four decimals, an exponent, nan or inf) as a float; None when it is not a number."""
+    try:
+        v = float(text)
+    except (TypeError, ValueError):
+        return None
+    return v if v == v and abs(v) != float("inf") else None
+
+
+def _hrange(rows, key):
+    vals = [v for v in (_hflt(r[key]) for r in rows) if v is not None]
+    if not vals:
+        return "no number"
+    lo, hi = min(vals), max(vals)
+    return "%.4f" % lo if lo == hi else "%.4f to %.4f" % (lo, hi)
+
+
+def _hj_livcam(rows, ctx):
+    """F229: the Livery camera instrument (shop_screen_core.h, read-only). Once a second for each watched screen that reads open (the two buy screens, the two Livery screens and the
+    loadout browser) the preview client's camera fields: the setup mode and camera kind, the zoom step, the current, maximum and minimum distances, the retry flag and the pose matrix; and each call of
+    the client's scene setup (0x12714C0) with its mode int and which watched screen's object rcx lies in. The summary names, per class, how many lines and the range the orbit distances and the
+    translation lengths took, and the setup calls' modes. It reads no verdict about the cause: the lines are the evidence. PARTIAL when the setup hook stood down, a client could not be read or held
+    a value that is not a number (the offsets are not this build's camera), calls or lines were not recorded, or lines were dropped by the cap."""
+    kinds = ("hook", "sec", "setup", "unread", "capped", "lost")
+    if not any(rows.get(k) for k in kinds):
+        return None
+    hooks, secs, setups = rows.get("hook", []), rows.get("sec", []), rows.get("setup", [])
+    parts = []
+    stood = [r for r in hooks if r["st"] == "stood down"]
+    if hooks:
+        parts.append("setup hook %s" % ("stood down" if stood and len(stood) == len(hooks) else "armed"))
+    byclass = collections.defaultdict(list)
+    for r in secs:
+        byclass[r["cls"]].append(r)
+    for cls in sorted(byclass):
+        rs = byclass[cls]
+        parts.append("%s: %d camera line(s), kind %s, dist %s, min %s, translation length last row %s, last column %s" % (
+            cls, len(rs), "/".join(sorted({r["kind"] for r in rs})), _hrange(rs, "oa"), _hrange(rs, "ob"), _hrange(rs, "rowlen"), _hrange(rs, "collen")))
+    if setups:
+        modes = collections.Counter(r["mode"] for r in setups)
+        where = collections.Counter(re.sub(r"object \+0x[0-9A-F]+, which is ", "", r["where"]) for r in setups)
+        parts.append("%d setup call(s), mode %s; object %s" % (len(setups), ", ".join("%s x%d" % (m, n) for m, n in sorted(modes.items())),
+                                                           "; ".join("%s x%d" % (w, n) for w, n in sorted(where.items()))))
+    text = "; ".join(parts) or "no camera line"
+    problems = []
+    if stood:
+        problems.append("the setup hook stood down: the setup calls are not logged")
+    if rows.get("unread"):
+        problems.append("%d client(s) could not be read or held a value that is not a number (%s): the camera offsets are not this build's" % (
+            len(rows["unread"]), ", ".join(sorted({r["cls"] for r in rows["unread"]}))))
+    if rows.get("lost"):
+        problems.append("%d setup call(s) were not recorded" % _hsum(rows["lost"], "n"))
+    if rows.get("capped"):
+        problems.append("%d line(s) were not written (the cap of 40 in ten seconds)" % _hsum(rows["capped"], "n"))
     if problems:
         return ("PARTIAL", text + "; " + "; ".join(problems))
     return ("OK", text)
@@ -17833,6 +17894,15 @@ HEALTH_RULES = (
         ("capped", r"shop screens \(F209\): (?P<n>\d+) event lines in the last 10 s were not written"),
         ("lost", r"shop screens \(F209\): (?P<n>\d+) shop event\(s\) were not recorded"),
     ), _hj_shop),
+    _hrule(H_LIVCAM, ("F229",), ("(F229)",), (
+        ("hook", r"avatar hooks: (?P<hook>livery-camera-setup) hook (?P<st>armed|stood down)"),
+        ("sec", r"livery camera \(F229\): (?P<cls>\w+) 1 s: this 0x(?P<this>[0-9A-F]+), client 0x(?P<client>[0-9A-F]+): mode (?P<mode>-?\d+), kind (?P<kind>-?\d+), step (?P<step>\S+), dist (?P<oa>\S+), max (?P<max>\S+), min (?P<ob>\S+), retry (?P<retry>\d+), "
+                r"pose rows (?P<rows>.*), translation length last row (?P<rowlen>\S+), last column (?P<collen>\S+)$"),
+        ("setup", r"livery camera \(F229\): setup call 0x12714C0: rcx 0x(?P<rcx>[0-9A-F]+), object \(rcx - 0x58\) 0x(?P<obj>[0-9A-F]+), r8 0x(?P<r8>[0-9A-F]+), mode (?P<mode>-?\d+|unreadable) \(thread (?P<tid>\d+)\), the object is (?P<where>.*)$"),
+        ("unread", r"livery camera \(F229\): (?P<cls>\w+) \(this 0x(?P<this>[0-9A-F]+)\) client 0x(?P<client>[0-9A-F]+): the camera fields (?P<why>could not be read|hold a value that is not a number):.*"),
+        ("capped", r"livery camera \(F229\): (?P<n>\d+) (?P<what>camera|setup) lines in the last 10 s were not written"),
+        ("lost", r"livery camera \(F229\): (?P<n>\d+) setup call\(s\) were not recorded"),
+    ), _hj_livcam),
     _hrule(H_F212, ("F212",), ("(F212)",), (
         ("hook", r"avatar hooks: (?P<hook>conversation-look) hook (?P<st>armed|stood down)(?:: (?P<why>.*?)(?:\. the conversation look \(F212\) is not held.*)?)?$"),
         ("began", r"conversation look \(F212\): run (?P<n>\d+) began: .*\|yaw\| (?P<yaw>[\d.]+) and \|pitch\| (?P<pitch>[\d.]+) asked in its first frames"),
@@ -22492,6 +22562,43 @@ def self_test_health():
         check("F228: the Livery signal went on and F107 logged no episode by the shop screen: the view did not change",
               [neck(), BEGAN209, LSHOW209, LOPEN_HELD209, LON209, AWAY_LEFT_3M7, AWAY_END_3M7, LCLOSE209, LOFF209, neck()], 3, [("NEVER APPLIED", S209)])
         check("F209: a line that drifted from its pattern is unparsed", [neck(), "shop screens (F209): the buy screen is somewhere else"], 4, [("UNPARSED", S209)])
+
+        # ---- the Livery camera instrument (F229): the preview client's camera fields once a second, the setup's calls, and the loadout browser watched beside the Livery screens ----
+        TAG229 = "livery camera (F229):"
+        ROWS229 = ("-1.0000", "-0.5000", "0.0000", "0.0000", "0.5000", "1.0000", "1.5000", "0.0000", "2.0000", "2.5000", "3.0000", "0.0000", "3.0000", "4.0000", "0.0000", "1.0000")
+
+        def cam229(cls, this, client, orbit_a, orbit_b, rowlen, collen):
+            return RS("1 s: this 0x%08X, client 0x%08X: mode %d", TAG229, cls, this, client, 3, 1, "0.2500", orbit_a, "9.0000", orbit_b, 1, *(ROWS229 + (rowlen, collen)))
+        CAM_L1 = cam229("HumanoidLiveryActivity", 0x4D5E6F70, 0x4D5E75F0, "4.0000", "0.0000", "5.0000", "3.0000")
+        CAM_L2 = cam229("HumanoidLiveryActivity", 0x4D5E6F70, 0x4D5E75F0, "0.0000", "0.0000", "0.0000", "0.0000")
+        CAM_O1 = cam229("HumanoidOutfittingInteraction", 0x6F708192, 0x6F708252, "4.2000", "4.2000", "4.2000", "4.2000")
+        CAM_NAN = cam229("HumanoidLiveryActivity", 0x4D5E6F70, 0x4D5E75F0, "nan", "nan", "nan", "nan")
+        SETUP_L = RS("setup call 0x12714C0: rcx 0x%08X", TAG229, 0x4D5E7648, 0x4D5E75F0, 0x00FF0010, "3", 7, "HumanoidLiveryActivity object +0x680, which is client +0x0")
+        SETUP_NONE = RS("setup call 0x12714C0: rcx 0x%08X", TAG229, 0x12345678, 0x12345620, 0x00FF0010, "unreadable", 7, "in no watched screen's object")
+        UNREAD229 = RS("(this 0x%08X) client 0x%08X: the camera fields %s:", TAG229, "HumanoidLiveryActivity", 0x4D5E6F70, 0x4D5E75F0, "could not be read")
+        NAN229 = RS("(this 0x%08X) client 0x%08X: the camera fields %s:", TAG229, "HumanoidLiveryActivity", 0x4D5E6F70, 0x4D5E75F0, "hold a value that is not a number")
+        CAPPED229 = RS("%s lines in the last 10 s were not written", TAG229, 12, "camera", 40)
+        LOST229 = RS("setup call(s) were not recorded", TAG229, 3)
+        OSHOW209 = RS(": +0x79 %d -> %d (this", TAG209, "HumanoidOutfittingInteraction", "Show", 0, 1, 0x6F708192, 7)
+        OCLOSE209 = RS(": +0x79 %d -> %d (this", TAG209, "HumanoidOutfittingInteraction", "Close", 1, 0, 0x6F708192, 7)
+        HOOK_UP229 = RH("hook armed: EliteDangerous64.exe+0x%llX", "avatar hooks:", "livery-camera-setup", 0x12714C0,
+                        "CustomisationVisual preview client's scene setup (picks the attach and camera nodes from the mode int at r8)", 0x7FF6012714C0, 6, 16, 16, 0x7FF700000000,
+                        RHT("the Livery camera instrument (F229)"))
+        HOOK_DOWN229 = RH("hook stood down: %s. %s", "avatar hooks:", "livery-camera-setup", "the game build differs (the PE timestamp or image size is not build 334925's); EliteDangerous64.exe+0x12714C0 was not touched",
+                          RHT("the Livery preview client's setup calls (F229) are not logged"))
+        check("F229: the setup call and the once-a-second camera lines of a Livery screen and the loadout browser are summarised by class, with the orbit distances' and the translation lengths' ranges",
+              [neck(), HOOK_UP229, LSHOW209, SETUP_L, SETUP_NONE, CAM_L1, CAM_O1, CAM_L2, LCLOSE209, neck()], 0, [("OK", H_LIVCAM)],
+              has=["setup hook armed", "HumanoidLiveryActivity: 2 camera line(s), kind 1, dist 0.0000 to 4.0000", "HumanoidOutfittingInteraction: 1 camera line(s), kind 1, dist 4.2000", "translation length last row 0.0000 to 5.0000",
+                   "2 setup call(s), mode 3 x1, unreadable x1; object HumanoidLiveryActivity client +0x0 x1; in no watched screen's object x1"], lacks=["UNPARSED"])
+        check("F229: the loadout browser's Show and Close are counted by class and are not a buy screen: a Show with no signal is not a fault",
+              [neck(), OSHOW209, OCLOSE209, neck()], 0, [("OK", S209)], has=["HumanoidOutfittingInteraction 1"], lacks=["a buy screen was shown but the signal never went on", "UNPARSED"])
+        check("F229: a client that could not be read, or holds a value that is not a number, is PARTIAL and names the class",
+              [neck(), HOOK_UP229, UNREAD229, CAM_NAN, NAN229], 0, [("PARTIAL", H_LIVCAM)], has=["could not be read or held a value that is not a number (HumanoidLiveryActivity)", "no number"])
+        check("F229: the setup hook stood down is PARTIAL and says the calls are not logged", [neck(), HOOK_DOWN229, CAM_L1], 0, [("PARTIAL", H_LIVCAM)],
+              has=["setup hook stood down", "the setup calls are not logged"])
+        check("F229: setup calls that were not recorded and lines the cap dropped are PARTIAL", [neck(), HOOK_UP229, SETUP_L, LOST229, CAPPED229, CAM_L1], 0, [("PARTIAL", H_LIVCAM)],
+              has=["3 setup call(s) were not recorded", "12 line(s) were not written (the cap of 40 in ten seconds)"])
+        check("F229: a line that drifted from its pattern is unparsed", [neck(), "livery camera (F229): the camera is somewhere else"], 4, [("UNPARSED", H_LIVCAM)])
 
         # ---- the conversation look (F212): the leaf that sets the look springs' targets is held at 0 while native on foot is active ----
         S212 = "conversation look (F212)"

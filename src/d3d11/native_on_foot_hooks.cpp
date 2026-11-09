@@ -52,7 +52,8 @@ namespace {
 // ---- the three hooks ------------------------------------------------------------------------------------------------------------
 // F209 adds five optional ones for the Pioneer Supplies buy screens: the base class's Show and Close, the UI state machine's SetState and the armoury kiosk's start and stop.
 // F212 adds one more: the leaf that sets the look springs' targets (the conversation look).
-enum Hk : int { kHkCtl = 0, kHkFade, kHkFind, kHkShow, kHkClose, kHkSetState, kHkKioskStart, kHkKioskStop, kHkLook, kHkCount };
+// F229 adds a read-only one: the Livery preview client's scene setup (the instrument that watches the Livery camera).
+enum Hk : int { kHkCtl = 0, kHkFade, kHkFind, kHkShow, kHkClose, kHkSetState, kHkKioskStart, kHkKioskStop, kHkLook, kHkLiveryCam, kHkCount };
 constexpr bool isShopHook(int id) { return id >= kHkShow && id <= kHkKioskStop; }
 struct HookSpec {
     const char* label;      // the log's name for it
@@ -79,6 +80,8 @@ const HookSpec kSpec[kHkCount] = {
      shop::kKioskStopPrologueBytes},
     {"conversation-look", "look springs' target setter (the look component facade's slot +0xE8, a 17-byte leaf)", "avatar-hooks-conversation-look", nofoot::f212::kLeafRva,
      nofoot::f212::kLeaf, nofoot::f212::kLeafBytes},
+    {"livery-camera-setup", "CustomisationVisual preview client's scene setup (picks the attach and camera nodes from the mode int at r8)", "avatar-hooks-livery-camera-setup", shop::kSetupRva,
+     shop::kSetupPrologue, shop::kSetupPrologueBytes},
 };
 
 // ---- state shared between the threads --------------------------------------------------------------------------------------
@@ -206,6 +209,7 @@ float* g_testFadeAmount = nullptr;
 uintptr_t g_testShopBase = 0;             // F209: the rig's image base for the buy screens' vtable compares (0: the armed hook's target minus its RVA)
 bool g_testShopReal = false;              // F209: try the shop hooks against the real module too (the rig's identity-refusal case); otherwise only those with a test target
 uint64_t g_testShopNow = 0;               // F209: the rig's clock (ms) for the shop lines (0: the system clock)
+bool g_testLiveryCamReal = false;         // F229: try the Livery setup hook against the real module too (the rig's identity-refusal case); otherwise only with a test target
 uint64_t g_testConvNow = 0;               // F212: the rig's clock (ms) for the conversation look's calls and lines (0: the system clock)
 bool g_testLookReal = false;              // F212: try the conversation look's hook against the real module too (the rig's identity-refusal case); otherwise only with a test target
 #endif
@@ -479,8 +483,8 @@ __declspec(noinline) void __fastcall conversationLookHooked(void* iface, float y
 std::atomic<uintptr_t> g_shopBase{0};                      // the game image's base: the armed shop hooks' target minus its RVA (the vtables are compared as base + RVA)
 std::atomic<uintptr_t> g_shopObj[shop::kClassCount];       // the object each class's Show / start last remembered (0: none); hook threads store, the frame thread clears
 std::atomic<uint8_t> g_shopOpen[shop::kClassCount];        // 1 while that class's object reads open: the callbacks set it at once, the frame thread re-derives it every frame
-std::atomic<int8_t> g_shopByte[shop::kClassCount] = {{-1}, {-1}, {-1}, {-1}, {-1}};   // the frame thread's last read of each remembered byte (-1 none, 0, 1), for the once-a-second line; one initializer per class
-static_assert(shop::kClassCount == 5, "g_shopByte's initializer lists one -1 per class: extend it with the enum");
+std::atomic<int8_t> g_shopByte[shop::kClassCount] = {{-1}, {-1}, {-1}, {-1}, {-1}, {-1}};   // the frame thread's last read of each remembered byte (-1 none, 0, 1), for the once-a-second line; one initializer per class
+static_assert(shop::kClassCount == 6, "g_shopByte's initializer lists one -1 per class: extend it with the enum");
 std::atomic<bool> g_liveryHold{true};                      // F228 (TEMPORARY): experimental.native_on_foot_livery_game_view, set live by native_on_foot.cpp: a Livery screen open holds the camera away
 std::atomic<bool> g_shopBusy{false};                       // the ring's try-flag: a second concurrent producer drops its event (counted) rather than wait
 std::atomic<uint64_t> g_shopBusyDrops{0};
@@ -599,6 +603,38 @@ __declspec(noinline) uint64_t shopKiosk(bool start, void* a, void* b, void* c, v
 }
 __declspec(noinline) uint64_t __fastcall shopKioskStartHooked(void* a, void* b, void* c, void* d) noexcept { return shopKiosk(true, a, b, c, d); }
 __declspec(noinline) uint64_t __fastcall shopKioskStopHooked(void* a, void* b, void* c, void* d) noexcept { return shopKiosk(false, a, b, c, d); }
+
+// F229 (read-only): the Livery preview client's scene setup. rcx is the client + 0x58, rdx a scene handle, r8 a pointer to the mode int. The call is described (rcx, rcx - 0x58 and r8's low 32 bits, the
+// int at r8 read under SEH, the thread, which watched screen's object rcx - 0x58 lies in) and queued, then forwarded unchanged: the original's result is returned as it came, nothing is written.
+avh::Ring<shop::SetupCall, 32> g_setupRing;
+std::atomic<bool> g_setupBusy{false};                      // the ring's try-flag, as the shop ring's
+std::atomic<uint64_t> g_setupBusyDrops{0};
+__declspec(noinline) uint64_t __fastcall livCamSetupHooked(void* a, void* b, void* c, void* d) noexcept {
+    const auto forward = reinterpret_cast<ForwardFn>(g_forward[kHkLiveryCam].load(std::memory_order_acquire));
+    if (!forward) return 0;
+    shop::SetupCall call;
+    call.tid = GetCurrentThreadId();
+    const uintptr_t rcx = reinterpret_cast<uintptr_t>(a), object = rcx - shop::kClientInterface;   // the setup is reached through the client's interface at +0x58
+    call.rcxLow = static_cast<uint32_t>(rcx);
+    call.objLow = static_cast<uint32_t>(object);
+    call.r8Low = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(c));
+    call.modeRead = plausibleUserPointer(reinterpret_cast<uintptr_t>(c)) && sehReadInt32(static_cast<const int32_t*>(c), &call.mode);
+    for (int cls = 0; cls < shop::kClassCount; ++cls) {
+        int32_t delta = 0;
+        if (shop::clientOffset(cls) != 0 && shop::locateInObject(object, g_shopObj[cls].load(std::memory_order_acquire), &delta)) {
+            call.cls = static_cast<int8_t>(cls);
+            call.delta = delta;
+            break;
+        }
+    }
+    if (g_setupBusy.exchange(true, std::memory_order_acquire)) {
+        g_setupBusyDrops.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        g_setupRing.push(call);
+        g_setupBusy.store(false, std::memory_order_release);
+    }
+    return forward(a, b, c, d);
+}
 
 // ---- hiding the head parts (the avatar-fade hook's post-call) -------------------------------------------------------------------
 // Runs inside the game's submit job, right after the dither fade and before the loop that reads the view masks, on the same thread: a zero written here is
@@ -2674,6 +2710,7 @@ const void* callbackFor(int id) {
         case kHkKioskStart: return reinterpret_cast<const void*>(&shopKioskStartHooked);
         case kHkKioskStop: return reinterpret_cast<const void*>(&shopKioskStopHooked);
         case kHkLook: return reinterpret_cast<const void*>(&conversationLookHooked);
+        case kHkLiveryCam: return reinterpret_cast<const void*>(&livCamSetupHooked);
         default: return nullptr;
     }
 }
@@ -2743,6 +2780,9 @@ const char* armedRole(int id) {
                           bytes);
             return text;
         }
+        case kHkLiveryCam:
+            return "the Livery camera instrument (F229): the original runs and its result is returned unchanged; each call's arguments (rcx, rcx - 0x58 as the object, r8 and the int it points to) "
+                   "are logged with the watched screen that object lies in; nothing is written";
         default:
             return "the original runs untouched and the mode byte is read after it, for native on foot's camera signal; nothing is written";
     }
@@ -2760,6 +2800,7 @@ const char* downConsequence(int id) {
         case kHkKioskStart:
         case kHkKioskStop: return "the armoury kiosk's start and stop (F209) are not logged.";
         case kHkLook: return "the conversation look (F212) is not held: the game's conversation may turn the commander's look toward the NPC, as before.";
+        case kHkLiveryCam: return "the Livery preview client's setup calls (F229) are not logged; the camera fields are still read once a second.";
         default: return "native on foot's body changes stay on in every camera (the game's third-person camera is not told apart).";
     }
 }
@@ -2816,6 +2857,8 @@ void updateGates() {
     // F212: the conversation look's callback is open while the native key is on; it decides gated or passed itself, by nativeOnFootActive() at each call. A closed gate sends the
     // call down the relay's original path: the stolen instruction, then the rest of the leaf, which is what the game ran before.
     g_gate[kHkLook].store(armed(kHkLook) && capture ? 1u : 0u, std::memory_order_release);
+    // F229: the Livery setup's callback is open while the native key is on (it is a rare call: a preview scene being set up).
+    g_gate[kHkLiveryCam].store(armed(kHkLiveryCam) && capture ? 1u : 0u, std::memory_order_release);
 }
 
 // ---- F209: the frame thread's half of the buy screens --------------------------------------------------------------------------------------------
@@ -2826,6 +2869,11 @@ struct ShopFrame {
     uint64_t lostSeen = 0;               // events the ring or the try-flag dropped, already said
     shop::LineCap cap;                   // the event lines' rate cap
     bool identityLine = false;           // the one "build differs" line for the five hooks was said
+    // F229 (the Livery camera instrument): the camera lines' own caps and pacers, and what was already said.
+    shop::LineCap camCap, setupCap;      // the once-a-second camera lines' cap and the setup calls' cap (each at most 40 in ten seconds)
+    shop::Pacer camPacer[shop::kClassCount];   // one line a second per open screen
+    bool camUnreadableSaid[shop::kClassCount] = {};   // the one "could not be read / not a number" line per class
+    uint64_t setupLostSeen = 0;          // setup calls the ring or the try-flag dropped, already said
 };
 ShopFrame g_shopFrame;   // frame thread only (nativeOnFootShopRead is the frame thread's too)
 
@@ -2923,10 +2971,76 @@ void shopFrameTick(const avh::Sink& sink) {
     }
 }
 
+// ---- F229: the frame thread's half of the Livery camera instrument (read-only) --------------------------------------------------------------------
+// One line under a cap: a window that dropped lines says how many (and of what), once, before its first line.
+void camWrite(shop::LineCap& cap, const char* what, const avh::Sink& sink, uint64_t now, const char* line) {
+    uint32_t summary = 0;
+    const bool ok = cap.allow(now, &summary);
+    if (summary) {
+        char note[avh::kLineBytes];
+        shop::formatCamCapped(note, sizeof(note), what, summary);
+        say(sink, "%s", note);
+    }
+    if (ok) say(sink, "%s", line);
+}
+// The preview client's camera fields, read under SEH; false when any read faults.
+bool readCameraFields(uintptr_t client, shop::CamFields* out) {
+    uint8_t modeKind[8], step[4], dist[4], maxDist[4], minDist[4], retry = 0, pose[64];
+    if (!plausibleUserPointer(client) || !sehCopyBytes(client + shop::kOffMode, modeKind, sizeof(modeKind)) || !sehCopyBytes(client + shop::kOffStep, step, sizeof(step)) ||
+        !sehCopyBytes(client + shop::kOffDist, dist, sizeof(dist)) || !sehCopyBytes(client + shop::kOffMax, maxDist, sizeof(maxDist)) || !sehCopyBytes(client + shop::kOffMin, minDist, sizeof(minDist)) ||
+        !sehReadByteAt(client + shop::kOffRetry, &retry) || !sehCopyBytes(client + shop::kOffPose, pose, sizeof(pose)))
+        return false;
+    *out = shop::camFromBytes(modeKind, step, dist, maxDist, minDist, retry, pose);
+    return true;
+}
+// Once a frame: the setup calls the hook queued (as lines), then once a second for each watched screen that reads open (g_shopOpen: set by shopFrameTick's re-check) its client's camera fields.
+void liveryCameraTick(const avh::Sink& sink) {
+    ShopFrame& f = g_shopFrame;
+    const uint64_t now = shopNowMs();
+    char line[avh::kLineBytes];
+    shop::SetupCall call;
+    while (g_setupRing.take(&call)) {
+        shop::formatSetup(line, sizeof(line), call);
+        camWrite(f.setupCap, "setup", sink, now, line);
+    }
+    const uint64_t lost = g_setupRing.lost() + g_setupBusyDrops.load(std::memory_order_relaxed);
+    if (lost != f.setupLostSeen) {
+        shop::formatSetupLost(line, sizeof(line), lost - f.setupLostSeen);
+        f.setupLostSeen = lost;
+        camWrite(f.setupCap, "setup", sink, now, line);
+    }
+    for (int c = 0; c < shop::kClassCount; ++c) {
+        if (shop::clientOffset(c) == 0 || g_shopOpen[c].load(std::memory_order_acquire) == 0) continue;
+        const uintptr_t obj = g_shopObj[c].load(std::memory_order_acquire);
+        if (obj == 0 || !f.camPacer[c].due(now)) continue;
+        const uintptr_t client = obj + shop::clientOffset(c);
+        shop::CamFields fields;
+        const bool readable = readCameraFields(client, &fields);
+        if (!readable || !shop::camFinite(fields)) {
+            if (!f.camUnreadableSaid[c]) {   // said once per class
+                f.camUnreadableSaid[c] = true;
+                shop::formatCameraUnreadable(line, sizeof(line), c, static_cast<uint32_t>(obj), static_cast<uint32_t>(client), !readable);
+                camWrite(f.camCap, "camera", sink, now, line);
+            }
+            if (!readable) continue;
+        }
+        shop::formatCamera(line, sizeof(line), c, static_cast<uint32_t>(obj), static_cast<uint32_t>(client), fields);
+        camWrite(f.camCap, "camera", sink, now, line);
+    }
+}
+
 // ---- F212: the frame thread's half of the conversation look ----------------------------------------------------------------------------------------
 nofoot::f212::Tracker g_convTracker;   // frame thread only
 
 // The rigs install the hook only when they gave it a target; production tries it.
+// F229: the same for the Livery setup hook.
+bool liveryCamWanted() {
+#ifdef EDVR_NATIVE_ON_FOOT_HOOKS_TEST
+    return g_testLiveryCamReal || g_testTargets[kHkLiveryCam] != 0;
+#else
+    return true;
+#endif
+}
 bool convLookWanted() {
 #ifdef EDVR_NATIVE_ON_FOOT_HOOKS_TEST
     return g_testLookReal || g_testTargets[kHkLook] != 0;
@@ -3158,6 +3272,7 @@ void boundaryAt(const avh::Sink& sink) {
         if (g_hooks[kHkCtl].state == kHookStateNotTried) tryHook(kHkCtl, sink);
         tryShopHooks(sink);   // F209: optional; a stand-down leaves F107 on its distance test alone
         if (g_hooks[kHkLook].state == kHookStateNotTried && convLookWanted()) tryHook(kHkLook, sink);   // F212: optional; a stand-down leaves the game's conversation look as it was
+        if (g_hooks[kHkLiveryCam].state == kHookStateNotTried && liveryCamWanted()) tryHook(kHkLiveryCam, sink);   // F229: optional, read-only; a stand-down says so in one line and loses only the setup lines
         checkPartNames(sink);
         skeletonArm(fs, sink);
     }
@@ -3167,6 +3282,7 @@ void boundaryAt(const avh::Sink& sink) {
         nativeFadeTick(nativeBody && !external, external ? "the game's third-person camera (F93d)" : g_nativeReason, sink);
     }
     shopFrameTick(sink);   // F209
+    liveryCameraTick(sink);   // F229
     convLookTick(sink);    // F212
     updateGates();
 }
@@ -3211,6 +3327,7 @@ void nativeOnFootHooksShutdown() {
     nativeFadeTick(false, "the game is shutting down", avh::Sink{&logSink, nullptr});
     // F212: a call after this goes down the relay's original path (the callback is in the code about to be unloaded); the destructor puts the leaf's own bytes back.
     g_gate[kHkLook].store(0, std::memory_order_release);
+    g_gate[kHkLiveryCam].store(0, std::memory_order_release);   // F229: a call after this goes down the relay's original path
 }
 
 bool avatarHooksBuildKnown(uintptr_t* baseOut, char* why, size_t whyCap) {
@@ -3858,6 +3975,7 @@ void setTargets(const NativeOnFootHooksTestTargets& t) {
     g_testTargets[kHkKioskStart] = t.kioskStart;
     g_testTargets[kHkKioskStop] = t.kioskStop;
     g_testTargets[kHkLook] = t.conversationLook;   // F212
+    g_testTargets[kHkLiveryCam] = t.liveryCameraSetup;   // F229
 }
 void setFadeGlobal(int32_t* mode, float* amount) {
     g_testFadeMode = mode;
@@ -3895,6 +4013,7 @@ void shopTryReal(bool on) { g_testShopReal = on; }
 void shopClock(uint64_t nowMs) { g_testShopNow = nowMs; }
 void conversationClock(uint64_t nowMs) { g_testConvNow = nowMs; }   // F212
 void conversationTryReal(bool on) { g_testLookReal = on; }          // F212
+void liveryCameraTryReal(bool on) { g_testLiveryCamReal = on; }     // F229
 void reset() {
     for (HookEntry& entry : g_hooks) {
         entry.hook.uninstall();
@@ -3986,6 +4105,13 @@ void reset() {
         shop::Event drop;
         while (g_shopRing.take(&drop)) {}
         g_shopFrame = ShopFrame();
+        {   // F229: the Livery setup ring and its flags start from nothing
+            shop::SetupCall dropped;
+            while (g_setupRing.take(&dropped)) {}
+            g_setupBusy.store(false);
+            g_setupBusyDrops.store(0);
+            g_testLiveryCamReal = false;
+        }
         g_testShopBase = 0;
         g_testShopReal = false;
         g_testShopNow = 0;

@@ -261,11 +261,13 @@ struct NativeOnFootHooksTestTargets {
     uintptr_t controller = 0, avatarFade = 0, findJoint = 0;
     uintptr_t shopShow = 0, shopClose = 0, shopSetState = 0, kioskStart = 0, kioskStop = 0;   // F209: the shop hooks are tried only for the ones given here (or all, shopTryReal)
     uintptr_t conversationLook = 0;   // F212: the conversation look's hook is tried only when a target is given here
+    uintptr_t liveryCameraSetup = 0;  // F229: the preview client's scene setup hook is tried only when a target is given here
 };
 namespace nofoothookstest {
 constexpr int kController = 0, kFade = 1, kFind = 2;   // the hooks, in the order stolenBytes, hookState and gateOpen take them
 constexpr int kShopShow = 3, kShopClose = 4, kShopSetState = 5, kKioskStart = 6, kKioskStop = 7;   // F209
 constexpr int kConversationLook = 8;   // F212
+constexpr int kLiveryCameraSetup = 9;  // F229
 void setTargets(const NativeOnFootHooksTestTargets& targets);
 void setFadeGlobal(int32_t* mode, float* amount);   // the synthetic dither-fade global and its amount float (null: the build's real addresses)
 void setHeadImage(uintptr_t base, size_t size);     // the rig's synthetic game image for the skeleton reads' arming (base 0: the real module)
@@ -293,6 +295,7 @@ void shopTryReal(bool on);            // F209: try the shop hooks against the re
 void shopClock(uint64_t nowMs);       // F209: the shop lines' clock (ms); 0 restores the system clock
 void conversationClock(uint64_t nowMs);   // F212: the conversation look's clock (ms) for its calls and lines; 0 restores the system clock
 void conversationTryReal(bool on);         // F212: try the conversation look's hook against the real module too (the build-identity refusal); off: only with a target
+void liveryCameraTryReal(bool on);          // F229: try the Livery setup hook against the real module too (the build-identity refusal); off: only with a target
 void reset();                      // every hook uninstalled, every latch and counter cleared
 }  // namespace nofoothookstest
 #endif

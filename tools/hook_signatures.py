@@ -1979,7 +1979,8 @@ AUDIT_EXACT_ONLY = (
     ("d3d11/avatar_hooks_core.h", "the extracted avatar hooks' exact-build addresses and identity"),
     ("d3d11/avatar_skeleton_core.h", "the extracted avatar skeleton's exact-build vtables and slots"),
     ("d3d11/shop_screen_core.h", "F209's exact-build Pioneer Supplies buy screens: five hook addresses, their prologue bytes and three vtables, checked against the build's PE identity and the "
-     "prologue bytes before any is placed (native_on_foot_hooks.cpp, in this family, places them); making them self-locating needs the signature table regenerated"),
+     "prologue bytes before any is placed (native_on_foot_hooks.cpp, in this family, places them); F229 adds the Livery preview client's scene setup (0x12714C0, 16 prologue bytes, "
+     "read-only) and the two Livery vtables and the loadout browser's, under the same gate; making them self-locating needs the signature table regenerated"),
     ("d3d11/native_on_foot_f212.h", "F212's exact-build conversation look: the address and all 17 bytes of the look springs' target setter (a leaf with no unwind data), checked against the "
      "build's PE identity and every byte before the hook is placed (native_on_foot_hooks.cpp, in this family, places it); making it self-locating needs the signature table regenerated"),
     ("d3d11/native_on_foot_f87.h", "the exact-build interaction prompt probe's addresses and pins"),

@@ -52,6 +52,9 @@
 - **Then, if needed (build):** log the CustomisationVisual's distance and pose fields (+0x340, +0x344, +0x580,
   +0x5A0, +0x5E0) once a second while Livery is open, from the remembered activity +0x680. Optionally, an
   exact-build hook on 0x12714C0 logging its mode.
+- **F229 (read-only, built, NOT FLOWN):** logs the preview client's camera fields once a second per open screen
+  and each call of the setup 0x12714C0 (`livery camera (F229):` lines; the loadout browser is watched beside
+  Livery as the correct reference). Offsets, rcx and how to read it: "F229 instrument" at the end.
 - **Temporary keys:** `experimental.native_on_foot_livery_game_view` (on|off, default on, live, F8 row "Livery
   uses game view"). When the arc closes, the winning value becomes the behaviour and the key goes (ask first).
 - **Issue:** none yet.
@@ -208,3 +211,25 @@ This test does not settle the fix. If H1 holds, there are two candidate fixes:
   (0.000 0.000 0.000)` (STAGE coincides with LOCAL on both).
 - ruled out: EDVR's on-foot view offsets as the cause, because they are centimetres (raise +7.0 cm, virtual neck 0)
   and the model is metres off. F107 kept the camera as the commander's throughout, which is correct: it is.
+
+## F229 instrument (2026-11-09)
+
+Read-only, no behaviour change; the lines start `livery camera (F229):`. Once a second per open screen it logs
+the client's fields by name (new RE: the first draft's +0x340 and +0x344 were relative to the interface at
+object+0x58): mode (+0x398 int, the setup mode), kind (+0x39C int: 0 node distance, 1 avatar-bounds distance,
+2 none), step (+0x570 zoom step), dist (+0x580 current orbit distance), max (+0x590), min (+0x5A0), retry
+(+0x5B0 byte, 1 = the game recomputes the distance on its next update) and the 16 floats at +0x5E0 as four rows,
+with the length of the translation read as the last row and as the last column.
+
+- Client offsets, from each constructor's `lea rcx,[object+X]` before the call to 0x126B670: suit and weapons
+  buy screens 0x448, suit Livery 0x680, weapon Livery 0x630 (not 0x680), loadout browser
+  (`HumanoidOutfittingInteraction`, watched only; its vtable slots +0x70/+0x78/+0x80 hold the shared Show,
+  IsOpen and Close) 0xC0.
+- The hook on 0x12714C0 (16 prologue bytes verified, no stack arguments, r9 unused) logs rcx, rcx - 0x58 as the
+  object, r8, `*(int*)r8` and which watched screen's client that object is. The function has no direct caller:
+  it is slot 3 of the vtable at client+0x58 (0x51AA4B8, stored there by the client constructor), so its rcx is
+  client+0x58 and the line says "client +0x0" when the object is a watched client.
+- No render-camera distance column: the concourse `cam_local` is anchor-local and not reachable from the hooks.
+- Reading it: Livery against the loadout browser (correct) at the same second. (b) predicts dist and the
+  translation near 0 (kind 1 with the avatar still empty) in Livery only, and retry 1; (a) predicts setup calls
+  after the open with a different mode.
