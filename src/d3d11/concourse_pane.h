@@ -81,52 +81,59 @@ private:
     void endProbePass() noexcept;       // ends the probe's query and puts its state back (all but the constant buffer, which the display pass keeps and end() restores)
     void end() noexcept;
 
-    ID3D11DeviceContext* ctx_ = nullptr;
-    const ConcoursePaneCalls* calls_ = nullptr;
+    // The three members the destructor and the inline accessors read, and so the only ones the constructor sets when nothing is armed (the unarmed draw, 13-17k a frame, pays
+    // for these three stores and not for ~330 bytes of defaults). Every other member is set by initCold() as the first act of begin(), before anything reads it: begin() runs
+    // whenever the scope is armed, and no member below is read unless begin() ran (end() only when flags_ != 0, nextMirrorPassSlow() only when family_, both set by begin()).
     uint32_t flags_ = 0;   // which of the things to put back or close are open
     bool family_ = false;   // the draw is a pane of the list
     bool withheld_ = false;
+    // /GS: MSVC guards an array of a non-pointer type with more than two elements, and a struct of three or more such values, so a scope holding FLOAT[4] (or a struct of four floats)
+    // made every draw thunk that builds one set up a security cookie and check it, armed or not (measured on a replica, 2026-11-08). The blend factors are therefore flat members
+    // here, and the code that hands them to D3D copies them through a local array. The pointer arrays (the saved t8..t10) are not guarded.
+    void initCold() noexcept;   // every member below, to the value it had as a default member initialiser
+    ID3D11DeviceContext* ctx_;
+    const ConcoursePaneCalls* calls_;
     // The plan begin() decides and beginMirrorSlow() carries out.
-    bool planMirror_ = false;
-    bool planMark_ = false;     // the mirror draw is limited to the marked pixels
-    bool planOpaque_ = true;    // false: the fade (blend factor opacity)
-    bool planTint_ = false;
-    bool planSoft_ = false;     // mirror-soft: EDVR's constant buffer 2
-    float planGlow_ = 0.0f;     // the lit modes: the glow pass's blend factor (0: no glow pass)
-    bool planSteady_ = false;   // the steady modes: the glow pass is a flat colour, with no light or shadow in it
-    bool mirrorBound_ = false;  // the mirror pass has been bound
-    bool planBackdrop_ = false; // mirror-backdrop: the steady pass with the cube-sampling pixel shader
-    bool planCapture_ = false;  // an armed backdrop capture: this exterior pane gets a capture pass before its display pass
-    bool capDone_ = false;      // the capture pass has been asked for
-    bool capBound_ = false;     // the capture pass's state is bound (endCapturePass puts it back)
-    bool planProbe_ = false;    // a test frame in mirror-backdrop with the mark: a probe pass runs before the display pass
-    bool probeDone_ = false;    // the probe pass has been asked for
-    bool probeBound_ = false;   // the probe pass's state is bound and its query is open (endProbePass closes and restores; the capture pass's save fields are used, the two never share a scope)
-    ID3D11SamplerState* probePrevSampler_ = nullptr;
-    ID3D11BlendState* capPrevBs_ = nullptr;
-    FLOAT capPrevFactor_[4] = {};
-    UINT capPrevMask_ = 0;
-    ID3D11PixelShader* capPrevPs_ = nullptr;
-    ID3D11ShaderResourceView* capPrevSrv_[3] = {};
-    ID3D11DepthStencilState* capPrevDs_ = nullptr;
-    UINT capPrevRef_ = 0;
-    ID3D11SamplerState* prevSampler_ = nullptr;   // the display pass's sampler slot, the game's kept for end()
-    FLOAT planFactor_[4] = {1.0f, 1.0f, 1.0f, 1.0f};
-    uint32_t keyN_ = 0, keyStart_ = 0;
-    int32_t keyBase_ = 0;
-    int query_ = -1;
-    int capQuery_ = -1;
-    int testSlot_ = -1;
-    ID3D11BlendState* prevBs_ = nullptr;
-    FLOAT prevFactor_[4] = {};
-    UINT prevMask_ = 0;
-    ID3D11PixelShader* prevPs_ = nullptr;
-    ID3D11ShaderResourceView* prevSrv_[3] = {};
-    ID3D11DepthStencilState* prevDs_ = nullptr;
-    UINT prevStencilRef_ = 0;
-    ID3D11DeviceContext1* ctx1_ = nullptr;
-    ID3D11Buffer* prevCb_ = nullptr;
-    UINT prevCbFirst_ = 0, prevCbNum_ = 0;
+    bool planMirror_;
+    bool planMark_;     // the mirror draw is limited to the marked pixels
+    bool planOpaque_;   // false: the fade (blend factor opacity)
+    bool planTint_;
+    bool planSoft_;     // mirror-soft: EDVR's constant buffer 2
+    float planGlow_;    // the lit modes: the glow pass's blend factor (0: no glow pass)
+    bool planSteady_;   // the steady modes: the glow pass is a flat colour, with no light or shadow in it
+    bool mirrorBound_;  // the mirror pass has been bound
+    bool planBackdrop_; // mirror-backdrop: the steady pass with the cube-sampling pixel shader
+    bool planCapture_;  // an armed backdrop capture: this exterior pane gets a capture pass before its display pass
+    bool capDone_;      // the capture pass has been asked for
+    bool capBound_;     // the capture pass's state is bound (endCapturePass puts it back)
+    bool planProbe_;    // a test frame in mirror-backdrop with the mark: a probe pass runs before the display pass
+    bool probeDone_;    // the probe pass has been asked for
+    bool probeBound_;   // the probe pass's state is bound and its query is open (endProbePass closes and restores; the capture pass's save fields are used, the two never share a scope)
+    ID3D11SamplerState* probePrevSampler_;
+    ID3D11BlendState* capPrevBs_;
+    FLOAT capPrevFactor0_, capPrevFactor1_, capPrevFactor2_, capPrevFactor3_;   // the blend factor as four members, not FLOAT[4]: see the note above
+    UINT capPrevMask_;
+    ID3D11PixelShader* capPrevPs_;
+    ID3D11ShaderResourceView* capPrevSrv_[3];
+    ID3D11DepthStencilState* capPrevDs_;
+    UINT capPrevRef_;
+    ID3D11SamplerState* prevSampler_;   // the display pass's sampler slot, the game's kept for end()
+    FLOAT planFactor0_, planFactor1_, planFactor2_, planFactor3_;
+    uint32_t keyN_, keyStart_;
+    int32_t keyBase_;
+    int query_;
+    int capQuery_;
+    int testSlot_;
+    ID3D11BlendState* prevBs_;
+    FLOAT prevFactor0_, prevFactor1_, prevFactor2_, prevFactor3_;
+    UINT prevMask_;
+    ID3D11PixelShader* prevPs_;
+    ID3D11ShaderResourceView* prevSrv_[3];
+    ID3D11DepthStencilState* prevDs_;
+    UINT prevStencilRef_;
+    ID3D11DeviceContext1* ctx1_;
+    ID3D11Buffer* prevCb_;
+    UINT prevCbFirst_, prevCbNum_;
 };
 
 // What the concourse tick tells the panes each frame.

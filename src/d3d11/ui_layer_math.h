@@ -2008,6 +2008,23 @@ inline double uiLayerPercentile(float* v, uint32_t n, double frac) {
     return uiLayerSortedPercentile(v, n, frac);
 }
 
+// The same number as uiLayerPercentile, by selection instead of a full sort: the interpolation reads only the two order
+// statistics at lo and lo+1, and nth_element leaves every element after lo >= v[lo], so the (lo+1)th statistic is the minimum of
+// the rest. O(n) instead of O(n log n); v is left partitioned (any order is a valid input to another call). Samples are finite
+// timer sums, so there is no NaN to order differently.
+inline double uiLayerPercentileSelect(float* v, uint32_t n, double frac) {
+    if (!v || !n) return 0.0;
+    const double pos = frac * static_cast<double>(n - 1);
+    uint32_t lo = static_cast<uint32_t>(pos);
+    if (lo > n - 1) lo = n - 1;
+    const uint32_t hi = lo + 1 < n ? lo + 1 : lo;
+    const double t = pos - static_cast<double>(lo);
+    std::nth_element(v, v + lo, v + n);
+    const float a = v[lo];
+    const float b = hi != lo ? *std::min_element(v + lo + 1, v + n) : a;
+    return static_cast<double>(a) * (1.0 - t) + static_cast<double>(b) * t;
+}
+
 // THE TONEMAP RE-ISSUE'S SCENE IMAGES (docs/cockpit-hud-layer-design-2026-09-27.md, "2026-10-20: bloom counted twice").
 // The re-issue swaps only the tone's HDR source for the HDR layer; everything else the game's draw bound stays bound. With
 // Elite's Bloom on, the tone reads the scene's bloom from a slot of its own (quarter size at t2 on the flat E894/0D43 tone, t1

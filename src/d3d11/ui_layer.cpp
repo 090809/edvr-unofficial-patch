@@ -43,6 +43,7 @@
 #include "depth_probe.h"   // depthProbeDrawsAtSize: the world-screen gate's own count
 #include "device_hook.h"   // deviceHookHmdQuality, for the configure line
 #include "gpu_timing.h"
+#include "gpu_query_count.h"  // GpuQueryOwnerScope: the route timers' Ends count as ui_route
 #include "gpu_census.h"    // issue #38: the per-feature GPU cost census
 #include "graphics_runtime.h"
 #include "journal_watch.h" // the on-foot gate's reading: Status.json's Flags2 bit 0, GuiFocus
@@ -1004,11 +1005,21 @@ void routeApplyCoverage(int eye, uint64_t seq) {
     }
 }
 
+// One eye-frame in 16 is timed, each of them whole: the choice is a function of the frame's sequence alone, so every stage of a
+// sampled eye-frame (and both eyes of it) is timed and every stage of any other is not, which keeps the per-eye-frame sums
+// coherent (they are the only thing the timers feed: logTotals' price line, whose medians now come from a 16th of the samples).
+// An eye-frame that is not sampled is not "untimed" and not "lost": nothing of it begins, so no ledger entry, sum or counter is
+// touched. The HDR draw diagnostics (g_hdrDrawTimingOn, compiled off) time every frame as they always did: that census prices
+// the moved draw per frame. A frame one in 16 matches the draw clock (perf_monitor.cpp) and ui_depth's stellar timer.
+constexpr uint64_t kRouteSampleMask = 15;
+inline bool routeSampled(uint64_t seq) { return g_hdrDrawTimingOn || (seq & kRouteSampleMask) == 0; }
+
 void routeMovedMissing(int eye, uint64_t seq) {
     // A disabled draw is absent from both moved-only and combined coverage,
     // including an on/off toggle within one source sequence. Machinery stays
     // valid. Steady diagnostics-off frames need no scan of the pending ring.
     constexpr UiRouteStage stage = UiRouteStage::kHdrMovedDraw;
+    if (!routeSampled(seq)) return;  // an eye-frame the route timers skip has no sums to spoil
     uiRouteLost(g_stageSum[static_cast<size_t>(stage)][eye], seq);
     g_routeTotals[eye].lost(stage, seq);
     if (g_routeCoverage.missing(stage, eye, seq) &&
@@ -1022,10 +1033,13 @@ void routeMovedMissing(int eye, uint64_t seq) {
 // before any of that: logTotals is the only reader and flat never calls it,
 // and each timestamp query costs the driver work (on DXMT it splits the
 // Metal pass: a reporter's flat scene went from under 60 fps to 60 without
-// them). routePoll still drains what a VR frame left in flight.
+// them). -1 too, with no accounting, for an eye-frame that is not one of the
+// sampled 16th (routeSampled). routePoll still drains what a VR frame left in flight.
 int routeBegin(ID3D11DeviceContext* ctx, UiRouteStage stage, int eye, uint64_t seq) {
     if (!ctx || eye < 0 || eye > 1 || !seq) return -1;
     if (runtimeFlatProfile()) return -1;
+    if (!routeSampled(seq)) return -1;
+    const GpuQueryOwnerScope queryOwner(GpuQueryOwner::UiRoute);  // the timer's Ends count as ui_route, not "other"
     const size_t si = static_cast<size_t>(stage);
     RouteSlot& s = g_route[g_routeHead % kRouteRing];
     bool ok = false;
@@ -1062,6 +1076,7 @@ void routeEnd(ID3D11DeviceContext* ctx, int idx) {
     if (idx < 0 || idx >= static_cast<int>(kRouteRing) || !ctx) return;
     // Closes the moved HDR draw's census item opened by routeBegin (the same slot, the same stage).
     if (g_route[idx].stage == UiRouteStage::kHdrMovedDraw) gpuCensusEnd(ctx, GpuCensusSection::AlteredHdrHud);
+    const GpuQueryOwnerScope queryOwner(GpuQueryOwner::UiRoute);
     g_route[idx].timer.end(ctx);  // a failed end reads back as not measured
 }
 
@@ -1124,8 +1139,8 @@ void appendPrice(std::string& s, size_t stat) {
         s += "-";
         return;
     }
-    const double p95 = uiLayerPercentile(r.v, r.n, 0.95);  // sorts; the median reads the same order
-    const double med = uiLayerSortedPercentile(r.v, r.n, 0.5);
+    const double p95 = uiLayerPercentileSelect(r.v, r.n, 0.95);  // selection, not a sort: same numbers, O(n)
+    const double med = uiLayerPercentileSelect(r.v, r.n, 0.5);
     char buf[64];
     _snprintf_s(buf, sizeof(buf), _TRUNCATE, "%.3f/%.3f (%u)", med, p95, r.n);
     s += buf;
@@ -1134,9 +1149,9 @@ void appendPrice(std::string& s, size_t stat) {
 uint64_t g_winStartMs = 0;
 uint64_t g_sessionRedirected = 0;
 // Phase-0 timing (src/common/periodic_work.h) of the 30 s totals and price
-// lines, built on Elite's thread at the frame boundary: appendPrice sorts up
+// lines, built on Elite's thread at the frame boundary: appendPrice selects the median and p95 of up
 // to kRouteSamples floats for each of the price stats. Context: the samples
-// held then (what the sorts had to order). One run per window that logs, so
+// held then (what the selection had to scan). One run per window that logs, so
 // nothing is written while fix.ui_quality is off and nothing was redirected.
 PeriodicWork g_workTotals{"ui_layer_totals", "samples"};
 

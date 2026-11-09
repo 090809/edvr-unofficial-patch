@@ -325,7 +325,15 @@ bool Hotkey::pressed() {
     // A game-mirrored binding is never filtered by focus; see the note above.
     // A pad or joystick binding takes the same rule: neither device has a
     // window, so "focused" is whether the game has it, as for a key.
-    return pressedWith(readDownNow(), m_bind.kind == HotkeyKind::Key ? heldMods() : 0,
+    //
+    // With the binding up, pressedWith's result and every member it writes
+    // (m_down = false, no edge, no m_missedUnfocused) are the same whatever
+    // `held` and `focused` are, and hotkeysSuspended() is not reached. So the
+    // modifier reads and the foreground-window query are made only when the
+    // binding is down.
+    const bool down = readDownNow();
+    if (!down) return pressedWith(false, 0, false);
+    return pressedWith(true, m_bind.kind == HotkeyKind::Key ? heldMods() : 0,
                        m_gameMirrored || gameHasFocus());
 }
 
