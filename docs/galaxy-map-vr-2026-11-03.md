@@ -2,7 +2,7 @@
 
 ## Status
 
-State (2026-11-09): a tester on rc.7 finds the side buttons click only when aimed with the left eye. MEASURED: the UI frame's origin is the tracking origin, not the head, and the arrow at star depth is aimed from it. The ray from the head as the map opened (0b806fa1) FLOWN 14:11: the point was taken, but a still head is not the case. Dump 141144750001: the head had turned about 45 degrees to a side column, carrying the eyes 6.5 cm from that point, and the arrow at star depth then showed on a button in the left eye while the game's own cursor was 4.6 degrees beside the column. The probe was right. So a fixed ray origin cannot serve the panels. Sean chose the wider zone: within 0.11 tan of a panel (0.13 to stay) the arrow is the game's, and the hover takes the live head while it is (built on the same branch, NOT FLOWN; both maps, both sides). See "The ray from the head as the map opened", "Flight, the latched ray" and "The panel zone".
+State (2026-11-09): a tester on rc.7 finds the side buttons click only when aimed with the left eye. MEASURED: the UI frame's origin is the tracking origin, not the head, and the arrow at star depth is aimed from it. The ray from the head as the map opened (0b806fa1) FLOWN 14:11: the point was taken, but a still head is not the case. Dump 141144750001: the head had turned about 45 degrees to a side column, carrying the eyes 6.5 cm from that point, and the arrow at star depth then showed on a button in the left eye while the game's own cursor was 4.6 degrees beside the column. The probe was right. So a fixed ray origin cannot serve the panels. Sean chose the wider zone: within 0.11 tan of a panel (0.13 to stay) the arrow is the game's, and the hover takes the live head while it is (both maps, both sides). 40a96dc3 FLOWN OK (Sean: "Works great"), merged to main the same day. See "The ray from the head as the map opened", "Flight, the latched ray" and "The panel zone".
 
 State (2026-11-04): fixes 1, 2 and 3 FLOWN 09:50 (ca707034): the map is crisp and does not smear, systems select properly, the UI works. Build bf17a80a FLOWN 11:00: panels at the game's depth and the arrow's panel mask work; icons facing the eye REJECTED, they yaw with the head. Third build 6a12ef42 FLOWN 12:35: world-fixed quads and gap bridging work. Fourth build 759ec617 FLOWN 13:21: "basically works", but the map fell to 45 fps and near icons wobble. Fifth build e02c6248 FLOWN 14:13: still about 60 fps on the map, and icons and text rotate about y as the camera moves sideways. An adversarial review found both causes (see "After the fifth flight"; `reviews\galaxy-map-perf-review-2026-11-04.md`, not in git). Its course, built as the sixth build 5086b6f3, FLOWN 16:38: the map holds 88 to 90 fps, `xr_end_frame` p50 0.20 to 0.22 ms, 2 render target binds a frame. Sean chose the camera's up, so the key and the grid's-vertical option are removed. Sean: "Wobble is gone", so `mapEyeRel` and the stems' swap stay. Merged with main, which was 168 commits newer with a rewritten draw path. Main's build 5bce272d FLOWN 18:35: 90 fps on the map and 2 render target binds a frame. ON MAIN, pushed.
 
@@ -367,7 +367,7 @@ Build 0b806fa1, FLOWN 2026-11-09 14:11, Frontier, Pimax, native OpenXR, 3008x304
 
 ## The panel zone
 
-Sean, 2026-11-09, after the flight above: the wider zone. Built, NOT FLOWN.
+Sean, 2026-11-09, after the flight above: the wider zone. Build 40a96dc3 FLOWN OK the same day, Sean: "Works great". Merged to main.
 
 **The rule.** The tip is on a panel when the mask covers it or any point within a reach of it, sampled in 16 directions at 12 steps (galaxy_map_vs.h THE PANEL ZONE). Getting on reaches 0.11 tan (about 6.3 degrees), staying on 0.13 tan (about 7.4); between the two the arrow keeps what it was. This replaces getting on by the exact test or mask on both sides, and staying on by mask on either side within about 0.05 tan. The reach is an angle on every headset: the probe's vertex shader hands the pixel shader the projection's scale (NDC per tan, the clip x row across the forward row), and the pixel shader makes it pixels with the mask's width. Measured against it: the arrow at star depth was 0.08 tan off the game's cursor for a 45-degree turn, so at 0.11 the arrow is the game's before the star-depth one could show on a button.
 
@@ -377,9 +377,9 @@ Sean, 2026-11-09, after the flight above: the wider zone. Built, NOT FLOWN.
 
 Log: the 30 s `map pointer: the arrow's ray origin:` line ends `hover calls from the live head, the arrow on a panel: N of M replaced`; N is 0 when the arrow was never on a panel in the window. Rigs: `galaxy_map_vs_test` G6.zone (each of eight directions in and out of the reach; the reach doubling with the projection's scale, with and without a forward w row; a panel's edge 5 pixels away, now on) and G6b (staying on, and the band between the reaches, which does not get the arrow on); `ui_quality_test` GP34 (the live head from the dump's eyes) and GP33 (the wiring).
 
-## Flight card, the panel zone
+## Flight card, the panel zone (flown OK)
 
-Build: the head of `claude/vr-map-eye-tracking-issue-e48b3c`. VR, Frontier (Odyssey), both maps, both side columns.
+Build 40a96dc3 (`claude/vr-map-eye-tracking-issue-e48b3c`). VR, Frontier (Odyssey), both maps, both side columns.
 
 1. The case flown at 14:11: turn the head to a side column and approach its buttons from the map. The arrow should change to the panel's depth about 6 degrees before the column, in open map, and from then on sit on the same spot of a button in each eye, with each eye shut in turn and with both open. The buttons should click where the arrow shows.
 2. The same on the other column and on the System Map's.
