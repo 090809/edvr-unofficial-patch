@@ -12476,6 +12476,7 @@ def _hj_f107_away(rows, ctx):
 H_SHOP = "shop screens (F209)"
 H_SHOP_BUY_CLASSES = ("SuitVendorInteraction", "WeaponsVendorInteraction")   # the buy screens: the Livery screens (F228) and the loadout browser (F229) are watched, and never hold the signal
 H_LIVCAM = "livery camera (F229)"
+H_LIVREP = "livery camera repair (F230)"
 F107_SHOWROOM_MAX_M = 50.0   # F209: a distance-test episode whose first camera stood over F107's 3 m and no farther than this from the neck is the size of a showroom's camera (the suit shop's: 3.6 to 3.7 m)
 
 
@@ -12609,6 +12610,9 @@ def _hj_livcam(rows, ctx):
     if setups:
         modes = collections.Counter(r["mode"] for r in setups)
         where = collections.Counter(re.sub(r"object \+0x[0-9A-F]+, which is ", "", r["where"]) for r in setups)
+        theirs = [r for r in setups if not r["ours"]]
+        if theirs:
+            parts.append("%d of %d game setup call(s) left the camera node INVALID" % (len([r for r in theirs if r["node"] == "INVALID"]), len(theirs)))
         parts.append("%d setup call(s), mode %s; object %s" % (len(setups), ", ".join("%s x%d" % (m, n) for m, n in sorted(modes.items())),
                                                            "; ".join("%s x%d" % (w, n) for w, n in sorted(where.items()))))
     text = "; ".join(parts) or "no camera line"
@@ -12622,6 +12626,41 @@ def _hj_livcam(rows, ctx):
         problems.append("%d setup call(s) were not recorded" % _hsum(rows["lost"], "n"))
     if rows.get("capped"):
         problems.append("%d line(s) were not written (the cap of 40 in ten seconds)" % _hsum(rows["capped"], "n"))
+    if problems:
+        return ("PARTIAL", text + "; " + "; ".join(problems))
+    return ("OK", text)
+
+
+def _hj_livrep(rows, ctx):
+    """F230: the Livery camera repair (shop_screen_core.h, TEMPORARY key experimental.native_on_foot_livery_camera_repair). The Update hook (armed or stood down), the key's line, and each retry
+    (attempt n of 5: the game's own setup run again by EDVR, the node before and after). OK when every retry ended with the camera node valid or none was needed. PARTIAL when the key is on and the
+    Update hook stood down, a retry left the node INVALID or faulted or could not test it, every attempt of an open failed, retry lines were lost, or the key was on and a Livery setup left the camera node INVALID
+    (F229's lines) with no retry at all."""
+    kinds = ("hook", "key", "retry", "lost")
+    if not any(rows.get(k) for k in kinds):
+        return None
+    hooks, keys, retries = rows.get("hook", []), rows.get("key", []), rows.get("retry", [])
+    stood = [r for r in hooks if r["st"] == "stood down"]
+    parts = []
+    if hooks:
+        parts.append("Update hook %s" % ("stood down" if stood and len(stood) == len(hooks) else "armed"))
+    if keys:
+        parts.append("key %s" % ", ".join(sorted({r["key"] for r in keys})))
+    fixed = [r for r in retries if r["after"] == "valid"]
+    parts.append("%d retry line(s): %d left the camera node valid, %d did not" % (len(retries), len(fixed), len(retries) - len(fixed)))
+    keyon = bool(keys) and keys[-1]["key"] == "on"
+    problems = []
+    if stood and len(stood) == len(hooks) and keyon:
+        problems.append("the Update hook stood down with the key on: the repair did not run")
+    bad = [r for r in retries if r["after"] != "valid"]
+    if bad:
+        problems.append("%d retry(ies) ended with the camera node %s" % (len(bad), ", ".join(sorted({r["after"] for r in bad}))))
+    if rows.get("lost"):
+        problems.append("%d retry line(s) were not recorded" % _hsum(rows["lost"], "n"))
+    invalid_setups = [r for r in _hrows(ctx, H_LIVCAM, "setup") if not r["ours"] and r["node"] == "INVALID" and "LiveryActivity" in r["where"]]
+    if keyon and invalid_setups and not retries and not stood:
+        problems.append("%d Livery setup(s) left the camera node INVALID and no repair ran (the Update did not reach the gates)" % len(invalid_setups))
+    text = "; ".join(parts)
     if problems:
         return ("PARTIAL", text + "; " + "; ".join(problems))
     return ("OK", text)
@@ -17898,11 +17937,18 @@ HEALTH_RULES = (
         ("hook", r"avatar hooks: (?P<hook>livery-camera-setup) hook (?P<st>armed|stood down)"),
         ("sec", r"livery camera \(F229\): (?P<cls>\w+) 1 s: this 0x(?P<this>[0-9A-F]+), client 0x(?P<client>[0-9A-F]+): mode (?P<mode>-?\d+), kind (?P<kind>-?\d+), step (?P<step>\S+), dist (?P<oa>\S+), max (?P<max>\S+), min (?P<ob>\S+), retry (?P<retry>\d+), "
                 r"pose rows (?P<rows>.*), translation length last row (?P<rowlen>\S+), last column (?P<collen>\S+)$"),
-        ("setup", r"livery camera \(F229\): setup call 0x12714C0: rcx 0x(?P<rcx>[0-9A-F]+), object \(rcx - 0x58\) 0x(?P<obj>[0-9A-F]+), r8 0x(?P<r8>[0-9A-F]+), mode (?P<mode>-?\d+|unreadable) \(thread (?P<tid>\d+)\), the object is (?P<where>.*)$"),
+        ("setup", r"livery camera \(F229\): setup call 0x12714C0: rcx 0x(?P<rcx>[0-9A-F]+), object \(rcx - 0x58\) 0x(?P<obj>[0-9A-F]+), r8 0x(?P<r8>[0-9A-F]+), mode (?P<mode>-?\d+|unreadable), (?P<q>qword 0x[0-9A-F]+|qword unreadable) \(thread (?P<tid>\d+)\), the object is (?P<where>.*?), camera node (?P<node>valid|INVALID|not tested)(?P<ours> \(EDVR's repair call\))?$"),
         ("unread", r"livery camera \(F229\): (?P<cls>\w+) \(this 0x(?P<this>[0-9A-F]+)\) client 0x(?P<client>[0-9A-F]+): the camera fields (?P<why>could not be read|hold a value that is not a number):.*"),
-        ("capped", r"livery camera \(F229\): (?P<n>\d+) (?P<what>camera|setup) lines in the last 10 s were not written"),
+        ("capped", r"livery camera \(F229\): (?P<n>\d+) (?P<what>camera|setup|repair) lines in the last 10 s were not written"),
         ("lost", r"livery camera \(F229\): (?P<n>\d+) setup call\(s\) were not recorded"),
     ), _hj_livcam),
+    _hrule(H_LIVREP, ("F230",), ("(F230",), (
+        ("hook", r"avatar hooks: (?P<hook>livery-camera-update) hook (?P<st>armed|stood down)"),
+        ("key", r"native on foot livery camera \(F230, TEMPORARY\): experimental\.native_on_foot_livery_camera_repair is (?P<key>on|off) -- .*"),
+        ("retry", r"livery camera repair \(F230\): attempt (?P<n>\d+) of (?P<max>\d+): the setup was run again by EDVR \(client 0x(?P<client>[0-9A-F]+), mode (?P<mode>\d+), qword 0x(?P<q>[0-9A-F]+), "
+                  r"thread (?P<tid>\d+)\), camera node INVALID before, (?P<after>valid|INVALID|unreadable|the call faulted) after"),
+        ("lost", r"livery camera repair \(F230\): (?P<n>\d+) repair line\(s\) were not recorded"),
+    ), _hj_livrep),
     _hrule(H_F212, ("F212",), ("(F212)",), (
         ("hook", r"avatar hooks: (?P<hook>conversation-look) hook (?P<st>armed|stood down)(?:: (?P<why>.*?)(?:\. the conversation look \(F212\) is not held.*)?)?$"),
         ("began", r"conversation look \(F212\): run (?P<n>\d+) began: .*\|yaw\| (?P<yaw>[\d.]+) and \|pitch\| (?P<pitch>[\d.]+) asked in its first frames"),
@@ -22573,8 +22619,9 @@ def self_test_health():
         CAM_L2 = cam229("HumanoidLiveryActivity", 0x4D5E6F70, 0x4D5E75F0, "0.0000", "0.0000", "0.0000", "0.0000")
         CAM_O1 = cam229("HumanoidOutfittingInteraction", 0x6F708192, 0x6F708252, "4.2000", "4.2000", "4.2000", "4.2000")
         CAM_NAN = cam229("HumanoidLiveryActivity", 0x4D5E6F70, 0x4D5E75F0, "nan", "nan", "nan", "nan")
-        SETUP_L = RS("setup call 0x12714C0: rcx 0x%08X", TAG229, 0x4D5E7648, 0x4D5E75F0, 0x00FF0010, "3", 7, "HumanoidLiveryActivity object +0x680, which is client +0x0")
-        SETUP_NONE = RS("setup call 0x12714C0: rcx 0x%08X", TAG229, 0x12345678, 0x12345620, 0x00FF0010, "unreadable", 7, "in no watched screen's object")
+        SETUP_L = RS("setup call 0x12714C0: rcx 0x%08X", TAG229, 0x4D5E7648, 0x4D5E75F0, 0x00FF0010, "1", "qword 0x1", 7, "HumanoidLiveryActivity object +0x680, which is client +0x0", "INVALID", "")
+        SETUP_OURS = RS("setup call 0x12714C0: rcx 0x%08X", TAG229, 0x4D5E7648, 0x4D5E75F0, 0x00FF0010, "1", "qword 0x1", 7, "HumanoidLiveryActivity object +0x680, which is client +0x0", "valid", " (EDVR's repair call)")
+        SETUP_NONE = RS("setup call 0x12714C0: rcx 0x%08X", TAG229, 0x12345678, 0x12345620, 0x00FF0010, "unreadable", "qword unreadable", 7, "in no watched screen's object", "not tested", "")
         UNREAD229 = RS("(this 0x%08X) client 0x%08X: the camera fields %s:", TAG229, "HumanoidLiveryActivity", 0x4D5E6F70, 0x4D5E75F0, "could not be read")
         NAN229 = RS("(this 0x%08X) client 0x%08X: the camera fields %s:", TAG229, "HumanoidLiveryActivity", 0x4D5E6F70, 0x4D5E75F0, "hold a value that is not a number")
         CAPPED229 = RS("%s lines in the last 10 s were not written", TAG229, 12, "camera", 40)
@@ -22589,7 +22636,7 @@ def self_test_health():
         check("F229: the setup call and the once-a-second camera lines of a Livery screen and the loadout browser are summarised by class, with the orbit distances' and the translation lengths' ranges",
               [neck(), HOOK_UP229, LSHOW209, SETUP_L, SETUP_NONE, CAM_L1, CAM_O1, CAM_L2, LCLOSE209, neck()], 0, [("OK", H_LIVCAM)],
               has=["setup hook armed", "HumanoidLiveryActivity: 2 camera line(s), kind 1, dist 0.0000 to 4.0000", "HumanoidOutfittingInteraction: 1 camera line(s), kind 1, dist 4.2000", "translation length last row 0.0000 to 5.0000",
-                   "2 setup call(s), mode 3 x1, unreadable x1; object HumanoidLiveryActivity client +0x0 x1; in no watched screen's object x1"], lacks=["UNPARSED"])
+                   "1 of 2 game setup call(s) left the camera node INVALID", "2 setup call(s), mode 1 x1, unreadable x1; object HumanoidLiveryActivity client +0x0 x1; in no watched screen's object x1"], lacks=["UNPARSED"])
         check("F229: the loadout browser's Show and Close are counted by class and are not a buy screen: a Show with no signal is not a fault",
               [neck(), OSHOW209, OCLOSE209, neck()], 0, [("OK", S209)], has=["HumanoidOutfittingInteraction 1"], lacks=["a buy screen was shown but the signal never went on", "UNPARSED"])
         check("F229: a client that could not be read, or holds a value that is not a number, is PARTIAL and names the class",
@@ -22599,6 +22646,29 @@ def self_test_health():
         check("F229: setup calls that were not recorded and lines the cap dropped are PARTIAL", [neck(), HOOK_UP229, SETUP_L, LOST229, CAPPED229, CAM_L1], 0, [("PARTIAL", H_LIVCAM)],
               has=["3 setup call(s) were not recorded", "12 line(s) were not written (the cap of 40 in ten seconds)"])
         check("F229: a line that drifted from its pattern is unparsed", [neck(), "livery camera (F229): the camera is somewhere else"], 4, [("UNPARSED", H_LIVCAM)])
+
+        # ---- the Livery camera repair (F230): the Update hook, the key, the retries ----
+        TAG230 = "livery camera repair (F230):"
+        HOOK_UP230 = RH("hook armed: EliteDangerous64.exe+0x%llX", "avatar hooks:", "livery-camera-update", 0x1272780,
+                        "CustomisationVisual preview client's per-frame Update (the Livery camera repair runs the setup again from it)", 0x7FF601272780, 7, 16, 16, 0x7FF700000000,
+                        RHT("the Livery camera repair (F230, TEMPORARY key"))
+        HOOK_DOWN230 = RH("hook stood down: %s. %s", "avatar hooks:", "livery-camera-update", "the game build differs (the PE timestamp or image size is not build 334925's); EliteDangerous64.exe+0x1272780 was not touched",
+                          RHT("the Livery camera repair (F230) does not run"))
+        KEY_ON230 = RS("native on foot livery camera (F230, TEMPORARY): %s is %s -- %s", "experimental.native_on_foot_livery_camera_repair", "on", "when a Livery preview's camera node is invalid")
+        KEY_OFF230 = RS("native on foot livery camera (F230, TEMPORARY): %s is %s -- %s", "experimental.native_on_foot_livery_camera_repair", "off", "the Livery preview's camera node is only logged (F229); EDVR runs nothing")
+        RETRY_OK230 = RS("attempt %u of %u: the setup was run again", TAG230, 1, 5, 0x4D5E75F0, 1, 0x1, 7, "valid")
+        RETRY_BAD230 = RS("attempt %u of %u: the setup was run again", TAG230, 2, 5, 0x4D5E75F0, 1, 0x1, 7, "INVALID")
+        LOST230 = RH("repair line(s) were not recorded", TAG230, 2)
+        check("F230: the key on, the Update hook armed and a retry that made the node valid is OK", [neck(), HOOK_UP230, KEY_ON230, LSHOW209, SETUP_L, RETRY_OK230, SETUP_OURS, LCLOSE209, neck()], 0, [("OK", H_LIVREP)],
+              has=["Update hook armed", "key on", "1 retry line(s): 1 left the camera node valid, 0 did not"], lacks=["UNPARSED"])
+        check("F230: the key off with no retry is OK: only the evidence lines (F229) are written", [neck(), HOOK_UP230, KEY_OFF230, LSHOW209, SETUP_L, LCLOSE209, neck()], 0, [("OK", H_LIVREP)],
+              has=["key off", "0 retry line(s)"], lacks=["UNPARSED", "no repair ran"])
+        check("F230: a retry that left the node INVALID is PARTIAL", [neck(), HOOK_UP230, KEY_ON230, SETUP_L, RETRY_BAD230], 0, [("PARTIAL", H_LIVREP)], has=["1 retry(ies) ended with the camera node INVALID"])
+        check("F230: the key on, a Livery setup left the node INVALID and no repair ran is PARTIAL", [neck(), HOOK_UP230, KEY_ON230, LSHOW209, SETUP_L, LCLOSE209], 0, [("PARTIAL", H_LIVREP)],
+              has=["1 Livery setup(s) left the camera node INVALID and no repair ran"])
+        check("F230: the Update hook stood down with the key on is PARTIAL", [neck(), HOOK_DOWN230, KEY_ON230], 0, [("PARTIAL", H_LIVREP)], has=["Update hook stood down", "the repair did not run"])
+        check("F230: retry lines that were not recorded are PARTIAL", [neck(), HOOK_UP230, KEY_ON230, RETRY_OK230, LOST230], 0, [("PARTIAL", H_LIVREP)], has=["2 retry line(s) were not recorded"])
+        check("F230: a line that drifted from its pattern is unparsed", [neck(), "livery camera repair (F230): the setup is somewhere else"], 4, [("UNPARSED", H_LIVREP)])
 
         # ---- the conversation look (F212): the leaf that sets the look springs' targets is held at 0 while native on foot is active ----
         S212 = "conversation look (F212)"

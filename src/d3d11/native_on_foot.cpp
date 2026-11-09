@@ -313,6 +313,7 @@ std::atomic<uint32_t> g_f216PubSeq{0};                        // F216: the P1 ho
 nofoot::f216::Pub g_f216PubMove;
 std::atomic<bool> g_f222Key{true};                            // F222 (TEMPORARY): experimental.native_on_foot_steady_body_in_turns, on by default, live: the eye's heading, up and offset are taken in the frame the rows were drawn in
 bool g_f222KeyLast = true;                                    // the value last logged (frame thread; the first read always logs)
+bool g_f230KeyLast = true;                                    // F230 (TEMPORARY): experimental.native_on_foot_livery_camera_repair, on by default, live: the value last logged (frame thread; the first read always logs); the value lives in native_on_foot_hooks.cpp (nativeOnFootSetLiveryRepair)
 bool g_f228KeyLast = true;                                    // F228 (TEMPORARY): experimental.native_on_foot_livery_game_view, on by default, live: the value last logged (frame thread; the first read always logs); the key's value lives in native_on_foot_hooks.cpp (nativeOnFootSetLiveryHold)
 nofoot::f222::OwnFrame g_f222;                                // F222: the rotations of the last two pin frames and the rows' vectors in the model (one writer: the pin hook, under g_pfzBusy; reset at an edge)
 nofoot::f171c::Mailbox<nofoot::f222::Stats> g_f222Box;        // F222: the hook's window of pin calls for the log line (the frame thread takes it)
@@ -1370,6 +1371,17 @@ void readKey() {
                                : "the Livery screens are only watched (Show, Close and the open byte are logged); EDVR's on-foot body and view adjustments run as before F228");
         g_f228KeyLast = on;
         nativeOnFootSetLiveryHold(on);
+    }
+    // F230 (TEMPORARY, live, the developer tier's "Livery camera repair"): a Livery preview whose camera node is invalid has the game's own setup run again from the client's Update.
+    {
+        const bool on = cfg.getString("experimental.native_on_foot_livery_camera_repair", "on") != "off";
+        if (first || on != g_f230KeyLast) {
+            char line[512];
+            shop::formatRepairKey(line, sizeof(line), on);
+            Log::get().note("%s", line);
+        }
+        g_f230KeyLast = on;
+        nativeOnFootSetLiveryRepair(on);
     }
     // F220 (TEMPORARY A/B, live, the developer tier's "HUD stays with view"): with View bob off, the HUD's placement moves with the view's bob term instead of the view moving against it.
     {
@@ -38390,6 +38402,7 @@ static std::string recorderKeysJson() {
     str("experimental.native_on_foot_hud_stays_with_view", cfg.getString("experimental.native_on_foot_hud_stays_with_view", "on"));
     str("experimental.native_on_foot_steady_body_in_turns", cfg.getString("experimental.native_on_foot_steady_body_in_turns", "on"));
     str("experimental.native_on_foot_livery_game_view", cfg.getString("experimental.native_on_foot_livery_game_view", "on"));
+    str("experimental.native_on_foot_livery_camera_repair", cfg.getString("experimental.native_on_foot_livery_camera_repair", "on"));   // F230
     str("fix.native_on_foot_view_bob", cfg.getString("fix.native_on_foot_view_bob", "off"));
     num("experimental.native_on_foot_stand_ads_spine_straighten",
         nofoot::f180::clampDial(static_cast<double>(cfg.getFloat("experimental.native_on_foot_stand_ads_spine_straighten", 0.9f))));

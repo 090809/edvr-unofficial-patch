@@ -1959,17 +1959,39 @@ void shopImgInit() {
         std::memcpy(p + n, body, sizeof(body));
     }
 }
-// F229: the Livery preview client's scene setup, with the game's first 16 prologue bytes and a balanced tail (`add rsp,0 | pop r15 | pop r12 | pop rbp | mov eax,5A60h | ret`): it writes nothing.
+// F229/F230: the Livery preview client's scene setup, Update and camera-node test, with the game's own first 16 prologue bytes where the hooks verify them.
+// The setup (`add rsp,0 | mov al,[fix] | mov [rcx+420h],al | pop r15 | pop r12 | pop rbp | mov eax,5A60h | ret`) stores the rig's "fix" byte into the camera node (client + 0x478, as rcx = client + 0x58 gives
+// it); the node test (`mov al,[rcx] | ret`) reads it; the Update (`push r15 | pop r15 | add rsp,90h | pop rsi | mov rbx,[r11+18h] | mov eax,5A70h | ret`) does nothing else.
 using FnSetup = uint64_t (__fastcall*)(void*, void*, void*, void*);
+constexpr size_t kSetupFixAt = 0x70;   // the "fix" byte's place inside the setup's committed bytes
 void setupImgInit() {
     cimgCommit(shop::kSetupRva, 0x80);
     uint8_t* p = g_cimg + shop::kSetupRva;
     std::memset(p, 0xCC, 0x80);
     size_t n = 0;
     for (uint8_t b : shop::kSetupPrologue) p[n++] = b;   // mov r11,rsp; push rbp; push r12; push r15; lea rbp,[r11-768h]; 48h (the first byte of the add that follows)
-    const uint8_t tail[] = {0x83, 0xC4, 0x00, 0x41, 0x5F, 0x41, 0x5C, 0x5D, 0xB8, 0x60, 0x5A, 0x00, 0x00, 0xC3};
+    const uint8_t add0[] = {0x83, 0xC4, 0x00, 0x8A, 0x05};   // add rsp,0 | mov al,[rip+rel32]
+    std::memcpy(p + n, add0, sizeof(add0));
+    n += sizeof(add0);
+    const int32_t rel = static_cast<int32_t>(kSetupFixAt) - static_cast<int32_t>(n + 4);
+    std::memcpy(p + n, &rel, 4);
+    n += 4;
+    const uint8_t tail[] = {0x88, 0x81, 0x20, 0x04, 0x00, 0x00, 0x41, 0x5F, 0x41, 0x5C, 0x5D, 0xB8, 0x60, 0x5A, 0x00, 0x00, 0xC3};
     std::memcpy(p + n, tail, sizeof(tail));
+    p[kSetupFixAt] = 0;
+    cimgCommit(shop::kNodeValidRva, 0x10);
+    const uint8_t node[] = {0x8A, 0x01, 0xC3};
+    std::memcpy(g_cimg + shop::kNodeValidRva, node, sizeof(node));
+    cimgCommit(shop::kUpdateRva, 0x80);
+    uint8_t* u = g_cimg + shop::kUpdateRva;
+    std::memset(u, 0xCC, 0x80);
+    n = 0;
+    for (uint8_t b : shop::kUpdatePrologue) u[n++] = b;   // mov r11,rsp; mov [r11+18h],rbx; push rsi; sub rsp,90h; 41h (the first byte of `push r15`)
+    const uint8_t utail[] = {0x57, 0x41, 0x5F, 0x48, 0x81, 0xC4, 0x90, 0x00, 0x00, 0x00, 0x5E, 0x49, 0x8B, 0x5B, 0x18, 0xB8, 0x70, 0x5A, 0x00, 0x00, 0xC3};
+    std::memcpy(u + n, utail, sizeof(utail));
 }
+void setupFix(uint8_t v) { g_cimg[shop::kSetupRva + kSetupFixAt] = v; }
+uint64_t livUpdate(void* client) { return reinterpret_cast<uint64_t (__fastcall*)(void*)>(g_cimg + shop::kUpdateRva)(client); }
 bool g_withLiveryCam = false;   // installShopTargets also gives the F229 hook its synthetic function
 // A Livery or loadout screen's object with room for its preview client (the largest offset is 0x680 + 0x620).
 struct CamObj {
@@ -2023,7 +2045,10 @@ void installShopTargets(const CtlPages& p, int badShop = -1) {
     tt.shopSetState = at(2, shop::kSetStateRva);
     tt.kioskStart = at(3, shop::kKioskStartRva);
     tt.kioskStop = at(4, shop::kKioskStopRva);
-    if (g_withLiveryCam) tt.liveryCameraSetup = b + shop::kSetupRva;   // F229
+    if (g_withLiveryCam) {   // F229, F230
+        tt.liveryCameraSetup = b + shop::kSetupRva;
+        tt.liveryCameraUpdate = b + shop::kUpdateRva;
+    }
     nofoothookstest::setTargets(tt);
     nofoothookstest::setHeadImage(b, kCImgSize);
 }
@@ -2500,7 +2525,7 @@ void testShopGlue(const CtlPages& p) {
         check(rig.cap.count(expect) == 2, "...but once more when the second has passed");
         // the setup call through the hook: the original runs (0x5A60), the line names rcx as the Livery client's interface
         rig.cap.clear();
-        int32_t mode = 3;
+        uint64_t mode = 3;   // the qword r8 points to
         const uint64_t r = reinterpret_cast<FnSetup>(g_cimg + shop::kSetupRva)(reinterpret_cast<void*>(livClient + shop::kClientInterface), nullptr, &mode, nullptr);
         shop::SetupCall sc;
         sc.tid = GetCurrentThreadId();
@@ -2509,17 +2534,24 @@ void testShopGlue(const CtlPages& p) {
         sc.r8Low = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&mode));
         sc.modeRead = true;
         sc.mode = 3;
+        sc.qwordRead = true;
+        sc.qword = 3;
+        sc.node = 0;   // the synthetic setup stores the rig's fix byte (0) in the node
         sc.cls = static_cast<int8_t>(shop::kLivery);
         sc.delta = static_cast<int32_t>(shop::clientOffset(shop::kLivery));
         shop::formatSetup(expect, sizeof(expect), sc);
         rig.boundary();
         check(r == 0x5A60 && mode == 3 && rig.cap.count(expect) == 1 && has(expect, "which is client +0x0"), "F229: the setup call is forwarded (its result 0x5A60, the mode int untouched) and logged with rcx - 0x58 as the Livery client");
         rig.cap.clear();
-        const uint64_t r2 = reinterpret_cast<FnSetup>(g_cimg + shop::kSetupRva)(&mode, nullptr, nullptr, nullptr);   // an rcx in no watched screen, a null r8
-        sc.rcxLow = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&mode));
-        sc.objLow = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&mode) - shop::kClientInterface);
+        static CamObj elsewhere;
+        elsewhere.init(0);
+        uint8_t* odd = elsewhere.b + 0x58 + 0x100;
+        const uint64_t r2 = reinterpret_cast<FnSetup>(g_cimg + shop::kSetupRva)(odd, nullptr, nullptr, nullptr);   // an rcx in no watched screen, a null r8
+        sc.rcxLow = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(odd));
+        sc.objLow = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(odd) - shop::kClientInterface);
         sc.r8Low = 0;
         sc.modeRead = false;
+        sc.qwordRead = false;
         sc.cls = static_cast<int8_t>(shop::kNotOurs);
         sc.delta = 0;
         shop::formatSetup(expect, sizeof(expect), sc);
@@ -2564,6 +2596,115 @@ void testShopGlue(const CtlPages& p) {
                 VirtualFree(pages, 0, MEM_RELEASE);
             }
         }
+        t::shopClock(0);
+        t::reset();
+    }
+    {   // F230: the Livery camera repair: the Update hook over a synthetic function, the node test, the decision's gates through the real glue
+        Rig rig;
+        g_withLiveryCam = true;
+        start(rig);
+        g_withLiveryCam = false;
+        check(t::hookState(t::kLiveryCameraUpdate) == 1 && t::stolenBytes(t::kLiveryCameraUpdate) == 7 && t::gateOpen(t::kLiveryCameraUpdate) && t::hookState(t::kLiveryCameraSetup) == 1,
+              "F230: the Update hook is armed over the synthetic function (seven bytes stolen: mov r11,rsp; mov [r11+18h],rbx), its gate open while the native key is on");
+        static CamObj liv, loadout;
+        liv.init(base + shop::kLiveryVtableRva);
+        loadout.init(base + shop::kOutfittingVtableRva);
+        uint8_t* cl = liv.b + shop::clientOffset(shop::kLivery);
+        uint8_t* node = cl + shop::kOffNode;
+        uint64_t q = 1;   // a suit Livery setup: mode 1
+        auto gameSetup = [&](CamObj& o, uint32_t cls, uint64_t* qw) {
+            return reinterpret_cast<FnSetup>(g_cimg + shop::kSetupRva)(o.b + shop::clientOffset(static_cast<int>(cls)) + shop::kClientInterface, o.b + shop::clientOffset(static_cast<int>(cls)) + shop::kOffSetupHandle, qw, nullptr);
+        };
+        auto countRepairs = [&] { return rig.cap.count("livery camera repair (F230):"); };
+        shop::RepairEvent ev;
+        ev.tid = GetCurrentThreadId();
+        ev.clientLow = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(cl));
+        ev.qword = 1;
+        auto repairLine = [&](uint32_t attempt, int8_t after) {
+            char buf[400];
+            ev.attempt = attempt;
+            ev.after = after;
+            shop::formatRepair(buf, sizeof(buf), ev);
+            return std::string(buf);
+        };
+        t::shopClock(200000);
+        setupFix(0);
+        nativeOnFootSetLiveryRepair(true);
+        shopShow(&liv);
+        gameSetup(liv, shop::kLivery, &q);   // the game's setup at the open: the scene is not ready, the node stays invalid
+        rig.boundary();
+        check(rig.cap.count("setup call 0x12714C0:") == 1 && rig.cap.count("mode 1, qword 0x1 (thread") == 1 && rig.cap.count("camera node INVALID") == 1 && rig.cap.count("EDVR's repair call") == 0,
+              "F230: the game's Livery setup is logged with its qword and the camera node INVALID after it, and is not marked as ours");
+        // too soon: 100 ms after the setup nothing is run (the node is invalid, the key on, the screen open)
+        rig.cap.clear();
+        t::shopClock(200100);
+        check(livUpdate(cl) == 0x5A70, "F230: the original Update runs and its result is returned (0x5A70)");
+        rig.boundary();
+        check(countRepairs() == 0 && rig.cap.count("setup call") == 0, "F230: under 0.5 s after the setup the Update does not run the setup again");
+        // due: the repair runs the setup again by its own address; the fix byte makes the node valid
+        t::shopClock(200600);
+        setupFix(1);
+        livUpdate(cl);
+        rig.boundary();
+        check(rig.cap.count(repairLine(1, 1).c_str()) == 1 && rig.cap.count("camera node valid (EDVR's repair call)") == 1 && node[0] == 1,
+              "F230: 0.5 s on, the invalid node is repaired: the setup ran again from the Update (nested through its own hook, which logged it as EDVR's call), one retry line says valid after");
+        // the node is valid: nothing more is run, however often the Update comes
+        rig.cap.clear();
+        t::shopClock(201700);
+        livUpdate(cl);
+        livUpdate(cl);
+        rig.boundary();
+        check(countRepairs() == 0 && rig.cap.count("setup call") == 0, "F230: a valid node is left alone");
+        // the key off: an invalid node is only logged, nothing is run
+        node[0] = 0;
+        nativeOnFootSetLiveryRepair(false);
+        t::shopClock(203000);
+        livUpdate(cl);
+        rig.boundary();
+        check(node[0] == 0 && countRepairs() == 0 && rig.cap.count("setup call") == 0, "F230: with the key off the Update runs nothing: the node stays invalid and no line is written");
+        nativeOnFootSetLiveryRepair(true);
+        // five attempts an open, then no more: the setup does not fix the node (fix byte 0); a Livery Show starts the count again
+        setupFix(0);
+        shopShow(&liv);
+        rig.cap.clear();
+        uint32_t clock = 204000;
+        for (int k = 0; k < 8; ++k) {
+            t::shopClock(clock);
+            livUpdate(cl);
+            clock += 600;
+        }
+        rig.boundary();
+        check(countRepairs() == 5 && rig.cap.count(repairLine(1, 0).c_str()) == 1 && rig.cap.count(repairLine(5, 0).c_str()) == 1 && rig.cap.count("of 5: the setup was run again") == 5,
+              "F230: a setup that leaves the node invalid is retried five times for one open and no more, each line saying INVALID after");
+        // another thread's Update is left alone
+        rig.cap.clear();
+        shopShow(&liv);   // the count starts again
+        t::shopClock(clock + 5000);
+        std::thread other([&] { livUpdate(cl); });
+        other.join();
+        rig.boundary();
+        check(countRepairs() == 0, "F230: an Update on another thread than the one that ran the setup runs nothing");
+        // a client whose Livery setup was not remembered (the loadout browser's setup, a mode that is not 1 or 4) is left alone
+        uint64_t q2 = 2;
+        uint8_t* lcl = loadout.b + shop::clientOffset(shop::kOutfitting);
+        shopShow(&loadout);
+        gameSetup(loadout, shop::kOutfitting, &q2);
+        rig.cap.clear();
+        t::shopClock(clock + 7000);
+        livUpdate(lcl);
+        rig.boundary();
+        check(countRepairs() == 0, "F230: a client whose Livery setup was not remembered (the loadout browser) is left alone");
+        // no Livery screen open: nothing is run
+        shopClose(&liv);
+        shopClose(&loadout);
+        rig.boundary();
+        rig.cap.clear();
+        shopShow(&liv);
+        shopClose(&liv);
+        t::shopClock(clock + 9000);
+        livUpdate(cl);
+        rig.boundary();
+        check(countRepairs() == 0, "F230: with the Livery screen closed the Update runs nothing");
         t::shopClock(0);
         t::reset();
     }

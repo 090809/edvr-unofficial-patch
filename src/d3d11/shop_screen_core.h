@@ -74,6 +74,17 @@ inline constexpr uint8_t kKioskStopPrologue[kKioskStopPrologueBytes] = {0x48, 0x
 constexpr uintptr_t kSetupRva = 0x12714C0;
 constexpr size_t kSetupPrologueBytes = 16;
 inline constexpr uint8_t kSetupPrologue[kSetupPrologueBytes] = {0x4C, 0x8B, 0xDC, 0x55, 0x41, 0x54, 0x41, 0x57, 0x49, 0x8D, 0xAB, 0x98, 0xF8, 0xFF, 0xFF, 0x48};
+// F230 (the Livery camera repair, TEMPORARY key kRepairKey): the client's per-frame Update (0x1272780, rcx the client; the first 16 bytes `mov r11,rsp | mov [r11+18h],rbx | push rsi | sub rsp,90h |
+// the first byte of the next instruction` carry no relative operand; CodeHook steals the first seven, `mov r11,rsp | mov [r11+18h],rbx`) and the game's own camera-node test (0x3175B40, rcx = client+0x478:
+// a plain test, no writes; its low byte is the answer). The setup resolves the camera node into client+0x478 once; Livery runs it once at the open and, when its scene is not ready then, the node stays
+// invalid and the per-frame pose step writes an identity pose (the camera lands at the scene origin, at the commander). The repair runs the setup again from the Update, with the mode the game gave.
+constexpr uintptr_t kUpdateRva = 0x1272780, kNodeValidRva = 0x3175B40;
+constexpr size_t kUpdatePrologueBytes = 16;
+inline constexpr uint8_t kUpdatePrologue[kUpdatePrologueBytes] = {0x4C, 0x8B, 0xDC, 0x49, 0x89, 0x5B, 0x18, 0x56, 0x48, 0x81, 0xEC, 0x90, 0x00, 0x00, 0x00, 0x41};
+constexpr uint32_t kOffNode = 0x478, kOffSetupHandle = 0x390;   // the camera node inside the client; the setup's rdx (client + 0x390)
+constexpr char kRepairKey[] = "experimental.native_on_foot_livery_camera_repair";
+constexpr uint32_t kRepairMinMs = 500, kRepairMaxAttempts = 5;   // a repair waits this long after the last setup, and is tried at most this often for one open
+
 // The preview client's camera fields, relative to the client. The setup is reached through the client's interface at +0x58 (the vtable 0x51AA4B8 slot 3, installed there by the client's constructor),
 // so its rcx is the client + 0x58: kClientInterface is subtracted before the client is looked for.
 constexpr uint32_t kOffMode = 0x398, kOffKind = 0x39C, kOffStep = 0x570, kOffDist = 0x580, kOffMax = 0x590, kOffMin = 0x5A0, kOffRetry = 0x5B0, kOffPose = 0x5E0, kClientInterface = 0x58;
@@ -305,6 +316,8 @@ inline bool locateInObject(uintptr_t p, uintptr_t obj, int32_t* delta) noexcept 
     *delta = static_cast<int32_t>(p - obj);
     return true;
 }
+// The camera node's state as a word: -1 could not be tested, 0 invalid, 1 valid.
+inline const char* nodeText(int state) noexcept { return state < 0 ? "unreadable" : state == 0 ? "INVALID" : "valid"; }
 // One call of the setup, as the hook saw it. rcx on entry is the client + 0x58: objLow is rcx - 0x58, the CustomisationVisual object.
 struct SetupCall {
     uint32_t tid = 0;
@@ -313,6 +326,10 @@ struct SetupCall {
     int32_t mode = 0;
     int8_t cls = kNotOurs;      // the watched screen whose object rcx - 0x58 lies in (kNotOurs: none)
     int32_t delta = 0;          // rcx - 0x58 minus that screen's object
+    bool qwordRead = false;     // F230: *(uint64_t*)r8 could be read
+    uint64_t qword = 0;
+    int8_t node = -1;           // F230: the camera node after the call: -1 not tested, 0 invalid, 1 valid
+    bool ours = false;          // F230: the call EDVR's repair made
 };
 inline int formatSetup(char* buf, size_t cap, const SetupCall& c) noexcept {
     char where[120];
@@ -325,8 +342,11 @@ inline int formatSetup(char* buf, size_t cap, const SetupCall& c) noexcept {
     char mode[24];
     if (c.modeRead) std::snprintf(mode, sizeof(mode), "%d", c.mode);
     else std::snprintf(mode, sizeof(mode), "unreadable");
-    return std::snprintf(buf, cap, "%s setup call 0x12714C0: rcx 0x%08X, object (rcx - 0x58) 0x%08X, r8 0x%08X, mode %s (thread %u), the object is %s", camTag(), c.rcxLow, c.objLow, c.r8Low, mode, c.tid,
-                         where);
+    char qword[40];
+    if (c.qwordRead) std::snprintf(qword, sizeof(qword), "qword 0x%llX", static_cast<unsigned long long>(c.qword));
+    else std::snprintf(qword, sizeof(qword), "qword unreadable");
+    return std::snprintf(buf, cap, "%s setup call 0x12714C0: rcx 0x%08X, object (rcx - 0x58) 0x%08X, r8 0x%08X, mode %s, %s (thread %u), the object is %s, camera node %s%s", camTag(), c.rcxLow, c.objLow,
+                         c.r8Low, mode, qword, c.tid, where, c.node < 0 ? "not tested" : nodeText(c.node), c.ours ? " (EDVR's repair call)" : "");
 }
 // A window that dropped lines says so once; `what` is "camera" or "setup".
 inline int formatCamCapped(char* buf, size_t cap, const char* what, uint32_t dropped) noexcept {
@@ -334,6 +354,53 @@ inline int formatCamCapped(char* buf, size_t cap, const char* what, uint32_t dro
 }
 inline int formatSetupLost(char* buf, size_t cap, uint64_t lost) noexcept {
     return std::snprintf(buf, cap, "%s %llu setup call(s) were not recorded (the ring was full or a second hook thread was in it)", camTag(), static_cast<unsigned long long>(lost));
+}
+
+// ---- F230: the Livery camera repair --------------------------------------------------------------------------------------------------------------------------------------------
+inline const char* repairTag() noexcept { return "livery camera repair (F230):"; }
+// A Livery setup: the low dword of the mode qword is 1 (the suit) or 4 (the weapon), run while a Livery screen reads open. Those are the modes whose node nothing re-resolves.
+inline bool isLiverySetupMode(uint64_t modeQword, bool liveryOpen) noexcept {
+    const uint32_t low = static_cast<uint32_t>(modeQword);
+    return liveryOpen && (low == 1 || low == 4);
+}
+// What the Update hook knows about the client it was called for. The cheap tests come first in repairDecide and the node test last (it calls into the game).
+struct RepairIn {
+    bool keyOn = false;
+    bool remembered = false;      // rcx is a client whose Livery setup was remembered
+    bool liveryOpen = false;      // a Livery screen reads open (F228's reading)
+    bool sameThread = false;      // the thread that runs this Update is the one that ran the remembered setup
+    uint64_t nowMs = 0, lastSetupMs = 0;   // the last setup, the game's or ours
+    uint32_t attempts = 0;        // made for this open
+};
+enum class RepairVerdict : int { kKeyOff = 0, kNotRemembered, kScreenClosed, kOtherThread, kTooSoon, kExhausted, kTestNode, kCount };
+// kTestNode means every cheap condition holds: the caller tests the camera node and repairs only when it is invalid.
+inline RepairVerdict repairDecide(const RepairIn& in) noexcept {
+    if (!in.keyOn) return RepairVerdict::kKeyOff;
+    if (!in.remembered) return RepairVerdict::kNotRemembered;
+    if (!in.liveryOpen) return RepairVerdict::kScreenClosed;
+    if (!in.sameThread) return RepairVerdict::kOtherThread;
+    if (in.nowMs < in.lastSetupMs || in.nowMs - in.lastSetupMs < kRepairMinMs) return RepairVerdict::kTooSoon;
+    if (in.attempts >= kRepairMaxAttempts) return RepairVerdict::kExhausted;
+    return RepairVerdict::kTestNode;
+}
+// One repair attempt as the Update hook made it.
+struct RepairEvent {
+    uint32_t tid = 0;
+    uint32_t attempt = 0;         // 1-based within the open
+    uint32_t clientLow = 0;
+    uint64_t qword = 0;           // the mode qword handed to the setup
+    int8_t after = -1;            // the node after the setup: -1 unreadable, 0 invalid, 1 valid
+    bool faulted = false;         // the setup call faulted
+};
+inline int formatRepair(char* buf, size_t cap, const RepairEvent& e) noexcept {
+    return std::snprintf(buf, cap, "%s attempt %u of %u: the setup was run again by EDVR (client 0x%08X, mode %u, qword 0x%llX, thread %u), camera node INVALID before, %s after", repairTag(), e.attempt,
+                         kRepairMaxAttempts, e.clientLow, static_cast<unsigned>(static_cast<uint32_t>(e.qword)), static_cast<unsigned long long>(e.qword), e.tid,
+                         e.faulted ? "the call faulted" : nodeText(e.after));
+}
+inline int formatRepairKey(char* buf, size_t cap, bool on) noexcept {
+    return std::snprintf(buf, cap, "native on foot livery camera (F230, TEMPORARY): %s is %s -- %s", kRepairKey, on ? "on" : "off",
+                         on ? "when a Livery preview's camera node is invalid (the setup ran before its scene was ready) EDVR runs the game's own setup again, so the preview stands beside the panel"
+                            : "the Livery preview's camera node is only logged (F229); EDVR runs nothing");
 }
 
 }  // namespace shop

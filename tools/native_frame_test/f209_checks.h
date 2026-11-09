@@ -483,14 +483,16 @@ inline void run209(Check&& check) {
         c.mode = 3;
         c.cls = static_cast<int8_t>(shop::kLivery);
         c.delta = 0x680;
+        c.qwordRead = true;
+        c.qword = 3;
         shop::formatSetup(line, sizeof(line), c);
         const std::string setup = line;
-        check(setup == "livery camera (F229): setup call 0x12714C0: rcx 0x1A2B42CD, object (rcx - 0x58) 0x1A2B4275, r8 0x00FF0010, mode 3 (thread 7), the object is HumanoidLiveryActivity object +0x680, which is client +0x0",
+        check(setup == "livery camera (F229): setup call 0x12714C0: rcx 0x1A2B42CD, object (rcx - 0x58) 0x1A2B4275, r8 0x00FF0010, mode 3, qword 0x3 (thread 7), the object is HumanoidLiveryActivity object +0x680, which is client +0x0, camera node not tested",
               "F229: the setup call's line names rcx, rcx - 0x58 as the object, r8, the mode int, the thread, and the object as the watched screen's client");
         c.cls = static_cast<int8_t>(shop::kNotOurs);
         c.modeRead = false;
         shop::formatSetup(line, sizeof(line), c);
-        check(has_(std::string(line), "mode unreadable (thread 7), the object is in no watched screen's object"), "F229: an unreadable mode and an object in no watched screen say so");
+        check(has_(std::string(line), "mode unreadable, qword 0x3 (thread 7), the object is in no watched screen's object"), "F229: an unreadable mode and an object in no watched screen say so");
         c.cls = static_cast<int8_t>(shop::kSuit);
         c.delta = 0x40;   // below the client
         shop::formatSetup(line, sizeof(line), c);
@@ -508,11 +510,120 @@ inline void run209(Check&& check) {
         const std::string block = at != std::string::npos && end != std::string::npos ? hooks.substr(at, end - at) : std::string();
         check(!block.empty() && countOf(block, "return forward(a, b, c, d);") == 1 && block.find("VirtualProtect") == std::string::npos && block.find("WriteProcessMemory") == std::string::npos &&
                   block.find("Log::get()") == std::string::npos && block.find("std::string") == std::string::npos && block.find("lock_guard") == std::string::npos && block.find("= new ") == std::string::npos,
-              "F229: the setup callback forwards the call unchanged, writes nothing to the game, takes no lock, allocates nothing and logs nothing");
+              "F229/F230: the setup and Update callbacks forward their calls (the Update always, unchanged), map no memory, write no process memory, take no lock, allocate nothing and log nothing");
         check(has_(hooks, "case kHkLiveryCam: return reinterpret_cast<const void*>(&livCamSetupHooked);") && has_(hooks, "{\"livery-camera-setup\"") && has_(hooks, "shop::kSetupRva,") &&
                   has_(hooks, "liveryCameraTick(sink);   // F229") && has_(hooks, "g_gate[kHkLiveryCam].store(armed(kHkLiveryCam) && capture ? 1u : 0u, std::memory_order_release);") &&
                   has_(hooks, "if (g_hooks[kHkLiveryCam].state == kHookStateNotTried && liveryCamWanted()) tryHook(kHkLiveryCam, sink);"),
               "F229: the setup hook is in the hook table, tried at the frame boundary while the native key is on, gated with it, and the camera fields are read every frame");
+    }
+    // ---- 9. F230: the Livery camera repair (TEMPORARY key): constants, the decision core's gates, the lines ---------------------------------------------------------------------------------------
+    {
+        check(shop::kUpdateRva == 0x1272780 && shop::kNodeValidRva == 0x3175B40 && shop::kUpdatePrologueBytes == 16 && shop::kUpdatePrologue[0] == 0x4C && shop::kUpdatePrologue[1] == 0x8B &&
+                  shop::kUpdatePrologue[2] == 0xDC && shop::kUpdatePrologue[3] == 0x49 && shop::kUpdatePrologue[4] == 0x89 && shop::kUpdatePrologue[5] == 0x5B && shop::kUpdatePrologue[6] == 0x18 &&
+                  shop::kUpdatePrologue[7] == 0x56 && shop::kUpdatePrologue[8] == 0x48 && shop::kUpdatePrologue[11] == 0x90 && shop::kUpdatePrologue[15] == 0x41 && shop::kOffNode == 0x478 &&
+                  shop::kOffSetupHandle == 0x390 && shop::kRepairMinMs == 500 && shop::kRepairMaxAttempts == 5 && std::strcmp(shop::kRepairKey, "experimental.native_on_foot_livery_camera_repair") == 0,
+              "F230: the Update's address and 16 prologue bytes (seven stolen: mov r11,rsp; mov [r11+18h],rbx), the node test's address, the node and the setup handle's offsets, 0.5 s, five attempts, the key's name");
+        check(shop::isLiverySetupMode(1, true) && shop::isLiverySetupMode(4, true) && shop::isLiverySetupMode(0x100000001ull, true) && !shop::isLiverySetupMode(0, true) && !shop::isLiverySetupMode(2, true) &&
+                  !shop::isLiverySetupMode(3, true) && !shop::isLiverySetupMode(1, false) && !shop::isLiverySetupMode(4, false),
+              "F230: a Livery setup is a low dword of 1 (suit) or 4 (weapon) while a Livery screen reads open; mode 0, 2 and 3, or no Livery screen open, are not");
+        using V = shop::RepairVerdict;
+        shop::RepairIn in;
+        in.keyOn = true;
+        in.remembered = true;
+        in.liveryOpen = true;
+        in.sameThread = true;
+        in.nowMs = 10000;
+        in.lastSetupMs = 9000;
+        in.attempts = 0;
+        check(shop::repairDecide(in) == V::kTestNode, "F230: every condition holds: the camera node is tested (and repaired when invalid)");
+        shop::RepairIn x = in;
+        x.keyOn = false;
+        check(shop::repairDecide(x) == V::kKeyOff, "F230: the key off: nothing is run");
+        x = in;
+        x.remembered = false;
+        check(shop::repairDecide(x) == V::kNotRemembered, "F230: a client whose Livery setup was not remembered (the loadout browser, a buy screen) is left alone");
+        x = in;
+        x.liveryOpen = false;
+        check(shop::repairDecide(x) == V::kScreenClosed, "F230: no Livery screen reads open: nothing is run");
+        x = in;
+        x.sameThread = false;
+        check(shop::repairDecide(x) == V::kOtherThread, "F230: another thread than the one that ran the setup: nothing is run");
+        x = in;
+        x.lastSetupMs = 9501;
+        check(shop::repairDecide(x) == V::kTooSoon, "F230: under 0.5 s after the last setup (the game's or ours): too soon");
+        x.lastSetupMs = 9500;
+        check(shop::repairDecide(x) == V::kTestNode, "F230: exactly 0.5 s after it: due");
+        x.lastSetupMs = 10500;   // a clock that went back
+        check(shop::repairDecide(x) == V::kTooSoon, "F230: a clock that went back is too soon, not due");
+        x = in;
+        x.attempts = 4;
+        check(shop::repairDecide(x) == V::kTestNode, "F230: the fifth attempt is allowed");
+        x.attempts = 5;
+        check(shop::repairDecide(x) == V::kExhausted, "F230: five attempts for one open are the most");
+        x = in;
+        x.keyOn = false;
+        x.remembered = false;
+        check(shop::repairDecide(x) == V::kKeyOff, "F230: the key is the first gate");
+        char line[1100];
+        shop::RepairEvent e;
+        e.tid = 7;
+        e.attempt = 2;
+        e.clientLow = 0x4D5E75F0u;
+        e.qword = 0x100000001ull;
+        e.after = 1;
+        shop::formatRepair(line, sizeof(line), e);
+        check(std::string(line) == "livery camera repair (F230): attempt 2 of 5: the setup was run again by EDVR (client 0x4D5E75F0, mode 1, qword 0x100000001, thread 7), camera node INVALID before, valid after",
+              "F230: the retry line names the attempt, the client, the mode and qword handed to the setup, the thread, the node before and after");
+        e.after = 0;
+        shop::formatRepair(line, sizeof(line), e);
+        const std::string stillBad = line;
+        e.faulted = true;
+        shop::formatRepair(line, sizeof(line), e);
+        check(has_(stillBad, "INVALID before, INVALID after") && has_(std::string(line), "the call faulted"), "F230: a setup that left the node invalid, and one that faulted, say so");
+        shop::formatRepairKey(line, sizeof(line), true);
+        const std::string keyOn = line;
+        shop::formatRepairKey(line, sizeof(line), false);
+        check(keyOn.rfind("native on foot livery camera (F230, TEMPORARY): experimental.native_on_foot_livery_camera_repair is on -- ", 0) == 0 &&
+                  has_(std::string(line), "experimental.native_on_foot_livery_camera_repair is off -- the Livery preview's camera node is only logged (F229); EDVR runs nothing"),
+              "F230: the key's line says what each value does");
+        shop::SetupCall c;
+        c.tid = 7;
+        c.rcxLow = 0x1A2B42CDu;
+        c.objLow = 0x1A2B4275u;
+        c.r8Low = 0x00FF0010u;
+        c.modeRead = true;
+        c.mode = 1;
+        c.qwordRead = true;
+        c.qword = 0x100000001ull;
+        c.cls = static_cast<int8_t>(shop::kLivery);
+        c.delta = 0x680;
+        c.node = 0;
+        shop::formatSetup(line, sizeof(line), c);
+        const std::string setupBad = line;
+        c.node = 1;
+        c.ours = true;
+        shop::formatSetup(line, sizeof(line), c);
+        const std::string setupOurs = line;
+        c.node = -1;
+        c.ours = false;
+        c.qwordRead = false;
+        shop::formatSetup(line, sizeof(line), c);
+        check(has_(setupBad, "mode 1, qword 0x100000001 (thread 7), the object is HumanoidLiveryActivity object +0x680, which is client +0x0, camera node INVALID") && !has_(setupBad, "EDVR's repair call") &&
+                  has_(setupOurs, "camera node valid (EDVR's repair call)") && has_(std::string(line), "qword unreadable") && has_(std::string(line), "camera node not tested"),
+              "F229/F230: the setup line carries the qword, the camera node's state (valid, INVALID or not tested) and marks EDVR's own call");
+        // the wiring, read as text
+        const std::string hooks = slurp("src/d3d11/native_on_foot_hooks.cpp"), cpp = slurp("src/d3d11/native_on_foot.cpp"), ini = slurp("edvr.ini");
+        check(has_(hooks, "case kHkLiveryUpdate: return reinterpret_cast<const void*>(&livUpdateHooked);") && has_(hooks, "{\"livery-camera-update\"") && has_(hooks, "shop::kUpdateRva,") &&
+                  has_(hooks, "g_gate[kHkLiveryUpdate].store(armed(kHkLiveryUpdate) && capture ? 1u : 0u, std::memory_order_release);") &&
+                  has_(hooks, "tryHook(kHkLiveryUpdate, sink);") && has_(hooks, "if (g_repairKey.load(std::memory_order_relaxed) && nativeOnFootLiveryOpen()) livRepairStep(reinterpret_cast<uintptr_t>(a));") &&
+                  has_(hooks, "return forward(a, b, c, d);\n}\n\n// ---- hiding the head parts") && has_(hooks, "if (show && shop::isLivery(cls))\n        for (SetupMemo& m : g_memo) m.attempts.store(0"),
+              "F230: the Update hook is in the table, gated and tried with the others, its fast path is the key and the Livery reading, it always forwards, and a Livery Show resets the attempts");
+        check(has_(cpp, "cfg.getString(\"experimental.native_on_foot_livery_camera_repair\", \"on\") != \"off\"") && has_(cpp, "nativeOnFootSetLiveryRepair(on);") && has_(cpp, "shop::formatRepairKey(line, sizeof(line), on);") &&
+                  has_(cpp, "str(\"experimental.native_on_foot_livery_camera_repair\""),
+              "F230: the key is read live on the frame thread, default on, logged on a change, set into the hooks and dumped");
+        check(has_(ini, "# ui: Livery camera repair | choices on, off | recommended on | live\nnative_on_foot_livery_camera_repair = on\n") && has_(ini, "# TEMPORARY (F230): Livery camera repair") &&
+                  has_(ini, "The preview stands beside the panel instead of around you.") && ini.find("native_on_foot_livery_camera_repair = on") > ini.find("native_on_foot_livery_game_view = on"),
+              "F230: the shipped key is on, TEMPORARY, with its ui line after the F228 row and the plain sentence of what the user gets");
     }
 }
 

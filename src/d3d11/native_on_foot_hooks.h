@@ -153,6 +153,9 @@ bool nativeOnFootShopOpen() noexcept;
 bool nativeOnFootLiveryOpen() noexcept;
 // F228: the key's live value, set by native_on_foot.cpp's frame thread. Default true.
 void nativeOnFootSetLiveryHold(bool on) noexcept;
+// F230 (TEMPORARY): experimental.native_on_foot_livery_camera_repair's live value, set by native_on_foot.cpp's frame thread. Default true. On: a Livery preview whose camera node is invalid has the game's own
+// setup run again from the client's Update; off: only the evidence lines (F229).
+void nativeOnFootSetLiveryRepair(bool on) noexcept;
 // What the frame thread's once-a-second line reports: the remembered objects' bytes (-1 none or unreadable, 0, 1), the kiosk session, the newest SuitUIStateMachine state ("" until one) and
 // how often the signal has changed. buyScreenOpen is the two buy screens alone; liveryOpen the two Livery screens (F228); signal is nativeOnFootShopOpen(). Frame thread only. False when no shop hook is armed.
 struct NativeOnFootShopRead {
@@ -262,12 +265,14 @@ struct NativeOnFootHooksTestTargets {
     uintptr_t shopShow = 0, shopClose = 0, shopSetState = 0, kioskStart = 0, kioskStop = 0;   // F209: the shop hooks are tried only for the ones given here (or all, shopTryReal)
     uintptr_t conversationLook = 0;   // F212: the conversation look's hook is tried only when a target is given here
     uintptr_t liveryCameraSetup = 0;  // F229: the preview client's scene setup hook is tried only when a target is given here
+    uintptr_t liveryCameraUpdate = 0; // F230: the preview client's Update hook (the repair), likewise
 };
 namespace nofoothookstest {
 constexpr int kController = 0, kFade = 1, kFind = 2;   // the hooks, in the order stolenBytes, hookState and gateOpen take them
 constexpr int kShopShow = 3, kShopClose = 4, kShopSetState = 5, kKioskStart = 6, kKioskStop = 7;   // F209
 constexpr int kConversationLook = 8;   // F212
 constexpr int kLiveryCameraSetup = 9;  // F229
+constexpr int kLiveryCameraUpdate = 10; // F230
 void setTargets(const NativeOnFootHooksTestTargets& targets);
 void setFadeGlobal(int32_t* mode, float* amount);   // the synthetic dither-fade global and its amount float (null: the build's real addresses)
 void setHeadImage(uintptr_t base, size_t size);     // the rig's synthetic game image for the skeleton reads' arming (base 0: the real module)
