@@ -1848,7 +1848,7 @@ def real_dll_migration(target):
             "shared_bom": shared_bom, "flat_text": flat_text, "flat_bom": flat_bom}
 
 
-REAL_DLL_NEW_SHARED = ("# EDVR settings shared by the VR and flat profiles. advanced.real_dll names the mod EDVR chains through;\r\n"
+REAL_DLL_NEW_SHARED = ("# ED-UP settings shared by the VR and flat profiles. advanced.real_dll names the mod ED-UP chains through;\r\n"
                        "# edvr-flat.ini can override it for the flat profile, or say real_dll = none to run flat without it.\r\n"
                        "[advanced]\r\nreal_dll = %s\r\n")
 

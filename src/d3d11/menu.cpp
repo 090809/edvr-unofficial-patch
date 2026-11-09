@@ -1995,7 +1995,7 @@ void statusLine(MenuContent& c, const char* left, const char* right) {
 void buildStatus(MenuContent& c) {
     char buf[200];
     snprintf(buf, sizeof(buf), "%s / game build %s", EDVR_VERSION_STRING, gameBuildVersion().c_str());
-    statusLine(c, "EDVR", buf);
+    statusLine(c, "ED-UP", buf);
     statusLine(c, "Runtime",
                nativeMenuActive() ? "native OpenXR (experimental)"
                : (glitchConsumerPresent() ? "not identified" : "no compositor consumer"));
@@ -2762,7 +2762,7 @@ void buildContent(MenuContent& c) {
                     if (r.clashCount) {
                         body += std::string("\nElite also uses this press: ") + r.clashList +
                                 (strcmp(d.key, "menu") == 0 && s.summon.kind() == HotkeyKind::Key
-                                     ? ". EDVR keeps the menu key from the game, so those are masked while it is installed."
+                                     ? ". ED-UP keeps the menu key from the game, so those are masked while it is installed."
                                      : ". The key is watched, not captured: the game sees the press too, so one press does both.");
                     } else if (!s.readGameBindings) {
                         body += "\nNot checked against your Elite bindings (hotkey.read_game_bindings is off).";
@@ -2891,7 +2891,7 @@ void buildContent(MenuContent& c) {
                      s.summonName.c_str(), status);
         // The installed version, on every page, drawn at the right end of this same
         // footer line (menu_panel.cpp). Flat only: VR's footer does not carry it.
-        snprintf(c.footerTag, sizeof(c.footerTag), "EDVR %s", EDVR_VERSION_STRING);
+        snprintf(c.footerTag, sizeof(c.footerTag), "ED-UP %s", EDVR_VERSION_STRING);
         return;
     }
     {
@@ -3923,7 +3923,7 @@ void applyDecision(int def, const CaptureDecision& dec) {
     if (dec.check.clashCount) {
         setHotkeyNote(def, "set - also used in Elite",
                       masksElite ? std::string("Elite's ") + dec.check.clashList +
-                                       " is masked by the menu key; EDVR keeps it from the game."
+                                       " is masked by the menu key; ED-UP keeps it from the game."
                                  : std::string("Elite also uses ") + text + ": " + dec.check.clashList +
                                        ". The game sees the press too.");
     } else {

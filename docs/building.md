@@ -1,6 +1,6 @@
-# Building EDVR
+# Building ED Unofficial Patch
 
-How to build EDVR from source, check the build without the game or a headset,
+How to build ED-UP from source, check the build without the game or a headset,
 and what the optional DLSS mode and the release package need.
 
 Building needs Visual Studio 2022 with the C++ workload, and Python with the
@@ -288,7 +288,7 @@ python tools\fetch_ngx.py
 ```
 
 fetches one pinned commit of NVIDIA's public SDK repository into
-`%LOCALAPPDATA%\EDVR\ngx-sdk` and checks the runtime's hash against the pin in
+`%LOCALAPPDATA%\ED-UP\ngx-sdk` and checks the runtime's hash against the pin in
 the script. `EDVR_NGX_SDK` points the build at a copy somewhere else.
 
 Generating the installer's resources needs the native pair and the bundled

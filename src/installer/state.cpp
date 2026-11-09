@@ -447,7 +447,7 @@ InstallState readState(const std::wstring& gameDir) {
 
 std::string serializeState(const InstallState& state) {
     std::string out;
-    out += "# EDVR install record. Written by the installer; read by it on the next run.\r\n";
+    out += "# ED-UP install record. Written by the installer; read by it on the next run.\r\n";
     out += "# Deleting this file loses nothing the game needs -- it only makes the\r\n";
     out += "# installer fall back to guessing what a previous run did.\r\n";
     out += "\r\n[edvr]\r\n";

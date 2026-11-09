@@ -220,7 +220,7 @@ bool Log::open(const std::wstring& dir, const wchar_t* tag) {
     }
 
     m_open = true;
-    note("EDVR log -- unofficial VR fixes for Elite Dangerous: Odyssey");
+    note("ED-UP log -- unofficial VR and flat fixes for Elite Dangerous: Odyssey");
     // The version names the git tag the DLL was built from, straight from
     // `git describe` at build time (see build.bat). It exists because the link
     // stamp alone cannot answer "which release is this" without correlating

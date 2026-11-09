@@ -329,7 +329,7 @@ struct FlatSettingsWarning {
 // and FSR resolve before the post chain at any render size from the output's up, so they are the way out, and so is rendering
 // at or below the output.
 inline constexpr char kFlatTaaAboveWords[] =
-    "Above 1.0 supersampling, EDVR's TAA works only on a post chain it knows. Set Elite's supersampling to 1.0 or "
+    "Above 1.0 supersampling, ED-UP's TAA works only on a post chain it knows. Set Elite's supersampling to 1.0 or "
     "lower, or choose DLSS or FSR.";
 static_assert(sizeof(kFlatTaaAboveWords) <= sizeof(FlatSettingsWarning{}.line[0]),
               "the TAA paragraph fits one unwrapped log line");
