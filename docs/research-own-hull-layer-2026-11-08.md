@@ -11,34 +11,32 @@ The smear is terrain that is newly uncovered at the hull edge every frame
 ## Status
 
 * **Separate mode WORKS in the headset (2026-11-08 ~22:00, build
-  4e252a32, FG off):** the ship is drawn, the terrain smear is gone, the
-  HUD is correct (the pilot).
-* **Night vision state** (section "Night vision state and the hangar
-  light", compile-only, not flown): the hull re-issue of night vision's
-  draw runs with EDVR's state (it was ~8x dark); FCF7 no longer reopens
-  the lighting window; A7339D1F is a light. **Next dump:** night vision
-  on, compare median ~1.0, `night_vision=N/N` on the state line.
-* **Step 1 CONFIRMED (2026-11-08 20:30, build cfa4e5f5):** the private
-  layer equals the game's HDR where the game shows the hull (median
-  1.000, 85-98% bit-exact; AO and decals the residue).
-* **Step 2** (section "Step 2 build"): `separate` discards the own records in
-  the main pass with an own-discard variant of the patched hull and decal PS
-  (mask at PS t127). **Open:** the 6 own forward draws still draw in the world.
-* **Step 3** (sections "Step 3 build", "Step 3 flight (21:45)"): tonemap
-  re-issue, own TAA, composite onto dlSubmit after the UI resolve.
-* **AO** (section "AO on the hull layer"; not flown): the game's AO chain
-  re-dispatched on the private depth copy and RT0. The `ao:` line: 3.00.
-* **Dump v2** (sections "Dump v2", "Dump gaps fixed"; not flown): census
-  whole, passes timed, reference frame, `HullLights.json`, TAA sequence.
-* **Station fixes** (section "Station fixes", compile-only, not flown): the
-  re-issue culls foreign instances in a keep-own VS (mask at VS t127; the
-  filter only as a fallback), a busy governor, the two station light pairs,
-  unknown pairs only before a later lighting draw, stages at eye size only,
-  no scratch R16. Scissoring skipped. **Next:** one docking flight, one dump
-  inside the station and one in flight: `culled_draws` high, `filter_draws`
-  0, `busy=` 0, the station's light on the hull in `HullLights.json`.
-* **Temporary keys of this arc:** `diag.hull_layer` (off | dump | separate).
-  Temporary code: the busy governor (`kBusyDraws`, `kBusyDrawsCulled`).
+  4e252a32, FG off):** ship drawn, terrain smear gone, HUD correct.
+  Step 1 CONFIRMED (20:30, cfa4e5f5: median 1.000). Steps 2-3, AO, dump
+  v2, station fixes, night vision state: their sections; not all flown.
+  **Open:** the 6 own forward draws still draw in the world.
+* **Variant bench** (section "Variant bench", 2026-11-10, compile-only,
+  not flown): one press of `hotkey.hull_bench` runs orig_a, sep_taa,
+  sep_noaa, dlss_full, dlss_sub, orig_b live (native, native_fxaa refused:
+  shader dump first) to `eye_<stamp>_Bench*`, for `hull_bench_report.py`.
+* **Next flight (morning):** compile-only install of this branch's HEAD.
+  In the game dir's `edvr.ini`: `[diag] hull_layer = separate`,
+  `[hotkey] hull_bench = <a bare key Elite does not bind>`,
+  `[advanced] glare_shader_dump = 1` (stage 3: the native rect's PS; needs
+  the game started with it; set 0 after), FG off. Landed (or hovering,
+  throttle 0) over terrain with the wing edges in view in both eyes, not
+  at a station; press, hold the head still until "Hull bench done" (~10 s).
+  Then one `hotkey.dump_eyes` press (HullLights.json) and the night-vision
+  and docking checks below. Read: `edvr_log.py --health` ("hull layer
+  bench" row), then `hull_bench_report.py <edvr_logs>\eyes\eye_<stamp>
+  --expect-build HEAD`.
+* **Night vision state** (not flown): **next dump** night vision on,
+  compare median ~1.0, `night_vision=N/N`. **Station fixes** (not flown):
+  a docking dump, `culled_draws` high, `filter_draws` 0, `busy=` 0.
+* **Temporary keys of this arc:** `diag.hull_layer` (off | dump | separate),
+  `hotkey.hull_bench`. Temporary code: the busy governor (`kBusyDraws`,
+  `kBusyDrawsCulled`), `hull_bench.cpp` and the bench in `hull_layer.cpp`,
+  `g_hullFeature` (dlaa.cpp), the bench's `hull_dlss` timer.
 * **Background:** the hole-fill (e) fails ("Result"); neighbours interleave
   with the own hull draws, so ownership is per record ("The binding map").
 * **Rig seed** (section "Rig seed", 2026-11-10, compile-only, not flown):
@@ -1281,6 +1279,147 @@ draw; N/0: re-issued as the game's own. `--health` says both.
 (median ~1.0, no "U" rows after FCF7); A7339D1F as K+R in a hangar dump
 with a correct mask; the world's stencil behind the hull in an applied
 frame (inferred, not measured).
+
+## Variant bench (2026-11-10, compile-only, not flown)
+
+Builds 76a0fed5 (stage 1) and bc7c052e (stage 2), and the commit that
+adds this section. One press of `hotkey.hull_bench` (TEMPORARY, default
+unbound) runs the hull variants live, one after another, at the same spot.
+It writes `eye_<stamp>_Bench*.bin` and `_Bench.json` to `edvr_logs\eyes`.
+`tools\hull_bench_report.py` (committed before) scores them. The spec is
+the side session's `bench-spec.md`; this entry records where the build
+differs from it.
+
+Environment: OpenXR (EDVR runtime), DLSS on the eyes (the bench refuses
+FSR and XeSS), FG off, 2817x2448 render to 3756x3264 output per eye
+(x4/3), NGX 310.9.1.
+
+**Variants:**
+
+| id | what runs |
+|---|---|
+| `orig_a`, `orig_b` | The layer sleeps (`g_benchSleep`): no seed, discard, re-issue, stage or composite. The game draws the hull and the eyes' DLSS sees it. This is not counted as busy and arms no hold. `orig_b` is the stillness control. |
+| `sep_taa` | Today's separate mode. dump v2's `HullSeq` covers its last 8 warm frames and its 8 captures. |
+| `sep_noaa` | The same TAA CS with its history off (`cb.jit[2] = 0`): the 3x3 reconstruct, then the sharpen. |
+| `dlss_full` | A second DLSS on the hull (below). |
+| `dlss_sub` | The same, with the bench rect as an NGX output subrect. |
+| `native`, `native_fxaa` | `refused: needs shader dump (feasibility builds A and C)`. |
+
+**Machine** (`hull_layer.cpp`, "the variant bench"):
+
+- Phases: Rect, Quiet, then per variant Warm, Capture (8), Settle (2),
+  then Drain. Each phase names the frame about to run. `benchStep` runs
+  before `decideNext`, `benchDecided` after it.
+- Rect: both eyes' cover alpha is staged and read 2 frames later. The
+  bench rect is the union bbox, grown by 96 output px and aligned to 3
+  render px, so both corners land on whole output pixels.
+- Quiet: the bench waits until 2.8 s after the press, so the press toast
+  is gone before the first headset frame. `overlay_in_final` is false.
+- Warm: 60 frames for the history variants, 8 for `sep_noaa`.
+- A frame that `decideNext` makes a fallback, or whose eye-0 composite was
+  not applied, does not count as warm. During Capture it restarts the run
+  of 8, after an 8-frame re-warm.
+- A variant is refused after 150 fallback frames or 4 restarts. 150, not
+  the spec's 60: one miss on waking from an original arms the 120-frame
+  hold, and that should cost time, not the variant.
+- Abort: frame generation, the busy governor, the vehicle (`journalSeatKind`),
+  menu or loading (Status.json has no vehicle), the jump tunnel, device
+  loss, an eye size change, a non-DLSS upscaler, an eye dump armed, 20 s,
+  or a second press. The manifest is still written, with `aborted`.
+- Refused at the press (toast and line): diag not separate, not VR, on
+  foot, FG on, busy, no device yet, a dump or eye run in progress, the
+  last bench still writing, or under 4 GB free.
+- Captures: the submitted eye after the composite (`temporal_pass.cpp`,
+  outside the composite's condition). Eye 0 gives 8 frames; eye 1 and the
+  headset frame (`temporalPassCaptureFinalEye`, region-local, flips in the
+  manifest) give frame 0 only.
+- Copies go to 16 staging copies, mapped 2 frames later without waiting.
+  A writer thread (`hull_bench.cpp`) writes them. A capture run starts
+  only with 6 copies free and the queue under 384 MB.
+- The mask is `sep_taa`'s TAA history on its last capture frame (RGBA16F,
+  coverage in alpha), or `sep_noaa`'s when `sep_taa` has none.
+
+**Measurements** (medians over the capture frames, both eyes summed):
+
+- `layer_stage`: the layer's stage timers. Every frame is timed while the
+  bench runs (`g_benchTimeAll`), and each set carries its frame number.
+- `main_dlss`: a timestamp pair around the eyes' `dlaaEvaluate`.
+- `hull_dlss`: a pair around the second NGX evaluation only. The bench uses
+  its own query ring here instead of a new `TStage`. The prep and
+  composite CS stay in the `taa` stage.
+- `frame_span`: `gpuCensusFrameSpan`, sampled at each capture boundary.
+  It is the last completed frame's span, so it lags by 1-3 frames, all
+  inside the same variant's warm or capture.
+- `cpu_ms`: the stages' CPU ticks per frame.
+- `mb.own`: from the descs, the layer's mirrors, tone, cover, masks and
+  composite targets. The second DLSS's four private targets are added for
+  its variants. The originals are 0.
+- `mb.ngx`: the change in `NGX_DLSS_GET_STATS` (on the capability block)
+  from the variant's start to its end.
+- `mb.dxgi`: `QueryVideoMemoryInfo` CurrentUsage at the variant's end.
+
+**Second DLSS** (`dlaa.cpp` `dlaaHullEvaluate`, `g_hullFeature[2]`):
+
+- A private pair, outside `kUpscalerSlots`. It uses the eyes' create flags
+  and preset hints, and picks the mode by size ratio (no range walk).
+- The full pair is released before the subrect pair is made, and each pair
+  is released when its variant ends.
+- `hull_dlss_in_cs` writes the inputs at render size. Where the cover is
+  hull: the cover colour, the cover depth, and a motion vector from the
+  TAA's head-only reprojection (`pp - pr`). Elsewhere: the eye's own
+  `dlColour`, `dlDepth` and `dlMv`.
+- `hull_cov_comp_cs` lerps the hull DLSS output over the submitted eye by
+  the cover alpha, upsampled bilinearly, inside the bench rect only.
+- If NGX refuses the feature, the subrect or an evaluation, that frame
+  falls back to the TAA path and the next boundary refuses the variant
+  with NGX's reason.
+
+**Checks run:** `compile_only.py --build-native` green at each stage.
+`hlsl_embedded_check.py` passes, the two new CS included.
+`edvr_log.py --self-test` passes (the new "hull layer bench" row: OK,
+aborted, NEVER APPLIED, refused, silent).
+`hull_bench_report.py --self-test` passes. The new rig
+`tools\hull_bench_test` (`build.bat :rig_hull_bench`) writes a synthetic
+press through `hull_bench.cpp`, and `hull_bench_report.py` reads it back
+(exit 0, the dlss and refused rows as expected). It was run by hand; the
+full `build.bat` has not run it yet.
+
+**Logs:**
+
+- Never pressed: no `hull layer: bench` line, and `--health` says nothing.
+- Refused: `hull layer: bench refused: <why>`.
+- Ran: `armed`, `rect:`, one `variant <id>: <status> frames= ... reason=`
+  line per variant, then `done:` or `aborted:`. `--health` reads them
+  into the "hull layer bench" row.
+
+**Stage 3, the shader dump for the native rect.** The feasibility doc's
+missing PS are:
+
+- the DE54, 61AE and 66DE 864F, and decal DB3E8D20 PS;
+- the depth copy DEF19B03/CB95394B;
+- the sun 7E38A6AA;
+- the tonemap 2D78DC3F;
+- the lights 963B52C7, 24DE25E4 and B121A79E.
+
+`advanced.glare_shader_dump = 1` already writes every VS, PS and CS the
+game creates to `edvr_logs\shaders\<vs|ps|cs>_<hash>.dxbc`. Compute was
+added on 2026-09-07; the feasibility doc's "CS never dumped" is out of
+date. So no code is needed. The key is read when the hooks install, so it
+needs a game start. One eye dump in the cockpit names the PS of the three
+lights in `HullLights.json`.
+
+**Unverified (not flown):** none of the above has run in the game. In
+particular:
+
+- whether NGX accepts a second feature pair and a subrect, and whether
+  the subrect's cost scales;
+- the hull motion vectors' sign and scale against `dlMv`;
+- whether the headset frame lands in the capture's frame (it is taken at
+  the first final-eye call after capture frame 0 is decided);
+- whether `dlSubmit`'s format reads back (typeless families are written
+  as their UNORM);
+- the writer's throughput (about 1.7 GB a press);
+- the memcpy hitch on the render thread during capture.
 
 ## Optimisation debt (recorded 2026-11-08 at the pilot's request)
 

@@ -4725,9 +4725,7 @@ void benchStep() {
             if (b.left) --b.left;
             if (!b.left) benchEndVariant(nullptr);
             break;
-        case BenchPhase::Drain:
-            ++b.drainFrames;
-            break;
+        case BenchPhase::Drain: break;   // benchDrainStep's
     }
     b.staged0 = b.applied0 = false;
     b.pendingFrame = hb::Frame{};
@@ -4756,6 +4754,7 @@ void benchDecided(uint32_t why) {
 
 void benchDrainStep(ID3D11DeviceContext* ctx) {
     BenchRun& b = g_bench;
+    ++b.drainFrames;
     const bool late = GetTickCount64() - b.drainStartMs > kBenchDrainMs;
     if (late) benchMapSlots(ctx, true);
     bool slots = false;
