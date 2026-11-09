@@ -3616,6 +3616,7 @@ python tools\run_jobs.py --jobs 4 ^
     --gate "tools\character_motion_check.py --self-test" ^
     --gate "tools\hull_layer_compare.py --self-test" ^
     --gate "tools\hull_taa_sim.py --self-test" ^
+    --gate "tools\hull_bench_report.py --self-test" ^
     --gate "tools\hlsl_embedded_check.py --self-test" ^
     --gate "tools\hlsl_embedded_check.py" ^
     --gate "tools\onfoot_check.py --self-test" ^
