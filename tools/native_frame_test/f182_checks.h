@@ -419,6 +419,46 @@ inline void run182(Check&& check) {
         check(!p1.two && !p1.kept && !i1.two && !i1.kept && !w1.two && !w1.kept, "F182c: nothing is kept for a pistol's pair, another item, or the one-hand policy: those release or never acquire as before");
         // the constant
         check(nf::kOffHandStaleKeepSec == 3.0, "F182c: the stale keep is 3 s of hook time");
+
+        // The Genetic Sampler's limits (offHandLimits, 2026-11-08): the resting left hand (40.0 cm, 37.9 at the nearest) never acquires; the hand that takes
+        // the canister out (25.8 cm) does, and holds to 35 cm; every other item keeps 40 cm both ways.
+        const nf::OffHandLimits smp = nf::offHandLimits("$humanoid_sampletool_name;"), other = nf::offHandLimits("$humanoid_rechargetool_name;");
+        check(smp.acquireM == 0.32 && smp.releaseM == 0.35 && other.acquireM == nf::kOffHandMaxM && other.releaseM == nf::kOffHandMaxM &&
+                  nf::offHandLimits(nullptr).acquireM == nf::kOffHandMaxM,
+              "offHandLimits: the sampler acquires within 32 cm and releases past 35; any other item (and no item) keeps kOffHandMaxM both ways");
+        float aRest[16], aNear[16], aCanister[16], aHold[16], aOut[16];
+        rigid(0.0, 0.0, 0.30 + 0.400, 1.30, 0.20, aRest);
+        rigid(0.0, 0.0, 0.30 + 0.379, 1.30, 0.20, aNear);
+        rigid(0.0, 0.0, 0.30 + 0.258, 1.30, 0.20, aCanister);
+        rigid(0.0, 0.0, 0.30 + 0.340, 1.30, 0.20, aHold);
+        rigid(0.0, 0.0, 0.30 + 0.360, 1.30, 0.20, aOut);
+        struct LimRig {
+            nf::OffHand st;
+            uint32_t frame = 1;
+            const float* a51p = nullptr;
+            nf::OffHandLimits lim{};
+            nf::OffHand::Out step(const float* l) { return st.step(0.011, true, true, a51p, l, true, frame++, 7, 3, 5ull, 5, 0, false, false, lim); }
+        };
+        auto everTwo = [&](const float* l, nf::OffHandLimits lim, int calls) {
+            LimRig r;
+            r.a51p = a51;
+            r.lim = lim;
+            bool two = false;
+            for (int i = 0; i < calls; ++i) two = r.step(l).two || two;
+            return two;
+        };
+        check(!everTwo(aRest, smp, 120) && !everTwo(aNear, smp, 120) && everTwo(aNear, other, 120),
+              "offHandLimits: with the sampler's limits the resting hand (40.0 and 37.9 cm) never acquires in 120 calls; with kOffHandMaxM 37.9 cm acquires, as before");
+        LimRig can;
+        can.a51p = a51;
+        can.lim = smp;
+        int canAt = 0;
+        for (int i = 1; i <= 30; ++i)
+            if (can.step(aCanister).two && !canAt) canAt = i;
+        const nf::OffHand::Out held = can.step(aHold);
+        const nf::OffHand::Out out = can.step(aOut);
+        check(canAt == 11 && held.two && !out.two,
+              "offHandLimits: the sampler's hand on the canister (25.8 cm) acquires after the usual 11 steady frames, holds at 34 cm (between the limits), and is released at 36 cm");
     }
 
     // ---- F182c 2. the held grip point in the item's frame --------------------------------------------------------------------------------------------------------------------------------------------
@@ -583,7 +623,9 @@ inline void run182(Check&& check) {
               "F182b: the stage returns at the share 0 or with no reference before the rule; the rule is one-sided (oneSided, applyOneSided), writes nothing when every bone is left as animated, counts the frame as made, and the bend yields only to a straighten that moved something");
         check(has("const bool offStaleOnly = armsOk && fpHandsGenerationOk && fpHands.valid[0] && fpHands.valid[1] && fpAge > nofoot::kIkPoseDeviationMaxGapMs;") &&
                   has("const bool offInputValid = armsOk && fpHandsGenerationOk && fpHands.valid[0] && fpHands.valid[1] && fpAge <= nofoot::kIkPoseDeviationMaxGapMs;") &&
-                  has("f83NativeEpochIdentity ? f83SelectionForCall.epoch : 0, f83SelectionSuspended, offStaleOnly);") && has("double offW = armedNow ? offOut.w : 1.0;"),
+                  has("f83NativeEpochIdentity ? f83SelectionForCall.epoch : 0, f83SelectionSuspended, offStaleOnly,") &&
+                  has("nofoot::OffHandLimits{g_offHandAcquireM.load(std::memory_order_relaxed), g_offHandReleaseM.load(std::memory_order_relaxed)});") &&
+                  has("double offW = armedNow ? offOut.w : 1.0;"),
               "F182c: F69h is given the snapshot's staleness apart from its other reasons for an unreadable input (offStaleOnly: the pair, the generation and the rig readable, the age over the gap)");
         check(has("const bool offReadable = offOut.ok || offOut.kept;") && has("exactRifleForCall && offReadable && offOut.stablePolicy && !primaryDrawWrite ?") && has("const bool leftStablePolicy = offReadable && offOut.stablePolicy;") &&
                   has("sample.leftStablePolicy = offReadable && offOut.stablePolicy;") && has("leftStablePolicy);") && !has("offOut.ok && offOut.stablePolicy);") && !has("physicalPoleActive, offOut.ok && offOut.stablePolicy,"),
@@ -598,10 +640,17 @@ inline void run182(Check&& check) {
                   has("nofoot::f182::formatClause(f182Clause, sizeof(f182Clause), w.f182, f182UnheldN ?") && has("G %llu (oldest %.0f ms)%s\",") && has("w.staleG), w.gAgeMax, f182Clause);") &&
                   has("nofoot::f182::Counters f182;") && has("#include \"native_on_foot_f182.h\""),
               "F182c: the F67f window counts the kept calls, the releases, the held calls and their error against the unheld calls', and the line ends with the clause");
-        check(core.find("constexpr double kOffHandStaleKeepSec = 3.0;") != std::string::npos && core.find("bool sourceSuspended = false, bool staleOnly = false) noexcept {") != std::string::npos &&
+        check(core.find("constexpr double kOffHandStaleKeepSec = 3.0;") != std::string::npos && core.find("bool sourceSuspended = false, bool staleOnly = false,") != std::string::npos &&
+                  core.find("OffHandLimits limits = OffHandLimits{}) noexcept {") != std::string::npos &&
+                  core.find("closeEnough = o.ok && o.dist <= (attached ? limits.releaseM : limits.acquireM);") != std::string::npos &&
                   core.find("bool keepNow = staleOnly && !ok && attached && allowTwoHand;") != std::string::npos && core.find("if (!allowTwoHand || (!ok && !keepNow)) clearHistory();") != std::string::npos &&
                   core.find("        if (keepNow) {\n            o.kept = true;") != std::string::npos && core.find("} else if (!o.ok || !allowTwoHand || !closeEnough) {") != std::string::npos,
-              "F182c: OffHand::step keeps an attached decision and its history through a stale-only input (up to 3 s), and releases for every other unreadable input, a pair past 40 cm or the one-hand policy as before");
+              "F182c: OffHand::step keeps an attached decision and its history through a stale-only input (up to 3 s), and releases for every other unreadable input, a pair past the item's release limit (40 cm but for the sampler's 35) or the one-hand policy as before");
+        // F227 (issue 200): a held marker match with no find of its key is left as the game placed it. The hold names its draw by place alone, and
+        // its fallback (the key's newest P, up to 90 frames old, with the held record as this Unmap wrote it) moved the whole HUD in one eye.
+        check(has("    } else if (!cpuFind) {\n        ++s.heldNoFind;   // F227\n    }") && has("(no find of the key, left as the game placed it (F227) %llu)") &&
+                  !has("g_keyP") && !has("x0Now") && !has("heldPX0"),
+              "F227: a held marker match with no find of its key takes no P (no key's newest P, no held record read at the Unmap), and the F63 line counts it");
     }
 }
 

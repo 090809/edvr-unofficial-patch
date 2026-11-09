@@ -11107,6 +11107,9 @@ bool opticItemRead(uint32_t* serial, char name[64]) noexcept;
 std::atomic<uint8_t> g_supportCupMode{nofoot::kSupportNone};
 std::atomic<bool> g_arcCutterHeld{false};          // F221: the held item is the arc cutter (the left elbow hangs from the body-down pole)
 std::atomic<bool> g_gameAuthoredLeftArm{false};   // Energy Link and Profile Analyser: preserve the game's relaxed left-arm pose
+// F69h's distance rule for the held item (nofoot::offHandLimits): kOffHandMaxM both ways but for the Genetic Sampler. Set with the item, read by the pose hook.
+std::atomic<float> g_offHandAcquireM{static_cast<float>(nofoot::kOffHandMaxM)};
+std::atomic<float> g_offHandReleaseM{static_cast<float>(nofoot::kOffHandMaxM)};
 void pinInPublish(const float cam[3], const float camRaw[3], const float weaponViewWorld[3], const float m3p[16], uint64_t nowMs, double f94SeatedY,
                   uint8_t f94Source, const double f137Seated[3], uint8_t f137Source) noexcept {
     double localPitchRad = 0.0;
@@ -14390,6 +14393,8 @@ void f66ArmedStep(uint64_t now, double dt) noexcept {
     if (!active) {
         g_supportCupMode.store(nofoot::kSupportNone, std::memory_order_relaxed);
         g_gameAuthoredLeftArm.store(false, std::memory_order_relaxed);
+        g_offHandAcquireM.store(static_cast<float>(nofoot::kOffHandMaxM), std::memory_order_relaxed);
+        g_offHandReleaseM.store(static_cast<float>(nofoot::kOffHandMaxM), std::memory_order_relaxed);
         g_arcCutterHeld.store(false, std::memory_order_relaxed);
         g_f66aKindLast = -1;
         g_f66aNameLast[0] = '\0';
@@ -14400,6 +14405,11 @@ void f66ArmedStep(uint64_t now, double dt) noexcept {
                         kind == kHeldUnknown ? " [unknown]" : kind == kHeldNone ? " [fists]" : "", nativePrimary ? " [native primary selection]" : "", journalStatusSamples());
         g_supportCupMode.store(static_cast<uint8_t>(nofoot::supportItem(name)), std::memory_order_relaxed);
         g_gameAuthoredLeftArm.store(nofoot::gameAuthoredLeftArm(name), std::memory_order_relaxed);
+        {
+            const nofoot::OffHandLimits lim = nofoot::offHandLimits(name);
+            g_offHandAcquireM.store(static_cast<float>(lim.acquireM), std::memory_order_relaxed);
+            g_offHandReleaseM.store(static_cast<float>(lim.releaseM), std::memory_order_relaxed);
+        }
         g_arcCutterHeld.store(nofoot::f221::arcCutter(name), std::memory_order_relaxed);
         if (g_f66aKindLast >= 0) f68dFlip(now, static_cast<int>(kind), name);   // F68d: the onset window (not for the first reading)
         g_f66aKindLast = static_cast<int>(kind);
@@ -20917,7 +20927,8 @@ void armIkAfterAnimate(uint64_t x, const PfzSpan& sp, bool froze) noexcept {
         const bool offStaleOnly = armsOk && fpHandsGenerationOk && fpHands.valid[0] && fpHands.valid[1] && fpAge > nofoot::kIkPoseDeviationMaxGapMs;
         offOut = s_off.step(dtOff, armedNow, offInputValid, fpm[0], fpm[1], !(relaxLeftArmForItem && !f83JournalPolicyHold), poseFrame,
                             itemSerialForCall, pl.generation, fpHands.x, fpHands.generation,
-                            f83NativeEpochIdentity ? f83SelectionForCall.epoch : 0, f83SelectionSuspended, offStaleOnly);
+                            f83NativeEpochIdentity ? f83SelectionForCall.epoch : 0, f83SelectionSuspended, offStaleOnly,
+                            nofoot::OffHandLimits{g_offHandAcquireM.load(std::memory_order_relaxed), g_offHandReleaseM.load(std::memory_order_relaxed)});
         if (!armedNow) s_offTwoPrev = false;
     }
     const bool physicalPoleActive = armedNow && armsOk && mode == 3 && writeOk;
@@ -25079,11 +25090,11 @@ void f67fLine(uint64_t now) noexcept {
         journalHeldItemName(nm, sizeof(nm));
         const double on = w.offN ? static_cast<double>(w.offN) : 1.0;
         Log::get().note("native on foot off hand (F69h): item \"%s\": %llu armed calls with both FP attaches read (%llu unread): the FP left handAttach (52) to the right "
-                        "(51) mean %.1f min %.1f max %.1f cm (two-handed within %.0f cm; the rifle's pair is 32.6); 52's orientation against 51 changed at most %.1f deg over "
+                        "(51) mean %.1f min %.1f max %.1f cm (two-handed within %.0f cm, released past %.0f; the rifle's pair is 32.6); 52's orientation against 51 changed at most %.1f deg over "
                         "the last %u frames (steady under %.0f); decision two-handed %llu, off hand free (weight 0: the game's own 3P arm) %llu, ramping %llu; decision "
                         "flips %llu; off arm weight mean %.2f",
                         nm, static_cast<unsigned long long>(w.offN), static_cast<unsigned long long>(w.offUnread), w.offDistSum / on, w.offDistMin, w.offDistMax,
-                        100.0 * nofoot::kOffHandMaxM, w.offChangeMax, nofoot::kOffHandSteadyFrames, nofoot::kOffHandSteadyDeg, static_cast<unsigned long long>(w.offTwo),
+                        100.0 * g_offHandAcquireM.load(std::memory_order_relaxed), 100.0 * g_offHandReleaseM.load(std::memory_order_relaxed), w.offChangeMax, nofoot::kOffHandSteadyFrames, nofoot::kOffHandSteadyDeg, static_cast<unsigned long long>(w.offTwo),
                         static_cast<unsigned long long>(w.offFree), static_cast<unsigned long long>(w.offRamp), static_cast<unsigned long long>(w.offFlips), w.offWSum / on);
     }
 }
@@ -29051,10 +29062,10 @@ struct EyeStats {
     uint32_t staleFrame = ~0u;
     uint64_t notNow = 0, rowsAge[5] = {}, staleWhy[5] = {}, staleRefused[4] = {}, unmapAge[4] = {};
     uint32_t lastDraw = ~0u, lastRows = ~0u, lastUnmap = ~0u;
-    // F63 at the draw: decisions whose match came from the CPU identification (same frame) or from a held match; held decisions whose P and
-    // X0 came from the hold's fallback (the key's last P, the held record read at this frame's Unmap); contradictions by the CPU identification.
+    // F63 at the draw: decisions whose match came from the CPU identification (same frame) or from a held match; held decisions with no find
+    // of the key this frame or the last, left as the game placed them (F227); contradictions by the CPU identification.
     // At read-back: holds confirmed and contradicted. The residual of fresh patched frames against P + e (the fixed e): its mean and max.
-    uint64_t viaCpu = 0, viaHold = 0, heldPX0 = 0, cpuContradict = 0, rbConfirm = 0, rbContradict = 0;
+    uint64_t viaCpu = 0, viaHold = 0, heldNoFind = 0, cpuContradict = 0, rbConfirm = 0, rbContradict = 0;
     uint64_t eN = 0;
     double exSum = 0.0, eySum = 0.0, eMax = 0.0;
     // F66f at the draw (patched draws): the affine (sigma, u, the jitter removed), the icon offset used and its source (the mesh / the head-still
@@ -29436,13 +29447,10 @@ struct LagEye {
     }
 };
 // F52: a tag key's state per eye: its read-back match, its baseline; and the record it was last found at (F64: no last good delta).
-// F63: the match is held (drawtag::HeldMatch) with the pool its record lives in, and the held record's position as this frame's pool Unmap
-// wrote it (the hold's X0 when the key has no find this frame).
+// F63: the match is held (drawtag::HeldMatch) with the pool its record lives in.
 struct KeyEye {
     drawtag::HeldMatch hold;
     const void* pool = nullptr;   // identity only
-    float x0Now[3] = {};
-    uint32_t x0Frame = ~0u;
     LagEye lag;
 };
 struct KeyState {
@@ -29451,15 +29459,6 @@ struct KeyState {
 };
 drawtag::KeyIndex<kKeySlots> g_keyIdx;
 KeyState g_keys[kKeySlots];
-// F63: each tag key's newest P (node+0x50 at its newest find with P), for a held match's patch in a frame without a find.
-struct KeyP {
-    float p[3] = {};
-    uint32_t frame = ~0u;
-    bool headOk = false;   // F66f: the key's newest find's record head (scale and quaternion words), for a held match's patch
-    float scale = 0.0f;
-    uint32_t w0 = 0, q2 = 0, q3 = 0;
-};
-KeyP g_keyP[256];
 // F63: the per-frame residual per eye (read-back of a fresh patched frame): the marker against P + e (the fixed e) and the e the patch used,
 // in px of the eye's target. The waypoint series' CSV reads it by frame (nativeOnFootMarkerResidual).
 struct ResCell {
@@ -29694,16 +29693,6 @@ void addFind(const Pool& p, const uint8_t* base, const drawtag::Hit& h, int mapT
         std::memcpy(f.p, t->p, sizeof(f.p));
         const bool exact = std::memcmp(f.tp, f.x0, sizeof(f.x0)) == 0;
         if (exact) ++g_win.exact; else ++g_win.differs;
-        if (f.pOk) {   // F63: the key's newest P (a held match's patch in a frame without a find)
-            KeyP& kp = g_keyP[f.key & 0xFFu];
-            std::memcpy(kp.p, f.p, sizeof(kp.p));
-            kp.frame = frame;
-            kp.headOk = f.headOk;
-            kp.scale = f.scale;
-            kp.w0 = f.w0;
-            kp.q2 = f.q2;
-            kp.q3 = f.q3;
-        }
     }
     ++g_win.finds;
     if (nofoot::f85::isWeaponKey(f.key)) {   // F85b: the identification path that ran
@@ -29792,19 +29781,6 @@ void unmapPool(Pool& p) {
     const uint32_t frame = g_f44Frame.load(std::memory_order_relaxed);
     p.unmapFrame = frame;   // F63: the CPU identification takes only finds of this Unmap
     labRecRead(p.res, base, p.bytes, frame);   // F87p: the label candidates' records, as this Unmap wrote them
-    // F63: each held match's record in this pool, as this Unmap wrote it (the hold's X0 when its key has no find this frame); under SEH.
-    if (g_nativeOnFootMarkerFixKey.load(std::memory_order_relaxed))
-        for (uint32_t i = 0; i < kKeySlots; ++i) {
-            if (!g_keyIdx.used[i]) continue;
-            for (int e = 0; e < 2; ++e) {
-                KeyEye& ke = g_keys[i].eye[e];
-                if (ke.pool != p.res || !ke.hold.held(frame)) continue;
-                uint32_t wv[4] = {};
-                if (!readRecordGuarded(base, p.bytes, ke.hold.record, wv)) continue;
-                for (int k = 0; k < 3; ++k) ke.x0Now[k] = drawtag::floatOf(wv[k]);
-                ke.x0Frame = frame;
-            }
-        }
     for (size_t i = 0; i < kF44Cells; ++i) {
         F44Tag t;
         if (f44ReadCell(i, t)) remember(t);
@@ -34821,8 +34797,10 @@ void fixDecide(ID3D11DeviceContext* ctx, uint32_t frame, const Rec& r, int slot,
     const CpuWorld& w = g_cpuWorld[e];
     ++g_win.ref[e].decided[ref];
     // F63: P and X0: the CPU identification's find (this draw's own record), else the held record's find at this frame's pool Unmap, else the
-    // key's newest find (this frame or the last, as F47); else the hold's fallback: the key's newest P within the hold (a world point) with the
-    // held record as this frame's pool Unmap wrote it (what the draw reads). Neither: no P.
+    // key's newest find (this frame or the last, as F47). None: no P, and the draw is left as the game placed it. F227: a held match with no
+    // find no longer takes the key's newest P (up to the hold's 90 frames old) with the held record as this Unmap wrote it. The hold names its
+    // draw by place alone, and on the Genetic Sampler (issue 200) that pair moved the whole HUD in one eye by 0.15 to 0.38 NDC: the reticle's
+    // old P failed F85c's aim-line gate and stood 0.19 m from the eye, and the place held another draw (dumps 132928432001, 191457062004).
     const uint32_t keyNow = g_keyIdx.key[ks];
     const bool keyIsReticle = f191IsReticle(keyNow);   // F191: the key type 1001 uses (slot 10 until a type 1001 call is seen); one answer for the draw (the render thread reads the tracker's atomic)
     const Find* f = cpuFind ? cpuFind : findAt(K.eye[e].pool, match.record);
@@ -34844,22 +34822,8 @@ void fixDecide(ID3D11DeviceContext* ctx, uint32_t frame, const Rec& r, int slot,
         hW0 = f->w0;
         hQ2 = f->q2;
         hQ3 = f->q3;
-    } else {
-        const KeyP& kp = g_keyP[keyNow & 0xFFu];
-        const KeyEye& ke = K.eye[e];
-        if (kp.frame != ~0u && frame - kp.frame <= kMatchHold && ke.x0Frame != ~0u && frame - ke.x0Frame <= 1u) {
-            for (int k = 0; k < 3; ++k) {
-                fX0[k] = ke.x0Now[k];
-                fP[k] = kp.p[k];
-            }
-            haveP = true;
-            ++s.heldPX0;
-            headOk = kp.headOk;
-            hScale = kp.scale;
-            hW0 = kp.w0;
-            hQ2 = kp.q2;
-            hQ3 = kp.q3;
-        }
+    } else if (!cpuFind) {
+        ++s.heldNoFind;   // F227
     }
     // F85c: the reticle's P (F191: the key type 1001 uses) at the aim line's hit depth (O + D u; the direction from O is the game's), once a hit depth has come back.
     if (haveP && keyIsReticle) {
@@ -36294,15 +36258,15 @@ void report(uint64_t nowMs) {
                                     s.aN ? s.eyPxMax : 0.0, s.aN ? s.exPxSum / an : 0.0, meshes, s.exSum / rn2, s.eySum / rn2, s.eMax, ull(s.eN),
                                     s.discN ? s.discDxSum / double(s.discN) : 0.0, s.discN ? s.discDySum / double(s.discN) : 0.0, s.discMax, ull(s.discN));
                 }
-                // F63, per eye: where the decisions' matches came from (the CPU identification in this frame, a held match), the hold's P
-                // and X0 fallback, the contradictions (at the draw by the CPU identification, at read-back), the read-back's confirmations;
-                // the per-frame residual of fresh patched frames against P + e (the fixed e) and the bias now subtracted from e.
+                // F63, per eye: where the decisions' matches came from (the CPU identification in this frame, a held match), the held
+                // matches with no find (F227: not patched), the contradictions (at the draw by the CPU identification, at read-back), the
+                // read-back's confirmations; the per-frame residual of fresh patched frames against P + e (the fixed e) and the bias now subtracted from e.
                 const double rn = s.eN ? double(s.eN) : 1.0;
                 Log::get().note("native on foot marker fix (F63): eye %d: matched by the CPU identification %llu, by a held match (%u frames) %llu "
-                                "(P and X0 from the hold's fallback %llu); holds contradicted at the draw %llu, at read-back %llu; read-back "
+                                "(no find of the key, left as the game placed it (F227) %llu); holds contradicted at the draw %llu, at read-back %llu; read-back "
                                 "confirmations %llu; residual of the anchor shown against its target (read back, F66f): %llu frames, dx mean %+.2f px, dy "
                                 "mean %+.2f px, max %.2f px",
-                                e, ull(s.viaCpu), kMatchHold, ull(s.viaHold), ull(s.heldPX0), ull(s.cpuContradict), ull(s.rbContradict),
+                                e, ull(s.viaCpu), kMatchHold, ull(s.viaHold), ull(s.heldNoFind), ull(s.cpuContradict), ull(s.rbContradict),
                                 ull(s.rbConfirm), ull(s.eN), s.exSum / rn, s.eySum / rn, s.eMax);
                 // F64, the success line (marker-visible seconds only): the applied fraction of the eye-frames in which a key's match named a
                 // marker composite draw of the eye, by the head's speed band, and those eye-frames by state (a patch bound at the issue through
@@ -37424,7 +37388,6 @@ void nativeOnFootMarkerProbeShutdown() {
     for (f44::IconMesh& m : f44::g_iconMesh) m = f44::IconMesh{};   // F67d
     f44::g_iconOwner[0] = f44::g_iconOwner[1] = -1;
     f44::g_iconLastHit = -1;   // F142
-    for (f44::KeyP& kp : f44::g_keyP) kp = f44::KeyP{};
     if (f44::g_privCb) f44::g_privCb->Release();
     if (f44::g_workBuf) f44::g_workBuf->Release();
     f44::g_privCb = f44::g_workBuf = nullptr;
