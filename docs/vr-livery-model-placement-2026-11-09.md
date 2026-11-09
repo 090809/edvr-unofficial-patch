@@ -10,18 +10,50 @@
   1504x1522 per eye, output 3008x3044, DLSS k. Native on-foot VR on.
 - **Evidence:** eye dump `064024386001` (06:40:24, the Livery screen, LIVERY / GENERAL tabs in view). Dump
   `064036735002` (06:40:36) is after the screen closed (concourse kiosks).
-- **Leading hypothesis (H4):** EDVR's native on-foot machinery (the body pin, the neck reference's raise)
-  misplaces the Livery model whenever it is engaged during the screen. On the Pimax it happened to stand down; on
-  the Quest it did not (see "The Pimax visit").
-- **Open:** H4; H1 in its weak form (the projection consumed downstream of the placement, by the render camera);
-  H3. H2 (the Steam install's ini) is ruled out.
+- **F228 FLOWN (2026-11-09 08:21, Quest 3, `edvr_gfx_20261109_082137.log`, c25fac3e):** the hold works as built
+  (Livery Show seen, F107 held 3630 calls) and moves the model, but does not fix it. Key on: the model is behind
+  the pilot. Key off: it stands over him. The UI is right in both. See "Flight F228".
+- **Leading hypothesis (H5):** in Livery the game renders from the commander's OWN camera, while the loadout
+  browser (correct) renders from the third-person preview camera about 4 m out. Livery shows that preview camera
+  for about a second at open, then drops it. The model stands at the commander, so the view is from inside it.
+  EDVR's adjustments (H4) only decide which wrong view: behind (held off) or over (engaged). Same class as the
+  weapon showroom on 11-01, which also used the commander's camera (the pilot's comparison).
+- **Open:** H5's cause: why Livery drops the preview camera, and whether the Pimax does too on this build (no
+  logged Pimax Livery visit exists; the 05:04 "Pimax visit" below was most likely the loadout browser). H1 weak form.
 - **RE (2026-11-09, build 334925):** the Livery placement is authored scene geometry and reads no projection
   element (see "RE"). The notes wait in the analysis inbox, `20261109-090000-livery-anchor`, not yet filed.
-- **Next flight (proposed, not built):** extend F209's buy-screen signal to the two Livery activities, so F107
-  holds the camera away while Livery is open, behind a temporary A/B key. On the Quest, open Livery with the
-  key on and then off, with an eye dump in each. H4 predicts the model behind the UI with it on. If it is not,
-  the symmetric-frustum A/B (H1) is next.
-- **Temporary keys:** none yet.
+- **F228 (c25fac3e, BUILT, INSTALLED Steam `--scope both` as v0.22.0-rc.7-274-gc25fac3e, NOT FLOWN):** F209's
+  Show/Close watch also knows `HumanoidLiveryActivity` and `HumanoidWeaponLiveryActivity` (their vtable slots
+  checked in the installed exe). While one reads open and the key is on, F107 holds the camera away, as at a
+  buy screen. With the key off the screens are only logged. The full build ran green in a short-path worktree
+  (`C:\wt99`, branch `claude/f228-short-build`, same commit): in this worktree's long path `launcher_test` fails
+  two checks for path length alone.
+- **RE 2 (2026-11-09, inbox `20261109-101500-livery-camera`, not filed):**
+  - No EDVR patch is on Livery's camera choice (scan of the camera classes and the activity region). No HMD,
+    projection or render-size input is either.
+  - Livery and the loadout screens bind the same preview manager with the same mode byte 0.
+  - The model is a separate preview avatar (six new AMCs, 0 parts at the open, filled later).
+  - The lead is (b): the orbit distance is taken from the preview avatar's bounds while the avatar is still
+    empty, so the camera collapses to the avatar centre (the commander) and is never recomputed. CANDIDATE.
+- **Next (proposed, no build):**
+  - On the Quest: open Livery, wait 20 s, hold Mouse 2 and rotate (the orbit input), then close and reopen it
+    twice. Note any open where the model sits behind the UI, and take an eye dump.
+  - Then the same on the Pimax.
+  - (b) predicts that a later open, or a rotate after the avatar loads, puts the camera back out.
+- **Reopen-and-rotate test FLOWN (08:53, Quest, c25fac3e, `edvr_gfx_20261109_085334.log`):**
+  - The pilot: reopening and rotating did not move the model to the right spot.
+  - The log holds ONE Livery open (Show 08:55:48.5, Close 08:56:26.2; the key off, then on from 08:56:13). It
+    ends at 08:56:40, when on-foot stereo ended, so the reopens are not in it.
+  - Inside that open the pattern repeats: the 4 m preview camera for about a second at the open (08:55:43-47)
+    and at the close (08:56:27-28), and the commander's spot in between.
+  - During the rotate (08:56:17-25) `cam_local` moved only 10-25 cm about one point. That is either the orbit on
+    a collapsed radius or head motion; the once-a-second samples cannot split them.
+  - (b) is not refuted.
+- **Then, if needed (build):** log the CustomisationVisual's distance and pose fields (+0x340, +0x344, +0x580,
+  +0x5A0, +0x5E0) once a second while Livery is open, from the remembered activity +0x680. Optionally, an
+  exact-build hook on 0x12714C0 logging its mode.
+- **Temporary keys:** `experimental.native_on_foot_livery_game_view` (on|off, default on, live, F8 row "Livery
+  uses game view"). When the arc closes, the winning value becomes the behaviour and the key goes (ask first).
 - **Issue:** none yet.
 
 ## What the flight shows
@@ -98,7 +130,37 @@ From a Ghidra read of the installed build. The decompilations are in the analysi
 - **Not established:** what draws the showroom from the commander's camera in HMD mode, and the consumers of the
   projection.
 
+## Flight F228 (2026-11-09 08:21, Quest 3 under VirtualDesktopXR, Steam, c25fac3e)
+
+Build matched (`--expect-build c25fac3e`). The pilot: "the model is now behind me with the key turned on, and
+stands over me with it off". Eye dumps: `082443795001` (key on) and `082506704002` (key off), both looking at
+the UI. They show the LIVERY / GENERAL panel front-left, a "rotate" hint to its right, and no model in the empty
+space where it belongs. `082529135003` and `082540518004` are the loadout browser, with the model standing to the
+right of its panel, correctly.
+
+- **The signal works.** `HumanoidLiveryActivity Show` at 08:23:47.860, the shop signal ON, and Close at
+  08:25:16.502. The key changes at 08:24:07.9 (off), 08:24:15.7 (on) and 08:24:57.9 (off) each flip the signal.
+  With the key on, F107 refuses every call (episode 4: 3630 refused, "away by: the shop screen"), with the game's
+  camera 0.3 to 0.5 m from the neck.
+- **The render camera** (`concourse frame: cam_local`, once a second):
+  - 08:23:41-44: the showroom spot (6.0 20.0 -17.5), about 21 m from the neck;
+  - 08:23:45-46: the preview camera (6.62 23.09 2.29), 3.9 m from the neck;
+  - 08:23:47: the showroom spot once more, and Livery's Show;
+  - 08:23:48 to 08:25:15: the commander's own position (4.8 22.67 3.28), with the key on and with it off;
+  - 08:25:17-37 (the loadout browser): the preview camera again (6.72 23.10 2.30, F107 at 3.9-4.0 m).
+- The first flight had the same sequence: 3.9 m at 06:39:58-06:40:02, then the commander's camera from 06:40:03.
+
+So the model stands where the game puts it, at the commander, and Livery renders from inside it. The loadout
+browser keeps the preview camera and is right.
+
+- ruled out: H4 as the whole cause, because with EDVR's on-foot adjustments held off for the whole screen
+  (3630 calls refused) the model is behind the pilot, not behind the UI.
+
 ## The Pimax visit: EDVR stood down there and did not on the Quest
+
+**Corrected after F228:** this stretch's signature (a far showroom camera, then a 4.0 m camera that restarts F107
+every 8 s) is the loadout browser's in the F228 flight (08:25:19-08:25:40), not Livery's. Read it as a loadout
+browser visit. The comparison below does not stand as evidence about Livery.
 
 The pilot's correct Pimax view was on the same Steam install (Pimax OpenXR, `edvr_gfx_20261109_045925.log`,
 d5241a7b). Its showroom visit (05:04:06 to past 05:06:44) has the same opening as the Quest's: a far showroom camera
