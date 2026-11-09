@@ -2286,6 +2286,117 @@ void ConcoursePaneScope::initCold() noexcept {
     prevCbNum_ = 0;
 }
 
+// ---- TEMPORARY (H63 instrument, Flight 57): the glass census -------------------------------------------------------------------------------------------
+// Flight 56's Orbis never matched a draw of the glass family, so its windows were never treated (docs\concourse-cull-2026-11-05.md, "Flight 56 results"). Every armed
+// draw outside a capture frame is tallied here by context and by the family's vertex and pixel shaders (the shadow's on the immediate context, the context's own
+// elsewhere, as the scope reads them); the pair's draws are tallied by the step that turned them away; and 1 draw in 64 on the immediate context has the shadow's
+// shaders checked against the context's own. The tick logs it every 5 s while any draw was tallied. Goes when H63 is settled.
+namespace {
+enum GlassExit : int { kGxPeople = 0, kGxLightTest, kGxWithheld, kGxSealed, kGxFarGlow, kGxNoPs, kGxNotListed, kGxTriple, kGxMatched, kGxCount };
+struct GlassCensus {
+    std::atomic<uint32_t> drawsImm, drawsOther;
+    std::atomic<uint32_t> pairImm, vsOnlyImm, psOnlyImm;      // both shaders the family's; the vertex shader alone; the pixel shader alone
+    std::atomic<uint32_t> pairOther, vsOnlyOther, psOnlyOther;
+    std::atomic<uint32_t> exits[kGxCount];
+    std::atomic<uint32_t> sampleTick, sampled, psCtxNotShadow, psShadowNotCtx, vsCtxNotShadow, vsShadowNotCtx;
+};
+GlassCensus g_gc;   // static storage: every count starts at zero
+constexpr size_t kGcPsSlots = 4;
+std::mutex g_gcPsMutex;   // the pixel shaders drawn with the family's vertex shader, the first four seen in a window
+uint64_t g_gcPs[kGcPsSlots] = {};
+uint32_t g_gcPsN[kGcPsSlots] = {};
+uint32_t g_gcPsOver = 0;
+uint64_t g_gcLastMs = 0;
+
+inline void gcAdd(std::atomic<uint32_t>& c) noexcept { c.fetch_add(1, std::memory_order_relaxed); }
+
+// True when the draw is the glass pair, read as the scope reads it.
+bool glassCensus(ID3D11DeviceContext* ctx, bool followed) noexcept {
+    uint64_t vs = 0, ps = 0;
+    if (followed) {
+        vs = bindingShaderHash(BindSlot::Vs);
+        ps = bindingShaderHash(BindSlot::Ps);
+        gcAdd(g_gc.drawsImm);
+        if ((g_gc.sampleTick.fetch_add(1, std::memory_order_relaxed) & 63u) == 0) {
+            const uint64_t vsCtx = vertexShaderHash(ctx);
+            const uint64_t psCtx = pixelShaderHash(ctx);
+            gcAdd(g_gc.sampled);
+            if (psCtx == cc::kPaneFamilyPs && ps != cc::kPaneFamilyPs) gcAdd(g_gc.psCtxNotShadow);
+            if (ps == cc::kPaneFamilyPs && psCtx != cc::kPaneFamilyPs) gcAdd(g_gc.psShadowNotCtx);
+            if (vsCtx == cc::kPaneFamilyVs && vs != cc::kPaneFamilyVs) gcAdd(g_gc.vsCtxNotShadow);
+            if (vs == cc::kPaneFamilyVs && vsCtx != cc::kPaneFamilyVs) gcAdd(g_gc.vsShadowNotCtx);
+        }
+    } else {
+        vs = vertexShaderHash(ctx);
+        ps = pixelShaderHash(ctx);
+        gcAdd(g_gc.drawsOther);
+    }
+    const bool fv = vs == cc::kPaneFamilyVs;
+    const bool fp = ps == cc::kPaneFamilyPs;
+    if (fv && fp) {
+        gcAdd(followed ? g_gc.pairImm : g_gc.pairOther);
+    } else if (fv) {
+        gcAdd(followed ? g_gc.vsOnlyImm : g_gc.vsOnlyOther);
+        std::lock_guard<std::mutex> lock(g_gcPsMutex);
+        size_t k = 0;
+        while (k < kGcPsSlots && g_gcPsN[k] != 0 && g_gcPs[k] != ps) ++k;
+        if (k == kGcPsSlots) {
+            ++g_gcPsOver;
+        } else {
+            g_gcPs[k] = ps;
+            ++g_gcPsN[k];
+        }
+    } else if (fp) {
+        gcAdd(followed ? g_gc.psOnlyImm : g_gc.psOnlyOther);
+    }
+    return fv && fp;
+}
+
+inline uint32_t gcTake(std::atomic<uint32_t>& c) noexcept { return c.exchange(0, std::memory_order_relaxed); }
+
+void glassCensusReport(uint64_t nowMs) noexcept {
+    if (nowMs - g_gcLastMs < 5000) return;
+    g_gcLastMs = nowMs;
+    const uint32_t imm = gcTake(g_gc.drawsImm), other = gcTake(g_gc.drawsOther);
+    const uint32_t pairImm = gcTake(g_gc.pairImm), vsOnlyImm = gcTake(g_gc.vsOnlyImm), psOnlyImm = gcTake(g_gc.psOnlyImm);
+    const uint32_t pairOther = gcTake(g_gc.pairOther), vsOnlyOther = gcTake(g_gc.vsOnlyOther), psOnlyOther = gcTake(g_gc.psOnlyOther);
+    uint32_t ex[kGxCount] = {};
+    for (int k = 0; k < kGxCount; ++k) ex[k] = gcTake(g_gc.exits[k]);
+    const uint32_t sampled = gcTake(g_gc.sampled), psCns = gcTake(g_gc.psCtxNotShadow), psSnc = gcTake(g_gc.psShadowNotCtx);
+    const uint32_t vsCns = gcTake(g_gc.vsCtxNotShadow), vsSnc = gcTake(g_gc.vsShadowNotCtx);
+    char tops[160] = {};
+    {
+        std::lock_guard<std::mutex> lock(g_gcPsMutex);
+        size_t used = 0;
+        for (size_t k = 0; k < kGcPsSlots && g_gcPsN[k] != 0; ++k) {
+            const int w = std::snprintf(tops + used, sizeof(tops) - used, "%s%016llX x%u", k ? ", " : "", static_cast<unsigned long long>(g_gcPs[k]), g_gcPsN[k]);
+            if (w > 0 && used + static_cast<size_t>(w) < sizeof(tops)) used += static_cast<size_t>(w);
+        }
+        if (g_gcPsOver != 0) {
+            const int w = std::snprintf(tops + used, sizeof(tops) - used, "%s%u more", used ? ", " : "", g_gcPsOver);
+            if (w > 0 && used + static_cast<size_t>(w) < sizeof(tops)) used += static_cast<size_t>(w);
+        }
+        if (used == 0) std::snprintf(tops, sizeof(tops), "none");
+        for (size_t k = 0; k < kGcPsSlots; ++k) {
+            g_gcPs[k] = 0;
+            g_gcPsN[k] = 0;
+        }
+        g_gcPsOver = 0;
+    }
+    if (imm == 0 && other == 0) return;   // the scope was not armed in this window
+    Log::get().note("concourse glass census 5s (TEMPORARY, H63): draws immediate %u, other contexts %u; the glass pair (vs %016llX ps %016llX) immediate %u, other %u; "
+                    "its vertex shader with another pixel shader immediate %u, other %u [%s]; its pixel shader with another vertex shader immediate %u, other %u; "
+                    "the pair turned away: people %u, light test %u, withheld family %u, sealed %u, far glow %u, no ps %u, not listed %u, vs or index count %u; matched as a pane %u; "
+                    "the shadow against the context (1 immediate draw in 64, %u sampled): ps the glass's in the context only %u, in the shadow only %u; vs likewise %u, %u; "
+                    "state: treat %d, shares %d, effects %d, withhold %d, mode %s, list %u",
+                    imm, other, static_cast<unsigned long long>(cc::kPaneFamilyVs), static_cast<unsigned long long>(cc::kPaneFamilyPs), pairImm, pairOther, vsOnlyImm, vsOnlyOther,
+                    tops, psOnlyImm, psOnlyOther, ex[kGxPeople], ex[kGxLightTest], ex[kGxWithheld], ex[kGxSealed], ex[kGxFarGlow], ex[kGxNoPs], ex[kGxNotListed], ex[kGxTriple],
+                    ex[kGxMatched], sampled, psCns, psSnc, vsCns, vsSnc, g_treatNow.load(std::memory_order_relaxed) ? 1 : 0, g_shareOn.load(std::memory_order_relaxed) ? 1 : 0,
+                    g_effectsNow.load(std::memory_order_relaxed) ? 1 : 0, g_withholdNow.load(std::memory_order_relaxed) ? 1 : 0, modeText(g_mode.load(std::memory_order_relaxed)),
+                    static_cast<unsigned>(g_listN.load(std::memory_order_relaxed)));
+}
+}  // namespace
+
 void ConcoursePaneScope::begin(ID3D11DeviceContext* ctx, UINT indexCount, UINT startIndex, INT baseVertex, char kind, const ConcoursePaneCalls& calls) noexcept {
     initCold();   // first: nothing reads a cold member before this
     beginBody(ctx, indexCount, startIndex, baseVertex, calls);
@@ -2307,10 +2418,12 @@ void ConcoursePaneScope::beginBody(ID3D11DeviceContext* ctx, UINT indexCount, UI
     // Every draw of the frame passes here while the gate holds. On the immediate context (the one the binding shadow follows) the shadow answers with no COM
     // call: 0 is no pixel shader (a depth-only draw), and the draw has none to name. Any other context asks the context for its pixel shader.
     const bool followed = ctx == g_immediate.load(std::memory_order_relaxed);
+    const bool gp = glassCensus(ctx, followed);   // TEMPORARY (H63 instrument, Flight 57): the glass pair, and where each of its draws is turned away below
     // The bake's frames: the people (an NPC, the commander's arms and suit) are not issued, so what is behind them is captured. By vertex shader, on any context.
     if (g_bakePeopleOff.load(std::memory_order_relaxed) && cc::bakePeopleVs(followed ? bindingShaderHash(BindSlot::Vs) : vertexShaderHash(ctx))) {
         withheld_ = true;
         g_bakePeopleLeft.fetch_add(1, std::memory_order_relaxed);
+        if (gp) gcAdd(g_gc.exits[kGxPeople]);
         return;
     }
     const uint64_t ps = followed ? bindingShaderHash(BindSlot::Ps) : pixelShaderHash(ctx);
@@ -2323,6 +2436,7 @@ void ConcoursePaneScope::beginBody(ID3D11DeviceContext* ctx, UINT indexCount, UI
         if (lightTest != 0 && cc::lightTestLeavesOut(lightTest, ps)) {
             withheld_ = true;
             g_lightTestHits.fetch_add(1, std::memory_order_relaxed);
+            if (gp) gcAdd(g_gc.exits[kGxLightTest]);
             return;
         }
         // The outside (smoke, trails, ship lasers, the planet) is not issued while the cull is on. By pixel shader on any context; by vertex shader too on the
@@ -2346,11 +2460,16 @@ void ConcoursePaneScope::beginBody(ID3D11DeviceContext* ctx, UINT indexCount, UI
             withheld_ = true;
             g_withheld.fetch_add(1, std::memory_order_relaxed);
             g_withheldFam[fam].fetch_add(1, std::memory_order_relaxed);
+            if (gp) gcAdd(g_gc.exits[kGxWithheld]);
             return;
         }
         // The glows that may also be the room's: their far pixels are dropped by the mark (concourse_cull_core.h, farLimitedPs). Immediate context only, as the mark is.
-        if (!cullOn && !washOff) return;   // sealed: nothing below is for a sealed hangar
+        if (!cullOn && !washOff) {   // sealed: nothing below is for a sealed hangar
+            if (gp) gcAdd(g_gc.exits[kGxSealed]);
+            return;
+        }
         if (followed && g_withholdNow.load(std::memory_order_relaxed) && cc::farLimitedPs(ps)) {   // the plain phase only: the capture's lift draws the room's far glows
+            if (gp) gcAdd(g_gc.exits[kGxFarGlow]);
             if (ensureMarked(ctx, calls)) {
                 UINT ref = 0;
                 ctx->OMGetDepthStencilState(&prevDs_, &ref);
@@ -2370,7 +2489,10 @@ void ConcoursePaneScope::beginBody(ID3D11DeviceContext* ctx, UINT indexCount, UI
             return;
         }
     }
-    if (!ps) return;
+    if (!ps) {
+        if (gp) gcAdd(g_gc.exits[kGxNoPs]);
+        return;
+    }
     const uint32_t listN = std::min<uint32_t>(g_listN.load(std::memory_order_acquire), static_cast<uint32_t>(cc::kPaneListCap));
     bool listed = false;
     for (uint32_t i = 0; i < listN; ++i)
@@ -2378,12 +2500,19 @@ void ConcoursePaneScope::beginBody(ID3D11DeviceContext* ctx, UINT indexCount, UI
             listed = true;
             break;
         }
-    if (!listed) return;   // the pixel shader first: the vertex shader's hash is read only for a draw that could be a pane
+    if (!listed) {   // the pixel shader first: the vertex shader's hash is read only for a draw that could be a pane
+        if (gp) gcAdd(g_gc.exits[kGxNotListed]);
+        return;
+    }
     const uint64_t vs = vertexShaderHash(ctx);
-    if (cc::paneTripleIndex(g_list, listN, vs, ps, indexCount) < 0) return;
+    if (cc::paneTripleIndex(g_list, listN, vs, ps, indexCount) < 0) {
+        if (gp) gcAdd(g_gc.exits[kGxTriple]);
+        return;
+    }
     ctx_ = ctx;
     calls_ = &calls;
     family_ = true;
+    if (gp) gcAdd(g_gc.exits[kGxMatched]);
     keyN_ = indexCount;
     keyStart_ = startIndex;
     keyBase_ = baseVertex;
@@ -4455,6 +4584,7 @@ void concoursePaneTick(ID3D11Device* device, uint32_t frame, uint64_t nowMs) noe
     bakeTick(device, nowMs);
     vrBakeTick(device, frame);   // TEMPORARY (the VR bake): its prepare and read-backs; nothing while it was never armed
     if (g_vrDiffOn.load(std::memory_order_acquire)) vrDrawDiffTick(frame);   // TEMPORARY (H62 instrument): a finished face's draw diff, sorted and logged here, not in the draw hook
+    glassCensusReport(nowMs);   // TEMPORARY (H63 instrument, Flight 57): every 5 s while the scope tallied a draw
     // A backstop: a bake takes about 110 ms, and every end of one clears the people's flag. A bake ended some other way (its mode stepped by the key mid-bake) would leave the
     // people out for good, so past 2 s they come back, and the log says so.
     if (g_bakePeopleOff.load(std::memory_order_acquire) && nowMs - g_bakeHoldStartMs > 2000 && g_bakePeopleOff.exchange(false, std::memory_order_acq_rel))
