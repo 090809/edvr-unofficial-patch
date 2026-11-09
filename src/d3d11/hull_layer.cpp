@@ -58,6 +58,11 @@ constexpr uint32_t kRecordBytes = 336;    // a pool record (tools\eye_run_ledger
 constexpr uint32_t kMaxSeedInstances = 4096;
 constexpr uint32_t kMaxRecords = 1u << 20;
 constexpr float kOwnRadius = 120.0f;      // metres about the seed records' centroid (the five ledgers: object A at 120 m)
+// The rig seed's margin past its records' reach (docs "Rig seed", 45 dumps of 2026-11-09): the own records lay at most 13-25 m
+// past the rig records' reach (Anaconda 71-83 m against a reach of 54-61 m; the transport 17-28 m against 4-6 m), the nearest
+// foreign record past reach + 30 in every dump. kOwnRadius stays the rig seed's ceiling.
+constexpr float kRigMargin = 30.0f;
+constexpr uint32_t kStatsBytes = 32;      // an eye's seed stats (the seed shader's comment says the words)
 constexpr UINT kSrvSlots = 16;            // PS resource slots a stage is searched and restored over
 // 48, not 32: the AO chain adds three private copies an eye (its deinterleaved depth, its HBAO slices, the 704x612 AO).
 constexpr size_t kMaxMirrors = 48;
@@ -146,11 +151,15 @@ bool isTerrainVs(uint64_t vs) { return vs == kTerrainVs || static_cast<uint32_t>
 // hlsl-check: kFilterVsHlsl hull_layer_filter_vs vs_5_0
 // hlsl-check: kFilterPsHlsl hull_layer_filter_ps ps_5_0
 //
-// The seed: the seed draw's instance window names its records; their mean position is the own ship's centre, and every
-// pool record within the radius of it is the own ship's. One group; one uint a record in the mask; stats = (own records,
-// filtered pixels, seed records read, seed instances).
+// The seed: the seed records' mean position is the own ship's centre, and every pool record within the radius of it is the
+// own ship's. The seed records are the rig probe's own slots (rigSeed 1, docs "Rig seed": the records the own rigs emitted,
+// always on the own vehicle) or, when the probe has none, the seed draw's instance window (rigSeed 0, the old seed: wrong
+// object in 14 of 45 dumps of 2026-11-09). A rig seed's radius is its records' reach from their centre (the farthest, held
+// per eye while the own rigs stay the same: resetHold 1 when they changed) plus `margin`, at most radiusMax; a draw seed's is
+// radiusMax. Rig seed records at exactly (0,0,0) are unused records and are skipped. One group; one uint a record in the
+// mask; stats = (own records, filtered pixels, seed records read, seed records; radius, reach used, rigSeed, reach held).
 constexpr char kSeedHlsl[] =
-    "cbuffer Seed : register(b0) { uint seedCount; uint recordCount; float radius2; uint unused; };\n"
+    "cbuffer Seed : register(b0) { uint seedCount; uint recordCount; float radiusMax; uint rigSeed; float margin; uint resetHold; uint2 unused; };\n"
     "ByteAddressBuffer inst : register(t0);\n"
     "ByteAddressBuffer pool : register(t1);\n"
     "RWByteAddressBuffer ownMask : register(u0);\n"
@@ -158,16 +167,19 @@ constexpr char kSeedHlsl[] =
     "groupshared float3 gSum[256];\n"
     "groupshared uint gN[256];\n"
     "groupshared uint gOwn;\n"
+    "bool seedPoint(uint i, out float3 p) {\n"
+    "    p = float3(0, 0, 0);\n"
+    "    uint r = inst.Load(i * 8) & 0x7FFFFF;\n"
+    "    if (r >= recordCount) return false;\n"
+    "    p = asfloat(pool.Load3(r * 336 + 16));\n"
+    "    return all(isfinite(p)) && (rigSeed == 0 || any(p != 0));\n"
+    "}\n"
     "[numthreads(256, 1, 1)] void hull_layer_seed_cs(uint t : SV_GroupIndex) {\n"
     "    float3 s = float3(0, 0, 0);\n"
     "    uint n = 0;\n"
-    "    for (uint i = t; i < seedCount; i += 256) {\n"
-    "        uint r = inst.Load(i * 8) & 0x7FFFFF;\n"
-    "        if (r < recordCount) {\n"
-    "            float3 p = asfloat(pool.Load3(r * 336 + 16));\n"
-    "            if (all(isfinite(p))) { s += p; n += 1; }\n"
-    "        }\n"
-    "    }\n"
+    "    float3 p;\n"
+    "    for (uint i = t; i < seedCount; i += 256)\n"
+    "        if (seedPoint(i, p)) { s += p; n += 1; }\n"
     "    gSum[t] = s;\n"
     "    gN[t] = n;\n"
     "    if (t == 0) gOwn = 0;\n"
@@ -178,19 +190,39 @@ constexpr char kSeedHlsl[] =
     "    }\n"
     "    uint valid = gN[0];\n"
     "    float3 c = gSum[0] / max((float)valid, 1.0);\n"
+    "    GroupMemoryBarrierWithGroupSync();\n"
+    // The rig seed's reach: the farthest seed record from the centre (a non-negative float orders as its bits).
+    "    uint reach = 0;\n"
+    "    if (rigSeed != 0)\n"
+    "        for (uint j = t; j < seedCount; j += 256)\n"
+    "            if (seedPoint(j, p)) reach = max(reach, asuint(length(p - c)));\n"
+    "    gN[t] = reach;\n"
+    "    GroupMemoryBarrierWithGroupSync();\n"
+    "    [unroll] for (uint m = 128; m > 0; m >>= 1) {\n"
+    "        if (t < m) gN[t] = max(gN[t], gN[t + m]);\n"
+    "        GroupMemoryBarrierWithGroupSync();\n"
+    "    }\n"
+    "    float held = resetHold != 0 ? 0.0 : asfloat(stats.Load(28));\n"
+    "    if (!(held >= 0.0 && held <= radiusMax)) held = 0.0;\n"
+    "    float used = rigSeed != 0 ? max(asfloat(gN[0]), held) : held;\n"
+    "    float radius = rigSeed != 0 ? min(radiusMax, used + margin) : radiusMax;\n"
+    "    float radius2 = radius * radius;\n"
     "    uint mine = 0;\n"
     "    for (uint q = t; q < recordCount; q += 256) {\n"
-    "        float3 p = asfloat(pool.Load3(q * 336 + 16));\n"
-    "        float3 d = p - c;\n"
+    "        float3 r = asfloat(pool.Load3(q * 336 + 16));\n"
+    "        float3 d = r - c;\n"
     // An unused pool record sits at exactly (0,0,0); with the own ship near the origin they flooded the mask (dump
     // 214124277001: 936 of 1056, never drawn), and the 400-record guard then held separate mode off all flight.
-    "        uint own = (valid > 0 && all(isfinite(p)) && any(p != 0) && dot(d, d) <= radius2) ? 1u : 0u;\n"
+    "        uint own = (valid > 0 && all(isfinite(r)) && any(r != 0) && dot(d, d) <= radius2) ? 1u : 0u;\n"
     "        ownMask.Store(q * 4, own);\n"
     "        mine += own;\n"
     "    }\n"
     "    InterlockedAdd(gOwn, mine);\n"
     "    GroupMemoryBarrierWithGroupSync();\n"
-    "    if (t == 0) stats.Store4(0, uint4(gOwn, 0, valid, seedCount));\n"
+    "    if (t == 0) {\n"
+    "        stats.Store4(0, uint4(gOwn, 0, valid, seedCount));\n"
+    "        stats.Store4(16, uint4(asuint(radius), asuint(used), rigSeed, asuint(used)));\n"
+    "    }\n"
     "}\n";
 
 // A pixel is a neighbour's when its private slot is set (2*slot+1 >= 1; the clear is -1) and names a record outside the
@@ -486,6 +518,7 @@ struct Eye {
     uint8_t aoOutCount = 0, aoDone = 0, aoSeen = 0;
     float clearDepth = 0.0f;
     uint32_t records = 0, seedInstances = 0;
+    uint32_t rigGen = ~0u;   // the own rigs' generation the eye's held reach (stats word 7) belongs to
     // The seed's private views (references held from the seed to the filter).
     ID3D11RenderTargetView* privRtv[4] = {};
     ID3D11RenderTargetView* privSlot = nullptr;
@@ -604,6 +637,10 @@ struct Window {
     // step dispatches and apply draws re-issued; eye-frames where the game ran a step (or the apply) for the eye and it was
     // not re-issued, by step; chain dispatches whose eye could not be named (none of its resources is an eye's).
     uint32_t aoEyeFrames = 0, aoFull = 0, aoDispatches = 0, aoApplied = 0, aoMissed[kAoSteps + 1] = {}, aoNoEye = 0;
+    // The rig seed (the "own seed" line): eye-frames seeded from the rig probe's own slots and from the seed draw (the fallback),
+    // the hold restarted (the own rigs changed); the rig seeds' slot counts, and from their readbacks the radius and reach (metres).
+    uint32_t rigSeeds = 0, drawSeeds = 0, holdResets = 0;
+    std::vector<uint32_t> rigSlots, rigRadius, rigReach;
 };
 
 // Separate mode: what hullLayerBeforeMainDraw bound over the game's issue, which hullLayerAfterMainDraw puts back.
@@ -1351,7 +1388,7 @@ bool ensureGpu() {
     rd.FillMode = D3D11_FILL_SOLID;
     rd.CullMode = D3D11_CULL_NONE;
     rd.DepthClipEnable = TRUE;
-    g_gpu.seedCb = makeConstantBuffer();
+    g_gpu.seedCb = makeConstantBuffer(32);
     g_gpu.passCb = makeConstantBuffer();
     if (FAILED(g_device->CreateDepthStencilState(&dd, &g_gpu.depthAlways)) || FAILED(g_device->CreateRasterizerState(&rd, &g_gpu.noCull)) ||
         !g_gpu.seedCb || !g_gpu.passCb || !makeRawBuffer(kMaxSeedInstances * 8, false, &g_gpu.inst, &g_gpu.instSrv, nullptr)) {
@@ -1797,7 +1834,8 @@ bool seedOwnMask(ID3D11DeviceContext* ctx, Eye& e, UINT instances, UINT startIns
     }
     if (!e.statsUav) {
         releaseRef(e.stats);
-        if (!makeRawBuffer(16, true, &e.stats, nullptr, &e.statsUav)) return fail("the stats buffer could not be made");
+        if (!makeRawBuffer(kStatsBytes, true, &e.stats, nullptr, &e.statsUav)) return fail("the stats buffer could not be made");
+        e.rigGen = ~0u;   // a new buffer holds no reach
     }
     D3D11_BOX box{};
     box.left = static_cast<UINT>(base);
@@ -1807,12 +1845,40 @@ bool seedOwnMask(ID3D11DeviceContext* ctx, Eye& e, UINT instances, UINT startIns
     box.front = 0;
     box.back = 1;
     vScreenCopySubresourceRegionRaw(ctx, g_gpu.pool, 0, poolBuf, &box);
-    box.left = static_cast<UINT>(instBegin);
-    box.right = static_cast<UINT>(instEnd);
-    vScreenCopySubresourceRegionRaw(ctx, g_gpu.inst, 0, instBuf, &box);
-    float radius2 = kOwnRadius * kOwnRadius;
-    uint32_t cb[4] = {seeds, records, 0u, 0u};
-    std::memcpy(&cb[2], &radius2, sizeof radius2);
+    // The seed records: the rig probe's own slots in this buffer, this frame (docs "Rig seed"), else the seed draw's instance window.
+    // The probe's record q is the game buffer's record base/336 + q, the mask's numbering, only when the view starts on a record.
+    static uint32_t s_rigSlots[kMaxSeedInstances];
+    static uint32_t s_rigUpload[kMaxSeedInstances * 2];
+    uint32_t rigGen = 0;
+    const uint32_t rigCount = base % kRecordBytes == 0 ? hullRigProbeOwnSlots(poolBuf, static_cast<uint32_t>(base / kRecordBytes), records, s_rigSlots,
+                                                                                kMaxSeedInstances, &rigGen)
+                                                       : 0;
+    uint32_t seedCount = seeds, resetHold = 0;
+    if (rigCount) {
+        for (uint32_t i = 0; i < rigCount; ++i) {
+            s_rigUpload[2 * i] = s_rigSlots[i];   // the instance stream's layout: the record index first
+            s_rigUpload[2 * i + 1] = 0;
+        }
+        D3D11_BOX ub{0, 0, 0, rigCount * 8u, 1, 1};
+        vScreenUpdateSubresourceRaw(ctx, g_gpu.inst, 0, &ub, s_rigUpload, 0, 0);
+        seedCount = rigCount;
+        if (e.rigGen != rigGen) {
+            resetHold = 1;
+            e.rigGen = rigGen;
+            ++g_win.holdResets;
+        }
+        ++g_win.rigSeeds;
+        g_win.rigSlots.push_back(rigCount);
+    } else {
+        box.left = static_cast<UINT>(instBegin);
+        box.right = static_cast<UINT>(instEnd);
+        vScreenCopySubresourceRegionRaw(ctx, g_gpu.inst, 0, instBuf, &box);
+        ++g_win.drawSeeds;
+    }
+    const float radiusMax = kOwnRadius, margin = kRigMargin;
+    uint32_t cb[8] = {seedCount, records, 0u, rigCount ? 1u : 0u, 0u, resetHold, 0u, 0u};
+    std::memcpy(&cb[2], &radiusMax, sizeof radiusMax);
+    std::memcpy(&cb[4], &margin, sizeof margin);
     vScreenUpdateSubresourceRaw(ctx, g_gpu.seedCb, 0, nullptr, cb, 0, 0);
     CsSave save;
     save.capture(ctx);
@@ -1830,7 +1896,7 @@ bool seedOwnMask(ID3D11DeviceContext* ctx, Eye& e, UINT instances, UINT startIns
     hullRigProbeAtSeed(ctx, g_device, g_frame, static_cast<int>(&e - g_eyes), e.mask, g_gpu.pool, base % kRecordBytes == 0 ? poolBuf : nullptr,
                        static_cast<uint32_t>(base / kRecordBytes), records, g_dump == Dump::Capturing ? g_dumpStamp : nullptr);
     e.records = records;
-    e.seedInstances = seeds;
+    e.seedInstances = seedCount;
     releaseRef(instBuf);
     releaseRef(poolBuf);
     releaseRef(poolSrv);
@@ -2191,7 +2257,7 @@ void finishGbuffer(ID3D11DeviceContext* ctx, int ei, End why) {
             break;
         }
     if (slot) {
-        if (!slot->staging) slot->staging = makeStagingBuffer(16);
+        if (!slot->staging) slot->staging = makeStagingBuffer(kStatsBytes);
         if (slot->staging) {
             vScreenCopyResourceRaw(ctx, slot->staging, e.stats);
             slot->frame = g_frame;
@@ -2205,7 +2271,7 @@ void finishGbuffer(ID3D11DeviceContext* ctx, int ei, End why) {
         if (e.gameRt0) copyToStaging(ctx, e.gameRt0, e.stageGbuf0);
         if (e.gameDepth) copyToStaging(ctx, e.gameDepth, e.stageMainDepth);
         copyToStaging(ctx, static_cast<ID3D11Texture2D*>(depthRes), e.stageDepth);
-        if (!e.stageStats) e.stageStats = makeStagingBuffer(16);
+        if (!e.stageStats) e.stageStats = makeStagingBuffer(kStatsBytes);
         if (e.stageStats) vScreenCopyResourceRaw(ctx, e.stageStats, e.stats);
         e.dumpHull = e.hull;
     }
@@ -3044,9 +3110,16 @@ void readBacks(ID3D11DeviceContext* ctx) {
                 }
                 continue;
             }
-            uint32_t v[4] = {};
+            uint32_t v[kStatsBytes / 4] = {};
             std::memcpy(v, map.pData, sizeof v);
             ctx->Unmap(r.staging, 0);
+            if (v[6]) {   // a rig seed: its radius and reach
+                float radius = 0.0f, reach = 0.0f;
+                std::memcpy(&radius, &v[4], sizeof radius);
+                std::memcpy(&reach, &v[5], sizeof reach);
+                g_win.rigRadius.push_back(static_cast<uint32_t>(radius + 0.5f));
+                g_win.rigReach.push_back(static_cast<uint32_t>(reach + 0.5f));
+            }
             g_win.own.push_back(v[0]);
             g_win.filtered.push_back(v[1]);
             ++g_win.readbacks;
@@ -3566,6 +3639,14 @@ void report() {
                     g_win.noCounterpart[kMask], g_win.noCounterpart[kLight], g_win.unknownPairs, g_win.ended[kEndCopy], g_win.ended[kEndShell],
                     g_win.ended[kEndLight], g_win.ended[kEndFrame], g_win.terrainFrames, g_win.autoDumps, g_win.busyFrames, g_win.offscreen,
                     g_win.nullRt1);
+    uint32_t rs[3], rr[3], rh[3];
+    loMidHi(g_win.rigSlots, &rs[0], &rs[1], &rs[2]);
+    loMidHi(g_win.rigRadius, &rr[0], &rr[1], &rr[2]);
+    loMidHi(g_win.rigReach, &rh[0], &rh[1], &rh[2]);
+    Log::get().note("hull layer: own seed: rig=%u draw=%u hold_resets=%u rig_slots=%u/%u/%u radius=%u/%u/%u reach=%u/%u/%u (eye-frames whose own mask grew "
+                    "from the rig probe's own slots, and from the seed draw, the fallback when the pool held no own slot; the hold restarted when the own "
+                    "rigs changed; over the rig seeds min/median/max: slots, and from their readbacks the radius and the reach held, in metres)",
+                    g_win.rigSeeds, g_win.drawSeeds, g_win.holdResets, rs[0], rs[1], rs[2], rr[0], rr[1], rr[2], rh[0], rh[1], rh[2]);
     Log::get().note("hull layer: ao: eye_frames=%u full=%u dispatches=%u per_eye_frame=%.2f applied=%u missed=deinterleave:%u,hbao:%u,interleave:%u,"
                     "apply:%u no_eye=%u (the game's AO chain re-issued on the private G-buffer: eye-frames with a private G-buffer, and those whose "
                     "three compute steps and apply draw all were; per_eye_frame is dispatches over eye-frames, %d when every step ran; missed: "

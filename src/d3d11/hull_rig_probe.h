@@ -1,6 +1,6 @@
-// diag.hull_layer (TEMPORARY; docs\research-own-hull-layer-2026-11-08.md, "Rig probe"): a diagnostic that changes nothing the game or the
-// layer draws. It asks whether the own ship's pool (t33) slots can be known exactly on the CPU from the engine's own rig data, and compares
-// that set with the hull layer's GPU own mask.
+// diag.hull_layer (TEMPORARY; docs\research-own-hull-layer-2026-11-08.md, "Rig probe" and "Rig seed"): the own ship's pool (t33) slots,
+// known on the CPU from the engine's own rig data, compared with the hull layer's GPU own mask, and (hullRigProbeOwnSlots) the seed that
+// mask is grown from.
 //
 // The chain, all on what engine motion and vehicle_rig already observe:
 //   emit (FUN_144315A20, job threads): a rig record inside the own ship's or cockpit's record array (vehicle_rig.h g_vehicleRigOwn) claims the
@@ -45,6 +45,12 @@ void hullRigProbeConfigure(bool on);
 // only); firstSlot: the view's first record in that buffer. dumpStamp: non-null on the eye dump's capture frame.
 void hullRigProbeAtSeed(ID3D11DeviceContext* ctx, ID3D11Device* device, uint32_t hullFrame, int eye, ID3D11Buffer* mask, ID3D11Buffer* poolCopy,
                         const void* gamePool, uint32_t firstSlot, uint32_t records, const wchar_t* dumpStamp);
+// The rig seed (docs "Rig seed", 2026-11-10): at an eye's seed, before the seed dispatch (render thread), the own slots the watched buffer
+// `gamePool` holds now (the content set: own items the copier put there, cleared by any other copy and by a DISCARD map), as indices from
+// firstSlot, at most `cap` of them; gen: the own rigs' generation (vehicle_rig's), also when 0 is returned. 0: the probe is off, no own rig is
+// known (on foot), the buffer is not one engine motion watches, or it holds no own record. The set belongs to the frame being drawn: the
+// copier filled the buffer between its map and this frame's draws.
+uint32_t hullRigProbeOwnSlots(const void* gamePool, uint32_t firstSlot, uint32_t records, uint32_t* out, uint32_t cap, uint32_t* gen);
 // At the hull layer's frame boundary (render thread): readbacks, the 30 s line, the target and emit-gap lines.
 void hullRigProbeFrameEnd(ID3D11DeviceContext* ctx, uint32_t hullFrame);
 // The layer's device goes away: staging released, pending readbacks dropped.

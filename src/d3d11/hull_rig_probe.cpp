@@ -1,5 +1,6 @@
 // diag.hull_layer (TEMPORARY): the rig probe. hull_rig_probe.h says what it asks and how; docs\research-own-hull-layer-2026-11-08.md
-// ("Rig probe", 2026-11-09) says which line answers which question. It writes nothing into the game and changes no draw.
+// ("Rig probe", 2026-11-09) says which line answers which question. It writes nothing into the game. Since 2026-11-10 ("Rig seed") its own
+// slots also seed the layer's own mask (hullRigProbeOwnSlots), so it is load-bearing while the layer is on, not only a diagnostic.
 //
 // LOG LINES (all "hull layer: rig_probe ..."):
 //   rig_probe armed / rig_probe off                 the probe's state follows diag.hull_layer
@@ -14,6 +15,7 @@
 
 #include <windows.h>
 #include <d3d11.h>
+#include <intrin.h>
 
 #include <algorithm>
 #include <cstdio>
@@ -735,6 +737,32 @@ void hullRigProbeAtSeed(ID3D11DeviceContext* ctx, ID3D11Device* device, uint32_t
         return;
     }
     if (!dump) g_due = false;
+}
+
+uint32_t hullRigProbeOwnSlots(const void* gamePool, uint32_t firstSlot, uint32_t records, uint32_t* out, uint32_t cap, uint32_t* gen) {
+    if (gen) *gen = g_vehicleRigOwn.gen.load(std::memory_order_acquire);
+    if (!g_on.load(std::memory_order_relaxed) || !gamePool || !out || !cap || !records) return 0;
+    if (!(g_vehicleRigOwn.hi[0].load(std::memory_order_acquire) | g_vehicleRigOwn.hi[1].load(std::memory_order_acquire))) return 0;   // no own rig (on foot)
+    std::lock_guard<std::mutex> lock(g_mutex);
+    for (const Pool& q : g_pools) {
+        if (q.buffer != gamePool) continue;
+        if (firstSlot >= q.slots) return 0;
+        const uint32_t end = firstSlot + std::min(records, q.slots - firstSlot);
+        uint32_t n = 0;
+        // Word by word: the set bits only (a few dozen of a few thousand slots).
+        for (uint32_t w = firstSlot >> 6; w <= (end - 1) >> 6 && n < cap; ++w) {
+            uint64_t bits = q.own[w];
+            while (bits && n < cap) {
+                unsigned long b = 0;
+                _BitScanForward64(&b, bits);
+                bits &= bits - 1;
+                const uint32_t slot = (w << 6) + static_cast<uint32_t>(b);
+                if (slot >= firstSlot && slot < end) out[n++] = slot - firstSlot;
+            }
+        }
+        return n;
+    }
+    return 0;
 }
 
 void hullRigProbeFrameEnd(ID3D11DeviceContext* ctx, uint32_t hullFrame) {

@@ -7,7 +7,9 @@
 //   1. The seed: the eye's first hull-family G-buffer draw (VS 66DE, 61AE, AACF, DE54) after the cockpit shell (VS
 //      BFE5) into the same eye depth. Its instance window (the stride-8 instance stream, record index first) and the
 //      pool (VS t33, 336-byte records, position at bytes 16-27) are copied, and one compute dispatch marks every pool
-//      record within 120 m of the seed records' centroid in the eye's own mask (one uint a record). The mask's count
+//      record within 120 m of the seed records' centroid in the eye's own mask (one uint a record). Since the rig seed
+//      (2026-11-10, docs "Rig seed") the seed records are the rig probe's own slots this frame (hull_rig_probe.h) and the
+//      radius their reach plus 30 m (at most 120 m); the draw's instance window only when the pool holds no own slot. The mask's count
 //      is read back a few frames later, never with a stall. Needs engine motion's patched shaders (part of fix.temporal_aa):
 //      without the slot target at MRT6 on the seed draw the eye-frame does nothing (no-slot-target).
 //   2. The private G-buffer: from the seed until the eye's G-buffer ends (its depth copy DEF19B03/CB95394B, or the next
