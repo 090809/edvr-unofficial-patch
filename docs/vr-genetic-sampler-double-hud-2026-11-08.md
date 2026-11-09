@@ -2,58 +2,63 @@
 
 ## Status
 
-- **State: OPEN, two parts.** Issue #200. A user on v0.22.0-rc.7 (VR, native
-  on foot) reported "Double vision hud when using genetic scanner". Sean
-  reproduced it on Frontier on 2026-11-08 and also found the sampler's pose
-  wrong.
-- **The double is the right eye's UI layer, with the sampler only.** In eye
-  dump `132928432001` (sampler in SAMPLE MODE), R00 had its composite skipped
-  and shows the whole HUD where the game drew it. R01 to R15, composited, show
-  the bright HUD (radar, suit energy, the ring) (+607, +69) native px away,
-  about 17 deg, with only the HUD's dark backing left at the right place. The
-  left eye is right. 30 earlier dumps with other items agree within 5 px.
-- **Its shape:** each eye's composited HUD lands outward of the game's (the
-  right eye's to the right, the left eye's to the left), by a size that varies:
-  607 px, then 288 and 126 (native, right eye). `marker_bound` in
-  decisions.json is [3, 0] in R00 (right) and [3, 3] from R01 (displaced).
-- **The left arm, two flights.** The two-hand detector acquires within
-  kOffHandMaxM (40 cm), and the sampler's resting left hand sits at 40.0 cm,
-  so it flapped (elbow 28 cm over the hand). ea13030c vetoed it (flown OK: the
-  left arm wrote on 26 of 7131 calls), but the left hand also takes the
-  canister out after the third sample (18 to 26 cm), and that came out with no
-  hand. The build after it gives the sampler its own limits instead: acquire
-  within 32 cm, release past 35 (`offHandLimits`). Not flown.
+- **State: the double's cause FOUND, fix F227 built, NOT FLOWN; the left arm
+  FLOWN OK.** Issue #200. A user on v0.22.0-rc.7 (VR, native on foot)
+  reported "Double vision hud when using genetic scanner". Sean reproduced it
+  on Frontier on 2026-11-08 in three flights.
+- **The double: the marker fix's held match.** The on-foot marker fix (F63)
+  holds a key's match for 90 frames and names the held draw by its place
+  among the eye's marker composite draws, nothing else. In a frame with no
+  find of the key, its fallback took the key's newest P (up to 90 frames old)
+  with the held record as that frame's Unmap wrote it. On the sampler the
+  key was the reticle (indicator type 1001). Its old P failed F85c's
+  aim-line gate, so each eye moved by the parallax of a point about 0.19 m
+  away, and the draw at the held place carried the whole bright HUD.
+- **The evidence.** In all three Frontier logs of the day, every second whose
+  patches came only from the fallback moved by 0.15 to 0.38 NDC. Fresh
+  matches moved under 0.1. The three doubled dumps (`132928432001` right eye,
+  `143515440001` both, `191457062004` left) match their eye's fallback move
+  to within a few px. An eye whose move passed the 0.40 NDC gate was refused
+  and stayed right, which is why the doubled eye changed between flights.
+- **F227:** a held match with no find takes no P, and the draw stays where the
+  game placed it. The fallback's state (`g_keyP`, the held record's `x0Now`)
+  is gone. The F63 line counts these frames: `no find of the key, left as the
+  game placed it (F227) N`. Cost: in a held frame of a healthy marker the
+  game's placement shows for that frame (healthy fallback moves were under
+  0.03 NDC).
+- **Still open, not seen to matter:** when the held record does have a find,
+  the hold still names its draw by place alone. A place shift would then
+  patch another draw with the key's own small move.
+- **The left arm: FLOWN OK** (24b03a15). The sampler's own two-hand limits
+  (acquire 32 cm, release 35): the hand takes the canister after the third
+  sample (`185655158001`; Sean: "works well now") and rests otherwise.
 - **Held higher: the game's pose.** At level aim the game holds the sampler
   3.6 cm higher and 5.4 cm nearer its camera than the Profile Analyser, and
   EDVR adds the same offsets to both. A per-item correction is Sean's call.
+- **Not this arc:** the blue highlight on sampled plants blurs
+  (`190859367003`, from the cockpit). DLSS's input already draws it as a
+  noisy, scan-lined pattern, and DLSS smears it. It is the DLSS-blurred
+  translucent-effect class, and its draw is not named.
 - **Environment (Sean):** Frontier, game build 334925, OpenXR, DLSS at
   2016x2017 into 4032x4034, world scale 110%. Reporter: SteamVR lighthouse,
   RTX 4080, DLSS K.
 
-**Open hypotheses** for the double, with the A/B that splits them:
-
-- H7: a per-draw constant patch bound only on layered draws (the marker
-  fix's private b0, which F85b also binds through) is applied to the HUD
-  canvas draw in the right eye with the wrong camera. Confirmed if the double
-  goes with `fix.native_on_foot_marker_fix = off` (live; it stands down F85b's
-  binds too).
-- H8: the layer's own take of the HUD places the right eye's draws wrong
-  without any patch. Confirmed if the double survives H7's switch and goes
-  with `fix.ui_quality = off` (live), which leaves the HUD in the game's
-  frame.
+**Hypotheses:** H7 (a marker-fix patch) holds, through the hold's fallback
+rather than a fresh match. H8 (the layer's own take) is ruled out: the
+doubled eye's displacement equals the logged patch move.
 
 **Ruled out** (evidence in the journal): one unpinned tool part, true stereo
 at close range, a DLSS ghost of one overlay, a world marker missing the fix,
 a second unplaced HUD (frame 0 shows one HUD), the layer's eye table (0
 SWAPPED, 0 untold), aim-space reprojection (head 4.6 deg from the aim), the
-viewport remap, the marker fix's logged move (+0.00003 NDC), the label
-features (F95b, F97b, F98b), and F151's place bind (0 bound by place).
+viewport remap, the label features (F95b, F97b, F98b), and F151's place bind
+(0 bound by place). The marker fix's "logged move" was wrongly ruled out from
+a second eight seconds before the dump.
 
-**Next flight** (the limits build): native on foot, detail log on. Take three
-samples: the left hand should take the canister out, and rest otherwise (the
-F69h line: `decision two-handed` only around the canister). When the HUD
-doubles, take an eye dump, set the marker fix off and dump again, then UI
-quality off and dump again, then put both back.
+**Next flight** (F227): native on foot with the sampler. Take samples and
+walk up to exobio sites. The HUD stays single, and the reticle does not pop.
+In the log, around sampling the F63 line's F227 count is non-zero, and
+F66f's `t` stays under about 0.05 NDC in both eyes.
 
 ## Journal
 
@@ -238,3 +243,71 @@ The readout in `143543183003`'s overviews looks vertically apart between the
 eyes (about 60 overview px). R00 is a composite-skipped frame, so its readout
 is the game's unpinned one. This is not evidence until a composited pair is
 compared, and the readout lies outside the dump's centre crops.
+
+### 2026-11-08, third flight (24b03a15): the canister, and the double's cause
+
+Log `edvr_gfx_20261108_185348` (v0.22.0-rc.7-242-g24b03a15, build matched).
+Five dumps: `185655158001` (the canister), `185705703002` (after the third
+sample), `190859367003` (the cockpit, blue highlight), `191457062004` (the
+double, sampling) and `191503761005` (its companion, single).
+
+The canister: `185655158001` shows the left hand holding it. Sean: "The
+canister animation works well now".
+
+The double: `191457062004` has it in the left eye only, the bright HUD (+75,
+-147) overview px (900 a side) from its dark backing. The right eye is
+single. `marker_bound` is [2, 1].
+
+The marker fix's lines at 19:14:57 give the cause. Eye 0: 50 of 70
+decisions patched, 49 by a held match, 48 of those with P and X0 from the
+hold's fallback, `t` (+0.167, +0.326) NDC. That is (+75, -147) at 450 px per
+NDC unit: the dump's displacement. Eye 1: 48 refused for `|d| over 0.40 NDC`,
+3 patched, `t` (-0.008, +0.009). At 19:15:00 and 19:15:01 eye 0 is patched
+only from the fallback, (+0.16, +0.33) and (+0.15, +0.31); eye 1 is refused.
+The key is 10, the reticle (`indicators (F92c): type 1001 [keys 10]`). Its
+draw place flipped 1 -> 2 -> 1 at 19:14:48 as the sampler's HUD changed. The
+F47 line at 19:14:57 puts the key's P 78.6 deg from where the marker rows put
+it.
+
+The two earlier doubles fit the same rule:
+
+- `132928432001` (13:29:28, right eye, +607 native px): eye 1 at 13:29:29
+  moved +0.150 NDC as a mean over 46 draws, 23 of them from the fallback,
+  about 0.30 each = 605 px. Eye 0's fallback moved under 0.001. At 13:29:28
+  the reticle indicator (key 13 that flight) was updated twice, then not at
+  all.
+- `143515440001` (14:35:15, both eyes outward): eye 0 (-0.144, +0.022) and eye
+  1 (+0.102, +0.022) over 61 draws, 43 from the fallback, about -0.20 and
+  +0.145 each, = -103 overview px (1008 a side) and +292 native px. Measured:
+  105 and 288.
+
+A tally over the three logs (F63 and F66f lines, per eye-second): seconds
+with any fallback 20, 10 and 40; every one patched only from the fallback
+moved 0.15 to 0.38 NDC. Fallback frames mixed into many fresh finds moved
+under 0.03. The eyes' moves differ by about 0.35 NDC in x and agree in y,
+the parallax of a point about 0.19 m away, the HUD's own distance (`HUD
+placement ... distance 0.190 m`).
+
+Code (a read-only trace): a hold names its draw by `ke.hold.ord !=
+r.ordEye` alone, the place among all the eye's marker composite draws, and
+the CPU identification can contradict it only when the draw's stream entry
+was read. The fallback paired `g_keyP` (the key's newest P, up to 90 frames
+old) with `x0Now`, the held record index read at this frame's Unmap without
+a tag check. For the reticle F85c then replaces P with the aim line's hit
+only when P lies within 0.2 deg of the aim line, which an old P does not.
+
+- retracted: "ruled out: the on-foot marker fix moving the HUD", because that
+  line was 13:29:20, eight seconds before the dump. At 13:29:28 and 29 the
+  right eye's fallback patches carried about 0.30 NDC.
+- ruled out: H8 (the layer's own take of the HUD), because each doubled
+  eye's displacement equals that eye's logged fallback move.
+
+F227 removes the fallback: a held match with no find of its key takes no P,
+and the draw is left as the game placed it.
+
+The blue highlight (`190859367003`, eye 0, output x 1800 to 2400, y 1650 to
+2050): C00, DLSS's input, draws the highlight as a noisy pattern with
+horizontal scan lines; P00, DLSS's output before the UI, smears it into
+horizontal streaks; T00 and the final image match P00. EDVR adds nothing
+after DLSS there. The blur is made by DLSS from that input, the class of
+docs' DLSS-blurred translucent effects; this flight did not name the draw.

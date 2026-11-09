@@ -646,6 +646,11 @@ inline void run182(Check&& check) {
                   core.find("bool keepNow = staleOnly && !ok && attached && allowTwoHand;") != std::string::npos && core.find("if (!allowTwoHand || (!ok && !keepNow)) clearHistory();") != std::string::npos &&
                   core.find("        if (keepNow) {\n            o.kept = true;") != std::string::npos && core.find("} else if (!o.ok || !allowTwoHand || !closeEnough) {") != std::string::npos,
               "F182c: OffHand::step keeps an attached decision and its history through a stale-only input (up to 3 s), and releases for every other unreadable input, a pair past the item's release limit (40 cm but for the sampler's 35) or the one-hand policy as before");
+        // F227 (issue 200): a held marker match with no find of its key is left as the game placed it. The hold names its draw by place alone, and
+        // its fallback (the key's newest P, up to 90 frames old, with the held record as this Unmap wrote it) moved the whole HUD in one eye.
+        check(has("    } else if (!cpuFind) {\n        ++s.heldNoFind;   // F227\n    }") && has("(no find of the key, left as the game placed it (F227) %llu)") &&
+                  !has("g_keyP") && !has("x0Now") && !has("heldPX0"),
+              "F227: a held marker match with no find of its key takes no P (no key's newest P, no held record read at the Unmap), and the F63 line counts it");
     }
 }
 
