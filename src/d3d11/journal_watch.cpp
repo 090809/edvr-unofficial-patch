@@ -4,6 +4,7 @@
 
 #include <windows.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstring>
 #include <memory>
@@ -303,6 +304,9 @@ struct Session {
     loadout::Reader loadoutReader;   // F140: the worker's own
     // Issue 140: which SRV the player is in, read from the bytes the tail reads (journal_vehicle_latch.h). The worker's own, reset with the file.
     journal_vehicle::Latch vehicle;
+    // The station's type (journal_station.h), from the same bytes. The worker's own; the file it is saved to is read once, before the first byte.
+    journal_station::Latch station;
+    bool stationLoaded = false;
     // The flat profile's GuiFocus note (pollStatus): the last value noted, and how many notes were written (capped).
     bool         guiNoted = false;
     bool         guiNotedPresent = false;
@@ -359,6 +363,106 @@ void noteVehicle(Session& s, bool scorpion, journal_vehicle::Event cause) {
     Log::get().note("srv turret: the vehicle is %s (event %s)", scorpion ? "the Scorpion" : "not the Scorpion", journal_vehicle::eventName(cause));
 }
 
+std::atomic<uint8_t> g_stationKind{0};   // journal_station::Kind, for journalStationKind on the Present thread
+std::atomic<uint32_t> g_carrierJumps{0}; // the latch's CarrierJump count, for journalCarrierJumps
+
+// %LOCALAPPDATA%\EDVR\last-station.txt: the type of the last station the journal named and a hash of its name, so that a load on foot, which names neither, can be told it.
+std::wstring stationFilePath() {
+    wchar_t appdata[MAX_PATH] = {};
+    const DWORD n = GetEnvironmentVariableW(L"LOCALAPPDATA", appdata, MAX_PATH);
+    if (n == 0 || n >= MAX_PATH) return std::wstring();
+    return std::wstring(appdata) + L"\\EDVR\\last-station.txt";
+}
+
+void stationLoad(Session& s) {
+    const std::wstring path = stationFilePath();
+    if (path.empty()) return;
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return;
+    char text[128] = {};
+    DWORD got = 0;
+    const BOOL ok = ReadFile(h, text, sizeof(text) - 1, &got, nullptr);
+    CloseHandle(h);
+    journal_station::Saved saved;
+    if (ok && journal_station::parseSaved(text, &saved)) {
+        s.station.restore(saved);
+        Log::get().note("journal: the last station saved is of type %s", journal_station::kindName(saved.kind));
+    }
+}
+
+// Whole or not at all: a new file, then a replace. A failure is said once, and only costs a load on foot its type.
+void stationSave(const Session& s) {
+    static bool saidFailure = false;
+    const std::wstring path = stationFilePath();
+    if (path.empty()) return;
+    const std::wstring dir = path.substr(0, path.find_last_of(L'\\'));
+    CreateDirectoryW(dir.c_str(), nullptr);
+    const std::wstring temp = path + L".new";
+    char text[128] = {};
+    const int len = journal_station::formatSaved(s.station.saved(), text, sizeof(text));
+    bool ok = false;
+    HANDLE h = CreateFileW(temp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h != INVALID_HANDLE_VALUE) {
+        DWORD wrote = 0;
+        ok = len > 0 && WriteFile(h, text, static_cast<DWORD>(len), &wrote, nullptr) && wrote == static_cast<DWORD>(len);
+        CloseHandle(h);
+        ok = ok && MoveFileExW(temp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING);
+    }
+    if (!ok && !saidFailure) {
+        saidFailure = true;
+        Log::get().note("journal: the last station could not be saved (error %lu): a load on foot will not know its type", GetLastError());
+    }
+}
+
+void noteStationKind(journal_station::Kind k) {
+    g_stationKind.store(static_cast<uint8_t>(k), std::memory_order_relaxed);
+    Log::get().note("journal: the station's type is %s", journal_station::kindName(k));
+}
+
+// A load on foot where nothing saved says what the station is: the first flight after an install, or after playing without EDVR. The game's own older journals do, newest first, until
+// one names any station. Read on the worker, once a load. Names are hashed here as in the latch, and none is logged.
+void stationSearchJournals(Session& s, uint64_t bodyHash) {
+    constexpr size_t kFilesMax = 40;
+    constexpr uint64_t kFileBytesMax = 32ull * 1024 * 1024;
+    struct Entry {
+        uint64_t when;
+        std::wstring name;
+    };
+    std::vector<Entry> files;
+    WIN32_FIND_DATAW fd{};
+    HANDLE find = FindFirstFileW((s.dir + L"\\Journal.*.log").c_str(), &fd);
+    if (find == INVALID_HANDLE_VALUE) return;
+    do {
+        files.push_back(Entry{(static_cast<uint64_t>(fd.ftLastWriteTime.dwHighDateTime) << 32) | fd.ftLastWriteTime.dwLowDateTime, fd.cFileName});
+    } while (FindNextFileW(find, &fd));
+    FindClose(find);
+    std::sort(files.begin(), files.end(), [](const Entry& a, const Entry& b) { return a.when > b.when; });
+    std::vector<char> buf;
+    const size_t look = files.size() < kFilesMax ? files.size() : kFilesMax;
+    for (size_t i = 0; i < look; ++i) {
+        HANDLE h = CreateFileW((s.dir + L"\\" + files[i].name).c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (h == INVALID_HANDLE_VALUE) continue;
+        LARGE_INTEGER size{};
+        DWORD got = 0;
+        bool ok = false;
+        if (GetFileSizeEx(h, &size) && size.QuadPart > 0 && static_cast<uint64_t>(size.QuadPart) <= kFileBytesMax) {
+            buf.resize(static_cast<size_t>(size.QuadPart));
+            ok = ReadFile(h, buf.data(), static_cast<DWORD>(buf.size()), &got, nullptr) != 0;
+        }
+        CloseHandle(h);
+        journal_station::Saved found;
+        if (!ok || !journal_station::lastStationIn(buf.data(), got, &found)) continue;
+        if (found.nameHash == bodyHash) {
+            Log::get().note("journal: the station is named in an older journal, %zu back", i);
+            s.station.adopt(found, noteStationKind);
+        } else {
+            Log::get().note("journal: the last station named, %zu journals back, is another one: this one's type is not known", i);
+        }
+        return;
+    }
+    Log::get().note("journal: no station is named in the last %zu journals: this one's type is not known", look);
+}
+
 void closeFile(Session& s) {
     if (s.handle != INVALID_HANDLE_VALUE) {
         CloseHandle(s.handle);
@@ -369,6 +473,7 @@ void closeFile(Session& s) {
     s.loadoutReader.close();   // F140
     // Issue 140: another file is another stream, and what the last one said of the vehicle does not carry over (unknown is "not the Scorpion").
     if (s.vehicle.reset()) noteVehicle(s, false, journal_vehicle::Event::kNewJournal);
+    s.station.newFile();
 }
 
 // FILETIME is a 64-bit count in two halves; the decision below wants one
@@ -619,6 +724,14 @@ void scanEvents(Session& s, const char* data, uint32_t len) {
     scanRange(s, data, len);
     // Issue 140: the Scorpion latch reads the new bytes themselves, once (a stream: the carry and the stitched head above would feed some bytes twice).
     s.vehicle.feed(data, len, [&s](bool scorpion, journal_vehicle::Event cause) { noteVehicle(s, scorpion, cause); });
+    s.station.feed(data, len, noteStationKind);
+    if (s.station.jumps() != g_carrierJumps.load(std::memory_order_relaxed)) {
+        g_carrierJumps.store(s.station.jumps(), std::memory_order_relaxed);
+        Log::get().note("journal: CarrierJump: the commander was aboard a carrier as it jumped (%u this session)", s.station.jumps());
+    }
+    uint64_t unmatchedBody = 0;
+    if (s.station.takeUnmatched(&unmatchedBody)) stationSearchJournals(s, unmatchedBody);
+    if (s.station.takeSavedChanged()) stationSave(s);
 
     // Keep the tail as the next carry. Anything already scanned in `stitched`
     // that also sits in `data`'s head double-scans harmlessly: LoadGame and
@@ -634,6 +747,10 @@ void scanEvents(Session& s, const char* data, uint32_t len) {
 // the Present thread; it runs on the worker now and is otherwise the same code.
 // Returns false when the watcher has retired.
 bool pass(Session& s, char* buf) {
+    if (!s.stationLoaded) {
+        s.stationLoaded = true;
+        stationLoad(s);
+    }
     // dueMs, not elapsedMs: the counter this replaced started at 0 meaning
     // "poll on the first frame", and a stamp of 0 read as "never due" would
     // have retired the watcher before it ever ran -- silently, because the
@@ -1043,7 +1160,7 @@ void journalWatchConfigure() {
         // patch motion (journalFlatSupercruise). The accessors above answer flat with the no-journal values, so this line is the
         // only place the watcher says it runs there.
         Log::get().note("journal: flat profile -- Status.json is read for the map's GuiFocus (temporal AA off on the maps and the Full System Scanner) and for "
-                        "supercruise (planet patch motion). The journal's events are tailed but not used in flat.");
+                        "supercruise (planet patch motion). The journal's events are tailed for the station's type (the concourse cull's bake), and not otherwise used in flat.");
         return;
     }
     Log::get().note("journal: watching the game's own event stream for the "
@@ -1253,6 +1370,9 @@ bool journalVehicleKnown() { return journalWatchActive() && peek(g_v.vehicleKnow
 bool journalVehicle() { return !runtimeFlatProfile() && peek(g_v.vehicle); }
 uint32_t journalSeatKind() { return runtimeFlatProfile() ? 0u : peek(g_v.seatKind); }
 uint32_t journalStatusSamples() { return runtimeFlatProfile() ? 0u : peek(g_v.statusSamples); }
+
+journal_station::Kind journalStationKind() { return static_cast<journal_station::Kind>(g_stationKind.load(std::memory_order_relaxed)); }
+uint32_t journalCarrierJumps() { return g_carrierJumps.load(std::memory_order_relaxed); }
 
 JournalRawStatus journalRawStatus() {
     JournalRawStatus r;

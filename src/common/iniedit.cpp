@@ -550,7 +550,7 @@ std::string mergeIni(const std::string& next, const std::string& user, const std
             if (u.present) {
                 const std::string note = b.known
                                              ? carriedFrom + "; this version no longer uses it"
-                                             : carriedFrom + "; not an EDVR setting this version knows";
+                                             : carriedFrom + "; not an ED-UP setting this version knows";
                 appended[lower(section)].push_back(note);
                 appended[lower(section)].push_back(key + " = " + u.value);
                 (b.known ? rep.retired : rep.carried).push_back(dotted + " = " + u.value);

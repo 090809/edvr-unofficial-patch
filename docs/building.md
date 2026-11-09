@@ -1,6 +1,6 @@
-# Building EDVR
+# Building ED Unofficial Patch
 
-How to build EDVR from source, check the build without the game or a headset,
+How to build ED-UP from source, check the build without the game or a headset,
 and what the optional DLSS mode and the release package need.
 
 Building needs Visual Studio 2022 with the C++ workload, and Python with the
@@ -47,7 +47,7 @@ Visual Studio 2022, Python 3.12, and all four pinned dependencies. It invokes
 the full `build.bat --wait-lock --jobs 4`, including every test rig and the
 installer gate, then calls `package.bat`. The packages contain the exact
 version stamp checked by `package_native.py`. Each successful run uploads the
-full build receipt, installer, native DLLs, three release ZIPs, and
+full build receipt, installer, native DLLs, four release ZIPs, and
 `SHA256SUMS`. Build logs, phase timings, and failed flat pixel fixtures are
 uploaded separately even when a gate fails. The workflow does not create a
 GitHub release or use signing secrets.
@@ -211,24 +211,70 @@ Write and review release notes before creating the draft. Generate the Thanks
 section from the previous tag, then write each contributor's sentence by hand.
 Only merged PR authors are named, plus anyone the maintainer approved by name
 in `tools/release_credits_approved.json` for a commit in the release. Issue and
-log reporters get the tool's general line. Review the final notes file, then
-attach the three verified ZIPs and `SHA256SUMS` to a draft release:
+log reporters get the tool's general line. Review the final notes file.
+
+Besides the four ZIPs, the package artifact carries the split assets the
+launcher updates from: `ed-up-core-<version>.zip`, an `ed-up-dlss-<hash>.zip`
+and an `ed-up-xess-<hash>.zip` when the build has those runtimes,
+`ed-up-launcher.exe` when the build has one, and `ed-up-manifest.json`, which
+names them all with their hashes. `SHA256SUMS` lists every one of them. The
+workflow never signs. Sign the manifest in your own terminal, because
+`sign_manifest.py` refuses to run anywhere else, and it reads the private key
+from a hidden prompt or, with `--key-stdin`, from one line on stdin so your
+password manager's command line can supply it. The key is never kept in a
+repository or in a session. The signing tool only signs with a key whose public
+half is listed in `src/installer/update_keys.h`. Check the folder before
+attaching anything; the check exits 0 only when the signature, the schema and
+the size and hash of every asset and every file inside the zips all pass:
+
+```powershell
+python tools/sign_manifest.py sign "edvr-artifacts/$runId/ed-up-manifest.json"
+if ($LASTEXITCODE -ne 0) { throw 'Signing the manifest failed' }
+python tools/sign_manifest.py verify "edvr-artifacts/$runId"
+if ($LASTEXITCODE -ne 0) { throw 'The signed release folder did not verify' }
+```
+
+Then attach the four verified ZIPs (the fourth, `ed-up-launcher-linux-<version>.zip`,
+is a convenience package outside the signed manifest), the split assets, the manifest with its
+`.sig`, and `SHA256SUMS` to a draft release. A release with no `.sig` is simply
+not offered to the launcher as an update:
 
 ```powershell
 python tools/release_credits.py --from vPREVIOUS --to "v$version" --thanks --out thanks.md
 if ($LASTEXITCODE -ne 0) { throw 'Review release credits before continuing' }
 # Edit release-notes.md and include the reviewed ## Thanks section from thanks.md.
+$folder = "edvr-artifacts/$runId"
 $assets = @(
-    "edvr-artifacts/$runId/edvr-$version.zip"
-    "edvr-artifacts/$runId/edvr-installer-$version.zip"
-    "edvr-artifacts/$runId/edvr-installer-linux-$version.zip"
-    "edvr-artifacts/$runId/SHA256SUMS"
+    "$folder/ed-up-$version.zip"
+    "$folder/ed-up-installer-$version.zip"
+    "$folder/ed-up-installer-linux-$version.zip"
+    "$folder/ed-up-launcher-linux-$version.zip"
+    "$folder/ed-up-manifest.json"
+    "$folder/ed-up-manifest.json.sig"
+    "$folder/SHA256SUMS"
 )
-gh release create "v$version" @assets --draft --verify-tag --notes-file release-notes.md
+$assets += Get-ChildItem "$folder/ed-up-core-$version.zip", "$folder/ed-up-dlss-*.zip", "$folder/ed-up-xess-*.zip", "$folder/ed-up-launcher.exe" -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName }
+gh release create "v$version" @assets --draft --verify-tag --title "ED Unofficial Patch $version" --notes-file release-notes.md
 if ($LASTEXITCODE -ne 0) { throw 'Draft release creation failed' }
 ```
 
 For a prerelease tag, add `--prerelease` to `gh release create` as well.
+
+On native Windows, where `package.bat <version>` packages the release without
+Actions, the same assets land in `dist\`. `package.bat` prints the signing
+command when it finishes. Run `python tools\sign_manifest.py sign
+dist\ed-up-manifest.json` and then `python tools\sign_manifest.py verify dist`,
+and attach the files from `dist\` the same way. `package_native.py` writes the
+split zips with fixed timestamps and file order, so packaging twice gives the
+same bytes, and it removes older `ed-up-dlss-*.zip` and `ed-up-xess-*.zip` from
+`dist\` when a runtime's contents change.
+
+Build every release by the same route. `ed-up-launcher.exe` is the same bytes
+from two builds on one machine, but a CI build and a local build differ, and an
+installed launcher replaces itself when the digest changes. Replacing an asset on
+a published release also takes a few minutes to reach everyone: the API lists the
+new digest at once while GitHub's download cache can still serve the old file. The
+launcher skips its check while the two disagree and looks again on its next start.
 
 The draft is the review point before publication. A failed build has no package
 artifact and should never be used for a release.
@@ -242,7 +288,7 @@ python tools\fetch_ngx.py
 ```
 
 fetches one pinned commit of NVIDIA's public SDK repository into
-`%LOCALAPPDATA%\EDVR\ngx-sdk` and checks the runtime's hash against the pin in
+`%LOCALAPPDATA%\ED-UP\ngx-sdk` and checks the runtime's hash against the pin in
 the script. `EDVR_NGX_SDK` points the build at a copy somewhere else.
 
 Generating the installer's resources needs the native pair and the bundled

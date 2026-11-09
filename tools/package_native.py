@@ -15,15 +15,19 @@ release's tag and a binary with no version stamp are refused as mismatches.
 """
 import argparse
 import hashlib
+import io
+import json
 import os
 import re
 import shutil
 import struct
 import subprocess
 import tempfile
+import time
 import zipfile
 from pathlib import Path
 
+import sign_manifest
 from gen_installer_rc import descriptor_bytes
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -35,7 +39,44 @@ STAMPED = ("d3d11.dll", "openvr/openvr_api.dll", "edvr-installer.exe")
 INSTALLER = "edvr-installer.exe"
 LINUX_WRAPPER = "edvr-installer-linux.py"
 LINUX_LAUNCHER = "edvr_installer.sh"
+# The launcher's Linux package: the same launcher exe the Windows release publishes, run inside Elite's
+# Proton prefix by the installer wrapper's --launcher mode. A convenience package, not in the signed manifest.
+LAUNCHER_LINUX_WRAPPER = "ed-up-launcher-linux.py"
+LAUNCHER_LINUX_SH = "ed-up-launcher.sh"
+LAUNCHER_LINUX_README = "README-launcher-linux.txt"
+UNIX_EXECUTABLE = (LINUX_WRAPPER, LINUX_LAUNCHER, LAUNCHER_LINUX_WRAPPER, LAUNCHER_LINUX_SH)
 STAMP_KEYS = ("FileVersion", "ProductVersion")
+
+# The split assets published beside the three archives (docs\design-launcher,
+# "Updates"). The core zip carries the files that change every release; DLSS and
+# XeSS go in zips named by a hash of their contents, so an unchanged runtime keeps
+# its asset name from release to release.
+MIN_LAUNCHER = "0.1.0"
+MANIFEST = sign_manifest.MANIFEST_NAME
+LAUNCHER_ASSET = "ed-up-launcher.exe"
+LAUNCHER_VERSION_HEADER = ("src", "installer", "launcher_version.h")
+# The licence of the code direct launch is ported from (min-ed-launcher, MIT). The launcher exe carries it
+# as RCDATA 120 and prints it with --licenses; the core zip carries it as MIN-ED-LAUNCHER-LICENSE.txt.
+LAUNCHER_LICENSE_FILE = ("third_party", "min_ed_launcher", "LICENSE")
+LAUNCHER_LICENSE_NAME = "MIN-ED-LAUNCHER-LICENSE.txt"
+LAUNCHER_LICENSE_RESOURCE = 120
+KEYS_HEADER = ("src", "installer", "update_keys.h")
+CORE_NAMES = ("d3d11.dll", "openvr/openvr_api.dll", "openvr/openxr_loader.dll",
+              "openvr/OPENXR-LOADER-LICENSE.txt", "edvr.ini", "edvr-flat.ini", "edvr_profile.ini",
+              "LICENSE.txt", "DXBC-HASH-LICENSE.txt", "FIDELITYFX-SDK-DX11-LICENSE.txt",
+              "MIN-ED-LAUNCHER-LICENSE.txt")
+DLSS_NAMES = ("nvngx_dlss.dll", "NVIDIA-DLSS-LICENSE.txt")
+XESS_NAMES = ("libxess.dll", "INTEL-XESS-LICENSE.txt", "INTEL-XESS-THIRD-PARTY.txt")
+# Manifest item -> path in the zips. A licence file not listed here ships in its
+# zip but has no entry in the manifest's files.
+ITEM_PATHS = (("native_graphics", "d3d11.dll"), ("native_runtime", "openvr/openvr_api.dll"),
+              ("ini", "edvr.ini"), ("flat_ini", "edvr-flat.ini"), ("profile", "edvr_profile.ini"),
+              ("openxr_loader", "openvr/openxr_loader.dll"),
+              ("openxr_license", "openvr/OPENXR-LOADER-LICENSE.txt"),
+              ("ngx", "nvngx_dlss.dll"), ("xess", "libxess.dll"),
+              ("xess_license", "INTEL-XESS-LICENSE.txt"),
+              ("xess_third_party", "INTEL-XESS-THIRD-PARTY.txt"))
+SPLIT_PATTERNS = ("ed-up-dlss-*.zip", "ed-up-xess-*.zip")
 
 
 def _version(value):
@@ -79,6 +120,7 @@ def _files(root, no_dlss):
                    (build / "edvr-flat.ini", "edvr-flat.ini"),
                    (root / "LICENSE", "LICENSE.txt")])
     result.append((root / "third_party" / "dxbc_hash" / "LICENSE.TXT", "DXBC-HASH-LICENSE.txt"))
+    result.append((root.joinpath(*LAUNCHER_LICENSE_FILE), LAUNCHER_LICENSE_NAME))
     # AMD's FSR3 D3D11 port (MIT). Unlike NVIDIA's runtime it ships no DLL --
     # it is statically linked into d3d11.dll -- so its presence in a build is
     # exactly this notice, which build.bat copies beside the binaries when it
@@ -208,9 +250,10 @@ def _embedded_resource(executable, resource_id, required=True):
         resource = kernel.FindResourceW(handle, resource_id, 10)
         if not resource:
             error = ctypes.get_last_error()
-            # Mandatory RCDATA is checked first; only an absent named resource
-            # is an expected result when probing the optional DLSS payload.
-            if not required and error == 1814:  # ERROR_RESOURCE_NAME_NOT_FOUND
+            # Mandatory RCDATA is checked first; only an absent resource is an
+            # expected result when probing the optional DLSS payload, or an exe
+            # that carries no RCDATA at all (the launcher).
+            if not required and error in (1813, 1814):  # ERROR_RESOURCE_TYPE_NOT_FOUND, ..._NAME_NOT_FOUND
                 return None
             raise ValueError("installer resource %d is missing (Windows error %d)" %
                              (resource_id, error))
@@ -254,7 +297,7 @@ def _validate_installer_resources(executable, files):
 
 
 def _write_zip_entry(output, source, name):
-    if name in (LINUX_WRAPPER, LINUX_LAUNCHER):
+    if name in UNIX_EXECUTABLE:
         # zipfile.write inherits Windows' non-executable mode. Record the Unix
         # mode explicitly so extracted wrappers can also be run directly.
         info = zipfile.ZipInfo(name)
@@ -266,14 +309,146 @@ def _write_zip_entry(output, source, name):
         output.write(source, name)
 
 
+def _split_zip_bytes(members):
+    """A zip of (name, bytes) members that is the same bytes on every run: sorted
+    names, a fixed date, no platform attributes, deflate level 9."""
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as output:
+        for name, data in sorted(members):
+            info = zipfile.ZipInfo(name, (1980, 1, 1, 0, 0, 0))
+            info.compress_type = zipfile.ZIP_DEFLATED
+            info.create_system = 0
+            info.external_attr = 0
+            output.writestr(info, data, compresslevel=9)
+    return buffer.getvalue()
+
+
+def _content_asset_name(prefix, members):
+    """prefix-<16 hex>.zip: the hash is taken over the sorted lines
+    name, NUL, sha256 of the file, newline."""
+    lines = b"".join(name.encode("ascii") + b"\0" + hashlib.sha256(data).hexdigest().encode("ascii") + b"\n"
+                     for name, data in sorted(members))
+    return "%s-%s.zip" % (prefix, hashlib.sha256(lines).hexdigest()[:16])
+
+
+def _launcher_version(root):
+    """The version string in src\\installer\\launcher_version.h: the first quoted
+    x.y.z in the file."""
+    text = root.joinpath(*LAUNCHER_VERSION_HEADER).read_text(encoding="utf-8")
+    found = re.search(r'"([0-9]+\.[0-9]+\.[0-9]+(?:[-+][A-Za-z0-9.-]+)?)"', text)
+    if not found:
+        raise ValueError("no launcher version string in " + "\\".join(LAUNCHER_VERSION_HEADER))
+    return found.group(1)
+
+
+def _validate_launcher(root):
+    """Refuse (ValueError) a release whose launcher is not one. The launcher is an asset like
+    the others, but it is also what installed copies replace themselves with, so a bad one is
+    worse than a missing one:
+
+      * build\\ed-up-launcher.exe exists (build.bat writes it);
+      * its FileVersion and ProductVersion are exactly src\\installer\\launcher_version.h's;
+      * it carries none of the installer's payload resources, 101 to 111, and carries the min-ed-launcher
+        licence as resource 120, byte for byte the file in third_party;
+      * src\\installer\\update_keys.h lists two distinct keys, and neither is the public test key
+        of RFC 6979, whose private half is in every library's tests."""
+    launcher = root / "build" / LAUNCHER_ASSET
+    if not launcher.is_file():
+        raise ValueError("build\\%s is missing: build.bat writes it, and a release without a launcher "
+                         "leaves installed copies with nothing to update to" % LAUNCHER_ASSET)
+    version = _launcher_version(root)
+    stamp = _stamped_versions(launcher) or {}
+    problems = []
+    for key in STAMP_KEYS:
+        if stamp.get(key) != version:
+            problems.append("%s %s is %s, but launcher_version.h says %s" % (LAUNCHER_ASSET, key, stamp.get(key), version))
+    for resource_id in range(101, 112):
+        if _embedded_resource(launcher, resource_id, required=False) is not None:
+            problems.append("%s carries resource %d: the launcher has no embedded payload" % (LAUNCHER_ASSET, resource_id))
+    licence = _embedded_resource(launcher, LAUNCHER_LICENSE_RESOURCE, required=False)
+    licence_file = root.joinpath(*LAUNCHER_LICENSE_FILE)
+    if licence is None:
+        problems.append("%s does not carry resource %d, the min-ed-launcher licence" % (LAUNCHER_ASSET, LAUNCHER_LICENSE_RESOURCE))
+    elif not licence_file.is_file() or licence != licence_file.read_bytes():
+        problems.append("%s resource %d differs from %s" % (LAUNCHER_ASSET, LAUNCHER_LICENSE_RESOURCE, "/".join(LAUNCHER_LICENSE_FILE)))
+    keys = sign_manifest.header_keys(root.joinpath(*KEYS_HEADER))
+    if len(keys) != 2:
+        problems.append("update_keys.h lists %d keys; a release needs the main key and the recovery key" % len(keys))
+    if len(set(keys)) != len(keys):
+        problems.append("update_keys.h lists the same key twice")
+    if bytes.fromhex(sign_manifest.RFC_PUBLIC) in keys:
+        problems.append("update_keys.h lists the public test key, so anyone could sign an update")
+    if problems:
+        raise ValueError("the launcher cannot be released:\n  " + "\n  ".join(problems))
+
+
+def _split_outputs(root, version, files):
+    """The split assets and the unsigned manifest as [(file name, bytes)], all in
+    memory so a dry run builds and checks them and writes nothing. The launcher
+    exe, build\\ed-up-launcher.exe, is required (_validate_launcher)."""
+    present = {name: source for source, name in files}
+    data = {name: present[name].read_bytes() for name in CORE_NAMES + DLSS_NAMES + XESS_NAMES
+            if name in present}
+    groups = [("ed-up-core-%s.zip" % version, [name for name in CORE_NAMES if name in data])]
+    if DLSS_NAMES[0] in data:
+        groups.append(("ed-up-dlss", [name for name in DLSS_NAMES if name in data]))
+    if XESS_NAMES[0] in data:
+        groups.append(("ed-up-xess", [name for name in XESS_NAMES if name in data]))
+    outputs, assets, held = [], [], {}
+    for name, members in groups:
+        pairs = [(member, data[member]) for member in members]
+        if not name.endswith(".zip"):
+            name = _content_asset_name(name, pairs)
+        blob = _split_zip_bytes(pairs)
+        outputs.append((name, blob))
+        assets.append({"name": name, "sha256": hashlib.sha256(blob).hexdigest(), "size": len(blob)})
+        held.update((member, name) for member in members)
+    stamp = _stamped_versions(present["d3d11.dll"]) or {}
+    if not stamp.get("FileVersion"):
+        raise ValueError("d3d11.dll carries no FileVersion for the manifest's build")
+    manifest = {"schema": 1, "version": version, "build": stamp["FileVersion"], "tag": "v" + version,
+                "issued": int(os.environ["SOURCE_DATE_EPOCH"]) if os.environ.get("SOURCE_DATE_EPOCH")
+                else int(time.time()),
+                "min_launcher": MIN_LAUNCHER}
+    launcher = root / "build" / LAUNCHER_ASSET
+    if not launcher.is_file():
+        raise ValueError("build\\%s is missing" % LAUNCHER_ASSET)
+    blob = launcher.read_bytes()
+    manifest["launcher"] = {"version": _launcher_version(root), "asset": LAUNCHER_ASSET,
+                            "sha256": hashlib.sha256(blob).hexdigest(), "size": len(blob)}
+    outputs.append((LAUNCHER_ASSET, blob))
+    manifest["assets"] = assets
+    manifest["files"] = [{"item": item, "path": path, "asset": held[path],
+                          "sha256": hashlib.sha256(data[path]).hexdigest(), "size": len(data[path])}
+                         for item, path in ITEM_PATHS if path in held]
+    problems = sign_manifest.validate_manifest(manifest)
+    if problems:
+        raise ValueError("the manifest is not valid:\n  " + "\n  ".join(problems))
+    outputs.append((MANIFEST, (json.dumps(manifest, indent=2, ensure_ascii=True) + "\n").encode("ascii")))
+    return outputs
+
+
+def _launcher_linux_members(root):
+    """(source, archive name) of the launcher's Linux ZIP."""
+    return [(root / "build" / LAUNCHER_ASSET, LAUNCHER_ASSET),
+            (root / "tools" / "install_proton.py", LAUNCHER_LINUX_WRAPPER),
+            (root / LAUNCHER_LINUX_SH, LAUNCHER_LINUX_SH),
+            (root / "release" / LAUNCHER_LINUX_README, LAUNCHER_LINUX_README)]
+
+
 def package(root, version, no_dlss=False, dry_run=False):
     version = _version(version); root = root.resolve()
-    dist = root / "dist"; stage = dist / (".edvr-stage-" + version); final_stage = dist / ("edvr-" + version)
-    archive = dist / ("edvr-" + version + ".zip"); temporary_archive = dist / (".edvr-" + version + ".zip.tmp")
+    dist = root / "dist"; stage = dist / (".edvr-stage-" + version); final_stage = dist / ("ed-up-" + version)
+    archive = dist / ("ed-up-" + version + ".zip"); temporary_archive = dist / (".edvr-" + version + ".zip.tmp")
     if not _inside(stage, dist) or not _inside(final_stage, dist) or not _inside(archive, dist):
         raise ValueError("resolved staging destination escapes repository dist")
     files = _files(root, no_dlss)
     missing = [str(src) for src, _ in files if not src.is_file()]
+    if missing:
+        raise ValueError("missing release payload:\n  " + "\n  ".join(missing))
+    launcher_linux = _launcher_linux_members(root)
+    # The launcher exe itself is checked, with a clearer message, by _validate_launcher below.
+    missing = [str(src) for src, name in launcher_linux if name != LAUNCHER_ASSET and not src.is_file()]
     if missing:
         raise ValueError("missing release payload:\n  " + "\n  ".join(missing))
     wrapper = (root / "tools" / "install_proton.py").read_bytes()
@@ -282,6 +457,9 @@ def package(root, version, no_dlss=False, dry_run=False):
     launcher = (root / LINUX_LAUNCHER).read_bytes()
     if not launcher.startswith(b"#!/bin/sh\n") or b"\r" in launcher:
         raise ValueError("Linux shell launcher needs a /bin/sh shebang and LF line endings")
+    launcher_sh = (root / LAUNCHER_LINUX_SH).read_bytes()
+    if not launcher_sh.startswith(b"#!/bin/sh\n") or b"\r" in launcher_sh:
+        raise ValueError("launcher Linux shell script needs a /bin/sh shebang and LF line endings")
     _check_version_stamps(version, files)
     try:
         import openxr_pe
@@ -295,22 +473,34 @@ def package(root, version, no_dlss=False, dry_run=False):
     except (ImportError, OSError, ValueError) as exc:
         raise ValueError("bundled OpenXR loader validation failed: %s" % exc)
     _validate_installer_resources(root / "build" / INSTALLER, files)
+    _validate_launcher(root)
     print("[edvr] package plan: %s" % archive)
     for _, name in files: print("       %s" % name)
-    installer_archive = dist / ("edvr-installer-" + version + ".zip")
-    linux_archive = dist / ("edvr-installer-linux-" + version + ".zip")
+    installer_archive = dist / ("ed-up-installer-" + version + ".zip")
+    linux_archive = dist / ("ed-up-installer-linux-" + version + ".zip")
     print("[edvr] installer plan: %s (%s)" % (installer_archive, INSTALLER))
     print("[edvr] Linux installer plan: %s (%s, %s, %s, README-linux.txt)" %
           (linux_archive, INSTALLER, LINUX_WRAPPER, LINUX_LAUNCHER))
+    launcher_linux_archive = dist / ("ed-up-launcher-linux-" + version + ".zip")
+    print("[edvr] Linux launcher plan: %s (%s)" % (
+        launcher_linux_archive, ", ".join(name for _, name in launcher_linux)))
+    split = _split_outputs(root, version, files)
+    for name, blob in split:
+        print("[edvr] split asset plan: %s (%d bytes)" % (dist / name, len(blob)))
     if dry_run:
         print("[edvr] dry run: wrote nothing."); return 0
     dist.mkdir(parents=True, exist_ok=True)
     if stage.exists(): shutil.rmtree(stage)
     temporary_installer_archive = dist / (".edvr-installer-" + version + ".zip.tmp")
     temporary_linux_archive = dist / (".edvr-installer-linux-" + version + ".zip.tmp")
-    for temporary in (temporary_archive, temporary_installer_archive, temporary_linux_archive):
+    temporary_launcher_linux = dist / (".edvr-launcher-linux-" + version + ".zip.tmp")
+    split_temporaries = [dist / (".edvr-" + name + ".tmp") for name, _ in split]
+    for temporary in (temporary_archive, temporary_installer_archive, temporary_linux_archive,
+                      temporary_launcher_linux, *split_temporaries):
         if temporary.exists(): temporary.unlink()
     try:
+        for (_, blob), temporary in zip(split, split_temporaries):
+            temporary.write_bytes(blob)
         for source, name in files:
             destination = stage / Path(name)
             if not _inside(destination, stage): raise ValueError("payload path traversal")
@@ -323,8 +513,12 @@ def package(root, version, no_dlss=False, dry_run=False):
         with zipfile.ZipFile(temporary_linux_archive, "w", compression=zipfile.ZIP_DEFLATED) as output:
             for name in (INSTALLER, LINUX_WRAPPER, LINUX_LAUNCHER, "README-linux.txt"):
                 _write_zip_entry(output, stage / name, name)
+        with zipfile.ZipFile(temporary_launcher_linux, "w", compression=zipfile.ZIP_DEFLATED) as output:
+            for source, name in launcher_linux:
+                _write_zip_entry(output, source, name)
     except Exception:
-        for temporary in (temporary_archive, temporary_installer_archive, temporary_linux_archive):
+        for temporary in (temporary_archive, temporary_installer_archive, temporary_linux_archive,
+                          temporary_launcher_linux, *split_temporaries):
             if temporary.exists(): temporary.unlink()
         raise
     old_stage = dist / (".edvr-old-stage-" + version)
@@ -332,9 +526,19 @@ def package(root, version, no_dlss=False, dry_run=False):
                 (temporary_installer_archive, installer_archive,
                  dist / (".edvr-old-installer-" + version + ".zip")),
                 (temporary_linux_archive, linux_archive,
-                 dist / (".edvr-old-installer-linux-" + version + ".zip")))
+                 dist / (".edvr-old-installer-linux-" + version + ".zip")),
+                (temporary_launcher_linux, launcher_linux_archive,
+                 dist / (".edvr-old-launcher-linux-" + version + ".zip")))
+    archives += tuple((temporary, dist / name, dist / (".edvr-old-" + name))
+                      for temporary, (name, _) in zip(split_temporaries, split))
+    # DLSS and XeSS zips from earlier packages are named by content, so a changed
+    # runtime leaves the old name behind; it goes in the same replace-or-roll-back.
+    new_names = {name for name, _ in split}
+    stale = sorted(path for pattern in SPLIT_PATTERNS for path in dist.glob(pattern)
+                   if path.name not in new_names)
+    stale_backups = [dist / (".edvr-old-stale-%d" % number) for number in range(len(stale))]
     if old_stage.exists(): shutil.rmtree(old_stage)
-    for _, _, backup in archives:
+    for backup in [backup for _, _, backup in archives] + stale_backups:
         if backup.exists(): backup.unlink()
     if final_stage.exists(): final_stage.replace(old_stage)
     replaced, backed_up = [], []
@@ -346,6 +550,9 @@ def package(root, version, no_dlss=False, dry_run=False):
                 backed_up.append((destination, backup))
             os.replace(temporary, destination)
             replaced.append(destination)
+        for path, backup in zip(stale, stale_backups):
+            os.replace(path, backup)
+            backed_up.append((path, backup))
     except Exception:
         if final_stage.exists(): shutil.rmtree(final_stage)
         if old_stage.exists(): old_stage.replace(final_stage)
@@ -357,9 +564,10 @@ def package(root, version, no_dlss=False, dry_run=False):
             if temporary.exists(): temporary.unlink()
         raise
     if old_stage.exists(): shutil.rmtree(old_stage)
-    for _, _, backup in archives:
+    for backup in [backup for _, _, backup in archives] + stale_backups:
         if backup.exists(): backup.unlink()
-    for written in (archive, installer_archive, linux_archive):
+    for written in (archive, installer_archive, linux_archive, launcher_linux_archive,
+                    *(dist / name for name, _ in split)):
         print("[edvr] wrote %s (%d bytes)" % (written, written.stat().st_size))
     return 0
 
@@ -417,8 +625,21 @@ def self_test():
         wrapper_source.write_bytes(b"#!/usr/bin/env python3\nprint('fixture')\n")
         launcher_source = root / LINUX_LAUNCHER
         launcher_source.write_bytes((ROOT / LINUX_LAUNCHER).read_bytes())
+        launcher_sh_source = root / LAUNCHER_LINUX_SH
+        launcher_sh_source.write_bytes((ROOT / LAUNCHER_LINUX_SH).read_bytes())
+        launcher_readme_source = root / "release" / LAUNCHER_LINUX_README
+        launcher_readme_source.write_bytes(b"launcher readme")
         vr_descriptor = b"[install]\r\nschema = 2\r\nscope = both\r\n"
         (root / "build" / "edvr_profile_vr.ini").write_bytes(vr_descriptor)
+        # The launcher: an exe, its version header and the keys header. The release's own
+        # update_keys.h is copied, so the self-test also holds the repository to two real keys.
+        (root / "build" / LAUNCHER_ASSET).write_bytes(b"launcher exe")
+        header = root.joinpath(*LAUNCHER_VERSION_HEADER)
+        header.parent.mkdir(parents=True, exist_ok=True)
+        header.write_text('inline constexpr const char* kLauncherVersion = "0.1.0";\n', encoding="ascii")
+        keys_header = root.joinpath(*KEYS_HEADER)
+        keys_header.write_bytes((ROOT.joinpath(*KEYS_HEADER)).read_bytes())
+        real_keys_text = keys_header.read_text(encoding="utf-8")
         (root / "build" / "OPENXR-LOADER-LICENSE.txt").write_bytes(b"notice")
         import openxr_pe
         old_native, old_graphics = openxr_pe.native_exports, openxr_pe.native_graphics_exports
@@ -428,7 +649,13 @@ def self_test():
         old_resource = globals()['_embedded_resource']
         resources = {101: b"payload", 102: b"payload", 103: b"payload",
                      105: b"payload", 106: b"notice", 107: vr_descriptor, 111: b"payload"}
+        # The launcher carries the min-ed-launcher licence as resource 120, the bytes of the file in third_party;
+        # a case puts a payload resource into it, or spoils the licence.
+        launcher_resources = {LAUNCHER_LICENSE_RESOURCE: root.joinpath(*LAUNCHER_LICENSE_FILE).read_bytes()}
+
         def fake_resource(executable, resource_id, required=True):
+            if Path(executable).name == LAUNCHER_ASSET:
+                return launcher_resources.get(resource_id)
             if required and resource_id not in resources:
                 raise ValueError("missing fixture resource")
             return resources.get(resource_id)
@@ -445,6 +672,8 @@ def self_test():
         def fake_stamps(path):
             if path.name in stamps["override"]:
                 return stamps["override"][path.name]
+            if path.name == LAUNCHER_ASSET:   # its own number, not the release's: launcher_version.h says 0.1.0
+                return {"FileVersion": "0.1.0", "ProductVersion": "0.1.0"}
             return stamp("v" + stamps["version"])
 
         real_package = globals()['package']
@@ -460,10 +689,10 @@ def self_test():
             try: package(root, "../escape", dry_run=True); raise AssertionError("bad version accepted")
             except ValueError: pass
             assert package(root, "1.2.3", no_dlss=True) == 0
-            with zipfile.ZipFile(root / "dist" / "edvr-installer-1.2.3.zip") as installer_archive:
+            with zipfile.ZipFile(root / "dist" / "ed-up-installer-1.2.3.zip") as installer_archive:
                 assert set(installer_archive.namelist()) == {"edvr-installer.exe"}
                 assert installer_archive.read("edvr-installer.exe") == b"payload"
-            with zipfile.ZipFile(root / "dist" / "edvr-installer-linux-1.2.3.zip") as linux_archive:
+            with zipfile.ZipFile(root / "dist" / "ed-up-installer-linux-1.2.3.zip") as linux_archive:
                 assert set(linux_archive.namelist()) == {INSTALLER, LINUX_WRAPPER, LINUX_LAUNCHER,
                                                         "README-linux.txt"}
                 assert linux_archive.read(INSTALLER) == b"payload"
@@ -479,6 +708,24 @@ def self_test():
                     linux_archive.extractall(extracted)
                     extracted_launcher = extracted / LINUX_LAUNCHER
                     extracted_launcher.chmod(mode & 0o777)
+            # The launcher's Linux ZIP: the launcher exe (the Windows asset's bytes), the wrapper's bytes, the
+            # shell script and the README, with Unix modes on the script and the wrapper only.
+            with zipfile.ZipFile(root / "dist" / "ed-up-launcher-linux-1.2.3.zip") as launcher_archive:
+                assert set(launcher_archive.namelist()) == {LAUNCHER_ASSET, LAUNCHER_LINUX_WRAPPER,
+                                                           LAUNCHER_LINUX_SH, LAUNCHER_LINUX_README}
+                assert launcher_archive.read(LAUNCHER_ASSET) == b"launcher exe"
+                assert launcher_archive.read(LAUNCHER_ASSET) == (root / "dist" / LAUNCHER_ASSET).read_bytes()
+                assert launcher_archive.read(LAUNCHER_LINUX_WRAPPER) == wrapper_source.read_bytes()
+                assert launcher_archive.read(LAUNCHER_LINUX_SH) == launcher_sh_source.read_bytes()
+                assert launcher_archive.read(LAUNCHER_LINUX_README) == b"launcher readme"
+                for name in (LAUNCHER_LINUX_WRAPPER, LAUNCHER_LINUX_SH):
+                    assert launcher_archive.getinfo(name).create_system == 3
+                    assert launcher_archive.getinfo(name).external_attr >> 16 == 0o100755
+                assert launcher_archive.getinfo(LAUNCHER_ASSET).external_attr >> 16 != 0o100755
+                if os.name != "nt":
+                    launcher_extracted = root / "launcher release with spaces"
+                    launcher_archive.extractall(launcher_extracted)
+                    (launcher_extracted / LAUNCHER_LINUX_SH).chmod(0o755)
             if os.name != "nt":
                 fake_bin = root / "fake bin"
                 fake_bin.mkdir()
@@ -516,11 +763,38 @@ def self_test():
                 result = subprocess.run([str(extracted_launcher)], cwd=elsewhere,
                                         env=dict(env, PATH=""), capture_output=True, check=False)
                 assert result.returncode != 0 and b"python3 is required" in result.stderr
-            assert not (root / "dist" / "edvr-installer-1.2.3.exe").exists()
+                # The launcher script puts --launcher before the player's own arguments.
+                launcher_script = launcher_extracted / LAUNCHER_LINUX_SH
+                launcher_wrapper = launcher_extracted / LAUNCHER_LINUX_WRAPPER
+                for args in ([], ["--dry-run", "--", "--vr", "a b"]):
+                    result = subprocess.run([str(launcher_script), *args], cwd=elsewhere, env=env,
+                                            capture_output=True, check=False)
+                    assert result.returncode == 37, result.stderr
+                    assert args_file.read_bytes().splitlines() == [
+                        str(launcher_wrapper).encode(), b"--launcher", *(arg.encode() for arg in args)]
+                launcher_source_dir = root / "launcher source with spaces"
+                (launcher_source_dir / "tools").mkdir(parents=True)
+                source_sh = launcher_source_dir / LAUNCHER_LINUX_SH
+                shutil.copy2(launcher_sh_source, source_sh)
+                source_sh.chmod(0o755)
+                shutil.copy2(wrapper_source, launcher_source_dir / "tools" / "install_proton.py")
+                result = subprocess.run([str(source_sh), "--dry-run"], cwd=elsewhere, env=env,
+                                        capture_output=True, check=False)
+                assert result.returncode == 37 and args_file.read_bytes().splitlines() == [
+                    str(launcher_source_dir / "tools" / "install_proton.py").encode(), b"--launcher", b"--dry-run"]
+                (launcher_source_dir / "tools" / "install_proton.py").unlink()
+                result = subprocess.run([str(source_sh)], cwd=elsewhere, env=env,
+                                        capture_output=True, check=False)
+                assert result.returncode != 0 and b"Python wrapper missing" in result.stderr
+                result = subprocess.run([str(launcher_script)], cwd=elsewhere,
+                                        env=dict(env, PATH=""), capture_output=True, check=False)
+                assert result.returncode != 0 and b"python3 is required" in result.stderr
+            assert not (root / "dist" / "ed-up-installer-1.2.3.exe").exists()
             artifacts = [root / "dist" / (name + "-1.2.3.zip") for name in
-                         ("edvr", "edvr-installer", "edvr-installer-linux")]
+                         ("ed-up", "ed-up-installer", "ed-up-installer-linux", "ed-up-launcher-linux")]
             old_archives = {path: path.read_bytes() for path in artifacts}
-            for missing_file in (wrapper_source, launcher_source, root / "release" / "README-linux.txt"):
+            for missing_file in (wrapper_source, launcher_source, root / "release" / "README-linux.txt",
+                                 launcher_sh_source, launcher_readme_source):
                 saved = missing_file.read_bytes()
                 missing_file.unlink()
                 for dry_run in (True, False):
@@ -540,11 +814,19 @@ def self_test():
                 except ValueError as error:
                     assert "shell launcher" in str(error), str(error)
             launcher_source.write_bytes((ROOT / LINUX_LAUNCHER).read_bytes())
+            launcher_sh_source.write_bytes(b"#!/bin/sh\r\nexit 0\r\n")
+            for dry_run in (True, False):
+                try:
+                    package(root, "1.2.3", no_dlss=True, dry_run=dry_run)
+                    raise AssertionError("CRLF launcher shell script accepted")
+                except ValueError as error:
+                    assert "launcher Linux shell script" in str(error), str(error)
+            launcher_sh_source.write_bytes((ROOT / LAUNCHER_LINUX_SH).read_bytes())
             assert all(path.read_bytes() == old_archives[path] for path in artifacts)
             assert not (root / "dist" / ".edvr-stage-1.2.3").exists()
             old_replace = os.replace
             linux_temporary = root / "dist" / ".edvr-installer-linux-1.2.3.zip.tmp"
-            linux_destination = root / "dist" / "edvr-installer-linux-1.2.3.zip"
+            linux_destination = root / "dist" / "ed-up-installer-linux-1.2.3.zip"
 
             def fail_linux_publish(source, destination):
                 if Path(source) == linux_temporary and Path(destination) == linux_destination:
@@ -562,6 +844,27 @@ def self_test():
                 os.replace = old_replace
             assert all(path.read_bytes() == old_archives[path] for path in artifacts)
             assert not linux_temporary.exists()
+            # The launcher's ZIP is published last of the four, so a failure there rolls the other three back.
+            launcher_temporary = root / "dist" / ".edvr-launcher-linux-1.2.3.zip.tmp"
+            launcher_destination = root / "dist" / "ed-up-launcher-linux-1.2.3.zip"
+
+            def fail_launcher_publish(source, destination):
+                if Path(source) == launcher_temporary and Path(destination) == launcher_destination:
+                    raise OSError("simulated launcher archive publish failure")
+                return old_replace(source, destination)
+
+            os.replace = fail_launcher_publish
+            try:
+                try:
+                    package(root, "1.2.3", no_dlss=True)
+                    raise AssertionError("failed launcher publish accepted")
+                except OSError as error:
+                    assert "simulated launcher archive publish failure" in str(error)
+            finally:
+                os.replace = old_replace
+            assert all(path.read_bytes() == old_archives[path] for path in artifacts)
+            assert not launcher_temporary.exists()
+            assert not [p for p in (root / "dist").iterdir() if p.name.startswith(".edvr-old")]
             (root / "build" / "edvr_openxr_runtime.dll").unlink()
             try:
                 package(root, "1.2.3", no_dlss=True)
@@ -569,18 +872,18 @@ def self_test():
             except ValueError:
                 pass
             assert all(path.read_bytes() == old_archives[path] for path in artifacts)
-            with zipfile.ZipFile(root / "dist" / "edvr-1.2.3.zip") as archive:
+            with zipfile.ZipFile(root / "dist" / "ed-up-1.2.3.zip") as archive:
                 names = set(archive.namelist())
                 assert names == {"d3d11.dll", "edvr_profile.ini", "openvr/openvr_api.dll", "openvr/openxr_loader.dll",
                                  "openvr/OPENXR-LOADER-LICENSE.txt", "edvr-installer.exe",
                                  "README.txt", "openvr/READ-ME-FIRST.txt", "edvr.ini", "edvr-flat.ini",
                                   "README-linux.txt", LINUX_WRAPPER, LINUX_LAUNCHER,
-                                  "LICENSE.txt", "DXBC-HASH-LICENSE.txt"}
+                                  "LICENSE.txt", "DXBC-HASH-LICENSE.txt", LAUNCHER_LICENSE_NAME}
                 assert archive.read(LINUX_WRAPPER) == wrapper_source.read_bytes()
                 assert archive.getinfo(LINUX_WRAPPER).external_attr >> 16 == 0o100755
                 assert archive.read(LINUX_LAUNCHER) == launcher_source.read_bytes()
                 assert archive.getinfo(LINUX_LAUNCHER).external_attr >> 16 == 0o100755
-                with zipfile.ZipFile(root / "dist" / "edvr-installer-linux-1.2.3.zip") as linux_archive:
+                with zipfile.ZipFile(root / "dist" / "ed-up-installer-linux-1.2.3.zip") as linux_archive:
                     assert archive.read(INSTALLER) == linux_archive.read(INSTALLER)
             (root / "build" / "edvr_openxr_runtime.dll").write_bytes(b"payload")
             dlss = root / "build" / "nvngx_dlss.dll"
@@ -600,7 +903,7 @@ def self_test():
                 pass
             notice.write_bytes(b"NVIDIA runtime notice")
             assert package(root, "1.2.4", no_dlss=True) == 0
-            with zipfile.ZipFile(root / "dist" / "edvr-1.2.4.zip") as archive:
+            with zipfile.ZipFile(root / "dist" / "ed-up-1.2.4.zip") as archive:
                 assert archive.read("nvngx_dlss.dll") == resources[104]
                 assert archive.read("NVIDIA-DLSS-LICENSE.txt") == notice.read_bytes()
             for bad in (None, b"different-installer-runtime"):
@@ -626,11 +929,11 @@ def self_test():
             assert not ffx.exists()
             ffx.write_bytes(b"MIT, FidelityFX SDK DX11 port")
             assert package(root, "1.2.6", no_dlss=True) == 0
-            with zipfile.ZipFile(root / "dist" / "edvr-1.2.6.zip") as archive:
+            with zipfile.ZipFile(root / "dist" / "ed-up-1.2.6.zip") as archive:
                 assert archive.read("FIDELITYFX-SDK-DX11-LICENSE.txt") == ffx.read_bytes()
             ffx.unlink()
             assert package(root, "1.2.7", no_dlss=True) == 0
-            with zipfile.ZipFile(root / "dist" / "edvr-1.2.7.zip") as archive:
+            with zipfile.ZipFile(root / "dist" / "ed-up-1.2.7.zip") as archive:
                 assert "FIDELITYFX-SDK-DX11-LICENSE.txt" not in set(archive.namelist())
 
             # The release version check through package(): read before anything is
@@ -652,20 +955,24 @@ def self_test():
                         raise AssertionError("%s accepted (dry_run=%s)" % (label, dry_run))
                     except ValueError as error:
                         assert needle in str(error) and "3.0.0" in str(error), (label, str(error))
-                assert not (root / "dist" / "edvr-3.0.0.zip").exists(), "a refused release wrote: " + label
-                assert not (root / "dist" / "edvr-installer-linux-3.0.0.zip").exists()
+                assert not (root / "dist" / "ed-up-3.0.0.zip").exists(), "a refused release wrote: " + label
+                assert not (root / "dist" / "ed-up-installer-linux-3.0.0.zip").exists()
+                assert not (root / "dist" / "ed-up-launcher-linux-3.0.0.zip").exists()
+                assert not (root / "dist" / ".edvr-launcher-linux-3.0.0.zip.tmp").exists()
                 assert not (root / "dist" / ".edvr-stage-3.0.0").exists(), "a refused release staged: " + label
-                assert not (root / "dist" / "edvr-3.0.0").exists(), "a refused release staged: " + label
+                assert not (root / "dist" / "ed-up-3.0.0").exists(), "a refused release staged: " + label
             stamps["override"] = {}
             assert package(root, "3.0.0", no_dlss=True, dry_run=True) == 0
-            assert not (root / "dist" / "edvr-3.0.0.zip").exists()
-            assert not (root / "dist" / "edvr-installer-linux-3.0.0.zip").exists()
+            assert not (root / "dist" / "ed-up-3.0.0.zip").exists()
+            assert not (root / "dist" / "ed-up-installer-linux-3.0.0.zip").exists()
             assert not (root / "dist" / ".edvr-installer-linux-3.0.0.zip.tmp").exists()
-            assert package(root, "3.0.0", no_dlss=True) == 0 and (root / "dist" / "edvr-3.0.0.zip").is_file()
+            assert not (root / "dist" / "ed-up-launcher-linux-3.0.0.zip").exists()
+            assert not (root / "dist" / ".edvr-launcher-linux-3.0.0.zip.tmp").exists()
+            assert package(root, "3.0.0", no_dlss=True) == 0 and (root / "dist" / "ed-up-3.0.0.zip").is_file()
 
             # One release, one installer executable: there is no flat archive,
             # and --profile is no longer an option. The VR archive carries both settings files.
-            with zipfile.ZipFile(root / "dist" / "edvr-1.2.7.zip") as archive:
+            with zipfile.ZipFile(root / "dist" / "ed-up-1.2.7.zip") as archive:
                 assert "edvr-flat.ini" in set(archive.namelist()) and "edvr.ini" in set(archive.namelist())
             import contextlib, io
             refusal = io.StringIO()  # argparse's usage text: expected, so not echoed raw
@@ -677,7 +984,7 @@ def self_test():
                 assert error.code == 2
                 assert "unrecognized arguments: --profile flat" in refusal.getvalue()
                 print("expected-error: argparse refused --profile flat (exit 2)")
-            assert not (root / "dist" / "edvr-flat-1.2.8.zip").exists()
+            assert not (root / "dist" / "ed-up-flat-1.2.8.zip").exists()
             # The installer's own copy of each settings file is checked against that
             # file, under its own name: edvr-flat.ini (111) is not edvr.ini (103).
             resources[111] = b"[fix]\r\ntemporal_aa = dlss\r\n"
@@ -694,7 +1001,7 @@ def self_test():
             except ValueError:
                 pass
             resources[111] = b"payload"
-            with zipfile.ZipFile(root / "dist" / "edvr-installer-1.2.7.zip") as installer_archive:
+            with zipfile.ZipFile(root / "dist" / "ed-up-installer-1.2.7.zip") as installer_archive:
                 assert set(installer_archive.namelist()) == {"edvr-installer.exe"}
             xess_files = {108: "libxess.dll", 109: "INTEL-XESS-LICENSE.txt",
                           110: "INTEL-XESS-THIRD-PARTY.txt"}
@@ -703,7 +1010,7 @@ def self_test():
                 (root / "build" / name).write_bytes(contents)
                 resources[resource_id] = contents
             assert package(root, "3.0.3", no_dlss=True) == 0
-            with zipfile.ZipFile(root / "dist" / "edvr-3.0.3.zip") as archive:
+            with zipfile.ZipFile(root / "dist" / "ed-up-3.0.3.zip") as archive:
                 for name in xess_files.values():
                     assert archive.read(name) == (root / "build" / name).read_bytes()
             resources[108] = b"wrong XeSS"
@@ -712,6 +1019,188 @@ def self_test():
                 raise AssertionError("installer with mismatched XeSS runtime accepted")
             except ValueError:
                 pass
+
+            # The split assets and the unsigned manifest, beside the three archives.
+            resources[108] = (root / "build" / "libxess.dll").read_bytes()
+            old_epoch = os.environ.get("SOURCE_DATE_EPOCH")
+            os.environ["SOURCE_DATE_EPOCH"] = "1794000000"
+            dist = root / "dist"
+            dlss_names = {"nvngx_dlss.dll", "NVIDIA-DLSS-LICENSE.txt"}
+            xess_names = set(xess_files.values())
+            core_names = {"d3d11.dll", "openvr/openvr_api.dll", "openvr/openxr_loader.dll",
+                          "openvr/OPENXR-LOADER-LICENSE.txt", "edvr.ini", "edvr-flat.ini",
+                          "edvr_profile.ini", "LICENSE.txt", "DXBC-HASH-LICENSE.txt", LAUNCHER_LICENSE_NAME}
+
+            def snapshot():
+                return {path.relative_to(dist).as_posix(): (path.read_bytes() if path.is_file() else None)
+                        for path in dist.rglob("*")}
+
+            def split_assets(directory):
+                return {kind: sorted(p.name for p in directory.glob("ed-up-%s-*.zip" % kind))
+                        for kind in ("dlss", "xess")}
+
+            def members(path):
+                with zipfile.ZipFile(path) as opened:
+                    return set(opened.namelist())
+
+            before = snapshot()
+            assert package(root, "4.0.0", no_dlss=True, dry_run=True) == 0
+            assert snapshot() == before, "a dry run wrote under dist"
+            assert package(root, "4.0.0", no_dlss=True) == 0
+            core = dist / "ed-up-core-4.0.0.zip"
+            found = split_assets(dist)
+            assert len(found["dlss"]) == 1 and len(found["xess"]) == 1, found
+            dlss_zip, xess_zip = dist / found["dlss"][0], dist / found["xess"][0]
+            assert members(core) == core_names, members(core)
+            assert members(dlss_zip) == dlss_names and members(xess_zip) == xess_names
+            assert not list(dist.rglob("*.sig")), "packaging wrote a signature"
+            assert not [p for p in dist.iterdir() if p.name.startswith(".")], "a temporary was left"
+            # The three archives keep their member lists.
+            with zipfile.ZipFile(dist / "ed-up-4.0.0.zip") as archive:
+                assert set(archive.namelist()) == core_names | dlss_names | xess_names | {
+                    INSTALLER, "README.txt", "openvr/READ-ME-FIRST.txt", "README-linux.txt",
+                    LINUX_WRAPPER, LINUX_LAUNCHER}
+            assert members(dist / "ed-up-installer-4.0.0.zip") == {INSTALLER}
+            assert members(dist / "ed-up-installer-linux-4.0.0.zip") == {
+                INSTALLER, LINUX_WRAPPER, LINUX_LAUNCHER, "README-linux.txt"}
+            assert members(dist / "ed-up-launcher-linux-4.0.0.zip") == {
+                LAUNCHER_ASSET, LAUNCHER_LINUX_WRAPPER, LAUNCHER_LINUX_SH, LAUNCHER_LINUX_README}
+            # The manifest: valid, ASCII, LF, the real hashes, and the launcher the release carries.
+            manifest_bytes = (dist / MANIFEST).read_bytes()
+            assert manifest_bytes.decode("ascii") and b"\r" not in manifest_bytes and manifest_bytes.endswith(b"\n")
+            parsed, problems = sign_manifest.load_manifest(manifest_bytes)
+            assert problems == [], problems
+            assert (parsed["version"], parsed["build"], parsed["tag"], parsed["issued"],
+                    parsed["min_launcher"]) == ("4.0.0", "v4.0.0", "v4.0.0", 1794000000, MIN_LAUNCHER)
+            assert parsed["launcher"] == {"version": "0.1.0", "asset": LAUNCHER_ASSET,
+                                          "sha256": hashlib.sha256(b"launcher exe").hexdigest(), "size": 12}
+            assert (dist / LAUNCHER_ASSET).read_bytes() == b"launcher exe"
+            assert [asset["name"] for asset in parsed["assets"]] == [core.name, dlss_zip.name, xess_zip.name]
+            assert {entry["item"] for entry in parsed["files"]} == {
+                "native_graphics", "native_runtime", "ini", "flat_ini", "profile", "openxr_loader",
+                "openxr_license", "ngx", "xess", "xess_license", "xess_third_party"}
+            lines = []
+            assert sign_manifest.verify_directory(dist, allow_unsigned=True, out=lines.append), lines
+            ngx = next(entry for entry in parsed["files"] if entry["item"] == "ngx")
+            assert ngx["asset"] == dlss_zip.name and ngx["path"] == "nvngx_dlss.dll"
+            # Two runs give the same bytes, and a new version keeps the DLSS and XeSS names.
+            first = {path: path.read_bytes() for path in (core, dlss_zip, xess_zip, dist / MANIFEST)}
+            assert package(root, "4.0.0", no_dlss=True) == 0
+            assert all(path.read_bytes() == data for path, data in first.items()), "packaging is not deterministic"
+            assert package(root, "4.0.1", no_dlss=True) == 0
+            assert split_assets(dist) == found and (dist / "ed-up-core-4.0.1.zip").is_file()
+            assert dlss_zip.read_bytes() == first[dlss_zip] and xess_zip.read_bytes() == first[xess_zip]
+            assert json.loads((dist / MANIFEST).read_text(encoding="ascii"))["version"] == "4.0.1"
+            # A changed runtime gets a new name and the old one goes.
+            dlss_dll = root / "build" / "nvngx_dlss.dll"
+            kept = dlss_dll.read_bytes()
+            dlss_dll.write_bytes(b"another DLSS runtime"); resources[104] = b"another DLSS runtime"
+            assert package(root, "4.0.1", no_dlss=True) == 0
+            renamed = split_assets(dist)
+            assert len(renamed["dlss"]) == 1 and renamed["dlss"] != found["dlss"] and renamed["xess"] == found["xess"]
+            assert sign_manifest.verify_directory(dist, allow_unsigned=True, out=lambda line: None)
+            # No DLSS runtime in the tree: no DLSS asset and no ngx item.
+            dlss_dll.unlink(); notice.unlink(); resources[104] = None
+            assert package(root, "4.0.2", no_dlss=True) == 0
+            assert split_assets(dist)["dlss"] == [] and split_assets(dist)["xess"] == found["xess"]
+            parsed = json.loads((dist / MANIFEST).read_text(encoding="ascii"))
+            assert "ngx" not in {entry["item"] for entry in parsed["files"]}
+            assert all("dlss" not in asset["name"] for asset in parsed["assets"])
+            assert sign_manifest.verify_directory(dist, allow_unsigned=True, out=lambda line: None)
+            with zipfile.ZipFile(dist / "ed-up-4.0.2.zip") as archive:
+                assert not dlss_names & set(archive.namelist())
+            dlss_dll.write_bytes(kept); resources[104] = kept
+            notice.write_bytes(b"NVIDIA runtime notice")
+            # A failed publish puts the earlier split assets back.
+            before = snapshot()
+            old_replace = os.replace
+            target = dist / "ed-up-core-4.0.3.zip"
+
+            def fail_core_publish(source, destination):
+                if Path(destination) == target:
+                    raise OSError("simulated split asset publish failure")
+                return old_replace(source, destination)
+
+            os.replace = fail_core_publish
+            try:
+                try:
+                    package(root, "4.0.3", no_dlss=True)
+                    raise AssertionError("failed split publish accepted")
+                except OSError as error:
+                    assert "simulated split asset" in str(error)
+            finally:
+                os.replace = old_replace
+            after = snapshot()
+            assert {k: v for k, v in after.items() if not k.startswith("ed-up-4.0.3")
+                    and not k.startswith("ed-up-installer")} == \
+                {k: v for k, v in before.items() if not k.startswith("ed-up-4.0.3")
+                 and not k.startswith("ed-up-installer")}, "a failed publish changed dist"
+            assert not target.exists() and not [p for p in dist.iterdir() if p.name.startswith(".")]
+            # The launcher exe is listed and copied.
+            assert package(root, "4.0.4", no_dlss=True) == 0
+            parsed = json.loads((dist / MANIFEST).read_text(encoding="ascii"))
+            assert parsed["launcher"] == {"version": "0.1.0", "asset": LAUNCHER_ASSET,
+                                          "sha256": hashlib.sha256(b"launcher exe").hexdigest(), "size": 12}
+            assert (dist / LAUNCHER_ASSET).read_bytes() == b"launcher exe"
+            assert sign_manifest.verify_directory(dist, allow_unsigned=True, out=lambda line: None)
+            header.write_text("// no version here\n", encoding="ascii")
+            try:
+                package(root, "4.0.5", no_dlss=True, dry_run=True)
+                raise AssertionError("launcher without a version accepted")
+            except ValueError as error:
+                assert "launcher version" in str(error)
+            header.write_text('inline constexpr const char* kLauncherVersion = "0.1.0";\n', encoding="ascii")
+
+            # The launcher is required, and a bad one is refused, each for its own reason.
+            def refused_launcher(label, needle):
+                try:
+                    package(root, "4.0.6", no_dlss=True, dry_run=True)
+                except ValueError as error:
+                    assert needle in str(error), (label, str(error))
+                    return str(error)
+                raise AssertionError("accepted: " + label)
+
+            launcher_exe = root / "build" / LAUNCHER_ASSET
+            launcher_exe.unlink()
+            print("expected-error: " + refused_launcher("no launcher", "ed-up-launcher.exe is missing").splitlines()[0])
+            launcher_exe.write_bytes(b"launcher exe")
+            stamps["override"][LAUNCHER_ASSET] = {"FileVersion": "0.0.9", "ProductVersion": "0.1.0"}
+            print("expected-error: " + refused_launcher("stale launcher version", "FileVersion is 0.0.9").splitlines()[1].strip())
+            stamps["override"][LAUNCHER_ASSET] = None
+            refused_launcher("launcher without a version resource", "FileVersion is None")
+            del stamps["override"][LAUNCHER_ASSET]
+            for resource_id in (101, 102, 111):
+                launcher_resources[resource_id] = b"payload"
+                refused_launcher("launcher with resource %d" % resource_id, "carries resource %d" % resource_id)
+                del launcher_resources[resource_id]
+            good_licence = launcher_resources.pop(LAUNCHER_LICENSE_RESOURCE)
+            refused_launcher("launcher without the licence", "does not carry resource 120")
+            launcher_resources[LAUNCHER_LICENSE_RESOURCE] = good_licence + b" "
+            refused_launcher("launcher with another licence", "resource 120 differs from third_party/min_ed_launcher/LICENSE")
+            launcher_resources[LAUNCHER_LICENSE_RESOURCE] = good_licence
+            rfc = sign_manifest.RFC_PUBLIC.lower()
+            real_pair = [k for k in re.findall(r'"([0-9a-f]{128})"', real_keys_text)]
+            assert len(real_pair) == 2 and real_pair[0] != rfc and real_pair[1] != rfc, "the repository's own keys"
+            keys_header.write_text('inline constexpr const char* kUpdatePublicKeys[] = {"%s", "%s", nullptr};\n'
+                                   % (real_pair[0], rfc), encoding="ascii")
+            print("expected-error: " + refused_launcher("the test key", "public test key").splitlines()[1].strip())
+            keys_header.write_text('inline constexpr const char* kUpdatePublicKeys[] = {"%s", nullptr};\n' % real_pair[0],
+                                   encoding="ascii")
+            refused_launcher("one key", "lists 1 keys")
+            keys_header.write_text('inline constexpr const char* kUpdatePublicKeys[] = {"%s", "%s", nullptr};\n'
+                                   % (real_pair[0], real_pair[0]), encoding="ascii")
+            refused_launcher("the same key twice", "same key twice")
+            keys_header.write_text(real_keys_text, encoding="utf-8")
+            assert package(root, "4.0.6", no_dlss=True, dry_run=True) == 0   # and the good one passes again
+
+            # The folder table the launcher reads --payload with is this tool's item table.
+            table = re.findall(r'\{"([a-z_]+)", L"([^"]+)"\}', ROOT.joinpath("src", "installer", "launcher_core.cpp").read_text(encoding="utf-8"))
+            assert sorted((item, path.replace("\\\\", "/")) for item, path in table) == sorted(ITEM_PATHS), \
+                "src/installer/launcher_core.cpp's kFolderEntries and package_native.ITEM_PATHS differ"
+            if old_epoch is None:
+                del os.environ["SOURCE_DATE_EPOCH"]
+            else:
+                os.environ["SOURCE_DATE_EPOCH"] = old_epoch
         finally:
             openxr_pe.native_exports, openxr_pe.native_graphics_exports = old_native, old_graphics
             fetch_openxr_loader.verify = old_verify

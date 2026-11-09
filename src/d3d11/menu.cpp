@@ -60,6 +60,7 @@
 #include "terrain_checkerboard.h"   // Elite's terrain checkerboard rendering in VR: the worker's tick and the word it publishes
 #include "ui_layer_math.h"  // uiQualityParse: the HUD Anti-Aliasing row dims while fix.ui_quality is off (or the anti-aliasing is), UI quality read as the layer reads it
 #include "vscreen.h"        // vScreenRenderBelowEye: Elite's Supersampling below 1, from the sizes
+#include "concourse_pane.h"     // concoursePaneTakeToast: the concourse window mode's toast (TEMPORARY, docs\concourse-cull-2026-11-05.md)
 #include "vr_ssaa_hold.h"       // vrSsaaHoldNoticeDue: the Supersampling hold's toast (a requested value held at 1.0)
 #include "vr_ssaa_hold_math.h"  // ssaahold::formatHoldToast
 #include "mode_watch.h"         // modeWatchNoticeDue: the 3D mode watch's toast, once per commit
@@ -537,6 +538,24 @@ bool cockpitGlassDirtRowDisabled() {
 const char* cockpitGlassDirtHint() { return "Needs Cockpit glass set to Legacy: choose it above to use this."; }
 
 const char* cockpitGlassDirtRefusal() { return "This row is inactive: set Cockpit glass to Legacy above first."; }
+
+// fix.station_window_distance (the Window 3D distance row, directly under Optimized stations on the flat panel's Performance tab). It is part of that setting, so with the setting
+// off the row stays on the page, dimmed, and stops responding, the way the Legacy glass dirt row does. Read as the station reads it: anything but "off" is on.
+bool isStationWindowDistanceRow(const MenuRowDef& d) {
+    return strcmp(d.section, "fix") == 0 && strcmp(d.key, "station_window_distance") == 0;
+}
+
+bool stationWindowDistanceRowDisabled() { return Config::get().getString("fix.optimized_stations", "on") == "off"; }
+
+const char* stationWindowDistanceHint() { return "Needs Optimized stations: turn it on above to use this."; }
+
+// fix.skip_rooms_behind_doors (the Skip rooms behind doors row, under Window 3D distance on the flat panel's Performance tab): part of Optimized stations too, so dimmed and
+// refused the same way while that is off.
+bool isRoomsBehindDoorsRow(const MenuRowDef& d) { return strcmp(d.section, "fix") == 0 && strcmp(d.key, "skip_rooms_behind_doors") == 0; }
+
+const char* roomsBehindDoorsRefusal() { return "Skip rooms behind doors is inactive: turn Optimized stations on above first."; }
+
+const char* stationWindowDistanceRefusal() { return "Window 3D distance is inactive: turn Optimized stations on above first."; }
 
 // The on-foot panel's width: "auto", or a width in pixels -- never a list, so
 // this is not a headset row despite living beside one in the ini. The height
@@ -1976,7 +1995,7 @@ void statusLine(MenuContent& c, const char* left, const char* right) {
 void buildStatus(MenuContent& c) {
     char buf[200];
     snprintf(buf, sizeof(buf), "%s / game build %s", EDVR_VERSION_STRING, gameBuildVersion().c_str());
-    statusLine(c, "EDVR", buf);
+    statusLine(c, "ED-UP", buf);
     statusLine(c, "Runtime",
                nativeMenuActive() ? "native OpenXR (experimental)"
                : (glitchConsumerPresent() ? "not identified" : "no compositor consumer"));
@@ -2557,10 +2576,14 @@ void buildContent(MenuContent& c) {
             const bool sharpenRow = isSharpenRow(d);
             const bool hudAaRow = isHudAntiAliasingRow(d);
             const bool glassDirtRow = isCockpitGlassDirtRow(d);
+            const bool windowDistanceRow = isStationWindowDistanceRow(d);
+            const bool doorsRow = isRoomsBehindDoorsRow(d);
             const bool dim = (dlssRow && dlssPresetDisabled()) ||
                              (sharpenRow && sharpenRowDisabled()) ||
                              (hudAaRow && hudAntiAliasingRowDisabled()) ||
-                             (glassDirtRow && cockpitGlassDirtRowDisabled());
+                             (glassDirtRow && cockpitGlassDirtRowDisabled()) ||
+                             (doorsRow && stationWindowDistanceRowDisabled()) ||
+                             (windowDistanceRow && stationWindowDistanceRowDisabled());
             l.dim = dim;
             strncpy(l.left, d.label, sizeof(l.left) - 1);
             if (dlssRow) {
@@ -2633,6 +2656,8 @@ void buildContent(MenuContent& c) {
                 snprintf(c.hint, sizeof(c.hint), "%s", hudAntiAliasingHint());
             else if (hi && dim && glassDirtRow)
                 snprintf(c.hint, sizeof(c.hint), "%s", cockpitGlassDirtHint());
+            else if (hi && dim && (windowDistanceRow || doorsRow))
+                snprintf(c.hint, sizeof(c.hint), "%s", stationWindowDistanceHint());
             else if (hi && dim && runtimeFlatProfile())
                 snprintf(c.hint, sizeof(c.hint), "%s",
                          sharpenRow ? "Turn anti-aliasing on to sharpen."
@@ -2755,7 +2780,7 @@ void buildContent(MenuContent& c) {
                     if (r.clashCount) {
                         body += std::string("\nElite also uses this press: ") + r.clashList +
                                 (strcmp(d.key, "menu") == 0 && s.summon.kind() == HotkeyKind::Key
-                                     ? ". EDVR keeps the menu key from the game, so those are masked while it is installed."
+                                     ? ". ED-UP keeps the menu key from the game, so those are masked while it is installed."
                                      : ". The key is watched, not captured: the game sees the press too, so one press does both.");
                     } else if (!s.readGameBindings) {
                         body += "\nNot checked against your Elite bindings (hotkey.read_game_bindings is off).";
@@ -2884,7 +2909,7 @@ void buildContent(MenuContent& c) {
                      s.summonName.c_str(), status);
         // The installed version, on every page, drawn at the right end of this same
         // footer line (menu_panel.cpp). Flat only: VR's footer does not carry it.
-        snprintf(c.footerTag, sizeof(c.footerTag), "EDVR %s", EDVR_VERSION_STRING);
+        snprintf(c.footerTag, sizeof(c.footerTag), "ED-UP %s", EDVR_VERSION_STRING);
         return;
     }
     {
@@ -3133,6 +3158,16 @@ void stepRow(int defIndex, int dir, int mult) {
     }
     if (isCockpitGlassDirtRow(d) && cockpitGlassDirtRowDisabled()) {
         g_s.lastWrite = cockpitGlassDirtRefusal();
+        g_s.contentDirty = true;
+        return;
+    }
+    if (isStationWindowDistanceRow(d) && stationWindowDistanceRowDisabled()) {
+        g_s.lastWrite = stationWindowDistanceRefusal();
+        g_s.contentDirty = true;
+        return;
+    }
+    if (isRoomsBehindDoorsRow(d) && stationWindowDistanceRowDisabled()) {
+        g_s.lastWrite = roomsBehindDoorsRefusal();
         g_s.contentDirty = true;
         return;
     }
@@ -3544,6 +3579,16 @@ void beginEdit(int entryIndex, int defIndex) {
         s.contentDirty = true;
         return;
     }
+    if (isStationWindowDistanceRow(kMenuRows[defIndex]) && stationWindowDistanceRowDisabled()) {
+        s.lastWrite = stationWindowDistanceRefusal();
+        s.contentDirty = true;
+        return;
+    }
+    if (isRoomsBehindDoorsRow(kMenuRows[defIndex]) && stationWindowDistanceRowDisabled()) {
+        s.lastWrite = roomsBehindDoorsRefusal();
+        s.contentDirty = true;
+        return;
+    }
     if (isOpenxrRenderScaleRow(kMenuRows[defIndex])) {
         // The buffer holds the worn headset's width as digits, never the
         // list (so kEditMax cannot cut it); with no headset to key on the
@@ -3896,7 +3941,7 @@ void applyDecision(int def, const CaptureDecision& dec) {
     if (dec.check.clashCount) {
         setHotkeyNote(def, "set - also used in Elite",
                       masksElite ? std::string("Elite's ") + dec.check.clashList +
-                                       " is masked by the menu key; EDVR keeps it from the game."
+                                       " is masked by the menu key; ED-UP keeps it from the game."
                                  : std::string("Elite also uses ") + text + ": " + dec.check.clashList +
                                        ". The game sees the press too.");
     } else {
@@ -4003,6 +4048,12 @@ void dispatchNav(MenuNav nav, uint64_t now) {
                         }
                     } else if (isCockpitGlassDirtRow(d) && cockpitGlassDirtRowDisabled()) {
                         s.lastWrite = cockpitGlassDirtRefusal();
+                        s.contentDirty = true;
+                    } else if (isStationWindowDistanceRow(d) && stationWindowDistanceRowDisabled()) {
+                        s.lastWrite = stationWindowDistanceRefusal();
+                        s.contentDirty = true;
+                    } else if (isRoomsBehindDoorsRow(d) && stationWindowDistanceRowDisabled()) {
+                        s.lastWrite = roomsBehindDoorsRefusal();
                         s.contentDirty = true;
                     } else {
                         applyChange(def, d.shipped);
@@ -4874,11 +4925,14 @@ void menuShowNotice(const char* text) {
         Log::get().note("menu: notice \"%s\" not queued: menu.toasts is off.", text);
         return;
     }
-    // The newest AA notice replaces an older one still waiting or on screen: a quick second press must not queue behind the first.
+    // The newest AA notice (or "Windows: " notice, the concourse pane mode) replaces an older one of its kind still waiting or on screen: a quick second press
+    // must not queue behind the first.
+    const char* const kind = std::strncmp(text, "Windows: ", 9) == 0 ? "Windows: " : "AA ";
+    const size_t kindLen = std::strlen(kind);
     for (size_t i = s.toastQueue.size(); i-- > 0;) {
-        if (s.toastQueue[i].compare(0, 3, "AA ") == 0) s.toastQueue.erase(s.toastQueue.begin() + static_cast<std::ptrdiff_t>(i));
+        if (s.toastQueue[i].compare(0, kindLen, kind) == 0) s.toastQueue.erase(s.toastQueue.begin() + static_cast<std::ptrdiff_t>(i));
     }
-    if (s.toastUp && s.toastText.compare(0, 3, "AA ") == 0) s.toastUntilMs = 0;
+    if (s.toastUp && s.toastText.compare(0, kindLen, kind) == 0) s.toastUntilMs = 0;
     s.toastQueue.push_back(text);
     Log::get().note("menu: notice \"%s\" queued as a toast.", text);
 }
@@ -5001,6 +5055,12 @@ void menuTick(ID3D11Device* dev) {
     State& s = g_s;
     menuDrainPluginRows();
     if (!s.configured) return;
+    {
+        // TEMPORARY (concourse window mode, docs\concourse-cull-2026-11-05.md): a hotkey change of the mode, and the capture's result, are said as a notice (flat: the panel's
+        // raster in the upper left, as the AA comparison's; VR: a toast). menuShowNotice keeps only the newest "Windows: " notice.
+        char windowsToast[64];
+        if (concoursePaneTakeToast(windowsToast, sizeof(windowsToast))) menuShowNotice(windowsToast);
+    }
     if (runtimeFlatProfile()) {
         guardedBudget(g_budget, [&] {
             const uint64_t now = nowMs();

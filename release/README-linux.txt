@@ -1,4 +1,4 @@
-EDVR Linux wrapper for Steam + Proton
+ED-UP Linux wrapper for Steam + Proton
 
 Requirements: Python 3 and an existing Steam install of Elite Dangerous with
 its Proton prefix. The wrapper uses Steam's installed Proton and runtime
@@ -27,7 +27,9 @@ starting a process or writing files. The shell launcher works from any
 directory and forwards every option to the Python wrapper. You can also run
 python3 edvr-installer-linux.py directly.
 
-The wrapper also accepts --repair, --uninstall, and --collect-logs. Use
+The wrapper also accepts --repair, --uninstall, and --collect-logs.
+--collect-logs saves the log zip to your Downloads folder (your home folder if
+there is none) and prints the Linux path. Use
 --game-dir '/path/to/product' for a different product folder inside the
 installed game tree, or --installer '/path/to/edvr-installer.exe' for a
 separate EXE. --steam-dir '/path/to/Steam' or STEAM_DIR selects a nonstandard

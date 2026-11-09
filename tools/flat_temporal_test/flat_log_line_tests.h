@@ -248,6 +248,32 @@ inline std::vector<Case> buildCases() {
                true};
         cases.push_back(c);
     }
+    {   // the source-veto line (2026-11-08): one part, the window, the last refusal's causes and its four stock draws
+        Case c{"source-veto", 1, {"flat source veto 5s: frames="},
+               {{"frames=", 'q', false}, {"with-stock-family=", 'q', false}, {"of-those-selected=", 'q', false}, {"refused-by-family=", 'q', false},
+                {"refused-by-pool=", 'q', false}, {"last refused frame=", 'q', false}, {"stock-family-draws=", 'd', false},
+                {"unsupported-pool-draws=", 'd', false}, {"kinds=", 'x', false}, {"past-the-kinds=", 'd', false},
+                {"[VS=", 'n', true}, {" PS=", 'n', true}, {"draws=", 'n', true}, {"depth=", 'n', true},
+                {"target=", 'n', true}, {"color=", 'n', true}, {"camera=", 'n', true}},
+               [](char* out, size_t n, unsigned part, int l) {
+                   if (part) return 0;
+                   FlatSourceVetoWindow w;
+                   const uint64_t v = levelQ(l);
+                   w.frames = w.withFamily = w.withFamilySelected = w.refusedByFamily = w.refusedByPool = v;
+                   FlatMonoSourceless last;
+                   FlatFamilyVeto vetoes[kFlatFamilyVetoKinds];
+                   uint32_t kinds = 0;
+                   if (l != kZero) {
+                       last.vetoFamilyDraws = last.vetoPoolDraws = ~0u;
+                       kinds = kFlatFamilyVetoKinds;
+                       // depth stays null against a null HDR depth: "other", the longer word
+                       for (auto& e : vetoes) { e.vs = e.ps = ~0ull; e.draws = e.width = e.height = ~0u; e.color = e.camera = true; }
+                   }
+                   return flatSourceVetoLine(out, n, w, last, v, vetoes, kinds, levelD(l));
+               },
+               true};
+        cases.push_back(c);
+    }
     {   // the history lines (already split by the build before): the summary, three writes lines, the vertex line, an example
         cases.push_back({"history", 1, {"flat foreground history 5s: "},
                          {{"records=", 'd', false}, {"bytes=", 'd', false}, {"peak-records=", 'd', false}, {"peak-bytes=", 'd', false},
@@ -719,7 +745,7 @@ inline Estimate estimateCall(const NoteCall& call, unsigned digits, const Row* r
 inline std::vector<Measured> measuredFormatters(const std::vector<Case>& cases) {
     struct Map { const char* callee; const char* caseName; };
     static const Map map[] = {{"flatNoCandidateLine(", "no-candidate"}, {"flatIdentityLine(", "identity"}, {"flatSiblingLine(", "sibling"},
-                              {"flatSourceSpellLine(", "source-spell"}, {"flatHistoryLine(", "history"}, {"flatHistoryWritesLine(", "history-writes"},
+                              {"flatSourceSpellLine(", "source-spell"}, {"flatSourceVetoLine(", "source-veto"}, {"flatHistoryLine(", "history"}, {"flatHistoryWritesLine(", "history-writes"},
                               {"flatHistoryVertexLine(", "history-vertex"}, {"flatHistoryExampleLine(", "history-example"}, {"flatShadowLine(", "shadow"},
                               {"flatNoCandidateExampleLine(", "no-candidate-example"}, {"flatIdentityExampleLine(", "identity-example"}};
     std::vector<Measured> out;

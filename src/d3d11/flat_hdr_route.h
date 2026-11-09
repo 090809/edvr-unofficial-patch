@@ -358,6 +358,7 @@ inline FlatMonoFrame flatSelectHdrFrame(const FlatMonoFrameInput& in, const void
     if (!out.supportedDraws) {
         // Section 104, as flatSelectMonoFrame: no pool family in the scene is source-free; a family draw left stock stays refused.
         summarizeSourceless(in, count, hdr->key.depth, *hdrCamera, out.sourceless);
+        out.sourceless.vetoFamilyDraws = in.unsupportedFamilyDraws; out.sourceless.vetoPoolDraws = out.unsupportedDraws;
         if (in.unsupportedFamilyDraws || out.unsupportedDraws) return refuse(FlatMonoReason::NoSupportedSource);
         out.sourceFree = true;
     }
@@ -455,16 +456,29 @@ inline bool flatHdrRouteEvaluatesAtRender(FlatMonoResolveMode mode, uint32_t rW,
 
 // What the route adds to a frame's stand-down verdict at its trigger (key auto; flat_standdown.h). That verdict is
 // about the SHAPE of the game's chain, so the route speaks only where it recognised the frame and will resolve it:
-// Treatable, whatever the copy stage makes of the bloom or tone variant. Every other answer adds nothing. A refusal
-// merged as itself would outrank the copy stage's structural one (the order is None < Structural < Transient <
-// Treatable), and the stand-down that stops an unrecognised chain from costing CPU, and the F8 warning that says why,
-// would never start: render below the output (R < D), where the copy route and its whitelist serve the frame and every
-// trigger says hdr-route-needs-render-at-least-output, and EDVR's TAA above D, which stays on the copy route, are
-// both that case. The key off merges nothing, so none of this reaches it.
+// Treatable, whatever the copy stage makes of the bloom or tone variant. Every other answer from this function adds
+// nothing; the one refusal the route does speak for is flatHdrTriggerRefusalSeen's, below. A refusal merged as itself
+// would outrank the copy stage's structural one (the order is None < Structural < Transient < Treatable), and the
+// stand-down that stops an unrecognised chain from costing CPU, and the F8 warning that says why, would never start:
+// render below the output (R < D), where the copy route and its whitelist serve the frame and every trigger says
+// hdr-route-needs-render-at-least-output, and EDVR's TAA above D, which stays on the copy route, are both that case.
+// The key off merges nothing, so none of this reaches it.
 inline FlatFrameSeen flatHdrTriggerSeen(const FlatMonoFrame& selection, FlatMonoResolveMode mode) {
     return selection.selected() && flatHdrRouteEvaluatesAtRender(mode, selection.renderWidth, selection.renderHeight,
                                                                  selection.outputWidth, selection.outputHeight)
         ? FlatFrameSeen::Treatable : FlatFrameSeen::None;
+}
+// The one refusal the route does speak for (2026-11-08, Sean's Frontier flight: DLAA at 3840x2160, on foot beside the SRV): no supported
+// motion source, where the route itself resolves the frame (H at a render size the mode evaluates at, at least the output). The chain was
+// recognised (the selector reached the source stage past H, its camera and its depth) and the view decides, so it is Transient, as the copy
+// route's own refusal is: the work stays Full and the selector is asked every frame. Merged as nothing, the copy stage's structural
+// no-known-tone-pass stood the work down and the F8 warning blamed Elite's post-processing. Below the output nothing changes: the copy
+// route serves that frame and says for itself why it refused. Sizes are passed in, since a refusal carries none.
+inline FlatFrameSeen flatHdrTriggerRefusalSeen(const FlatMonoFrame& selection, FlatMonoResolveMode mode, uint32_t hdrWidth,
+                                               uint32_t hdrHeight, uint32_t outputWidth, uint32_t outputHeight) {
+    return selection.reason == FlatMonoReason::NoSupportedSource &&
+               flatHdrRouteEvaluatesAtRender(mode, hdrWidth, hdrHeight, outputWidth, outputHeight)
+        ? FlatFrameSeen::Transient : FlatFrameSeen::None;
 }
 
 // ---- the scene's and the output's sizes, for the panel ------------------------------------------------------

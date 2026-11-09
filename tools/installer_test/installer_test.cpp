@@ -688,11 +688,11 @@ static void testShippedIni(const std::wstring& root) {
                   flatMerged.find("carried over from your edvr.ini") == std::string::npos,
               "a merge of edvr-flat.ini says the retired line was carried over from edvr-flat.ini");
         const std::string flatBare = mergeIni(shipped, flown, nullptr, {}, nullptr, "edvr-flat.ini");
-        check(flatBare.find("# carried over from your edvr-flat.ini; not an EDVR setting this version knows") !=
+        check(flatBare.find("# carried over from your edvr-flat.ini; not an ED-UP setting this version knows") !=
                   std::string::npos,
               "...and so does the note for a key this version never shipped");
         check(mergeIni(shipped, flown, nullptr, {}, nullptr, nullptr)
-                      .find("# carried over from your edvr.ini; not an EDVR setting this version knows") !=
+                      .find("# carried over from your edvr.ini; not an ED-UP setting this version knows") !=
                   std::string::npos,
               "no file named: the VR file's name, as before");
 
@@ -1593,7 +1593,7 @@ static void testPlanner() {
         check(hasStep(plan, Action::WritePayload, nullptr, L"d3d11.dll"), "and EDVR goes back");
         expectEq(iniValue(plannedIni(plan), "advanced.real_dll"), "d3d11_reshade.dll",
                  "with the chain pointed at it");
-        check(notesMention(plan, "replaced EDVR"), "the report says what happened");
+        check(notesMention(plan, "replaced ED-UP"), "the report says what happened");
     }
 
     {   // The same mod reinstalled itself over us twice: its older copy is
@@ -1906,15 +1906,28 @@ static void testPlanner() {
         s.eliteKind = EliteExeKind::Legacy;
         Plan plan = planInstall(s, options, payload);
         check(plan.blocked && plan.steps.empty(), "legacy Elite Dangerous is refused");
+
+        // The installs on offer leave legacy out, by the executable's own words: these are
+        // what the two real executables say. A folder's name does not decide it.
+        check(versionStringsNameLegacyElite(L"Elite:Dangerous", L"Elite:Dangerous Executable"), "the pre-Odyssey version strings read as legacy");
+        check(!versionStringsNameLegacyElite(L"Elite Dangerous: Odyssey", L"Elite Dangerous: Odyssey Executable"), "Odyssey's version strings do not");
+        check(!versionStringsNameLegacyElite(L"", L""), "an exe with no version strings is not called legacy");
+        GameInstall odysseyInstall, legacyInstall;
+        odysseyInstall.dir = L"C:\\Games\\ED\\Products\\elite-dangerous-odyssey-64";
+        legacyInstall.dir = L"C:\\Games\\ED\\Products\\elite-dangerous-64";
+        const std::vector<GameInstall> kept = withoutLegacyInstalls({legacyInstall, odysseyInstall}, [](const std::wstring& exe) {
+            return exe == L"C:\\Games\\ED\\Products\\elite-dangerous-64\\EliteDangerous64.exe";
+        });
+        check(kept.size() == 1 && kept[0].dir == odysseyInstall.dir, "the list drops a legacy install, tested on its executable's path, and keeps the Odyssey one");
         check(notesMention(plan, "Elite Dangerous (Horizons)"), "and named as Horizons, not Odyssey");
-        check(notesMention(plan, "no EDVR build supports this game"),
+        check(notesMention(plan, "no ED-UP build supports this game"),
               "with no pointer at some other build");
 
         s.eliteKind = EliteExeKind::OdysseyUnknown;
         s.eliteFileVersion = L"999999";
         plan = planInstall(s, options, payload);
         check(!plan.blocked && !plan.steps.empty(), "an unknown Odyssey revision installs");
-        check(problemMentions(plan, "is not the one this EDVR build was checked against"),
+        check(problemMentions(plan, "is not the one this ED-UP build was checked against"),
               "with a warning that says why");
         check(problemMentions(plan, "fixes tied to the game build stand down"),
               "and says what stands down");
@@ -2627,7 +2640,7 @@ static void testContentOwnership(const std::wstring& scratch) {
         check(!hasStep(plan, Action::Delete, L"libxess.dll", nullptr) &&
               !hasStep(plan, Action::Delete, L"INTEL-XESS-LICENSE.txt", nullptr) &&
               !hasStep(plan, Action::Delete, L"INTEL-XESS-THIRD-PARTY.txt", nullptr) &&
-              notesMention(plan, "nothing shows EDVR placed it"),
+              notesMention(plan, "nothing shows ED-UP placed it"),
               "keeps the XeSS trio: a payload match with no record or receipt is not proof");
         check(hasStep(plan, Action::Delete, L"openvr_api.dll", nullptr) &&
               hasStep(plan, Action::Rename, L"openvr_api_orig.dll", L"openvr_api.dll"),
@@ -2689,7 +2702,7 @@ static void testSharedFilesKept() {
     const std::wstring dir = L"C:\\Games\\ED\\Products\\elite-dangerous-odyssey-64";
     const PayloadInfo p = contentPayload();
     const std::wstring loaderPath = joinPath(joinPath(dir, L"Openvr\\win64"), L"openxr_loader.dll");
-    const char* kept = "matches EDVR's copy but nothing shows EDVR placed it; left alone";
+    const char* kept = "matches ED-UP's copy but nothing shows ED-UP placed it; left alone";
     {   // A fresh flat install, stock runtime, no record, no descriptor: another mod's loader matching the payload is kept.
         Survey s = baseSurvey(dir);
         s.openxrLoader = fakeDll(DllKind::Foreign, loaderPath, p.openxrLoaderSha);
@@ -2979,7 +2992,7 @@ static void testToolAdoption(const std::wstring& scratch) {
     {
         const Survey s = survey();
         const Plan conversion = planInstall(s, flatOptions, flat);
-        check(conversion.blocked && notesMention(conversion, "Cannot prove EDVR's VR runtime and the game's original"),
+        check(conversion.blocked && notesMention(conversion, "Cannot prove ED-UP's VR runtime and the game's original"),
               "and flat conversion is still blocked with today's message");
         check(planUninstall(s, testOptions(), vr).blocked, "and uninstall is still blocked");
     }
@@ -3141,7 +3154,7 @@ static void testFlatSettingsPlanner() {
         s.flatIniText = std::string(kFlatOwnIni) + "stale_line = 1\r\n";
         const std::string merged = plannedText(planInstall(s, options, flatNew), L"edvr-flat.ini");
         check(merged.find("stale_line = 1") != std::string::npos &&
-                  merged.find("# carried over from your edvr-flat.ini; not an EDVR setting this version knows") !=
+                  merged.find("# carried over from your edvr-flat.ini; not an ED-UP setting this version knows") !=
                       std::string::npos,
               "a flat update carries an unknown line under a note naming edvr-flat.ini");
         check(merged.find("carried over from your edvr.ini") == std::string::npos,
@@ -3151,9 +3164,31 @@ static void testFlatSettingsPlanner() {
         seed.iniPresent = true;
         seed.iniText = kSharedIni;
         const std::string seeded = plannedText(planInstall(seed, options, flatNew), L"edvr-flat.ini");
-        check(seeded.find("# carried over from your edvr.ini; not an EDVR setting this version knows") !=
+        check(seeded.find("# carried over from your edvr.ini; not an ED-UP setting this version knows") !=
                   std::string::npos,
               "a seed from the shared file names edvr.ini for the lines it carries over");
+    }
+
+    {   // A file written by 0.21 (the carried-line note and the file's own header say EDVR) merges again without
+        // a second note for the same line, and the note it carries from then on is the ED-UP wording.
+        const std::string shippedIni = "# ED-UP settings.\r\n\r\n[fix]\r\nblack_void = 1\r\n";
+        const std::string oldWording =
+            "# EDVR settings.\r\n\r\n[fix]\r\nblack_void = 0\r\n"
+            "# carried over from your edvr.ini; not an EDVR setting this version knows\r\n"
+            "stale_line = 7\r\n";
+        const std::string merged = mergeIni(shippedIni, oldWording, &shippedIni, {}, nullptr);
+        const std::string oldNote = "not an EDVR setting this version knows";
+        const std::string newNote = "# carried over from your edvr.ini; not an ED-UP setting this version knows";
+        size_t notes = 0, lines = 0;
+        for (size_t at = merged.find("carried over from your"); at != std::string::npos;
+             at = merged.find("carried over from your", at + 1)) ++notes;
+        for (size_t at = merged.find("stale_line = 7"); at != std::string::npos; at = merged.find("stale_line = 7", at + 1)) ++lines;
+        check(notes == 1 && lines == 1 && merged.find(newNote) != std::string::npos &&
+                  merged.find(oldNote) == std::string::npos,
+              "a 0.21 file's carried line gets one note, in the ED-UP wording, and no second one",
+              merged);
+        const std::string again = mergeIni(shippedIni, merged, &shippedIni, {}, nullptr);
+        check(again == merged, "and merging that result again changes nothing");
     }
 
     {   // Asked for fresh defaults with two files: the flat one is replaced, after
@@ -6502,6 +6537,23 @@ static void testLogBundle(const std::wstring& scratch) {
         std::string copyError;
         check(!copyFileToClipboard(nullptr, std::wstring(), &copyError) && !copyError.empty(),
               "copying no file says so rather than clearing the clipboard");
+    }
+
+    // Wine's WINEHOMEDIR, as the pure string function reads it.
+    {
+        check(hostHomeFromWineHomeDir(L"\\??\\Z:\\home\\deck") == L"Z:\\home\\deck", "the Z: form loses its NT prefix");
+        check(hostHomeFromWineHomeDir(L"\\??\\z:\\home\\deck") == L"z:\\home\\deck", "a lower-case drive is a drive");
+        check(hostHomeFromWineHomeDir(L"\\??\\Z:\\home\\deck\\") == L"Z:\\home\\deck", "a trailing backslash is trimmed");
+        check(hostHomeFromWineHomeDir(L"\\??\\Z:\\") == L"Z:\\", "a bare drive root keeps its backslash");
+        check(hostHomeFromWineHomeDir(L"\\??\\unix\\home\\deck").empty(), "the \\??\\unix form names no drive");
+        check(hostHomeFromWineHomeDir(L"").empty(), "an empty value is an unknown home");
+        check(hostHomeFromWineHomeDir(L"\\??\\Z:\\Users\\sean") == L"Z:\\Users\\sean", "a Mac-style home");
+        check(hostHomeFromWineHomeDir(L"Z:\\home\\deck") == L"Z:\\home\\deck", "a value without the prefix still works");
+        // Not Wine here: the folder is the Desktop, as before, and a host path is the Windows path.
+        if (!runningUnderWine()) {
+            check(logSaveFolder(true) == desktopFolder(), "on Windows the logs go to the Desktop");
+            check(hostPathFor(L"C:\\a\\b.zip") == "C:\\a\\b.zip", "on Windows the path is shown as it is");
+        }
     }
 }
 

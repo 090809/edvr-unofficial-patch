@@ -253,7 +253,7 @@ MUTANTS = [
     M("pin-ini-forgets-the-rule", "R12o", [("#   fitted   when the VR on-foot world route will run (it needs", "#   fitted   when the VR on-foot route will run (it needs")], "the ini's text no longer names the world route", "edvr.ini"),
     M("pin-ini-forgets-the-restart", "R12o", [("# while it runs (never any file on disk). Needs a game restart; typing the", "# while it runs (never any file on disk). Takes effect later; typing the")], "the ini's text no longer says a restart is needed", "edvr.ini"),
     M("pin-ini-curve-stops-it", "R12o", [("fix.panel_curvature, does not stop it)", "fix.panel_curvature at 0)")], "the ini's text says a curved screen holds the route off again", "edvr.ini"),
-    M("pin-ini-curve-at-zero-added", "R12o", [("#            layer on, and EDVR's own OpenXR runtime; a curved screen,", "#            layer on, fix.panel_curvature at 0, and EDVR's own OpenXR runtime; a curved screen,")],
+    M("pin-ini-curve-at-zero-added", "R12o", [("#            layer on, and ED-UP's own OpenXR runtime; a curved screen,", "#            layer on, fix.panel_curvature at 0, and ED-UP's own OpenXR runtime; a curved screen,")],
       "the ini's text lists the old condition beside the new sentence", "edvr.ini"),
     M("pin-ini-says-it-is-the-width", "R12o", [("does not stop it): about 70% of the\n#            width the screen has in your eyes head-on", "does not stop it): the width the screen has in your eyes head-on")],
       "the ini's text says the fitted width is the screen's width, not about 70% of it", "edvr.ini"),

@@ -3,7 +3,7 @@
 `edvr-installer.exe` — one executable, carrying the native graphics/runtime
 pair, `openxr_loader.dll`, its license notice, `edvr.ini`, `edvr-flat.ini` and
 optional NVIDIA DLSS runtime as resources. It finds the game, installs or
-updates EDVR, preserves the settings you have changed, keeps other mods
+updates ED-UP, preserves the settings you have changed, keeps other mods
 working, and can put everything back.
 
 This file is why it does what it does. Using it is one paragraph in the
@@ -13,7 +13,7 @@ This file is why it does what it does. Using it is one paragraph in the
 
 - **One installer:** `edvr-installer.exe` covers VR and flat; the flat
   installer is retired.
-- **Scope:** "Install EDVR for:" offers VR and flat (recommended), VR only, or
+- **Scope:** "Install ED-UP for:" offers VR and flat (recommended), VR only, or
   Flat only; `--scope both|vr|flat` does the same. A new install gets both; an
   existing install keeps its scope.
 - **Scope on disk:** the canonical `edvr_profile.ini` decides the scope. When
@@ -43,13 +43,13 @@ This file is why it does what it does. Using it is one paragraph in the
 The manual install is five steps: place the native pair and bundled loader,
 preserve the original OpenVR DLL, and keep any existing graphics-mod chain.
 
-**Preserve the game's original `openvr_api.dll` for uninstall.** EDVR provides
+**Preserve the game's original `openvr_api.dll` for uninstall.** ED-UP provides
 the compatibility entry points itself and sends frames to native OpenXR. It
 does not load the original library. Keeping that original lets uninstall
 restore the game without requiring launcher file verification.
 
 **One `d3d11.dll` name, several mods that want it.** EDHM installs as
-`d3d11.dll`. So does anything built on 3Dmigoto. Copying EDVR's file over it
+`d3d11.dll`. So does anything built on 3Dmigoto. Copying ED-UP's file over it
 uninstalls the other mod silently — nothing reports an error, the other mod's
 effects are simply gone. The fix is a rename plus one line in `edvr.ini`, which
 is fine as an instruction and unreliable as a habit.
@@ -73,8 +73,8 @@ Nothing is guessed from a fixed path. Each store is asked in its own terms:
 Every answer is then **confirmed by finding `EliteDangerous64.exe`**, and
 anything that fails that test is not offered. A folder the user browses to goes
 through the same confirmation. Odyssey products sort first, since that is what
-EDVR is for. Three storefronts on one machine is not unusual, so when more than
-one install is found the window pre-selects the one that already has EDVR in
+ED-UP is for. Three storefronts on one machine is not unusual, so when more than
+one install is found the window pre-selects the one that already has ED-UP in
 it.
 
 The `Openvr` folder is found by **file, not by name**: `Openvr\win64`, then
@@ -84,7 +84,7 @@ install the renamed original is the only openvr file with a familiar name.
 
 ## Whose file is this?
 
-Every decision below depends on telling EDVR's DLLs from the game's, from
+Every decision below depends on telling ED-UP's DLLs from the game's, from
 another mod's. That question is answered by **mapping the file read-only and
 parsing its export table** — never by loading it. Loading a stranger's
 `d3d11.dll` to ask what it is runs that stranger's `DllMain` inside the
@@ -92,9 +92,9 @@ installer, and the file we are least sure about is exactly the one we would be
 executing.
 
 The discriminator is the same one `tools/gen_exports.py` uses to refuse
-building a proxy of a proxy: **an EDVR build exports `edvr_*` symbols** and
+building a proxy of a proxy: **an ED-UP build exports `edvr_*` symbols** and
 nothing else in this world does. It is tested first and unconditionally — an
-EDVR proxy also exports everything the DLL it stands in for exports, so testing
+ED-UP proxy also exports everything the DLL it stands in for exports, so testing
 for `VR_InitInternal` or `D3D11CreateDevice` first would file every one of our
 own installs as the thing it replaced, and the installer would rename our proxy
 aside believing it had found the game's original.
@@ -112,14 +112,14 @@ sibling for each later one. The newest receipt is the evidence of who owns the
 files now, and it is the only one the installer reads for that.
 
 Its backup of the runtime is the runtime the tool replaced. After one tool
-install that is the game's own `openvr_api.dll`. After two it is the first EDVR
+install that is the game's own `openvr_api.dll`. After two it is the first ED-UP
 runtime, and the game's own is in the older receipt's backup. The installer
 therefore looks for the original in the current receipt first and then in the
 older native receipts, newest first (`readNativeReceiptHistory`,
 `adoptToolOriginal`). An older receipt gets no softer proof than the current
 one: it must be an installed receipt for this folder, name this folder's
 `openvr_api.dll`, keep the backup beside it, record the backup's hash, and the
-backup must probe as a genuine OpenVR runtime and not as EDVR's. Without one
+backup must probe as a genuine OpenVR runtime and not as ED-UP's. Without one
 that passes, nothing is adopted, and flat conversion and uninstall stay blocked
 as before.
 
@@ -133,7 +133,7 @@ as before.
 | ours, same build | left alone (Repair rewrites it anyway) |
 | ours, older | backed up, replaced |
 | another mod | backed up, renamed `d3d11_<mod>.dll`, ours takes the name, `advanced.real_dll` in `edvr.ini` points at it (one value for both profiles, below) |
-| another mod, and we were installed here before | the same, reported as "it has replaced EDVR's d3d11.dll" |
+| another mod, and we were installed here before | the same, reported as "it has replaced ED-UP's d3d11.dll" |
 | another mod, and its own older copy is already parked under that name | the older copy goes to the backup folder, the newcomer takes its place in the chain |
 | unreadable (locked, or not a PE) | nothing is touched, and the report says why |
 
@@ -188,8 +188,8 @@ session with EDHM chained on the build being released. The EDHM HUD shows, the
 gfx log carries the `real dll: ... (from edvr.ini, shared)` line, and the
 openxr log has no `error,D3D11Device,80070005`.
 
-Repair is for when another mod's installer overwrites EDVR's files. A common
-case is EDHM's uninstaller running `del d3d11.dll`, which after an EDVR install
+Repair is for when another mod's installer overwrites ED-UP's files. A common
+case is EDHM's uninstaller running `del d3d11.dll`, which after an ED-UP install
 deletes *ours*. Repair puts both back, side by side.
 
 **Native `openvr_api.dll` and the preserved original**, in `Openvr\win64`:
@@ -297,7 +297,7 @@ follows the same split for every operation:
 
 ## The settings screen
 
-The second tab is every EDVR setting, with what it does, the value it ships
+The second tab is every ED-UP setting, with what it does, the value it ships
 with, and the range it will accept — edited there instead of in Notepad.
 Changes are written straight into `edvr.ini` (or `edvr-flat.ini` when the Flat
 selector is set), keeping its layout and comments, and the game re-reads that
@@ -342,7 +342,7 @@ the Sharpening row shipped as a text box for three releases: the in-headset
 menu echoes `fix.render_sharpness` with `getString` from a file that sorts
 before the pass reading it with `getFloat`, and a text box that shows
 percentages wrote a typed `20` as `20` and showed it back as `2000%`
-([#35](https://github.com/characterecho-sean/edvr-unofficial-patch/issues/35)).
+([#35](https://github.com/characterecho-sean/ed-unofficial-patch/issues/35)).
 The generator's `--self-test` holds that shape, and `build.bat` runs it before
 generating.
 
@@ -371,10 +371,10 @@ and developer instruments — the log names one when it wants you to change it,
 and that is the only way anybody should arrive at them; a list that offers them
 invites changing things nobody asked you to change. The remaining sections
 (`[hotkey]`, `[log]`, `[d3d11]`) are plumbing named after the
-halves of EDVR that read them. A `ui:` line outside `[fix]` is a build error,
+halves of ED-UP that read them. A `ui:` line outside `[fix]` is a build error,
 so the rule cannot drift by accident.
 
-**Every row says when it takes effect.** Most settings are live — EDVR re-reads
+**Every row says when it takes effect.** Most settings are live — ED-UP re-reads
 `edvr.ini` about once a second — and those that are not are marked *restart the
 game*: at present `openxr_resolution`,
 and the two `vscreen_res_*` sizes. That fact is not a fourth list either: it
@@ -414,7 +414,22 @@ line's `--collect-logs` leaves the clipboard alone. The block's layout is
 checked in `installer_test` with the shell's own `DragQueryFileW`; the rig does
 not touch the clipboard.
 
-*Most recent session* is meant literally. EDVR names its logs
+Under Wine, Proton or CrossOver the Desktop is inside the prefix, so the zip
+goes to the host instead. The installer reads `WINEHOMEDIR` (`\??\Z:\home\deck`
+normally), drops the `\??\` prefix, and tries `<home>\Downloads`, then `<home>`,
+then the prefix Desktop, using the first that exists and takes a test file. A
+value with no drive letter (`\??\unix\home\deck`) or no value means the home is
+unknown. The report shows the host path (`/home/deck/Downloads/edvr-logs-....zip`),
+found with `wine_get_unix_file_name` looked up at run time, and falls back to the
+`C:\` path if that fails. After a save, **Copy path** puts the host path on the
+clipboard as text and **Show folder** starts `winebrowser.exe` on the folder,
+which hands it to `xdg-open` (`open` on a Mac). `--collect-logs` makes the same
+folder choice and prints the host path; with `--dry-run` it only prints the
+folder it would save to and writes nothing, not even the test file. None of this runs on real Windows. The
+string handling is a pure function, covered in `installer_test`; the Wine calls
+themselves have not been run on a Wine host.
+
+*Most recent session* is meant literally. ED-UP names its logs
 `edvr_<gfx|vr>_YYYYMMDD_HHMMSS.log` and writes two a few seconds apart at each
 launch, so the newest stamp and everything within three minutes of it is one
 session; older sessions are left out, because an attachment with six launches
@@ -468,7 +483,7 @@ dumps, post-crash alert banners, and active process guards) are documented in
   the rig, under a stand-in for a scanner, saw it in a few runs in a hundred.
   Copies, deletes and the rollback itself still do not wait.
 - **Uninstall never leaves the folder without an `openvr_api.dll`.** If the
-  game's original is missing it is restored from an EDVR backup, and if there
+  game's original is missing it is restored from an ED-UP backup, and if there
   is no backup either, ours stays where it is with an explanation — removing it
   would be worse than leaving it.
 - **The install record is written last**, so a run interrupted half way leaves
@@ -503,9 +518,9 @@ the game's executable, where NGX looks for it, under three rules. Only where an
 NVIDIA adapter is present, by DXGI's vendor id (a machine with an AMD
 integrated GPU beside an RTX card counts): it is 59 MB, and on any other card
 the pass falls back to its own history regardless. Only when the slot is empty
-or holds the copy a previous EDVR install placed: a copy you put there
+or holds the copy a previous ED-UP install placed: a copy you put there
 yourself, or one NVIDIA's updater replaced, is left alone, and the report says
-so. And uninstall removes only the copy EDVR placed, by the hash in the install
+so. And uninstall removes only the copy ED-UP placed, by the hash in the install
 record. A build made without the DLSS SDK ships an installer without the
 runtime, and says so in its window and its report.
 
@@ -530,7 +545,7 @@ edvr-installer.exe --collect-logs [--dir D]
 edvr-installer.exe --help
 ```
 
-`--scope` is the window's "Install EDVR for:" choice: `both` (VR and flat),
+`--scope` is the window's "Install ED-UP for:" choice: `both` (VR and flat),
 `vr` or `flat`. Without it, the scope already installed is kept, and a new
 install gets `both`. `--replace-settings` does what it says. Without `--dir` it
 finds the installs itself and refuses to guess when there is more than one.

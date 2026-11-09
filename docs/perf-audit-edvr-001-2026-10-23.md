@@ -62,6 +62,7 @@ census design. This doc records what EDVR's review made of it and what was built
   - G03 was measured with the seed census and ruled out: it saves no seeds.
   - The repeat-seed depth skip is flown and on main (6716f875).
   - See "2026-10-30: HUD layer seed" below.
+- **2026-11-08 (v0.22.0 review):** five cuts on main 9bd1b9dd, flown 2026-11-09: "Flight results".
 
 ## What was built
 
@@ -310,8 +311,103 @@ pixels are across waves (one such pixel holds its whole wave in the loop), and o
   already measured. They should be unchanged in kind. Only a same-scene A/B of the motion pass, or
   a rig bench, would show the price.
 
+## 2026-11-08: pre-release review
+
+A read-only review of main 649c4639 before the v0.22.0 release, run as eight area reviews. Every item
+below was checked against the source and, where a log line exists, against the day's Steam VR flights
+(v0.22.0-rc.6-401..417, eye render 2016x2017). Each change keeps output identical. The combined tree
+built green at 4c30ab13. Not flown.
+
+- **Concourse entry (8b5f84da).** Measured: "concourse bake: armed: the cube is ready and empty after
+  78-125 ms", then "...the VR capture shader and its buffers are ready after 62-94 ms", on the render
+  thread at every entry. The causes:
+  - runtime D3DCompile of the bake CS and the VR capture CS;
+  - three backdrop pixel shaders, released with the cube and so compiled again at every entry;
+  - a 33.5 MB zero buffer uploaded as initial data to 12 cube faces.
+  The fix: seven shaders are now build-time bytecode in temporal_shader_build, each pinned to the
+  former call's text hash, profile and flags. The backdrop shaders are held per device, like
+  `g_csBake`. The cubes are created empty and cleared on the GPU before the front pair is published
+  from them. The mark VS stays a runtime compile, because it embeds `diag.concourse_mirror_beyond`.
+- **ConcoursePaneScope on every draw (same merge).** All ~330 bytes of members had default
+  initialisers, and begin() is out of line. A replica of the unarmed draw with the production flags
+  took 72 instructions, 34 stores and a /GS cookie, against one tail jump without the scope.
+  - Now the constructor sets three members and begin() sets the rest first. The blend factors became
+  flat floats, because MSVC guards FLOAT[4]. The replica takes 29 instructions and 4 stores, with no
+  cookie from the scope.
+  - The scope sits inside the DrawClock bracket, so "draw hook CPU:" books it as forwarded game time:
+  that line cannot show this cost or its saving. Use tools\cpu_profile.py.
+- **30 s reports (0eaccc43).** Measured: the runtime's frame_cycle_report took up to 2.21 ms on Elite's
+  WaitGetPoses thread, and its span missed emitOwnerInvoke and emitPoseCache. The gfx log's
+  ui_layer_totals took up to 0.88 ms on the render thread.
+  - Both now use order-statistic selection instead of full sorts, with byte-identical text. The rigs
+  are openxr_frame_test and ui_quality_test, each against the old sort.
+  - The runtime's lines go out in one write; the lines of one report now share a timestamp.
+  - The report stays on Elite's thread: makeReport runs under the stats mutex, and the emit functions
+  read state other threads write.
+- **UI layer route timers (same merge).** routeBegin timed every VR write-back, composite, tonemap,
+  coverage, seed and clear: about 40 timestamp pairs a frame with a HUD up. They were untagged, so
+  they were most of the 37-102 "other" Ends a frame in the "gpu timing queries:" line.
+  - Their only reader is the 30 s price line. They now time one eye-frame in 16, whole
+  (`seq & 15 == 0`), and count as the new owner `ui_route`.
+- **Small ones (4c30ab13).**
+  - Hotkey::pressed skips the modifier and focus queries while the key is up: 6-7 user32 calls per
+  bound key per frame.
+  - f9ProbeTick compares the raw HRC fields before building its formatted key.
+  - The flat foreground block takes the vs/ps bytes from the domain proof memo, instead of two
+  mutex-guarded map finds per draw.
+- **Flight checks** (`edvr_log.py --expect-build <commit>` first):
+  - both "armed ... after N ms" lines in single digits;
+  - "periodic work: frame_cycle_report" and "ui_layer_totals" lower than before (the runtime span is
+    now the whole report);
+  - "gpu timing queries:" "other" well below 37, with ui_route about a sixteenth of the old count;
+  - HUD, holograms, the concourse windows and the bake unchanged; in flat, the cockpit, the weapon
+    and the hotkeys unchanged.
+- **Left for the maintainer's decision** (temporary instruments that ship):
+  - the H62 draw diff, which runs on every draw of a VR bake's aim frames;
+  - the concourse `diag.*` keys;
+  - the runtime's F87h head sample on every WaitGetPoses;
+  - the native on-foot measure-only probes (F9, F54, findJoint census), installed in every VR session.
+- **Measure first:**
+  - a duplicate xrLocateSpace (game pose against the pose cache's now slot);
+  - always-on producer GPU timing;
+  - the desktop window's per-Present RTV creation;
+  - the concourse share queries;
+  - #169's copy, which needs a census scope first;
+  - flat late-overlay replay depth copies;
+  - flat foreground UpdateSubresource under DXVK.
+
+### Flight results (2026-11-09)
+
+Steam, Windows, VR and flat, on v0.22.0-rc.7-264-gd5241a7b and -268-ga89e193e, both of which hold
+9bd1b9dd. The baseline is the same rig on 2026-11-08 at 12:43 and 13:07 (v0.22.0-rc.6-414 and -417),
+before the cuts.
+
+- **A1 holds.** "the cube is ready and empty after" reads 0 ms at all five VR entries in three
+  flights, and the VR capture line reads 0 ms beside each. Flat reads 0 ms at a89e193e and 15 ms once
+  at d5241a7b. The baseline's first entries read 93 and 78 ms, then 78 and 94 ms. No log has a
+  runtime compile line.
+- **A2 holds.** The runtime's frame_cycle_report peaks at 0.76-1.63 ms a report, against 1.70-2.21
+  ms before (one SLOW at 2.205). The gfx log's ui_layer_totals peaks at 0.08-0.26 ms, against
+  0.55-1.30 ms before, after one flight's first window at 1.46 ms.
+- **A4 applied, smaller than expected.** `ui_route` reads 0.14-1.21 a frame. In the first three
+  windows of each flight, "other" went from 32.7-44.4 a frame to 27.8-38.8. The route timers were
+  about 8 of it. The rest is untagged GpuTimer queries, which have not been named.
+- A3 and A5 have no log line of their own.
+
 ## Ruled out (with reasons)
 
+- ruled out: the UI layer's route timers as most of the "gpu timing queries:" "other" count
+  (2026-11-09), because timing one eye-frame in 16 took "other" from 32.7-44.4 a frame to 27.8-38.8,
+  not well below 37 (Steam flights on a89e193e and d5241a7b).
+
+- ruled out: the journal watcher's directory walk as a frame cost (2026-11-08), because it runs on the
+  watcher's worker (journal_watch.cpp:746-747). Measured: 4-9 ms, once 41.5 ms, every 12 s over 3,140
+  files, as background CPU only.
+- ruled out: the F23 load-stages probe as a cost (2026-11-08), because its dispatcher ran 3,516 times
+  over a 40 s load and is idle outside loads.
+- ruled out: hookedEnd as the cost of EDVR's timing queries (2026-11-08), because it is a few loads
+  before realEnd (vscreen.cpp:5063). The cost is the driver's work per query, so the cut is fewer
+  queries.
 - ruled out: CPU-03 (skip DS/blend inspection on a known MRT refusal), because no MRT/UAV refusal
   appears in four current VR logs. The seeder is already warmed at the frame boundary, so the
   "first-use" side effect is moot.

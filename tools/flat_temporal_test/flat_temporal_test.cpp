@@ -2939,13 +2939,13 @@ void testFlatCpuWiring() {
     const auto endBody=endAt!=std::string::npos&&dtorAt!=std::string::npos?runtimeCpp.substr(endAt,dtorAt-endAt):std::string{};
     bool drawOutsideCallbacks=true;size_t hookAt=0;
     // The span from beginActualDraw to endActualDraw is a proximity bound, not a ceiling on useful work: since 2026-11-03 the four instanced/indexed/plain
-    // hooks hold a FlatParticleScope block around the game's issue (fix.particle_billboard), the longest span being DrawIndexedInstanced's at 447 characters.
+    // hooks hold a FlatParticleScope block around the game's issue (fix.particle_billboard), the longest span being DrawIndexedInstanced's at 447 characters. Since 2026-11-05 the ConcoursePaneScope line (concourse_pane.h) adds about 80 more to each of the indexed hooks. Since 2026-11-06 each of the four indexed hooks also issues the mirror draw (beginMirror), up to 260 more, so the bound is 850.
     for(unsigned i=0;i<7;++i) {
         const auto before=vscreenCpp.find("if (flatDraw.needsActualDraw()) flatDraw.beginActualDraw",hookAt);
         const auto draw=before==std::string::npos?std::string::npos:vscreenCpp.find("g_state->realDraw",before);
         const auto after=before==std::string::npos?std::string::npos:vscreenCpp.find("if (flatDraw.needsActualDraw()) flatDraw.endActualDraw",before);
         drawOutsideCallbacks=drawOutsideCallbacks&&before!=std::string::npos&&draw!=std::string::npos&&
-            after!=std::string::npos&&before<draw&&draw<after&&after-before<500;
+            after!=std::string::npos&&before<draw&&draw<after&&after-before<850;
         hookAt=after==std::string::npos?vscreenCpp.size():after+1;
     }
     check(beginBody.find("if(!ctx)return;")<beginBody.find("flatcpu::Scope callbacks(flatcpu::kIssueCallbacks);")&&
@@ -3912,8 +3912,15 @@ void testFlatWrapperNoteWiring() {
     struct Pin { const std::string* text; const char* needle; unsigned times; const char* what; };
     const Pin pins[] = {
         {&proxyCpp, "#include \"flat_wrapper_note.h\"", 1, "the probe takes the decision from its header"},
-        {&proxyCpp, "edvr::vtableDominantOtherModule(vt, kSample, g_systemModule, owner, sizeof(owner))", 1,
+        {&proxyCpp, "edvr::vtableDominantOtherModule(vt, kSample, systemModule, owner, sizeof(owner))", 1,
          "the probe asks which module backs the methods, excluding Windows' d3d11.dll"},
+        // The module those two calls and the count read is the one probeSystemModule checked by path (src\common\system_d3d11.h),
+        // never the handle LoadLibrary returned in DllMain: a hook on LoadLibraryExW can answer that with another module, and the
+        // probe then read 0 of 96 for a context whose methods were all Windows' own (docs\windows-d3d11-system-module-2026-11-07.md).
+        {&proxyCpp, "HMODULE const systemModule = probeSystemModule();", 1,
+         "the probe takes Windows' d3d11.dll from probeSystemModule, which checks it by path, not from the DllMain handle"},
+        {&proxyCpp, "edvr::vtableEntriesInModule(vt, kSample, systemModule)", 1,
+         "and counts the context's entries against that module"},
         {&proxyCpp, "flatWrapperFile(mode, probed, owner)", 1, "and lets the header decide from the mode it used and what it alone chose"},
         {&proxyCpp, "g_wrapperFileSet.store(true, std::memory_order_release);", 1, "the name is published once, after it is written"},
         {&proxyCpp, "const char* contextWrapperFile() {", 1, "and read back through one accessor"},

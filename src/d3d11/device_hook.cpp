@@ -49,8 +49,10 @@ extern "C" IMAGE_DOS_HEADER __ImageBase;
 #include "flat_stationary_camera_capture.h"  // mapCameraFrame (the VR map camera's publisher)
 #include "galaxy_map_pointer.h"                // mapPointerFrame (the VR Galaxy Map's hover and panel depth)
 #include "optimized_station.h"   // fix.optimized_stations: the sealed-hangar station (install, the frame tick, the store and the sun skip)
+#include "concourse_pane.h"   // TEMPORARY (docs\concourse-cull-2026-11-05.md): the concourse panes' frame tick
 #include "store_hook.h"
 #include "flat_world_witness.h"
+#include "onfoot_recorder.h"   // F213: onfootrec::mark, the on-foot mark key's job
 #include "native_on_foot_hooks.h"   // nativeOnFootHooksFrameBoundary (the frame tick) and nativeOnFootHooksShutdown (the avatar dither-fade global goes back at an unload)
 #include "ui_surfaces.h"   // the glyph atlas and sizing chain instruments
 #include "ui_panel_scale.h" // uiPanelScaleShutdown: the panel operands put back
@@ -293,10 +295,12 @@ struct State {
     Hotkey frameGenKey;
     // Phase 2.4: the value the key last turned off (auto, on), which the next press restores; Off: none yet, so auto.
     FrameGenMode frameGenLastOn = FrameGenMode::Off;
+    // The on-foot flight recorder's mark (F213, hotkey.on_foot_mark): a line in the recording and in the log at the moment of a press. Bound by default (F9).
+    Hotkey onFootMarkKey;
     // What each of those was last bound from (the ini text), so a reload
     // that changes one re-resolves it and one that does not says nothing: the
     // settings menu's Hotkeys page writes them while the game runs.
-    std::string dumpKeyText, censusKeyText, eyesKeyText, gpuPassKeyText, blendProbeKeyText, frameGenKeyText;
+    std::string dumpKeyText, censusKeyText, eyesKeyText, gpuPassKeyText, blendProbeKeyText, frameGenKeyText, onFootMarkKeyText;
     bool        diagnosticKeysBound = false;
     // The player's own FSS enter/quit keys, adopted from their Elite
     // bindings; they give the FSS mode latch its frame-exact edges.
@@ -783,6 +787,7 @@ HRESULT STDMETHODCALLTYPE hookedCreatePS(ID3D11Device* self, const void* bytecod
         captureFlatShader('p', hash, bytecode, len);
         { cross_profile::CaptureScope capture(!runtimeFlatProfile()); rememberFlatProbeShader('p', hash, bytecode, len); }
         registerShaderHash(*out, hash);
+        concoursePaneNoteShader(hash, bytecode, static_cast<size_t>(len));
         engineVelocityRememberPs(static_cast<ID3D11PixelShader*>(*out),hash,bytecode,static_cast<size_t>(len),linkage!=nullptr);
         remlokRememberVisorPs(hash, bytecode, static_cast<size_t>(len));   // F27: the visor shader's bytes, for the per-eye variants
         if (runtimeScopeIncludesFlat()) {
@@ -1246,6 +1251,7 @@ EDVR_BOUNDARY_TICK(tkSchedulerProbe, "scheduler_probe");
 EDVR_BOUNDARY_TICK(tkVtableWatch, "vtable_watch");
 EDVR_BOUNDARY_TICK(tkVrRuntime, "vr_runtime");
 EDVR_BOUNDARY_TICK(tkOptimizedStation, "optimized_station");
+EDVR_BOUNDARY_TICK(tkConcoursePane, "concourse_pane");   // TEMPORARY: the concourse panes (concourse_pane.h); one key poll and a few atomic stores a frame
 EDVR_BOUNDARY_TICK(tkLightGridCache, "light_grid_cache");
 EDVR_BOUNDARY_TICK(tkHotkeys, "hotkeys");
 EDVR_BOUNDARY_TICK(tkAaCompare, "aa_compare");   // hotkey.compare_aa: the AA comparison toggle (aa_compare.h); one key poll when idle
@@ -1397,6 +1403,8 @@ void tickHotkeys() {
             }
         }
     }
+    // F213: the on-foot recording's mark. Nothing else happens on this thread for it.
+    if (g_state->onFootMarkKey.pressed()) onfootrec::mark();
     if (g_state->missedCensusNotes < kMissedDumpNotes &&
         g_state->censusKey.takeMissedWhileUnfocused()) {
         ++g_state->missedCensusNotes;
@@ -1655,6 +1663,7 @@ void presentFrameBoundary() {
     tkVrRuntime.run([] { vrRuntimeTick(); });
     // The optimized station's tick: the setting, the seal and release rules, the held cell in the pad's frame, the 30 s summary.
     tkOptimizedStation.run([] { optimizedStationFrame(static_cast<uint32_t>(g_state->frameCounter)); });
+    tkConcoursePane.run([] { concoursePaneTick(g_state->device, static_cast<uint32_t>(g_state->frameCounter), GetTickCount64()); });
     tkLightGridCache.run([] { lightGridCacheNoteFrame(g_state->frameCounter); });   // the frame count for the grid cache's 30 s line
     tkHotkeys.run(tickHotkeys);
     tkIntroSkipFlat.run([] { introSkipTickFlat(); });
@@ -1876,6 +1885,7 @@ HRESULT STDMETHODCALLTYPE hookedPresent(IDXGISwapChain* self, UINT syncInterval,
         formatDesktopVsync(line, sizeof(line), flatProfileNow, syncInterval);
         Log::get().note("%s", line);
     }
+    if (flatProfileNow && !(flags & DXGI_PRESENT_TEST)) concoursePaneBakePresent(self);   // TEMPORARY (the concourse bake): keeps the back buffer, or puts the kept image back. One load otherwise
     const int64_t presentT0 = qpcNow();
     const HRESULT hr = g_state->realPresent(self, presentSync, flags);
     const int64_t presentT1 = qpcNow();
@@ -2168,6 +2178,12 @@ void configureDiagnosticHotkeys() {
          "hotkey: frame_generation is set but bound nothing, so the frame generation key is off this session "
          "(the Performance page's row still works).",
          " Each press turns fix.frame_generation off, or back to the value it last turned off (auto at first; saved to the ini, like the Performance page's row), and says so in a toast."},
+        // F213: the on-foot flight recorder's mark. Bound by default (F9 is in none of Elite's stock control schemes); a press only counts, writes one mark record when the
+        // recorder is running and says so in the log either way. It does not touch the eye dump, which stalls a frame.
+        {&s.onFootMarkKey, &s.onFootMarkKeyText, Config::get().getString("hotkey.on_foot_mark", "F9"),
+         "hotkey.on_foot_mark", "on-foot mark",
+         "hotkey: on_foot_mark is set but bound nothing, so a press cannot mark the on-foot recording this session.",
+         " A press writes a mark into the on-foot recording (log.on_foot_detail) and a line to the log."},
     };
     for (Item& it : items) {
         if (!first && *it.applied == it.value) continue;
