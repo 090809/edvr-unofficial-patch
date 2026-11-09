@@ -314,6 +314,8 @@ std::atomic<uint32_t> g_f216PubSeq{0};                        // F216: the P1 ho
 nofoot::f216::Pub g_f216PubMove;
 std::atomic<bool> g_f222Key{true};                            // F222 (TEMPORARY): experimental.native_on_foot_steady_body_in_turns, on by default, live: the eye's heading, up and offset are taken in the frame the rows were drawn in
 bool g_f222KeyLast = true;                                    // the value last logged (frame thread; the first read always logs)
+std::atomic<bool> g_previewCamKey{true};            // experimental.native_on_foot_preview_camera, as the frame thread last read it (F231, TEMPORARY)
+bool g_f231KeyLast = true;                          // frame thread: the value last logged
 bool g_f230KeyLast = true;                                    // F230 (TEMPORARY): experimental.native_on_foot_livery_camera_repair, on by default, live: the value last logged (frame thread; the first read always logs); the value lives in native_on_foot_hooks.cpp (nativeOnFootSetLiveryRepair)
 bool g_f228KeyLast = true;                                    // F228 (TEMPORARY): experimental.native_on_foot_livery_game_view, on by default, live: the value last logged (frame thread; the first read always logs); the key's value lives in native_on_foot_hooks.cpp (nativeOnFootSetLiveryHold)
 nofoot::f222::OwnFrame g_f222;                                // F222: the rotations of the last two pin frames and the rows' vectors in the model (one writer: the pin hook, under g_pfzBusy; reset at an edge)
@@ -2732,8 +2734,6 @@ void meshSiteTick(MeshSite& s, bool want, const char* reason) {
 // ---- F231 (TEMPORARY key experimental.native_on_foot_preview_camera): the preview camera patch, 45 33 C0 -> 41 B0 01 at +0x126FE70 (preview_camera_core.h holds the bytes, the rule and the lines) -----
 // Applied while the key is on and native stereo is on foot with the first-person HUD override held (the panel patch's condition); verified (21 bytes) before the write; written as ONE interlocked
 // compare-exchange of the aligned qword holding the three bytes, so another thread executing them never sees a mix; put back while the bytes still read as ours, and at shutdown.
-std::atomic<bool> g_previewCamKey{true};            // experimental.native_on_foot_preview_camera, as the frame thread last read it
-bool g_f231KeyLast = true;                          // frame thread: the value last logged
 previewcam::Patch g_previewPatch;                   // frame thread only
 previewcam::Event g_previewLastRefusal = previewcam::Event::kNone;   // frame thread only: the refusal already said
 __declspec(noinline) bool casCodeQword(uintptr_t address, uint64_t expected, uint64_t desired) noexcept {
