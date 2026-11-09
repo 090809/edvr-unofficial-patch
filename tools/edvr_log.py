@@ -10657,6 +10657,9 @@ H_HULL_LIGHTS = (r"hull layer: dump (?P<stamp>\S+): HullLights (?P<status>[\w ]+
                  r"lighting, (?P<reissued>\d+) re-issued, (?P<unknown>\d+) unknown writing the HDR, (?P<stencil>\d+) stencil-only\)")
 H_HULL_SEQ = (r"hull layer: dump (?P<stamp>\S+): HullSeq (?P<written>\d+) of (?P<wanted>\d+) frames written \(eye 0 from frame (?P<frame>\d+), "
               r"(?P<mb>[\d.]+) MB\), history (?P<hist>[^;]+); end: (?P<end>[^(]+?) \(")
+# The rig seed (docs "Rig seed", 2026-11-10): the own mask's seed source, its 30 s line after the report line (a build before it has none).
+H_HULL_SEED = (r"hull layer: own seed: rig=(?P<rig>\d+) draw=(?P<draw>\d+) hold_resets=(?P<resets>\d+) rig_slots=(?P<s_lo>\d+)/(?P<s_mid>\d+)/(?P<s_hi>\d+) "
+               r"radius=(?P<r_lo>\d+)/(?P<r_mid>\d+)/(?P<r_hi>\d+) reach=(?P<h_lo>\d+)/(?P<h_mid>\d+)/(?P<h_hi>\d+)")
 # The rest of its lines (the dump armed, a private copy made or dropped, a cap or a create failure said once, an unknown key value, the seed's facts and
 # refusals, the shaders): matched, not judged.
 H_HULL_OTHER = (r"hull layer: (?:dump \S+ armed|private copy (?:made|of a)|\d+ private (?:copies|views) held|a \d+x\d+ format \d+ target is multisampled|"
@@ -17530,6 +17533,19 @@ def _hj_hull_layer(rows, ctx=None):
     if ao_broken:
         return ("PARTIAL", text + ": the game's AO chain ran, but no eye-frame had it re-issued in full on the private G-buffer (the hull has no AO; the "
                                   "missed counts say at which step)")
+    # The rig seed: where the own mask grew from. A build before it has no 'own seed' line and is not judged on it.
+    seeds = rows.get("seed", [])
+    if seeds:
+        rig = sum(int(r["rig"]) for r in seeds)
+        draw = sum(int(r["draw"]) for r in seeds)
+        ls = seeds[-1]
+        text += ("; own seed: %d eye-frame(s) from the rig probe's own slots, %d from the seed draw (fallback), %d hold restart(s); last line: slots "
+                 "%s/%s/%s, radius %s/%s/%s m, reach %s/%s/%s m"
+                 % (rig, draw, sum(int(r["resets"]) for r in seeds), ls["s_lo"], ls["s_mid"], ls["s_hi"], ls["r_lo"], ls["r_mid"], ls["r_hi"],
+                    ls["h_lo"], ls["h_mid"], ls["h_hi"]))
+        if rig == 0 and draw > 0:
+            return ("PARTIAL", text + ": every own mask grew from the seed draw, the fallback that took the wrong object in 14 of 45 dumps; the rig probe "
+                                      "gave no own slot (its row says why)")
     return ("OK", text)
 
 
@@ -19075,6 +19091,7 @@ HEALTH_RULES = (
         ("gpu", H_HULL_GPU),
         ("lights", H_HULL_LIGHTS),
         ("seq", H_HULL_SEQ),
+        ("seed", H_HULL_SEED),
         ("_", H_HULL_OTHER),
     ), _hj_hull_layer),
     # The hull layer's rig probe (diag.hull_layer, TEMPORARY): its own row, from the "hull layer: rig_probe" lines health_scan routes here.
@@ -26907,6 +26924,19 @@ def self_test_health():
         check("hull layer: separate, discarded and never composited, is PARTIAL", hl_base + [hl_key("separate"), hl_report(), hl_main(),
                                                                                          hl_comp(comp=0, ready=0, fail=(0, 0, 0, 5400), declined=(5400, 0, 0))],
               0, [("PARTIAL", HL)], has=["no eye-frame was composited", "misses seed 0, lit 0, tone 0, composite 5400; declined stale 5400"])
+
+        def hl_seed(rig=5300, draw=100, resets=2, slots=(12, 14, 46), radius=(84, 87, 91), reach=(54, 57, 61)):
+            return RH("hull layer: own seed: rig=%u", rig, draw, resets, slots[0], slots[1], slots[2], radius[0], radius[1], radius[2], reach[0], reach[1],
+                      reach[2])
+
+        check("hull layer: the rig seed's line is parsed and said, the verdict unchanged", hl_base + [hl_key(), hl_report(), hl_seed()], 0, [("OK", HL)],
+              has=["own seed: 5300 eye-frame(s) from the rig probe's own slots, 100 from the seed draw (fallback), 2 hold restart(s); last line: slots 12/14/46, "
+                   "radius 84/87/91 m, reach 54/57/61 m"], lacks=["UNPARSED", "do not match"])
+        check("hull layer: every own mask from the seed draw is PARTIAL", hl_base + [hl_key(), hl_report(), hl_seed(rig=0, draw=5400, resets=0, slots=(0, 0, 0),
+                                                                                                                     radius=(0, 0, 0), reach=(0, 0, 0))],
+              0, [("PARTIAL", HL)], has=["every own mask grew from the seed draw", "the rig probe gave no own slot"])
+        check("hull layer: a drifted own seed line is counted as unparsed", hl_base + [hl_key(), hl_report(), hl_seed().replace(" hold_resets=", " resets=")],
+              0, [("OK", HL)], has=["+1 line(s) the rule's patterns do not match: [10:00:04.000] hull layer: own seed"], lacks=["own seed: 5300"])
         # ---- the hull layer's rig probe (diag.hull_layer, TEMPORARY): its own row, from the C format strings in src\d3d11\hull_rig_probe.cpp ----
         rpsrc = read_text(os.path.join(repo_root(), "src", "d3d11", "hull_rig_probe.cpp"))
 
