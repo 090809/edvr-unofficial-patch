@@ -2634,9 +2634,9 @@ void testShopGlue(const CtlPages& p) {
         rig.cap.clear();
         shopShow(&outf);
         rig.boundary();
-        check(!nativeOnFootShopOpen() && !nativeOnFootLiveryOpen() && rig.cap.count(shopEventLine("HumanoidOutfittingInteraction", "Show", 0, 1, &outf).c_str()) == 1 &&
+        check(!nativeOnFootLiveryOpen() && rig.cap.count(shopEventLine("HumanoidOutfittingInteraction", "Show", 0, 1, &outf).c_str()) == 1 &&
                   rig.cap.count("HumanoidOutfittingInteraction 1 s: this 0x") == 1,
-              "F229: the loadout browser's Show is logged and its client's camera line written, and neither the shop signal nor the Livery reading moves");
+              "F229: the loadout browser's Show is logged and its client's camera line written, and the Livery reading does not move (the shop signal follows F234's key)");
         // closed screens are not read
         shopClose(&outf);
         rig.boundary();
