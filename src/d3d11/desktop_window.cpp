@@ -31,6 +31,7 @@
 #include "../common/native_desktop_window.h"
 #include "../common/timing.h"
 #include "graphics_runtime.h"
+#include "native_on_foot.h"   // g_nativeLastEffective: the render mode the game was last given (a cinema mode keeps the game's window shape)
 #include "shader_swap.h"
 #include "vr_world_route.h"
 
@@ -51,6 +52,7 @@ constexpr unsigned kFightsAllowed = 10;         // the game moves the window off
 constexpr unsigned kUnsettledAllowed = 20;      // requests in a row after which the window never reached its target: we stop for the session
 constexpr unsigned kRequestLogCap = 32;
 constexpr unsigned kActivationLogCap = 8;
+constexpr unsigned kCinemaLogCap = 32;          // the flat screen's begin and end lines (holdGameShape)
 
 // ---- the handoff: the latest finished texture of each eye, from the XR owner thread ----
 struct Held {
@@ -206,6 +208,10 @@ struct Session {
     unsigned userMoves = 0, userResizes = 0;     // seen since the last 10 s line
     bool gaveUp = false;
     uint64_t lastRequestMs = 0, lastEvaluateMs = 0;
+    // the game's flat screen (holdGameShape): the window is the game's own shape while the game is in a cinema render mode
+    bool cinema = false;                // the game was in a cinema mode at this activation's last Present
+    bool cinemaRestored = false;        // the window has been put back for it (or there was nothing to put back)
+    unsigned cinemaLines = 0;
     // log-once memory
     char declined[8][128] = {};
     unsigned declinedCount = 0;
@@ -746,12 +752,51 @@ void restoreWindow(char* out, size_t size) {
     S.unsettled = 0;
 }
 
+// The game's flat screen (2026-11-09, Steam). In a cinema render mode (5 or 6: the flat screen shown in the headset, which is on foot with fix.native_on_foot
+// off) the game lays out its 2D interface for its own window's shape. The on-foot HUD's layout scale is min(1, aspect / 1.7222), so a window at the eye's shape
+// (2041x2032) made it 0.583 and the HUD was drawn shrunk toward the middle of the virtual screen; at the game's own 3840x2160 it is 1.000 (the F16 "hud part"
+// lines' hrc=(S,..), every cinema stretch since round 2). While the mode lasts the window is put back to the game's own shape, as at the end of an activation,
+// and not reshaped; the picture is still drawn, undistorted, with bars. When it ends, evaluateWindow's first look takes the window to the picture's shape again,
+// from where it last settled. A reshape of ours still in flight is given its time to land first, so it cannot land after the restore. The mode is the one the
+// native on-foot setter hook last forwarded (installed whatever fix.native_on_foot says); without the hook it is never a cinema mode and nothing changes.
+// Returns true while the window is held at the game's shape.
+bool holdGameShape(uint64_t now) {
+    const uint32_t mode = g_nativeLastEffective.load(std::memory_order_relaxed);
+    const bool cinema = nofoot::isCinemaMode(mode);
+    if (!cinema) {
+        if (S.cinema) {
+            S.cinema = false;
+            S.lastEvaluateMs = now;   // the restore (queued at most moments ago in a short stretch) lands before the window is next read as the game's
+            if (S.cinemaRestored && ++S.cinemaLines <= kCinemaLogCap)
+                Log::get().note("desktop window: the game's flat screen ended (render mode %u); the window takes the picture's shape again%s", mode,
+                                S.cinemaLines == kCinemaLogCap ? " (the last such line)" : "");
+        }
+        return false;
+    }
+    if (!S.cinema) {
+        S.cinema = true;
+        S.cinemaRestored = false;
+    }
+    if (!S.cinemaRestored && (!S.pending || now - S.lastRequestMs >= kRequestEveryMs)) {
+        S.cinemaRestored = true;
+        char window[200];
+        restoreWindow(window, sizeof window);
+        if (++S.cinemaLines <= kCinemaLogCap)
+            Log::get().note("desktop window: the game shows its flat screen in the headset (render mode %u); the window keeps the game's own shape while it does, "
+                            "because the game lays out the screen's interface (the on-foot HUD) for the window's shape -- %s%s", mode, window,
+                            S.cinemaLines == kCinemaLogCap ? " (the last such line)" : "");
+    }
+    return true;
+}
+
 // The activation ends. Said once, with its reason and what became of the window.
 void leave(const char* reason) {
     g_desktopWindowBack.store(nullptr, std::memory_order_relaxed);
     desktopWindowCursorSetActive(false);   // the cursor hooks pass everything through again
     if (!S.active) return;
     S.active = false;
+    S.cinema = false;   // the next activation looks at the mode afresh
+    S.cinemaRestored = false;
     char window[200];
     restoreWindow(window, sizeof window);
     char line[500];
@@ -1072,7 +1117,7 @@ Outcome presentActive(IDXGISwapChain* swap, ID3D11Device* device, uint64_t now, 
         if (ClientToScreen(hwnd, &centre)) desktopWindowCursorPublishCentre(centre.x, centre.y);
     }
     desktopWindowCursorHide(hwnd);   // the cursor over the picture, while the window has focus (round 4)
-    evaluateWindow(swap, hwnd, aspect, now);
+    if (!holdGameShape(now)) evaluateWindow(swap, hwnd, aspect, now);
 
     bool stale = false;
     for (unsigned eye = 0; eye < 2; ++eye) {
