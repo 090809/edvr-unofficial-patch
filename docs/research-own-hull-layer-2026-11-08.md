@@ -11,16 +11,16 @@ The smear is terrain that is newly uncovered at the hull edge every frame
 ## Status
 
 * **Separate mode WORKS in the headset (2026-11-08 ~22:00, build
-  4e252a32, FG off).** The pilot's verdict: "the ship is drawn, the terrain
-  smear seems gone, I don't feel it, the HUD is in place and correct".
-  **Bug:** the game's night vision no longer applies to the own ship,
-  because the hull is composited after the game's image. Next: one
-  dump with night vision on and one off, at the same spot, to find the
-  night-vision draws in the census, then re-issue them on the hull layer.
+  4e252a32, FG off):** the ship is drawn, the terrain smear is gone, the
+  HUD is correct (the pilot).
+* **Night vision state** (section "Night vision state and the hangar
+  light", compile-only, not flown): the hull re-issue of night vision's
+  draw runs with EDVR's state (it was ~8x dark); FCF7 no longer reopens
+  the lighting window; A7339D1F is a light. **Next dump:** night vision
+  on, compare median ~1.0, `night_vision=N/N` on the state line.
 * **Step 1 CONFIRMED (2026-11-08 20:30, build cfa4e5f5):** the private
-  layer, picked per record by the GPU own mask and re-lit by re-issuing the
-  game's lighting, equals the game's HDR where the game shows the hull
-  (median ratio 1.000, 85-98% bit-exact; AO and decals the residue).
+  layer equals the game's HDR where the game shows the hull (median
+  1.000, 85-98% bit-exact; AO and decals the residue).
 * **Step 2** (section "Step 2 build"): `separate` discards the own records in
   the main pass with an own-discard variant of the patched hull and decal PS
   (mask at PS t127). **Open:** the 6 own forward draws still draw in the world.
@@ -28,8 +28,8 @@ The smear is terrain that is newly uncovered at the hull edge every frame
   re-issue, own TAA, composite onto dlSubmit after the UI resolve.
 * **AO** (section "AO on the hull layer"; not flown): the game's AO chain
   re-dispatched on the private depth copy and RT0. The `ao:` line: 3.00.
-* **Dump v2** (section "Dump v2"; not flown): census whole, passes timed,
-  reference frame, `HullLights.json`, TAA sequence, `gpu_ms` every 30 s.
+* **Dump v2** (sections "Dump v2", "Dump gaps fixed"; not flown): census
+  whole, passes timed, reference frame, `HullLights.json`, TAA sequence.
 * **Station fixes** (section "Station fixes", compile-only, not flown): the
   re-issue culls foreign instances in a keep-own VS (mask at VS t127; the
   filter only as a fallback), a busy governor, the two station light pairs,
@@ -37,8 +37,6 @@ The smear is terrain that is newly uncovered at the hull edge every frame
   no scratch R16. Scissoring skipped. **Next:** one docking flight, one dump
   inside the station and one in flight: `culled_draws` high, `filter_draws`
   0, `busy=` 0, the station's light on the hull in `HullLights.json`.
-* **Dump gaps fixed** (section "Dump gaps fixed", compile-only, not flown):
-  a dump wakes the busy layer; the stage timer holds 4,096 pairs.
 * **Temporary keys of this arc:** `diag.hull_layer` (off | dump | separate).
   Temporary code: the busy governor (`kBusyDraws`, `kBusyDrawsCulled`).
 * **Background:** the hole-fill (e) fails ("Result"); neighbours interleave
@@ -68,6 +66,8 @@ The smear is terrain that is newly uncovered at the hull edge every frame
     object in 14 of 45 dumps); about the rig set, a fixed 120 m sphere
     (hangar walls), 20 m linkage (splits the ship) and reach x 1.5 (misses
     the transport's parts): section "Rig seed".
+  * ruled out (2026-11-10, offline): unknown lights as the cause of the
+    ~0% compares, because those 15 dumps are exactly the night-vision ones.
 
 ## 1. How Elite draws the own hull
 
@@ -1226,6 +1226,61 @@ reach=lo/mid/hi`. `--health`: PARTIAL when every seed was the draw's.
 a ship/transport switch (it restarts on the rigs' generation); the cost
 of the probe's mutex on the render thread twice a frame (a copier span
 holds it briefly); a view not starting on a record (falls back).
+
+## Night vision state and the hangar light (2026-11-10, offline, then compile-only, not flown)
+
+The 15 dumps that compared at ~0% (2026-11-09 evening, build bbdfeb37)
+are exactly the 15 with night vision on. EDVR's realistic night vision
+(`night_vision.cpp`) swaps the draw's PS, sets a dual-source blend, the
+exterior gain (8x) at PS b3 and the exterior mask at PS t5, and
+`nightVisionEnd` puts the game's state back inside the draw's forwarding.
+`hullLayerAfterDraw` ran after that, so the private hull got stock night
+vision: private/game median 0.109-0.130, about 1/8. A live bug too: with
+night vision on, the composited hull was ~8x darker than the scene.
+
+- ruled out: unknown lights as the cause of the ~0% compares, because
+  the bad dumps are the night-vision ones; the "unknown" writers were
+  forward draws (glass, stars, scanner, glows, HUD) after the
+  night-vision draw, which reopened the lighting window as a `kLightVs`.
+
+Fixes:
+- `nightVisionReissueBegin/End` (night_vision.cpp): binds again, through
+  the raw entries, exactly what `nightVisionBegin` gave the game's issue
+  of the draw just issued (PS; realistic: blend, b3, t5), once; a declined
+  draw or night vision off re-issues as the game drew it. vscreen calls it
+  around the hull re-issue of a `kNightVision` draw. Rig: the re-issue
+  equals the engaged draw (gain 8 included) and restores PS, b3, t5, blend.
+- The exterior mask stays the game's (classified from the game's stencil
+  just before): bit 16 is clear on 100% of the hull pixels in all 32
+  reference eye-frames and on 100% of sky pixels; the world behind the
+  hull in an applied frame is stencil 0/4 (section "Status", ruled out by
+  stencil), so it is exterior there too.
+- FCF7 is `kNightVisionVs`, out of `kLightVs`: still re-issued and staged
+  (`stageGameHdr`), but it opens no lighting window, resets no span,
+  commits nothing and moves no stage eye.
+- `kLightVs` gains A7339D1F (PS 93A4B9DA), the hangar's third box light
+  volume, the only "U" row of 204100368002. Census (edvr_gfx 20:28:36): bound
+  as A1B7CFCD's PS 6796562E draw, a light buffer at t0 (3920 B against
+  8192 B), the eye-size f39/f23/f27/f27 at t1-t4, the 1536^2 shadow map:
+  no new substitution.
+
+Offline prediction (`nv_predict.py`, scratch): private HullHdr x8 against
+GameHdrLit on the hull (RefDepth mask), the 16 dumps with hull pixels
+(204255 and 204304 show none): median
+0.99-1.04 in 9 (within 5%: 33-83%), 0.93-0.95 in 4 late ones (within 5%:
+9-44%), 0.87 in 204757, 0.56 in 204335, 0.11 in 205323 (12k px). The
+residue is the contour and pulse, which the realistic PS draws
+differently from the stock one; the fix re-issues the same PS, so the
+fixed compare should be closer than x8.
+
+Log: the 30 s `hull layer: state=` line ends `night_vision=N/M`: N
+night-vision draws re-issued, M of them with EDVR's state. 0/0: no such
+draw; N/0: re-issued as the game's own. `--health` says both.
+
+**Unverified (not flown):** the fixed compare on a night-vision dump
+(median ~1.0, no "U" rows after FCF7); A7339D1F as K+R in a hangar dump
+with a correct mask; the world's stencil behind the hull in an applied
+frame (inferred, not measured).
 
 ## Optimisation debt (recorded 2026-11-08 at the pilot's request)
 
