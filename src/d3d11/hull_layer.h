@@ -172,6 +172,36 @@ void hullLayerCompositeEye(ID3D11DeviceContext* ctx, int eye, const HullLayerCom
 // Once per frame on the owner thread: the per-eye bookkeeping, the readbacks, the dump's write, the auto dump, the 30 s line.
 void hullLayerFrameBoundary(ID3D11DeviceContext* ctx);
 
+// The variant bench (hotkey.hull_bench, TEMPORARY; docs\research-own-hull-layer-2026-11-08.md "Variant bench"). One press runs
+// every hull variant live at the same spot -- the original, the layer with its own TAA, without AA, (stage 2) a second DLSS
+// on the hull -- and writes the image after the composite (8 frames an eye-0 variant, eye 1 and the headset frame once), the
+// GPU ms and MB of each to edvr_logs\eyes\eye_<stamp>_Bench*.bin and _Bench.json (tools\hull_bench_report.py). Refused,
+// with a toast and a line, unless diag.hull_layer = separate in the VR profile, frame generation off, the layer awake, no
+// dump or eye run, and 4 GB free. A second press cancels. Everything below costs one bool load while no bench runs.
+namespace detail {
+extern bool g_hullBenchOn;
+}  // namespace detail
+inline bool hullBenchActive() { return detail::g_hullBenchOn; }
+// The key (device_hook.cpp): starts a bench, or cancels the one running.
+void hullBenchPress();
+// Right after the hull composite (temporal_pass.cpp, outside its condition: in the original variants the layer sleeps), the
+// eye's submitted texture at the output size (the eye at 0,0), the eye's frame values. dlss: the eyes' upscaler is DLSS.
+void hullBenchCaptureEye(ID3D11DeviceContext* ctx, int eye, ID3D11Texture2D* submit, bool dlss, uint32_t renderW, uint32_t renderH,
+                         uint32_t outW, uint32_t outH, float jitterX, float jitterY, const float* tanNow, const float* headDelta);
+// The headset frame (temporalPassCaptureFinalEye): the texture the runtime gets, its region (x0, y0, x1, y1) and flips.
+void hullBenchCaptureFinal(uint32_t eye, ID3D11Texture2D* texture, const uint32_t region[4], bool flipU, bool flipV);
+// A GPU time of kind 0 (the eyes' DLSS) or 1 (the hull's DLSS) around one evaluation; a handle, -1 when none.
+int hullBenchTimeBegin(ID3D11DeviceContext* ctx, int kind);
+void hullBenchTimeEnd(ID3D11DeviceContext* ctx, int handle);
+template <class F>
+bool hullBenchTimed(ID3D11DeviceContext* ctx, int kind, F&& f) {
+    if (!detail::g_hullBenchOn) return f();
+    const int t = hullBenchTimeBegin(ctx, kind);
+    const bool ok = f();
+    hullBenchTimeEnd(ctx, t);
+    return ok;
+}
+
 void hullLayerShutdown();
 
 }  // namespace edvr

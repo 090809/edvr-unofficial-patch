@@ -202,6 +202,8 @@ bool dlaaEvaluate(ID3D11DeviceContext* ctx, int eye, ID3D11Texture2D* colour,
 // Performance mode's default M is at 2.7x K's error at rest on fine detail;
 // on the full frame the models cost the same.
 void dlaaSetPreset(unsigned preset);
+// The preset set last (the hull variant bench's manifest; 0 without NGX in the build).
+unsigned dlaaPresetNow();
 
 // The measured price, for the totals line: evaluations, the mean
 // milliseconds by timestamp query, and how many evaluations carried the

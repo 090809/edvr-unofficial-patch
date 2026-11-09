@@ -10698,6 +10698,23 @@ H_HULL_PROBE_TARGET = (r"hull layer: rig_probe target ship=\"(?P<ship>[^\"]*)\" 
 H_HULL_PROBE_GAP = r"hull layer: rig_probe own emits (?P<what>stopped|resumed)\b"
 H_HULL_PROBE_DUMP = r"hull layer: rig_probe dump (?P<stamp>\S+): HullRigProbe (?P<status>written|write failed)"
 H_HULL_PROBE_OTHER = r"hull layer: rig_probe: a staging buffer"
+# The hull variant bench (hotkey.hull_bench, TEMPORARY; src\d3d11\hull_layer.cpp, docs "Variant bench"): a row of its own from the "hull layer: bench"
+# lines, routed before the hull layer's rule. Ran is the armed line (a press the bench took); applied is the done line with a variant ok.
+H_HULL_BENCH = "hull layer bench"
+H_HULL_BENCH_LABEL = "hull layer: bench"
+H_HULL_BENCH_ARMED = r"hull layer: bench (?P<stamp>\S+) armed \(hotkey\.hull_bench, TEMPORARY.*?(?P<variants>\d+) variants, (?P<built>\d+) built"
+H_HULL_BENCH_REFUSED = r"hull layer: bench refused: (?P<why>.+?) \(hotkey\.hull_bench, TEMPORARY\)"
+H_HULL_BENCH_RECT = (r"hull layer: bench (?P<stamp>\S+) rect: render (?P<rx>\d+),(?P<ry>\d+) (?P<rw>\d+)x(?P<rh>\d+) -> output (?P<ox>\d+),(?P<oy>\d+) "
+                     r"(?P<ow>\d+)x(?P<oh>\d+) \(eye (?P<ew>\d+)x(?P<eh>\d+) -> (?P<eow>\d+)x(?P<eoh>\d+), aligned to (?P<align>\d+) render px\)")
+H_HULL_BENCH_VARIANT = (r"hull layer: bench (?P<stamp>\S+) variant (?P<id>\w+): (?P<status>\w+) frames=(?P<frames>\d+) warm=(?P<warm>\d+) "
+                        r"fallback=(?P<fallback>\d+) restarts=(?P<restarts>\d+) layer_ms=(?P<layer>-?[\d.]+) hull_dlss_ms=(?P<hull>-?[\d.]+) "
+                        r"main_dlss_ms=(?P<main>-?[\d.]+) frame_ms=(?P<frame>-?[\d.]+) cpu_ms=(?P<cpu>-?[\d.]+) mb_own=(?P<own>-?[\d.]+) "
+                        r"mb_ngx=(?P<ngx>-?[\d.]+) mb_dxgi=(?P<dxgi>-?[\d.]+) final=(?P<final>\d+) reason=(?P<reason>.*)$")
+H_HULL_BENCH_DONE = (r"hull layer: bench (?P<stamp>\S+) done: ok=(?P<ok>\d+) refused=(?P<refused>\d+) aborted=(?P<aborted>\d+) files=(?P<files>\d+) "
+                     r"failed=(?P<failed>\d+) stage_fails=(?P<stage_fails>\d+) mb=(?P<mb>[\d.]+) evicted=(?P<evicted>\d+) manifest=(?P<manifest>\w+)")
+H_HULL_BENCH_ABORTED = (r"hull layer: bench (?P<stamp>\S+) aborted: (?P<why>.+?); ok=(?P<ok>\d+) refused=(?P<refused>\d+) aborted=(?P<aborted>\d+) "
+                        r"files=(?P<files>\d+) failed=(?P<failed>\d+)")
+H_HULL_BENCH_OTHER = r"hull layer: bench \S+: (?:press ignored|cancel pressed)"
 # Frame generation, Phase 1 (fix.frame_generation_shadow, TEMPORARY; src\common\framegen_shadow_report.h): two lines of the graphics log with no build tag, read the way the desktop
 # window's are. The armed line is said once per change to on (so health_scan keeps it whatever --since says); the report line every second.
 H_FRAMEGEN = "frame generation shadow"
@@ -10874,7 +10891,7 @@ H_F125_LABEL = "native on foot log (F125)"
 H_F125_RE = re.compile(r"native on foot log \(F125\): detail (?P<detail>on|off), summary window (?P<wl>\d+) s")
 # Rules whose absence says nothing about a feature, so a log without their lines does not list them as not present: every log written before F125 has no F125
 # line, and its report stays as it was.
-HEALTH_QUIET_WHEN_ABSENT = frozenset((H_F125, H_WORLD, H_DESKTOP, H_SRV_TURRET, H_FRAMEGEN, H_FRAMEGEN_SYNTH, H_FRAMEGEN_LOCK, H_HULL, H_HULL_PROBE))   # the frame generation shadow is off by default and says nothing then; world scale writes nothing while the value stays 100; the desktop window nothing while the setting is game; the SRV turret view nothing in a log with no VR profile
+HEALTH_QUIET_WHEN_ABSENT = frozenset((H_F125, H_WORLD, H_DESKTOP, H_SRV_TURRET, H_FRAMEGEN, H_FRAMEGEN_SYNTH, H_FRAMEGEN_LOCK, H_HULL, H_HULL_PROBE, H_HULL_BENCH))   # the frame generation shadow is off by default and says nothing then; world scale writes nothing while the value stays 100; the desktop window nothing while the setting is game; the SRV turret view nothing in a log with no VR profile
 
 # ---- F125: summary windows (the on-foot log diet) ----
 # By default an on-foot summary line covers a window of 10 s, 1 s with log.on_foot_detail = on, and 1 to 10 s when a window is flushed early (a held-item change,
@@ -17598,6 +17615,40 @@ def _hj_hull_rig_probe(rows, ctx=None):
     return ("OK", text)
 
 
+def _hj_hull_bench(rows, ctx=None):
+    """The hull variant bench (hotkey.hull_bench, TEMPORARY; src\\d3d11\\hull_layer.cpp): ran is the armed line, applied is the done line. OK when the last
+    bench finished with a variant ok and every capture and the manifest written; PARTIAL when it aborted (the reason), finished with no variant ok or a write
+    failed, or the presses were all refused (the reason); NEVER APPLIED when armed and no done or aborted line follows (its drain never ended); None with no
+    line."""
+    armed, refused = rows.get("armed", []), rows.get("refused", [])
+    ends = rows.get("done", []) + rows.get("aborted", [])
+    ends.sort(key=lambda r: r["_t"] if r["_t"] is not None else -1.0)
+    if not armed and not refused and not ends:
+        return None
+    if not armed and not ends:
+        return ("PARTIAL", "%d press(es), all refused (the last: %s)" % (len(refused), refused[-1]["why"]))
+    if not ends:
+        return ("NEVER APPLIED", "bench %s was armed but no 'hull layer: bench ... done' or 'aborted' line follows (its drain never finished, or the game "
+                                 "closed first)" % armed[-1]["stamp"])
+    last = ends[-1]
+    variants = [v for v in rows.get("variant", []) if v["stamp"] == last["stamp"]]
+    text = "%d bench(es) armed, %d refused; bench %s: %s ok, %s refused, %s aborted, %s files, %s failed" % (
+        len(armed), len(refused), last["stamp"], last["ok"], last["refused"], last["aborted"], last["files"], last["failed"])
+    rects = [r for r in rows.get("rect", []) if r["stamp"] == last["stamp"]]
+    if rects:
+        r = rects[-1]
+        text += "; rect output %s,%s %sx%s" % (r["ox"], r["oy"], r["ow"], r["oh"])
+    if variants:
+        text += "; " + ", ".join("%s %s%s" % (v["id"], v["status"], "" if v["status"] == "ok" else " (%s)" % v["reason"]) for v in variants)
+    if "why" in last:
+        return ("PARTIAL", text + "; ABORTED: %s" % last["why"])
+    if int(last["ok"]) == 0:
+        return ("PARTIAL", text + ": no variant was captured")
+    if int(last["failed"]) > 0 or last.get("manifest") != "written":
+        return ("PARTIAL", text + ": a capture or the manifest was not written")
+    return ("OK", text)
+
+
 def _hj_framegen_shadow(rows, ctx=None):
     """Frame generation, Phase 1 (fix.frame_generation_shadow, TEMPORARY): ran is the armed line (the first treated eye with the key on), applied is a report line (the
     scorer's one-second line). OK when at least one report line is in the window; NEVER APPLIED when the armed line is there and no report line is (the scorer armed and
@@ -19109,6 +19160,16 @@ HEALTH_RULES = (
         ("dump", H_HULL_PROBE_DUMP),
         ("_", H_HULL_PROBE_OTHER),
     ), _hj_hull_rig_probe),
+    # The hull variant bench (hotkey.hull_bench, TEMPORARY): its own row, from the "hull layer: bench" lines health_scan routes here.
+    _hrule(H_HULL_BENCH, (), (H_HULL_BENCH_LABEL,), (
+        ("armed", H_HULL_BENCH_ARMED),
+        ("refused", H_HULL_BENCH_REFUSED),
+        ("rect", H_HULL_BENCH_RECT),
+        ("variant", H_HULL_BENCH_VARIANT),
+        ("done", H_HULL_BENCH_DONE),
+        ("aborted", H_HULL_BENCH_ABORTED),
+        ("_", H_HULL_BENCH_OTHER),
+    ), _hj_hull_bench),
     # The SRV turret view (issue 140): lines of the graphics log that carry no build tag (health_scan reads them, as it reads the desktop window's, before it drops the untagged lines).
     _hrule(H_SRV_TURRET, (), H_SRV_TURRET_LABELS, (
         ("setting", H_SRV_TURRET_SETTING),
@@ -19186,7 +19247,24 @@ def health_scan(text, since=None, until=None):
     turret =next(r for r in HEALTH_RULES if r.name == H_SRV_TURRET)
     hull = next(r for r in HEALTH_RULES if r.name == H_HULL)
     probe = next(r for r in HEALTH_RULES if r.name == H_HULL_PROBE)
+    bench = next(r for r in HEALTH_RULES if r.name == H_HULL_BENCH)
     for raw in text.splitlines():
+        if H_HULL_BENCH_LABEL in raw:
+            # The hull variant bench: untagged like the layer's lines, its own row; every line is an event, cut by the window.
+            sm = HEALTH_STAMP_RE.match(raw)
+            tod = int(sm.group(1)) * 3600 + int(sm.group(2)) * 60 + int(sm.group(3)) + int(sm.group(4)) / 1000.0 if sm else None
+            body = raw[sm.end():] if sm else raw
+            for kind, rx in bench.kinds:
+                g = rx.search(body)
+                if g:
+                    if kind != "_" and _health_in_window(tod, since, until):
+                        rows[H_HULL_BENCH].setdefault(kind, []).append(dict(g.groupdict(), _t=tod))
+                    break
+            else:
+                u = unparsed[H_HULL_BENCH]
+                u[0] += 1
+                u[1] = u[1] or raw.strip()[:160]
+            continue
         if H_HULL_PROBE_LABEL in raw:
             # The hull layer's rig probe: untagged like the layer's lines, its own row. The armed line is state, kept whatever --since says.
             sm = HEALTH_STAMP_RE.match(raw)
@@ -26987,6 +27065,30 @@ def self_test_health():
         check("hull layer rig probe: a drifted comparison line is counted as unparsed",
               hl_base + [hl_key(), rp_armed, rp_line().replace(" spliced=", " splice="), hl_report()], 3, [("NEVER APPLIED", RPN)],
               has=["line(s) the rule's patterns do not match"])
+        # ---- the hull variant bench (hotkey.hull_bench, TEMPORARY): its own row, from the C format strings in src\d3d11\hull_layer.cpp ----
+        HB, hb_stamp = H_HULL_BENCH, "101112123001"
+        hb_armed = RH("hull layer: bench %s armed", hb_stamp, 8, 4, "C:\\logs\\eyes")
+        hb_rect = RH("hull layer: bench %s rect:", hb_stamp, 300, 600, 1500, 900, 400, 800, 2000, 1200, 2817, 2448, 3756, 3264, 3)
+
+        def hb_var(vid, status="ok", frames=8, reason="-"):
+            return RH("hull layer: bench %s variant %s:", hb_stamp, vid, status, frames, 60, 0, 0, 0.8, 0.0, 1.5, 11.0, 0.3, 120.0, 0.0, 9000, 1, reason)
+        hb_done = RH("hull layer: bench %s done:", hb_stamp, 4, 4, 0, 42, 0, 0, 900.5, 0, "written", "", hb_stamp)
+        hb_abort = RH("hull layer: bench %s aborted:", hb_stamp, "frame generation turned on", 1, 4, 3, 10, 0, 0, 200.0, 0, "written")
+        check("hull layer bench: a press that finished is OK and says the variants",
+              hl_base + [hl_key("separate"), hb_armed, hb_rect, hb_var("orig_a"), hb_var("dlss_full", "refused", 0, "not built"), hb_done, hl_report()], 0,
+              [("OK", HB)], has=["bench 101112123001: 4 ok, 4 refused, 0 aborted, 42 files, 0 failed", "rect output 400,800 2000x1200", "orig_a ok",
+                                 "dlss_full refused (not built)"], lacks=["UNPARSED", "do not match"])
+        check("hull layer bench: an abort is PARTIAL and says why",
+              hl_base + [hl_key("separate"), hb_armed, hb_rect, hb_var("orig_a"), hb_var("sep_taa", "aborted", 3, "frame generation turned on"), hb_abort,
+                         hl_report()], 0, [("PARTIAL", HB)], has=["ABORTED: frame generation turned on", "sep_taa aborted (frame generation turned on)"],
+              lacks=["UNPARSED", "do not match"])
+        check("hull layer bench: armed and never ended is NEVER APPLIED", hl_base + [hl_key("separate"), hb_armed, hl_report()], 3,
+              [("NEVER APPLIED", HB)], has=["bench 101112123001 was armed but no"])
+        check("hull layer bench: presses all refused are PARTIAL and say why",
+              hl_base + [hl_key("separate"), RH("hull layer: bench refused: %s", "frame generation is on (the layer stands aside)"),
+                         RH("hull layer: bench %s: cancel pressed", hb_stamp), hl_report()], 0, [("PARTIAL", HB)],
+              has=["1 press(es), all refused (the last: frame generation is on (the layer stands aside))"], lacks=["do not match"])
+        check("hull layer bench: no press says nothing", hl_base + [hl_key(), hl_report()], 0, [("OK", HL)], lacks=[row("OK", HB), row("PARTIAL", HB)])
         # ---- the SRV turret view: the graphics log's untagged lines, rendered from the C format strings in src\d3d11\srv_turret.cpp and (the geometry shader's creation line) shader_swap.cpp ----
         stsrc = read_text(os.path.join(repo_root(), "src", "d3d11", "srv_turret.cpp"))
 

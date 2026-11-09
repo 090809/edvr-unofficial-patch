@@ -5034,9 +5034,11 @@ void* temporalInner(void* srcTex, int eye, const float* bounds,
                                                         nullptr, e.dlOut,
                                                         w, h, oW, oH, jxNow, jyNow, resetHist, frameMs,
                                                         nearZ, farZ, fovY, &why)
-                                    : dlaaEvaluate(ctx, eye, e.dlColour, e.dlDepth, e.dlMv, e.dlOut,
-                                                  biasMask, w, h,
-                                                  oW, oH, jxNow, jyNow, resetHist, frameMs, &why))) {
+                                    : hullBenchTimed(ctx, 0, [&] {   // the hull bench's main_dlss time (TEMPORARY; one bool load without it)
+                                          return dlaaEvaluate(ctx, eye, e.dlColour, e.dlDepth, e.dlMv, e.dlOut,
+                                                              biasMask, w, h,
+                                                              oW, oH, jxNow, jyNow, resetHist, frameMs, &why);
+                                      }))) {
                         endRegion(qs, Region::Full, ctx);
                         gpuCensusEnd(ctx, GpuCensusSection::DoorUpscaler);
                         usedDlaa = true;
@@ -5238,6 +5240,10 @@ void* temporalInner(void* srcTex, int eye, const float* bounds,
                         hullLayerCompositeEye(ctx, eye, hc);
                         if (!intoSubmit) ctx->CopyResource(e.dlSubmit, e.dlOut);
                     }
+                    // The hull variant bench (hotkey.hull_bench, TEMPORARY): the submitted eye after the composite, outside the
+                    // condition above (its original variants put the layer to sleep). One bool load while no bench runs.
+                    if (usedDlaa && hullBenchActive())
+                        hullBenchCaptureEye(ctx, eye, e.dlSubmit, !amdEngine && !intelEngine, w, h, oW, oH, jxNow, jyNow, tanNow, deltaHead);
                     // luma probe stage 1, dlss_out: e.dlSubmit already holds it
                     // here on every usedDlaa path, UI-resolved or copied
                     // straight from e.dlOut above.
@@ -5639,6 +5645,8 @@ void temporalPassMarkerPre(uint64_t sequence, uint32_t eye, ID3D11Texture2D* tex
 
 void temporalPassCaptureFinalEye(uint64_t sequence,uint32_t eye,ID3D11Texture2D* texture,
                                  const uint32_t region[4],bool composite,bool flipU,bool flipV) {
+    // The hull variant bench's headset frame (TEMPORARY; one bool load while no bench runs).
+    if (hullBenchActive() && texture && eye <= 1) guarded("hull bench/final", [&] { hullBenchCaptureFinal(eye, texture, region, flipU, flipV); });
     if (g_mkArmed && texture && eye <= 1) {   // F59: the waypoint dump's final-eye crop (marker probe on, armed by the eye dump key)
         ID3D11Device* device = nullptr;
         ID3D11DeviceContext* ctx = nullptr;
@@ -7282,6 +7290,17 @@ void temporalPassArmEyeDump() {
         return;
     }
     beginEyeRun();
+}
+
+bool temporalPassEyeRunBusy() { return g_eyeRunLeft > 0 || g_eyeRunReady || g_eyeFinalRun.armed; }
+
+void temporalPassMakeEyeStamp(wchar_t* out, size_t count) {
+    if (!out || !count) return;
+    SYSTEMTIME stm{};
+    GetLocalTime(&stm);
+    const uint32_t serial = ++g_eyeStampSerial;
+    _snwprintf_s(out, count, _TRUNCATE, L"%02u%02u%02u%03u%03u", static_cast<unsigned>(stm.wHour), static_cast<unsigned>(stm.wMinute),
+                 static_cast<unsigned>(stm.wSecond), static_cast<unsigned>(stm.wMilliseconds), serial % 1000);
 }
 
 float temporalPassDepthAt(float metres) {

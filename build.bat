@@ -691,7 +691,7 @@ python tools\compile_cache.py --prune --keep thunks.obj --keep weapon_ui_getter_
     "src\d3d11\object_probe.cpp" ^
     "src\d3d11\pixel_probe.cpp" ^
     "src\d3d11\depth_writer_probe.cpp" ^
-    "src\d3d11\hull_layer.cpp" "src\d3d11\hull_rig_probe.cpp" ^
+    "src\d3d11\hull_layer.cpp" "src\d3d11\hull_bench.cpp" "src\d3d11\hull_rig_probe.cpp" ^
     "src\d3d11\object_record_writer_probe.cpp" "src\d3d11\object_record_writer_hook.cpp" ^
     "src\d3d11\kinematic_eval_probe.cpp" "src\d3d11\kinematic_eval_hook.cpp" ^
     "src\d3d11\store_hook.cpp" "src\d3d11\view_source.cpp" "src\d3d11\optimized_station.cpp" "src\d3d11\concourse_pane.cpp" "src\d3d11\concourse_camera_test.cpp" "src\d3d11\pad_state_probe.cpp" "src\d3d11\hmd_reset_press.cpp" ^
@@ -2371,6 +2371,17 @@ if not exist "%OBJ%\nightvision" mkdir "%OBJ%\nightvision"
 "%OBJ%\nightvision\night_vision_test.exe" --self-test || exit /b 1
 exit /b 0
 
+:rig_hull_bench
+echo [edvr] === hull_bench_test (the hull variant bench's files, TEMPORARY) ===
+if not exist "%OBJ%\hullbench" mkdir "%OBJ%\hullbench"
+if exist "%OBJ%\hullbench\eyes" rmdir /s /q "%OBJ%\hullbench\eyes"
+%CC% /nologo /O2 /MT /std:c++17 /EHsc /W4 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /D_CRT_SECURE_NO_WARNINGS ^
+    /Fo"%OBJ%\hullbench\\" /Fe"%OBJ%\hullbench\hull_bench_test.exe" ^
+    "tools\hull_bench_test\hull_bench_test.cpp" "src\d3d11\hull_bench.cpp" ^
+    /link /INCREMENTAL:NO || exit /b 1
+"%OBJ%\hullbench\hull_bench_test.exe" "%OBJ%\hullbench\eyes" || exit /b 1
+python tools\hull_bench_report.py "%OBJ%\hullbench\eyes\eye_010203004001" --dry-run || exit /b 1
+exit /b 0
 :rig_intro_skip
 echo [edvr] === DirectShow intro skip regression ===
 if not exist "%OBJ%\introskip" mkdir "%OBJ%\introskip"

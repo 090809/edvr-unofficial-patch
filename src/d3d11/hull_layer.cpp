@@ -5,8 +5,10 @@
 
 #include <windows.h>
 #include <d3d11.h>
+#include <dxgi1_4.h>          // the variant bench's VRAM sample (IDXGIAdapter3::QueryVideoMemoryInfo)
 
 #include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <cstdio>
 #include <cstring>
@@ -18,9 +20,14 @@
 #include "../common/runtime_profile.h"   // runtimeVrProfile: Step 3's discard is the VR eye pass's only
 #include "binding_shadow.h"
 #include "cs_stage_save.h"    // Step 3's dispatches: the compute stage put back as the game (or the temporal pass) left it
-#include "engine_velocity.h"  // engineVelocityLiveNow, engineVelocityOwnDiscardPs and its mask slot (kEngineVelocityOwnMaskPsSlot)
+#include "dlaa.h"             // the variant bench's manifest: the eyes' DLSS preset and mode
+#include "engine_velocity.h" // engineVelocityLiveNow, engineVelocityOwnDiscardPs and its mask slot (kEngineVelocityOwnMaskPsSlot)
 #include "framegen_shadow.h"  // frameGenShadowOn: Step 3 stands aside while any frame generation key is on
+#include "gpu_census.h"       // the variant bench: gpuCensusFrameSpan, the frame's GPU span
+#include "hull_bench.h"       // the variant bench's manifest, file names and writer thread (TEMPORARY)
 #include "hull_rig_probe.h"   // the rig probe: the own ship's pool slots from the engine's rigs, against the own mask (diagnostic only)
+#include "journal_watch.h"    // the variant bench's aborts: the seat, the menu (no vehicle), the jump tunnel
+#include "menu.h"             // the variant bench's toasts (menuShowNotice)
 #include "native_on_foot.h"   // nativeOnFootActive: no discard on foot
 #include "temporal_pass.h"    // temporalPassArmEyeDump: the auto dump arms the eye dump the hotkey arms; temporalPassFrameGenMode
 #include "tonemap_admit.h"    // Step 3: the game's tonemap, admitted by structure
@@ -32,6 +39,7 @@ namespace edvr {
 namespace detail {
 bool g_hullLayerOn = false;
 bool g_hullLayerSeparate = false;
+bool g_hullBenchOn = false;   // the variant bench runs (hotkey.hull_bench, TEMPORARY)
 }  // namespace detail
 
 namespace {
@@ -776,6 +784,7 @@ struct StageSet {
     ID3D11Query* q[2 * kStagePairCap] = {};   // made on first use, kept
     uint8_t stage[kStagePairCap] = {};
     uint32_t used = 0, overflow = 0;
+    uint32_t frame = 0;   // the layer frame it times (the variant bench reads its sums by frame)
     bool open = false, pending = false;
 };
 struct StageTimes {
@@ -792,6 +801,15 @@ struct StageTimes {
 };
 StageTimes g_st;
 LARGE_INTEGER g_entryQpc{};   // the hook's entry (hullLayerBegin, hullLayerBeginDispatch): an item's CPU time starts there
+// The variant bench (below, "the variant bench"): while it runs every frame is timed, and a timed frame's sums go to it by frame;
+// g_benchSleep puts the layer to sleep for the original variants (no seed, discard, re-issue, stage or composite), without the
+// busy governor's hold or its count.
+bool g_benchTimeAll = false, g_benchSleep = false;
+bool g_benchNoAa = false;          // the variant bench's sep_noaa: the TAA runs with its history off (the 3x3 reconstruct, then the sharpen)
+uint32_t g_benchEvictions = 0;     // private copies dropped (evictStale) while the bench runs
+void benchNoteStages(uint32_t frame, const double* sums);
+// Right after an eye's composite, before its history pair flips: the bench's rect cover, mask and applied mark.
+void benchAfterComposite(ID3D11DeviceContext* ctx, int eye, const Eye& e, const Comp& c, const HullLayerCompositeInputs& in, bool applied);
 
 // The lighting window's draws on the dump frame (eye_<stamp>_HullLights.json): every draw between an eye's shadow mask and its sky
 // that writes the eye's HDR, and every stencil-only draw there (a light volume's stencil pass), with what the layer did with it.
@@ -1192,6 +1210,7 @@ void evictStale() {
         Mirror& m = g_mirrors[i];
         if (g_frame - m.lastSeen > kEvictFrames) {
             const D3D11_TEXTURE2D_DESC d = m.desc;
+            if (detail::g_hullBenchOn) ++g_benchEvictions;   // the variant bench: a private copy lost in its window (the manifest says)
             dropMirror(m.game);   // erases index i
             Log::get().note("hull layer: private copy of a %ux%u format %u target dropped, its game target unseen for %u frames (%u held)", d.Width,
                             d.Height, static_cast<unsigned>(d.Format), kEvictFrames, static_cast<unsigned>(g_mirrors.size()));
@@ -1529,6 +1548,7 @@ void stageOpen(ID3D11DeviceContext* ctx, TStage ts, bool fromEntry) {
         ctx->Begin(s.disjoint);
         s.open = true;
         s.used = s.overflow = 0;
+        s.frame = g_frame;
     }
     if (s.used >= kStagePairCap) {
         ++s.overflow;
@@ -1583,7 +1603,7 @@ void stageFrameEnd(ID3D11DeviceContext* ctx) {
 // The next frame (g_frame): timed when its number says so and a set is free.
 void stageFrameStart() {
     g_st.cur = -1;
-    if (g_frame % kStageEvery != 0) return;
+    if (g_frame % kStageEvery != 0 && !g_benchTimeAll) return;
     for (uint32_t i = 0; i < kStageSets; ++i)
         if (!g_st.set[i].pending && !g_st.set[i].open) {
             g_st.cur = static_cast<int>(i);
@@ -1615,6 +1635,7 @@ void stageCollect(ID3D11DeviceContext* ctx) {
             ++g_st.disjoint;
             continue;
         }
+        if (detail::g_hullBenchOn) benchNoteStages(s.frame, sum);
         double total = 0.0;
         for (int k = 0; k < kTStages; ++k) {
             g_st.ms[k].push_back(static_cast<float>(sum[k]));
@@ -3061,12 +3082,12 @@ void governBusy() {
     if (g_busy) ++g_win.busyFrames;
 }
 
-// The next frame's decision, made before any of its draws.
-void decideNext() {
+// The next frame's decision, made before any of its draws. Returns the fallback reason (kFallbacks: the discard is on).
+Fallback decideNext() {
     g_discard = false;
     if (g_busy) {
         g_hold = kHoldFrames;   // asleep: no discard, and the hold runs from the wake (counted as busy=, not as a fallback)
-        return;
+        return kFbStreak;
     }
     Fallback why = kFallbacks;
     if (!runtimeVrProfile() || nativeOnFootActive()) {
@@ -3101,6 +3122,7 @@ void decideNext() {
     // A fallback other than the hold itself (mask pending or large, frame generation, outside) re-arms the hold, so
     // separate resumes only after kHoldFrames clean frames, never on the first frame the reason clears.
     if (!g_discard && why != kFbStreak) g_hold = kHoldFrames;
+    return g_discard ? kFallbacks : why;
 }
 
 // ---- the readbacks, the dump ------------------------------------------------------------------------------------------
@@ -3693,6 +3715,761 @@ void report() {
     }
 }
 
+// ---- the variant bench (hotkey.hull_bench, TEMPORARY; hull_layer.h, docs "Variant bench") -----------------------------------
+//
+// Idle -press-> Rect (the hull's extent from both eyes' covers) -> Quiet (until the press toast is gone) -> per variant
+// { Warm -> Capture (8 frames) -> Settle (2) } -> Drain (the last staging maps, the times, the writer thread) -> Idle.
+// The phase always names the frame about to run: the boundary before a frame decides it (benchStep, then decideNext, then
+// benchDecided), as decideNext decides the discard. The frame's hooks (hullBenchCaptureEye, benchAfterComposite,
+// hullBenchCaptureFinal) only stage copies and mark what they did; the boundary after it judges it.
+
+namespace hb = hull_bench;
+
+enum class BenchPhase : uint8_t { Idle, Rect, Quiet, Warm, Capture, Settle, Drain };
+constexpr uint32_t kBenchRectFrames = 45;     // frames the rect step waits for both eyes' covers
+constexpr uint32_t kBenchGrow = 96;           // output pixels about the hull's extent
+constexpr ULONGLONG kBenchQuietMs = 2800;     // from the press: the press toast (menu.cpp kToastMs, 2.5 s) gone before any capture
+constexpr uint32_t kBenchWarmLong = 60;       // the history variants: the main DLSS relearns the hull, the layer's TAA converges (0.05)
+constexpr uint32_t kBenchWarmShort = 8;       // no history; also the re-warm after a lost capture frame
+constexpr uint32_t kBenchSettleFrames = 2;
+// Fallback frames (decideNext) before a variant is refused: 150, past kHoldFrames, so one miss on waking from an original (its
+// 120-frame hold) costs time and not the variant; the run's wall clock (kBenchRunMs) still bounds it.
+constexpr uint32_t kBenchFallbackMax = 150;
+constexpr uint32_t kBenchRestartMax = 4;      // capture restarts before a variant is refused
+constexpr ULONGLONG kBenchRunMs = 20000;      // the variants' wall clock, from the end of the quiet
+constexpr ULONGLONG kBenchDrainMs = 60000;    // the drain's
+constexpr uint32_t kBenchDrainFrames = 8;     // drain frames at least (the stage timers' last sets come back)
+constexpr uint64_t kBenchMinFreeBytes = 4ull << 30;
+constexpr uint32_t kBenchSlots = 16;          // staging copies in flight
+constexpr uint32_t kBenchMapLag = 2;          // frames before a staging copy is mapped without waiting
+constexpr uint32_t kBenchMapForce = 8;        // frames after which it is mapped waiting
+constexpr uint32_t kBenchFreeToCapture = 6;   // free staging copies a capture run needs to start
+constexpr uint32_t kBenchQueries = 32;
+enum : int { kBtMainDlss = 0, kBtHullDlss = 1, kBtSpan = 2, kBtCpu = 3, kBtStage = 10 };
+
+struct BenchSlot {   // a staging copy on its way to the writer
+    ID3D11Texture2D* tex = nullptr;
+    uint32_t w = 0, h = 0, bpp = 0;
+    DXGI_FORMAT fmt = DXGI_FORMAT_UNKNOWN, fileFmt = DXGI_FORMAT_UNKNOWN;
+    bool pending = false;
+    uint32_t at = 0, frame = 0, eye = 0;
+    std::wstring path;
+};
+struct BenchQuery {   // a GPU time around one evaluation
+    ID3D11Query* dj = nullptr;
+    ID3D11Query* t0 = nullptr;
+    ID3D11Query* t1 = nullptr;
+    uint32_t frame = 0;
+    int kind = -1;
+    bool open = false, pending = false;
+};
+struct BenchTime {
+    uint32_t frame = 0;
+    int kind = 0;
+    double ms = 0.0;
+};
+struct BenchRun {
+    BenchPhase phase = BenchPhase::Idle;
+    int var = -1;
+    uint32_t left = 0;
+    int capIndex = -1;   // Capture: the frame about to run is capture frame capIndex
+    uint32_t restarts[hb::kVariants] = {};   // capture runs restarted, by variant
+    // The frame in progress, from its hooks; judged and cleared at its boundary.
+    bool staged0 = false, applied0 = false, discarded = false;
+    hb::Frame pendingFrame;
+    wchar_t stamp[32] = L"";
+    std::string stampA;
+    std::wstring dir;
+    ULONGLONG pressMs = 0, runStartMs = 0, drainStartMs = 0;
+    uint32_t drainFrames = 0;
+    uint32_t seat = 0;
+    bool sawDlss = false, sawOther = false;
+    uint32_t renderW = 0, renderH = 0, outW = 0, outH = 0;
+    uint32_t rectFrames = 0;
+    uint32_t rectAt[2] = {};
+    int rectState[2] = {};   // 0 not staged, 1 staged, 2 read
+    uint32_t box[4] = {};    // the covers' extent, render px of the eye region: x0, y0, x1, y1 (exclusive)
+    bool boxAny = false;
+    uint32_t align = 1;
+    uint32_t rectR[4] = {}, rectO[4] = {};
+    std::vector<BenchTime> times;
+    int64_t cpuLast = 0;
+    bool finalWant[2] = {};
+    bool maskTaken = false;
+    uint32_t stageFails = 0;
+    bool seqStarted = false;
+    uint32_t lastFallback = kFallbacks;
+    const char* abortWhy = nullptr;
+    std::string aborted;
+    hb::Manifest m;
+    std::vector<uint32_t> capFrames[hb::kVariants];   // each variant's captured layer frames
+};
+BenchRun g_bench;
+BenchSlot g_benchSlots[kBenchSlots];
+BenchQuery g_benchQ[kBenchQueries];
+ID3D11Texture2D* g_benchRectStage[2] = {};
+hb::Writer g_benchWriter;
+
+bool benchAsleepVariant(int v) { return v == hb::kOrigA || v == hb::kOrigB; }
+// What this build runs. Stage 1: the originals and the layer with and without its TAA.
+const char* benchNotBuilt(int v) {
+    if (v == hb::kDlssFull || v == hb::kDlssSub) return "not built";
+    if (v == hb::kNative || v == hb::kNativeFxaa) return "needs shader dump (feasibility builds A and C)";
+    return nullptr;
+}
+uint32_t benchWarm(int v) { return v == hb::kSepNoaa || v == hb::kNative || v == hb::kNativeFxaa ? kBenchWarmShort : kBenchWarmLong; }
+bool benchRunning() { return g_bench.phase == BenchPhase::Warm || g_bench.phase == BenchPhase::Capture || g_bench.phase == BenchPhase::Settle; }
+
+const char* fallbackName(uint32_t f) {
+    switch (f) {
+        case kFbFrameGen: return "frame_gen";
+        case kFbOutside: return "outside";
+        case kFbMaskPending: return "mask_pending";
+        case kFbMaskLarge: return "mask_large";
+        case kFbStreak: return "streak";
+        default: return "?";
+    }
+}
+
+// Bytes a pixel, by DXGI format family (4 for anything not listed).
+uint32_t formatBytes(DXGI_FORMAT f) {
+    const int v = static_cast<int>(f);
+    if (v >= 1 && v <= 4) return 16;
+    if (v >= 5 && v <= 8) return 12;
+    if (v >= 9 && v <= 22) return 8;
+    if (v >= 48 && v <= 59) return 2;
+    if (v >= 60 && v <= 65) return 1;
+    return 4;
+}
+// The format a capture is written as: a typeless or sRGB view family as the UNORM one tools\eye_inputs.py reads.
+DXGI_FORMAT fileFormat(DXGI_FORMAT f) {
+    switch (f) {
+        case DXGI_FORMAT_R8G8B8A8_TYPELESS:
+        case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB: return DXGI_FORMAT_R8G8B8A8_UNORM;
+        case DXGI_FORMAT_R10G10B10A2_TYPELESS: return DXGI_FORMAT_R10G10B10A2_UNORM;
+        case DXGI_FORMAT_B8G8R8A8_TYPELESS:
+        case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB: return DXGI_FORMAT_B8G8R8A8_UNORM;
+        case DXGI_FORMAT_R16G16B16A16_TYPELESS: return DXGI_FORMAT_R16G16B16A16_FLOAT;
+        default: return f;
+    }
+}
+uint64_t texBytes(ID3D11Texture2D* t) {
+    if (!t) return 0;
+    D3D11_TEXTURE2D_DESC d{};
+    t->GetDesc(&d);
+    const uint64_t one = static_cast<uint64_t>(d.Width) * d.Height * formatBytes(d.Format) * std::max(1u, d.ArraySize) * std::max(1u, d.SampleDesc.Count);
+    return d.MipLevels > 1 ? one * 4 / 3 : one;
+}
+uint64_t bufBytes(ID3D11Buffer* b) {
+    if (!b) return 0;
+    D3D11_BUFFER_DESC d{};
+    b->GetDesc(&d);
+    return d.ByteWidth;
+}
+// The layer's own GPU memory (its private copies, the eyes' tonemap, cover and masks, the composite's history and out), MB.
+double layerVramMb() {
+    uint64_t sum = 0;
+    for (const auto& m : g_mirrors) sum += texBytes(m.priv);
+    for (const auto& e : g_eyes) {
+        sum += texBytes(e.tone) + texBytes(e.cover) + texBytes(e.coverZ);
+        sum += bufBytes(e.mask) + bufBytes(e.stats);
+    }
+    for (const auto& c : g_comp) sum += texBytes(c.hist[0]) + texBytes(c.hist[1]) + texBytes(c.out);
+    return static_cast<double>(sum) / (1024.0 * 1024.0);
+}
+// The adapter's local memory in use (context only: the game allocates in parallel), MB; < 0 when it cannot be read.
+double dxgiUsageMb() {
+    if (!g_device) return -1.0;
+    IDXGIDevice* dd = nullptr;
+    IDXGIAdapter* ad = nullptr;
+    IDXGIAdapter3* ad3 = nullptr;
+    double mb = -1.0;
+    if (SUCCEEDED(g_device->QueryInterface(__uuidof(IDXGIDevice), reinterpret_cast<void**>(&dd))) && dd && SUCCEEDED(dd->GetAdapter(&ad)) && ad &&
+        SUCCEEDED(ad->QueryInterface(__uuidof(IDXGIAdapter3), reinterpret_cast<void**>(&ad3))) && ad3) {
+        DXGI_QUERY_VIDEO_MEMORY_INFO vmi{};
+        if (SUCCEEDED(ad3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &vmi))) mb = static_cast<double>(vmi.CurrentUsage) / (1024.0 * 1024.0);
+    }
+    releaseRef(ad3);
+    releaseRef(ad);
+    releaseRef(dd);
+    return mb;
+}
+// The head's rotation in a 3x3 delta (row-major), degrees; < 0 without one.
+float headRotDeg(const float* d) {
+    if (!d) return -1.0f;
+    const double c = std::max(-1.0, std::min(1.0, (static_cast<double>(d[0]) + d[4] + d[8] - 1.0) * 0.5));
+    return static_cast<float>(std::acos(c) * 57.29577951308232);
+}
+
+void benchToast(const char* text) {
+    static char toast[112];   // menuShowNotice keeps the pointer (device_hook.cpp's frame generation toast does the same)
+    _snprintf_s(toast, sizeof toast, _TRUNCATE, "%s", text);
+    menuShowNotice(toast);
+}
+
+// A staging copy of src's box, queued for the writer as dir\name once mapped. False (counted) when no copy is free or the
+// source cannot be copied.
+bool benchStage(ID3D11DeviceContext* ctx, ID3D11Texture2D* src, uint32_t x, uint32_t y, uint32_t w, uint32_t h, const std::string& name,
+                uint32_t frame, uint32_t eye) {
+    if (!ctx || !src || !g_device || !w || !h) return false;
+    D3D11_TEXTURE2D_DESC d{};
+    src->GetDesc(&d);
+    if (d.SampleDesc.Count != 1 || x >= d.Width || y >= d.Height) {
+        ++g_bench.stageFails;
+        return false;
+    }
+    w = std::min(w, d.Width - x);
+    h = std::min(h, d.Height - y);
+    BenchSlot* s = nullptr;
+    for (auto& c : g_benchSlots)   // a free copy of this size and format, else an empty one, else any free one
+        if (!c.pending && c.tex && c.w == w && c.h == h && c.fmt == d.Format) {
+            s = &c;
+            break;
+        }
+    for (int pass = 0; pass < 2 && !s; ++pass)
+        for (auto& c : g_benchSlots)
+            if (!c.pending && (pass == 1 || !c.tex)) {
+                s = &c;
+                break;
+            }
+    if (!s) {
+        ++g_bench.stageFails;
+        return false;
+    }
+    if (s->tex && (s->w != w || s->h != h || s->fmt != d.Format)) releaseRef(s->tex);
+    if (!s->tex) {
+        D3D11_TEXTURE2D_DESC sd{};
+        sd.Width = w;
+        sd.Height = h;
+        sd.MipLevels = 1;
+        sd.ArraySize = 1;
+        sd.Format = d.Format;
+        sd.SampleDesc.Count = 1;
+        sd.Usage = D3D11_USAGE_STAGING;
+        sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        if (FAILED(g_device->CreateTexture2D(&sd, nullptr, &s->tex)) || !s->tex) {
+            s->tex = nullptr;
+            ++g_bench.stageFails;
+            return false;
+        }
+        s->w = w;
+        s->h = h;
+        s->fmt = d.Format;
+    }
+    const D3D11_BOX box{x, y, 0u, x + w, y + h, 1u};
+    vScreenCopySubresourceRegionRaw(ctx, s->tex, 0, src, &box);
+    s->bpp = formatBytes(d.Format);
+    s->fileFmt = fileFormat(d.Format);
+    s->pending = true;
+    s->at = g_frame;
+    s->frame = frame;
+    s->eye = eye;
+    s->path = g_bench.dir + L"\\" + std::wstring(name.begin(), name.end());
+    return true;
+}
+
+uint32_t benchFreeSlots() {
+    uint32_t n = 0;
+    for (const auto& s : g_benchSlots) n += s.pending ? 0u : 1u;
+    return n;
+}
+
+// The staged copies old enough mapped (without waiting until kBenchMapForce) and handed to the writer; `all`: every one, waiting.
+void benchMapSlots(ID3D11DeviceContext* ctx, bool all) {
+    for (auto& s : g_benchSlots) {
+        if (!s.pending || !s.tex) continue;
+        const uint32_t age = g_frame - s.at;
+        if (!all && age < kBenchMapLag) continue;
+        D3D11_MAPPED_SUBRESOURCE map{};
+        const UINT flags = all || age >= kBenchMapForce ? 0u : static_cast<UINT>(D3D11_MAP_FLAG_DO_NOT_WAIT);
+        const HRESULT hr = ctx->Map(s.tex, 0, D3D11_MAP_READ, flags, &map);
+        if (hr == DXGI_ERROR_WAS_STILL_DRAWING) continue;
+        s.pending = false;
+        if (FAILED(hr)) {
+            ++g_bench.stageFails;
+            continue;
+        }
+        const uint32_t rowBytes = s.w * s.bpp;
+        std::vector<uint8_t> data(static_cast<size_t>(rowBytes) * s.h);
+        for (uint32_t y = 0; y < s.h; ++y)
+            std::memcpy(data.data() + static_cast<size_t>(y) * rowBytes, static_cast<const uint8_t*>(map.pData) + static_cast<size_t>(y) * map.RowPitch, rowBytes);
+        ctx->Unmap(s.tex, 0);
+        g_benchWriter.push(s.path, s.w, s.h, static_cast<uint32_t>(s.fileFmt), rowBytes, s.frame, s.eye, std::move(data));
+    }
+}
+
+void benchCollectQueries(ID3D11DeviceContext* ctx) {
+    for (auto& q : g_benchQ) {
+        if (!q.pending) continue;
+        D3D11_QUERY_DATA_TIMESTAMP_DISJOINT dj{};
+        UINT64 a = 0, b = 0;
+        if (ctx->GetData(q.dj, &dj, sizeof dj, D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK ||
+            ctx->GetData(q.t0, &a, sizeof a, D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK || ctx->GetData(q.t1, &b, sizeof b, D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK)
+            continue;
+        q.pending = false;
+        if (!dj.Disjoint && dj.Frequency && b >= a)
+            g_bench.times.push_back({q.frame, q.kind, static_cast<double>(b - a) * 1000.0 / static_cast<double>(dj.Frequency)});
+    }
+}
+
+bool benchQueriesPending() {
+    for (const auto& q : g_benchQ)
+        if (q.pending || q.open) return true;
+    return false;
+}
+
+void benchReleaseGpu() {
+    for (auto& s : g_benchSlots) {
+        releaseRef(s.tex);
+        s = BenchSlot{};
+    }
+    for (auto& q : g_benchQ) {
+        releaseRef(q.dj);
+        releaseRef(q.t0);
+        releaseRef(q.t1);
+        q = BenchQuery{};
+    }
+    for (auto*& t : g_benchRectStage) releaseRef(t);
+}
+
+// Restore: the configured mode back and the bench's state off the layer; the variants not finished say why. Then the drain.
+void benchRestore(const char* abortReason) {
+    BenchRun& b = g_bench;
+    g_benchSleep = false;
+    g_benchNoAa = false;
+    g_benchTimeAll = false;
+    b.finalWant[0] = b.finalWant[1] = false;
+    for (auto& c : g_comp) c.have = false;   // the layer's TAA history starts again (one history reset an eye)
+    if (b.seqStarted && g_seq.active && !g_seq.end) g_seq.end = "the variant bench ended";
+    if (abortReason) {
+        b.aborted = abortReason;
+        b.m.aborted = abortReason;
+        for (int v = 0; v < hb::kVariants; ++v) {
+            hb::VariantRec& r = b.m.variants[v];
+            if (v == b.var && benchRunning()) {
+                r.status = "aborted";
+                r.reason = abortReason;
+            } else if (v > b.var && !benchNotBuilt(v)) {
+                r.status = "aborted";
+                r.reason = "not run (the bench aborted)";
+            }
+        }
+    }
+    b.phase = BenchPhase::Drain;
+    b.capIndex = -1;
+    b.drainStartMs = GetTickCount64();
+    b.drainFrames = 0;
+}
+
+// The next variant from v on: the ones this build does not run are refused in the manifest; the rest start warming.
+void benchStartVariant(int v) {
+    BenchRun& b = g_bench;
+    for (; v < hb::kVariants; ++v) {
+        const char* why = benchNotBuilt(v);
+        if (!why) break;
+        b.m.variants[v].status = "refused";
+        b.m.variants[v].reason = why;
+    }
+    b.var = v;
+    if (v >= hb::kVariants) {
+        benchRestore(nullptr);
+        return;
+    }
+    hb::VariantRec& r = b.m.variants[v];
+    r = hb::VariantRec{};
+    r.status = "running";
+    b.capFrames[v].clear();
+    b.phase = BenchPhase::Warm;
+    b.left = benchWarm(v);
+    b.capIndex = -1;
+    b.restarts[v] = 0;
+}
+
+// The variant ends: ok with its MB, or refused (why). The next one starts.
+void benchEndVariant(const char* refusedWhy) {
+    BenchRun& b = g_bench;
+    hb::VariantRec& r = b.m.variants[b.var];
+    b.finalWant[0] = b.finalWant[1] = false;
+    if (refusedWhy) {
+        r.status = "refused";
+        r.reason = refusedWhy;
+        r.frames.clear();
+        b.capFrames[b.var].clear();
+    } else {
+        r.status = "ok";
+        r.mbOwn.have = true;
+        r.mbOwn.v = benchAsleepVariant(b.var) ? 0.0 : layerVramMb();
+        r.mbNgx.have = true;   // no second DLSS in this variant: none of the hull's
+        r.mbNgx.v = 0.0;
+        const double dx = dxgiUsageMb();
+        r.mbDxgi.have = dx >= 0.0;
+        r.mbDxgi.v = dx;
+    }
+    benchStartVariant(b.var + 1);
+}
+
+// A capture frame was lost (no copy, a fallback, the composite not applied): the run of 8 starts again after a short re-warm.
+void benchRestart(const char* why) {
+    BenchRun& b = g_bench;
+    hb::VariantRec& r = b.m.variants[b.var];
+    r.frames.clear();
+    b.capFrames[b.var].clear();
+    b.finalWant[0] = b.finalWant[1] = false;
+    if (++b.restarts[b.var] > kBenchRestartMax) {
+        static char why2[96];
+        _snprintf_s(why2, sizeof why2, _TRUNCATE, "the capture restarted %u times (%s)", kBenchRestartMax, why);
+        benchEndVariant(why2);
+        return;
+    }
+    b.phase = BenchPhase::Warm;
+    b.left = kBenchWarmShort;
+    b.capIndex = -1;
+}
+
+// The next frame's flags from the phase: the layer asleep for the originals, the TAA's history off for sep_noaa.
+void benchApplyFrameFlags() {
+    const bool run = benchRunning();
+    g_benchSleep = run && benchAsleepVariant(g_bench.var);
+    g_benchNoAa = run && g_bench.var == hb::kSepNoaa;
+}
+
+// The rect from the covers' extent: grown by kBenchGrow output px, aligned so that render and output corners are whole pixels
+// in both (x4/3: render multiples of 3), fixed for the run. False when no hull was seen.
+bool benchMakeRect() {
+    BenchRun& b = g_bench;
+    if (!b.boxAny || !b.renderW || !b.renderH || !b.outW || !b.outH) return false;
+    b.align = 1;
+    for (uint32_t k = 1; k <= 8; ++k)
+        if ((static_cast<uint64_t>(k) * b.outW) % b.renderW == 0 && (static_cast<uint64_t>(k) * b.outH) % b.renderH == 0) {
+            b.align = k;
+            break;
+        }
+    const uint32_t k = b.align;
+    const uint32_t gx = (kBenchGrow * b.renderW + b.outW - 1) / b.outW, gy = (kBenchGrow * b.renderH + b.outH - 1) / b.outH;
+    uint32_t x0 = b.box[0] > gx ? b.box[0] - gx : 0u, y0 = b.box[1] > gy ? b.box[1] - gy : 0u;
+    uint32_t x1 = std::min(b.box[2] + gx, b.renderW), y1 = std::min(b.box[3] + gy, b.renderH);
+    x0 -= x0 % k;
+    y0 -= y0 % k;
+    x1 = std::min((x1 + k - 1) / k * k, b.renderW - b.renderW % k);
+    y1 = std::min((y1 + k - 1) / k * k, b.renderH - b.renderH % k);
+    if (x1 <= x0 || y1 <= y0) return false;
+    const uint32_t r[4] = {x0, y0, x1 - x0, y1 - y0};
+    std::memcpy(b.rectR, r, sizeof r);
+    b.rectO[0] = static_cast<uint32_t>(static_cast<uint64_t>(x0) * b.outW / b.renderW);
+    b.rectO[1] = static_cast<uint32_t>(static_cast<uint64_t>(y0) * b.outH / b.renderH);
+    b.rectO[2] = std::min(static_cast<uint32_t>(static_cast<uint64_t>(x1) * b.outW / b.renderW), b.outW) - b.rectO[0];
+    b.rectO[3] = std::min(static_cast<uint32_t>(static_cast<uint64_t>(y1) * b.outH / b.renderH), b.outH) - b.rectO[1];
+    return b.rectO[2] > 0 && b.rectO[3] > 0;
+}
+
+// The rect step's cover copies, read once they are old enough (alpha above 0 in the eye region).
+void benchReadRect(ID3D11DeviceContext* ctx) {
+    BenchRun& b = g_bench;
+    for (int i = 0; i < 2; ++i) {
+        if (b.rectState[i] != 1 || !g_benchRectStage[i] || g_frame - b.rectAt[i] < kBenchMapLag) continue;
+        D3D11_MAPPED_SUBRESOURCE map{};
+        const HRESULT hr = ctx->Map(g_benchRectStage[i], 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &map);
+        if (hr == DXGI_ERROR_WAS_STILL_DRAWING) continue;
+        b.rectState[i] = 2;
+        if (FAILED(hr)) continue;
+        D3D11_TEXTURE2D_DESC d{};
+        g_benchRectStage[i]->GetDesc(&d);
+        for (uint32_t y = 0; y < d.Height; ++y) {
+            const uint8_t* row = static_cast<const uint8_t*>(map.pData) + static_cast<size_t>(y) * map.RowPitch;
+            for (uint32_t x = 0; x < d.Width; ++x)
+                if (row[4 * x + 3]) {
+                    if (!b.boxAny) {
+                        b.box[0] = b.box[2] = x;
+                        b.box[1] = b.box[3] = y;
+                        b.boxAny = true;
+                    }
+                    b.box[0] = std::min(b.box[0], x);
+                    b.box[1] = std::min(b.box[1], y);
+                    b.box[2] = std::max(b.box[2], x + 1);
+                    b.box[3] = std::max(b.box[3], y + 1);
+                }
+        }
+        ctx->Unmap(g_benchRectStage[i], 0);
+    }
+}
+
+// Why the bench must stop now, or null. Read at every boundary while variants run.
+const char* benchAbortReason() {
+    BenchRun& b = g_bench;
+    if (b.abortWhy) return b.abortWhy;
+    if (!detail::g_hullLayerSeparate) return "diag.hull_layer is no longer separate";
+    if (frameGenOn()) return "frame generation turned on";
+    if (g_busy) return "the busy governor put the layer to sleep";
+    if (!runtimeVrProfile() || nativeOnFootActive()) return "left the cockpit (the flat profile, or on foot)";
+    if (journalSeatKind() != b.seat) return "the vehicle changed";
+    if (journalVehicleKnown() && !journalVehicle()) return "the game's menu or a loading screen";
+    if (journalInJumpTunnel()) return "hyperspace";
+    if (g_dump != Dump::Idle) return "an eye dump was armed";
+    if (!g_device || FAILED(g_device->GetDeviceRemovedReason())) return "the device was lost";
+    const ULONGLONG now = GetTickCount64();
+    if (b.runStartMs ? now - b.runStartMs > kBenchRunMs : now - b.pressMs > kBenchRunMs) return "over 20 s";
+    return nullptr;
+}
+
+// The manifest, the per-variant lines and the done/aborted line, the toast; everything the bench held released.
+void benchFinish() {
+    BenchRun& b = g_bench;
+    // Medians over each variant's capture frames, both eyes summed: the stage times, the DLSS times, the frame span, the CPU.
+    for (int v = 0; v < hb::kVariants; ++v) {
+        hb::VariantRec& r = b.m.variants[v];
+        const auto& frames = b.capFrames[v];
+        if (frames.empty()) continue;
+        auto med = [&](int kind) {
+            std::vector<double> vals;
+            for (uint32_t f : frames) {
+                double sum = 0.0;
+                bool any = false;
+                for (const auto& t : b.times)
+                    if (t.frame == f && t.kind == kind) {
+                        sum += t.ms;
+                        any = true;
+                    }
+                if (any) vals.push_back(sum);
+            }
+            return hb::median(vals);
+        };
+        const bool asleep = benchAsleepVariant(v);
+        for (int k = 0; k < hb::kLayerStages; ++k) {
+            r.layerStage[k] = med(kBtStage + k);
+            if (!r.layerStage[k].have && asleep) r.layerStage[k] = hb::Num{true, 0.0};   // asleep: the layer did no GPU work
+        }
+        r.mainDlss = med(kBtMainDlss);
+        r.hullDlss = med(kBtHullDlss);
+        if (!r.hullDlss.have && v != hb::kDlssFull && v != hb::kDlssSub) r.hullDlss = hb::Num{true, 0.0};
+        r.frameSpan = med(kBtSpan);
+        r.cpuMs = med(kBtCpu);
+    }
+    b.m.evicted = g_benchEvictions > 0;
+    const std::string manifest = hb::manifestName(b.stampA);
+    const std::wstring mpath = b.dir + L"\\" + std::wstring(manifest.begin(), manifest.end());
+    FILE* f = nullptr;
+    bool wrote = false;
+    if (_wfopen_s(&f, mpath.c_str(), L"wb") == 0 && f) {
+        const std::string text = hb::manifestJson(b.m);
+        wrote = std::fwrite(text.data(), 1, text.size(), f) == text.size();
+        wrote = (std::fclose(f) == 0) && wrote;
+    }
+    int ok = 0, refused = 0, aborted = 0;
+    for (int v = 0; v < hb::kVariants; ++v) {
+        const hb::VariantRec& r = b.m.variants[v];
+        if (r.status == "ok")
+            ++ok;
+        else if (r.status == "refused")
+            ++refused;
+        else
+            ++aborted;
+        double layer = -1.0;
+        for (const auto& s : r.layerStage)
+            if (s.have) layer = (layer < 0.0 ? 0.0 : layer) + s.v;
+        Log::get().note("hull layer: bench %s variant %s: %s frames=%u warm=%u fallback=%u restarts=%u layer_ms=%.3f hull_dlss_ms=%.3f "
+                        "main_dlss_ms=%.3f frame_ms=%.3f cpu_ms=%.3f mb_own=%.1f mb_ngx=%.1f mb_dxgi=%.0f final=%u reason=%s",
+                        b.stampA.c_str(), hb::variantId(v), r.status.c_str(), static_cast<unsigned>(r.frames.size()), r.warmFrames, r.fallbackFrames,
+                        b.restarts[v], layer, r.hullDlss.have ? r.hullDlss.v : -1.0, r.mainDlss.have ? r.mainDlss.v : -1.0,
+                        r.frameSpan.have ? r.frameSpan.v : -1.0, r.cpuMs.have ? r.cpuMs.v : -1.0, r.mbOwn.have ? r.mbOwn.v : -1.0,
+                        r.mbNgx.have ? r.mbNgx.v : -1.0, r.mbDxgi.have ? r.mbDxgi.v : -1.0,
+                        static_cast<unsigned>(!r.finalFiles[0].empty()) + static_cast<unsigned>(!r.finalFiles[1].empty()), r.reason.empty() ? "-" : r.reason.c_str());
+    }
+    const double mb = static_cast<double>(g_benchWriter.bytesWritten()) / (1024.0 * 1024.0);
+    const bool drained = g_benchWriter.idle();
+    if (b.aborted.empty()) {
+        Log::get().note("hull layer: bench %s done: ok=%d refused=%d aborted=%d files=%u failed=%u stage_fails=%u mb=%.1f evicted=%u manifest=%s%s "
+                        "(python tools\\hull_bench_report.py <edvr_logs>\\eyes\\eye_%s)",
+                        b.stampA.c_str(), ok, refused, aborted, g_benchWriter.written(), g_benchWriter.failed(), b.stageFails, mb, g_benchEvictions,
+                        wrote ? "written" : "write_failed", drained ? "" : " (the writer had not drained)", b.stampA.c_str());
+        char text[96];
+        _snprintf_s(text, sizeof text, _TRUNCATE, "Hull bench done: %d/%d variants (%d refused)", ok, hb::kVariants, refused + aborted);
+        benchToast(text);
+    } else {
+        Log::get().note("hull layer: bench %s aborted: %s; ok=%d refused=%d aborted=%d files=%u failed=%u stage_fails=%u mb=%.1f evicted=%u manifest=%s",
+                        b.stampA.c_str(), b.aborted.c_str(), ok, refused, aborted, g_benchWriter.written(), g_benchWriter.failed(), b.stageFails, mb,
+                        g_benchEvictions, wrote ? "written" : "write_failed");
+        char text[112];
+        _snprintf_s(text, sizeof text, _TRUNCATE, "Hull bench aborted: %s", b.aborted.c_str());
+        benchToast(text);
+    }
+    if (drained) g_benchWriter.stop();   // else the thread finishes its queue and is joined at the next bench or at shutdown
+    g_benchWriter.resetCounts();
+    benchReleaseGpu();
+    g_benchSleep = g_benchNoAa = g_benchTimeAll = false;
+    detail::g_hullBenchOn = false;
+    g_bench.phase = BenchPhase::Idle;
+}
+
+// At the boundary, inside the layer's own scope: the staged copies mapped, the GPU times read, the rect's covers read, the
+// frame's span and CPU time noted.
+void benchCollect(ID3D11DeviceContext* ctx) {
+    BenchRun& b = g_bench;
+    benchMapSlots(ctx, false);
+    benchCollectQueries(ctx);
+    if (b.phase == BenchPhase::Rect) benchReadRect(ctx);
+    if (b.phase == BenchPhase::Capture || b.phase == BenchPhase::Settle) {
+        double ms = 0.0;
+        unsigned n = 0;
+        if (gpuCensusFrameSpan(&ms, &n)) b.times.push_back({g_frame - 1, kBtSpan, ms});
+    }
+    int64_t ticks = 0;
+    for (const auto t : g_st.cpuTicks) ticks += t;
+    const int64_t d = ticks >= b.cpuLast ? ticks - b.cpuLast : ticks;   // the 30 s line zeroes them
+    b.cpuLast = ticks;
+    LARGE_INTEGER fq{};
+    QueryPerformanceFrequency(&fq);
+    if (fq.QuadPart) b.times.push_back({g_frame - 1, kBtCpu, static_cast<double>(d) * 1000.0 / static_cast<double>(fq.QuadPart)});
+}
+
+// At the boundary before decideNext: the frame that ended judged, the phase advanced, the next frame's flags set.
+void benchStep() {
+    BenchRun& b = g_bench;
+    if (b.phase != BenchPhase::Drain && b.phase != BenchPhase::Idle) {
+        if (const char* why = benchAbortReason()) {
+            benchRestore(why);
+            benchApplyFrameFlags();
+            return;
+        }
+    }
+    const bool asleep = benchAsleepVariant(b.var);
+    const bool good = asleep || (b.discarded && b.applied0);
+    switch (b.phase) {
+        case BenchPhase::Idle: break;
+        case BenchPhase::Rect:
+            if (b.rectState[0] == 2 && b.rectState[1] == 2) {
+                if (!b.boxAny || !benchMakeRect()) {
+                    benchRestore("no_hull_visible");
+                    break;
+                }
+                b.m.render[0] = b.renderW;
+                b.m.render[1] = b.renderH;
+                b.m.output[0] = b.outW;
+                b.m.output[1] = b.outH;
+                std::memcpy(b.m.rectRender, b.rectR, sizeof b.rectR);
+                std::memcpy(b.m.rectOutput, b.rectO, sizeof b.rectO);
+                const DlssMode mode = dlssModeByRatio(b.renderW, b.outW);
+                b.m.dlssQuality = b.renderW == b.outW ? "dlaa" : kDlssModeNames[static_cast<int>(mode)];
+                Log::get().note("hull layer: bench %s rect: render %u,%u %ux%u -> output %u,%u %ux%u (eye %ux%u -> %ux%u, aligned to %u render px)",
+                                b.stampA.c_str(), b.rectR[0], b.rectR[1], b.rectR[2], b.rectR[3], b.rectO[0], b.rectO[1], b.rectO[2], b.rectO[3],
+                                b.renderW, b.renderH, b.outW, b.outH, b.align);
+                b.phase = BenchPhase::Quiet;
+            } else if (++b.rectFrames > kBenchRectFrames) {
+                benchRestore(b.sawOther && !b.sawDlss ? "the eyes' upscaler is not DLSS"
+                                                     : "no cover from the layer (the own ship not composited on both eyes)");
+            }
+            break;
+        case BenchPhase::Quiet:
+            if (GetTickCount64() - b.pressMs >= kBenchQuietMs) {
+                b.runStartMs = GetTickCount64();
+                benchStartVariant(0);
+            }
+            break;
+        case BenchPhase::Warm:
+            if (good) {
+                ++b.m.variants[b.var].warmFrames;
+                if (b.left) --b.left;
+            }
+            // dump v2's TAA sequence over sep_taa's last 8 warm frames and its 8 captures (tools\hull_taa_sim.py runs on it)
+            if (b.var == hb::kSepTaa && b.left == static_cast<uint32_t>(hb::kCaptureFrames) && !b.seqStarted && !g_seq.active) {
+                wcsncpy_s(g_dumpStamp, b.stamp, _TRUNCATE);
+                seqStart();   // from the frame about to run
+                b.seqStarted = true;
+            }
+            if (!b.left) {
+                // A capture run needs its copies free and the writer under half its budget; else the warm holds a frame.
+                if (benchFreeSlots() < kBenchFreeToCapture || g_benchWriter.queuedBytes() > hb::Writer::kQueueBudget / 2) {
+                    b.left = 1;
+                } else {
+                    b.phase = BenchPhase::Capture;
+                    b.capIndex = 0;
+                    b.finalWant[0] = b.finalWant[1] = true;
+                }
+            }
+            break;
+        case BenchPhase::Capture:
+            if (good && b.staged0) {
+                hb::VariantRec& r = b.m.variants[b.var];
+                r.frames.push_back(b.pendingFrame);
+                b.capFrames[b.var].push_back(b.pendingFrame.layerFrame);
+                if (++b.capIndex >= hb::kCaptureFrames) {
+                    b.phase = BenchPhase::Settle;
+                    b.left = kBenchSettleFrames;
+                    b.capIndex = -1;
+                }
+            } else {
+                benchRestart(!b.staged0 ? "no copy of the eye" : "the composite was not applied");
+            }
+            break;
+        case BenchPhase::Settle:
+            if (b.left) --b.left;
+            if (!b.left) benchEndVariant(nullptr);
+            break;
+        case BenchPhase::Drain:
+            ++b.drainFrames;
+            break;
+    }
+    b.staged0 = b.applied0 = false;
+    b.pendingFrame = hb::Frame{};
+    benchApplyFrameFlags();
+}
+
+// After decideNext (the next frame's discard): a fallback frame in a separate variant is not captured; it extends the warm, or
+// restarts a capture run, and past kBenchFallbackMax the variant is refused.
+void benchDecided(uint32_t why) {
+    BenchRun& b = g_bench;
+    b.discarded = g_discard;
+    if (!(b.phase == BenchPhase::Warm || b.phase == BenchPhase::Capture) || benchAsleepVariant(b.var) || g_discard) return;
+    hb::VariantRec& r = b.m.variants[b.var];
+    ++r.fallbackFrames;
+    b.lastFallback = why;
+    if (r.fallbackFrames > kBenchFallbackMax) {
+        static char reason[64];
+        _snprintf_s(reason, sizeof reason, _TRUNCATE, "fallback %s", fallbackName(why));
+        benchEndVariant(reason);
+    } else if (b.phase == BenchPhase::Capture) {
+        benchRestart("a fallback frame");
+    }
+    benchApplyFrameFlags();
+    if (g_benchSleep) g_discard = false;   // the next variant is an original: asleep from this frame
+}
+
+void benchDrainStep(ID3D11DeviceContext* ctx) {
+    BenchRun& b = g_bench;
+    const bool late = GetTickCount64() - b.drainStartMs > kBenchDrainMs;
+    if (late) benchMapSlots(ctx, true);
+    bool slots = false;
+    for (const auto& s : g_benchSlots) slots = slots || s.pending;
+    const bool queries = benchQueriesPending() && b.drainFrames < 4 * kBenchDrainFrames;
+    if (!late && (slots || queries || b.drainFrames < kBenchDrainFrames || !g_benchWriter.idle())) return;
+    benchFinish();
+}
+
+// A timed frame's stage sums (stageCollect), kept by frame while the bench runs.
+void benchNoteStages(uint32_t frame, const double* sums) {
+    for (int k = 0; k < kTStages; ++k) g_bench.times.push_back({frame, kBtStage + k, sums[k]});
+}
+
+void benchAfterComposite(ID3D11DeviceContext* ctx, int eye, const Eye& e, const Comp& c, const HullLayerCompositeInputs& in, bool applied) {
+    BenchRun& b = g_bench;
+    if (b.phase == BenchPhase::Rect && b.rectState[eye] == 0) {
+        if (stageRegion(ctx, e.cover, in.regionX, in.regionY, in.renderW, in.renderH, g_benchRectStage[eye])) {
+            b.rectState[eye] = 1;
+            b.rectAt[eye] = g_frame;
+        }
+        return;
+    }
+    if (eye == 0 && applied) b.applied0 = true;
+    // The mask: the layer's TAA history this frame wrote (premultiplied colour, its coverage in alpha, at the output size), on the
+    // last capture frame of sep_taa (of sep_noaa only when sep_taa gave none).
+    if (b.phase == BenchPhase::Capture && b.capIndex == hb::kCaptureFrames - 1 && (b.var == hb::kSepTaa || (b.var == hb::kSepNoaa && !b.maskTaken)) &&
+        c.hist[c.read ^ 1u]) {
+        if (benchStage(ctx, c.hist[c.read ^ 1u], b.rectO[0], b.rectO[1], b.rectO[2], b.rectO[3], hb::maskName(b.stampA, eye), g_frame,
+                       static_cast<uint32_t>(eye)) &&
+            eye == 1)
+            b.maskTaken = true;
+    }
+}
+
 }  // namespace
 
 void hullLayerConfigure(Config& cfg) {
@@ -3718,7 +4495,7 @@ void hullLayerConfigure(Config& cfg) {
 }
 
 bool hullLayerBeforeMainDraw(ID3D11DeviceContext* ctx, UINT instances, UINT startInstance) {
-    if (!detail::g_hullLayerSeparate || !ctx || g_pending.active || g_main.active || g_busy) return false;   // asleep: no seed, no discard
+    if (!detail::g_hullLayerSeparate || !ctx || g_pending.active || g_main.active || g_busy || g_benchSleep) return false;   // asleep: no seed, no discard
     const uint64_t vs = bindingShaderHash(BindSlot::Vs);
     const bool hull = isHullVs(vs), decal = vs == kDecalVs;
     if (!hull && !decal) return false;
@@ -3809,6 +4586,7 @@ static bool busyDraw(ID3D11DeviceContext* ctx) {
 
 bool hullLayerBegin(ID3D11DeviceContext* ctx, char kind, UINT count, UINT instances, UINT startInstance) {
     if (!detail::g_hullLayerOn || !ctx || g_pending.active) return false;
+    if (g_benchSleep) return false;   // the variant bench's original: asleep, and not counted as busy
     if (g_busy) return busyDraw(ctx);
     if (g_dump != Dump::Capturing) return beginDraw(ctx, kind, count, instances, startInstance);
     // Dump v2, the dump frame: the draw's bindings before the hook (it may bind the private ones), and after it the lighting
@@ -3879,7 +4657,7 @@ void hullLayerNoteNightVisionState() {
 }
 
 bool hullLayerBeginDispatch(ID3D11DeviceContext* ctx, uint64_t cs) {
-    if (!detail::g_hullLayerOn || !ctx || !g_device || g_pending.active || g_main.active || g_dispatch.active || g_busy) return false;
+    if (!detail::g_hullLayerOn || !ctx || !g_device || g_pending.active || g_main.active || g_dispatch.active || g_busy || g_benchSleep) return false;
     for (int s = 0; s < kAoSteps; ++s)
         if (kAoCs[s] == cs) return beginAoStep(ctx, s);
     return false;
@@ -3900,7 +4678,7 @@ void hullLayerEndDispatch(ID3D11DeviceContext* ctx) {
 }
 
 void hullLayerAfterCopy(ID3D11DeviceContext* ctx, ID3D11Resource* dst, ID3D11Resource* src) {
-    if (!detail::g_hullLayerOn || !ctx || !dst || !src || !g_device || g_busy) return;
+    if (!detail::g_hullLayerOn || !ctx || !dst || !src || !g_device || g_busy || g_benchSleep) return;
     Mirror* ms = findMirror(src);
     if (!ms) return;   // only a copy out of a texture the layer mirrors (the G-buffer, depth, HDR) has a private twin
     D3D11_RESOURCE_DIMENSION dim = D3D11_RESOURCE_DIMENSION_UNKNOWN;
@@ -3925,7 +4703,7 @@ void hullLayerAfterCopy(ID3D11DeviceContext* ctx, ID3D11Resource* dst, ID3D11Res
 }
 
 void hullLayerNoteClearRtv(ID3D11DeviceContext* ctx, ID3D11RenderTargetView* rtv, const float colour[4]) {
-    if (!detail::g_hullLayerOn || !rtv || !colour || !g_device || g_busy || !findMirror(resourceOf(rtv))) return;   // asleep: the copies age out
+    if (!detail::g_hullLayerOn || !rtv || !colour || !g_device || g_busy || g_benchSleep || !findMirror(resourceOf(rtv))) return;   // asleep: the copies age out
     auto* priv = static_cast<ID3D11RenderTargetView*>(privateView(ViewKind::Rtv, rtv, false));
     if (priv) vScreenClearRenderTargetViewRaw(ctx, priv, colour);
 }
@@ -3944,7 +4722,7 @@ void hullLayerNoteClearDsv(ID3D11DeviceContext* ctx, ID3D11DepthStencilView* dsv
     }
     if (flags & D3D11_CLEAR_DEPTH) slot->depth = depth;
     if (flags & D3D11_CLEAR_STENCIL) slot->stencil = stencil;
-    if (!g_device || g_busy || !findMirror(res)) return;
+    if (!g_device || g_busy || g_benchSleep || !findMirror(res)) return;
     auto* priv = static_cast<ID3D11DepthStencilView*>(privateView(ViewKind::Dsv, dsv, false));
     if (priv) {
         VrWorldInternalScope internal;   // the hook forwards this clear raw and does not see it as the game's
@@ -3954,13 +4732,17 @@ void hullLayerNoteClearDsv(ID3D11DeviceContext* ctx, ID3D11DepthStencilView* dsv
 
 void hullLayerArmDump(const wchar_t* stamp) {
     if (!detail::g_hullLayerOn || g_dump != Dump::Idle) return;
+    if (detail::g_hullBenchOn && g_bench.phase != BenchPhase::Drain) {
+        g_bench.abortWhy = "an eye dump was armed";   // its reference frame and sequence would cut into a variant
+        return;
+    }
     wcsncpy_s(g_dumpStamp, stamp ? stamp : L"", _TRUNCATE);
     g_dump = Dump::Armed;
     Log::get().note("hull layer: dump %ls armed for the next whole frame", g_dumpStamp);
 }
 
 void hullLayerCompositeEye(ID3D11DeviceContext* ctx, int eye, const HullLayerCompositeInputs& in) {
-    if (!detail::g_hullLayerSeparate || !ctx || eye < 0 || eye > 1 || !g_device || !in.output || !in.outputSrv || !in.source || !in.tanNow || g_busy)
+    if (!detail::g_hullLayerSeparate || !ctx || eye < 0 || eye > 1 || !g_device || !in.output || !in.outputSrv || !in.source || !in.tanNow || g_busy || g_benchSleep)
         return;   // asleep (Station fixes): no composite
     VrWorldInternalScope internal;   // the layer's own dispatch and copy
     // The hull eye: the one whose tonemap wrote the submitted texture this frame (the same index first, should both eyes share one
@@ -4012,7 +4794,7 @@ void hullLayerCompositeEye(ID3D11DeviceContext* ctx, int eye, const HullLayerCom
     }
     cb.jit[0] = in.jitterX;
     cb.jit[1] = in.jitterY;
-    cb.jit[2] = history ? 1.0f : 0.0f;
+    cb.jit[2] = history && !g_benchNoAa ? 1.0f : 0.0f;
     cb.jit[3] = kTaaCurrent;
     cb.depthAB[0] = in.depthA;
     cb.depthAB[1] = in.depthB;
@@ -4067,6 +4849,7 @@ void hullLayerCompositeEye(ID3D11DeviceContext* ctx, int eye, const HullLayerCom
         e.dumpApplied = apply;
     }
     if (eye == 0) seqStage(ctx, e, c, in, history, apply);   // dump v2: the TAA sequence (before the history pair flips)
+    if (detail::g_hullBenchOn) benchAfterComposite(ctx, eye, e, c, in, apply);   // the variant bench (before the history pair flips)
     c.read ^= 1u;
     c.lastFrame = g_frame;
     c.renderW = in.renderW;
@@ -4081,6 +4864,11 @@ void hullLayerCompositeEye(ID3D11DeviceContext* ctx, int eye, const HullLayerCom
 void hullLayerFrameBoundary(ID3D11DeviceContext* ctx) {
     if (g_main.active) hullLayerAfterMainDraw(ctx);   // never: Before and After are one call chain
     if (!detail::g_hullLayerOn) {
+        if (detail::g_hullBenchOn) {   // the variant bench ends with the layer: its copies so far written, the manifest says why
+            benchRestore("diag.hull_layer turned off");
+            if (ctx) benchMapSlots(ctx, true);
+            benchFinish();
+        }
         if (g_device || !g_mirrors.empty()) releaseAll();
         g_win = Window{};
         return;
@@ -4103,6 +4891,7 @@ void hullLayerFrameBoundary(ID3D11DeviceContext* ctx) {
             timerCollect(g_compTimer, ctx);
             stageCollect(ctx);
             seqBoundary(ctx);
+            if (detail::g_hullBenchOn) benchCollect(ctx);   // the variant bench: its copies mapped, its times read
         }
         if (g_dump == Dump::Capturing && ctx) writeDump(ctx);
     }
@@ -4144,7 +4933,7 @@ void hullLayerFrameBoundary(ID3D11DeviceContext* ctx) {
         if (detail::g_hullLayerSeparate) seqStart();   // dump v2: the TAA sequence starts on the capture frame
     }
     const ULONGLONG now = GetTickCount64();
-    if (g_autoStreak >= kAutoFrames && g_autoDumps < kAutoMax && g_dump == Dump::Idle && (g_lastAutoMs == 0 || now - g_lastAutoMs >= kAutoGapMs)) {
+    if (g_autoStreak >= kAutoFrames && g_autoDumps < kAutoMax && g_dump == Dump::Idle && !detail::g_hullBenchOn && (g_lastAutoMs == 0 || now - g_lastAutoMs >= kAutoGapMs)) {
         temporalPassArmEyeDump();   // the hotkey's own call: the eye run, its census and ledger, and hullLayerArmDump
         if (g_dump == Dump::Armed) {
             ++g_autoDumps;
@@ -4160,11 +4949,20 @@ void hullLayerFrameBoundary(ID3D11DeviceContext* ctx) {
     for (auto& e : g_eyes) resetFrame(e);
     g_inEye = g_stageEye = -1;
     g_terrainFrame = g_seededFrame = false;
+    // The variant bench: the frame that ended judged, the next frame's variant (an original sleeps: g_benchSleep).
+    if (detail::g_hullBenchOn) {
+        if (g_bench.phase == BenchPhase::Drain && ctx)
+            benchDrainStep(ctx);
+        else
+            benchStep();
+    }
     // Step 3: whether the next frame's main pass may discard the own ship, from what is known before its first draw.
-    if (detail::g_hullLayerSeparate)
-        decideNext();
+    Fallback why = kFallbacks;
+    if (detail::g_hullLayerSeparate && !g_benchSleep)
+        why = decideNext();
     else
         g_discard = false;
+    if (detail::g_hullBenchOn) benchDecided(why);
     // Dump v2: separate mode's capture frame is a reference frame: the main pass keeps the own ship (as on a fallback frame, the
     // layer still runs and its composite is made, not applied), so the dump holds the game's own hull to compare the layer with.
     // One frame of the ship drawn by the game; the hold and the miss judge are untouched.
@@ -4189,8 +4987,208 @@ void hullLayerShutdown() {
     g_pending = Pending{};   // references, if any, die with the device
     g_main = MainPending{};
     g_dispatch = DispatchPending{};
+    if (detail::g_hullBenchOn) {
+        g_benchWriter.stop();   // its queue written first: the files on disk are whole
+        benchReleaseGpu();
+        g_benchSleep = g_benchNoAa = g_benchTimeAll = false;
+        g_bench.phase = BenchPhase::Idle;
+        detail::g_hullBenchOn = false;
+    }
     releaseAll();
     detail::g_hullLayerOn = false;
+}
+
+// ---- the variant bench: its key and hooks (TEMPORARY) ---------------------------------------------------------------------
+
+void hullBenchPress() {
+    BenchRun& b = g_bench;
+    if (detail::g_hullBenchOn) {
+        if (b.phase == BenchPhase::Drain) {
+            Log::get().note("hull layer: bench %s: press ignored, the bench is writing its files", b.stampA.c_str());
+        } else {
+            b.abortWhy = "cancelled (a second press)";
+            Log::get().note("hull layer: bench %s: cancel pressed", b.stampA.c_str());
+        }
+        return;
+    }
+    const char* refuse = nullptr;
+    char why[160] = "";
+    ULARGE_INTEGER freeBytes{};
+    const std::wstring dir = Log::get().dir() + L"\\eyes";
+    if (!detail::g_hullLayerSeparate)
+        refuse = "diag.hull_layer is not separate";
+    else if (!runtimeVrProfile())
+        refuse = "not the VR profile";
+    else if (nativeOnFootActive())
+        refuse = "on foot";
+    else if (frameGenOn())
+        refuse = "frame generation is on (the layer stands aside)";
+    else if (g_busy)
+        refuse = "the layer sleeps (the busy governor)";
+    else if (!g_device)
+        refuse = "the layer has not run yet (no own ship composited)";
+    else if (g_dump != Dump::Idle || g_seq.active)
+        refuse = "a hull dump is being taken";
+    else if (temporalPassEyeRunBusy())
+        refuse = "an eye run is still being taken or written";
+    else if (!g_benchWriter.idle())
+        refuse = "the last bench's files are still being written";
+    else if (!GetDiskFreeSpaceExW(Log::get().dir().c_str(), &freeBytes, nullptr, nullptr) || freeBytes.QuadPart < kBenchMinFreeBytes) {
+        _snprintf_s(why, sizeof why, _TRUNCATE, "%.1f GB free on the log drive, under 4", static_cast<double>(freeBytes.QuadPart) / (1024.0 * 1024.0 * 1024.0));
+        refuse = why;
+    }
+    if (refuse) {
+        Log::get().note("hull layer: bench refused: %s (hotkey.hull_bench, TEMPORARY)", refuse);
+        char text[112];
+        _snprintf_s(text, sizeof text, _TRUNCATE, "Hull bench refused: %s", refuse);
+        benchToast(text);
+        return;
+    }
+    g_benchWriter.stop();   // a thread left from the last bench (its queue was empty)
+    g_benchWriter.resetCounts();
+    b = BenchRun{};
+    g_benchEvictions = 0;
+    temporalPassMakeEyeStamp(b.stamp, 32);
+    for (const wchar_t* p = b.stamp; *p; ++p) b.stampA += static_cast<char>(*p);
+    b.dir = dir;
+    CreateDirectoryW(dir.c_str(), nullptr);
+    b.pressMs = GetTickCount64();
+    b.seat = journalSeatKind();
+    b.phase = BenchPhase::Rect;
+    b.m.stamp = b.stampA;
+#ifndef EDVR_VERSION_STRING
+#define EDVR_VERSION_STRING "unversioned test build"
+#endif
+    b.m.build = EDVR_VERSION_STRING;
+    const unsigned preset = dlaaPresetNow();
+    b.m.dlssPreset = preset >= 10 && preset <= 13 ? std::string(1, static_cast<char>('J' + (preset - 10))) : std::to_string(preset);
+    b.m.dlssVersion = "the pinned NGX runtime (tools\\fetch_ngx.py)";
+    b.m.overlayNote = "the eye captures precede the UI layer; the headset frames are taken after the press toast (2.5 s) is gone";
+    int built = 0;
+    for (int v = 0; v < hb::kVariants; ++v) {
+        const char* nb = benchNotBuilt(v);
+        b.m.variants[v].status = nb ? "refused" : "pending";
+        b.m.variants[v].reason = nb ? nb : "";
+        built += nb ? 0 : 1;
+    }
+    g_benchTimeAll = true;
+    detail::g_hullBenchOn = true;
+    Log::get().note("hull layer: bench %s armed (hotkey.hull_bench, TEMPORARY; docs\\research-own-hull-layer-2026-11-08.md \"Variant bench\"): hold still; "
+                    "%d variants, %d built; files to %ls",
+                    b.stampA.c_str(), static_cast<int>(hb::kVariants), built, dir.c_str());
+    benchToast("Hull bench: hold still ~10 s");
+}
+
+void hullBenchCaptureEye(ID3D11DeviceContext* ctx, int eye, ID3D11Texture2D* submit, bool dlss, uint32_t renderW, uint32_t renderH,
+                         uint32_t outW, uint32_t outH, float jitterX, float jitterY, const float* tanNow, const float* headDelta) {
+    if (!detail::g_hullBenchOn || !ctx || !submit || eye < 0 || eye > 1) return;
+    BenchRun& b = g_bench;
+    (dlss ? b.sawDlss : b.sawOther) = true;
+    if (b.phase == BenchPhase::Rect) {
+        if (eye == 0) {
+            b.renderW = renderW;
+            b.renderH = renderH;
+            b.outW = outW;
+            b.outH = outH;
+        }
+        return;
+    }
+    if (!benchRunning()) return;
+    if (renderW != b.renderW || renderH != b.renderH || outW != b.outW || outH != b.outH) {
+        b.abortWhy = "the eye size changed";
+        return;
+    }
+    if (!dlss) {
+        b.abortWhy = "the eyes' upscaler is no longer DLSS";
+        return;
+    }
+    if (b.phase != BenchPhase::Capture || b.capIndex < 0) return;
+    VrWorldInternalScope internal;   // the bench's own copy
+    if (eye == 0) {
+        const std::string name = hb::frameName(b.stampA, b.var, b.capIndex, 0);
+        if (benchStage(ctx, submit, b.rectO[0], b.rectO[1], b.rectO[2], b.rectO[3], name, g_frame, 0)) {
+            b.staged0 = true;
+            hb::Frame& f = b.pendingFrame;
+            f.index = b.capIndex;
+            f.layerFrame = g_frame;
+            f.file = name;
+            f.jitter[0] = jitterX;
+            f.jitter[1] = jitterY;
+            f.headRotDeg = headRotDeg(headDelta);
+            if (tanNow) std::memcpy(f.tanNow, tanNow, sizeof f.tanNow);
+        }
+    } else if (b.capIndex == 0) {
+        benchStage(ctx, submit, b.rectO[0], b.rectO[1], b.rectO[2], b.rectO[3], hb::frameName(b.stampA, b.var, 0, 1), g_frame, 1);
+    }
+}
+
+void hullBenchCaptureFinal(uint32_t eye, ID3D11Texture2D* texture, const uint32_t region[4], bool flipU, bool flipV) {
+    if (!detail::g_hullBenchOn || eye > 1 || !texture || !region) return;
+    BenchRun& b = g_bench;
+    if (!b.finalWant[eye] || b.var < 0 || b.var >= hb::kVariants || !b.outW || !b.outH) return;
+    b.finalWant[eye] = false;
+    D3D11_TEXTURE2D_DESC d{};
+    texture->GetDesc(&d);
+    if (d.ArraySize != 1 || region[2] <= region[0] || region[3] <= region[1]) return;
+    // The rect in the headset frame: the region is the eye at its submitted size (the output size, or scaled), flipped as told.
+    const double sx = static_cast<double>(region[2] - region[0]) / b.outW, sy = static_cast<double>(region[3] - region[1]) / b.outH;
+    uint32_t x = static_cast<uint32_t>(b.rectO[0] * sx), y = static_cast<uint32_t>(b.rectO[1] * sy);
+    const uint32_t w = std::max(1u, static_cast<uint32_t>(b.rectO[2] * sx)), h = std::max(1u, static_cast<uint32_t>(b.rectO[3] * sy));
+    const uint32_t rw = region[2] - region[0], rh = region[3] - region[1];
+    if (flipU) x = rw > x + w ? rw - (x + w) : 0u;
+    if (flipV) y = rh > y + h ? rh - (y + h) : 0u;
+    ID3D11Device* dev = nullptr;
+    ID3D11DeviceContext* ctx = nullptr;
+    texture->GetDevice(&dev);
+    if (dev) dev->GetImmediateContext(&ctx);
+    if (ctx && dev == g_device) {
+        VrWorldInternalScope internal;
+        const std::string name = hb::finalName(b.stampA, b.var, static_cast<int>(eye));
+        if (benchStage(ctx, texture, region[0] + x, region[1] + y, w, h, name, g_frame, eye)) {
+            b.m.variants[b.var].finalFiles[eye] = name;
+            b.m.variants[b.var].finalFlip[eye][0] = flipU;
+            b.m.variants[b.var].finalFlip[eye][1] = flipV;
+        }
+    }
+    releaseRef(ctx);
+    releaseRef(dev);
+}
+
+int hullBenchTimeBegin(ID3D11DeviceContext* ctx, int kind) {
+    if (!detail::g_hullBenchOn || !ctx || !g_device || !benchRunning()) return -1;
+    for (uint32_t i = 0; i < kBenchQueries; ++i) {
+        BenchQuery& q = g_benchQ[i];
+        if (q.open || q.pending) continue;
+        if (!q.dj) {
+            D3D11_QUERY_DESC qd{};
+            qd.Query = D3D11_QUERY_TIMESTAMP_DISJOINT;
+            D3D11_QUERY_DESC qt{};
+            qt.Query = D3D11_QUERY_TIMESTAMP;
+            if (FAILED(g_device->CreateQuery(&qd, &q.dj)) || FAILED(g_device->CreateQuery(&qt, &q.t0)) || FAILED(g_device->CreateQuery(&qt, &q.t1))) {
+                releaseRef(q.dj);
+                releaseRef(q.t0);
+                releaseRef(q.t1);
+                return -1;
+            }
+        }
+        ctx->Begin(q.dj);
+        ctx->End(q.t0);
+        q.open = true;
+        q.kind = kind;
+        q.frame = g_frame;
+        return static_cast<int>(i);
+    }
+    return -1;
+}
+
+void hullBenchTimeEnd(ID3D11DeviceContext* ctx, int handle) {
+    if (handle < 0 || handle >= static_cast<int>(kBenchQueries) || !ctx) return;
+    BenchQuery& q = g_benchQ[handle];
+    if (!q.open) return;
+    ctx->End(q.t1);
+    ctx->End(q.dj);
+    q.open = false;
+    q.pending = true;
 }
 
 }  // namespace edvr

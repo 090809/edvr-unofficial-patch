@@ -140,6 +140,11 @@ void temporalPassNoteOffAaSceneDepth(int eye, ID3D11Texture2D* source, const uin
 // and per-eye motion metadata in edvr_logs\eyes; the diagnostics that ride one
 // armed frame (the draw census, the object ledger, the pixel probe) arm with it.
 void temporalPassArmEyeDump();
+// The hull variant bench (hotkey.hull_bench, TEMPORARY; hull_layer.h): whether an eye run is still taking or writing (the
+// bench refuses then), and a stamp from the eye dump's own maker (HHMMSSmmm and the session's serial), so the bench's files
+// sort among the dumps'.
+bool temporalPassEyeRunBusy();
+void temporalPassMakeEyeStamp(wchar_t* out, size_t count);
 // Active eye-run diagnostic only, after the final crisp composition and before
 // the runtime's menu. region is the actual returned texture's unflipped bounds.
 void temporalPassCaptureFinalEye(uint64_t sequence, uint32_t eye, ID3D11Texture2D* texture,
