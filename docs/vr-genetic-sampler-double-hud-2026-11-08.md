@@ -2,7 +2,8 @@
 
 ## Status
 
-- **State: the double's cause FOUND, fix F227 built, NOT FLOWN; the left arm
+- **State: the double's cause FOUND; fix F227 flown once, single by eye, but
+  that log had no held match, so its trigger did not occur; the left arm
   FLOWN OK.** Issue #200. A user on v0.22.0-rc.7 (VR, native on foot)
   reported "Double vision hud when using genetic scanner". Sean reproduced it
   on Frontier on 2026-11-08 in three flights.
@@ -35,10 +36,12 @@
 - **Held higher: the game's pose.** At level aim the game holds the sampler
   3.6 cm higher and 5.4 cm nearer its camera than the Profile Analyser, and
   EDVR adds the same offsets to both. A per-item correction is Sean's call.
-- **Not this arc:** the blue highlight on sampled plants blurs
-  (`190859367003`, from the cockpit). DLSS's input already draws it as a
-  noisy, scan-lined pattern, and DLSS smears it. It is the DLSS-blurred
-  translucent-effect class, and its draw is not named.
+- **Not this arc:** the bio-scan highlight on the ground blurs in VR
+  (`190859367003`) and shimmers in flat (flat capture
+  `20261109_025601_335_48048_1`). Its motion and depth equal the ground's,
+  and its noise is the game's own, animated over frames. DLSS halves the
+  frame-to-frame change in flat and smears it in VR's 2x upscale. Its draw is
+  not named.
 - **Environment (Sean):** Frontier, game build 334925, OpenXR, DLSS at
   2016x2017 into 4032x4034, world scale 110%. Reporter: SteamVR lighthouse,
   RTX 4080, DLSS K.
@@ -311,3 +314,34 @@ horizontal scan lines; P00, DLSS's output before the UI, smears it into
 horizontal streaks; T00 and the final image match P00. EDVR adds nothing
 after DLSS there. The blur is made by DLSS from that input, the class of
 docs' DLSS-blurred translucent effects; this flight did not name the draw.
+
+### 2026-11-08, fourth flight (a6caa1b8): F227 by eye, and the flat highlight
+
+Log `edvr_gfx_20261108_195240` (v0.22.0-rc.7-243-ga6caa1b8, build matched).
+VR with the sampler from 19:54:38 to 19:55:13, then a switch to flat at
+19:55:32. Sean: "That seems to have fixed it."
+
+The marker fix's F63 lines over the VR part: 80 eye-seconds, 7084 matches by
+the CPU identification, 0 by a held match. The fallback's trigger did not
+occur, so this log neither shows F227 acting nor rules it out. The earlier
+flights had held-only seconds in 10 to 40 eye-seconds each.
+
+The flat capture (Shift+NumLock, `flat_pixels\20261109_025601_335_48048_1`,
+frames 15824, 15825, 15840 and 15841; DLSS preset 13 at 3840x2160 in and
+out; HDR route; from the ship's cockpit): a green bio-scan highlight on the
+ground. Inside it the motion vectors and depth equal those of a ring of
+ground around it to 0.003 px and 1e-6 (15824: (-0.320, +0.746) px against
+(-0.322, +0.747)). The input's highlight is speckled (green Laplacian 10.0
+against the ground's 5.9) and changes over frames: mean |difference| 4.7 to
+5.7 between consecutive frames (ground 3.4 to 4.3) and 13.9 over 16 frames
+(ground 6.2). That is a slowly moving animation, not per-frame dither. DLSS's
+output keeps the animation (13.4 over 16 frames) and halves the
+frame-to-frame change (2.4 to 3.2). EDVR's rejection mask touched no pixel.
+
+- ruled out: wrong motion vectors or depth under the bio-scan highlight (flat),
+  because inside and around it they agree to 0.003 px.
+
+The shimmer is the game's own effect, which DLSS calms in flat. In VR the
+same speckle at half resolution comes out of DLSS's 2x upscale as streaks
+(`190859367003`). A baseline with EDVR's anti-aliasing off has not been
+taken.
