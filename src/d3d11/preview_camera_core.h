@@ -153,6 +153,14 @@ inline int formatKey(char* buf, size_t cap, bool on) noexcept {
                             : "the game's camera request is left as it is (a preview screen may show from the commander's own camera)");
 }
 
+// F232 (TEMPORARY key experimental.native_on_foot_preview_handover; native_preview_camera_core.h holds the roster check): its line on each change.
+constexpr char kHandoverKey[] = "experimental.native_on_foot_preview_handover";
+inline int formatHandoverKey(char* buf, size_t cap, bool on) noexcept {
+    return std::snprintf(buf, cap, "native on foot preview handover (F232, TEMPORARY): %s is %s -- %s", kHandoverKey, on ? "on" : "off",
+                         on ? "the preview camera accepts a Location camera list of two to six producers (one headset entry, the rest previews, the newest used), so a preview screen opened from another keeps its camera"
+                            : "the preview camera accepts a Location camera list of exactly two producers, as before");
+}
+
 // ---- the hooks' events --------------------------------------------------------------------------------------------------------------------------------------------------------
 constexpr size_t kNameCopy = 65;
 enum Kind : uint8_t { kSetCamera = 1, kRelease = 2 };

@@ -153,6 +153,8 @@ bool nativeOnFootShopOpen() noexcept;
 bool nativeOnFootLiveryOpen() noexcept;
 // F228: the key's live value, set by native_on_foot.cpp's frame thread. Default true.
 void nativeOnFootSetLiveryHold(bool on) noexcept;
+// F232: a preview screen F209 watches (a buy screen, a Livery screen, the loadout browser) reads open. Any thread.
+bool nativeOnFootPreviewScreenOpen() noexcept;
 // F230 (TEMPORARY): experimental.native_on_foot_livery_camera_repair's live value, set by native_on_foot.cpp's frame thread. Default true. On: a Livery preview whose camera node is invalid has the game's own
 // setup run again from the client's Update; off: only the evidence lines (F229).
 void nativeOnFootSetLiveryRepair(bool on) noexcept;

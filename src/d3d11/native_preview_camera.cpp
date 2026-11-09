@@ -35,6 +35,8 @@ std::atomic<void*> g_previewOriginal[5]{};
 uint8_t* g_previewRelays[5]{};
 void* g_eyeTrampolineSlot=nullptr;
 bool g_previewAttempted=false,g_previewInstalled=false,g_previewLastActive=false;
+previewcam::DiagCap g_diagCap;   // F232: the frame thread's
+uint64_t g_diagAt=0;
 uint64_t g_previewReportAt=0,g_previewLastApplied=0;
 #if defined(EDVR_PREVIEW_TEST_READ_PROBE)
 void (*g_previewReadProbe)(uintptr_t,size_t) noexcept=nullptr;
@@ -378,7 +380,25 @@ void nativePreviewCameraBoundary(bool wanted,bool active) {
     }
     g_previewLastActive=enabled;g_previewLastApplied=applied;
 }
+void nativePreviewCameraSetHandover(bool on) noexcept {g_previewGame.handover.store(on,std::memory_order_relaxed);}
+void nativePreviewCameraDiagTick(bool screenOpen) {
+    const bool wanted=screenOpen&&g_previewInstalled;
+    g_previewEngine.diagWanted.store(wanted,std::memory_order_relaxed);
+    if(!wanted)return;
+    const uint64_t now=GetTickCount64();
+    if(g_diagAt&&now-g_diagAt<1000)return;
+    g_diagAt=now;
+    const uintptr_t base=reinterpret_cast<uintptr_t>(GetModuleHandleW(L"EliteDangerous64.exe"));
+    for(unsigned role=0;role<2;++role) {
+        previewcam::Refusal r;uint64_t counts[size_t(previewcam::Refuse::kRefuseCount)]{};
+        if(!g_previewEngine.takeRefusal(role,r,counts)||!g_diagCap.allow(now))continue;
+        char line[1100];
+        previewcam::formatRefusal(line,sizeof(line),r,counts,base,g_previewGame.handover.load(std::memory_order_relaxed));
+        Log::get().note("%s",line);
+    }
+}
 void nativePreviewCameraStop() noexcept {
+    g_previewEngine.diagWanted.store(false,std::memory_order_relaxed);
     g_previewEngine.enable(false);
     g_probe.writing.store(false,std::memory_order_release);
     g_probe.armed.store(false,std::memory_order_release);

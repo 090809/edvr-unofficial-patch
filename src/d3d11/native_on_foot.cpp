@@ -316,6 +316,7 @@ std::atomic<bool> g_f222Key{true};                            // F222 (TEMPORARY
 bool g_f222KeyLast = true;                                    // the value last logged (frame thread; the first read always logs)
 std::atomic<bool> g_previewCamKey{true};            // experimental.native_on_foot_preview_camera, as the frame thread last read it (F231, TEMPORARY)
 bool g_f231KeyLast = true;                          // frame thread: the value last logged
+bool g_f232KeyLast = true;                                    // F232 (TEMPORARY): experimental.native_on_foot_preview_handover, on by default, live: the value last logged (frame thread)
 bool g_f230KeyLast = true;                                    // F230 (TEMPORARY): experimental.native_on_foot_livery_camera_repair, on by default, live: the value last logged (frame thread; the first read always logs); the value lives in native_on_foot_hooks.cpp (nativeOnFootSetLiveryRepair)
 bool g_f228KeyLast = true;                                    // F228 (TEMPORARY): experimental.native_on_foot_livery_game_view, on by default, live: the value last logged (frame thread; the first read always logs); the key's value lives in native_on_foot_hooks.cpp (nativeOnFootSetLiveryHold)
 nofoot::f222::OwnFrame g_f222;                                // F222: the rotations of the last two pin frames and the rows' vectors in the model (one writer: the pin hook, under g_pfzBusy; reset at an edge)
@@ -1396,6 +1397,17 @@ void readKey() {
         }
         g_f231KeyLast = on;
         g_previewCamKey.store(on, std::memory_order_relaxed);
+    }
+    // F232 (TEMPORARY, live, the developer tier's "Preview handover"): the preview camera's roster check takes three to six producers on the Location child.
+    {
+        const bool on = cfg.getString("experimental.native_on_foot_preview_handover", "on") != "off";
+        if (first || on != g_f232KeyLast) {
+            char line[512];
+            previewcam::formatHandoverKey(line, sizeof(line), on);
+            Log::get().note("%s", line);
+        }
+        g_f232KeyLast = on;
+        nativePreviewCameraSetHandover(on);
     }
     // F220 (TEMPORARY A/B, live, the developer tier's "HUD stays with view"): with View bob off, the HUD's placement moves with the view's bob term instead of the view moving against it.
     {
@@ -38460,6 +38472,7 @@ static std::string recorderKeysJson() {
     str("experimental.native_on_foot_livery_game_view", cfg.getString("experimental.native_on_foot_livery_game_view", "on"));
     str("experimental.native_on_foot_livery_camera_repair", cfg.getString("experimental.native_on_foot_livery_camera_repair", "on"));   // F230
     str("experimental.native_on_foot_preview_camera", cfg.getString("experimental.native_on_foot_preview_camera", "on"));   // F231
+    str("experimental.native_on_foot_preview_handover", cfg.getString("experimental.native_on_foot_preview_handover", "on"));   // F232
     str("fix.native_on_foot_view_bob", cfg.getString("fix.native_on_foot_view_bob", "off"));
     num("experimental.native_on_foot_stand_ads_spine_straighten",
         nofoot::f180::clampDial(static_cast<double>(cfg.getFloat("experimental.native_on_foot_stand_ads_spine_straighten", 0.9f))));
@@ -38517,6 +38530,7 @@ void nativeOnFootFrameBoundary(uint32_t frameNo) {
     nativeOnFootHooksBody(keyOn, nativeOnFootActive(), bodyWhy);
     cameraGateTick(now);   // F93d: the game's camera (first person or its third-person suite) gates every body change; its lines
     nativePreviewCameraBoundary(keyOn && session, nativeOnFootActive() && !nativeOnFootCameraExternal());
+    nativePreviewCameraDiagTick(nativeOnFootPreviewScreenOpen());   // F232: the refused roster, once a second while a preview screen is open
     headShadowTick(now);   // F95c: the head kept in the shadows; its lines
     f142Tick(now);         // F142: the outfit census (a change), and the full outfit's window while the key is on
     coatPackTick(now);     // F157: whether the coat outfit is armed, to the draw path; the draws left out of the eyes, written once a window

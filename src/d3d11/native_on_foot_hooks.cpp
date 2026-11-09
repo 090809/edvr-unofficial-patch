@@ -3556,6 +3556,11 @@ static bool shopBuyScreenOpen() noexcept {
 bool nativeOnFootLiveryOpen() noexcept {
     return g_shopOpen[shop::kLivery].load(std::memory_order_acquire) != 0 || g_shopOpen[shop::kWeaponLivery].load(std::memory_order_acquire) != 0;
 }
+// F232: one of the preview screens F209 watches reads open (the two buy screens, the two Livery screens, the loadout browser). Any thread.
+bool nativeOnFootPreviewScreenOpen() noexcept {
+    return g_shopOpen[shop::kSuit].load(std::memory_order_acquire) != 0 || g_shopOpen[shop::kWeapons].load(std::memory_order_acquire) != 0 || nativeOnFootLiveryOpen() ||
+           g_shopOpen[shop::kOutfitting].load(std::memory_order_acquire) != 0;
+}
 void nativeOnFootSetLiveryHold(bool on) noexcept { g_liveryHold.store(on, std::memory_order_relaxed); }
 void nativeOnFootSetLiveryRepair(bool on) noexcept { g_repairKey.store(on, std::memory_order_relaxed); }   // F230 (TEMPORARY)
 // F107's shop input: a buy screen is open (F209), or a Livery screen is open while experimental.native_on_foot_livery_game_view is on (F228). Any thread.

@@ -12478,6 +12478,7 @@ H_SHOP_BUY_CLASSES = ("SuitVendorInteraction", "WeaponsVendorInteraction")   # t
 H_LIVCAM = "livery camera (F229)"
 H_LIVREP = "livery camera repair (F230)"
 H_PREVCAM = "preview camera (F231)"
+H_PREVROSTER = "preview camera roster (F232)"
 F107_SHOWROOM_MAX_M = 50.0   # F209: a distance-test episode whose first camera stood over F107's 3 m and no farther than this from the neck is the size of a showroom's camera (the suit shop's: 3.6 to 3.7 m)
 
 
@@ -12710,6 +12711,36 @@ def _hj_prevcam(rows, ctx):
         problems.append("a preview client asked for its camera with force 0 and the patch never applied")
     if problems:
         return ("PARTIAL", text + "; " + "; ".join(problems))
+    return ("OK", text)
+
+
+def _hj_prevroster(rows, ctx):
+    """F232: the preview camera's roster check (native_preview_camera_core.h; TEMPORARY key experimental.native_on_foot_preview_handover). While one of F209's watched preview screens is open, once a
+    second a line says which check refused the Location child last (per role, HMD or preview) with a snapshot of its roster (the count, mode, registered, stack vtable, members, name and each
+    entry's vtables, back-pointer and byte at entry-4) and how often each reason refused. The summary names the reasons seen and, for the newest line of each role, the roster's count. PARTIAL when
+    a roster could not be read (its count is unreadable)."""
+    kinds = ("key", "refused")
+    if not any(rows.get(k) for k in kinds):
+        return None
+    keys, refused = rows.get("key", []), rows.get("refused", [])
+    parts = []
+    if keys:
+        parts.append("key %s" % ", ".join(sorted({r["key"] for r in keys})))
+    byrole = collections.defaultdict(list)
+    for r in refused:
+        byrole[r["role"]].append(r)
+    for role in sorted(byrole):
+        rs = byrole[role]
+        reasons = collections.Counter(r["why"] for r in rs)
+        last = rs[-1]
+        parts.append("%s: %d line(s), refused for %s; newest roster count %s mode %s, %s entr(ies)" % (
+            role, len(rs), ", ".join("%s x%d" % (w, n) for w, n in sorted(reasons.items())), last["count"], last["mode"], len(re.findall(r"; entry \d+:", last["entries"]))))
+    if not refused:
+        parts.append("no refused roster logged")
+    text = "; ".join(parts)
+    unread = [r for r in refused if r["count"] == "unreadable"]
+    if unread:
+        return ("PARTIAL", text + "; %d roster(s) could not be read" % len(unread))
     return ("OK", text)
 
 
@@ -18010,6 +18041,12 @@ HEALTH_RULES = (
         ("capped", r"preview camera \(F231\): (?P<n>\d+) (?P<what>SetCamera|Release) lines in the last 10 s were not written"),
         ("lost", r"preview camera \(F231\): (?P<n>\d+) call\(s\) were not recorded"),
     ), _hj_prevcam),
+    _hrule(H_PREVROSTER, ("F232",), ("(F232",), (
+        ("key", r"native on foot preview handover \(F232, TEMPORARY\): experimental\.native_on_foot_preview_handover is (?P<key>on|off) -- .*"),
+        ("refused", r"native preview camera \(F232\): role (?P<role>HMD|preview) refused: (?P<why>[^;]+); handover (?P<ho>on|off); roster: child 0x(?P<child>[0-9A-F]+), count (?P<count>\w+), "
+                    r"mode (?P<mode>\w+), registered (?P<reg>\w+), stack vtable (?P<stack>\S+), members (?P<members>\w+), name \"(?P<name>[^\"]*)\"(?P<entries>(?:; entry \d+: .*?)*)"
+                    r"; refusals by reason:(?P<counts>.*)$"),
+    ), _hj_prevroster),
     _hrule(H_F212, ("F212",), ("(F212)",), (
         ("hook", r"avatar hooks: (?P<hook>conversation-look) hook (?P<st>armed|stood down)(?:: (?P<why>.*?)(?:\. the conversation look \(F212\) is not held.*)?)?$"),
         ("began", r"conversation look \(F212\): run (?P<n>\d+) began: .*\|yaw\| (?P<yaw>[\d.]+) and \|pitch\| (?P<pitch>[\d.]+) asked in its first frames"),
@@ -19909,6 +19946,7 @@ def self_test_health():
         f205src = read_text(os.path.join(repo_root(), "src", "d3d11", "native_on_foot_f205.h"))   # F205: the ADS view circle's press, runtime and override lines
         c1src = read_text(c1_path)
         shopsrc = read_text(os.path.join(repo_root(), "src", "d3d11", "shop_screen_core.h"))   # F209: the buy screens' event, signal and one-second lines
+        rostersrc = read_text(os.path.join(repo_root(), "src", "d3d11", "native_preview_camera_core.h"))   # F232: the refused roster's line
         previewsrc = read_text(os.path.join(repo_root(), "src", "d3d11", "preview_camera_core.h"))   # F231: the preview camera patch's and the two hooks' lines
         f212src = read_text(os.path.join(repo_root(), "src", "d3d11", "native_on_foot_f212.h"))   # F212: the conversation look's run and summary lines
         probesrc = read_text(probe_path)
@@ -20329,6 +20367,15 @@ def self_test_health():
             fmts[key] = health_c_format(shopsrc, needle)
         if fmts[key] is None:
             raise AssertionError("shop_screen_core.h has no format holding %r: the --health rule that reads it is out of date" % needle)
+        return health_render(fmts[key], vals)
+
+    def RN(needle, *vals):
+        """F232's refused-roster line pieces (formatRefusal in native_preview_camera_core.h), from their own format literals."""
+        key = "roster:" + needle
+        if key not in fmts:
+            fmts[key] = health_c_format(rostersrc, needle)
+        if fmts[key] is None:
+            raise AssertionError("native_preview_camera_core.h has no format holding %r: the --health rule that reads it is out of date" % needle)
         return health_render(fmts[key], vals)
 
     def RP(needle, *vals):
@@ -22770,6 +22817,22 @@ def self_test_health():
         check("F231: calls that were not recorded and lines the cap dropped are PARTIAL", [neck(), HOOK_UP231, KEY_ON231, APPLIED231, LOST231, CAPPED231], 0, [("PARTIAL", H_PREVCAM)],
               has=["3 call(s) were not recorded", "12 line(s) were not written (the cap of 40 in ten seconds)"])
         check("F231: a line that drifted from its pattern is unparsed", [neck(), "preview camera (F231): SetCamera somewhere else"], 4, [("UNPARSED", H_PREVCAM)])
+
+        # ---- the preview camera's roster (F232): the key and the refused roster's line ----
+        TAG232 = "native preview camera (F232):"
+        KEY_ON232 = RP("native on foot preview handover (F232, TEMPORARY): %s is %s -- %s", "experimental.native_on_foot_preview_handover", "on", "the preview camera accepts a Location camera list of two to six producers")
+        KEY_OFF232 = RP("native on foot preview handover (F232, TEMPORARY): %s is %s -- %s", "experimental.native_on_foot_preview_handover", "off", "the preview camera accepts a Location camera list of exactly two producers, as before")
+        HEAD232 = RN("role %s refused: %s; handover %s; roster:", TAG232, "preview", "count", "off", 0x1234ABCD, "3", "0", "1", "+0x8180", "1", "Location")
+        HEAD232U = RN("role %s refused: %s; handover %s; roster:", TAG232, "HMD", "child vtable", "on", 0x0, "unreadable", "unreadable", "unreadable", "unreadable", "unreadable", "unreadable")
+        ENT232 = [RN("; entry %u: ptr 0x%llX iface %s obj-0x20 %s obj-0x60 %s back %s b-4 %s", i, 0x1000 * (i + 1), "+0x8200", "+0x8280", "0x0", "yes", "01") for i in range(3)]
+        TAIL232 = RN("; refusals by reason:") + RN(" %s %llu,", "count", 2)
+        REFUSED232 = HEAD232 + "".join(ENT232) + TAIL232
+        REFUSED232U = HEAD232U + RN("; refusals by reason:") + " none"
+        check("F232: the key on and a refused roster (a count of three with the key off) is OK and names the reason and the roster's size", [neck(), KEY_OFF232, REFUSED232], 0, [("OK", H_PREVROSTER)],
+              has=["key off", "preview: 1 line(s), refused for count x1; newest roster count 3 mode 0, 3 entr(ies)"], lacks=["UNPARSED"])
+        check("F232: no refused roster logged is OK", [neck(), KEY_ON232], 0, [("OK", H_PREVROSTER)], has=["key on", "no refused roster logged"])
+        check("F232: a roster that could not be read is PARTIAL", [neck(), KEY_ON232, REFUSED232U], 0, [("PARTIAL", H_PREVROSTER)], has=["1 roster(s) could not be read"])
+        check("F232: a line that drifted from its pattern is unparsed", [neck(), "native preview camera (F232): the roster is somewhere else"], 4, [("UNPARSED", H_PREVROSTER)])
 
         # ---- the conversation look (F212): the leaf that sets the look springs' targets is held at 0 while native on foot is active ----
         S212 = "conversation look (F212)"

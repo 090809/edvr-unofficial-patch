@@ -822,6 +822,35 @@ inline void run209(Check&& check) {
                   has_(ini, "the preview screens (Livery, the shops, the loadout) show the preview from their own camera") && ini.find("native_on_foot_preview_camera = on") > ini.find("native_on_foot_livery_camera_repair = on"),
               "F231: the shipped key is on, TEMPORARY, with its ui line after F230's and the plain sentence of what the user gets");
     }
+    // ---- 11. F232: the preview handover (TEMPORARY key): the key's line and the wiring (the roster check itself is run by native_preview_camera_test) -----------------------------------------------
+    {
+        namespace pc = edvr::previewcam;
+        char line[700];
+        pc::formatHandoverKey(line, sizeof(line), true);
+        const std::string on = line;
+        pc::formatHandoverKey(line, sizeof(line), false);
+        check(std::strcmp(pc::kHandoverKey, "experimental.native_on_foot_preview_handover") == 0 &&
+                  on.rfind("native on foot preview handover (F232, TEMPORARY): experimental.native_on_foot_preview_handover is on -- ", 0) == 0 && has_(on, "two to six producers") &&
+                  has_(std::string(line), "is off -- the preview camera accepts a Location camera list of exactly two producers, as before"),
+              "F232: the key's line says what each value does");
+        const std::string cpp = slurp("src/d3d11/native_on_foot.cpp"), cam = slurp("src/d3d11/native_preview_camera.cpp"), core = slurp("src/d3d11/native_preview_camera_core.h"),
+                          hooks = slurp("src/d3d11/native_on_foot_hooks.cpp"), ini = slurp("edvr.ini");
+        check(has_(cpp, "cfg.getString(\"experimental.native_on_foot_preview_handover\", \"on\") != \"off\"") && has_(cpp, "previewcam::formatHandoverKey(line, sizeof(line), on);") &&
+                  has_(cpp, "nativePreviewCameraSetHandover(on);") && has_(cpp, "nativePreviewCameraDiagTick(nativeOnFootPreviewScreenOpen());") && has_(cpp, "str(\"experimental.native_on_foot_preview_handover\""),
+              "F232: the key is read live on the frame thread, default on, logged on a change, set into the preview camera, the diagnostic ticks with the watched screens' reading, and the key is dumped");
+        check(has_(cam, "void nativePreviewCameraSetHandover(bool on) noexcept {g_previewGame.handover.store(on,std::memory_order_relaxed);}") &&
+                  has_(cam, "g_previewEngine.diagWanted.store(wanted,std::memory_order_relaxed);") && has_(cam, "g_diagCap.allow(now)") && has_(cam, "if(g_diagAt&&now-g_diagAt<1000)return;"),
+              "F232: the switch is one relaxed atomic store, the snapshot is wanted only while a watched screen is open, and the line is written once a second under the cap");
+        check(has_(core, "inline bool identity(const Memory& m,const Game& g,uintptr_t child,Identity& out) noexcept {\n    Refuse why=Refuse::kNone;\n    return identityWhy(m,g,child,out,why);\n}") &&
+                  has_(core, "const bool handover=g.handover.load(std::memory_order_relaxed);") && has_(core, "if(handover&&count!=2) {") && core.find("Log::get()") == std::string::npos &&
+                  core.find("std::mutex") == std::string::npos && has_(core, "if(d.busy.test_and_set(std::memory_order_acquire))return;"),
+              "F232: identity() is identityWhy(), a count of two takes the original path with the key on, the snapshot is a try-claim that is skipped when busy, and the core logs and locks nothing");
+        check(has_(hooks, "bool nativeOnFootPreviewScreenOpen() noexcept {") && has_(hooks, "g_shopOpen[shop::kOutfitting].load(std::memory_order_acquire) != 0"),
+              "F232: the watched preview screens' reading is the two buy screens, the two Livery screens and the loadout browser");
+        check(has_(ini, "# ui: Preview handover | choices on, off | recommended on | live\nnative_on_foot_preview_handover = on\n") && has_(ini, "# TEMPORARY (F232): Preview handover") &&
+                  has_(ini, "a preview screen opened from another (Livery from the loadout browser) keeps its preview camera") && ini.find("native_on_foot_preview_handover = on") > ini.find("native_on_foot_preview_camera = on"),
+              "F232: the shipped key is on, TEMPORARY, with its ui line after F231's and the plain sentence of what the user gets");
+    }
 }
 
 }  // namespace f209test

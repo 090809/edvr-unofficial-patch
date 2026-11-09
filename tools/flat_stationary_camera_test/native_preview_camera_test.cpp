@@ -343,6 +343,140 @@ int main(int argc,char** argv) {
         edvr::g_previewEngine.enter();edvr::nativePreviewCameraStop();
         check(!edvr::g_previewEngine.current(),"runtime shutdown poisons the live preview evaluation");edvr::g_previewEngine.leave();
     }
+    {   // F232: the roster check's reasons, the handover scan, the snapshot and its line
+        auto entry=[&](Fixture& f,size_t obj,bool hmdKind,uint8_t enabled=1)->uintptr_t {
+            if(hmdKind){f.put(obj,f.game.at[HmdObject]);f.put(obj+0x20,f.game.at[HmdIface]);f.put<uint8_t>(obj+0x1C,enabled);f.put(obj+0x20+0x120,f.at(0x3000));return f.at(obj+0x20);}
+            f.put(obj,f.game.at[PreviewObject]);f.put(obj+0x60,f.game.at[PreviewIface]);f.put(obj+0x60+0x120,f.at(0x3000));return f.at(obj+0x60);
+        };
+        auto roster=[&](Fixture& f,unsigned count,uintptr_t slot1,uintptr_t slot2=0){f.put<uint64_t>(0x3058,count);f.put(0x6008,slot1);if(slot2)f.put(0x6010,slot2);};
+        auto run=[&](Fixture& f,bool handover,Identity& id,Refuse& why){f.game.handover.store(handover);return identityWhy(f.memory,f.game,f.at(0x3000),id,why);};
+        // count 2 is accepted as before, key on and off, by identity() and identityWhy() alike
+        {
+            Fixture f;Identity off,on,plain;Refuse w1=Refuse::kCount,w2=Refuse::kCount;
+            const bool a=run(f,false,off,w1),b=run(f,true,on,w2);f.game.handover.store(false);const bool c=identity(f.memory,f.game,f.at(0x3000),plain);
+            check(a&&b&&c&&w1==Refuse::kNone&&w2==Refuse::kNone&&off==on&&off==plain&&off.hmd==f.at(0x1020)&&off.preview==f.at(0x2060),"F232 count 2 is accepted exactly as before with the key on and off");
+        }
+        // count 3, the old preview in slot 1 and the new one in slot 2
+        {
+            Fixture f;const uintptr_t fresh=entry(f,0xA000,false);roster(f,3,f.at(0x2060),fresh);Identity id,again;Refuse why=Refuse::kNone;
+            check(!run(f,false,id,why)&&why==Refuse::kCount,"F232 count 3 with the key off refuses with the count reason");
+            check(run(f,true,id,why)&&why==Refuse::kNone&&id.hmd==f.at(0x1020)&&id.preview==fresh&&run(f,true,again,why)&&id==again,"F232 count 3 with the key on picks the last preview (slot 2), the same for the same memory");
+            f.game.handover.store(true);Identity plain;
+            check(identity(f.memory,f.game,f.at(0x3000),plain)&&plain==id,"F232 identity() is identityWhy() with the reason dropped");
+        }
+        // the preview in slot 0 and the HMD last: the scan does not care about the order
+        {
+            Fixture f;const uintptr_t hmd2=entry(f,0xB000,true);roster(f,3,f.at(0x1020),hmd2);f.put(0x6000,f.at(0x2060));f.put(0x6008,f.at(0x1020));f.put(0x6010,f.at(0x2060));
+            // [preview, hmd, preview]: one HMD, previews around it; the preview is the last entry
+            Identity id;Refuse why=Refuse::kNone;
+            check(run(f,true,id,why)&&id.hmd==f.at(0x1020)&&id.preview==f.at(0x2060),"F232 the scan takes the one HMD entry wherever it is and the last preview entry");
+        }
+        // two HMD entries, a foreign entry, a disabled HMD entry: refused
+        {
+            Fixture f;const uintptr_t hmd2=entry(f,0xB000,true);roster(f,3,f.at(0x2060),hmd2);Identity id;Refuse why=Refuse::kNone;
+            check(!run(f,true,id,why)&&why==Refuse::kHmdEntries,"F232 two HMD entries are refused");
+            Fixture g;const uintptr_t foreign=g.at(0xC060);g.put(0xC060,g.game.at[HmdObject]);g.put(0xC180,g.at(0x3000));roster(g,3,g.at(0x2060),foreign);
+            check(!run(g,true,id,why)&&why==Refuse::kForeignEntry,"F232 a foreign entry (an interface that is neither the HMD's nor the preview's) is refused");
+            Fixture h;const uintptr_t disabled=entry(h,0xB000,true,0);roster(h,3,h.at(0x2060),disabled);
+            check(!run(h,true,id,why)&&why==Refuse::kForeignEntry,"F232 a disabled HMD entry is not an HMD entry: refused as foreign");
+            Fixture k;const uintptr_t stale=entry(k,0xA000,false);k.put(0xA060+0x120,uintptr_t(0x1234));roster(k,3,k.at(0x2060),stale);
+            check(!run(k,true,id,why)&&why==Refuse::kForeignEntry,"F232 a preview entry that does not point back at the child is not a preview entry");
+            Fixture m;roster(m,7,m.at(0x2060));
+            check(!run(m,true,id,why)&&why==Refuse::kCount,"F232 a roster of seven is refused");
+            Fixture n;roster(n,1,n.at(0x2060));
+            check(!run(n,true,id,why)&&why==Refuse::kCount,"F232 a roster of one is refused");
+            Fixture o;roster(o,3,o.at(0x2060),0x10);
+            check(!run(o,true,id,why)&&why==Refuse::kEntryPointers,"F232 an entry pointer too small to be an interface is refused");
+        }
+        // every check names itself, with the key off (the original chain)
+        struct Case {const char* name;Refuse want;void (*mutate)(Fixture&);};
+        const Case cases[]={
+            {"child vtable",Refuse::kChildVtable,[](Fixture& f){f.put<uintptr_t>(0x3000,0);}},
+            {"child+0x10",Refuse::kChild10,[](Fixture& f){f.put<uintptr_t>(0x3010,0);}},
+            {"stack",Refuse::kStack,[](Fixture& f){f.put<uintptr_t>(0x3030,0);}},
+            {"stack type",Refuse::kStackType,[](Fixture& f){f.put<uintptr_t>(0x4000,0);}},
+            {"predecessor",Refuse::kPredecessor,[](Fixture& f){f.put<uintptr_t>(0x3040,0);}},
+            {"count",Refuse::kCount,[](Fixture& f){f.put<uint64_t>(0x3058,3);}},
+            {"array",Refuse::kArray,[](Fixture& f){f.denied=f.at(0x3060);}},
+            {"mode",Refuse::kMode,[](Fixture& f){f.put<uint32_t>(0x3068,1);}},
+            {"members",Refuse::kMembers,[](Fixture& f){f.put<uintptr_t>(0x4028,0);}},
+            {"registered",Refuse::kRegistered,[](Fixture& f){f.put<uint8_t>(0x3038,0);}},
+            {"name",Refuse::kName,[](Fixture& f){std::memcpy(f.bytes.data()+0x7014,"Locatiom",8);}},
+            {"entry pointers",Refuse::kEntryPointers,[](Fixture& f){f.put<uintptr_t>(0x6000,0x10);}},
+            {"iface vtable",Refuse::kIfaceVtable,[](Fixture& f){f.put<uintptr_t>(0x1020,0);}},
+            {"object vtable",Refuse::kObjectVtable,[](Fixture& f){f.put<uintptr_t>(0x1000,0);}},
+            {"enabled byte",Refuse::kEnabled,[](Fixture& f){f.put<uint8_t>(0x101C,0);}},
+            {"back-pointer",Refuse::kBackPointer,[](Fixture& f){f.put<uintptr_t>(0x1140,0);}},
+            {"weights",Refuse::kWeights,[](Fixture& f){f.put<uintptr_t>(0x8000+HmdIface*0x80+0x20,0);}},
+        };
+        for(const Case& c:cases) {
+            Fixture f;c.mutate(f);Identity id;Refuse why=Refuse::kNone;
+            check(!run(f,false,id,why)&&why==c.want&&std::strcmp(refuseName(why),c.name)==0,c.name);
+            Fixture g;c.mutate(g);
+            const bool onResult=run(g,true,id,why);
+            // with the key on the same break is the same reason, except the count (3 is a roster now, and the break leaves the old preview in slot 1 only)
+            check(c.want==Refuse::kCount?(!onResult&&why==Refuse::kHmdEntries||!onResult&&why==Refuse::kForeignEntry||!onResult&&why==Refuse::kEntryPointers):(!onResult&&why==c.want),"F232 the reason is the same with the key on");
+        }
+        {
+            Fixture f;Identity id;Refuse why=Refuse::kChildVtable;
+            check(run(f,false,id,why)&&why==Refuse::kNone,"F232 an accepted child leaves no reason");
+        }
+        // the producer hooks count and snapshot a refused child; the preview hook's count 3 is also refused with the key off
+        {
+            Fixture f;const uintptr_t fresh=entry(f,0xA000,false);roster(f,3,f.at(0x2060),fresh);f.game.handover.store(false);
+            uint64_t counts[size_t(Refuse::kRefuseCount)]{};Refusal r;
+            manager(f.engine,[&]{f.h();f.p();return uintptr_t(1);});
+            check(f.engine.reasons[0][size_t(Refuse::kCount)].load()==1&&f.engine.reasons[1][size_t(Refuse::kCount)].load()==1&&f.hmdN==1&&f.previewN==1&&f.writes==0,
+                "F232 both producers' refused children are counted by reason, the originals still run once and nothing is written");
+            check(!f.engine.takeRefusal(0,r,counts)&&counts[size_t(Refuse::kCount)]==1,"F232 no snapshot is kept while the frame thread does not want one, the counts are still read");
+            f.engine.diagWanted.store(true);
+            manager(f.engine,[&]{f.h();f.p();return uintptr_t(1);});
+            check(f.engine.takeRefusal(0,r,counts)&&r.role==0&&r.why==Refuse::kCount&&r.count==3&&r.mode==0&&r.registered==1&&r.members==1&&r.nameRead&&std::strcmp(r.name,"Location")==0&&r.entries==3&&
+                      r.entry[0].ptr==f.at(0x1020)&&r.entry[0].iface==f.game.at[HmdIface]&&r.entry[0].obj20==f.game.at[HmdObject]&&r.entry[0].back==f.at(0x3000)&&r.entry[0].b4==1&&
+                      r.entry[1].ptr==f.at(0x2060)&&r.entry[1].obj60==f.game.at[PreviewObject]&&r.entry[1].b4==0&&r.entry[2].ptr==fresh&&counts[size_t(Refuse::kCount)]==2,
+                "F232 the snapshot holds the child's count, mode, registered, stack vtable, members, name and each entry's pointer, vtables, back-pointer and byte at entry-4");
+            check(!f.engine.takeRefusal(0,r,counts)&&f.engine.takeRefusal(1,r,counts)&&r.role==1&&!f.engine.takeRefusal(1,r,counts),"F232 a snapshot is taken once, per role");
+            char line[1100];formatRefusal(line,sizeof(line),r,counts,f.at(0),false);
+            const std::string text=line;
+            check(text.rfind("native preview camera (F232): role preview refused: count; handover off; roster: child 0x",0)==0&&text.find(", count 3, mode 0, registered 1, stack vtable +0x8180, members 1, name \"Location\"")!=std::string::npos&&
+                      text.find("; entry 0: ptr 0x")!=std::string::npos&&text.find(" iface +0x8200 obj-0x20 +0x8280 obj-0x60 0x0 back yes b-4 01")!=std::string::npos&&
+                      text.find("; entry 1: ptr 0x")!=std::string::npos&&text.find(" iface +0x8300 obj-0x20 ")!=std::string::npos&&text.find(" obj-0x60 +0x8380 back yes b-4 00")!=std::string::npos&&
+                      text.find("; entry 2: ptr 0x")!=std::string::npos&&text.find("; refusals by reason: count 2,")!=std::string::npos,
+                "F232 the line names the role, the reason, the handover state, the roster and each entry (RVAs against the image base) and the role's per-reason counts");
+            Refusal blank;blank.role=0;blank.why=Refuse::kChildVtable;uint64_t none[size_t(Refuse::kRefuseCount)]{};
+            formatRefusal(line,sizeof(line),blank,none,0x1000,true);
+            check(std::string(line)=="native preview camera (F232): role HMD refused: child vtable; handover on; roster: child 0x0, count unreadable, mode unreadable, registered unreadable, stack vtable unreadable, members unreadable, name \"unreadable\"; refusals by reason: none",
+                "F232 an unreadable roster says so, field by field");
+        }
+        // the key on: the same roster qualifies and the scan is the same for the finalizer's two reads
+        {
+            Fixture f;const uintptr_t fresh=entry(f,0xA000,false);roster(f,3,f.at(0x2060),fresh);f.game.handover.store(true);
+            Identity a,b;Refuse why=Refuse::kNone;
+            check(identityWhy(f.memory,f.game,f.at(0x3000),a,why)&&identityWhy(f.memory,f.game,f.at(0x3000),b,why)&&a==b&&a.preview==fresh,"F232 the scan is deterministic for the same memory");
+            manager(f.engine,[&]{f.h();return uintptr_t(1);});
+            check(f.engine.reasons[0][size_t(Refuse::kCount)].load()==0&&f.hmdN==1,"F232 with the key on the HMD hook's child is not refused for its count");
+            Fixture g;const uintptr_t fresh2=entry(g,0xA000,false);roster(g,3,g.at(0x2060),fresh2);g.game.handover.store(true);
+            manager(g.engine,[&]{g.p();return uintptr_t(1);});
+            check(g.engine.reasons[1][size_t(Refuse::kOtherProducer)].load()==1,"F232 the earlier preview's producer is not the one the child names: counted as another producer, not refused as a roster");
+        }
+        // the cap and the switch's copy
+        {
+            DiagCap c2;unsigned w2=0;for(unsigned i=0;i<100;++i)w2+=c2.allow(5000+i)?1u:0u;
+            check(w2==40&&!c2.allow(5200)&&c2.allow(15000),"F232 at most 40 lines in any ten seconds, a new window after ten");
+            Game a,b;a.at[0]=7;a.handover.store(true);b=a;Game c(a);
+            check(b.at[0]==7&&b.handover.load()&&c.at[0]==7&&c.handover.load()&&!Game().handover.load(),"F232 the game's switch copies with it and starts off");
+        }
+        // wait-free: several threads refusing while the reader takes snapshots: nothing waits, nothing is lost from the counters
+        {
+            Fixture f;roster(f,3,f.at(0x2060));f.game.handover.store(false);f.engine.diagWanted.store(true);
+            std::atomic<bool> go{false};std::atomic<unsigned> taken{0};
+            std::thread t[3];
+            for(auto& th:t)th=std::thread([&]{while(!go.load());for(unsigned i=0;i<2000;++i)f.engine.refusedChild(f.memory,f.game,f.at(0x3000),i&1,Refuse::kCount);});
+            std::thread reader([&]{while(!go.load());Refusal r;uint64_t c[size_t(Refuse::kRefuseCount)]{};for(unsigned i=0;i<2000;++i)if(f.engine.takeRefusal(i&1,r,c)&&r.why==Refuse::kCount&&r.count==3)taken.fetch_add(1);});
+            go.store(true);for(auto& th:t)th.join();reader.join();
+            check(f.engine.reasons[0][size_t(Refuse::kCount)].load()+f.engine.reasons[1][size_t(Refuse::kCount)].load()==6000&&taken.load()>0,"F232 concurrent refusals are all counted and snapshots are taken without waiting");
+        }
+    }
     check(!edvr::previewInstall()&&edvr::layoutQueries==1&&edvr::unexpected==1,
         "unknown layout refuses before module lookup, resolver or hook installation");
     std::printf("native_preview_camera_test: %u checks, %u failures\n",checks,failures);

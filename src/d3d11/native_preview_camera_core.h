@@ -3,6 +3,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 
 namespace edvr { namespace previewcam {
@@ -38,7 +39,15 @@ enum Address { Child,Child10,Stack,Nested,HmdIface,HmdObject,PreviewIface,Previe
     Weight,ConstantWeight,State,AddressCount };
 constexpr uint32_t kRvas[AddressCount]={0x5189070,0x5189078,0x5189370,0x5189A18,
     0x518C920,0x518C8B0,0x51AA500,0x51AA388,0x8BEA20,0xF81910,0x5294E0};
-struct Game { uintptr_t at[AddressCount]{}; };
+// F232 (TEMPORARY key experimental.native_on_foot_preview_handover): `handover` lets identity() take a roster of up to six producers on the Location child (one HMD entry, any number of preview
+// entries, the last one the preview) instead of exactly two. Written by the frame thread, read by the game's threads; off, identity() is exactly what it was.
+struct Game {
+    uintptr_t at[AddressCount]{};
+    std::atomic<bool> handover{false};
+    Game()=default;
+    Game(const Game& o):handover(o.handover.load(std::memory_order_relaxed)){std::memcpy(at,o.at,sizeof(at));}
+    Game& operator=(const Game& o){std::memcpy(at,o.at,sizeof(at));handover.store(o.handover.load(std::memory_order_relaxed),std::memory_order_relaxed);return *this;}
+};
 struct Identity {
     uintptr_t child=0,stack=0,predecessor=0,array=0,hmd=0,preview=0;
     bool operator==(const Identity& b) const noexcept {
@@ -46,31 +55,170 @@ struct Identity {
             array==b.array&&hmd==b.hmd&&preview==b.preview;
     }
 };
-inline bool identity(const Memory& m,const Game& g,uintptr_t child,Identity& out) noexcept {
+// F232: the first check identity() failed, one value per check, in the order they run. kForeignEntry..kNoPreview belong to the handover scan; kOtherProducer is not an identity failure (the child
+// qualified but the producer calling is not the one it names) and is only counted.
+enum class Refuse : uint8_t { kNone = 0, kChildVtable, kChild10, kStack, kStackType, kPredecessor, kCount, kArray, kMode, kMembers, kRegistered, kName, kEntryPointers, kIfaceVtable, kObjectVtable,
+    kEnabled, kBackPointer, kWeights, kForeignEntry, kHmdEntries, kNoPreview, kOtherProducer, kRefuseCount };
+inline const char* refuseName(Refuse r) noexcept {
+    static const char* const names[] = {"none", "child vtable", "child+0x10", "stack", "stack type", "predecessor", "count", "array", "mode", "members", "registered", "name", "entry pointers",
+        "iface vtable", "object vtable", "enabled byte", "back-pointer", "weights", "foreign entry", "HMD entry count", "no preview entry", "other producer"};
+    static_assert(sizeof(names) / sizeof(names[0]) == size_t(Refuse::kRefuseCount), "one name per reason");
+    return size_t(r) < size_t(Refuse::kRefuseCount) ? names[size_t(r)] : "?";
+}
+constexpr uint64_t kMaxRoster = 6;
+// The roster's two kinds of entry (the handover scan): an HMD entry is the HMD activity's interface, enabled, pointing back at the child; a preview entry the CustomisationVisual's, pointing back.
+inline bool hmdEntry(const Memory& m,const Game& g,uintptr_t e,uintptr_t child) noexcept {
+    uintptr_t v=0,hc=0;uint8_t enabled=0;
+    return e>=0x20&&get(m,e,v)&&v==g.at[HmdIface]&&get(m,e-0x20,v)&&v==g.at[HmdObject]&&get(m,e-4,enabled)&&enabled&&get(m,e+0x120,hc)&&hc==child;
+}
+inline bool previewEntry(const Memory& m,const Game& g,uintptr_t e,uintptr_t child) noexcept {
+    uintptr_t v=0,pc=0;
+    return e>=0x60&&get(m,e,v)&&v==g.at[PreviewIface]&&get(m,e-0x60,v)&&v==g.at[PreviewObject]&&get(m,e+0x120,pc)&&pc==child;
+}
+// The identity check, naming the first failing check in `why`. With g.handover off every check, and the order of them, is what identity() always was.
+inline bool identityWhy(const Memory& m,const Game& g,uintptr_t child,Identity& out,Refuse& why) noexcept {
     Identity q; q.child=child;
     uintptr_t v=0,v10=0; uint64_t count=0; uint32_t mode=0;
-    if(!get(m,child,v)||v!=g.at[Child]||!get(m,child+0x10,v10)||v10!=g.at[Child10]||
-       !get(m,child+0x30,q.stack)||!get(m,q.stack,v)||(v!=g.at[Stack]&&v!=g.at[Nested])||
-       !get(m,child+0x40,q.predecessor)||!q.predecessor||!get(m,child+0x58,count)||count!=2||
-       !get(m,child+0x60,q.array)||!get(m,child+0x68,mode)||mode!=0) return false;
+    const bool handover=g.handover.load(std::memory_order_relaxed);
+    if(!get(m,child,v)||v!=g.at[Child]){why=Refuse::kChildVtable;return false;}
+    if(!get(m,child+0x10,v10)||v10!=g.at[Child10]){why=Refuse::kChild10;return false;}
+    if(!get(m,child+0x30,q.stack)||!get(m,q.stack,v)){why=Refuse::kStack;return false;}
+    if(v!=g.at[Stack]&&v!=g.at[Nested]){why=Refuse::kStackType;return false;}
+    if(!get(m,child+0x40,q.predecessor)||!q.predecessor){why=Refuse::kPredecessor;return false;}
+    // Exactly two producers, as ever; with the handover on, three to six (the loadout browser's preview still registered when the next screen's is added).
+    if(!get(m,child+0x58,count)||(handover?(count<2||count>kMaxRoster):count!=2)){why=Refuse::kCount;return false;}
+    if(!get(m,child+0x60,q.array)){why=Refuse::kArray;return false;}
+    if(!get(m,child+0x68,mode)||mode!=0){why=Refuse::kMode;return false;}
     unsigned members=0;uint8_t registered=0;
-    for(unsigned i=0;i<11;++i) {uintptr_t c=0;if(!get(m,q.stack+0x28+i*8,c))return false;members+=c==child?1u:0u;}
+    for(unsigned i=0;i<11;++i) {uintptr_t c=0;if(!get(m,q.stack+0x28+i*8,c)){why=Refuse::kMembers;return false;}members+=c==child?1u:0u;}
+    if(members!=1){why=Refuse::kMembers;return false;}
+    if(!get(m,child+0x38,registered)||registered!=1){why=Refuse::kRegistered;return false;}
     uintptr_t name=0;uint64_t length=0;char text[8]{};
-    if(members!=1||!get(m,child+0x38,registered)||registered!=1||!get(m,q.stack+0x20,name)||!get(m,name,length)||length!=8||
-       !m.read(m.context,name+0x14,text,8)||std::memcmp(text,"Location",8)) return false;
-    if(!get(m,q.array,q.hmd)||!get(m,q.array+8,q.preview)||q.hmd<0x20||q.preview<0x60) return false;
-    uintptr_t hc=0,pc=0;uint8_t enabled=0;
-    if(!get(m,q.hmd,v)||v!=g.at[HmdIface]||!get(m,q.preview,v)||v!=g.at[PreviewIface]||
-       !get(m,q.hmd-0x20,v)||v!=g.at[HmdObject]||!get(m,q.preview-0x60,v)||v!=g.at[PreviewObject]||
-       !get(m,q.hmd-4,enabled)||!enabled||!get(m,q.hmd+0x120,hc)||hc!=child||
-       !get(m,q.preview+0x120,pc)||pc!=child) return false;
+    if(!get(m,q.stack+0x20,name)||!get(m,name,length)||length!=8||!m.read(m.context,name+0x14,text,8)||std::memcmp(text,"Location",8)){why=Refuse::kName;return false;}
+    if(handover&&count!=2) {
+        // Scan the roster: exactly one HMD entry, at least one preview entry, nothing else; the preview is the last one. The scan reads the same memory the finalizer reads twice, so the
+        // answer is the same for the same memory.
+        unsigned hmds=0,previews=0;uintptr_t hmd=0,preview=0;
+        for(uint64_t i=0;i<count;++i) {
+            uintptr_t e=0;
+            if(!get(m,q.array+i*8,e)||e<0x60){why=Refuse::kEntryPointers;return false;}
+            if(hmdEntry(m,g,e,child)){++hmds;hmd=e;}
+            else if(previewEntry(m,g,e,child)){++previews;preview=e;}
+            else {why=Refuse::kForeignEntry;return false;}
+        }
+        if(hmds!=1){why=Refuse::kHmdEntries;return false;}
+        if(!previews){why=Refuse::kNoPreview;return false;}
+        q.hmd=hmd;q.preview=preview;
+    } else {
+        if(!get(m,q.array,q.hmd)||!get(m,q.array+8,q.preview)||q.hmd<0x20||q.preview<0x60){why=Refuse::kEntryPointers;return false;}
+        uintptr_t hc=0,pc=0;uint8_t enabled=0;
+        if(!get(m,q.hmd,v)||v!=g.at[HmdIface]||!get(m,q.preview,v)||v!=g.at[PreviewIface]){why=Refuse::kIfaceVtable;return false;}
+        if(!get(m,q.hmd-0x20,v)||v!=g.at[HmdObject]||!get(m,q.preview-0x60,v)||v!=g.at[PreviewObject]){why=Refuse::kObjectVtable;return false;}
+        if(!get(m,q.hmd-4,enabled)||!enabled){why=Refuse::kEnabled;return false;}
+        if(!get(m,q.hmd+0x120,hc)||hc!=child||!get(m,q.preview+0x120,pc)||pc!=child){why=Refuse::kBackPointer;return false;}
+    }
     uintptr_t f=0;
     if(!get(m,g.at[HmdIface]+0x20,f)||f!=g.at[Weight]||
        !get(m,g.at[PreviewIface]+0x20,f)||f!=g.at[ConstantWeight]||
        !get(m,g.at[HmdIface]+0x28,f)||f!=g.at[State]||
-       !get(m,g.at[PreviewIface]+0x28,f)||f!=g.at[State]) return false;
-    out=q;return true;
+       !get(m,g.at[PreviewIface]+0x28,f)||f!=g.at[State]){why=Refuse::kWeights;return false;}
+    out=q;why=Refuse::kNone;return true;
 }
+inline bool identity(const Memory& m,const Game& g,uintptr_t child,Identity& out) noexcept {
+    Refuse why=Refuse::kNone;
+    return identityWhy(m,g,child,out,why);
+}
+
+// ---- F232: why a linked child was refused, and a snapshot of its roster -----------------------------------------------------------------------------------------------------------------
+constexpr uint64_t kUnread=~uint64_t(0);
+struct RosterEntry {
+    uint64_t ptr=kUnread,iface=kUnread,obj20=kUnread,obj60=kUnread,back=kUnread;
+    uint32_t b4=0x100;   // the byte at entry-4; 0x100: unread
+};
+struct Refusal {
+    uint8_t role=0;                      // 0 the HMD activity's producer, 1 the preview's
+    Refuse why=Refuse::kNone;
+    uint64_t child=0,count=kUnread,mode=kUnread,registered=kUnread,stackVtable=kUnread,members=kUnread;
+    bool nameRead=false;
+    char name[9]{};
+    unsigned entries=0;                  // min(count, kMaxRoster) entries were read
+    RosterEntry entry[kMaxRoster];
+};
+// Best-effort reads of the child's roster. Fixed size, no allocation; an unreadable value stays kUnread.
+inline void snapshotRoster(const Memory& m,const Game& g,uintptr_t child,unsigned role,Refuse why,Refusal& r) noexcept {
+    (void)g;
+    r=Refusal();r.role=uint8_t(role);r.why=why;r.child=child;
+    uint64_t count=0,mode64=0;uint32_t mode=0;uint8_t registered=0;uintptr_t stack=0,array=0,v=0;
+    if(get(m,child+0x58,count))r.count=count;
+    if(get(m,child+0x68,mode))r.mode=mode;
+    if(get(m,child+0x38,registered))r.registered=registered;
+    (void)mode64;
+    if(get(m,child+0x30,stack)&&get(m,stack,v)) {
+        r.stackVtable=v;
+        unsigned members=0;bool ok=true;
+        for(unsigned i=0;i<11;++i) {uintptr_t c=0;if(!get(m,stack+0x28+i*8,c)){ok=false;break;}members+=c==child?1u:0u;}
+        if(ok)r.members=members;
+        uintptr_t name=0;
+        if(get(m,stack+0x20,name)&&m.read(m.context,name+0x14,r.name,8)) {r.nameRead=true;r.name[8]=0;}
+    }
+    if(r.count!=kUnread&&get(m,child+0x60,array)) {
+        r.entries=unsigned(r.count<kMaxRoster?r.count:kMaxRoster);
+        for(unsigned i=0;i<r.entries;++i) {
+            RosterEntry& e=r.entry[i];uintptr_t p=0,x=0,back=0;uint8_t b=0;
+            if(!get(m,array+i*8,p))continue;
+            e.ptr=p;
+            if(get(m,p,x))e.iface=x;
+            if(p>=0x20&&get(m,p-0x20,x))e.obj20=x;
+            if(p>=0x60&&get(m,p-0x60,x))e.obj60=x;
+            if(get(m,p+0x120,back))e.back=back;
+            if(p>=4&&get(m,p-4,b))e.b4=b;
+        }
+    }
+}
+// A value as an RVA when it lies in the image ("+0x1234"), else as raw hex; "unreadable" for kUnread.
+inline void rvaText(char* out,size_t cap,uint64_t value,uintptr_t base) noexcept {
+    if(value==kUnread)std::snprintf(out,cap,"unreadable");
+    else if(base&&value>=base&&value-base<0x10000000ull)std::snprintf(out,cap,"+0x%llX",static_cast<unsigned long long>(value-base));
+    else std::snprintf(out,cap,"0x%llX",static_cast<unsigned long long>(value));
+}
+inline void numText(char* out,size_t cap,uint64_t value) noexcept {
+    if(value==kUnread)std::snprintf(out,cap,"unreadable");
+    else std::snprintf(out,cap,"%llu",static_cast<unsigned long long>(value));
+}
+inline const char* roleName(unsigned role) noexcept {return role==0?"HMD":"preview";}
+inline const char* diagTag() noexcept {return "native preview camera (F232):";}
+// "role R refused: <reason>; roster: ..." and the role's per-reason counts. `counts` is indexed by Refuse.
+inline int formatRefusal(char* buf,size_t cap,const Refusal& r,const uint64_t counts[size_t(Refuse::kRefuseCount)],uintptr_t base,bool handover) noexcept {
+    char count[24],mode[24],reg[24],stackVt[28],members[24];
+    numText(count,sizeof(count),r.count);numText(mode,sizeof(mode),r.mode);numText(reg,sizeof(reg),r.registered);
+    rvaText(stackVt,sizeof(stackVt),r.stackVtable,base);numText(members,sizeof(members),r.members);
+    size_t at=size_t(std::snprintf(buf,cap,"%s role %s refused: %s; handover %s; roster: child 0x%llX, count %s, mode %s, registered %s, stack vtable %s, members %s, name \"%s\"",diagTag(),roleName(r.role),
+        refuseName(r.why),handover?"on":"off",static_cast<unsigned long long>(r.child),count,mode,reg,stackVt,members,r.nameRead?r.name:"unreadable"));
+    for(unsigned i=0;i<r.entries&&at<cap;++i) {
+        const RosterEntry& e=r.entry[i];char iface[28],o20[28],o60[28],b4[8];
+        rvaText(iface,sizeof(iface),e.iface,base);rvaText(o20,sizeof(o20),e.obj20,base);rvaText(o60,sizeof(o60),e.obj60,base);
+        if(e.b4>0xFF)std::snprintf(b4,sizeof(b4),"?");else std::snprintf(b4,sizeof(b4),"%02X",e.b4);
+        at+=size_t(std::snprintf(buf+at,cap-at,"; entry %u: ptr 0x%llX iface %s obj-0x20 %s obj-0x60 %s back %s b-4 %s",i,static_cast<unsigned long long>(e.ptr==kUnread?0:e.ptr),iface,o20,o60,
+            e.back==kUnread?"unreadable":e.back==r.child?"yes":"no",b4));
+    }
+    if(at<cap)at+=size_t(std::snprintf(buf+at,cap-at,"; refusals by reason:"));
+    bool any=false;
+    for(size_t i=1;i<size_t(Refuse::kRefuseCount)&&at<cap;++i)
+        if(counts[i]){any=true;at+=size_t(std::snprintf(buf+at,cap-at," %s %llu,",refuseName(Refuse(i)),static_cast<unsigned long long>(counts[i])));}
+    if(!any&&at<cap)at+=size_t(std::snprintf(buf+at,cap-at," none"));
+    return int(at);
+}
+// At most kDiagLines lines in any ten seconds (the frame thread's own, no shared state).
+constexpr unsigned kDiagLines=40;
+struct DiagCap {
+    uint64_t windowMs=0;unsigned written=0;
+    bool allow(uint64_t nowMs) noexcept {
+        if(!windowMs||nowMs-windowMs>=10000){windowMs=nowMs;written=0;}
+        if(written>=kDiagLines)return false;
+        ++written;return true;
+    }
+};
+
 struct Sample { Identity id; Pose primary,local,base; };
 struct EyeSnapshot { Pose composed{}; float raw[3]{}; uint32_t epoch=0; uint64_t generation=0; };
 inline bool hmdSample(const Memory& m,const Identity& id,Sample& s) noexcept {
@@ -112,6 +260,11 @@ class Engine {
         Pose composed{};
         float raw[3]{};
     } eye_;
+    struct Diag {
+        std::atomic_flag busy=ATOMIC_FLAG_INIT;
+        uint64_t serial=0,taken=0;   // serial: written under the claim; taken: the reader's, under the claim
+        Refusal refusal;
+    } diag_[2];
     Row* row(uintptr_t child,bool create) noexcept {
         if(!child)return nullptr;
         for(unsigned i=0;i<Slots;++i) {
@@ -123,6 +276,31 @@ class Engine {
     }
 public:
     std::atomic<uint64_t> applied{0},refused{0},evaluations{0},hmdCalls{0},previewCalls{0},finalizerCalls{0},hmdQualified{0},previewQualified{0};
+    // F232: per role and reason, how often a linked child was refused (the producer hooks); a roster snapshot of the latest refusal while the frame thread wants one. Wait-free: a refusal
+    // takes a try-claim on the role's slot with an atomic_flag and is skipped, never waited for, when the slot is busy; the counters are plain atomics; nothing is logged or allocated here.
+    std::atomic<uint64_t> reasons[2][size_t(Refuse::kRefuseCount)]{};
+    std::atomic<bool> diagWanted{false};
+    void refusedChild(const Memory& m,const Game& g,uintptr_t child,unsigned role,Refuse why) noexcept {
+        if(role>1)return;
+        reasons[role][size_t(why)].fetch_add(1,std::memory_order_relaxed);
+        if(why==Refuse::kOtherProducer||!diagWanted.load(std::memory_order_relaxed))return;
+        Diag& d=diag_[role];
+        if(d.busy.test_and_set(std::memory_order_acquire))return;
+        snapshotRoster(m,g,child,role,why,d.refusal);
+        ++d.serial;
+        d.busy.clear(std::memory_order_release);
+    }
+    // The frame thread: the latest snapshot of a role if there is a new one and its slot is not busy, with the role's counts.
+    bool takeRefusal(unsigned role,Refusal& out,uint64_t counts[size_t(Refuse::kRefuseCount)]) noexcept {
+        if(role>1)return false;
+        Diag& d=diag_[role];
+        if(d.busy.test_and_set(std::memory_order_acquire))return false;
+        const bool fresh=d.serial!=d.taken;
+        if(fresh){out=d.refusal;d.taken=d.serial;}
+        d.busy.clear(std::memory_order_release);
+        for(size_t i=0;i<size_t(Refuse::kRefuseCount);++i)counts[i]=reasons[role][i].load(std::memory_order_relaxed);
+        return fresh;
+    }
     void poison() noexcept {state_.fetch_or(Poison,std::memory_order_acq_rel);}
     void enable(bool value) noexcept {
         enabled_.store(value,std::memory_order_release);
@@ -274,8 +452,11 @@ template<class Original> uintptr_t hmd(Engine& e,const Memory& m,const Game& g,u
     uintptr_t child=0;Identity before;Pose baseBefore;
     const bool linked=e.current()&&get(m,object+0x140,child);
     if(linked)e.invalidateRole(child,0);
-    const bool eligible=linked&&
-        identity(m,g,child,before)&&before.hmd==object+0x20&&
+    Refuse why=Refuse::kNone;
+    const bool known=linked&&identityWhy(m,g,child,before,why);
+    if(linked&&!known)e.refusedChild(m,g,child,0,why);
+    else if(known&&before.hmd!=object+0x20)e.refusedChild(m,g,child,0,Refuse::kOtherProducer);
+    const bool eligible=known&&before.hmd==object+0x20&&
         get(m,before.predecessor+0x40,baseBefore)&&finite(baseBefore);
     const auto c=eligible?e.begin(child,0,object):Engine::Completion{};const uintptr_t result=original();
     Identity after;Sample s;
@@ -289,7 +470,11 @@ template<class Original> uintptr_t preview(Engine& e,const Memory& m,const Game&
     e.invalidateProducer(subscriber,1);
     uintptr_t child=0;Identity before;const bool linked=subscriber>=0x1B0&&e.current()&&get(m,subscriber-0x30,child);
     if(linked)e.invalidateRole(child,1);
-    const bool eligible=linked&&identity(m,g,child,before)&&before.preview==subscriber-0x150;
+    Refuse why=Refuse::kNone;
+    const bool known=linked&&identityWhy(m,g,child,before,why);
+    if(linked&&!known)e.refusedChild(m,g,child,1,why);
+    else if(known&&before.preview!=subscriber-0x150)e.refusedChild(m,g,child,1,Refuse::kOtherProducer);
+    const bool eligible=known&&before.preview==subscriber-0x150;
     const auto c=eligible?e.begin(child,1,subscriber):Engine::Completion{};const uintptr_t result=original();
     Identity after;Sample s;
     const bool good=eligible&&e.valid(c.epoch)&&identity(m,g,child,after)&&before==after&&previewSample(m,after,s);
