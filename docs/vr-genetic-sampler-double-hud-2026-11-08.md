@@ -45,10 +45,8 @@
 - **Environment (Sean):** Frontier, game build 334925, OpenXR, DLSS at
   2016x2017 into 4032x4034, world scale 110%. Reporter: SteamVR lighthouse,
   RTX 4080, DLSS K.
-
-**Hypotheses:** H7 (a marker-fix patch) holds, through the hold's fallback
-rather than a fresh match. H8 (the layer's own take) is ruled out: the
-doubled eye's displacement equals the logged patch move.
+- **Hypotheses:** H7 (a marker-fix patch) holds, through the fallback. H8
+  (the layer's own take) is ruled out by the logged moves.
 
 **Ruled out** (evidence in the journal): one unpinned tool part, true stereo
 at close range, a DLSS ghost of one overlay, a world marker missing the fix,
@@ -58,10 +56,9 @@ viewport remap, the label features (F95b, F97b, F98b), and F151's place bind
 (0 bound by place). The marker fix's "logged move" was wrongly ruled out from
 a second eight seconds before the dump.
 
-**Next flight** (F227): native on foot with the sampler. Take samples and
-walk up to exobio sites. The HUD stays single, and the reticle does not pop.
-In the log, around sampling the F63 line's F227 count is non-zero, and
-F66f's `t` stays under about 0.05 NDC in both eyes.
+**Next flight** (F227): longer with the sampler, several sites. The HUD
+stays single and the reticle does not pop; the F63 line's F227 count is
+non-zero somewhere, and F66f's `t` stays under about 0.05 NDC in both eyes.
 
 ## Journal
 
