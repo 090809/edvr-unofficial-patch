@@ -3362,6 +3362,11 @@ REM rig makes and removes), the self-update swap on a running exe and its rollba
 REM result files with this rig standing in for the elevated copy, the store addresses (recorded,
 REM never opened), the game watcher against two fake programs, the session the window drives, and
 REM the command line. The fake programs have no window the desktop could see: fake_proc.cpp.
+REM launcher_test.exe is linked long-path aware (tools\launcher_test\launcher_test.manifest, the one setting of
+REM installer.manifest that matters here), as the shipped launcher is. Without it the rig is a MAX_PATH process:
+REM the manifest store's temporary file sits about 140 characters under its scratch folder, so a worktree whose root
+REM is past about 100 characters (.claude\worktrees\<name>) failed the adoption checks in testCore, with
+REM nothing in the launcher at fault. It still needs long paths enabled in Windows (LongPathsEnabled).
 if not exist "%OBJ%\launchertest" mkdir "%OBJ%\launchertest"
 if not exist "%OBJ%\launchertest\fakeg" mkdir "%OBJ%\launchertest\fakeg"
 if not exist "%OBJ%\launchertest\fakee" mkdir "%OBJ%\launchertest\fakee"
@@ -3400,7 +3405,8 @@ if errorlevel 1 ( echo [edvr] ERROR: the fake steam_api64.dll build failed & exi
     "src\installer\mirror.cpp" "src\installer\settings.cpp" ^
     "src\installer\logbundle.cpp" "src\installer\app.cpp" "src\installer\payload.cpp" ^
     "src\installer\ui.cpp" %LAUNCHER_SRC% ^
-    /link /INCREMENTAL:NO %INSTALLER_LIBS% winhttp.lib ws2_32.lib
+    /link /INCREMENTAL:NO %INSTALLER_LIBS% winhttp.lib ws2_32.lib ^
+    /MANIFEST:EMBED /MANIFESTINPUT:"%ROOT%\tools\launcher_test\launcher_test.manifest"
 if errorlevel 1 ( echo [edvr] ERROR: launcher_test build failed & exit /b 1 )
 "%BUILD%\launcher_test.exe" "%ROOT%" "%BUILD%\launcher_test_fixtures" "%BUILD%\launcher_test_scratch" "%BUILD%\launcher_test_fakes" || (
     echo [edvr] ERROR: the launcher update core failed its own tests
