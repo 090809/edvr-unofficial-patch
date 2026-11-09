@@ -46,6 +46,10 @@ runtime, whether SteamVR, Pimax's PiOpenXR, Virtual Desktop's VDXR or Meta's,
 so there is no backend to choose. Elite's own Oculus (LibOVR) path is not
 supported, even as a fallback.
 
+ED-UP's native OpenXR route has been checked in the field on Pimax over
+PiOpenXR, Quest 3 over Virtual Desktop's VDXR, and the latest Air Link flight.
+Nothing is claimed for other headsets and runtimes.
+
 Before launching Elite, set the Windows active OpenXR runtime to the one you
 intend to use, and make sure that runtime is available and your headset
 connected. ED-UP needs no SteamVR loader; do not install OpenComposite or a
