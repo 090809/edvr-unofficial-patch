@@ -46,6 +46,9 @@
 - **Not shown:** an in-session count (no log line reports slots per commit; the overflow line is the only one and
   fires only on overflow); that the contributor's rig reclaims correctly once it has room (no flight); anything about
   the draw slots the sibling branch asks about.
+- **Flown 2026-11-09, inert there:** the maintainer's Steam flights on main's code (a89e193e, VR and flat) choose
+  LiveCopy (`96 of 96 sampled vtable entries are inside Windows' d3d11.dll`), which registers nothing, and no November
+  Steam log before or after the fix prints the full line. The InPlace case below is still unflown; `vtable_test` holds it.
 - **Next flight:** on an InPlace Windows session no `slot registry is full` line, and `edvr_log.py` shows
   `no longer holds EDVR's hook` lines if anything re-points a slot. The registry is not the answer to `draws=0`; that
   stays with `docs/windows-d3d11-system-module-2026-11-07.md` (branch `claude/windows-d3d11-module-resolution-61f112`).

@@ -62,7 +62,7 @@ census design. This doc records what EDVR's review made of it and what was built
   - G03 was measured with the seed census and ruled out: it saves no seeds.
   - The repeat-seed depth skip is flown and on main (6716f875).
   - See "2026-10-30: HUD layer seed" below.
-- **2026-11-08 (v0.22.0 review):** five exact cuts built, not flown; "2026-11-08: pre-release review".
+- **2026-11-08 (v0.22.0 review):** five cuts on main 9bd1b9dd, flown 2026-11-09: "Flight results".
 
 ## What was built
 
@@ -376,7 +376,29 @@ built green at 4c30ab13. Not flown.
   - flat late-overlay replay depth copies;
   - flat foreground UpdateSubresource under DXVK.
 
+### Flight results (2026-11-09)
+
+Steam, Windows, VR and flat, on v0.22.0-rc.7-264-gd5241a7b and -268-ga89e193e, both of which hold
+9bd1b9dd. The baseline is the same rig on 2026-11-08 at 12:43 and 13:07 (v0.22.0-rc.6-414 and -417),
+before the cuts.
+
+- **A1 holds.** "the cube is ready and empty after" reads 0 ms at all five VR entries in three
+  flights, and the VR capture line reads 0 ms beside each. Flat reads 0 ms at a89e193e and 15 ms once
+  at d5241a7b. The baseline's first entries read 93 and 78 ms, then 78 and 94 ms. No log has a
+  runtime compile line.
+- **A2 holds.** The runtime's frame_cycle_report peaks at 0.76-1.63 ms a report, against 1.70-2.21
+  ms before (one SLOW at 2.205). The gfx log's ui_layer_totals peaks at 0.08-0.26 ms, against
+  0.55-1.30 ms before, after one flight's first window at 1.46 ms.
+- **A4 applied, smaller than expected.** `ui_route` reads 0.14-1.21 a frame. In the first three
+  windows of each flight, "other" went from 32.7-44.4 a frame to 27.8-38.8. The route timers were
+  about 8 of it. The rest is untagged GpuTimer queries, which have not been named.
+- A3 and A5 have no log line of their own.
+
 ## Ruled out (with reasons)
+
+- ruled out: the UI layer's route timers as most of the "gpu timing queries:" "other" count
+  (2026-11-09), because timing one eye-frame in 16 took "other" from 32.7-44.4 a frame to 27.8-38.8,
+  not well below 37 (Steam flights on a89e193e and d5241a7b).
 
 - ruled out: the journal watcher's directory walk as a frame cost (2026-11-08), because it runs on the
   watcher's worker (journal_watch.cpp:746-747). Measured: 4-9 ms, once 41.5 ms, every 12 s over 3,140
