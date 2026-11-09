@@ -10,8 +10,9 @@
 //   * the probe. At each arrow-shader draw the layer takes, after its issue, one point is drawn at the arrow's tip in the game's own depth (galaxy_map_vs.h kMapProbeVS) with
 //     a pixel shader that discards where the mask is clear, inside an occlusion query. A pixel counted means the tip is on a panel in that eye. The result is read at a later
 //     probe, never waited for: over = over[0] || over[1], read by the arrow's swap decision. Before any answer over is false; if the mask or the query cannot be made it is
-//     true (the game's arrow). "On a panel" is the mask under the tip, or under a point within reach on both opposite sides along one of four axes (kMapProbePS), so the
-//     gaps between panels close. While the arrow is on a panel, mask within reach on either side keeps it there (kMapProbeStickyPS), so it does not drop off a narrow strip of buttons.
+//     true (the game's arrow). "On a panel" is the mask under the tip or within the panel zone round it (galaxy_map_vs.h THE PANEL ZONE): 0.11 tan to get on (kMapProbePS),
+//     0.13 to stay on (kMapProbeStickyPS). The zone is that wide because the arrow at star depth is aimed from a fixed point, and a head turned toward a side column puts it
+//     about 0.08 tan off the game's cursor against a panel. While the arrow is on a panel the hover takes its direction from the live head (galaxy_map_pointer.cpp pointerCall).
 //
 // THE MAP CAMERA'S CONSTANTS. The icons', labels', rings' and stems' replacement shaders (C31238, 12382D, 94EA99, 3028E7) take the one pair of axes the world quads are spanned on (galaxy_map_axes.h), the map camera's position and the two eyes'
 // offsets from a 96-byte constant buffer at vertex slot 10 (MapCam), written from mapCameraPose's stage 0 (rows, position) and mapCameraEyes (flat_stationary_camera_capture.h) when
@@ -224,6 +225,9 @@ inline bool bodyFillsView(const float origin[3], const float forward[3], const f
 }
 // Frame tick, System Map only. ray: the arrow's, in the map's axes (the camera's forward when the cursor is not known yet).
 void updateArrowDepth(const float cameraPosition[3], const float ray[3], const float forward[3]);
+// Frame tick, either map: the arrow's ray origin in the UI frame (galaxy_map_pointer_core.h HeadLatch; zero for the tracking origin), the arrow row's yzw.
+// The System Map's table reset keeps it.
+void setArrowOrigin(const float from[3]);
 float arrowDepth();   // the last distance, for the 30 s line; 0 when none
 inline bool over() noexcept { return g_over.load(std::memory_order_relaxed); }
 
