@@ -224,6 +224,9 @@ inline bool bodyFillsView(const float origin[3], const float forward[3], const f
 }
 // Frame tick, System Map only. ray: the arrow's, in the map's axes (the camera's forward when the cursor is not known yet).
 void updateArrowDepth(const float cameraPosition[3], const float ray[3], const float forward[3]);
+// Frame tick, either map: the arrow's ray origin in the UI frame (galaxy_map_pointer_core.h HeadLatch; zero for the tracking origin), the arrow row's yzw.
+// The System Map's table reset keeps it.
+void setArrowOrigin(const float from[3]);
 float arrowDepth();   // the last distance, for the 30 s line; 0 when none
 inline bool over() noexcept { return g_over.load(std::memory_order_relaxed); }
 

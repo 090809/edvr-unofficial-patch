@@ -1089,6 +1089,55 @@ inline void runArrowTests(Rig& rig, const Prog& arrow, ID3D11InputLayout* il) {
         std::snprintf(text, sizeof text, "G5b: at depth D the arrow's clip position moves by the eye term times |W| / D, and a positive-scale record not at all: worst %.2e", worst);
         check(worst < 2e-2, text);
     }
+    // G5d: the ray from the head as the map opened, F in the arrow row's yzw (galaxy_map_pointer_core.h, THE RAY'S ORIGIN). A negative-scale record's centre is W - F at infinity in
+    // every eye, and (W - F) + (F - eye) * |W - F| / D at depth D; against F = 0 at infinity the clip position moves by the clip rows' xyz on the difference. A positive-scale record does not move.
+    {
+        const double D = 3.0;
+        const float F[3] = {0.0275f, -0.004f, 0.006f};
+        Scene sc = makeScene(g, Cls::kUiFrame, 40, false, false);
+        gather(g, sc, V3{0.1, -0.2, 0.3});
+        for (size_t i = 0; i < sc.recs.size(); ++i) {
+            Rec& r = sc.recs[i];
+            float s; std::memcpy(&s, &r.a[1], 4);
+            s = (i % 2 == 0) ? -std::fabs(s) : std::fabs(s);
+            std::memcpy(&r.a[1], &s, 4);
+            r.p[0] = (float)g.u(-1, 1); r.p[1] = (float)g.u(-1, 1); r.p[2] = (float)g.u(0.5, 1.5);
+        }
+        const std::vector<float> base = run(rig, arrow, il, sc);
+        const size_t stride = static_cast<size_t>(arrow.outFloats), pos = static_cast<size_t>(arrow.posAt);
+        for (int withDepth = 0; withDepth < 2; ++withDepth) {
+            const double inverse = withDepth ? 1.0 / D : 0.0;
+            bodies[edvr::kMapBodies][0] = static_cast<float>(inverse);
+            for (int k = 0; k < 3; ++k) bodies[edvr::kMapBodies][1 + k] = F[k];
+            ComPtr<ID3D11Buffer> withFrom = makeBuf(rig, bodies, sizeof(bodies), D3D11_BIND_CONSTANT_BUFFER);
+            rig.ctx->VSSetConstantBuffers(11, 1, withFrom.GetAddressOf());
+            const std::vector<float> out = run(rig, arrow, il, sc);
+            for (float& v : bodies[edvr::kMapBodies]) v = 0.0f;
+            rig.ctx->VSSetConstantBuffers(11, 1, noDepth.GetAddressOf());
+            double worst = 0.0, largest = 0.0;
+            for (size_t i = 0; i < sc.verts.size(); ++i) {
+                const Rec& r = sc.recs[sc.verts[i][0]];
+                float s; std::memcpy(&s, &r.a[1], 4);
+                double e[3], wf[3], delta[3] = {0.0, 0.0, 0.0};
+                for (int k = 0; k < 3; ++k) { e[k] = sc.c.cb1[275][k]; wf[k] = double(r.p[k]) - F[k]; }
+                if (s < 0.0f) {
+                    const double length = std::sqrt(wf[0] * wf[0] + wf[1] * wf[1] + wf[2] * wf[2]);
+                    for (int k = 0; k < 3; ++k) delta[k] = (wf[k] + (F[k] - e[k]) * length * inverse) - double(r.p[k]);   // against the base centre W
+                }
+                for (int c = 0; c < 4; ++c) {
+                    const float* row = sc.c.cb0[4 + c];
+                    const double want = row[0] * delta[0] + row[1] * delta[1] + row[2] * delta[2];
+                    largest = (std::max)(largest, std::fabs(want));
+                    worst = (std::max)(worst, std::fabs(static_cast<double>(out[i * stride + pos + c]) - base[i * stride + pos + c] - want));
+                }
+            }
+            char text[200];
+            std::snprintf(text, sizeof text, "G5d.%s: with the ray from F the arrow's clip position moves as (W - F) + (F - eye) * |W - F| / D says, a positive-scale record not at all: worst %.2e (largest move %.3f)",
+                          withDepth ? "depth" : "infinity", worst, largest);
+            std::printf("%s\n", text);
+            check(worst < 1e-3 && largest > 1e-2, text);
+        }
+    }
     for (int sign = 0; sign < 2; ++sign) {
         for (int enc = 0; enc < 2; ++enc) {
             Scene sc = makeScene(g, Cls::kUiFrame, 600, enc != 0, sign == 0 && enc == 0);

@@ -51,7 +51,8 @@
 //
 // THE ARROW (4EF6DDB075A927FA): the game's own, except that W - cb1[275].xyz becomes W - ((s < 0) ? 0 : cb1[275].xyz). The arrow's record is the only one with a negative
 // scale (-0.402 in the dump); the same shader draws other sprites some frames (the loader's), which keep the game's depth. Drawn with the eye origin taken out, the arrow
-// sits at the stars' depth, which is where the panels would be were they not at the game's.
+// sits at the stars' depth, which is where the panels would be were they not at the game's. Its direction is taken from the head as the map opened (MapBodies's arrow row,
+// yzw), not the tracking origin: kMapArrowDepthVS.
 //
 // THE PROBE (galaxy_map_ui.h): one point at the arrow's tip, in the game's own depth (clip = dot(cb0[4..7], float4(W - cb1[275].xyz, 1)), the arrow's record position W
 // being exactly the tip), tested against the panel mask: the pixel shader discards where the mask is clear, an occlusion query counts what stays. The tip is on a panel when the
@@ -249,7 +250,10 @@ void main(uint2 v0 : INSTANCEANDMODELDATAINDEX, uint4 v1 : PACKEDVERTEXDATAA, ui
     float s = asfloat(a.y);
     // The arrow's depth: W - eye is the arrow at |W|; W - eye * |W| / D is the same arrow, at the same size and on the same ray, at distance D. mapArrow.x is 1 / D: 0 on the Galaxy Map, whose stars are at infinity, and on the
     // System Map just over the body it points at (galaxy_map_ui.h rayBodyDistance). Bodies there can be 2 units away, where an arrow at infinity sits a good way behind them in stereo.
-    float3 center = rec.p.xyz - ((s < 0.0) ? cb1[275].xyz * (length(rec.p.xyz) * mapArrow.x) : cb1[275].xyz);
+    // The ray starts at F, mapArrow.yzw (galaxy_map_pointer_core.h, THE RAY'S ORIGIN; zero is the tracking origin and the form above): the point at D along W - F from F, scaled about the eye by |W - F| / D to keep
+    // its size, is (W - F) + (F - eye) * |W - F| / D, and at infinity W - F in both eyes.
+    float3 wf = rec.p.xyz - mapArrow.yzw;
+    float3 center = (s < 0.0) ? wf + (mapArrow.yzw - cb1[275].xyz) * (length(wf) * mapArrow.x) : rec.p.xyz - cb1[275].xyz;
     float4 q = mapQuat(a);
     float4 p = float4(mapRotate(q, v) * s + center, 1.0);
     o1 = float4(dot(cb0[4], p), dot(cb0[5], p), dot(cb0[6], p), dot(cb0[7], p));
@@ -359,7 +363,7 @@ void main(float4 v0 : TEXCOORD0, float v1 : TEXCOORD1, float3 v2 : POSITION0, fl
 // and each k (galaxy_map_ui.cpp); a zero k ends the list, and a record at no known body is the game's. The match is 0.05 units: the records' positions and the bodies' constants round the same number apart.
 constexpr uint32_t kMapBodies = 32;
 // MapBodies, by row. kMapMarkerVS and kMapArrowDepthVS read only as far as the arrow's row.
-constexpr uint32_t kMapArrowRow = kMapBodies;        // x: 1 / the arrow's depth
+constexpr uint32_t kMapArrowRow = kMapBodies;        // x: 1 / the arrow's depth; yzw: the arrow's ray origin in the UI frame (the head as the map opened; 0 before it is taken)
 constexpr uint32_t kMapCameraRow = kMapBodies + 1;   // xyz: the map camera's position; w: 1 when it is known
 constexpr uint32_t kMapRadiusRow = kMapBodies + 2;   // the bodies' surface radii, four to a row
 constexpr uint32_t kMapBodyRows = kMapRadiusRow + kMapBodies / 4;
