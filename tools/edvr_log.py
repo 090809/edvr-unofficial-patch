@@ -10626,7 +10626,8 @@ H_HULL_REPORT = (r"hull layer: state=(?P<state>[\w-]+) frames=(?P<frames>\d+) ey
                  r"subst=copy:(?P<s_copy>\d+),mask:(?P<s_mask>\d+),light:(?P<s_light>\d+) light_draws=(?P<l_lo>\d+)/(?P<l_mid>\d+)/(?P<l_hi>\d+) "
                  r"no_counterpart=copy:(?P<n_copy>\d+),mask:(?P<n_mask>\d+),light:(?P<n_light>\d+) unknown_light_pairs=(?P<unknown>\d+) "
                  r"ended=copy:(?P<e_copy>\d+),shell:(?P<e_shell>\d+),light:(?P<e_light>\d+),frame:(?P<e_frame>\d+) terrain_frames=(?P<terrain>\d+) "
-                 r"auto_dumps=(?P<auto>\d+)(?: busy=(?P<busy>\d+) offscreen=(?P<offscreen>\d+) null_rt1=(?P<null_rt1>\d+))?")
+                 r"auto_dumps=(?P<auto>\d+)(?: busy=(?P<busy>\d+) offscreen=(?P<offscreen>\d+) null_rt1=(?P<null_rt1>\d+))?"
+                 r"(?: night_vision=(?P<nv>\d+)/(?P<nv_edvr>\d+))?")
 H_HULL_DUMP = (r"hull layer: dump (?P<stamp>\S+) eye (?P<eye>\d) frame (?P<frame>\d+): HullHdr (?P<w>\d+)x(?P<h>\d+) format (?P<fmt>\d+) (?P<hull>[\w ]+), "
                r"GameHdrLit (?P<game>[\w ]+), HullDepth (?P<depth>[\w ]+); own=(?P<own>-?\d+) filtered_px=(?P<filtered>-?\d+) "
                r"seed=(?P<seed_read>-?\d+)/(?P<seed_inst>-?\d+) hull_draws=(?P<hull_draws>\d+) light_draws=(?P<light_draws>\d+)")
@@ -17455,6 +17456,11 @@ def _hj_hull_layer(rows, ctx=None):
         busy = sum(int(r["busy"] or 0) for r in reports)
         text += "; asleep (busy) %d frame(s), %d offscreen stage draw(s) declined, %d lighting re-issue(s) without the scratch R16" % (
             busy, sum(int(r["offscreen"] or 0) for r in reports), sum(int(r["null_rt1"] or 0) for r in reports))
+    # Night vision's draw re-issued into the private HDR, and how many of those ran with EDVR's night-vision state (a build before
+    # 2026-11-10 has no field; N/0 means re-issued as the game's own: night vision's fix off or declined).
+    if any(r["nv"] is not None for r in reports):
+        text += "; night vision re-issued %d time(s), %d with EDVR's night-vision state" % (
+            sum(int(r["nv"] or 0) for r in reports), sum(int(r["nv_edvr"] or 0) for r in reports))
     if total["seeds"] == 0 and last["state"] == "busy":
         return ("PARTIAL", text + ": the busy governor slept the whole window (too many hull-family draws an eye: a station or a crowd); the game drew "
                                   "the ship")
@@ -26798,10 +26804,10 @@ def self_test_health():
             return RH("hull layer: diag.hull_layer=%s (TEMPORARY", mode)
 
         def hl_report(state="applied", eye_frames=5400, seeds=5400, no_seed=0, no_slot=0, own=(54, 54, 55), readbacks=5400, filt=(0, 1200, 9000),
-                      hd=(70, 84, 92), reissued=453600, light=59400, ld=(11, 11, 11), nocp=(0, 0, 0), culled=453000, filter_draws=600, busy=0):
+                      hd=(70, 84, 92), reissued=453600, light=59400, ld=(11, 11, 11), nocp=(0, 0, 0), culled=453000, filter_draws=600, busy=0, nv=(5400, 5400)):
             return RH("hull layer: state=%s", state, 2700, eye_frames, seeds, no_seed, no_slot, 0, own[0], own[1], own[2], readbacks, filt[0], filt[1], filt[2],
                       culled, filter_draws, hd[0], hd[1], hd[2], reissued, 0, seeds, seeds, 10800, 32400, light, ld[0], ld[1], ld[2], nocp[0], nocp[1], nocp[2],
-                      0, seeds, 0, 0, 0, 2700, 0, busy, 12, 59400)
+                      0, seeds, 0, 0, 0, 2700, 0, busy, 12, 59400, nv[0], nv[1])
 
         def hl_idle(state, eye_frames=5400, no_seed=0, no_slot=0):
             return hl_report(state, eye_frames=eye_frames, seeds=0, no_seed=no_seed, no_slot=no_slot, own=(0, 0, 0), readbacks=0, filt=(0, 0, 0), hd=(0, 0, 0),
@@ -26847,15 +26853,20 @@ def self_test_health():
                          RH("hull layer: the private copy of eye %d's slot target dropped", 1, 120, 30),
                          RH("hull layer: a %s stage draw into a", "lighting", 256, 256, 10, 0, 2816, 2448), hl_report(busy=240)], 0, [("OK", HL)],
               has=["453000 re-issue(s) culled to the own ship in the vertex shader, 600 needed the neighbour filter",
-                   "asleep (busy) 240 frame(s), 12 offscreen stage draw(s) declined, 59400 lighting re-issue(s) without the scratch R16"],
+                   "asleep (busy) 240 frame(s), 12 offscreen stage draw(s) declined, 59400 lighting re-issue(s) without the scratch R16",
+                   "night vision re-issued 5400 time(s), 5400 with EDVR's night-vision state"],
+              lacks=["UNPARSED", "do not match"])
+        check("hull layer: night vision re-issued without EDVR's state is said as such",
+              hl_base + [hl_key(), hl_report(nv=(5400, 0))], 0, [("OK", HL)], has=["night vision re-issued 5400 time(s), 0 with EDVR's night-vision state"],
               lacks=["UNPARSED", "do not match"])
         check("hull layer: a window the busy governor slept through is PARTIAL and says why",
               hl_base + [hl_key(), hl_report("busy", seeds=0, own=(0, 0, 0), readbacks=0, filt=(0, 0, 0), hd=(0, 0, 0), reissued=0, light=0, ld=(0, 0, 0),
                                              culled=0, filter_draws=0, busy=2700)], 0,
               [("PARTIAL", HL)], has=["the busy governor slept the whole window"])
         check("hull layer: a report line from before the station fixes still parses",
-              hl_base + [hl_key(), hl_report().replace(" culled_draws=453000 filter_draws=600", "").replace(" busy=0 offscreen=12 null_rt1=59400", "")], 0,
-              [("OK", HL)], lacks=["UNPARSED", "do not match", "culled to the own ship"])
+              hl_base + [hl_key(), hl_report().replace(" culled_draws=453000 filter_draws=600", "").replace(" busy=0 offscreen=12 null_rt1=59400", "")
+                         .replace(" night_vision=5400/5400", "")], 0,
+              [("OK", HL)], lacks=["UNPARSED", "do not match", "culled to the own ship", "night vision re-issued"])
 
         def hl_main(own=5400, decals=1800, no_variant=0, fallback=0, reissued=1800, no_slot=0):
             return RH("hull layer: main pass: own_draws=%u", own, decals, no_variant, fallback, reissued, no_slot)

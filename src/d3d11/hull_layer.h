@@ -119,6 +119,9 @@ void hullLayerAfterMainDraw(ID3D11DeviceContext* ctx);
 // passes, with the game's state put back).
 bool hullLayerBegin(ID3D11DeviceContext* ctx, char kind, UINT count, UINT instances, UINT startInstance);
 void hullLayerEnd(ID3D11DeviceContext* ctx);
+// Between hullLayerBegin and the re-issue of night vision's matched draw: EDVR's night-vision state was bound for it
+// (nightVisionReissueBegin). Counted for the state line's night_vision=<re-issued>/<with EDVR's state>.
+void hullLayerNoteNightVisionState();
 
 // Right after the game's own issue of an owner-context Dispatch (exposure_fix.cpp hookedDispatch), with its bindings still
 // bound and the bound compute shader's content hash: a step of the game's AO chain (kAoCs in hull_layer.cpp) whose eye has a

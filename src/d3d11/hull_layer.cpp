@@ -45,13 +45,18 @@ constexpr uint64_t kTerrainVs = 0x72BDD292154158ADull;   // the terrain's colour
 constexpr uint32_t kTerrainVsHigh = 0x6C320453u;         // the other terrain family, known by its prefix only (the ledgers)
 constexpr uint64_t kSkyVs = 0xF8FA801F2CB1E27Cull;       // the sky, the first forward draw after the lighting (flat_projection_recipes.h)
 // The lighting: the full-screen sun and ambient, then the instanced volumes (the doc's "The binding map", the mt= census).
-// The last is the game's night vision (2026-11-08 census 3 against 4: one draw an eye into the HDR after the lighting,
-// reading the depth copy and G-buffer RT0); re-issued like a light so the own hull gets it in separate mode.
-// The last two are a station's lights (docs "Station fixes"; the 23:35 docking dumps): A1B7CFCD with PS 2DB678B6 (box volumes,
+// Then a station's lights (docs "Station fixes"; the 23:35 docking dumps): A1B7CFCD with PS 2DB678B6 (box volumes,
 // 198-226 instances) and CE24A739 with PS 1F64463B (45-54 instances), drawn like the other volumes and missing from the hull.
+// The last is the hangar's third box light volume (docs "Night vision state and the hangar light", 2026-11-10; dump
+// 204100368002): A7339D1F with PS 93A4B9DA, 36 indices x8, drawn right after A1B7CFCD and CE24A739 and bound like A1B7CFCD's
+// PS 6796562E draw (a light buffer at t0, the depth copy, G-buffer and HDR-sized inputs, the shadow map).
 constexpr uint64_t kLightVs[9] = {0x7E38A6AA1269C901ull, 0x8289669D93A18C1Dull, 0x963B52C73B4143ACull,
                                   0x24DE25E496342EB8ull, 0xB121A79E457669E8ull, 0x0357BBB2DEE43C1Full,
-                                  0xFCF7BD2896751D96ull, 0xA1B7CFCD0BE7493Eull, 0xCE24A73943632F55ull};
+                                  0xA1B7CFCD0BE7493Eull, 0xCE24A73943632F55ull, 0xA7339D1F8A5AC0D0ull};
+// The game's night vision (2026-11-08 census 3 against 4: one draw an eye into the HDR, reading the depth copy and G-buffer
+// RT0), re-issued like a light so the own hull gets it in separate mode, but not a light: it comes after both eyes' lighting
+// and the sky, so it opens no lighting window and moves no stage eye (docs "Night vision state and the hangar light").
+constexpr uint64_t kNightVisionVs = 0xFCF7BD2896751D96ull;
 constexpr UINT kPoolSlot = 33;            // VS t33: the pool a pool draw reads
 constexpr UINT kSlotTarget = 6;           // engine motion's MRT6 (dxbc_engine_velocity.h kEngineVelocityTarget): float2(2*slot+1, depth)
 constexpr uint32_t kRecordBytes = 336;    // a pool record (tools\eye_run_ledger.py REC)
@@ -616,6 +621,8 @@ struct Window {
     // Station fixes: re-issues culled by the keep-own VS and those that needed the filter; frames the busy governor slept; stage
     // draws declined for targets not at the eye's render size; lighting draws whose scratch R16 RT1 was left unbound.
     uint32_t culledDraws = 0, filterDraws = 0, busyFrames = 0, offscreen = 0, nullRt1 = 0;
+    // Night vision's draw: re-issues set up, and those that ran with EDVR's night-vision state (hullLayerNoteNightVisionState).
+    uint32_t nightVision = 0, nightVisionEdvr = 0;
     uint32_t subst[kStages] = {}, noCounterpart[kStages] = {}, ended[kEnds] = {};
     std::vector<uint32_t> own, filtered, hullDraws, lightDraws;
     // Separate mode (the "main pass" line): main-pass draws given the own discard (hull, decals), draws in the window that
@@ -1718,7 +1725,7 @@ void recordLight(const DrawSnap& s, char kind, UINT count, UINT instances, UINT 
     r.stencilOnly = s.stencilOnly;
     r.stencilRef = s.stencilRef;
     r.reissued = reissued;
-    r.known = isLightVs(s.vs);
+    r.known = isLightVs(s.vs) || s.vs == kNightVisionVs;
     for (const auto& pair : kStagePairs)
         if (pair.vs == s.vs && pair.ps == s.ps) r.stagePair = true;
     g_lights.push_back(r);
@@ -2332,7 +2339,9 @@ void commitPending(Eye& e, int ei) {
     e.pendingCount = 0;
 }
 
-bool beginStage(ID3D11DeviceContext* ctx, Stage stage, uint8_t bit) {
+// nightVision: the game's night-vision draw (kNightVisionVs), a kLight stage that is re-issued and staged like a light but
+// leaves the lighting window, the unknown-pair window and the stage eye as they are.
+bool beginStage(ID3D11DeviceContext* ctx, Stage stage, uint8_t bit, bool nightVision = false) {
     QueryPerformanceCounter(&g_entryQpc);   // dump v2: the item's CPU time starts here
     ID3D11RenderTargetView* rtv[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT] = {};
     ID3D11DepthStencilView* dsv = nullptr;
@@ -2351,7 +2360,7 @@ bool beginStage(ID3D11DeviceContext* ctx, Stage stage, uint8_t bit) {
     int ei = dsv ? eyeFor(resourceOf(dsv), false) : -1;
     for (UINT i = 0; ei < 0 && i < kSrvSlots; ++i)
         if (srv[i]) ei = eyeFor(resourceOf(srv[i]), false);
-    if (ei < 0 && stage == kLight && g_stageEye >= 0 && g_eyes[g_stageEye].lightOpen) ei = g_stageEye;
+    if (ei < 0 && stage == kLight && !nightVision && g_stageEye >= 0 && g_eyes[g_stageEye].lightOpen) ei = g_stageEye;
     // The AO apply binds no depth: its eye is the one whose G-buffer RT2 it writes, or whose AO it reads.
     if (ei < 0 && stage == kAo) {
         bool both = false;
@@ -2413,11 +2422,11 @@ bool beginStage(ID3D11DeviceContext* ctx, Stage stage, uint8_t bit) {
         // Not a lighting stage: it does not open the lighting window or move the stage eye. It needs the eye's whole AO
         // chain this frame, or the private AO it would read is last frame's.
         if (e.gb != Gb::Done || (e.aoDone & kAoAllSteps) != kAoAllSteps) return decline(true);
-    } else {
+    } else if (!nightVision) {
         if (g_stageEye >= 0 && g_stageEye != ei) g_eyes[g_stageEye].pendingCount = 0;   // the other eye's lighting is over: its waiting writers were not lighting
         g_stageEye = ei;
     }
-    if (stage != kCopy && stage != kAo) {
+    if (stage != kCopy && stage != kAo && !nightVision) {
         e.lightOpen = true;   // the shadow mask opens the lighting window; the sky closes it
         e.lightSpan = 0;
     }
@@ -2427,8 +2436,8 @@ bool beginStage(ID3D11DeviceContext* ctx, Stage stage, uint8_t bit) {
         e.unknownOpen = true;
         e.pendingCount = 0;
     }
-    if (stage == kLight && e.unknownOpen) commitPending(e, ei);
-    if (stage == kLight) stageGameHdr(ctx, e, rtv[0]);   // the game's HDR after this lighting draw: the last one is the comparison
+    if (stage == kLight && e.unknownOpen && !nightVision) commitPending(e, ei);
+    if (stage == kLight) stageGameHdr(ctx, e, rtv[0]);   // the game's HDR after this lighting draw (or night vision): the last one is the comparison
     if (e.gb != Gb::Done) return decline(true);
     if (bit) {
         if (e.stagesDone & bit) return decline(false);   // once per eye per frame: a later use of the same pair is not the eye's
@@ -2470,6 +2479,7 @@ bool beginStage(ID3D11DeviceContext* ctx, Stage stage, uint8_t bit) {
     vScreenSetRenderTargetsRaw(ctx, boundCount(bindRtv), bindRtv, bindDsv);
     g_win.subst[stage] += swapped;
     if (stage == kLight) ++e.lightDraws;
+    if (nightVision) ++g_win.nightVision;
     if (stage == kAo) {
         e.aoDone |= kAoApplyBit;
         ++g_win.aoApplied;
@@ -3628,17 +3638,19 @@ void report() {
                                             : "no-eye-pass";
     // Station fixes: culled_draws (re-issues the keep-own VS culled to the own instances) and filter_draws (re-issues that needed
     // the neighbour filter); busy (frames the busy governor slept), offscreen (stage draws declined for a target not at the eye's
-    // render size) and null_rt1 (lighting re-issues with the scratch R16 left unbound).
+    // render size) and null_rt1 (lighting re-issues with the scratch R16 left unbound). night_vision: the game's night-vision
+    // draw re-issued into the private HDR, and of those the ones that ran with EDVR's night-vision state (0/0: no such draw;
+    // N/0: re-issued as the game's own, night vision's fix off or declined).
     Log::get().note("hull layer: state=%s frames=%u eye_frames=%u seeds=%u no_seed=%u no_slot=%u refused=%u own=%u/%u/%u readbacks=%u "
                     "filtered_px=%u/%u/%u culled_draws=%u filter_draws=%u hull_draws=%u/%u/%u reissued=%u no_slot_draws=%u clears=%u filters=%u "
                     "subst=copy:%u,mask:%u,light:%u light_draws=%u/%u/%u no_counterpart=copy:%u,mask:%u,light:%u unknown_light_pairs=%u "
-                    "ended=copy:%u,shell:%u,light:%u,frame:%u terrain_frames=%u auto_dumps=%u busy=%u offscreen=%u null_rt1=%u",
+                    "ended=copy:%u,shell:%u,light:%u,frame:%u terrain_frames=%u auto_dumps=%u busy=%u offscreen=%u null_rt1=%u night_vision=%u/%u",
                     state, g_win.frames, g_win.eyeFrames, g_win.seeds, g_win.noSeed, g_win.noSlot, g_win.refused, o[0], o[1], o[2], g_win.readbacks,
                     f[0], f[1], f[2], g_win.culledDraws, g_win.filterDraws, hd[0], hd[1], hd[2], g_win.reissued, g_win.noSlotDraws, g_win.clears,
                     g_win.filters, g_win.subst[kCopy], g_win.subst[kMask], g_win.subst[kLight], ld[0], ld[1], ld[2], g_win.noCounterpart[kCopy],
                     g_win.noCounterpart[kMask], g_win.noCounterpart[kLight], g_win.unknownPairs, g_win.ended[kEndCopy], g_win.ended[kEndShell],
                     g_win.ended[kEndLight], g_win.ended[kEndFrame], g_win.terrainFrames, g_win.autoDumps, g_win.busyFrames, g_win.offscreen,
-                    g_win.nullRt1);
+                    g_win.nullRt1, g_win.nightVision, g_win.nightVisionEdvr);
     uint32_t rs[3], rr[3], rh[3];
     loMidHi(g_win.rigSlots, &rs[0], &rs[1], &rs[2]);
     loMidHi(g_win.rigRadius, &rr[0], &rr[1], &rr[2]);
@@ -3822,6 +3834,7 @@ static bool beginDraw(ID3D11DeviceContext* ctx, char kind, UINT count, UINT inst
     if (isHullVs(vs)) return beginHullDraw(ctx, instances, startInstance, false);
     if (vs == kDecalVs && detail::g_hullLayerSeparate) return beginHullDraw(ctx, instances, startInstance, true);   // the own decals (Step 2)
     if (isLightVs(vs)) return beginStage(ctx, kLight, 0);
+    if (vs == kNightVisionVs) return beginStage(ctx, kLight, 0, true);
     for (const auto& pair : kStagePairs) {
         if (pair.vs != vs) continue;
         if (bindingShaderHash(BindSlot::Ps) == pair.ps) return beginStage(ctx, pair.stage, pair.bit);
@@ -3859,6 +3872,10 @@ void hullLayerEnd(ID3D11DeviceContext* ctx) {
     releaseTargets(p.rtv, p.dsv);
     for (auto*& s : p.srv) releaseRef(s);
     p = Pending{};
+}
+
+void hullLayerNoteNightVisionState() {
+    if (g_pending.active) ++g_win.nightVisionEdvr;
 }
 
 bool hullLayerBeginDispatch(ID3D11DeviceContext* ctx, uint64_t cs) {

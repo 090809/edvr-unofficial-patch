@@ -4129,7 +4129,12 @@ __declspec(noinline) void hullLayerAfterDraw(ID3D11DeviceContext* self, char kin
     if (v == DrawVerdict::kSkip || v == DrawVerdict::kQuadSkip || uiLayerIssueBlocked()) return;
     VrWorldInternalScope internal;
     if (hullLayerBegin(self, kind, count, instances, args.startInstance)) {
+        // Night vision's matched draw: forwardVerdictEnd has already put the game's state back, so the re-issue gets EDVR's
+        // night-vision state again (its PS; realistic: blend, gain, exterior mask), the state the game's issue ran with.
+        const bool nightVision = v == DrawVerdict::kNightVision && nightVisionReissueBegin(self);
+        if (nightVision) hullLayerNoteNightVisionState();
         pureDrawReissue(ReissueCaller::HullLayer, self, kind, count, instances, args);
+        if (nightVision) nightVisionReissueEnd(self);
         hullLayerEnd(self);
     }
 }
