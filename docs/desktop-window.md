@@ -19,16 +19,16 @@
   framed, movable, resizable window (or, in `borderless`, the whole monitor) showing EDVR's
   finished eye image, skips Elite's own drawing into it and hides the cursor over it while it
   has focus. The game's mouse lock is untouched. At 3D off the window is restored.
-- **Round 6, shape and style:** a shape but `full` crops each eye (both eyes: half the width
-  each) to the largest rectangle of that shape in its bounds sub-rect, kept inside the image;
-  the crop rule (round 8) centres it. `window` snaps to the shape; `borderless` is the whole
-  `rcMonitor` (popup style `0x94000000`), the picture fitted with black bars. A live change of
-  style or shape is not a fight. Back to `window`: the last settled rect if it fits.
-- **Round 7, the vertical shift:** `desktop_window_vertical_shift` moves the crop up (+) or
-  down (-): from the default position, a fraction of the way to the highest (top edge at the
-  picture's top) or lowest position; 0 changes nothing, +-100 reach the edges; no room, no
-  move. "Up" is the side the window shows at its top (`bounds[1]`). Both eyes alike; always
-  vertical, under either rule. Logs `vertical shift N` (first read, each change, `crop` line).
+- **Round 6, shape and style:** a shape but `full` crops each eye (both eyes: half each) to the
+  largest rectangle of that shape in its bounds; `window` snaps to it, `borderless` is the whole
+  `rcMonitor` (style `0x94000000`) with bars, back to `window` the last settled rect if it fits.
+  A live change of style or shape is not a fight.
+- **Round 7, the vertical shift:** moves the crop up (+) or down (-) by a share of its travel (0
+  none, +-100 the edges; "up" is `bounds[1]`'s side), both eyes alike; logs `vertical shift N`.
+- **Round 9 (2026-11-09, FLOWN OK on Steam, ON MAIN):** while Elite is in a cinema render mode
+  (5, 6: on foot with `fix.native_on_foot` off) the window is the game's own shape, because Elite
+  sizes that screen's HUD by it (the eye's shape shrank it to 0.583; held, the `hud part` lines
+  read `hrc=(1.000,`). Journal: "Round 9" in Flight history.
 - **Round 8, the crop rule** (`desktop_window_crop`; menu "Same as the game's mirror" |
   "Centre"): how a chosen shape is cut; `full` is never cropped or zoomed. `center`: the shape
   around the middle of the eye's bounds sub-rect, no zoom. `native` is what Elite's own mirror
@@ -117,6 +117,16 @@
      the game changed the style itself, the window is left alone. Both are logged.
   Not reshaped in exclusive fullscreen, maximized or minimized. No game address
   is hooked, so it works on every build.
+  8. The game's flat screen (round 9, `holdGameShape`). While the render mode the
+     native on-foot setter hook last forwarded is a cinema mode (5 or 6), the window
+     is put back to the game's own shape (the restore of 7) and not reshaped; the
+     picture is still drawn, undistorted, with bars. A reshape still in flight is
+     given `kRequestEveryMs` to land first. When the mode ends, the next look is the
+     first of an activation: the game's rect is remembered again and the window goes
+     back to where it last settled. Without the setter hook (an unknown build) the
+     mode is never a cinema mode and nothing changes. Lines: `the game shows its flat
+     screen in the headset (render mode N); ... -- <what the restore did>` and `the
+     game's flat screen ended (render mode N)`, 32 of them a session.
 
 - **The cursor (rounds 3 to 5)** (`desktop_window_cursor.cpp`). The executable's import
   table is patched once at startup in a VR-scope install (never a flat-only one) for
@@ -219,6 +229,29 @@
   lock and the hidden cursor working in both styles; restored at 3D off. `--health` OK. (The
   crop centre was the projection centre then; round 8 retired that for Elite's own rule.)
 - **Round 7:** the vertical shift flown OK (Sean: looks good).
+- **Round 9, the on-foot HUD shrunk on the virtual screen (2026-11-09, Steam,
+  `edvr_gfx_20261109_152746.log`, c42495e0).** Sean turned `fix.native_on_foot` off in the menu
+  at 15:28:01 and loaded in on foot (setter `incoming=5 effective=5 ... reason=key_off` at
+  15:29:38): the HUD on the virtual screen was bunched toward the middle and smaller. The F16
+  `hud part` lines read `hrc=(0.583,0.027,0.060)`: the layout scale S and the game's own margins.
+  The layout routine (0x1AB5B30) takes S = min(1, aspect / 1.7222) when the element-scale byte is
+  0, and 2041 / 2032 / 1.7222 = 0.583, the window round 2 reshapes to the eye's shape. Every cinema
+  stretch since agrees: 0.580 at 2031x2032 (2026-11-08, `_104337` and `_130757`), 0.583 at
+  2041x2032 (2026-11-09, `_055831` and `_100034`), 1.000 whenever the window had just been
+  restored to the game's 3840x2160 (`_055831` 06:03:45, `_104337` 10:46:23), and 1.000 on
+  2026-10-29 with the desktop window off. In HMD modes S stays the game's 1.000 (or the native
+  on-foot element scale) at either shape, so only the cinema mode reads it.
+  - ruled out: native on-foot HUD writes reaching the virtual screen, because native stereo on
+    foot never began in the flight (no F115 line), and no spread, element-scale, group-offset or
+    placement write was logged; the margins read the game's own 0.027 and 0.060.
+  - Not known: whether Elite re-lays out the cinema HUD when the window changes mid-stretch; the
+    restore lands within a frame or two of the mode change and the layout came about 1.7 s after
+    it in this flight, so the fix does not depend on it.
+  - **Flown OK (2026-11-09, Steam, `edvr_gfx_20261109_163947.log`, a0ac939b; Sean: "That fixed
+    it").** `fix.native_on_foot` off. The hold line at 16:41:27.134 (render mode 5, `restored to
+    0,0 3840x2160`), the swap chain 3840x2160 at 16:41:27.739, then the HUD laid out at
+    16:41:28.890 with `hrc=(1.000,0.027,0.060)` (Vitals at x 73, not 461). The flat screen ended
+    at 16:41:52.204 (mode 3) and reshape request 3 put the window back at 888,0 2063x2088.
 
 ## Decisions the briefs left open
 
