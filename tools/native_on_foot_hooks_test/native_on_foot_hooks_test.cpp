@@ -2760,15 +2760,16 @@ void testShopGlue(const CtlPages& p) {
         previewSetCamera(reinterpret_cast<const void*>(0x10), 0);
         rig.boundary();
         check(rig.cap.count("camera name \"?\", force 0") == 1, "F231: an unreadable name is logged as '?' and the call is forwarded");
-        // the cap: 40 SetCamera lines in ten seconds, the rest counted
+        // the cap: 40 SetCamera lines in ten seconds, the rest counted (a fresh window: the earlier lines are in the first)
         rig.cap.clear();
+        t::shopClock(311000);
         for (int batch = 0; batch < 5; ++batch) {   // 20 calls a frame, under the ring's 32
             for (int i = 0; i < 20; ++i) previewSetCamera(camName, 0);
             rig.boundary();
         }
         check(rig.cap.count("preview camera (F231): SetCamera at") == 40, "F231: at most 40 SetCamera lines in ten seconds are written");
         rig.cap.clear();
-        t::shopClock(311000);
+        t::shopClock(322000);
         previewSetCamera(camName, 0);
         rig.boundary();
         check(rig.cap.count("preview camera (F231): 60 SetCamera lines in the last 10 s were not written (at most 40 in any ten seconds)") == 1,
