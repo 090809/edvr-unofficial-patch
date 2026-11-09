@@ -1635,7 +1635,7 @@ int perfMonitorTiles(PerfTile* out, int max) {
             snprintf(v, sizeof(v), "--");
             snprintf(sub, sizeof(sub), glitchConsumerPresent() ? "no pair yet" : "no openvr half");
         }
-        if (!native) tile("EDVR GPU", v, sub);
+        if (!native) tile("ED-UP GPU", v, sub);
         const double total = edvrBoundary / frames +
                              (s.drawsSampled ? static_cast<double>(s.drawsMsRunning) : 0.0);
         snprintf(v, sizeof(v), "%.2f", total);
@@ -1646,7 +1646,7 @@ int perfMonitorTiles(PerfTile* out, int max) {
         } else {
             snprintf(sub, sizeof(sub), "ms/frame; hooks not yet");
         }
-        tile("EDVR CPU", v, sub);
+        tile("ED-UP CPU", v, sub);
     }
     {
         uint32_t t = 0, resets = 0;
@@ -1689,7 +1689,7 @@ int perfMonitorTiles(PerfTile* out, int max) {
             snprintf(v, sizeof(v), "--");
             snprintf(sub, sizeof(sub), "no pass running");
         }
-        tile("EDVR PASSES", v, sub);
+        tile("ED-UP PASSES", v, sub);
     }
     // The display side, which no producer tile can show: the runtime's
     // predicted period is the display cadence it advertises -- the same ring
@@ -1728,7 +1728,7 @@ void perfMonitorLastDropLine(char* buf, size_t bufLen) {
     char ev[120];
     eventList(s.lastDropEvents, s.lastDropEventMs, ev, sizeof(ev));
     const uint64_t ago = nowMs() - s.lastDropMs;
-    snprintf(buf, bufLen, "Last long frame %.0f s ago: %.1f ms between Presents. EDVR events: %s.",
+    snprintf(buf, bufLen, "Last long frame %.0f s ago: %.1f ms between Presents. ED-UP events: %s.",
              static_cast<double>(ago) / 1000.0, static_cast<double>(s.lastDropFrameMs), ev);
     buf[bufLen - 1] = 0;
 }

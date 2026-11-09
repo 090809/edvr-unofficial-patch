@@ -530,7 +530,7 @@ inline int flatEliteSettingsTests() {
         expect(w.count == 3 && std::strcmp(w.line[2], kFlatTaaAboveWords) == 0 &&
                std::strcmp(w.line[0], "TAA is not active: Elite's post-processing is not recognised.") == 0,
                "the TAA paragraph is the third line, after the post chain's two");
-        expect(std::string(kFlatTaaAboveWords) == "Above 1.0 supersampling, EDVR's TAA works only on a post chain it knows. Set "
+        expect(std::string(kFlatTaaAboveWords) == "Above 1.0 supersampling, ED-UP's TAA works only on a post chain it knows. Set "
                                                   "Elite's supersampling to 1.0 or lower, or choose DLSS or FSR.",
                "the TAA paragraph's words");
         // Only with the key auto (the structure is what DLSS and FSR do not depend on), never alongside a render-size refusal, never

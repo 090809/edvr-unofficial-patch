@@ -1,4 +1,4 @@
-EDVR Linux wrapper for Steam + Proton
+ED-UP Linux wrapper for Steam + Proton
 
 Requirements: Python 3 and an existing Steam install of Elite Dangerous with
 its Proton prefix. The wrapper uses Steam's installed Proton and runtime

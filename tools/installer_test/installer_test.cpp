@@ -688,11 +688,11 @@ static void testShippedIni(const std::wstring& root) {
                   flatMerged.find("carried over from your edvr.ini") == std::string::npos,
               "a merge of edvr-flat.ini says the retired line was carried over from edvr-flat.ini");
         const std::string flatBare = mergeIni(shipped, flown, nullptr, {}, nullptr, "edvr-flat.ini");
-        check(flatBare.find("# carried over from your edvr-flat.ini; not an EDVR setting this version knows") !=
+        check(flatBare.find("# carried over from your edvr-flat.ini; not an ED-UP setting this version knows") !=
                   std::string::npos,
               "...and so does the note for a key this version never shipped");
         check(mergeIni(shipped, flown, nullptr, {}, nullptr, nullptr)
-                      .find("# carried over from your edvr.ini; not an EDVR setting this version knows") !=
+                      .find("# carried over from your edvr.ini; not an ED-UP setting this version knows") !=
                   std::string::npos,
               "no file named: the VR file's name, as before");
 
@@ -3154,7 +3154,7 @@ static void testFlatSettingsPlanner() {
         s.flatIniText = std::string(kFlatOwnIni) + "stale_line = 1\r\n";
         const std::string merged = plannedText(planInstall(s, options, flatNew), L"edvr-flat.ini");
         check(merged.find("stale_line = 1") != std::string::npos &&
-                  merged.find("# carried over from your edvr-flat.ini; not an EDVR setting this version knows") !=
+                  merged.find("# carried over from your edvr-flat.ini; not an ED-UP setting this version knows") !=
                       std::string::npos,
               "a flat update carries an unknown line under a note naming edvr-flat.ini");
         check(merged.find("carried over from your edvr.ini") == std::string::npos,
@@ -3164,9 +3164,31 @@ static void testFlatSettingsPlanner() {
         seed.iniPresent = true;
         seed.iniText = kSharedIni;
         const std::string seeded = plannedText(planInstall(seed, options, flatNew), L"edvr-flat.ini");
-        check(seeded.find("# carried over from your edvr.ini; not an EDVR setting this version knows") !=
+        check(seeded.find("# carried over from your edvr.ini; not an ED-UP setting this version knows") !=
                   std::string::npos,
               "a seed from the shared file names edvr.ini for the lines it carries over");
+    }
+
+    {   // A file written by 0.21 (the carried-line note and the file's own header say EDVR) merges again without
+        // a second note for the same line, and the note it carries from then on is the ED-UP wording.
+        const std::string shippedIni = "# ED-UP settings.\r\n\r\n[fix]\r\nblack_void = 1\r\n";
+        const std::string oldWording =
+            "# EDVR settings.\r\n\r\n[fix]\r\nblack_void = 0\r\n"
+            "# carried over from your edvr.ini; not an EDVR setting this version knows\r\n"
+            "stale_line = 7\r\n";
+        const std::string merged = mergeIni(shippedIni, oldWording, &shippedIni, {}, nullptr);
+        const std::string oldNote = "not an EDVR setting this version knows";
+        const std::string newNote = "# carried over from your edvr.ini; not an ED-UP setting this version knows";
+        size_t notes = 0, lines = 0;
+        for (size_t at = merged.find("carried over from your"); at != std::string::npos;
+             at = merged.find("carried over from your", at + 1)) ++notes;
+        for (size_t at = merged.find("stale_line = 7"); at != std::string::npos; at = merged.find("stale_line = 7", at + 1)) ++lines;
+        check(notes == 1 && lines == 1 && merged.find(newNote) != std::string::npos &&
+                  merged.find(oldNote) == std::string::npos,
+              "a 0.21 file's carried line gets one note, in the ED-UP wording, and no second one",
+              merged);
+        const std::string again = mergeIni(shippedIni, merged, &shippedIni, {}, nullptr);
+        check(again == merged, "and merging that result again changes nothing");
     }
 
     {   // Asked for fresh defaults with two files: the flat one is replaced, after

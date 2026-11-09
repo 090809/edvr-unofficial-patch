@@ -1208,7 +1208,7 @@ Plan planInstall(const Survey& s, const Options& o, const PayloadInfo& p) {
         if (s.iniPresent) {
             text = mergeIni(s.iniText, s.iniText, &s.iniText, IniPairs{{kChainKey, sharedSet}}, nullptr);
         } else {
-            text = "# EDVR settings shared by the VR and flat profiles. advanced.real_dll names the mod EDVR chains through;\r\n"
+            text = "# ED-UP settings shared by the VR and flat profiles. advanced.real_dll names the mod ED-UP chains through;\r\n"
                    "# edvr-flat.ini can override it for the flat profile, or say real_dll = none to run flat without it.\r\n"
                    "[advanced]\r\nreal_dll = " + sharedSet + "\r\n";
         }

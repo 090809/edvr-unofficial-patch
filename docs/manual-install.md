@@ -18,8 +18,8 @@ native package.
    otherwise keep your existing settings.
 5. For a VR install, preserve the game's original `Openvr\win64\openvr_api.dll`
    as `openvr_api_orig.dll`. If that original already exists, use the installer
-   rather than renaming a previously installed EDVR DLL over it. The original
-   is for uninstall; native EDVR never loads it.
+   rather than renaming a previously installed ED-UP DLL over it. The original
+   is for uninstall; native ED-UP never loads it.
 6. For a VR install, copy all three files from the release's `openvr` directory
    into `Openvr\win64`: `openvr_api.dll`, `openxr_loader.dll`, and
    `OPENXR-LOADER-LICENSE.txt`. A flat-only install skips steps 5 and 6, so the
@@ -40,14 +40,14 @@ SteamVR may be the selected OpenXR runtime. When another runtime is selected,
 the package does not require SteamVR or OpenComposite. There is no legacy
 OpenVR/LibOVR backend fallback. Logs go into `edvr_logs` beside the game.
 
-For uninstall, close Elite and use the installer, or remove the EDVR files and
+For uninstall, close Elite and use the installer, or remove the ED-UP files and
 restore the original `openvr_api.dll` and any graphics-mod chain. Restore the
 original before launching the unmodified game. Preserve your `edvr.ini` if you
 intend to reinstall.
 
 ## Which files each scope needs
 
-The installer asks "Install EDVR for:" and writes the choice to a small
+The installer asks "Install ED-UP for:" and writes the choice to a small
 descriptor, `edvr_profile.ini`, beside the game:
 
 ```
@@ -75,15 +75,15 @@ EDHM also installs as `d3d11.dll`. To run both:
 
 1. Rename EDHM's `d3d11.dll` (say, to `d3d11_edhm.dll`) and leave it where it
    is.
-2. Put EDVR's `d3d11.dll` in its place.
+2. Put ED-UP's `d3d11.dll` in its place.
 3. In `edvr.ini`, under `[advanced]`, set `real_dll = d3d11_edhm.dll`.
 
-EDVR passes everything through EDHM, and anything EDHM doesn't handle falls
+ED-UP passes everything through EDHM, and anything EDHM doesn't handle falls
 through to Windows' own `d3d11.dll`. Restart the game for this to take effect.
-If the name is wrong or the file won't load, EDVR says so in the log and
+If the name is wrong or the file won't load, ED-UP says so in the log and
 carries on without it. This is the same procedure the installer follows, and
 what it will tell you it did.
 
-EDHM's uninstaller runs `del d3d11.dll`, which after this is EDVR's file. To
+EDHM's uninstaller runs `del d3d11.dll`, which after this is ED-UP's file. To
 undo the pair cleanly, delete `d3d11.dll` and `edvr.ini`, rename
 `d3d11_edhm.dll` back, then run EDHM's uninstaller if you want to.

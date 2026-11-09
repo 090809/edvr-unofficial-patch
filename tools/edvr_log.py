@@ -8885,7 +8885,7 @@ def self_test_freezes():
     old_summary = "native_long_cycle_summary,count=88,logged=1,threshold=2x_period"
 
     # ---- the two logs of a flight ----
-    gopen = [g(T0, "EDVR log -- unofficial VR fixes for Elite Dangerous: Odyssey"),
+    gopen = [g(T0, "ED-UP log -- unofficial VR and flat fixes for Elite Dangerous: Odyssey"),
              g(T0 + 0.002, "version %s (build 68C0A1F2) -- this DLL was linked 2026-10-01 14:20:00 UTC" % VERSION)]
     ropen = [r(T0 + 0.3, "module_init,version=%s,durable_log=1" % VERSION)]
     # The sampler's state line as stall_watch.cpp writes it (the numbers are PolicyConfig's defaults), and the same line as the first design wrote it.
@@ -9524,7 +9524,7 @@ def self_test_slow_regime():
                 "unwritten_50_100=0 unwritten_100_250=0; candidates are Present gaps over twice the runtime's predicted period; a candidate the runtime's cycle did not "
                 "confirm is a blip, counted and not written.")
 
-    gopen = [g(T0, "EDVR log -- unofficial VR fixes for Elite Dangerous: Odyssey"),
+    gopen = [g(T0, "ED-UP log -- unofficial VR and flat fixes for Elite Dangerous: Odyssey"),
              g(T0 + 0.002, "version %s (build 68C0A1F2) -- this DLL was linked 2026-10-02 08:00:00 UTC" % VERSION)]
     # The runtime's own counts at its close, so a fixture's INSTRUMENT row has what a closed session writes and the verdict is not a WARN for it.
     rt_counts = ("native_long_cycle_summary,count=3,logged=3,threshold=2x_period,candidates=3,long=3,written=3,unwritten=0,over_250ms=0,over_250ms_unwritten=0,long_lt50=0,"
@@ -29384,7 +29384,7 @@ def self_test_periodic():
         # runtime's frame_cycle_report, whose `at` is local in a UTC-prefixed
         # log. The VTableHook line says "monitor: LONG FRAME" and is no frame.
         gfx_text = (
-            "[07:15:30.001] EDVR log -- unofficial VR fixes for Elite Dangerous: "
+            "[07:15:30.001] ED-UP log -- unofficial VR and flat fixes for Elite Dangerous: "
             "Odyssey\r\n" + version_gfx +
             long_frame("07:15:45.300", 33.0, 4001) +
             "[07:15:52.001] periodic work: journal_reglob SLOW ms=3.412 at "

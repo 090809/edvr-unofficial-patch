@@ -477,14 +477,14 @@ void commitPosted(uint64_t packed) {
     Log::get().note("%s", line);
 
     if (target == RuntimeProfile::Vr) {
-        setNotice("EDVR switched to its VR fixes");
+        setNotice("ED-UP switched to its VR fixes");
     } else if (target == RuntimeProfile::Flat) {
-        setNotice("EDVR switched to its flat fixes");
+        setNotice("ED-UP switched to its flat fixes");
     } else if (flatRefused) {
-        setNotice("EDVR is paused: its flat fixes are unavailable this session");
+        setNotice("ED-UP is paused: its flat fixes are unavailable this session");
     } else {
         char notice[96];
-        std::snprintf(notice, sizeof(notice), "EDVR is paused: this install does not include %s", mode == GameMode::Vr ? "vr" : "flat");
+        std::snprintf(notice, sizeof(notice), "ED-UP is paused: this install does not include %s", mode == GameMode::Vr ? "vr" : "flat");
         setNotice(notice);
     }
 }

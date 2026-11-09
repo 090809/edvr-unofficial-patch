@@ -1,6 +1,6 @@
-# EDVR
+# ED Unofficial Patch
 
-EDVR binds to code and data inside one specific build of Elite Dangerous:
+ED-UP binds to code and data inside one specific build of Elite Dangerous:
 Odyssey. These are the words for that binding and for carrying it across game
 updates.
 
@@ -15,7 +15,7 @@ _Avoid_: version, patch, game version (4.4.2.0 is the product version, which
 several builds can share)
 
 **Identity pair**:
-The executable's PE timestamp and image size, which EDVR checks before
+The executable's PE timestamp and image size, which ED-UP checks before
 trusting any build-bound address.
 _Avoid_: version check, build check, PE pair
 
@@ -28,7 +28,7 @@ replaces)
 ### Binding
 
 **Build-bound address**:
-A game address EDVR hooks, reads or patches that is valid for one game build
+A game address ED-UP hooks, reads or patches that is valid for one game build
 only.
 _Avoid_: offset, hardcoded address
 
@@ -38,11 +38,11 @@ the object's layout changes.
 _Avoid_: address, RVA
 
 **Doc-only address**:
-A game address cited in `docs\` that EDVR's source does not bind.
+A game address cited in `docs\` that ED-UP's source does not bind.
 _Avoid_: unbound address
 
 **Pin**:
-The bytes or body hash EDVR expects at a build-bound address, checked before
+The bytes or body hash ED-UP expects at a build-bound address, checked before
 it hooks.
 _Avoid_: signature, fingerprint (the route profile's FNV fingerprints are one
 kind of pin)
@@ -110,16 +110,16 @@ _Avoid_: camera kind, projType, camera type
 ### Draws
 
 **Draw path**:
-Everything EDVR does on each of the game's draw calls, from the moment the call
-reaches EDVR until it is forwarded to the driver.
+Everything ED-UP does on each of the game's draw calls, from the moment the call
+reaches ED-UP until it is forwarded to the driver.
 _Avoid_: draw hooks (one part of it), hook path
 
 **Draw gate**:
-The single decision of whether any EDVR feature wants to see the game's draws
+The single decision of whether any ED-UP feature wants to see the game's draws
 at all; while it is closed, the draw path forwards every draw untouched.
 _Avoid_: subscriber gate, draw filter
 
 **Re-issue**:
-EDVR submitting one of the game's draws again, a second time, with its own
+ED-UP submitting one of the game's draws again, a second time, with its own
 state or target, in addition to the game's own submission.
 _Avoid_: replay, redraw, second issue
