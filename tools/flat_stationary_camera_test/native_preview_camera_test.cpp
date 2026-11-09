@@ -2,6 +2,7 @@
 // CameraState memory. No game, resolver, installer or runtime is consulted.
 #include "../../src/d3d11/native_preview_camera.cpp"
 #include <array>
+#include <memory>
 #include <thread>
 #include <limits>
 #include <stdexcept>
@@ -356,6 +357,24 @@ int main(int argc,char** argv) {
             const bool a=run(f,false,off,w1),b=run(f,true,on,w2);f.game.handover.store(false);const bool c=identity(f.memory,f.game,f.at(0x3000),plain);
             check(a&&b&&c&&w1==Refuse::kNone&&w2==Refuse::kNone&&off==on&&off==plain&&off.hmd==f.at(0x1020)&&off.preview==f.at(0x2060),"F232 count 2 is accepted exactly as before with the key on and off");
         }
+        // count 2 in the order the game leaves after a handover, [preview, HMD]
+        {
+            auto fp=std::make_unique<Fixture>();Fixture& f=*fp;f.put(0x6000,f.at(0x2060));f.put(0x6008,f.at(0x1020));Identity id;Refuse why=Refuse::kNone;
+            check(!run(f,false,id,why)&&why==Refuse::kIfaceVtable,"F232b [preview, HMD] with the key off is refused for the iface vtable, as before");
+            check(run(f,true,id,why)&&why==Refuse::kNone&&id.hmd==f.at(0x1020)&&id.preview==f.at(0x2060),"F232b [preview, HMD] with the key on is accepted, the HMD and preview entries the right ones");
+            Identity again;
+            check(run(f,true,again,why)&&id==again,"F232b the swapped order's scan is the same for the same memory");
+            auto gp=std::make_unique<Fixture>();Fixture& g=*gp;Identity orig,scan;Refuse w=Refuse::kNone;
+            g.game.handover.store(false);const bool a1=identityWhy(g.memory,g.game,g.at(0x3000),orig,w);
+            g.game.handover.store(true);const bool a2=identityWhy(g.memory,g.game,g.at(0x3000),scan,w);
+            check(a1&&a2&&orig==scan&&scan.hmd==g.at(0x1020)&&scan.preview==g.at(0x2060),"F232b [HMD, preview] with the key on equals the original's identity");
+            auto hp=std::make_unique<Fixture>();Fixture& h=*hp;h.put(0x6000,h.at(0x2060));h.put(0x6008,h.at(0x2060));
+            check(!run(h,true,id,why)&&why==Refuse::kHmdEntries,"F232b [preview, preview] with the key on is refused (HMD entry count)");
+            auto kp=std::make_unique<Fixture>();Fixture& k=*kp;k.put(0x6008,k.at(0x1020));
+            check(!run(k,true,id,why)&&why==Refuse::kHmdEntries,"F232b [HMD, HMD] with the key on is refused (HMD entry count)");
+            auto mp=std::make_unique<Fixture>();Fixture& m=*mp;m.put(0x6000,m.at(0x2060));m.put(0x6008,m.at(0x1020));m.put(0x8000+HmdIface*0x80+0x20,uintptr_t(0));
+            check(!run(m,true,id,why)&&why==Refuse::kWeights,"F232b the weights are still checked on the scan path");
+        }
         // count 3, the old preview in slot 1 and the new one in slot 2
         {
             Fixture f;const uintptr_t fresh=entry(f,0xA000,false);roster(f,3,f.at(0x2060),fresh);Identity id,again;Refuse why=Refuse::kNone;
@@ -414,8 +433,11 @@ int main(int argc,char** argv) {
             check(!run(f,false,id,why)&&why==c.want&&std::strcmp(refuseName(why),c.name)==0,c.name);
             Fixture g;c.mutate(g);
             const bool onResult=run(g,true,id,why);
-            // with the key on the same break is the same reason, except the count (3 is a roster now, and the break leaves the old preview in slot 1 only)
-            check(c.want==Refuse::kCount?(!onResult&&why==Refuse::kHmdEntries||!onResult&&why==Refuse::kForeignEntry||!onResult&&why==Refuse::kEntryPointers):(!onResult&&why==c.want),"F232 the reason is the same with the key on");
+            // with the key on the same break is the same reason, except the count (3 is a roster now, and the break leaves the old preview in slot 1 only) and the four entry checks (a broken
+            // entry is no longer an HMD or preview entry: foreign)
+            const bool entryCheck=c.want==Refuse::kIfaceVtable||c.want==Refuse::kObjectVtable||c.want==Refuse::kEnabled||c.want==Refuse::kBackPointer;
+            const bool expected=c.want==Refuse::kCount?(why==Refuse::kHmdEntries||why==Refuse::kForeignEntry||why==Refuse::kEntryPointers):entryCheck?why==Refuse::kForeignEntry:why==c.want;
+            check(!onResult&&expected,"F232 the reason is the same with the key on");
         }
         {
             Fixture f;Identity id;Refuse why=Refuse::kChildVtable;

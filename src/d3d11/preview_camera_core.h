@@ -157,7 +157,7 @@ inline int formatKey(char* buf, size_t cap, bool on) noexcept {
 constexpr char kHandoverKey[] = "experimental.native_on_foot_preview_handover";
 inline int formatHandoverKey(char* buf, size_t cap, bool on) noexcept {
     return std::snprintf(buf, cap, "native on foot preview handover (F232, TEMPORARY): %s is %s -- %s", kHandoverKey, on ? "on" : "off",
-                         on ? "the preview camera accepts a Location camera list of two to six producers (one headset entry, the rest previews, the newest used), so a preview screen opened from another keeps its camera"
+                         on ? "the preview camera accepts a Location camera list of two to six producers, in any order (one headset entry, the rest previews, the last preview used), so a preview screen opened from another keeps its camera"
                             : "the preview camera accepts a Location camera list of exactly two producers, as before");
 }
 
