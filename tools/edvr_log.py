@@ -12512,7 +12512,7 @@ def _hj_shop(rows, ctx):
     with native on foot begun and no F107 episode by the shop screen (its left line's test, or calls its ended line says the shop screen held) is NEVER APPLIED (the view did not
     change); a signal that did not hold on its object, events the hooks lost or the cap dropped, a Show that left
     the byte unset, a signal that went on more often than it went off, hooks that all stood down, or a Show with no signal are PARTIAL."""
-    kinds = ("hook", "show", "close", "on", "off", "state", "kstart", "kstop", "forgot", "sec", "capped", "lost")
+    kinds = ("hook", "show", "close", "on", "off", "state", "kstart", "kstop", "forgot", "sec", "capped", "lost", "lvopen")
     if not any(rows.get(k) for k in kinds):
         return None
     hooks, shows, closes = rows.get("hook", []), rows.get("show", []), rows.get("close", [])
@@ -12525,6 +12525,10 @@ def _hj_shop(rows, ctx):
     byclass = collections.Counter(r["cls"] for r in shows)
     if shows or closes:
         parts.append("%d Show / %d Close (%s)" % (len(shows), len(closes), ", ".join("%s %d" % (k, byclass[k]) for k in sorted(byclass)) or "no buy screen"))
+    lvopens = rows.get("lvopen", [])
+    lvheld = [r for r in lvopens if r["how"] != "only watched"]
+    if lvopens:   # F228: the Livery screens (HumanoidLiveryActivity, HumanoidWeaponLiveryActivity), held by experimental.native_on_foot_livery_game_view or only watched
+        parts.append("%d Livery screen(s) opened (%d held by the camera-away signal, %d only watched; key %s)" % (len(lvopens), len(lvheld), len(lvopens) - len(lvheld), ", ".join(sorted({r["key"] for r in lvopens}))))
     parts.append("the signal on %d, off %d" % (len(ons), len(offs)))
     if states:
         parts.append("%d state change(s), last %s" % (len(states), states[-1]["to"]))
@@ -12549,8 +12553,10 @@ def _hj_shop(rows, ctx):
     unset = [r for r in shows if r["a"] != "1"]
     if unset:
         problems.append("%d Show(s) left the byte +0x79 not set (read %s)" % (len(unset), ", ".join(sorted({r["a"] for r in unset}))))
-    if any(r["a"] == "1" for r in shows) and not ons:
+    if any(r["a"] == "1" and "Livery" not in r["cls"] for r in shows) and not ons:
         problems.append("a buy screen was shown but the signal never went on")
+    if lvheld and not ons:
+        problems.append("a Livery screen opened with the key on (held) but the signal never went on")
     if len(ons) > len(offs) + 1:
         problems.append("the signal went on %d times and off %d: it may have stuck" % (len(ons), len(offs)))
     if hooks and stood and not armed and not ons:
@@ -17813,15 +17819,16 @@ HEALTH_RULES = (
     ), _hj_f107_away),
     _hrule(H_SHOP, ("F209",), ("(F209)",), (
         ("hook", r"avatar hooks: (?P<hook>shop-[a-z-]+) hook (?P<st>armed|stood down)"),
-        ("on", r"shop screens \(F209\): the shop signal is ON: F107 holds the camera away \(suit (?P<suit>\w+), weapons (?P<weap>\w+), kiosk (?P<kiosk>[\w ]+?); change (?P<n>\d+)\)"),
-        ("off", r"shop screens \(F209\): the shop signal is OFF \(suit (?P<suit>\w+), weapons (?P<weap>\w+), kiosk (?P<kiosk>[\w ]+?); change (?P<n>\d+)\)"),
+        ("on", r"shop screens \(F209\): the shop signal is ON: F107 holds the camera away \(suit (?P<suit>\w+), weapons (?P<weap>\w+), kiosk (?P<kiosk>[\w ]+?), livery (?P<liv>[\w ]+?); change (?P<n>\d+)\)"),
+        ("off", r"shop screens \(F209\): the shop signal is OFF \(suit (?P<suit>\w+), weapons (?P<weap>\w+), kiosk (?P<kiosk>[\w ]+?), livery (?P<liv>[\w ]+?); change (?P<n>\d+)\)"),
+        ("lvopen", r"shop screens \(F209\): (?P<cls>Humanoid\w*LiveryActivity) opened: (?P<how>F107 holds the camera away|only watched)[^(]*\(experimental\.native_on_foot_livery_game_view is (?P<key>on|off)\)"),
         ("show", r"shop screens \(F209\): (?P<cls>\w+) Show: \+0x79 (?P<b>-?\d+) -> (?P<a>-?\d+) \(this 0x(?P<this>[0-9A-F]+), thread (?P<tid>\d+)\)"),
         ("close", r"shop screens \(F209\): (?P<cls>\w+) Close: \+0x79 (?P<b>-?\d+) -> (?P<a>-?\d+) \(this 0x(?P<this>[0-9A-F]+), thread (?P<tid>\d+)\)"),
         ("state", r"shop screens \(F209\): SuitUIStateMachine: \"(?P<from>[^\"]*)\" -> \"(?P<to>[^\"]*)\" \(thread (?P<tid>\d+)\)"),
         ("kstart", r"shop screens \(F209\): ArmouryVendorActivity started: \+0x1F8 (?P<b>-?\d+) -> (?P<a>-?\d+) \(this 0x(?P<this>[0-9A-F]+), thread (?P<tid>\d+)\)"),
         ("kstop", r"shop screens \(F209\): ArmouryVendorActivity stopped: \+0x1F8 (?P<b>-?\d+) -> (?P<a>-?\d+) \(this 0x(?P<this>[0-9A-F]+), thread (?P<tid>\d+)\)"),
         ("forgot", r"shop screens \(F209\): the remembered (?P<cls>\w+) \(this 0x(?P<this>[0-9A-F]+)\) is (?P<why>forgotten: .*?) \(vtable 0x(?P<vt>[0-9A-F]+), the class's 0x(?P<want>[0-9A-F]+)\)"),
-        ("sec", r"shop screens \(F209\): 1 s: suit \+0x79 (?P<suit>\w+), weapons \+0x79 (?P<weap>\w+), kiosk \+0x1F8 (?P<kiosk>\w+), SuitUIStateMachine \"(?P<state>[^\"]*)\", "
+        ("sec", r"shop screens \(F209\): 1 s: suit \+0x79 (?P<suit>\w+), weapons \+0x79 (?P<weap>\w+), kiosk \+0x1F8 (?P<kiosk>\w+), livery \+0x79 (?P<liv>\w+), weapon livery \+0x79 (?P<wliv>\w+), SuitUIStateMachine \"(?P<state>[^\"]*)\", "
                 "signal (?P<sig>on|off); F107: (?P<f107>.*)$"),
         ("capped", r"shop screens \(F209\): (?P<n>\d+) event lines in the last 10 s were not written"),
         ("lost", r"shop screens \(F209\): (?P<n>\d+) shop event\(s\) were not recorded"),
@@ -22424,12 +22431,20 @@ def self_test_health():
         CLOSE209 = RS(": +0x79 %d -> %d (this", TAG209, "SuitVendorInteraction", "Close", 1, 0, 0x1A2B3C4D, 7)
         WSHOW209 = RS(": +0x79 %d -> %d (this", TAG209, "WeaponsVendorInteraction", "Show", 0, 1, 0x2B3C4D5E, 7)
         BADSHOW209 = RS(": +0x79 %d -> %d (this", TAG209, "SuitVendorInteraction", "Show", 0, 0, 0x1A2B3C4D, 7)
-        ON209 = RS("the shop signal is %s (suit", TAG209, "ON: F107 holds the camera away", "open", "closed", "not running", 1)
-        OFF209 = RS("the shop signal is %s (suit", TAG209, "OFF", "closed", "closed", "not running", 2)
+        ON209 = RS("the shop signal is %s (suit", TAG209, "ON: F107 holds the camera away", "open", "closed", "not running", "closed", 1)
+        OFF209 = RS("the shop signal is %s (suit", TAG209, "OFF", "closed", "closed", "not running", "closed", 2)
+        LSHOW209 = RS(": +0x79 %d -> %d (this", TAG209, "HumanoidLiveryActivity", "Show", 0, 1, 0x4D5E6F70, 7)
+        LCLOSE209 = RS(": +0x79 %d -> %d (this", TAG209, "HumanoidLiveryActivity", "Close", 1, 0, 0x4D5E6F70, 7)
+        WLSHOW209 = RS(": +0x79 %d -> %d (this", TAG209, "HumanoidWeaponLiveryActivity", "Show", 0, 1, 0x5E6F7081, 7)
+        LON209 = RS("the shop signal is %s (suit", TAG209, "ON: F107 holds the camera away", "closed", "closed", "not running", "suit open", 1)
+        LOFF209 = RS("the shop signal is %s (suit", TAG209, "OFF", "closed", "closed", "not running", "closed", 2)
+        LOPEN_HELD209 = RS("opened: %s (%s is %s)", TAG209, "HumanoidLiveryActivity", "F107 holds the camera away, the view is the game's own", "experimental.native_on_foot_livery_game_view", "on")
+        LOPEN_WATCH209 = RS("opened: %s (%s is %s)", TAG209, "HumanoidWeaponLiveryActivity", "only watched, the camera is not held away", "experimental.native_on_foot_livery_game_view", "off")
         STATE209 = RS('SuitUIStateMachine: \\"%s\\" -> \\"%s\\"', TAG209, "OnFoot", "Suit Vendor", 7)
         KSTART209 = RS(": +0x1F8 %d -> %d (this", TAG209, "ArmouryVendorActivity", "started", 0, 1, 0x3C4D5E6F, 7)
         KSTOP209 = RS(": +0x1F8 %d -> %d (this", TAG209, "ArmouryVendorActivity", "stopped", 1, 0, 0x3C4D5E6F, 7)
-        SEC209 = RS("1 s: suit +0x79 %s", TAG209, "1", "none", "none", "Suit Vendor", "on", "away (episode 1, 90 calls refused, 90 with a buy screen open)")
+        SEC209 = RS("1 s: suit +0x79 %s", TAG209, "1", "none", "none", "none", "none", "Suit Vendor", "on", "away (episode 1, 90 calls refused, 90 with a buy screen open)")
+        LSEC209 = RS("1 s: suit +0x79 %s", TAG209, "none", "none", "none", "1", "none", "", "on", "away (episode 1, 90 calls refused, 90 with a buy screen open)")
         FORGOT209 = RS("is %s (vtable 0x%llX", TAG209, "SuitVendorInteraction", 0x1A2B3C4D, "forgotten: its vtable is no longer the class's", 0x7FF600001234, 0x7FF600005D20)
         LOST209 = RH("shop event(s) were not recorded", TAG209, 3)
         CAPPED209 = RH("event lines in the last 10 s were not written", TAG209, 12, 40)
@@ -22466,6 +22481,16 @@ def self_test_health():
               has=["1 Show(s) left the byte +0x79 not set (read 0)"], lacks=["UNPARSED"])
         check("F209: a signal that went on more often than it went off may have stuck", [neck(), SHOW209, ON209, AWAY_LEFT_SHOP, OFF209, ON209, ON209, AWAY_END_SHOP, neck()], 0, [("PARTIAL", S209)],
               has=["the signal went on 3 times and off 1: it may have stuck"], lacks=["UNPARSED"])
+        check("F228: a suit Livery screen opened and closed with the key on, F107 held the camera away by the shop screen, and the lines are counted by class",
+              [neck(), LSHOW209, LOPEN_HELD209, LON209, AWAY_LEFT_SHOP, LSEC209, LSEC209, LCLOSE209, LOFF209, AWAY_END_SHOP, neck()], 0, [("OK", S209), ("OK", F107)],
+              has=["1 Show / 1 Close (HumanoidLiveryActivity 1)", "1 Livery screen(s) opened (1 held by the camera-away signal, 0 only watched; key on)", "2 one-second line(s)"], lacks=["UNPARSED"])
+        check("F228: the weapon Livery with the key off is only watched: Show and Close are counted, the signal never goes on, and that is not a fault",
+              [neck(), WLSHOW209, LOPEN_WATCH209, LCLOSE209, neck()], 0, [("OK", S209)],
+              has=["HumanoidWeaponLiveryActivity 1", "1 Livery screen(s) opened (0 held by the camera-away signal, 1 only watched; key off)"], lacks=["never went on", "UNPARSED"])
+        check("F228: a Livery screen opened with the key on and the signal never went on is PARTIAL",
+              [neck(), LSHOW209, LOPEN_HELD209, LCLOSE209, neck()], 0, [("PARTIAL", S209)], has=["a Livery screen opened with the key on (held) but the signal never went on"])
+        check("F228: the Livery signal went on and F107 logged no episode by the shop screen: the view did not change",
+              [neck(), BEGAN209, LSHOW209, LOPEN_HELD209, LON209, AWAY_LEFT_3M7, AWAY_END_3M7, LCLOSE209, LOFF209, neck()], 3, [("NEVER APPLIED", S209)])
         check("F209: a line that drifted from its pattern is unparsed", [neck(), "shop screens (F209): the buy screen is somewhere else"], 4, [("UNPARSED", S209)])
 
         # ---- the conversation look (F212): the leaf that sets the look springs' targets is held at 0 while native on foot is active ----

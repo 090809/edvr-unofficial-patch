@@ -145,13 +145,19 @@ NativeOnFootCameraStats nativeOnFootCameraStats();
 // F209: the Pioneer Supplies buy screens (shop_screen_core.h). Five optional, build-gated hooks on the game (the base UI interaction's Show and Close, the UI state machine's SetState and
 // the armoury kiosk's start and stop; each stands down with one line on a build that differs) tell when the suit or the weapon buy screen is open: from its Show to its Close, re-read
 // once a frame from the remembered object (its vtable, then the byte +0x79) so a missed Close cannot leave it stuck. The Animate post-hook's F107 rule holds the camera away while it is.
-// Any thread; two atomic loads. False whenever the hooks are not armed.
+// F228 (TEMPORARY A/B): the same hooks also see the two Livery screens (HumanoidLiveryActivity, HumanoidWeaponLiveryActivity: shop_screen_core.h). While one reads open AND
+// nativeOnFootSetLiveryHold(true) (experimental.native_on_foot_livery_game_view, on by default) this returns true too; with the hold off the screens are only watched and logged.
+// Any thread; a few atomic loads. False whenever the hooks are not armed.
 bool nativeOnFootShopOpen() noexcept;
+// F228: a Livery screen reads open (whether or not it is held). Any thread.
+bool nativeOnFootLiveryOpen() noexcept;
+// F228: the key's live value, set by native_on_foot.cpp's frame thread. Default true.
+void nativeOnFootSetLiveryHold(bool on) noexcept;
 // What the frame thread's once-a-second line reports: the remembered objects' bytes (-1 none or unreadable, 0, 1), the kiosk session, the newest SuitUIStateMachine state ("" until one) and
-// how often the signal has changed. Frame thread only. False when no shop hook is armed.
+// how often the signal has changed. buyScreenOpen is the two buy screens alone; liveryOpen the two Livery screens (F228); signal is nativeOnFootShopOpen(). Frame thread only. False when no shop hook is armed.
 struct NativeOnFootShopRead {
-    bool armed = false, buyScreenOpen = false, kiosk = false;
-    int suitByte = -1, weaponsByte = -1, kioskByte = -1;
+    bool armed = false, buyScreenOpen = false, kiosk = false, liveryOpen = false, signal = false;
+    int suitByte = -1, weaponsByte = -1, kioskByte = -1, liveryByte = -1, weaponLiveryByte = -1;
     char state[40] = {};
     uint32_t signalChanges = 0;
 };

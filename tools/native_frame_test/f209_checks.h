@@ -33,6 +33,7 @@ inline std::string slurp(const char* path) {
     s.erase(std::remove(s.begin(), s.end(), '\r'), s.end());   // a checkout with CRLF reads as LF
     return s;
 }
+inline bool has_(const std::string& text, const char* needle) { return text.find(needle) != std::string::npos; }
 inline size_t countOf(const std::string& text, const std::string& needle) {
     size_t n = 0;
     for (size_t at = text.find(needle); at != std::string::npos; at = text.find(needle, at + needle.size())) ++n;
@@ -58,6 +59,9 @@ inline void run209(Check&& check) {
         check(shop::kShowRva == 0x9C3960 && shop::kCloseRva == 0x9C22A0 && shop::kSetStateRva == 0xA237B0 && shop::kKioskStartRva == 0x1973820 && shop::kKioskStopRva == 0x1916440 &&
                   shop::kSuitVtableRva == 0x5255D20 && shop::kWeaponsVtableRva == 0x5255A20 && shop::kKioskVtableRva == 0x51E9770 && shop::kOffOpen == 0x79 && shop::kOffKiosk == 0x1F8,
               "F209: the addresses are build 334925's (Show 0x9C3960, Close 0x9C22A0, SetState 0xA237B0, kiosk start 0x1973820 and stop 0x1916440; vtables suit 0x5255D20, weapons 0x5255A20, kiosk 0x51E9770; bytes +0x79 and +0x1F8)");
+        check(shop::kLiveryVtableRva == 0x5612F30 && shop::kWeaponLiveryVtableRva == 0x5614328 && shop::kClassCount == 5 && shop::kLivery == 3 && shop::kWeaponLivery == 4 &&
+                  std::strcmp(shop::kLiveryKey, "experimental.native_on_foot_livery_game_view") == 0,
+              "F228: the Livery screens' vtables are build 334925's (HumanoidLiveryActivity 0x5612F30, HumanoidWeaponLiveryActivity 0x5614328; their Show, IsOpen and Close slots hold the buy screens' functions), five classes, the key's name");
         check(shop::kShowPrologueBytes == 14 && shop::kShowPrologue[0] == 0x40 && shop::kShowPrologue[1] == 0x53 && shop::kShowPrologue[13] == 0xE8 && shop::kClosePrologueBytes == 15 &&
                   shop::kClosePrologue[6] == 0x80 && shop::kClosePrologue[7] == 0x79 && shop::kClosePrologue[8] == 0x79 && shop::kSetStatePrologueBytes == 10 && shop::kSetStatePrologue[9] == 0xE8 &&
                   shop::kKioskStartPrologueBytes == 16 && shop::kKioskStartPrologue[0] == 0x48 && shop::kKioskStartPrologue[2] == 0xC4 && shop::kKioskStopPrologueBytes == 16 &&
@@ -75,6 +79,19 @@ inline void run209(Check&& check) {
                   std::strcmp(shop::className(shop::kSuit), "SuitVendorInteraction") == 0 && std::strcmp(shop::className(shop::kWeapons), "WeaponsVendorInteraction") == 0 &&
                   std::strcmp(shop::className(shop::kKiosk), "ArmouryVendorActivity") == 0,
               "F209: each class names its vtable and its own name");
+    }
+    {   // F228: the Livery screens join the filter; the buy screens' filter is unchanged
+        const uint64_t liv = base + shop::kLiveryVtableRva, wliv = base + shop::kWeaponLiveryVtableRva, suit = base + shop::kSuitVtableRva, weapons = base + shop::kWeaponsVtableRva,
+                       kiosk = base + shop::kKioskVtableRva, other = base + 0x5255000;
+        check(shop::screenOfVtable(liv, base) == shop::kLivery && shop::screenOfVtable(wliv, base) == shop::kWeaponLivery && shop::screenOfVtable(suit, base) == shop::kSuit &&
+                  shop::screenOfVtable(weapons, base) == shop::kWeapons && shop::screenOfVtable(kiosk, base) == shop::kNotOurs && shop::screenOfVtable(other, base) == shop::kNotOurs &&
+                  shop::screenOfVtable(0, base) == shop::kNotOurs && shop::screenOfVtable(liv, base + 0x1000) == shop::kNotOurs &&
+                  shop::buyScreenOfVtable(liv, base) == shop::kNotOurs && shop::buyScreenOfVtable(wliv, base) == shop::kNotOurs,
+              "F228: Show and Close are filtered on *(this): the two Livery vtables are ours too (and not buy screens); the kiosk, any other class, null and another base are not");
+        check(shop::vtableRva(shop::kLivery) == shop::kLiveryVtableRva && shop::vtableRva(shop::kWeaponLivery) == shop::kWeaponLiveryVtableRva &&
+                  std::strcmp(shop::className(shop::kLivery), "HumanoidLiveryActivity") == 0 && std::strcmp(shop::className(shop::kWeaponLivery), "HumanoidWeaponLiveryActivity") == 0 &&
+                  shop::isLivery(shop::kLivery) && shop::isLivery(shop::kWeaponLivery) && !shop::isLivery(shop::kSuit) && !shop::isLivery(shop::kWeapons) && !shop::isLivery(shop::kKiosk) && !shop::isLivery(shop::kNotOurs),
+              "F228: each Livery class names its vtable and its own name");
     }
     // ---- 3. the signal from Show and Close, and the once-a-frame re-check ----------------------------------------------------------------------------------------------------------------------
     {
@@ -125,6 +142,37 @@ inline void run209(Check&& check) {
         suit.vtable = base + shop::kSuitVtableRva;
         suit.byte = 2;
         check(recheck(&suit, shop::kSuit, base) == shop::Verdict::kOpen, "F209: the byte is read as the game reads it: any non-zero value is open");
+    }
+    {   // F228: a Livery screen open holds the signal only while the key is on; the buy screens' signal is as before either way
+        FakeObject liv, wliv;
+        liv.vtable = base + shop::kLiveryVtableRva;
+        wliv.vtable = base + shop::kWeaponLiveryVtableRva;
+        auto sig = [&](const FakeObject* l, const FakeObject* w) {
+            return shop::signalOf(shop::Verdict::kNone, shop::Verdict::kNone, shop::Verdict::kNone, recheck(l, shop::kLivery, base), recheck(w, shop::kWeaponLivery, base));
+        };
+        check(!sig(nullptr, nullptr).holds(true) && !sig(nullptr, nullptr).holds(false) && !sig(nullptr, nullptr).liveryOpen(), "F228: no Livery screen remembered: nothing holds, key on or off");
+        liv.byte = 1;   // Show sets +0x79
+        const shop::Signal one = sig(&liv, nullptr);
+        check(one.liveryOpen() && one.livery[0] && !one.livery[1] && !one.buyScreenOpen() && one.holds(true) && !one.holds(false),
+              "F228: the suit Livery's Show: it holds the signal with the key on, and is only watched (liveryOpen, no hold) with it off; it is not a buy screen");
+        wliv.byte = 1;
+        const shop::Signal both = sig(&liv, &wliv);
+        check(both.livery[0] && both.livery[1] && both.holds(true) && !both.holds(false) && std::strcmp(shop::liveryText(both), "suit and weapon open") == 0 && std::strcmp(shop::liveryText(one), "suit open") == 0,
+              "F228: both Livery screens open are both in the signal");
+        liv.byte = 0;   // Close clears it
+        check(sig(&liv, &wliv).holds(true) && std::strcmp(shop::liveryText(sig(&liv, &wliv)), "weapon open") == 0, "F228: the suit Livery's Close: the weapon Livery still holds");
+        wliv.byte = 0;
+        check(!sig(&liv, &wliv).holds(true) && std::strcmp(shop::liveryText(sig(&liv, &wliv)), "closed") == 0, "F228: both Closed: nothing holds");
+        liv.byte = 1;
+        liv.vtable = base + shop::kLiveryVtableRva + 0x100;
+        check(recheck(&liv, shop::kLivery, base) == shop::Verdict::kStaleVtable && !sig(&liv, nullptr).holds(true), "F228: a Livery object whose vtable changed is forgotten and holds nothing");
+        liv.vtable = base + shop::kWeaponLiveryVtableRva;
+        check(recheck(&liv, shop::kLivery, base) == shop::Verdict::kStaleVtable, "F228: the weapon Livery's vtable at the suit Livery's address is stale");
+        FakeObject suit;
+        suit.vtable = base + shop::kSuitVtableRva;
+        suit.byte = 1;
+        const shop::Signal buy = shop::signalOf(recheck(&suit, shop::kSuit, base), shop::Verdict::kNone, shop::Verdict::kNone);
+        check(buy.holds(true) && buy.holds(false) && !buy.liveryOpen(), "F228: a buy screen holds with the key on or off: its behaviour is as in F209");
     }
     // ---- 4. F107: a buy screen open holds the camera away at any distance --------------------------------------------------------------------------------------------------------------------
     {   // the weapon showroom: the commander's own camera, 0.9 cm under the neck, 90 calls (the flight's) while the screen is open; the screen closes, the camera stays near
@@ -257,18 +305,45 @@ inline void run209(Check&& check) {
         shop::Signal s;
         s.open[shop::kSuit] = true;
         shop::formatSignal(line, sizeof(line), s, true, 3);
-        check(std::strcmp(line, "shop screens (F209): the shop signal is ON: F107 holds the camera away (suit open, weapons closed, kiosk not running; change 3)") == 0, "F209: the signal's ON line says which screen and the change count");
+        check(std::strcmp(line, "shop screens (F209): the shop signal is ON: F107 holds the camera away (suit open, weapons closed, kiosk not running, livery closed; change 3)") == 0, "F209: the signal's ON line says which screen and the change count (F228: and the Livery screens)");
         s = shop::Signal();
         s.kiosk = true;
         shop::formatSignal(line, sizeof(line), s, false, 4);
-        check(std::strcmp(line, "shop screens (F209): the shop signal is OFF (suit closed, weapons closed, kiosk running; change 4)") == 0, "F209: the OFF line likewise");
+        check(std::strcmp(line, "shop screens (F209): the shop signal is OFF (suit closed, weapons closed, kiosk running, livery closed; change 4)") == 0, "F209: the OFF line likewise");
+        s = shop::Signal();
+        s.livery[1] = true;
+        shop::formatSignal(line, sizeof(line), s, true, 5);
+        check(std::strcmp(line, "shop screens (F209): the shop signal is ON: F107 holds the camera away (suit closed, weapons closed, kiosk not running, livery weapon open; change 5)") == 0, "F228: the ON line says which Livery screen");
+        e = shop::Event();
+        e.kind = shop::kShow;
+        e.cls = shop::kLivery;
+        e.before = 0;
+        e.after = 1;
+        e.tid = 7;
+        e.thisLow = 0x4D5E6F70;
+        shop::formatEvent(line, sizeof(line), e);
+        check(std::strcmp(line, "shop screens (F209): HumanoidLiveryActivity Show: +0x79 0 -> 1 (this 0x4D5E6F70, thread 7)") == 0, "F228: a Livery screen's Show line names the class");
+        e.kind = shop::kClose;
+        e.cls = shop::kWeaponLivery;
+        e.before = 1;
+        e.after = 0;
+        shop::formatEvent(line, sizeof(line), e);
+        check(std::strcmp(line, "shop screens (F209): HumanoidWeaponLiveryActivity Close: +0x79 1 -> 0 (this 0x4D5E6F70, thread 7)") == 0, "F228: the weapon Livery's Close line names the class");
+        shop::formatLiveryOpened(line, sizeof(line), shop::kLivery, true);
+        check(std::strcmp(line, "shop screens (F209): HumanoidLiveryActivity opened: F107 holds the camera away, the view is the game's own (experimental.native_on_foot_livery_game_view is on)") == 0,
+              "F228: a Livery screen opening with the key on says it holds the camera away");
+        shop::formatLiveryOpened(line, sizeof(line), shop::kWeaponLivery, false);
+        check(std::strcmp(line, "shop screens (F209): HumanoidWeaponLiveryActivity opened: only watched, the camera is not held away (experimental.native_on_foot_livery_game_view is off)") == 0,
+              "F228: ... with the key off it says it is only watched");
         shop::formatForgotten(line, sizeof(line), shop::kSuit, shop::Verdict::kStaleVtable, 0x7FF600001234ull, 0x7FF605255D20ull, 0x1A2B3C4D);
         check(std::strstr(line, "the remembered SuitVendorInteraction (this 0x1A2B3C4D) is forgotten: its vtable is no longer the class's (vtable 0x7FF600001234, the class's 0x7FF605255D20)") != nullptr,
               "F209: the forgotten line says the class, the object and both vtables");
-        shop::formatSecond(line, sizeof(line), 1, -1, 0, "Suit Vendor", true, "away (episode 1, 90 calls refused, 90 with a buy screen open)");
-        check(std::strcmp(line, "shop screens (F209): 1 s: suit +0x79 1, weapons +0x79 none, kiosk +0x1F8 0, SuitUIStateMachine \"Suit Vendor\", signal on; F107: away (episode 1, 90 calls refused, 90 with a buy screen open)") == 0,
-              "F209: the once-a-second line says the remembered bytes, the state, the kiosk byte, the signal and F107's state");
-        shop::formatSecond(line, sizeof(line), -1, -1, -1, "", false, "not away");
+        shop::formatSecond(line, sizeof(line), 1, -1, 0, -1, -1, "Suit Vendor", true, "away (episode 1, 90 calls refused, 90 with a buy screen open)");
+        check(std::strcmp(line, "shop screens (F209): 1 s: suit +0x79 1, weapons +0x79 none, kiosk +0x1F8 0, livery +0x79 none, weapon livery +0x79 none, SuitUIStateMachine \"Suit Vendor\", signal on; F107: away (episode 1, 90 calls refused, 90 with a buy screen open)") == 0,
+              "F209: the once-a-second line says the remembered bytes, the state, the kiosk byte, the signal and F107's state (F228: and the Livery bytes)");
+        shop::formatSecond(line, sizeof(line), -1, -1, -1, 1, 0, "", true, "away");
+        check(std::strstr(line, "livery +0x79 1, weapon livery +0x79 0, SuitUIStateMachine \"unknown\", signal on") != nullptr, "F228: the Livery bytes read in the once-a-second line");
+        shop::formatSecond(line, sizeof(line), -1, -1, -1, -1, -1, "", false, "not away");
         check(std::strstr(line, "SuitUIStateMachine \"unknown\", signal off; F107: not away") != nullptr && std::strstr(line, "suit +0x79 none") != nullptr, "F209: no state yet reads unknown, no object reads none");
     }
     // ---- 6. the cap and the pacer; what is "set" -------------------------------------------------------------------------------------------------------------------------------------------------
@@ -295,6 +370,8 @@ inline void run209(Check&& check) {
               "F209: a vendor state is one whose name has Vendor in it; OnFoot, an empty state and a state the build does not name are not");
         check(shop::anySet(true, false, "OnFoot") && shop::anySet(false, true, "") && shop::anySet(false, false, "Suit Vendor") && !shop::anySet(false, false, "OnFoot") && !shop::anySet(false, false, ""),
               "F209: the once-a-second line runs while a buy screen is open, the kiosk runs, or the machine is in a vendor state, and is silent otherwise");
+        check(shop::anySet(false, false, "OnFoot", true) && shop::anySet(false, false, "", true) && !shop::anySet(false, false, "OnFoot", false) && !shop::anySet(false, false, "OnFoot"),
+              "F228: the once-a-second line also runs while a Livery screen is open (held or only watched)");
         check(shop::isSuitUiStateMachine("SuitUIStateMachine") && !shop::isSuitUiStateMachine("SuitUIStateMachineX") && !shop::isSuitUiStateMachine("SuitUIState") && !shop::isSuitUiStateMachine("") &&
                   !shop::isSuitUiStateMachine(nullptr) && !shop::isSuitUiStateMachine("OnFoot"),
               "F209: only the handle named exactly SuitUIStateMachine is recorded");
@@ -310,6 +387,17 @@ inline void run209(Check&& check) {
               "F209: the frame boundary tries the shop hooks (while the native key is on) and re-reads the remembered objects every frame, before the gates are set");
         check(cpp.find("g_f107Away.step(eyeNeckM, static_cast<double>(f30QpcUs(in.qpc)) * 1e-6, nativeOnFootShopOpen())") != std::string::npos,
               "F209: the Animate post-hook gives F107 the shop signal with every call");
+        // F228: the key is read live on the frame thread (default on), logged on each change as TEMPORARY, handed to the hooks, dumped with the recording's keys, and shipped on with its menu row
+        check(has_(cpp, "cfg.getString(\"experimental.native_on_foot_livery_game_view\", \"on\") != \"off\"") && has_(cpp, "nativeOnFootSetLiveryHold(on);") && has_(cpp, "if (first || on != g_f228KeyLast)") &&
+                  has_(cpp, "native on foot livery screens (F228, TEMPORARY): experimental.native_on_foot_livery_game_view is %s") && has_(cpp, "str(\"experimental.native_on_foot_livery_game_view\""),
+              "F228: the key is read live on the frame thread, default on, logged on a change as TEMPORARY, set into the hooks and dumped");
+        const std::string ini = slurp("edvr.ini");
+        check(has_(ini, "# ui: Livery uses game view | choices on, off | recommended on | live\nnative_on_foot_livery_game_view = on\n") && has_(ini, "# TEMPORARY (F228): Livery uses game view"),
+              "F228: the shipped key is on, TEMPORARY, with its ui line");
+        check(has_(hooks, "return shop::screenOfVtable(vtable, base);") && has_(hooks, "s.holds(g_liveryHold.load(std::memory_order_relaxed))") &&
+                  has_(hooks, "bool nativeOnFootShopOpen() noexcept { return shopBuyScreenOpen() || (g_liveryHold.load(std::memory_order_relaxed) && nativeOnFootLiveryOpen()); }") &&
+                  has_(hooks, "std::atomic<int8_t> g_shopByte[shop::kClassCount] = {{-1}, {-1}, {-1}, {-1}, {-1}};"),
+              "F228: the Show/Close filter takes the Livery vtables, the frame thread's signal and F107's input hold a Livery screen only with the key on, and every per-class array is sized by kClassCount");
         // every shop callback forwards to the original: the original's result is returned unchanged (nothing is written to the game)
         const size_t at = hooks.find("// ---- F209: the Pioneer Supplies buy screens");
         const size_t end = hooks.find("// ---- hiding the head parts", at);

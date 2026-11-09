@@ -313,6 +313,7 @@ std::atomic<uint32_t> g_f216PubSeq{0};                        // F216: the P1 ho
 nofoot::f216::Pub g_f216PubMove;
 std::atomic<bool> g_f222Key{true};                            // F222 (TEMPORARY): experimental.native_on_foot_steady_body_in_turns, on by default, live: the eye's heading, up and offset are taken in the frame the rows were drawn in
 bool g_f222KeyLast = true;                                    // the value last logged (frame thread; the first read always logs)
+bool g_f228KeyLast = true;                                    // F228 (TEMPORARY): experimental.native_on_foot_livery_game_view, on by default, live: the value last logged (frame thread; the first read always logs); the key's value lives in native_on_foot_hooks.cpp (nativeOnFootSetLiveryHold)
 nofoot::f222::OwnFrame g_f222;                                // F222: the rotations of the last two pin frames and the rows' vectors in the model (one writer: the pin hook, under g_pfzBusy; reset at an edge)
 nofoot::f171c::Mailbox<nofoot::f222::Stats> g_f222Box;        // F222: the hook's window of pin calls for the log line (the frame thread takes it)
 uint64_t g_f222LineMs = 0;                                    // F222: the log window's start (frame thread)
@@ -1359,6 +1360,16 @@ void readKey() {
                                : "the rows' heading, up and offset go through this call's model as they did before F222, so a turning body moves the neck target by its turn a call");
         g_f222KeyLast = on;
         g_f222Key.store(on, std::memory_order_relaxed);
+    }
+    // F228 (TEMPORARY A/B, live, the developer tier's "Livery uses game view"): while the suit or the weapon Livery screen is open, the shop signal holds F107's camera away, as at a buy screen.
+    {
+        const bool on = cfg.getString("experimental.native_on_foot_livery_game_view", "on") != "off";
+        if (first || on != g_f228KeyLast)
+            Log::get().note("native on foot livery screens (F228, TEMPORARY): experimental.native_on_foot_livery_game_view is %s -- %s", on ? "on" : "off",
+                            on ? "while a Livery screen (suit or weapon) is open the view is the game's own camera and EDVR's on-foot body and view adjustments stand down, as at a buy screen (F107 holds the camera away)"
+                               : "the Livery screens are only watched (Show, Close and the open byte are logged); EDVR's on-foot body and view adjustments run as before F228");
+        g_f228KeyLast = on;
+        nativeOnFootSetLiveryHold(on);
     }
     // F220 (TEMPORARY A/B, live, the developer tier's "HUD stays with view"): with View bob off, the HUD's placement moves with the view's bob term instead of the view moving against it.
     {
@@ -15036,12 +15047,12 @@ shop::Pacer g_shopSecondPacer;   // F209: the once-a-second line (frame thread)
 // the hooks' own event lines are written by native_on_foot_hooks.cpp's frame boundary). Silent when none of them is set, or when the shop hooks are not armed.
 void shopSecondLine(uint64_t now, bool away, uint32_t episodes) noexcept {
     NativeOnFootShopRead r;
-    if (!nativeOnFootShopRead(&r) || !shop::anySet(r.buyScreenOpen, r.kiosk, r.state) || !g_shopSecondPacer.due(now)) return;
+    if (!nativeOnFootShopRead(&r) || !shop::anySet(r.buyScreenOpen, r.kiosk, r.state, r.liveryOpen) || !g_shopSecondPacer.due(now)) return;
     char f107[200];
     std::snprintf(f107, sizeof(f107), "%s (episode %u, %u calls refused, %u with a buy screen open)", away ? "away" : "not away", episodes,
                   g_f107Calls.load(std::memory_order_relaxed), g_f107ShopCalls.load(std::memory_order_relaxed));
     char line[512];
-    shop::formatSecond(line, sizeof(line), r.suitByte, r.weaponsByte, r.kioskByte, r.state, r.buyScreenOpen, f107);
+    shop::formatSecond(line, sizeof(line), r.suitByte, r.weaponsByte, r.kioskByte, r.liveryByte, r.weaponLiveryByte, r.state, r.signal, f107);
     Log::get().note("%s", line);
 }
 bool f107Tick(uint64_t now) noexcept {
@@ -17976,7 +17987,7 @@ bool pinStage0(const pfz::ArmPlan& pl, const PfzSpan& sp, bool froze, uint64_t n
         {   // F107: the game's camera away from the commander (a terminal's or a screen's own camera): the pin, the neck reference and the standing calibration
             // take nothing from this call (native_on_foot_f107.h); the edges and the episode go to the frame thread, which logs them
             const double eyeNeckM = nofoot::f107::eyeNeckDistance(E, N0);
-            g_f107Away.step(eyeNeckM, static_cast<double>(f30QpcUs(in.qpc)) * 1e-6, nativeOnFootShopOpen());   // F209: a Pioneer Supplies buy screen open holds the camera away at any distance
+            g_f107Away.step(eyeNeckM, static_cast<double>(f30QpcUs(in.qpc)) * 1e-6, nativeOnFootShopOpen());   // F209: a Pioneer Supplies buy screen open holds the camera away at any distance; F228: so does a Livery screen while experimental.native_on_foot_livery_game_view is on
             if (g_f107Away.away) {
                 refusal = kPinRefCameraAway;
                 g_f107ShopCalls.store(g_f107Away.shopCalls, std::memory_order_relaxed);
@@ -38378,6 +38389,7 @@ static std::string recorderKeysJson() {
     str("experimental.native_on_foot_body_follows_view", cfg.getString("experimental.native_on_foot_body_follows_view", "on"));
     str("experimental.native_on_foot_hud_stays_with_view", cfg.getString("experimental.native_on_foot_hud_stays_with_view", "on"));
     str("experimental.native_on_foot_steady_body_in_turns", cfg.getString("experimental.native_on_foot_steady_body_in_turns", "on"));
+    str("experimental.native_on_foot_livery_game_view", cfg.getString("experimental.native_on_foot_livery_game_view", "on"));
     str("fix.native_on_foot_view_bob", cfg.getString("fix.native_on_foot_view_bob", "off"));
     num("experimental.native_on_foot_stand_ads_spine_straighten",
         nofoot::f180::clampDial(static_cast<double>(cfg.getFloat("experimental.native_on_foot_stand_ads_spine_straighten", 0.9f))));
