@@ -4,6 +4,9 @@ namespace edvr {
 // gate and drain bounded default diagnostics. No configuration key of its own.
 void nativePreviewCameraBoundary(bool wanted,bool active);
 void nativePreviewCameraStop() noexcept;
+// F232, present thread, once a frame: while one of F209's watched preview screens reads open (screenOpen) the producer hooks keep a roster snapshot of the last child they refused, and once a second
+// each role's newest snapshot is logged with the per-reason counts (at most 40 lines in any ten seconds). No effect on the camera.
+void nativePreviewCameraDiagTick(bool screenOpen);
 // TEMPORARY (the concourse cull's VR proving build, hotkey.concourse_vr_camera_probe; docs\concourse-cull-2026-11-05.md): a second client of the eye stub on 0x283FA20.
 // Arm: for `frames` consecutive present-thread frames after `frame` (the press's own), the first call of the stub in each frame raises the head pose's translation by
 // `offset` (metres). Installs the stub on demand when the ship preview has not. False with `why` when it cannot (not installed, already running, a bad count).

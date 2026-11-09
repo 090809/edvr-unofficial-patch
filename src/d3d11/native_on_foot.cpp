@@ -15036,12 +15036,12 @@ shop::Pacer g_shopSecondPacer;   // F209: the once-a-second line (frame thread)
 // the hooks' own event lines are written by native_on_foot_hooks.cpp's frame boundary). Silent when none of them is set, or when the shop hooks are not armed.
 void shopSecondLine(uint64_t now, bool away, uint32_t episodes) noexcept {
     NativeOnFootShopRead r;
-    if (!nativeOnFootShopRead(&r) || !shop::anySet(r.buyScreenOpen, r.kiosk, r.state) || !g_shopSecondPacer.due(now)) return;
+    if (!nativeOnFootShopRead(&r) || !shop::anySet(r.buyScreenOpen, r.kiosk, r.state, r.liveryOpen) || !g_shopSecondPacer.due(now)) return;
     char f107[200];
     std::snprintf(f107, sizeof(f107), "%s (episode %u, %u calls refused, %u with a buy screen open)", away ? "away" : "not away", episodes,
                   g_f107Calls.load(std::memory_order_relaxed), g_f107ShopCalls.load(std::memory_order_relaxed));
     char line[512];
-    shop::formatSecond(line, sizeof(line), r.suitByte, r.weaponsByte, r.kioskByte, r.state, r.buyScreenOpen, f107);
+    shop::formatSecond(line, sizeof(line), r.suitByte, r.weaponsByte, r.kioskByte, r.liveryByte, r.weaponLiveryByte, r.state, r.signal, f107);
     Log::get().note("%s", line);
 }
 bool f107Tick(uint64_t now) noexcept {
@@ -17976,7 +17976,7 @@ bool pinStage0(const pfz::ArmPlan& pl, const PfzSpan& sp, bool froze, uint64_t n
         {   // F107: the game's camera away from the commander (a terminal's or a screen's own camera): the pin, the neck reference and the standing calibration
             // take nothing from this call (native_on_foot_f107.h); the edges and the episode go to the frame thread, which logs them
             const double eyeNeckM = nofoot::f107::eyeNeckDistance(E, N0);
-            g_f107Away.step(eyeNeckM, static_cast<double>(f30QpcUs(in.qpc)) * 1e-6, nativeOnFootShopOpen());   // F209: a Pioneer Supplies buy screen open holds the camera away at any distance
+            g_f107Away.step(eyeNeckM, static_cast<double>(f30QpcUs(in.qpc)) * 1e-6, nativeOnFootShopOpen());   // F209: a Pioneer Supplies buy screen open holds the camera away at any distance; F228, F234: so does a Livery screen or the loadout browser
             if (g_f107Away.away) {
                 refusal = kPinRefCameraAway;
                 g_f107ShopCalls.store(g_f107Away.shopCalls, std::memory_order_relaxed);
@@ -38435,6 +38435,7 @@ void nativeOnFootFrameBoundary(uint32_t frameNo) {
     nativeOnFootHooksBody(keyOn, nativeOnFootActive(), bodyWhy);
     cameraGateTick(now);   // F93d: the game's camera (first person or its third-person suite) gates every body change; its lines
     nativePreviewCameraBoundary(keyOn && session, nativeOnFootActive() && !nativeOnFootCameraExternal());
+    nativePreviewCameraDiagTick(nativeOnFootPreviewScreenOpen());   // F232: the refused roster, once a second while a preview screen is open
     headShadowTick(now);   // F95c: the head kept in the shadows; its lines
     f142Tick(now);         // F142: the outfit census (a change), and the full outfit's window while the key is on
     coatPackTick(now);     // F157: whether the coat outfit is armed, to the draw path; the draws left out of the eyes, written once a window

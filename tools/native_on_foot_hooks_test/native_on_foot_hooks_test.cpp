@@ -151,6 +151,8 @@ void testShopPure() {
           "CodeHook steals 6 bytes of Show, Close and SetState (push rbx; sub rsp,20h) and 5 of the kiosk's start (mov rax,rsp; push rbp; push rbx) and stop (mov [rsp+10h],rbx): whole instructions, no displacement");
     check(shop::kSuitVtableRva == 0x5255D20 && shop::kWeaponsVtableRva == 0x5255A20 && shop::kKioskVtableRva == 0x51E9770 && shop::kOffOpen == 0x79 && shop::kOffKiosk == 0x1F8,
           "the buy screens' vtables are +0x5255D20 (suit) and +0x5255A20 (weapons), the kiosk's +0x51E9770; the bytes are +0x79 and +0x1F8");
+    check(shop::kLiveryVtableRva == 0x5612F30 && shop::kWeaponLiveryVtableRva == 0x5614328 && shop::kClassCount == 6 && shop::kLivery == 3 && shop::kWeaponLivery == 4 && shop::kOutfitting == 5 && shop::kOutfittingVtableRva == 0x524D908,
+          "F228/F234: the Livery screens' vtables are +0x5612F30 (suit) and +0x5614328 (weapon) and the loadout browser's +0x524D908, classes 3, 4 and 5 of six; they share the buy screens' Show, Close and byte +0x79");
 }
 
 void testFadeGuard() {
@@ -2101,7 +2103,7 @@ void testShopGlue(const CtlPages& p) {
         check(nativeOnFootShopOpen(), "...the signal is on at once, before any frame boundary");
         rig.boundary();
         check(rig.cap.count(shopEventLine("SuitVendorInteraction", "Show", 0, 1, &suit).c_str()) == 1, "...the boundary writes the Show line: the class, +0x79 0 -> 1, the object and the thread");
-        check(rig.cap.count("the shop signal is ON: F107 holds the camera away (suit open, weapons closed, kiosk not running; change 1)") == 1, "...and the signal's ON line, once");
+        check(rig.cap.count("the shop signal is ON: F107 holds the camera away (suit open, weapons closed, kiosk not running, livery closed; change 1)") == 1, "...and the signal's ON line, once");
         const int iShow = rig.cap.indexOf("SuitVendorInteraction Show:"), iOn = rig.cap.indexOf("the shop signal is ON");
         check(iShow >= 0 && iShow < iOn, "...the Show line comes before the ON line");
         rig.cap.clear();
@@ -2115,7 +2117,7 @@ void testShopGlue(const CtlPages& p) {
         check(r2 == 0x5A5B && suit.open() == 0 && !nativeOnFootShopOpen(), "F209 CLOSE: the original ran (0x5A5B), +0x79 is clear, the signal is off at once");
         rig.boundary();
         check(rig.cap.count(shopEventLine("SuitVendorInteraction", "Close", 1, 0, &suit).c_str()) == 1 &&
-                  rig.cap.count("the shop signal is OFF (suit closed, weapons closed, kiosk not running; change 2)") == 1,
+                  rig.cap.count("the shop signal is OFF (suit closed, weapons closed, kiosk not running, livery closed; change 2)") == 1,
               "...the Close line (+0x79 1 -> 0) and the OFF line, once each");
         check(nativeOnFootShopRead(&rd) && !rd.buyScreenOpen && rd.suitByte == 0 && rd.signalChanges == 2, "...the reading: the suit byte 0, two changes");
         // another class of the 40 that share Show/Close
@@ -2131,7 +2133,7 @@ void testShopGlue(const CtlPages& p) {
         shopShow(&suit);
         shopShow(&weapons);
         rig.boundary();
-        check(nativeOnFootShopOpen() && rig.cap.count("the shop signal is ON: F107 holds the camera away (suit open, weapons open, kiosk not running; change 1)") == 1 &&
+        check(nativeOnFootShopOpen() && rig.cap.count("the shop signal is ON: F107 holds the camera away (suit open, weapons open, kiosk not running, livery closed; change 1)") == 1 &&
                   rig.cap.count(shopEventLine("WeaponsVendorInteraction", "Show", 0, 1, &weapons).c_str()) == 1,
               "F209: both buy screens open: one signal edge saying both, each Show line written");
         shopClose(&suit);
@@ -2140,6 +2142,80 @@ void testShopGlue(const CtlPages& p) {
         shopClose(&weapons);
         rig.boundary();
         check(!nativeOnFootShopOpen() && rig.cap.count("the shop signal is OFF (suit closed, weapons closed") == 1, "...closing the weapon screen ends it");
+        t::reset();
+    }
+    {   // F228/F234: the Livery screens and the loadout browser: the same Show and Close, and F107 held away while one is open
+        Rig rig;
+        start(rig);
+        static ShopObj livery, wlivery, loadout;
+        livery.init(base + shop::kLiveryVtableRva);
+        wlivery.init(base + shop::kWeaponLiveryVtableRva);
+        loadout.init(base + shop::kOutfittingVtableRva);
+        check(nativeOnFootShopOpen() == false && !nativeOnFootLiveryOpen() && !nativeOnFootPreviewScreenOpen(), "F228: nothing open: no signal, no Livery screen, no preview screen");
+        // the suit Livery's Show holds the signal at once
+        const uint64_t r1 = shopShow(&livery);
+        check(r1 == 0x5A5A && livery.open() == 1 && nativeOnFootShopOpen() && nativeOnFootLiveryOpen() && nativeOnFootPreviewScreenOpen(), "F228 LIVERY SHOW: the original ran (0x5A5A), +0x79 is set, the signal is on at once");
+        rig.boundary();
+        check(rig.cap.count(shopEventLine("HumanoidLiveryActivity", "Show", 0, 1, &livery).c_str()) == 1 &&
+                  rig.cap.count("shop screens (F209): HumanoidLiveryActivity opened: F107 holds the camera away, the view is the game's own") == 1 &&
+                  rig.cap.count("the shop signal is ON: F107 holds the camera away (suit closed, weapons closed, kiosk not running, livery suit open; change 1)") == 1,
+              "...the Show line names the class, one line says it holds the camera away, and the signal's ON line names the Livery screen");
+        const int iShow = rig.cap.indexOf("HumanoidLiveryActivity Show:"), iOpened = rig.cap.indexOf("HumanoidLiveryActivity opened:"), iOn = rig.cap.indexOf("the shop signal is ON");
+        check(iShow >= 0 && iShow < iOpened && iOpened < iOn, "...in the order Show, opened, ON");
+        NativeOnFootShopRead rd;
+        check(nativeOnFootShopRead(&rd) && rd.liveryOpen && !rd.buyScreenOpen && rd.signal && rd.liveryByte == 1 && rd.weaponLiveryByte == -1 && rd.suitByte == -1,
+              "...the frame thread's reading: the Livery byte 1, not a buy screen, the signal on");
+        const uint64_t r2 = shopClose(&livery);
+        check(r2 == 0x5A5B && livery.open() == 0 && !nativeOnFootShopOpen() && !nativeOnFootLiveryOpen(), "F228 LIVERY CLOSE: the original ran (0x5A5B), +0x79 is clear, the signal is off at once");
+        rig.cap.clear();
+        rig.boundary();
+        check(rig.cap.count(shopEventLine("HumanoidLiveryActivity", "Close", 1, 0, &livery).c_str()) == 1 &&
+                  rig.cap.count("the shop signal is OFF (suit closed, weapons closed, kiosk not running, livery closed; change 2)") == 1,
+              "...the Close line and the OFF line, once each");
+        // the weapon Livery
+        rig.cap.clear();
+        shopShow(&wlivery);
+        rig.boundary();
+        check(nativeOnFootShopOpen() && rig.cap.count(shopEventLine("HumanoidWeaponLiveryActivity", "Show", 0, 1, &wlivery).c_str()) == 1 &&
+                  rig.cap.count("HumanoidWeaponLiveryActivity opened: F107 holds the camera away") == 1 && rig.cap.count("livery weapon open; change 3)") == 1,
+              "F228: the weapon Livery's Show holds the signal, with its own lines");
+        shopClose(&wlivery);
+        rig.boundary();
+        check(!nativeOnFootShopOpen() && rig.cap.count(shopEventLine("HumanoidWeaponLiveryActivity", "Close", 1, 0, &wlivery).c_str()) == 1, "...and its Close ends it");
+        // the loadout browser holds too (F234)
+        rig.cap.clear();
+        const uint64_t r3 = shopShow(&loadout);
+        check(r3 == 0x5A5A && loadout.open() == 1 && nativeOnFootShopOpen() && !nativeOnFootLiveryOpen() && nativeOnFootPreviewScreenOpen(),
+              "F234 LOADOUT SHOW: the original ran, +0x79 is set, the signal is on at once and it is not a Livery screen");
+        rig.boundary();
+        check(rig.cap.count(shopEventLine("HumanoidOutfittingInteraction", "Show", 0, 1, &loadout).c_str()) == 1 &&
+                  rig.cap.count("shop screens (F209): HumanoidOutfittingInteraction opened: F107 holds the camera away, the view is the game's own") == 1 &&
+                  rig.cap.count("the shop signal is ON: F107 holds the camera away (suit closed, weapons closed, kiosk not running, livery loadout open; change 5)") == 1,
+              "...the Show line, one line saying it holds the camera away, and the ON line naming the loadout browser");
+        shopClose(&loadout);
+        check(loadout.open() == 0 && !nativeOnFootShopOpen() && !nativeOnFootPreviewScreenOpen(), "F234 LOADOUT CLOSE: the signal is off at once");
+        // a buy screen still holds, the kiosk still does not
+        rig.cap.clear();
+        shopShow(&suit);
+        check(nativeOnFootShopOpen() && nativeOnFootPreviewScreenOpen() && !nativeOnFootLiveryOpen(), "F209: a buy screen holds the signal, as before");
+        shopShow(&loadout);
+        shopClose(&suit);
+        check(nativeOnFootShopOpen(), "F234: the loadout browser still holds when a buy screen closes");
+        shopClose(&loadout);
+        check(!nativeOnFootShopOpen(), "...and nothing holds when both are closed");
+        shopKioskStart(&kiosk);
+        check(!nativeOnFootShopOpen() && !nativeOnFootPreviewScreenOpen(), "F209: the kiosk does not hold, as before");
+        shopKioskStop(&kiosk);
+        rig.boundary();
+        // a Livery object whose vtable changed is forgotten, and the other class's address is not confused
+        rig.cap.clear();
+        shopShow(&livery);
+        livery.setVtable(base + shop::kWeaponLiveryVtableRva);
+        rig.boundary();
+        check(!nativeOnFootShopOpen() && rig.cap.count("the remembered HumanoidLiveryActivity (this 0x") == 1 && rig.cap.count("is forgotten: its vtable is no longer the class's") == 1,
+              "F228: a Livery object whose vtable changed is forgotten and holds no signal");
+        t::reset();
+        check(!nativeOnFootShopOpen() && !nativeOnFootLiveryOpen(), "RESET: nothing is open");
         t::reset();
     }
     {   // the armoury kiosk: start and stop events; it does not hold F107

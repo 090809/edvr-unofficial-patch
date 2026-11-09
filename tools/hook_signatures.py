@@ -1980,6 +1980,8 @@ AUDIT_EXACT_ONLY = (
     ("d3d11/avatar_skeleton_core.h", "the extracted avatar skeleton's exact-build vtables and slots"),
     ("d3d11/shop_screen_core.h", "F209's exact-build Pioneer Supplies buy screens: five hook addresses, their prologue bytes and three vtables, checked against the build's PE identity and the "
      "prologue bytes before any is placed (native_on_foot_hooks.cpp, in this family, places them); making them self-locating needs the signature table regenerated"),
+    ("d3d11/preview_headlook_core.h", "F233's exact-build HeadlookCamera: its producer (0x1074650, 15 pinned bytes) and its two vtables, taken only on the known build and only after the pin matches "
+     "(native_preview_camera.cpp, in the audit, hooks it through the resolver); making them self-locating needs the signature table regenerated"),
     ("d3d11/native_on_foot_f212.h", "F212's exact-build conversation look: the address and all 17 bytes of the look springs' target setter (a leaf with no unwind data), checked against the "
      "build's PE identity and every byte before the hook is placed (native_on_foot_hooks.cpp, in this family, places it); making it self-locating needs the signature table regenerated"),
     ("d3d11/native_on_foot_f87.h", "the exact-build interaction prompt probe's addresses and pins"),

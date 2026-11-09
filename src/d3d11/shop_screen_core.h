@@ -18,6 +18,13 @@
 // THE SIGNAL. A buy screen is open from its Show to its Close. The hooks remember `this` for each class; once a frame, on the frame thread, the remembered object's vtable is read (guarded) and
 // compared with the class's, and the byte +0x79 is read (guarded): so a missed Close, a freed object or a reused address cannot leave the signal stuck. The answer is handed to the Animate
 // post-hook (where F107 decides) through an atomic.
+//
+// F228 (behaviour since the key went): the two Livery screens, the suit's and the weapon's. In VR on foot the Livery screen's commander preview is placed at the commander when the camera is EDVR's, and right
+// while F107 holds the camera away (docs\vr-livery-model-placement-2026-11-09.md). The same reverse-engineering pass (build 334925) found that HumanoidLiveryActivity (vtable 0x5612F30) and
+// HumanoidWeaponLiveryActivity (0x5614328) share the buy screens' Show, IsOpen and Close (their vtable slots +0x70, +0x78 and +0x80 hold 0x9C3960, 0x9C3290 and 0x9C22A0; checked in the exe) and the open
+// byte +0x79, and so does HumanoidOutfittingInteraction, the loadout browser (vtable 0x524D908; F234). So the hooks above run for them: the Show/Close filter knows these vtables, and the frame thread
+// re-reads them like the buy screens. While a Livery screen or the loadout browser reads open, the shop signal is on and F107 holds the camera away, as it does at a buy screen: the loadout browser's
+// game camera stands a few metres from the neck, and its distance test ended and restarted all through a visit, switching EDVR's on-foot adjustments on and off.
 #pragma once
 
 #include <cstddef>
@@ -31,6 +38,8 @@ namespace shop {
 // ---- build 334925's addresses and prologues ---------------------------------------------------------------------------------------------------------------------------------
 constexpr uintptr_t kShowRva = 0x9C3960, kCloseRva = 0x9C22A0, kSetStateRva = 0xA237B0, kKioskStartRva = 0x1973820, kKioskStopRva = 0x1916440;
 constexpr uintptr_t kSuitVtableRva = 0x5255D20, kWeaponsVtableRva = 0x5255A20, kKioskVtableRva = 0x51E9770;
+constexpr uintptr_t kLiveryVtableRva = 0x5612F30, kWeaponLiveryVtableRva = 0x5614328;   // F228: HumanoidLiveryActivity and HumanoidWeaponLiveryActivity (Show, IsOpen, Close and the byte +0x79 are the buy screens')
+constexpr uintptr_t kOutfittingVtableRva = 0x524D908;   // F234: HumanoidOutfittingInteraction, the loadout browser (Show, IsOpen, Close and the byte +0x79 are the buy screens' too)
 constexpr uint32_t kOffOpen = 0x79;        // the interaction's "my screen is open" byte (the base class's Show sets it, Close clears it)
 constexpr uint32_t kOffKiosk = 0x1F8;      // ArmouryVendorActivity's session byte (OnStart sets it, OnStop clears it)
 constexpr uint32_t kOffHandleName = 0x08;  // the state machine handle's pointer to a refcounted Cobra string
@@ -51,14 +60,24 @@ constexpr size_t kKioskStopPrologueBytes = 16;
 inline constexpr uint8_t kKioskStopPrologue[kKioskStopPrologueBytes] = {0x48, 0x89, 0x5C, 0x24, 0x10, 0x57, 0x48, 0x83, 0xEC, 0x20, 0x48, 0x8B, 0xD9, 0x48, 0x81, 0xC1};
 
 // ---- the classes -----------------------------------------------------------------------------------------------------------------------------------------------------------
-enum Class : int { kSuit = 0, kWeapons = 1, kKiosk = 2, kClassCount = 3, kNotOurs = -1 };
+enum Class : int { kSuit = 0, kWeapons = 1, kKiosk = 2, kLivery = 3, kWeaponLivery = 4, kOutfitting = 5, kClassCount = 6, kNotOurs = -1 };
 inline const char* className(int c) noexcept {
-    return c == kSuit ? "SuitVendorInteraction" : c == kWeapons ? "WeaponsVendorInteraction" : c == kKiosk ? "ArmouryVendorActivity" : "another class";
+    return c == kSuit ? "SuitVendorInteraction" : c == kWeapons ? "WeaponsVendorInteraction" : c == kKiosk ? "ArmouryVendorActivity" : c == kLivery ? "HumanoidLiveryActivity"
+         : c == kWeaponLivery ? "HumanoidWeaponLiveryActivity" : c == kOutfitting ? "HumanoidOutfittingInteraction" : "another class";
 }
-inline uintptr_t vtableRva(int c) noexcept { return c == kSuit ? kSuitVtableRva : c == kWeapons ? kWeaponsVtableRva : c == kKiosk ? kKioskVtableRva : 0; }
+inline uintptr_t vtableRva(int c) noexcept {
+    return c == kSuit ? kSuitVtableRva : c == kWeapons ? kWeaponsVtableRva : c == kKiosk ? kKioskVtableRva : c == kLivery ? kLiveryVtableRva : c == kWeaponLivery ? kWeaponLiveryVtableRva
+         : c == kOutfitting ? kOutfittingVtableRva : 0;
+}
+inline bool isLivery(int c) noexcept { return c == kLivery || c == kWeaponLivery; }
 // Which of the two buy screens a vtable pointer belongs to (the Show/Close hook's whole filter); kNotOurs for any other class of the 40 that share the base.
 inline int buyScreenOfVtable(uint64_t vtable, uintptr_t base) noexcept {
     return vtable == base + kSuitVtableRva ? kSuit : vtable == base + kWeaponsVtableRva ? kWeapons : kNotOurs;
+}
+// F228/F234: which of the five screens that share the base's Show and Close (the two buy screens, the two Livery screens and the loadout browser) a vtable pointer belongs to: the hook's whole filter.
+inline int screenOfVtable(uint64_t vtable, uintptr_t base) noexcept {
+    const int buy = buyScreenOfVtable(vtable, base);
+    return buy != kNotOurs ? buy : vtable == base + kLiveryVtableRva ? kLivery : vtable == base + kWeaponLiveryVtableRva ? kWeaponLivery : vtable == base + kOutfittingVtableRva ? kOutfitting : kNotOurs;
 }
 
 // ---- the once-a-frame re-check ---------------------------------------------------------------------------------------------------------------------------------------------
@@ -87,13 +106,21 @@ inline const char* verdictText(Verdict v) noexcept {
 struct Signal {
     bool open[2] = {false, false};   // the suit and the weapon buy screen
     bool kiosk = false;              // ArmouryVendorActivity's session (not a buy screen: the home menu; it does not hold F107 away)
+    bool livery[2] = {false, false}; // F228: the suit and the weapon Livery screen (index 0 is kLivery, 1 is kWeaponLivery)
+    bool loadout = false;            // F234: the loadout browser (HumanoidOutfittingInteraction)
     bool buyScreenOpen() const noexcept { return open[0] || open[1]; }
+    bool liveryOpen() const noexcept { return livery[0] || livery[1]; }
+    // The signal F107 reads: a buy screen, a Livery screen (F228) or the loadout browser (F234) open.
+    bool holds() const noexcept { return buyScreenOpen() || liveryOpen() || loadout; }
 };
-inline Signal signalOf(Verdict suit, Verdict weapons, Verdict kiosk) noexcept {
+inline Signal signalOf(Verdict suit, Verdict weapons, Verdict kiosk, Verdict livery = Verdict::kNone, Verdict weaponLivery = Verdict::kNone, Verdict loadout = Verdict::kNone) noexcept {
     Signal s;
     s.open[kSuit] = suit == Verdict::kOpen;
     s.open[kWeapons] = weapons == Verdict::kOpen;
     s.kiosk = kiosk == Verdict::kOpen;
+    s.livery[0] = livery == Verdict::kOpen;
+    s.livery[1] = weaponLivery == Verdict::kOpen;
+    s.loadout = loadout == Verdict::kOpen;
     return s;
 }
 
@@ -104,8 +131,8 @@ inline bool isSuitUiStateMachine(const char* name) noexcept { return name && std
 // A vendor state ("Armoury Vendor", "Suit Vendor", "Weapons Vendor", "Suit Upgrade Vendor", "Weapons Upgrade Vendor"): the once-a-second line runs while the machine is in one, so a machine left in some
 // other state the build does not name (a ship, a menu) never keeps the log writing a line a second for the rest of the session.
 inline bool stateIsVendor(const char* state) noexcept { return state && std::strstr(state, "Vendor") != nullptr; }
-// Is anything the once-a-second line reports set: a buy screen open, the kiosk session running, or the machine in a vendor state.
-inline bool anySet(bool buyScreenOpen, bool kiosk, const char* state) noexcept { return buyScreenOpen || kiosk || stateIsVendor(state); }
+// Is anything the once-a-second line reports set: a buy screen open, the kiosk session running, the machine in a vendor state, or (F228) a Livery screen open.
+inline bool anySet(bool buyScreenOpen, bool kiosk, const char* state, bool liveryOpen = false) noexcept { return buyScreenOpen || kiosk || stateIsVendor(state) || liveryOpen; }
 // At most one line a second.
 struct Pacer {
     bool have = false;
@@ -145,9 +172,26 @@ inline int formatEvent(char* buf, size_t cap, const Event& e) noexcept {
             return std::snprintf(buf, cap, "%s an event of kind %u", tag(), static_cast<unsigned>(e.kind));
     }
 }
+// The Livery screens, and (F234) the loadout browser, that are open: "closed", "suit open", "weapon open", "loadout open", "suit and weapon open", "suit and loadout open", ...
+inline const char* liveryText(const Signal& s) noexcept {
+    switch ((s.livery[0] ? 1 : 0) | (s.livery[1] ? 2 : 0) | (s.loadout ? 4 : 0)) {
+        case 1: return "suit open";
+        case 2: return "weapon open";
+        case 3: return "suit and weapon open";
+        case 4: return "loadout open";
+        case 5: return "suit and loadout open";
+        case 6: return "weapon and loadout open";
+        case 7: return "suit and weapon and loadout open";
+        default: return "closed";
+    }
+}
 inline int formatSignal(char* buf, size_t cap, const Signal& s, bool on, uint32_t seq) noexcept {
-    return std::snprintf(buf, cap, "%s the shop signal is %s (suit %s, weapons %s, kiosk %s; change %u)", tag(), on ? "ON: F107 holds the camera away" : "OFF", s.open[kSuit] ? "open" : "closed",
-                         s.open[kWeapons] ? "open" : "closed", s.kiosk ? "running" : "not running", seq);
+    return std::snprintf(buf, cap, "%s the shop signal is %s (suit %s, weapons %s, kiosk %s, livery %s; change %u)", tag(), on ? "ON: F107 holds the camera away" : "OFF", s.open[kSuit] ? "open" : "closed",
+                         s.open[kWeapons] ? "open" : "closed", s.kiosk ? "running" : "not running", liveryText(s), seq);
+}
+// F228/F234: said once when a Livery screen or the loadout browser opens: F107 holds the camera away and the view is the game's own.
+inline int formatHeldOpened(char* buf, size_t cap, int cls) noexcept {
+    return std::snprintf(buf, cap, "%s %s opened: F107 holds the camera away, the view is the game's own", tag(), className(cls));
 }
 inline int formatForgotten(char* buf, size_t cap, int cls, Verdict v, uint64_t vtable, uint64_t expected, uint32_t thisLow) noexcept {
     return std::snprintf(buf, cap, "%s the remembered %s (this 0x%08X) is %s (vtable 0x%llX, the class's 0x%llX): the signal does not hold on it", tag(), className(cls), thisLow, verdictText(v),
@@ -155,9 +199,9 @@ inline int formatForgotten(char* buf, size_t cap, int cls, Verdict v, uint64_t v
 }
 // The once-a-second line while anything is set: the remembered objects' bytes ("none" when none is remembered), the state, the kiosk byte, the signal, and F107's state (text from its owner).
 inline const char* byteText(int b) noexcept { return b < 0 ? "none" : b == 0 ? "0" : "1"; }
-inline int formatSecond(char* buf, size_t cap, int suitByte, int weaponsByte, int kioskByte, const char* state, bool signal, const char* f107) noexcept {
-    return std::snprintf(buf, cap, "%s 1 s: suit +0x79 %s, weapons +0x79 %s, kiosk +0x1F8 %s, SuitUIStateMachine \"%s\", signal %s; F107: %s", tag(), byteText(suitByte), byteText(weaponsByte),
-                         byteText(kioskByte), state && state[0] ? state : "unknown", signal ? "on" : "off", f107);
+inline int formatSecond(char* buf, size_t cap, int suitByte, int weaponsByte, int kioskByte, int liveryByte, int weaponLiveryByte, const char* state, bool signal, const char* f107) noexcept {
+    return std::snprintf(buf, cap, "%s 1 s: suit +0x79 %s, weapons +0x79 %s, kiosk +0x1F8 %s, livery +0x79 %s, weapon livery +0x79 %s, SuitUIStateMachine \"%s\", signal %s; F107: %s", tag(),
+                         byteText(suitByte), byteText(weaponsByte), byteText(kioskByte), byteText(liveryByte), byteText(weaponLiveryByte), state && state[0] ? state : "unknown", signal ? "on" : "off", f107);
 }
 
 // ---- the log's cap ----------------------------------------------------------------------------------------------------------------------------------------------------------

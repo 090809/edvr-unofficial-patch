@@ -12474,6 +12474,9 @@ def _hj_f107_away(rows, ctx):
 
 
 H_SHOP = "shop screens (F209)"
+H_SHOP_BUY_CLASSES = ("SuitVendorInteraction", "WeaponsVendorInteraction")   # the buy screens (the Livery screens and the loadout browser hold the signal too, and are checked by their own opened lines)
+H_PREVROSTER = "preview camera roster (F232)"
+H_PREVEYE = "preview camera eye path (F233)"
 F107_SHOWROOM_MAX_M = 50.0   # F209: a distance-test episode whose first camera stood over F107's 3 m and no farther than this from the neck is the size of a showroom's camera (the suit shop's: 3.6 to 3.7 m)
 
 
@@ -12512,7 +12515,7 @@ def _hj_shop(rows, ctx):
     with native on foot begun and no F107 episode by the shop screen (its left line's test, or calls its ended line says the shop screen held) is NEVER APPLIED (the view did not
     change); a signal that did not hold on its object, events the hooks lost or the cap dropped, a Show that left
     the byte unset, a signal that went on more often than it went off, hooks that all stood down, or a Show with no signal are PARTIAL."""
-    kinds = ("hook", "show", "close", "on", "off", "state", "kstart", "kstop", "forgot", "sec", "capped", "lost")
+    kinds = ("hook", "show", "close", "on", "off", "state", "kstart", "kstop", "forgot", "sec", "capped", "lost", "lvopen")
     if not any(rows.get(k) for k in kinds):
         return None
     hooks, shows, closes = rows.get("hook", []), rows.get("show", []), rows.get("close", [])
@@ -12525,6 +12528,9 @@ def _hj_shop(rows, ctx):
     byclass = collections.Counter(r["cls"] for r in shows)
     if shows or closes:
         parts.append("%d Show / %d Close (%s)" % (len(shows), len(closes), ", ".join("%s %d" % (k, byclass[k]) for k in sorted(byclass)) or "no buy screen"))
+    lvopens = rows.get("lvopen", [])   # F228/F234: the Livery screens and the loadout browser, F107 held away for the whole screen
+    if lvopens:
+        parts.append("%d Livery or loadout screen opening(s) held by the camera-away signal (%s)" % (len(lvopens), ", ".join(sorted({r["cls"] for r in lvopens}))))
     parts.append("the signal on %d, off %d" % (len(ons), len(offs)))
     if states:
         parts.append("%d state change(s), last %s" % (len(states), states[-1]["to"]))
@@ -12549,12 +12555,67 @@ def _hj_shop(rows, ctx):
     unset = [r for r in shows if r["a"] != "1"]
     if unset:
         problems.append("%d Show(s) left the byte +0x79 not set (read %s)" % (len(unset), ", ".join(sorted({r["a"] for r in unset}))))
-    if any(r["a"] == "1" for r in shows) and not ons:
+    if any(r["a"] == "1" and r["cls"] in H_SHOP_BUY_CLASSES for r in shows) and not ons:
         problems.append("a buy screen was shown but the signal never went on")
+    if lvopens and not ons:
+        problems.append("a Livery screen or the loadout browser opened but the signal never went on")
     if len(ons) > len(offs) + 1:
         problems.append("the signal went on %d times and off %d: it may have stuck" % (len(ons), len(offs)))
     if hooks and stood and not armed and not ons:
         problems.append("every shop hook stood down: F107 holds a showroom camera by its distance test alone")
+    if problems:
+        return ("PARTIAL", text + "; " + "; ".join(problems))
+    return ("OK", text)
+
+
+def _hj_prevroster(rows, ctx):
+    """F232: the preview camera's roster check (native_preview_camera_core.h). While one of F209's watched preview screens is open, once a second a line says which check refused the Location child last (per
+    role, HMD or preview) with a snapshot of its roster (the count, mode, registered, stack vtable, members, name and each entry's vtables, back-pointer and byte at entry-4) and how often each reason refused.
+    The summary names the reasons seen and, for the newest line of each role, the roster's count. PARTIAL when a roster could not be read (its count is unreadable)."""
+    refused = rows.get("refused", [])
+    if not refused:
+        return None
+    byrole = collections.defaultdict(list)
+    for r in refused:
+        byrole[r["role"]].append(r)
+    parts = []
+    for role in sorted(byrole):
+        rs = byrole[role]
+        reasons = collections.Counter(r["why"] for r in rs)
+        last = rs[-1]
+        parts.append("%s: %d line(s), refused for %s; newest roster count %s mode %s, %s entr(ies)" % (
+            role, len(rs), ", ".join("%s x%d" % (w, n) for w, n in sorted(reasons.items())), last["count"], last["mode"], len(re.findall(r"; entry \d+:", last["entries"]))))
+    text = "; ".join(parts)
+    unread = [r for r in refused if r["count"] == "unreadable"]
+    if unread:
+        return ("PARTIAL", text + "; %d roster(s) could not be read" % len(unread))
+    return ("OK", text)
+
+
+def _hj_preveye(rows, ctx):
+    """F233: the weapon previews' head producer (HeadlookCamera) and the eye path's instrument (native_preview_camera_core.h): the producer hook (armed or stood down), and once a second while a watched
+    preview screen is open the finalization snapshot (the head class, applied or refused and why, the output, head, preview and base translations and the distances) and the eye stub's (the head it carried,
+    whether EDVR replaced it, the distances to the published head, output, head, preview, base and origin). PARTIAL when the hook stood down (weapon previews are not handled), or finalizations were logged
+    and none was applied."""
+    kinds = ("hook", "final", "eye")
+    if not any(rows.get(k) for k in kinds):
+        return None
+    hooks, finals, eyes = rows.get("hook", []), rows.get("final", []), rows.get("eye", [])
+    parts = []
+    stood = [r for r in hooks if r["st"] == "stood down"]
+    if hooks:
+        parts.append("Headlook producer hook %s" % ("stood down" if stood else "armed"))
+    if finals:
+        by = collections.Counter("%s %s" % (r["cls"], "applied" if r["res"] == "applied" else "refused (%s)" % r["why"]) for r in finals)
+        parts.append("%d final line(s): %s" % (len(finals), ", ".join("%s x%d" % (k, n) for k, n in sorted(by.items()))))
+    if eyes:
+        parts.append("%d eye line(s), %d replaced" % (len(eyes), len([r for r in eyes if r["rep"] == "replaced"])))
+    text = "; ".join(parts)
+    problems = []
+    if stood:
+        problems.append("the Headlook producer hook stood down: weapon previews are not handled")
+    if finals and not [r for r in finals if r["res"] == "applied"]:
+        problems.append("every finalization snapshot was refused")
     if problems:
         return ("PARTIAL", text + "; " + "; ".join(problems))
     return ("OK", text)
@@ -17813,19 +17874,32 @@ HEALTH_RULES = (
     ), _hj_f107_away),
     _hrule(H_SHOP, ("F209",), ("(F209)",), (
         ("hook", r"avatar hooks: (?P<hook>shop-[a-z-]+) hook (?P<st>armed|stood down)"),
-        ("on", r"shop screens \(F209\): the shop signal is ON: F107 holds the camera away \(suit (?P<suit>\w+), weapons (?P<weap>\w+), kiosk (?P<kiosk>[\w ]+?); change (?P<n>\d+)\)"),
-        ("off", r"shop screens \(F209\): the shop signal is OFF \(suit (?P<suit>\w+), weapons (?P<weap>\w+), kiosk (?P<kiosk>[\w ]+?); change (?P<n>\d+)\)"),
+        ("on", r"shop screens \(F209\): the shop signal is ON: F107 holds the camera away \(suit (?P<suit>\w+), weapons (?P<weap>\w+), kiosk (?P<kiosk>[\w ]+?), livery (?P<liv>[\w ]+?); change (?P<n>\d+)\)"),
+        ("off", r"shop screens \(F209\): the shop signal is OFF \(suit (?P<suit>\w+), weapons (?P<weap>\w+), kiosk (?P<kiosk>[\w ]+?), livery (?P<liv>[\w ]+?); change (?P<n>\d+)\)"),
+        ("lvopen", r"shop screens \(F209\): (?P<cls>Humanoid(?:\w*LiveryActivity|OutfittingInteraction)) opened: F107 holds the camera away, the view is the game's own$"),
         ("show", r"shop screens \(F209\): (?P<cls>\w+) Show: \+0x79 (?P<b>-?\d+) -> (?P<a>-?\d+) \(this 0x(?P<this>[0-9A-F]+), thread (?P<tid>\d+)\)"),
         ("close", r"shop screens \(F209\): (?P<cls>\w+) Close: \+0x79 (?P<b>-?\d+) -> (?P<a>-?\d+) \(this 0x(?P<this>[0-9A-F]+), thread (?P<tid>\d+)\)"),
         ("state", r"shop screens \(F209\): SuitUIStateMachine: \"(?P<from>[^\"]*)\" -> \"(?P<to>[^\"]*)\" \(thread (?P<tid>\d+)\)"),
         ("kstart", r"shop screens \(F209\): ArmouryVendorActivity started: \+0x1F8 (?P<b>-?\d+) -> (?P<a>-?\d+) \(this 0x(?P<this>[0-9A-F]+), thread (?P<tid>\d+)\)"),
         ("kstop", r"shop screens \(F209\): ArmouryVendorActivity stopped: \+0x1F8 (?P<b>-?\d+) -> (?P<a>-?\d+) \(this 0x(?P<this>[0-9A-F]+), thread (?P<tid>\d+)\)"),
         ("forgot", r"shop screens \(F209\): the remembered (?P<cls>\w+) \(this 0x(?P<this>[0-9A-F]+)\) is (?P<why>forgotten: .*?) \(vtable 0x(?P<vt>[0-9A-F]+), the class's 0x(?P<want>[0-9A-F]+)\)"),
-        ("sec", r"shop screens \(F209\): 1 s: suit \+0x79 (?P<suit>\w+), weapons \+0x79 (?P<weap>\w+), kiosk \+0x1F8 (?P<kiosk>\w+), SuitUIStateMachine \"(?P<state>[^\"]*)\", "
+        ("sec", r"shop screens \(F209\): 1 s: suit \+0x79 (?P<suit>\w+), weapons \+0x79 (?P<weap>\w+), kiosk \+0x1F8 (?P<kiosk>\w+), livery \+0x79 (?P<liv>\w+), weapon livery \+0x79 (?P<wliv>\w+), SuitUIStateMachine \"(?P<state>[^\"]*)\", "
                 "signal (?P<sig>on|off); F107: (?P<f107>.*)$"),
         ("capped", r"shop screens \(F209\): (?P<n>\d+) event lines in the last 10 s were not written"),
         ("lost", r"shop screens \(F209\): (?P<n>\d+) shop event\(s\) were not recorded"),
     ), _hj_shop),
+    _hrule(H_PREVROSTER, ("F232",), ("(F232",), (
+        ("refused", r"native preview camera \(F232\): role (?P<role>HMD|preview) refused: (?P<why>[^;]+); roster: child 0x(?P<child>[0-9A-F]+), count (?P<count>\w+), "
+                    r"mode (?P<mode>\w+), registered (?P<reg>\w+), stack vtable (?P<stack>\S+), members (?P<members>\w+), name \"(?P<name>[^\"]*)\"(?P<entries>(?:; entry \d+: .*?)*)"
+                    r"; refusals by reason:(?P<counts>.*)$"),
+    ), _hj_prevroster),
+    _hrule(H_PREVEYE, ("F233",), ("(F233",), (
+        ("hook", r"native preview camera \(F233\): HeadlookCamera producer hook (?P<st>armed|stood down).*"),
+        ("final", r"native preview camera \(F233\): final child 0x(?P<child>[0-9A-F]+) head class (?P<cls>HMD|Headlook): (?P<res>applied|refused \((?P<why>[^)]*)\)); output (?P<out>.*?), head primary .*"
+                  r"output to head (?P<oh>\S+) m, output to preview (?P<op>\S+) m(?P<extra>.*)$"),
+        ("eye", r"native preview camera \(F233\): eye head (?P<head>.*?), (?P<rep>replaced|not replaced); published eye head .*distance to published (?P<dp>\S+) m, to output (?P<do>\S+) m, "
+                r"to head primary (?P<dh>\S+) m, to preview primary (?P<dpr>\S+) m, to base (?P<db>\S+) m, to origin (?P<dor>\S+) m$"),
+    ), _hj_preveye),
     _hrule(H_F212, ("F212",), ("(F212)",), (
         ("hook", r"avatar hooks: (?P<hook>conversation-look) hook (?P<st>armed|stood down)(?:: (?P<why>.*?)(?:\. the conversation look \(F212\) is not held.*)?)?$"),
         ("began", r"conversation look \(F212\): run (?P<n>\d+) began: .*\|yaw\| (?P<yaw>[\d.]+) and \|pitch\| (?P<pitch>[\d.]+) asked in its first frames"),
@@ -19725,6 +19799,8 @@ def self_test_health():
         f205src = read_text(os.path.join(repo_root(), "src", "d3d11", "native_on_foot_f205.h"))   # F205: the ADS view circle's press, runtime and override lines
         c1src = read_text(c1_path)
         shopsrc = read_text(os.path.join(repo_root(), "src", "d3d11", "shop_screen_core.h"))   # F209: the buy screens' event, signal and one-second lines
+        rostersrc = read_text(os.path.join(repo_root(), "src", "d3d11", "native_preview_camera_core.h"))   # F232: the refused roster's line
+        camsrc = read_text(os.path.join(repo_root(), "src", "d3d11", "native_preview_camera.cpp"))   # F233: the Headlook hook's arming lines
         f212src = read_text(os.path.join(repo_root(), "src", "d3d11", "native_on_foot_f212.h"))   # F212: the conversation look's run and summary lines
         probesrc = read_text(probe_path)
     except OSError as e:
@@ -20144,6 +20220,24 @@ def self_test_health():
             fmts[key] = health_c_format(shopsrc, needle)
         if fmts[key] is None:
             raise AssertionError("shop_screen_core.h has no format holding %r: the --health rule that reads it is out of date" % needle)
+        return health_render(fmts[key], vals)
+
+    def RC(needle, *vals):
+        """F233's Headlook hook lines (native_preview_camera.cpp installHeadlook), from their own format literals."""
+        key = "cam:" + needle
+        if key not in fmts:
+            fmts[key] = health_c_format(camsrc, needle)
+        if fmts[key] is None:
+            raise AssertionError("native_preview_camera.cpp has no format holding %r: the --health rule that reads it is out of date" % needle)
+        return health_render(fmts[key], vals)
+
+    def RN(needle, *vals):
+        """F232's refused-roster line pieces (formatRefusal in native_preview_camera_core.h), from their own format literals."""
+        key = "roster:" + needle
+        if key not in fmts:
+            fmts[key] = health_c_format(rostersrc, needle)
+        if fmts[key] is None:
+            raise AssertionError("native_preview_camera_core.h has no format holding %r: the --health rule that reads it is out of date" % needle)
         return health_render(fmts[key], vals)
 
     def R212(needle, *vals):
@@ -22424,12 +22518,19 @@ def self_test_health():
         CLOSE209 = RS(": +0x79 %d -> %d (this", TAG209, "SuitVendorInteraction", "Close", 1, 0, 0x1A2B3C4D, 7)
         WSHOW209 = RS(": +0x79 %d -> %d (this", TAG209, "WeaponsVendorInteraction", "Show", 0, 1, 0x2B3C4D5E, 7)
         BADSHOW209 = RS(": +0x79 %d -> %d (this", TAG209, "SuitVendorInteraction", "Show", 0, 0, 0x1A2B3C4D, 7)
-        ON209 = RS("the shop signal is %s (suit", TAG209, "ON: F107 holds the camera away", "open", "closed", "not running", 1)
-        OFF209 = RS("the shop signal is %s (suit", TAG209, "OFF", "closed", "closed", "not running", 2)
+        ON209 = RS("the shop signal is %s (suit", TAG209, "ON: F107 holds the camera away", "open", "closed", "not running", "closed", 1)
+        OFF209 = RS("the shop signal is %s (suit", TAG209, "OFF", "closed", "closed", "not running", "closed", 2)
+        LSHOW209 = RS(": +0x79 %d -> %d (this", TAG209, "HumanoidLiveryActivity", "Show", 0, 1, 0x4D5E6F70, 7)
+        LCLOSE209 = RS(": +0x79 %d -> %d (this", TAG209, "HumanoidLiveryActivity", "Close", 1, 0, 0x4D5E6F70, 7)
+        WLSHOW209 = RS(": +0x79 %d -> %d (this", TAG209, "HumanoidWeaponLiveryActivity", "Show", 0, 1, 0x5E6F7081, 7)
+        LON209 = RS("the shop signal is %s (suit", TAG209, "ON: F107 holds the camera away", "closed", "closed", "not running", "suit open", 1)
+        LOFF209 = RS("the shop signal is %s (suit", TAG209, "OFF", "closed", "closed", "not running", "closed", 2)
+        LOPEN_HELD209 = RS("opened: F107 holds the camera away, the view is the game's own", TAG209, "HumanoidLiveryActivity")
         STATE209 = RS('SuitUIStateMachine: \\"%s\\" -> \\"%s\\"', TAG209, "OnFoot", "Suit Vendor", 7)
         KSTART209 = RS(": +0x1F8 %d -> %d (this", TAG209, "ArmouryVendorActivity", "started", 0, 1, 0x3C4D5E6F, 7)
         KSTOP209 = RS(": +0x1F8 %d -> %d (this", TAG209, "ArmouryVendorActivity", "stopped", 1, 0, 0x3C4D5E6F, 7)
-        SEC209 = RS("1 s: suit +0x79 %s", TAG209, "1", "none", "none", "Suit Vendor", "on", "away (episode 1, 90 calls refused, 90 with a buy screen open)")
+        SEC209 = RS("1 s: suit +0x79 %s", TAG209, "1", "none", "none", "none", "none", "Suit Vendor", "on", "away (episode 1, 90 calls refused, 90 with a buy screen open)")
+        LSEC209 = RS("1 s: suit +0x79 %s", TAG209, "none", "none", "none", "1", "none", "", "on", "away (episode 1, 90 calls refused, 90 with a buy screen open)")
         FORGOT209 = RS("is %s (vtable 0x%llX", TAG209, "SuitVendorInteraction", 0x1A2B3C4D, "forgotten: its vtable is no longer the class's", 0x7FF600001234, 0x7FF600005D20)
         LOST209 = RH("shop event(s) were not recorded", TAG209, 3)
         CAPPED209 = RH("event lines in the last 10 s were not written", TAG209, 12, 40)
@@ -22466,7 +22567,52 @@ def self_test_health():
               has=["1 Show(s) left the byte +0x79 not set (read 0)"], lacks=["UNPARSED"])
         check("F209: a signal that went on more often than it went off may have stuck", [neck(), SHOW209, ON209, AWAY_LEFT_SHOP, OFF209, ON209, ON209, AWAY_END_SHOP, neck()], 0, [("PARTIAL", S209)],
               has=["the signal went on 3 times and off 1: it may have stuck"], lacks=["UNPARSED"])
+        check("F228: a suit Livery screen opened and closed, F107 held the camera away by the shop screen, and the lines are counted by class",
+              [neck(), LSHOW209, LOPEN_HELD209, LON209, AWAY_LEFT_SHOP, LSEC209, LSEC209, LCLOSE209, LOFF209, AWAY_END_SHOP, neck()], 0, [("OK", S209), ("OK", F107)],
+              has=["1 Show / 1 Close (HumanoidLiveryActivity 1)", "1 Livery or loadout screen opening(s) held by the camera-away signal (HumanoidLiveryActivity)", "2 one-second line(s)"], lacks=["UNPARSED"])
+        check("F228: a Livery screen opened and the signal never went on is PARTIAL",
+              [neck(), LSHOW209, LOPEN_HELD209, LCLOSE209, neck()], 0, [("PARTIAL", S209)], has=["a Livery screen or the loadout browser opened but the signal never went on"])
+        check("F228: the Livery signal went on and F107 logged no episode by the shop screen: the view did not change",
+              [neck(), BEGAN209, LSHOW209, LOPEN_HELD209, LON209, AWAY_LEFT_3M7, AWAY_END_3M7, LCLOSE209, LOFF209, neck()], 3, [("NEVER APPLIED", S209)])
         check("F209: a line that drifted from its pattern is unparsed", [neck(), "shop screens (F209): the buy screen is somewhere else"], 4, [("UNPARSED", S209)])
+
+        # ---- the loadout browser joins the hold (F234) ----
+        OSHOW234 = RS(": +0x79 %d -> %d (this", TAG209, "HumanoidOutfittingInteraction", "Show", 0, 1, 0x6F708192, 7)
+        OCLOSE234 = RS(": +0x79 %d -> %d (this", TAG209, "HumanoidOutfittingInteraction", "Close", 1, 0, 0x6F708192, 7)
+        OON234 = RS("the shop signal is %s (suit", TAG209, "ON: F107 holds the camera away", "closed", "closed", "not running", "loadout open", 1)
+        OOFF234 = RS("the shop signal is %s (suit", TAG209, "OFF", "closed", "closed", "not running", "closed", 2)
+        OOPEN_HELD234 = RS("opened: F107 holds the camera away, the view is the game's own", TAG209, "HumanoidOutfittingInteraction")
+        check("F234: the loadout browser opened and closed, F107 held the camera away by the shop screen", [neck(), OSHOW234, OOPEN_HELD234, OON234, AWAY_LEFT_SHOP, OCLOSE234, OOFF234, AWAY_END_SHOP, neck()], 0,
+              [("OK", S209), ("OK", F107)], has=["1 Livery or loadout screen opening(s) held by the camera-away signal (HumanoidOutfittingInteraction)", "HumanoidOutfittingInteraction 1"], lacks=["UNPARSED"])
+        check("F234: the loadout browser opened and the signal never went on is PARTIAL", [neck(), OSHOW234, OOPEN_HELD234, OCLOSE234, neck()], 0, [("PARTIAL", S209)],
+              has=["a Livery screen or the loadout browser opened but the signal never went on"])
+
+        # ---- the preview camera's roster (F232): the refused roster's line ----
+        TAG232 = "native preview camera (F232):"
+        HEAD232 = RN("role %s refused: %s; roster:", TAG232, "preview", "foreign entry", 0x1234ABCD, "2", "0", "1", "+0x8180", "1", "Location")
+        HEAD232U = RN("role %s refused: %s; roster:", TAG232, "HMD", "child vtable", 0x0, "unreadable", "unreadable", "unreadable", "unreadable", "unreadable", "unreadable")
+        ENT232 = [RN("; entry %u: ptr 0x%llX iface %s obj-0x20 %s obj-0x60 %s back %s b-4 %s", i, 0x1000 * (i + 1), "+0x8200", "+0x8280", "0x0", "yes", "01") for i in range(2)]
+        TAIL232 = RN("; refusals by reason:") + RN(" %s %llu,", "foreign entry", 2)
+        REFUSED232 = HEAD232 + "".join(ENT232) + TAIL232
+        REFUSED232U = HEAD232U + RN("; refusals by reason:") + " none"
+        check("F232: a refused roster is OK and names the reason and the roster's size", [neck(), REFUSED232], 0, [("OK", H_PREVROSTER)],
+              has=["preview: 1 line(s), refused for foreign entry x1; newest roster count 2 mode 0, 2 entr(ies)"], lacks=["UNPARSED"])
+        check("F232: a roster that could not be read is PARTIAL", [neck(), REFUSED232U], 0, [("PARTIAL", H_PREVROSTER)], has=["1 roster(s) could not be read"])
+        check("F232: a line that drifted from its pattern is unparsed", [neck(), "native preview camera (F232): the roster is somewhere else"], 4, [("UNPARSED", H_PREVROSTER)])
+
+        # ---- the weapon previews' head producer and the eye path (F233) ----
+        TAG233 = "native preview camera (F233):"
+        HOOK_UP233 = RC("HeadlookCamera producer hook armed at +0x%X (pin %u bytes)", 0x1074650, 15)
+        HOOK_DOWN233 = RC("HeadlookCamera producer hook stood down: entry pin +0x%X failed on %s;", 0x1074650, "build 334925")
+        FINAL_HMD233 = RN("final child 0x%llX head class %s: %s%s%s%s; output %s", TAG233, 0x4D5E6F70, "HMD", "applied", "", "", "", "(1.000, 2.000, 3.000)", "(1.000, 2.000, 3.000)", "(1.000, 2.000, 3.000)", "(0.000, 0.000, 0.000)", "0.000", "0.000")
+        FINAL_HL233 = RN("final child 0x%llX head class %s: %s%s%s%s; output %s", TAG233, 0x4D5E6F70, "Headlook", "refused", " (", "the output is neither the head's nor the preview's pose", ")", "(1.000, 2.000, 3.000)", "(0.000, 0.000, 0.000)", "(1.000, 2.000, 3.000)", "(0.000, 0.000, 0.000)", "3.742", "0.000") + \
+            RN("; headlook R rows (%.3f, %.3f, %.3f)", 1.0, 0.0, 0.0)
+        EYE233 = RN("eye head %s, %s; published eye head %s, HMD primary %s; distance to published", TAG233, "(3.000, 4.000, 0.000)", "replaced", "(100.000, 200.000, 300.000)", "(1.000, 2.000, 3.000)", "371.248", "5.000", "5.000", "5.000", "5.000", "5.000")
+        check("F233: the hook armed, an applied HMD frame, a refused Headlook frame and an eye line are summarised", [neck(), HOOK_UP233, FINAL_HMD233, FINAL_HL233, EYE233], 0, [("OK", H_PREVEYE)],
+              has=["Headlook producer hook armed", "2 final line(s): HMD applied x1, Headlook refused (the output is neither the head's nor the preview's pose) x1", "1 eye line(s), 1 replaced"], lacks=["UNPARSED"])
+        check("F233: the hook stood down is PARTIAL", [neck(), HOOK_DOWN233], 0, [("PARTIAL", H_PREVEYE)], has=["Headlook producer hook stood down", "weapon previews are not handled"])
+        check("F233: finalization snapshots that were all refused are PARTIAL", [neck(), HOOK_UP233, FINAL_HL233], 0, [("PARTIAL", H_PREVEYE)], has=["every finalization snapshot was refused"])
+        check("F233: a line that drifted from its pattern is unparsed", [neck(), "native preview camera (F233): final somewhere else"], 4, [("UNPARSED", H_PREVEYE)])
 
         # ---- the conversation look (F212): the leaf that sets the look springs' targets is held at 0 while native on foot is active ----
         S212 = "conversation look (F212)"
