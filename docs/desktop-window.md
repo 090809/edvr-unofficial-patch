@@ -25,10 +25,10 @@
   A live change of style or shape is not a fight.
 - **Round 7, the vertical shift:** moves the crop up (+) or down (-) by a share of its travel (0
   none, +-100 the edges; "up" is `bounds[1]`'s side), both eyes alike; logs `vertical shift N`.
-- **Round 9 (2026-11-09, NOT FLOWN):** while Elite is in a cinema render mode (5, 6: on foot with
-  `fix.native_on_foot` off) the window is the game's own shape, because Elite sizes that screen's
-  HUD by it (the eye's shape shrank it to 0.583); the flight must show `hud part` lines with
-  `hrc=(1.000,` after the cinema setter line. Journal: "Round 9" in Flight history.
+- **Round 9 (2026-11-09, FLOWN OK on Steam, ON MAIN):** while Elite is in a cinema render mode
+  (5, 6: on foot with `fix.native_on_foot` off) the window is the game's own shape, because Elite
+  sizes that screen's HUD by it (the eye's shape shrank it to 0.583; held, the `hud part` lines
+  read `hrc=(1.000,`). Journal: "Round 9" in Flight history.
 - **Round 8, the crop rule** (`desktop_window_crop`; menu "Same as the game's mirror" |
   "Centre"): how a chosen shape is cut; `full` is never cropped or zoomed. `center`: the shape
   around the middle of the eye's bounds sub-rect, no zoom. `native` is what Elite's own mirror
@@ -247,6 +247,11 @@
   - Not known: whether Elite re-lays out the cinema HUD when the window changes mid-stretch; the
     restore lands within a frame or two of the mode change and the layout came about 1.7 s after
     it in this flight, so the fix does not depend on it.
+  - **Flown OK (2026-11-09, Steam, `edvr_gfx_20261109_163947.log`, a0ac939b; Sean: "That fixed
+    it").** `fix.native_on_foot` off. The hold line at 16:41:27.134 (render mode 5, `restored to
+    0,0 3840x2160`), the swap chain 3840x2160 at 16:41:27.739, then the HUD laid out at
+    16:41:28.890 with `hrc=(1.000,0.027,0.060)` (Vitals at x 73, not 461). The flat screen ended
+    at 16:41:52.204 (mode 3) and reshape request 3 put the window back at 888,0 2063x2088.
 
 ## Decisions the briefs left open
 
