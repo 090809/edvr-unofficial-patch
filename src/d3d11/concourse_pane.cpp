@@ -18,6 +18,7 @@
 #include "../common/runtime_profile.h"
 #include "binding_shadow.h"
 #include "concourse_cull_core.h"
+#include "concourse_glass_layout.h"
 #include "concourse_vr_bake_core.h"   // TEMPORARY (the VR bake): the capture shader's inverse and its limits
 #include "depth_probe.h"              // TEMPORARY (the VR bake): each eye's scene depth, and a draw's eye by its depth view
 #include "exposure_fix.h"
@@ -92,6 +93,18 @@ constexpr uint32_t kFlagSampler = 1u << 9;      // mirror-backdrop: the sampler 
 std::atomic<uint32_t> g_mode{kModeSteady};
 cc::PaneTriple g_list[cc::kPaneListCap] = {{cc::kPaneFamilyVs, cc::kPaneFamilyPs, 0}};   // entry 0 is the built-in glass family; diag.concourse_panes adds
 std::atomic<uint32_t> g_listN{1};
+// The glass's other pixel shaders: the game builds one per Material Quality level (and for Spot Shadows below High), all with the glass's layout
+// (concourse_glass_layout.h). Learned as each is created, from any thread, so it is static storage and survives the diag key's reload of g_list.
+constexpr uint32_t kLearnedCap = 32;
+std::atomic<uint64_t> g_learnedPs[kLearnedCap];
+std::atomic<uint32_t> g_learnedN{0};
+std::atomic<bool> g_learnedFullSaid{false};
+bool learnedPs(uint64_t ps) noexcept {
+    const uint32_t n = std::min<uint32_t>(g_learnedN.load(std::memory_order_acquire), kLearnedCap);
+    for (uint32_t i = 0; i < n; ++i)
+        if (g_learnedPs[i].load(std::memory_order_relaxed) == ps) return true;
+    return false;
+}
 std::atomic<bool> g_feedMeasure{false}, g_feedTreat{false}, g_feedWithhold{false}, g_feedSealed{false}, g_feedEffects{false};
 std::atomic<bool> g_withholdSealedNow{false};   // the hangar is sealed: only the families marked sealedToo are not issued
 std::atomic<float> g_bayOpacity{1.0f};
@@ -2332,7 +2345,7 @@ bool glassCensus(ID3D11DeviceContext* ctx, bool followed) noexcept {
         gcAdd(g_gc.drawsOther);
     }
     const bool fv = vs == cc::kPaneFamilyVs;
-    const bool fp = ps == cc::kPaneFamilyPs;
+    const bool fp = ps == cc::kPaneFamilyPs || learnedPs(ps);   // the family's pixel shader, or one learned from its layout
     if (fv && fp) {
         gcAdd(followed ? g_gc.pairImm : g_gc.pairOther);
     } else if (fv) {
@@ -2384,12 +2397,12 @@ void glassCensusReport(uint64_t nowMs) noexcept {
         g_gcPsOver = 0;
     }
     if (imm == 0 && other == 0) return;   // the scope was not armed in this window
-    Log::get().note("concourse glass census 5s (TEMPORARY, H63): draws immediate %u, other contexts %u; the glass pair (vs %016llX ps %016llX) immediate %u, other %u; "
-                    "its vertex shader with another pixel shader immediate %u, other %u [%s]; its pixel shader with another vertex shader immediate %u, other %u; "
+    Log::get().note("concourse glass census 5s (TEMPORARY, H63): draws immediate %u, other contexts %u; the glass pair (vs %016llX, a pixel shader of the glass's layout) immediate %u, other %u; "
+                    "its vertex shader with another pixel shader immediate %u, other %u [%s]; a pixel shader of the glass's layout with another vertex shader immediate %u, other %u; "
                     "the pair turned away: people %u, light test %u, withheld family %u, sealed %u, far glow %u, no ps %u, not listed %u, vs or index count %u; matched as a pane %u; "
                     "the shadow against the context (1 immediate draw in 64, %u sampled): ps the glass's in the context only %u, in the shadow only %u; vs likewise %u, %u; "
                     "state: treat %d, shares %d, effects %d, withhold %d, mode %s, list %u",
-                    imm, other, static_cast<unsigned long long>(cc::kPaneFamilyVs), static_cast<unsigned long long>(cc::kPaneFamilyPs), pairImm, pairOther, vsOnlyImm, vsOnlyOther,
+                    imm, other, static_cast<unsigned long long>(cc::kPaneFamilyVs), pairImm, pairOther, vsOnlyImm, vsOnlyOther,
                     tops, psOnlyImm, psOnlyOther, ex[kGxPeople], ex[kGxLightTest], ex[kGxWithheld], ex[kGxSealed], ex[kGxFarGlow], ex[kGxNoPs], ex[kGxNotListed], ex[kGxTriple],
                     ex[kGxMatched], sampled, psCns, psSnc, vsCns, vsSnc, g_treatNow.load(std::memory_order_relaxed) ? 1 : 0, g_shareOn.load(std::memory_order_relaxed) ? 1 : 0,
                     g_effectsNow.load(std::memory_order_relaxed) ? 1 : 0, g_withholdNow.load(std::memory_order_relaxed) ? 1 : 0, modeText(g_mode.load(std::memory_order_relaxed)),
@@ -2500,12 +2513,14 @@ void ConcoursePaneScope::beginBody(ID3D11DeviceContext* ctx, UINT indexCount, UI
             listed = true;
             break;
         }
-    if (!listed) {   // the pixel shader first: the vertex shader's hash is read only for a draw that could be a pane
+    const bool learned = !listed && learnedPs(ps);   // a pixel shader of the glass's layout, learned at creation: the built-in family's, with any index count
+    if (!listed && !learned) {   // the pixel shader first: the vertex shader's hash is read only for a draw that could be a pane
         if (gp) gcAdd(g_gc.exits[kGxNotListed]);
         return;
     }
     const uint64_t vs = vertexShaderHash(ctx);
-    if (cc::paneTripleIndex(g_list, listN, vs, ps, indexCount) < 0) {
+    const bool learnedGlass = learned && vs == cc::kPaneFamilyVs;
+    if (!learnedGlass && cc::paneTripleIndex(g_list, listN, vs, ps, indexCount) < 0) {
         if (gp) gcAdd(g_gc.exits[kGxTriple]);
         return;
     }
@@ -3390,6 +3405,21 @@ ConcoursePaneMirrorStats concoursePaneTakeMirrorStats() noexcept {
 }
 uint32_t concoursePaneClearingN() noexcept { return g_clearN.load(std::memory_order_relaxed); }
 const char* concoursePaneModeName() noexcept { return modeText(g_mode.load(std::memory_order_relaxed)); }
+void concoursePaneNoteShader(uint64_t hash, const void* bytecode, size_t len) noexcept {
+    if (!cc::glassLayoutPs(bytecode, len)) return;
+    static std::mutex writers;   // creation is rare and the draw path never takes this
+    std::lock_guard<std::mutex> lock(writers);
+    if (learnedPs(hash)) return;
+    const uint32_t n = g_learnedN.load(std::memory_order_relaxed);
+    if (n >= kLearnedCap) {
+        if (!g_learnedFullSaid.exchange(true, std::memory_order_relaxed))
+            Log::get().note("concourse pane: the learned glass shader set is full (%u); ps %016llX is not added", kLearnedCap, static_cast<unsigned long long>(hash));
+        return;
+    }
+    g_learnedPs[n].store(hash, std::memory_order_relaxed);
+    g_learnedN.store(n + 1, std::memory_order_release);
+    Log::get().note("concourse pane: a new pixel shader has the glass's layout: ps %016llX joins the glass family (%u known)", static_cast<unsigned long long>(hash), n + 1);
+}
 uint32_t concoursePaneSlotCount() noexcept { return g_listN.load(std::memory_order_relaxed); }
 bool concoursePaneTreating() noexcept { return g_treatNow.load(std::memory_order_relaxed); }
 

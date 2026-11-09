@@ -3,6 +3,7 @@
 // shell, a hangar change, launch), the pad-local frame's round trip and the release's threshold, the parse of the per-size floors, the own-ship
 // prefix and sphere, the bay's volume, and the unreadable rule. No DLL and no game.
 #include "../../src/d3d11/optimized_station_core.h"
+#include "../../src/d3d11/concourse_glass_layout.h"   // the glass pixel shader recognised by its layout (pure; the container checksum needs DxilHash.cpp)
 #include "../../src/d3d11/concourse_cull_core.h"   // the concourse cull: allow-list, gate, judge, rig verdict, pane triples (pure)
 #include "../../src/d3d11/concourse_vr_bake_core.h"   // the concourse cull's VR bake: the aim, the conversions, the pitch, the face test (pure)
 #include "../../src/d3d11/avatar_hooks_core.h"
@@ -29,6 +30,7 @@
 #include <cstddef>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <string>
 #include <vector>
 
@@ -439,9 +441,122 @@ void testVrBake() {
     }
 }
 
+// ---- The glass pixel shader's layout (concourse_glass_layout.h): synthetic programs, no game bytecode ----------------------------------------------
+namespace glt {
+struct Spec {
+    std::vector<std::pair<uint32_t, uint32_t>> cbs = {{1, 327}, {2, 3}};              // slot, size
+    std::vector<std::pair<uint32_t, uint32_t>> inputs = {{0, 0x1}, {1, 0x7}, {2, 0x7}, {3, 0x7}, {4, 0x3}};   // register, mask
+    std::vector<std::pair<uint32_t, uint32_t>> outputs = {{0, 0xF}};                  // register, mask
+    uint32_t outputType = 2;
+    bool sgvInput = false;
+    bool sgvOutput = false;
+    uint32_t programType = 0x50;
+    bool customData = false;
+};
+void tok(std::vector<uint32_t>& t, uint32_t opcode, std::initializer_list<uint32_t> body) {
+    t.push_back(opcode | (static_cast<uint32_t>(body.size() + 1) << 24));
+    t.insert(t.end(), body.begin(), body.end());
+}
+std::vector<unsigned char> build(const Spec& sp) {
+    std::vector<uint32_t> t = {sp.programType, 0};
+    if (sp.customData) {   // an immediate constant buffer: opcode 53, class 3, then the length word, then four values
+        t.push_back(53u | (3u << 11));
+        t.push_back(6);
+        for (int i = 0; i < 4; ++i) t.push_back(0);
+    }
+    for (const auto& cb : sp.cbs) tok(t, 89, {0x00208882u, cb.first, cb.second});
+    for (const auto& in : sp.inputs) tok(t, 98 | (2u << 11), {0x00101002u | (in.second << 4), in.first});
+    if (sp.sgvInput) tok(t, 99, {0x00101002u | (1u << 4), 7, 1});   // dcl_input_ps_sgv, ignored
+    for (const auto& out : sp.outputs) tok(t, 101, {(sp.outputType << 12) | 0x00100002u | (out.second << 4), out.first});
+    if (sp.sgvOutput) tok(t, 102, {0x00102002u | (1u << 4), 0, 1});
+    tok(t, 104, {1});   // dcl_temps 1
+    t.push_back(62u | (1u << 24));   // ret
+    t[1] = static_cast<uint32_t>(t.size());
+    edvr::dxbc_container::Chunk c;
+    c.tag = 0x58454853u;
+    c.bytes.resize(t.size() * 4);
+    std::memcpy(c.bytes.data(), t.data(), c.bytes.size());
+    auto out = edvr::dxbc_container::makeContainer({c});
+    return std::vector<unsigned char>(out.begin(), out.end());
+}
+bool ok(const Spec& sp) {
+    const auto b = build(sp);
+    return edvr::concourse::glassLayoutPs(b.data(), b.size());
+}
+void testAll() {
+    using edvr::concourse::glassLayoutPs;
+    Spec base;
+    check(ok(base), "glass layout: the exact layout passes");
+    { Spec s = base; s.customData = true; check(ok(s), "glass layout: custom data among the declarations is skipped"); }
+    { Spec s = base; s.sgvInput = true; check(ok(s), "glass layout: a dcl_input_ps_sgv is not counted"); }
+    { Spec s = base; s.cbs[0].second = 100; check(ok(s), "glass layout: constant buffer 1 of another size passes"); }
+    { Spec s = base; s.cbs[1].second = 2; check(!ok(s), "glass layout: constant buffer 2 of size 2 (the logo) fails"); }
+    { Spec s = base; s.cbs.push_back({0, 4}); check(!ok(s), "glass layout: a third constant buffer fails"); }
+    { Spec s = base; s.cbs.pop_back(); check(!ok(s), "glass layout: a missing constant buffer 2 fails"); }
+    { Spec s = base; s.cbs[0].first = 0; check(!ok(s), "glass layout: constant buffer 0 in place of 1 fails"); }
+    { Spec s = base; s.inputs[2].second = 0xF; check(!ok(s), "glass layout: v2.xyzw fails"); }
+    { Spec s = base; s.inputs.push_back({5, 0x3}); check(!ok(s), "glass layout: a sixth input fails"); }
+    { Spec s = base; s.inputs.pop_back(); check(!ok(s), "glass layout: a missing input fails"); }
+    { Spec s = base; s.inputs[4].second = 0x7; check(!ok(s), "glass layout: v4.xyz fails"); }
+    { Spec s = base; s.outputs.push_back({1, 0xF}); check(!ok(s), "glass layout: a second output fails"); }
+    { Spec s = base; s.outputs[0] = {1, 0xF}; check(!ok(s), "glass layout: o1 in place of o0 fails"); }
+    { Spec s = base; s.outputs[0].second = 0x7; check(!ok(s), "glass layout: o0.xyz fails"); }
+    { Spec s = base; s.outputType = 12; s.outputs[0].second = 0x1; check(!ok(s), "glass layout: an oDepth output fails"); }
+    { Spec s = base; s.sgvOutput = true; check(!ok(s), "glass layout: a dcl_output_sgv fails"); }
+    { Spec s = base; s.programType = 0x00010050u; check(!ok(s), "glass layout: a vs_5_0 program fails"); }
+    const auto good = build(base);
+    check(!glassLayoutPs(nullptr, 0), "glass layout: no bytes fail");
+    check(!glassLayoutPs(good.data(), 0), "glass layout: an empty buffer fails");
+    check(!glassLayoutPs(good.data(), 7), "glass layout: seven bytes fail");
+    bool anyTruncatedPassed = false;
+    for (size_t n = 1; n < good.size(); ++n)
+        if (glassLayoutPs(good.data(), n)) anyTruncatedPassed = true;
+    check(!anyTruncatedPassed, "glass layout: every truncation of a good container fails");
+    std::vector<unsigned char> junk(256);
+    for (size_t i = 0; i < junk.size(); ++i) junk[i] = static_cast<unsigned char>(i * 37 + 11);
+    check(!glassLayoutPs(junk.data(), junk.size()), "glass layout: garbage bytes fail");
+    std::vector<unsigned char> sized = good;
+    const uint32_t wrongSize = static_cast<uint32_t>(sized.size() + 4);
+    std::memcpy(sized.data() + 24, &wrongSize, 4);
+    check(!glassLayoutPs(sized.data(), sized.size()), "glass layout: a container whose size field is not its length fails");
+    std::vector<unsigned char> digest = good;
+    digest[4] ^= 0x55;   // the checksum is not read: D3D has accepted the bytecode before the check runs
+    check(glassLayoutPs(digest.data(), digest.size()), "glass layout: the container's checksum is not what decides");
+}
+// Local mode (--scan <dir> ...): every ps_*.dxbc in the folders is run through glassLayoutPs; the matches and the count of distinct pixel shaders are printed.
+int scan(int argc, char** argv) {
+    namespace fs = std::filesystem;
+    std::vector<std::string> matches, seen;
+    for (int i = 2; i < argc; ++i) {
+        std::error_code ec;
+        for (fs::directory_iterator it(argv[i], ec), end; !ec && it != end; it.increment(ec)) {
+            const std::string name = it->path().filename().string();
+            if (name.size() < 8 || name.compare(0, 3, "ps_") != 0 || it->path().extension() != ".dxbc") continue;
+            const std::string hash = name.substr(3, name.size() - 3 - 5);
+            if (std::find(seen.begin(), seen.end(), hash) != seen.end()) continue;
+            seen.push_back(hash);
+            FILE* f = std::fopen(it->path().string().c_str(), "rb");
+            if (!f) continue;
+            std::vector<unsigned char> bytes;
+            unsigned char buf[4096];
+            size_t got;
+            while ((got = std::fread(buf, 1, sizeof(buf), f)) > 0) bytes.insert(bytes.end(), buf, buf + got);
+            std::fclose(f);
+            if (edvr::concourse::glassLayoutPs(bytes.data(), bytes.size())) matches.push_back(hash);
+        }
+        if (ec) std::printf("scan: %s: %s\n", argv[i], ec.message().c_str());
+    }
+    std::sort(matches.begin(), matches.end());
+    for (const auto& m : matches) std::printf("match ps_%s\n", m.c_str());
+    std::printf("scan: %zu distinct pixel shaders checked, %zu match\n", seen.size(), matches.size());
+    return 0;
+}
+}  // namespace glt
+
 }  // namespace
 
 int main(int argc, char** argv) {
+    if (argc > 1 && std::strcmp(argv[1], "--scan") == 0) return glt::scan(argc, argv);
     if (argc > 1 && std::strcmp(argv[1], "--self-test") != 0) {
         std::printf("usage: optimized_station_test --self-test\n");
         return 2;
@@ -5068,6 +5183,7 @@ int main(int argc, char** argv) {
         }
     }
     testVrBake();
+    glt::testAll();
 
     std::printf("optimized_station_test: %d checks, %d failures\n", g_checks, g_failures);
     return g_failures ? 1 : 0;
