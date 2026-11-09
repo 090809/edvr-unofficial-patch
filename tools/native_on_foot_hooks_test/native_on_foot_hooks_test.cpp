@@ -151,8 +151,8 @@ void testShopPure() {
           "CodeHook steals 6 bytes of Show, Close and SetState (push rbx; sub rsp,20h) and 5 of the kiosk's start (mov rax,rsp; push rbp; push rbx) and stop (mov [rsp+10h],rbx): whole instructions, no displacement");
     check(shop::kSuitVtableRva == 0x5255D20 && shop::kWeaponsVtableRva == 0x5255A20 && shop::kKioskVtableRva == 0x51E9770 && shop::kOffOpen == 0x79 && shop::kOffKiosk == 0x1F8,
           "the buy screens' vtables are +0x5255D20 (suit) and +0x5255A20 (weapons), the kiosk's +0x51E9770; the bytes are +0x79 and +0x1F8");
-    check(shop::kLiveryVtableRva == 0x5612F30 && shop::kWeaponLiveryVtableRva == 0x5614328 && shop::kClassCount == 5 && shop::kLivery == 3 && shop::kWeaponLivery == 4,
-          "F228: the Livery screens' vtables are +0x5612F30 (suit) and +0x5614328 (weapon), classes 3 and 4 of five; they share the buy screens' Show, Close and byte +0x79");
+    check(shop::kLiveryVtableRva == 0x5612F30 && shop::kWeaponLiveryVtableRva == 0x5614328 && shop::kClassCount == 6 && shop::kLivery == 3 && shop::kWeaponLivery == 4,
+          "F228: the Livery screens' vtables are +0x5612F30 (suit) and +0x5614328 (weapon), classes 3 and 4 of six (F229 adds the loadout browser); they share the buy screens' Show, Close and byte +0x79");
 }
 
 void testFadeGuard() {
@@ -2525,7 +2525,9 @@ void testShopGlue(const CtlPages& p) {
         shop::formatSetup(expect, sizeof(expect), sc);
         rig.boundary();
         check(r2 == 0x5A60 && rig.cap.count(expect) == 1 && has(expect, "mode unreadable") && has(expect, "in no watched screen's object"), "F229: an object in no watched screen and an unreadable r8 are logged as such, and the call is still forwarded");
-        // the loadout browser is watched beside it and never joins the signal
+        // the loadout browser is watched (with the Livery screen closed) and never joins the signal
+        shopClose(&liv);
+        rig.boundary();
         rig.cap.clear();
         shopShow(&outf);
         rig.boundary();
@@ -2533,7 +2535,6 @@ void testShopGlue(const CtlPages& p) {
                   rig.cap.count("HumanoidOutfittingInteraction 1 s: this 0x") == 1,
               "F229: the loadout browser's Show is logged and its client's camera line written, and neither the shop signal nor the Livery reading moves");
         // closed screens are not read
-        shopClose(&liv);
         shopClose(&outf);
         rig.boundary();
         rig.cap.clear();
