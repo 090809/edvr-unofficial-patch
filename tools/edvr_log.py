@@ -10714,7 +10714,7 @@ H_HULL_BENCH_DONE = (r"hull layer: bench (?P<stamp>\S+) done: ok=(?P<ok>\d+) ref
                      r"failed=(?P<failed>\d+) stage_fails=(?P<stage_fails>\d+) mb=(?P<mb>[\d.]+) evicted=(?P<evicted>\d+) manifest=(?P<manifest>\w+)")
 H_HULL_BENCH_ABORTED = (r"hull layer: bench (?P<stamp>\S+) aborted: (?P<why>.+?); ok=(?P<ok>\d+) refused=(?P<refused>\d+) aborted=(?P<aborted>\d+) "
                         r"files=(?P<files>\d+) failed=(?P<failed>\d+)")
-H_HULL_BENCH_OTHER = r"hull layer: bench \S+: (?:press ignored|cancel pressed)"
+H_HULL_BENCH_OTHER = r"hull layer: bench(?: \S+: (?:press ignored|cancel pressed|\w+ eye \d feature made)|: the \w+ shader did not compile)"
 # Frame generation, Phase 1 (fix.frame_generation_shadow, TEMPORARY; src\common\framegen_shadow_report.h): two lines of the graphics log with no build tag, read the way the desktop
 # window's are. The armed line is said once per change to on (so health_scan keeps it whatever --since says); the report line every second.
 H_FRAMEGEN = "frame generation shadow"
@@ -27075,7 +27075,8 @@ def self_test_health():
         hb_done = RH("hull layer: bench %s done:", hb_stamp, 4, 4, 0, 42, 0, 0, 900.5, 0, "written", "", hb_stamp)
         hb_abort = RH("hull layer: bench %s aborted:", hb_stamp, "frame generation turned on", 1, 4, 3, 10, 0, 0, 200.0, 0, "written")
         check("hull layer bench: a press that finished is OK and says the variants",
-              hl_base + [hl_key("separate"), hb_armed, hb_rect, hb_var("orig_a"), hb_var("dlss_full", "refused", 0, "not built"), hb_done, hl_report()], 0,
+              hl_base + [hl_key("separate"), hb_armed, hb_rect, hb_var("orig_a"), RH("hull layer: bench %s: %s eye %d feature made", hb_stamp, "dlss_full", 0, 35.0),
+                                                         hb_var("dlss_full", "refused", 0, "not built"), hb_done, hl_report()], 0,
               [("OK", HB)], has=["bench 101112123001: 4 ok, 4 refused, 0 aborted, 42 files, 0 failed", "rect output 400,800 2000x1200", "orig_a ok",
                                  "dlss_full refused (not built)"], lacks=["UNPARSED", "do not match"])
         check("hull layer bench: an abort is PARTIAL and says why",

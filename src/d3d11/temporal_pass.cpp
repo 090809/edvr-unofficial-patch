@@ -5237,6 +5237,9 @@ void* temporalInner(void* srcTex, int eye, const float* bounds,
                         hc.depthB = p.knobs[2];
                         hc.jitterX = jxNow;
                         hc.jitterY = jyNow;
+                        hc.dlColour = e.dlColour;   // the hull bench's second DLSS reads the eye's own inputs (TEMPORARY)
+                        hc.dlDepth = e.dlDepth;
+                        hc.dlMv = e.dlMv;
                         hullLayerCompositeEye(ctx, eye, hc);
                         if (!intoSubmit) ctx->CopyResource(e.dlSubmit, e.dlOut);
                     }

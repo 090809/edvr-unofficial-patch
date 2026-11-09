@@ -807,6 +807,7 @@ LARGE_INTEGER g_entryQpc{};   // the hook's entry (hullLayerBegin, hullLayerBegi
 bool g_benchTimeAll = false, g_benchSleep = false;
 bool g_benchNoAa = false;          // the variant bench's sep_noaa: the TAA runs with its history off (the 3x3 reconstruct, then the sharpen)
 uint32_t g_benchEvictions = 0;     // private copies dropped (evictStale) while the bench runs
+int g_benchDlss = 0;               // the variant bench's second DLSS on the hull: 0 none, else its variant (dlss_full, dlss_sub)
 void benchNoteStages(uint32_t frame, const double* sums);
 // Right after an eye's composite, before its history pair flips: the bench's rect cover, mask and applied mark.
 void benchAfterComposite(ID3D11DeviceContext* ctx, int eye, const Eye& e, const Comp& c, const HullLayerCompositeInputs& in, bool applied);
@@ -3799,6 +3800,8 @@ struct BenchRun {
     uint32_t stageFails = 0;
     bool seqStarted = false;
     uint32_t lastFallback = kFallbacks;
+    uint64_t ngxBefore = 0;   // NGX's DLSS memory when a second-DLSS variant started
+    bool ngxBeforeOk = false;
     const char* abortWhy = nullptr;
     std::string aborted;
     hb::Manifest m;
@@ -3811,9 +3814,8 @@ ID3D11Texture2D* g_benchRectStage[2] = {};
 hb::Writer g_benchWriter;
 
 bool benchAsleepVariant(int v) { return v == hb::kOrigA || v == hb::kOrigB; }
-// What this build runs. Stage 1: the originals and the layer with and without its TAA.
+// What this build runs: the originals, the layer with and without its TAA, the second DLSS whole and as a subrect.
 const char* benchNotBuilt(int v) {
-    if (v == hb::kDlssFull || v == hb::kDlssSub) return "not built";
     if (v == hb::kNative || v == hb::kNativeFxaa) return "needs shader dump (feasibility builds A and C)";
     return nullptr;
 }
@@ -3894,6 +3896,304 @@ double dxgiUsageMb() {
     releaseRef(dd);
     return mb;
 }
+// ---- the variant bench's second DLSS on the hull (dlss_full, dlss_sub) ----
+//
+// Per eye, in place of the layer's TAA and sharpen: hull_dlss_in_cs writes DLSS inputs at the render size -- the cover's hull
+// (its tonemapped bytes, binary alpha) over the eye's own hull-free inputs, its depth (the same reversed Z), and for hull
+// pixels the head-only motion of the TAA's reprojection (the hull is rigid with the head's frame), else the eye's own -- then
+// a private DLSS (dlaa.cpp dlaaHullEvaluate) upscales them, whole or the bench rect as an NGX subrect, and hull_cov_comp_cs
+// lays its output over the submitted eye by the cover's alpha upsampled bilinearly, inside the bench rect only. The resources
+// are made on the variant's first frame and released when it ends.
+// hlsl-check: kDlssInHlsl hull_dlss_in_cs cs_5_0
+// hlsl-check: kCovCompHlsl hull_cov_comp_cs cs_5_0
+#define HULL_BENCH_CB_HLSL                                                                                                                  \
+    "cbuffer HullLayerTaaCb : register(b0) {\n"                                                                                              \
+    "    float4 tanNow; float4 tanPrev; float4 dRow0; float4 dRow1; float4 dRow2;\n"                                                         \
+    "    float4 headT; float4 jit; float4 depthAB; int4 sizes; int4 origin;\n"                                                               \
+    "};\n"                                                                                                                                   \
+    "cbuffer HullBenchCb : register(b1) { int4 rectR; int4 rectO; };\n"
+constexpr char kDlssInHlsl[] =
+    HULL_BENCH_CB_HLSL
+    "Texture2D<float4> cover : register(t0);\n"
+    "Texture2D<float> coverDepth : register(t1);\n"
+    "Texture2D<float4> worldColour : register(t2);\n"
+    "Texture2D<float> worldDepth : register(t3);\n"
+    "Texture2D<float2> worldMv : register(t4);\n"
+    "RWTexture2D<float4> colOut : register(u0);\n"
+    "RWTexture2D<float> depOut : register(u1);\n"
+    "RWTexture2D<float2> mvOut : register(u2);\n"
+    "[numthreads(8, 8, 1)] void hull_dlss_in_cs(uint3 id : SV_DispatchThreadID) {\n"
+    "    int2 rsz = sizes.xy;\n"
+    "    int2 p = int2(id.xy) + rectR.xy;\n"
+    "    if (any(p >= rectR.xy + rectR.zw) || any(p >= rsz)) return;\n"
+    "    float4 c = cover.Load(int3(origin.xy + p, 0));\n"
+    "    if (c.a > 0.0) {\n"
+    "        float zr = coverDepth.Load(int3(origin.xy + p, 0));\n"
+    "        float2 pr = float2(p);\n"
+    "        float2 mv = float2(0.0, 0.0);\n"
+    "        float3 d;\n"
+    "        d.x = tanNow.x + (pr.x + 0.5) / float(rsz.x) * (tanNow.y - tanNow.x);\n"
+    "        d.y = tanNow.w - (pr.y + 0.5) / float(rsz.y) * (tanNow.w - tanNow.z);\n"
+    "        d.z = -1.0;\n"
+    "        float3 dp = float3(dot(dRow0.xyz, d), dot(dRow1.xyz, d), dot(dRow2.xyz, d));\n"
+    "        float den = zr - depthAB.x;\n"
+    "        if (headT.w != 0.0 && zr > 0.0 && den > 0.0) dp = dp * (depthAB.y / den) + headT.xyz;\n"
+    "        if (dp.z < -1e-6) {\n"
+    "            float2 pp;\n"
+    "            pp.x = (dp.x / -dp.z - tanPrev.x) / (tanPrev.y - tanPrev.x) * float(rsz.x) - 0.5;\n"
+    "            pp.y = (tanPrev.w - dp.y / -dp.z) / (tanPrev.w - tanPrev.z) * float(rsz.y) - 0.5;\n"
+    "            mv = pp - pr;\n"
+    "        }\n"
+    "        colOut[p] = float4(c.rgb, 1.0);\n"
+    "        depOut[p] = zr;\n"
+    "        mvOut[p] = mv;\n"
+    "    } else {\n"
+    "        colOut[p] = worldColour.Load(int3(p, 0));\n"
+    "        depOut[p] = worldDepth.Load(int3(p, 0));\n"
+    "        mvOut[p] = worldMv.Load(int3(p, 0));\n"
+    "    }\n"
+    "}\n";
+constexpr char kCovCompHlsl[] =
+    HULL_BENCH_CB_HLSL
+    "Texture2D<float4> hullOut : register(t0);\n"
+    "Texture2D<float4> cover : register(t1);\n"
+    "Texture2D<float4> world : register(t2);\n"
+    "SamplerState lin : register(s0);\n"
+    "RWTexture2D<float4> compOut : register(u0);\n"
+    "[numthreads(8, 8, 1)] void hull_cov_comp_cs(uint3 id : SV_DispatchThreadID) {\n"
+    "    int2 o = int2(id.xy) + rectO.xy;\n"
+    "    if (any(o >= rectO.xy + rectO.zw)) return;\n"
+    "    float2 csz;\n"
+    "    cover.GetDimensions(csz.x, csz.y);\n"
+    "    float2 pr = (float2(o) + 0.5) * float2(sizes.xy) / float2(sizes.zw);\n"
+    "    float cov = cover.SampleLevel(lin, (float2(origin.xy) + pr) / csz, 0).a;\n"
+    "    float4 w = world.Load(int3(o, 0));\n"
+    "    float4 h = hullOut.Load(int3(o, 0));\n"
+    "    compOut[o] = float4(lerp(w.rgb, h.rgb, cov), w.a);\n"
+    "}\n";
+#undef HULL_BENCH_CB_HLSL
+
+struct BenchDlssEye {
+    ID3D11Texture2D* col = nullptr;
+    ID3D11UnorderedAccessView* colUav = nullptr;
+    ID3D11Texture2D* dep = nullptr;
+    ID3D11UnorderedAccessView* depUav = nullptr;
+    ID3D11Texture2D* mv = nullptr;
+    ID3D11UnorderedAccessView* mvUav = nullptr;
+    ID3D11Texture2D* out = nullptr;
+    ID3D11UnorderedAccessView* outUav = nullptr;
+    ID3D11ShaderResourceView* outSrv = nullptr;
+    uint32_t w = 0, h = 0, outW = 0, outH = 0;
+    // Views over the eye's own inputs, kept while the textures are the same.
+    const void* srvOf[3] = {};
+    ID3D11ShaderResourceView* srv[3] = {};
+};
+struct BenchDlssGpu {
+    bool tried = false, ok = false;
+    ID3D11ComputeShader* inCs = nullptr;
+    ID3D11ComputeShader* compCs = nullptr;
+    ID3D11Buffer* cb = nullptr;
+};
+BenchDlssEye g_benchDlssEye[2];
+BenchDlssGpu g_benchDlssGpu;
+
+void benchDlssRelease() {
+    for (auto& d : g_benchDlssEye) {
+        releaseRef(d.colUav);
+        releaseRef(d.col);
+        releaseRef(d.depUav);
+        releaseRef(d.dep);
+        releaseRef(d.mvUav);
+        releaseRef(d.mv);
+        releaseRef(d.outSrv);
+        releaseRef(d.outUav);
+        releaseRef(d.out);
+        for (auto*& s : d.srv) releaseRef(s);
+        d = BenchDlssEye{};
+    }
+    releaseRef(g_benchDlssGpu.inCs);
+    releaseRef(g_benchDlssGpu.compCs);
+    releaseRef(g_benchDlssGpu.cb);
+    g_benchDlssGpu = BenchDlssGpu{};
+    dlaaHullRelease();
+}
+
+double benchDlssMb() {
+    uint64_t sum = 0;
+    for (const auto& d : g_benchDlssEye) sum += texBytes(d.col) + texBytes(d.dep) + texBytes(d.mv) + texBytes(d.out);
+    return static_cast<double>(sum) / (1024.0 * 1024.0);
+}
+
+bool benchDlssEnsureGpu() {
+    BenchDlssGpu& g = g_benchDlssGpu;
+    if (g.tried) return g.ok;
+    g.tried = true;
+    const struct {
+        const char* src;
+        size_t len;
+        const char* entry;
+        ID3D11ComputeShader** out;
+    } items[2] = {{kDlssInHlsl, sizeof(kDlssInHlsl) - 1, "hull_dlss_in_cs", &g.inCs}, {kCovCompHlsl, sizeof(kCovCompHlsl) - 1, "hull_cov_comp_cs", &g.compCs}};
+    for (const auto& it : items) {
+        ID3DBlob* code = nullptr;
+        std::string why;
+        if (!compileShader(it.src, it.len, it.entry, "cs_5_0", &code, &why)) {
+            Log::get().note("hull layer: bench: the %s shader did not compile (%s)", it.entry, why.c_str());
+            if (code) code->Release();
+            return false;
+        }
+        const HRESULT hr = g_device->CreateComputeShader(code->GetBufferPointer(), code->GetBufferSize(), nullptr, it.out);
+        code->Release();
+        if (FAILED(hr)) return false;
+    }
+    g.cb = makeConstantBuffer(32);
+    g.ok = g.cb != nullptr;
+    return g.ok;
+}
+
+// A shader view over one of the eye's own inputs (a typeless colour read as UNORM), kept while the texture is the same.
+ID3D11ShaderResourceView* benchInputSrv(BenchDlssEye& d, int k, ID3D11Texture2D* tex) {
+    if (!tex) return nullptr;
+    if (d.srv[k] && d.srvOf[k] == tex) return d.srv[k];
+    releaseRef(d.srv[k]);
+    d.srvOf[k] = nullptr;
+    D3D11_TEXTURE2D_DESC td{};
+    tex->GetDesc(&td);
+    D3D11_SHADER_RESOURCE_VIEW_DESC vd{};
+    vd.Format = td.Format == DXGI_FORMAT_R8G8B8A8_TYPELESS ? DXGI_FORMAT_R8G8B8A8_UNORM
+              : td.Format == DXGI_FORMAT_R32_TYPELESS      ? DXGI_FORMAT_R32_FLOAT
+              : td.Format == DXGI_FORMAT_R16G16_TYPELESS   ? DXGI_FORMAT_R16G16_FLOAT
+                                                           : td.Format;
+    vd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+    vd.Texture2D.MipLevels = 1;
+    if (FAILED(g_device->CreateShaderResourceView(tex, &vd, &d.srv[k]))) {
+        d.srv[k] = nullptr;
+        return nullptr;
+    }
+    d.srvOf[k] = tex;
+    return d.srv[k];
+}
+
+bool benchDlssTargets(BenchDlssEye& d, uint32_t w, uint32_t h, uint32_t outW, uint32_t outH) {
+    if (d.out && d.w == w && d.h == h && d.outW == outW && d.outH == outH) return true;
+    const void* keepOf[3] = {d.srvOf[0], d.srvOf[1], d.srvOf[2]};
+    ID3D11ShaderResourceView* keep[3] = {d.srv[0], d.srv[1], d.srv[2]};
+    releaseRef(d.colUav);
+    releaseRef(d.col);
+    releaseRef(d.depUav);
+    releaseRef(d.dep);
+    releaseRef(d.mvUav);
+    releaseRef(d.mv);
+    releaseRef(d.outSrv);
+    releaseRef(d.outUav);
+    releaseRef(d.out);
+    bool ok = makeTexture(w, h, DXGI_FORMAT_R8G8B8A8_UNORM, true, &d.col, nullptr, &d.colUav) &&
+              makeTexture(w, h, DXGI_FORMAT_R32_FLOAT, true, &d.dep, nullptr, &d.depUav) &&
+              makeTexture(w, h, DXGI_FORMAT_R16G16_FLOAT, true, &d.mv, nullptr, &d.mvUav) &&
+              makeTexture(outW, outH, DXGI_FORMAT_R8G8B8A8_UNORM, true, &d.out, &d.outSrv, &d.outUav);
+    for (int k = 0; k < 3; ++k) {
+        d.srvOf[k] = keepOf[k];
+        d.srv[k] = keep[k];
+    }
+    if (!ok) return false;
+    d.w = w;
+    d.h = h;
+    d.outW = outW;
+    d.outH = outH;
+    return true;
+}
+
+const char* g_benchDlssFail = nullptr;   // the second DLSS's refusal this frame (the boundary refuses the variant with it)
+bool g_benchDlssReset[2] = {};           // the variant's first evaluation an eye restarts the hull feature's history
+
+// The hull through the second DLSS into c.out (the composite's out, copied over the eye when applied, as the TAA's is). False:
+// not run (the TAA path runs this frame and g_benchDlssFail says why).
+bool benchHullDlss(ID3D11DeviceContext* ctx, int eye, const Eye& e, const Comp& c, const HullLayerCompositeInputs& in) {
+    static char fail[192];
+    auto refuse = [&](const char* why) {
+        _snprintf_s(fail, sizeof fail, _TRUNCATE, "%s", why ? why : "?");
+        g_benchDlssFail = fail;
+        return false;
+    };
+    if (!in.dlColour || !in.dlDepth || !in.dlMv) return refuse("the eye's DLSS inputs were not handed over");
+    if (!benchDlssEnsureGpu()) return refuse("the bench's DLSS shaders could not be made");
+    BenchDlssEye& d = g_benchDlssEye[eye];
+    if (!benchDlssTargets(d, in.renderW, in.renderH, in.outW, in.outH)) return refuse("the bench's DLSS targets could not be made");
+    ID3D11ShaderResourceView* colSrv = benchInputSrv(d, 0, in.dlColour);
+    ID3D11ShaderResourceView* depSrv = benchInputSrv(d, 1, in.dlDepth);
+    ID3D11ShaderResourceView* mvSrv = benchInputSrv(d, 2, in.dlMv);
+    if (!colSrv || !depSrv || !mvSrv) return refuse("no shader view over the eye's DLSS inputs");
+    const BenchRun& b = g_bench;
+    const bool sub = g_benchDlss == hb::kDlssSub;
+    if (sub) {
+        // NGX maps the render subrect to the output subrect by the feature's scale: both corners must be whole pixels.
+        const uint64_t rw = in.renderW, rh = in.renderH;
+        if ((uint64_t{b.rectR[0]} * in.outW) % rw || (uint64_t{b.rectR[1]} * in.outH) % rh || (uint64_t{b.rectR[2]} * in.outW) % rw ||
+            (uint64_t{b.rectR[3]} * in.outH) % rh)
+            return refuse("the bench rect does not map to whole output pixels (the render to output ratio)");
+    }
+    // The rect: the bench's for the subrect; the whole eye for the full frame's inputs (the composite stays in the bench rect).
+    const int32_t rr[4] = {sub ? static_cast<int32_t>(b.rectR[0]) : 0, sub ? static_cast<int32_t>(b.rectR[1]) : 0,
+                           sub ? static_cast<int32_t>(b.rectR[2]) : static_cast<int32_t>(in.renderW),
+                           sub ? static_cast<int32_t>(b.rectR[3]) : static_cast<int32_t>(in.renderH)};
+    const int32_t cbData[8] = {rr[0], rr[1], rr[2], rr[3], static_cast<int32_t>(b.rectO[0]), static_cast<int32_t>(b.rectO[1]),
+                               static_cast<int32_t>(b.rectO[2]), static_cast<int32_t>(b.rectO[3])};
+    vScreenUpdateSubresourceRaw(ctx, g_benchDlssGpu.cb, 0, nullptr, cbData, 0, 0);
+    CsStageSave save;
+    save.save(ctx);
+    ID3D11Buffer* cbs[2] = {g_cgpu.taaCb, g_benchDlssGpu.cb};
+    ID3D11UnorderedAccessView* none[CsStageSave::kUavs] = {};
+    ID3D11ShaderResourceView* noSrv[5] = {};
+    {
+        ID3D11ShaderResourceView* srvs[5] = {e.coverSrv, e.coverZSrv, colSrv, depSrv, mvSrv};
+        ID3D11UnorderedAccessView* uavs[CsStageSave::kUavs] = {d.colUav, d.depUav, d.mvUav};
+        ctx->CSSetUnorderedAccessViews(0, CsStageSave::kUavs, uavs, nullptr);
+        ctx->CSSetShader(g_benchDlssGpu.inCs, nullptr, 0);
+        ctx->CSSetShaderResources(0, 5, srvs);
+        ctx->CSSetConstantBuffers(0, 2, cbs);
+        ctx->Dispatch((static_cast<uint32_t>(rr[2]) + 7u) / 8u, (static_cast<uint32_t>(rr[3]) + 7u) / 8u, 1);
+        ctx->CSSetShaderResources(0, 5, noSrv);
+        ctx->CSSetUnorderedAccessViews(0, CsStageSave::kUavs, none, nullptr);
+    }
+    save.restore(ctx);
+    stageClose(ctx);   // the layer's taa stage holds the prep and the composite; the NGX evaluation is timed apart (hull_dlss)
+    DlaaSubrect sr;
+    sr.renderX = b.rectR[0];
+    sr.renderY = b.rectR[1];
+    sr.renderW = b.rectR[2];
+    sr.renderH = b.rectR[3];
+    sr.outX = b.rectO[0];
+    sr.outY = b.rectO[1];
+    const char* why = nullptr;
+    double createMs = 0.0;
+    const bool reset = g_benchDlssReset[eye];
+    const bool ok = hullBenchTimed(ctx, 1, [&] {
+        return dlaaHullEvaluate(ctx, eye, d.col, d.dep, d.mv, d.out, in.renderW, in.renderH, in.outW, in.outH, in.jitterX, in.jitterY, reset,
+                                sub ? &sr : nullptr, &why, &createMs);
+    });
+    stageOpen(ctx, kTsTaa, false);
+    if (!ok) return refuse(why);
+    g_benchDlssReset[eye] = false;
+    if (createMs > 0.0) Log::get().note("hull layer: bench %s: %s eye %d feature made in %.0f ms", b.stampA.c_str(), hb::variantId(g_benchDlss), eye, createMs);
+    // The composite: the world copied whole, the hull's DLSS laid over it by coverage inside the bench rect.
+    vScreenCopyResourceRaw(ctx, c.out, in.output);
+    save.save(ctx);
+    {
+        ID3D11ShaderResourceView* srvs[3] = {d.outSrv, e.coverSrv, in.outputSrv};
+        ID3D11UnorderedAccessView* uavs[CsStageSave::kUavs] = {c.outUav};
+        ctx->CSSetUnorderedAccessViews(0, CsStageSave::kUavs, uavs, nullptr);
+        ctx->CSSetShader(g_benchDlssGpu.compCs, nullptr, 0);
+        ctx->CSSetShaderResources(0, 3, srvs);
+        ctx->CSSetConstantBuffers(0, 2, cbs);
+        ctx->CSSetSamplers(0, 1, &g_cgpu.linear);
+        ctx->Dispatch((b.rectO[2] + 7u) / 8u, (b.rectO[3] + 7u) / 8u, 1);
+        ctx->CSSetShaderResources(0, 3, noSrv);
+        ctx->CSSetUnorderedAccessViews(0, CsStageSave::kUavs, none, nullptr);
+    }
+    save.restore(ctx);
+    return true;
+}
+
 // The head's rotation in a 3x3 delta (row-major), degrees; < 0 without one.
 float headRotDeg(const float* d) {
     if (!d) return -1.0f;
@@ -4037,7 +4337,9 @@ void benchRestore(const char* abortReason) {
     BenchRun& b = g_bench;
     g_benchSleep = false;
     g_benchNoAa = false;
+    g_benchDlss = 0;
     g_benchTimeAll = false;
+    benchDlssRelease();
     b.finalWant[0] = b.finalWant[1] = false;
     for (auto& c : g_comp) c.have = false;   // the layer's TAA history starts again (one history reset an eye)
     if (b.seqStarted && g_seq.active && !g_seq.end) g_seq.end = "the variant bench ended";
@@ -4083,6 +4385,12 @@ void benchStartVariant(int v) {
     b.left = benchWarm(v);
     b.capIndex = -1;
     b.restarts[v] = 0;
+    if (v == hb::kDlssFull || v == hb::kDlssSub) {
+        dlaaHullRelease();   // never two hull pairs at once: the full pair goes before the subrect pair is made
+        g_benchDlssReset[0] = g_benchDlssReset[1] = true;
+        g_benchDlssFail = nullptr;
+        b.ngxBeforeOk = dlaaVramBytes(&b.ngxBefore);
+    }
 }
 
 // The variant ends: ok with its MB, or refused (why). The next one starts.
@@ -4097,14 +4405,17 @@ void benchEndVariant(const char* refusedWhy) {
         b.capFrames[b.var].clear();
     } else {
         r.status = "ok";
+        const bool dlss = b.var == hb::kDlssFull || b.var == hb::kDlssSub;
         r.mbOwn.have = true;
-        r.mbOwn.v = benchAsleepVariant(b.var) ? 0.0 : layerVramMb();
-        r.mbNgx.have = true;   // no second DLSS in this variant: none of the hull's
-        r.mbNgx.v = 0.0;
+        r.mbOwn.v = benchAsleepVariant(b.var) ? 0.0 : layerVramMb() + (dlss ? benchDlssMb() : 0.0);
+        uint64_t ngxNow = 0;
+        r.mbNgx.have = !dlss || (b.ngxBeforeOk && dlaaVramBytes(&ngxNow));   // no second DLSS in the others: none of the hull's
+        r.mbNgx.v = dlss && r.mbNgx.have ? (static_cast<double>(ngxNow) - static_cast<double>(b.ngxBefore)) / (1024.0 * 1024.0) : 0.0;
         const double dx = dxgiUsageMb();
         r.mbDxgi.have = dx >= 0.0;
         r.mbDxgi.v = dx;
     }
+    if (b.var == hb::kDlssFull || b.var == hb::kDlssSub) benchDlssRelease();   // its features and targets go with it
     benchStartVariant(b.var + 1);
 }
 
@@ -4131,6 +4442,7 @@ void benchApplyFrameFlags() {
     const bool run = benchRunning();
     g_benchSleep = run && benchAsleepVariant(g_bench.var);
     g_benchNoAa = run && g_bench.var == hb::kSepNoaa;
+    g_benchDlss = run && (g_bench.var == hb::kDlssFull || g_bench.var == hb::kDlssSub) ? g_bench.var : 0;
 }
 
 // The rect from the covers' extent: grown by kBenchGrow output px, aligned so that render and output corners are whole pixels
@@ -4296,6 +4608,7 @@ void benchFinish() {
     g_benchWriter.resetCounts();
     benchReleaseGpu();
     g_benchSleep = g_benchNoAa = g_benchTimeAll = false;
+    g_benchDlss = 0;
     detail::g_hullBenchOn = false;
     g_bench.phase = BenchPhase::Idle;
 }
@@ -4330,6 +4643,14 @@ void benchStep() {
             benchApplyFrameFlags();
             return;
         }
+    }
+    if (g_benchDlssFail && benchRunning() && (b.var == hb::kDlssFull || b.var == hb::kDlssSub)) {
+        const char* why = g_benchDlssFail;
+        g_benchDlssFail = nullptr;
+        benchEndVariant(why);   // NGX refused the second feature, the subrect or an evaluation: the variant is refused, the bench goes on
+        benchApplyFrameFlags();
+        b.staged0 = b.applied0 = false;
+        return;
     }
     const bool asleep = benchAsleepVariant(b.var);
     const bool good = asleep || (b.discarded && b.applied0);
@@ -4807,7 +5128,9 @@ void hullLayerCompositeEye(ID3D11DeviceContext* ctx, int eye, const HullLayerCom
     timerBegin(g_compTimer, ctx);
     stageOpen(ctx, kTsTaa, false);   // dump v2: the TAA, the sharpen and the composite's copy
     vScreenUpdateSubresourceRaw(ctx, g_cgpu.taaCb, 0, nullptr, &cb, 0, 0);
-    {
+    // The variant bench's dlss_full / dlss_sub: the hull through a second DLSS over the hull-free world in place of the TAA and sharpen.
+    const bool benchDlss = g_benchDlss && benchHullDlss(ctx, eye, e, c, in);
+    if (!benchDlss) {
         CsStageSave save;
         save.save(ctx);
         ID3D11ShaderResourceView* srvs[4] = {e.coverSrv, e.coverZSrv, c.histSrv[c.read], in.outputSrv};
@@ -4990,7 +5313,9 @@ void hullLayerShutdown() {
     if (detail::g_hullBenchOn) {
         g_benchWriter.stop();   // its queue written first: the files on disk are whole
         benchReleaseGpu();
+        benchDlssRelease();
         g_benchSleep = g_benchNoAa = g_benchTimeAll = false;
+        g_benchDlss = 0;
         g_bench.phase = BenchPhase::Idle;
         detail::g_hullBenchOn = false;
     }

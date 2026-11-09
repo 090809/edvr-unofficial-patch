@@ -145,9 +145,9 @@ int main(int argc, char** argv) {
     uint32_t files = 2;
     for (int v = 0; v < kVariants; ++v) {
         VariantRec& r = m.variants[v];
-        if (v == kDlssFull || v == kDlssSub || v == kNative || v == kNativeFxaa) {
+        if (v == kNative || v == kNativeFxaa) {
             r.status = "refused";
-            r.reason = v >= kNative ? "needs shader dump (feasibility builds A and C)" : "not built";
+            r.reason = "needs shader dump (feasibility builds A and C)";
             continue;
         }
         r.status = "ok";
@@ -179,14 +179,15 @@ int main(int argc, char** argv) {
             writer.push(path(f.file), W, H, bgra ? 87 : 28, W * 4, f.layerFrame, 0, std::move(img));
             ++files;
         }
-        const bool sep = v == kSepTaa || v == kSepNoaa;
+        const bool sep = !(v == kOrigA || v == kOrigB);
+        const bool dlss = v == kDlssFull || v == kDlssSub;
         for (auto& s : r.layerStage) s = Num{true, sep ? 0.1 : 0.0};
-        r.hullDlss = Num{true, 0.0};
+        r.hullDlss = Num{true, dlss ? 0.9 : 0.0};
         r.mainDlss = Num{true, 1.5};
         r.frameSpan = Num{true, 9.0 + v};
         r.cpuMs = Num{true, 0.2};
         r.mbOwn = Num{true, sep ? 40.0 : 0.0};
-        r.mbNgx = Num{true, 0.0};
+        r.mbNgx = Num{true, dlss ? 120.0 : 0.0};
     }
     writer.stop();
     expect(writer.written() == files && writer.failed() == 0, "the writer wrote every capture");
@@ -197,7 +198,8 @@ int main(int argc, char** argv) {
     expect(json.find("\"order\": [\"orig_a\", \"sep_taa\", \"sep_noaa\", \"dlss_full\", \"dlss_sub\", \"native\", \"native_fxaa\", \"orig_b\"]") !=
                std::string::npos,
            "manifest order");
-    expect(json.find("{\"id\": \"dlss_full\", \"status\": \"refused\", \"reason\": \"not built\"") != std::string::npos, "a refused variant");
+    expect(json.find("{\"id\": \"native\", \"status\": \"refused\", \"reason\": \"needs shader dump") != std::string::npos, "a refused variant");
+    expect(json.find("\"hull_dlss\": 0.9000") != std::string::npos && json.find("\"ngx\": 120.0") != std::string::npos, "the second DLSS's ms and MB");
     expect(json.find("\"layer_stage\": [0.1000, 0.1000") != std::string::npos, "the stage times");
     Manifest q;
     q.aborted = "a \"quoted\" reason\n";

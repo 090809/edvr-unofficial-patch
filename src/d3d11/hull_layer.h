@@ -163,6 +163,11 @@ struct HullLayerCompositeInputs {
     // only when no resolve can run). The resolve bounds its output by the raw input, which has no own hull, so a hull
     // composited before it is held to the background (the 21:45 flight).
     bool afterUiResolve = false;
+    // The eye's own DLSS inputs (render size, the region's): colour, reversed-Z depth, motion (R16G16_FLOAT, render px,
+    // current -> previous). Read only by the variant bench's second DLSS (TEMPORARY): the hull over this hull-free world.
+    ID3D11Texture2D* dlColour = nullptr;
+    ID3D11Texture2D* dlDepth = nullptr;
+    ID3D11Texture2D* dlMv = nullptr;
 };
 
 // Step 3: right after the upscaler wrote VR eye `eye` (temporal_pass.cpp). A no-op unless diag.hull_layer = separate.
