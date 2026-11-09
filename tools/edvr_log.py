@@ -12474,10 +12474,7 @@ def _hj_f107_away(rows, ctx):
 
 
 H_SHOP = "shop screens (F209)"
-H_SHOP_BUY_CLASSES = ("SuitVendorInteraction", "WeaponsVendorInteraction")   # the buy screens: the Livery screens (F228) and the loadout browser (F229) are watched, and never hold the signal
-H_LIVCAM = "livery camera (F229)"
-H_LIVREP = "livery camera repair (F230)"
-H_PREVCAM = "preview camera (F231)"
+H_SHOP_BUY_CLASSES = ("SuitVendorInteraction", "WeaponsVendorInteraction")   # the buy screens (the Livery screens and the loadout browser hold the signal too, and are checked by their own opened lines)
 H_PREVROSTER = "preview camera roster (F232)"
 H_PREVEYE = "preview camera eye path (F233)"
 F107_SHOWROOM_MAX_M = 50.0   # F209: a distance-test episode whose first camera stood over F107's 3 m and no farther than this from the neck is the size of a showroom's camera (the suit shop's: 3.6 to 3.7 m)
@@ -12518,7 +12515,7 @@ def _hj_shop(rows, ctx):
     with native on foot begun and no F107 episode by the shop screen (its left line's test, or calls its ended line says the shop screen held) is NEVER APPLIED (the view did not
     change); a signal that did not hold on its object, events the hooks lost or the cap dropped, a Show that left
     the byte unset, a signal that went on more often than it went off, hooks that all stood down, or a Show with no signal are PARTIAL."""
-    kinds = ("hook", "show", "close", "on", "off", "state", "kstart", "kstop", "forgot", "sec", "capped", "lost", "lvopen", "loadopen")
+    kinds = ("hook", "show", "close", "on", "off", "state", "kstart", "kstop", "forgot", "sec", "capped", "lost", "lvopen")
     if not any(rows.get(k) for k in kinds):
         return None
     hooks, shows, closes = rows.get("hook", []), rows.get("show", []), rows.get("close", [])
@@ -12531,14 +12528,9 @@ def _hj_shop(rows, ctx):
     byclass = collections.Counter(r["cls"] for r in shows)
     if shows or closes:
         parts.append("%d Show / %d Close (%s)" % (len(shows), len(closes), ", ".join("%s %d" % (k, byclass[k]) for k in sorted(byclass)) or "no buy screen"))
-    lvopens = rows.get("lvopen", [])
-    lvheld = [r for r in lvopens if r["how"] != "only watched"]
-    if lvopens:   # F228: the Livery screens (HumanoidLiveryActivity, HumanoidWeaponLiveryActivity), held by experimental.native_on_foot_livery_game_view or only watched
-        parts.append("%d Livery screen(s) opened (%d held by the camera-away signal, %d only watched; key %s)" % (len(lvopens), len(lvheld), len(lvopens) - len(lvheld), ", ".join(sorted({r["key"] for r in lvopens}))))
-    loadopens = rows.get("loadopen", [])   # F234: the loadout browser (HumanoidOutfittingInteraction), held by experimental.native_on_foot_loadout_game_view or only watched
-    loadheld = [r for r in loadopens if r["how"] != "only watched"]
-    if loadopens:
-        parts.append("%d loadout browser opening(s) (%d held by the camera-away signal, %d only watched; key %s)" % (len(loadopens), len(loadheld), len(loadopens) - len(loadheld), ", ".join(sorted({r["key"] for r in loadopens}))))
+    lvopens = rows.get("lvopen", [])   # F228/F234: the Livery screens and the loadout browser, F107 held away for the whole screen
+    if lvopens:
+        parts.append("%d Livery or loadout screen opening(s) held by the camera-away signal (%s)" % (len(lvopens), ", ".join(sorted({r["cls"] for r in lvopens}))))
     parts.append("the signal on %d, off %d" % (len(ons), len(offs)))
     if states:
         parts.append("%d state change(s), last %s" % (len(states), states[-1]["to"]))
@@ -12565,10 +12557,8 @@ def _hj_shop(rows, ctx):
         problems.append("%d Show(s) left the byte +0x79 not set (read %s)" % (len(unset), ", ".join(sorted({r["a"] for r in unset}))))
     if any(r["a"] == "1" and r["cls"] in H_SHOP_BUY_CLASSES for r in shows) and not ons:
         problems.append("a buy screen was shown but the signal never went on")
-    if lvheld and not ons:
-        problems.append("a Livery screen opened with the key on (held) but the signal never went on")
-    if loadheld and not ons:
-        problems.append("the loadout browser opened with the key on (held) but the signal never went on")
+    if lvopens and not ons:
+        problems.append("a Livery screen or the loadout browser opened but the signal never went on")
     if len(ons) > len(offs) + 1:
         problems.append("the signal went on %d times and off %d: it may have stuck" % (len(ons), len(offs)))
     if hooks and stood and not armed and not ons:
@@ -12578,172 +12568,23 @@ def _hj_shop(rows, ctx):
     return ("OK", text)
 
 
-def _hflt(text):
-    """A float the DLL wrote (four decimals, an exponent, nan or inf) as a float; None when it is not a number."""
-    try:
-        v = float(text)
-    except (TypeError, ValueError):
-        return None
-    return v if v == v and abs(v) != float("inf") else None
-
-
-def _hrange(rows, key):
-    vals = [v for v in (_hflt(r[key]) for r in rows) if v is not None]
-    if not vals:
-        return "no number"
-    lo, hi = min(vals), max(vals)
-    return "%.4f" % lo if lo == hi else "%.4f to %.4f" % (lo, hi)
-
-
-def _hj_livcam(rows, ctx):
-    """F229: the Livery camera instrument (shop_screen_core.h, read-only). Once a second for each watched screen that reads open (the two buy screens, the two Livery screens and the
-    loadout browser) the preview client's camera fields: the setup mode and camera kind, the zoom step, the current, maximum and minimum distances, the retry flag and the pose matrix; and each call of
-    the client's scene setup (0x12714C0) with its mode int and which watched screen's object rcx lies in. The summary names, per class, how many lines and the range the orbit distances and the
-    translation lengths took, and the setup calls' modes. It reads no verdict about the cause: the lines are the evidence. PARTIAL when the setup hook stood down, a client could not be read or held
-    a value that is not a number (the offsets are not this build's camera), calls or lines were not recorded, or lines were dropped by the cap."""
-    kinds = ("hook", "sec", "setup", "unread", "capped", "lost")
-    if not any(rows.get(k) for k in kinds):
-        return None
-    hooks, secs, setups = rows.get("hook", []), rows.get("sec", []), rows.get("setup", [])
-    parts = []
-    stood = [r for r in hooks if r["st"] == "stood down"]
-    if hooks:
-        parts.append("setup hook %s" % ("stood down" if stood and len(stood) == len(hooks) else "armed"))
-    byclass = collections.defaultdict(list)
-    for r in secs:
-        byclass[r["cls"]].append(r)
-    for cls in sorted(byclass):
-        rs = byclass[cls]
-        parts.append("%s: %d camera line(s), kind %s, dist %s, min %s, translation length last row %s, last column %s" % (
-            cls, len(rs), "/".join(sorted({r["kind"] for r in rs})), _hrange(rs, "oa"), _hrange(rs, "ob"), _hrange(rs, "rowlen"), _hrange(rs, "collen")))
-    if setups:
-        modes = collections.Counter(r["mode"] for r in setups)
-        where = collections.Counter(re.sub(r"object \+0x[0-9A-F]+, which is ", "", r["where"]) for r in setups)
-        theirs = [r for r in setups if not r["ours"]]
-        if theirs:
-            parts.append("%d of %d game setup call(s) left the camera node INVALID" % (len([r for r in theirs if r["node"] == "INVALID"]), len(theirs)))
-        parts.append("%d setup call(s), mode %s; object %s" % (len(setups), ", ".join("%s x%d" % (m, n) for m, n in sorted(modes.items())),
-                                                           "; ".join("%s x%d" % (w, n) for w, n in sorted(where.items()))))
-    text = "; ".join(parts) or "no camera line"
-    problems = []
-    if stood:
-        problems.append("the setup hook stood down: the setup calls are not logged")
-    if rows.get("unread"):
-        problems.append("%d client(s) could not be read or held a value that is not a number (%s): the camera offsets are not this build's" % (
-            len(rows["unread"]), ", ".join(sorted({r["cls"] for r in rows["unread"]}))))
-    if rows.get("lost"):
-        problems.append("%d setup call(s) were not recorded" % _hsum(rows["lost"], "n"))
-    if rows.get("capped"):
-        problems.append("%d line(s) were not written (the cap of 40 in ten seconds)" % _hsum(rows["capped"], "n"))
-    if problems:
-        return ("PARTIAL", text + "; " + "; ".join(problems))
-    return ("OK", text)
-
-
-def _hj_livrep(rows, ctx):
-    """F230: the Livery camera repair (shop_screen_core.h, TEMPORARY key experimental.native_on_foot_livery_camera_repair). The Update hook (armed or stood down), the key's line, and each retry
-    (attempt n of 5: the game's own setup run again by EDVR, the node before and after). OK when every retry ended with the camera node valid or none was needed. PARTIAL when the key is on and the
-    Update hook stood down, a retry left the node INVALID or faulted or could not test it, every attempt of an open failed, retry lines were lost, or the key was on and a Livery setup left the camera node INVALID
-    (F229's lines) with no retry at all."""
-    kinds = ("hook", "key", "retry", "lost")
-    if not any(rows.get(k) for k in kinds):
-        return None
-    hooks, keys, retries = rows.get("hook", []), rows.get("key", []), rows.get("retry", [])
-    stood = [r for r in hooks if r["st"] == "stood down"]
-    parts = []
-    if hooks:
-        parts.append("Update hook %s" % ("stood down" if stood and len(stood) == len(hooks) else "armed"))
-    if keys:
-        parts.append("key %s" % ", ".join(sorted({r["key"] for r in keys})))
-    fixed = [r for r in retries if r["after"] == "valid"]
-    parts.append("%d retry line(s): %d left the camera node valid, %d did not" % (len(retries), len(fixed), len(retries) - len(fixed)))
-    keyon = bool(keys) and keys[-1]["key"] == "on"
-    problems = []
-    if stood and len(stood) == len(hooks) and keyon:
-        problems.append("the Update hook stood down with the key on: the repair did not run")
-    bad = [r for r in retries if r["after"] != "valid"]
-    if bad:
-        problems.append("%d retry(ies) ended with the camera node %s" % (len(bad), ", ".join(sorted({r["after"] for r in bad}))))
-    if rows.get("lost"):
-        problems.append("%d retry line(s) were not recorded" % _hsum(rows["lost"], "n"))
-    invalid_setups = [r for r in _hrows(ctx, H_LIVCAM, "setup") if not r["ours"] and r["node"] == "INVALID" and "LiveryActivity" in r["where"]]
-    if keyon and invalid_setups and not retries and not stood:
-        problems.append("%d Livery setup(s) left the camera node INVALID and no repair ran (the Update did not reach the gates)" % len(invalid_setups))
-    text = "; ".join(parts)
-    if problems:
-        return ("PARTIAL", text + "; " + "; ".join(problems))
-    return ("OK", text)
-
-
-def _hj_prevcam(rows, ctx):
-    """F231: the preview camera patch (preview_camera_core.h, TEMPORARY key experimental.native_on_foot_preview_camera): `45 33 C0 -> 41 B0 01` at +0x126FE70 forces every preview client's
-    camera request, applied while native on foot VR is active with the HUD override held; plus the two log-only hooks on SetCamera and Release. The summary counts the patch's edges, the SetCamera
-    calls from a preview client (return address +0x126FE81) by name and force byte, and the Releases. PARTIAL when a hook stood down, the patch was refused, not restored or could not be restored,
-    calls were lost or capped, or the key was on and a preview client asked for a camera with force 0 and the patch never applied."""
-    kinds = ("hook", "key", "applied", "restored", "refused", "notrestored", "retry", "setcam", "release", "capped", "lost")
-    if not any(rows.get(k) for k in kinds):
-        return None
-    hooks, keys = rows.get("hook", []), rows.get("key", [])
-    applied, restored, refused = rows.get("applied", []), rows.get("restored", []), rows.get("refused", [])
-    setcams, releases = rows.get("setcam", []), rows.get("release", [])
-    preview = [r for r in setcams if r["who"] == "a preview client"]
-    parts = []
-    stood = sorted({r["hook"] for r in hooks if r["st"] == "stood down"})
-    if hooks:
-        parts.append("hooks: %d armed%s" % (len({r["hook"] for r in hooks if r["st"] == "armed"}), (", stood down: " + ", ".join(stood)) if stood else ""))
-    if keys:
-        parts.append("key %s" % ", ".join(sorted({r["key"] for r in keys})))
-    parts.append("patch applied %d, restored %d" % (len(applied), len(restored)))
-    if setcams:
-        names = collections.Counter(r["name"] for r in preview)
-        forces = sorted({r["force"] for r in preview})
-        parts.append("%d SetCamera call(s), %d from a preview client (names %s; force %s)" % (
-            len(setcams), len(preview), ", ".join("\"%s\" x%d" % (n, c) for n, c in sorted(names.items())) or "none", ", ".join(forces) or "none"))
-    if releases:
-        parts.append("%d Release call(s)" % len(releases))
-    text = "; ".join(parts)
-    problems = []
-    if stood:
-        problems.append("hook(s) stood down: %s" % ", ".join(stood))
-    if refused:
-        problems.append("the patch was refused %d time(s) (%s)" % (len(refused), refused[-1]["why"][:80]))
-    if rows.get("notrestored") or rows.get("retry"):
-        problems.append("the patch could not be put back cleanly (%d not restored, %d retried)" % (len(rows.get("notrestored", [])), len(rows.get("retry", []))))
-    if rows.get("lost"):
-        problems.append("%d call(s) were not recorded" % _hsum(rows["lost"], "n"))
-    if rows.get("capped"):
-        problems.append("%d line(s) were not written (the cap of 40 in ten seconds)" % _hsum(rows["capped"], "n"))
-    keyon = bool(keys) and keys[-1]["key"] == "on"
-    if keyon and not applied and not refused and any(r["force"] == "0" for r in preview):
-        problems.append("a preview client asked for its camera with force 0 and the patch never applied")
-    if problems:
-        return ("PARTIAL", text + "; " + "; ".join(problems))
-    return ("OK", text)
-
-
 def _hj_prevroster(rows, ctx):
-    """F232: the preview camera's roster check (native_preview_camera_core.h; TEMPORARY key experimental.native_on_foot_preview_handover). While one of F209's watched preview screens is open, once a
-    second a line says which check refused the Location child last (per role, HMD or preview) with a snapshot of its roster (the count, mode, registered, stack vtable, members, name and each
-    entry's vtables, back-pointer and byte at entry-4) and how often each reason refused. The summary names the reasons seen and, for the newest line of each role, the roster's count. PARTIAL when
-    a roster could not be read (its count is unreadable)."""
-    kinds = ("key", "refused")
-    if not any(rows.get(k) for k in kinds):
+    """F232: the preview camera's roster check (native_preview_camera_core.h). While one of F209's watched preview screens is open, once a second a line says which check refused the Location child last (per
+    role, HMD or preview) with a snapshot of its roster (the count, mode, registered, stack vtable, members, name and each entry's vtables, back-pointer and byte at entry-4) and how often each reason refused.
+    The summary names the reasons seen and, for the newest line of each role, the roster's count. PARTIAL when a roster could not be read (its count is unreadable)."""
+    refused = rows.get("refused", [])
+    if not refused:
         return None
-    keys, refused = rows.get("key", []), rows.get("refused", [])
-    parts = []
-    if keys:
-        parts.append("key %s" % ", ".join(sorted({r["key"] for r in keys})))
     byrole = collections.defaultdict(list)
     for r in refused:
         byrole[r["role"]].append(r)
+    parts = []
     for role in sorted(byrole):
         rs = byrole[role]
         reasons = collections.Counter(r["why"] for r in rs)
         last = rs[-1]
         parts.append("%s: %d line(s), refused for %s; newest roster count %s mode %s, %s entr(ies)" % (
             role, len(rs), ", ".join("%s x%d" % (w, n) for w, n in sorted(reasons.items())), last["count"], last["mode"], len(re.findall(r"; entry \d+:", last["entries"]))))
-    if not refused:
-        parts.append("no refused roster logged")
     text = "; ".join(parts)
     unread = [r for r in refused if r["count"] == "unreadable"]
     if unread:
@@ -12752,20 +12593,18 @@ def _hj_prevroster(rows, ctx):
 
 
 def _hj_preveye(rows, ctx):
-    """F233: the weapon previews' head producer (HeadlookCamera, TEMPORARY key experimental.native_on_foot_preview_headlook) and the eye path's instrument (native_preview_camera_core.h): the producer hook
-    (armed or stood down), the key, once a second while a watched preview screen is open the finalization snapshot (the head class, applied or refused and why, the output, head, preview and base translations
-    and the distances) and the eye stub's (the head it carried, whether EDVR replaced it, the distances to the published head, output, head, preview, base and origin). PARTIAL when the hook stood down
-    with the key on, or finalizations were logged and none was applied."""
-    kinds = ("hook", "key", "final", "eye")
+    """F233: the weapon previews' head producer (HeadlookCamera) and the eye path's instrument (native_preview_camera_core.h): the producer hook (armed or stood down), and once a second while a watched
+    preview screen is open the finalization snapshot (the head class, applied or refused and why, the output, head, preview and base translations and the distances) and the eye stub's (the head it carried,
+    whether EDVR replaced it, the distances to the published head, output, head, preview, base and origin). PARTIAL when the hook stood down (weapon previews are not handled), or finalizations were logged
+    and none was applied."""
+    kinds = ("hook", "final", "eye")
     if not any(rows.get(k) for k in kinds):
         return None
-    hooks, keys, finals, eyes = rows.get("hook", []), rows.get("key", []), rows.get("final", []), rows.get("eye", [])
+    hooks, finals, eyes = rows.get("hook", []), rows.get("final", []), rows.get("eye", [])
     parts = []
     stood = [r for r in hooks if r["st"] == "stood down"]
     if hooks:
         parts.append("Headlook producer hook %s" % ("stood down" if stood else "armed"))
-    if keys:
-        parts.append("key %s" % ", ".join(sorted({r["key"] for r in keys})))
     if finals:
         by = collections.Counter("%s %s" % (r["cls"], "applied" if r["res"] == "applied" else "refused (%s)" % r["why"]) for r in finals)
         parts.append("%d final line(s): %s" % (len(finals), ", ".join("%s x%d" % (k, n) for k, n in sorted(by.items()))))
@@ -12773,9 +12612,8 @@ def _hj_preveye(rows, ctx):
         parts.append("%d eye line(s), %d replaced" % (len(eyes), len([r for r in eyes if r["rep"] == "replaced"])))
     text = "; ".join(parts)
     problems = []
-    keyon = bool(keys) and keys[-1]["key"] == "on"
-    if stood and keyon:
-        problems.append("the Headlook producer hook stood down with the key on: weapon previews are not handled")
+    if stood:
+        problems.append("the Headlook producer hook stood down: weapon previews are not handled")
     if finals and not [r for r in finals if r["res"] == "applied"]:
         problems.append("every finalization snapshot was refused")
     if problems:
@@ -18038,8 +17876,7 @@ HEALTH_RULES = (
         ("hook", r"avatar hooks: (?P<hook>shop-[a-z-]+) hook (?P<st>armed|stood down)"),
         ("on", r"shop screens \(F209\): the shop signal is ON: F107 holds the camera away \(suit (?P<suit>\w+), weapons (?P<weap>\w+), kiosk (?P<kiosk>[\w ]+?), livery (?P<liv>[\w ]+?); change (?P<n>\d+)\)"),
         ("off", r"shop screens \(F209\): the shop signal is OFF \(suit (?P<suit>\w+), weapons (?P<weap>\w+), kiosk (?P<kiosk>[\w ]+?), livery (?P<liv>[\w ]+?); change (?P<n>\d+)\)"),
-        ("lvopen", r"shop screens \(F209\): (?P<cls>Humanoid\w*LiveryActivity) opened: (?P<how>F107 holds the camera away|only watched)[^(]*\(experimental\.native_on_foot_livery_game_view is (?P<key>on|off)\)"),
-        ("loadopen", r"shop screens \(F209\): HumanoidOutfittingInteraction opened: (?P<how>F107 holds the camera away|only watched)[^(]*\(experimental\.native_on_foot_loadout_game_view is (?P<key>on|off)\)"),
+        ("lvopen", r"shop screens \(F209\): (?P<cls>Humanoid(?:\w*LiveryActivity|OutfittingInteraction)) opened: F107 holds the camera away, the view is the game's own$"),
         ("show", r"shop screens \(F209\): (?P<cls>\w+) Show: \+0x79 (?P<b>-?\d+) -> (?P<a>-?\d+) \(this 0x(?P<this>[0-9A-F]+), thread (?P<tid>\d+)\)"),
         ("close", r"shop screens \(F209\): (?P<cls>\w+) Close: \+0x79 (?P<b>-?\d+) -> (?P<a>-?\d+) \(this 0x(?P<this>[0-9A-F]+), thread (?P<tid>\d+)\)"),
         ("state", r"shop screens \(F209\): SuitUIStateMachine: \"(?P<from>[^\"]*)\" -> \"(?P<to>[^\"]*)\" \(thread (?P<tid>\d+)\)"),
@@ -18051,45 +17888,13 @@ HEALTH_RULES = (
         ("capped", r"shop screens \(F209\): (?P<n>\d+) event lines in the last 10 s were not written"),
         ("lost", r"shop screens \(F209\): (?P<n>\d+) shop event\(s\) were not recorded"),
     ), _hj_shop),
-    _hrule(H_LIVCAM, ("F229",), ("(F229)",), (
-        ("hook", r"avatar hooks: (?P<hook>livery-camera-setup) hook (?P<st>armed|stood down)"),
-        ("sec", r"livery camera \(F229\): (?P<cls>\w+) 1 s: this 0x(?P<this>[0-9A-F]+), client 0x(?P<client>[0-9A-F]+): mode (?P<mode>-?\d+), kind (?P<kind>-?\d+), step (?P<step>\S+), dist (?P<oa>\S+), max (?P<max>\S+), min (?P<ob>\S+), retry (?P<retry>\d+), "
-                r"pose rows (?P<rows>.*), translation length last row (?P<rowlen>\S+), last column (?P<collen>\S+)$"),
-        ("setup", r"livery camera \(F229\): setup call 0x12714C0: rcx 0x(?P<rcx>[0-9A-F]+), object \(rcx - 0x58\) 0x(?P<obj>[0-9A-F]+), r8 0x(?P<r8>[0-9A-F]+), mode (?P<mode>-?\d+|unreadable), (?P<q>qword 0x[0-9A-F]+|qword unreadable) \(thread (?P<tid>\d+)\), the object is (?P<where>.*?), camera node (?P<node>valid|INVALID|not tested)(?P<ours> \(EDVR's repair call\))?$"),
-        ("unread", r"livery camera \(F229\): (?P<cls>\w+) \(this 0x(?P<this>[0-9A-F]+)\) client 0x(?P<client>[0-9A-F]+): the camera fields (?P<why>could not be read|hold a value that is not a number):.*"),
-        ("capped", r"livery camera \(F229\): (?P<n>\d+) (?P<what>camera|setup|repair) lines in the last 10 s were not written"),
-        ("lost", r"livery camera \(F229\): (?P<n>\d+) setup call\(s\) were not recorded"),
-    ), _hj_livcam),
-    _hrule(H_LIVREP, ("F230",), ("(F230",), (
-        ("hook", r"avatar hooks: (?P<hook>livery-camera-update) hook (?P<st>armed|stood down)"),
-        ("key", r"native on foot livery camera \(F230, TEMPORARY\): experimental\.native_on_foot_livery_camera_repair is (?P<key>on|off) -- .*"),
-        ("retry", r"livery camera repair \(F230\): attempt (?P<n>\d+) of (?P<max>\d+): the setup was run again by EDVR \(client 0x(?P<client>[0-9A-F]+), mode (?P<mode>\d+), qword 0x(?P<q>[0-9A-F]+), "
-                  r"thread (?P<tid>\d+)\), camera node INVALID before, (?P<after>valid|INVALID|unreadable|the call faulted) after"),
-        ("lost", r"livery camera repair \(F230\): (?P<n>\d+) repair line\(s\) were not recorded"),
-    ), _hj_livrep),
-    _hrule(H_PREVCAM, ("F231",), ("(F231",), (
-        ("hook", r"avatar hooks: (?P<hook>preview-camera-(?:set|release)) hook (?P<st>armed|stood down)"),
-        ("key", r"native on foot preview camera \(F231, TEMPORARY\): experimental\.native_on_foot_preview_camera is (?P<key>on|off) -- .*"),
-        ("applied", r"native on foot preview camera \(F231, TEMPORARY\): patch EliteDangerous64\.exe\+0x126FE70 45 33 C0 -> 41 B0 01 \(.*"),
-        ("restored", r"native on foot preview camera \(F231, TEMPORARY\): patch EliteDangerous64\.exe\+0x126FE70 41 B0 01 -> 45 33 C0 \(restored: (?P<why>.*)\)$"),
-        ("refused", r"native on foot preview camera \(F231, TEMPORARY\): patch EliteDangerous64\.exe\+0x126FE70 NOT patched -- (?P<why>.*)$"),
-        ("notrestored", r"native on foot preview camera \(F231, TEMPORARY\): patch EliteDangerous64\.exe\+0x126FE70 NOT restored -- .*"),
-        ("retry", r"native on foot preview camera \(F231, TEMPORARY\): patch EliteDangerous64\.exe\+0x126FE70 could not be restored .*"),
-        ("setcam", r"preview camera \(F231\): SetCamera at (?P<ms>\d+) ms, thread (?P<tid>\d+), called from \+0x(?P<ret>[0-9A-F]+) \((?P<who>a preview client|another caller)\), "
-                   r"camera name \"(?P<name>[^\"]*)\"(?P<via> \(read through a string object\))?, force (?P<force>\d+)$"),
-        ("release", r"preview camera \(F231\): Release at (?P<ms>\d+) ms, thread (?P<tid>\d+), called from \+0x(?P<ret>[0-9A-F]+)$"),
-        ("capped", r"preview camera \(F231\): (?P<n>\d+) (?P<what>SetCamera|Release) lines in the last 10 s were not written"),
-        ("lost", r"preview camera \(F231\): (?P<n>\d+) call\(s\) were not recorded"),
-    ), _hj_prevcam),
     _hrule(H_PREVROSTER, ("F232",), ("(F232",), (
-        ("key", r"native on foot preview handover \(F232, TEMPORARY\): experimental\.native_on_foot_preview_handover is (?P<key>on|off) -- .*"),
-        ("refused", r"native preview camera \(F232\): role (?P<role>HMD|preview) refused: (?P<why>[^;]+); handover (?P<ho>on|off); roster: child 0x(?P<child>[0-9A-F]+), count (?P<count>\w+), "
+        ("refused", r"native preview camera \(F232\): role (?P<role>HMD|preview) refused: (?P<why>[^;]+); roster: child 0x(?P<child>[0-9A-F]+), count (?P<count>\w+), "
                     r"mode (?P<mode>\w+), registered (?P<reg>\w+), stack vtable (?P<stack>\S+), members (?P<members>\w+), name \"(?P<name>[^\"]*)\"(?P<entries>(?:; entry \d+: .*?)*)"
                     r"; refusals by reason:(?P<counts>.*)$"),
     ), _hj_prevroster),
     _hrule(H_PREVEYE, ("F233",), ("(F233",), (
         ("hook", r"native preview camera \(F233\): HeadlookCamera producer hook (?P<st>armed|stood down).*"),
-        ("key", r"native on foot preview headlook \(F233, TEMPORARY\): experimental\.native_on_foot_preview_headlook is (?P<key>on|off) -- .*"),
         ("final", r"native preview camera \(F233\): final child 0x(?P<child>[0-9A-F]+) head class (?P<cls>HMD|Headlook): (?P<res>applied|refused \((?P<why>[^)]*)\)); output (?P<out>.*?), head primary .*"
                   r"output to head (?P<oh>\S+) m, output to preview (?P<op>\S+) m(?P<extra>.*)$"),
         ("eye", r"native preview camera \(F233\): eye head (?P<head>.*?), (?P<rep>replaced|not replaced); published eye head .*distance to published (?P<dp>\S+) m, to output (?P<do>\S+) m, "
@@ -19996,7 +19801,6 @@ def self_test_health():
         shopsrc = read_text(os.path.join(repo_root(), "src", "d3d11", "shop_screen_core.h"))   # F209: the buy screens' event, signal and one-second lines
         rostersrc = read_text(os.path.join(repo_root(), "src", "d3d11", "native_preview_camera_core.h"))   # F232: the refused roster's line
         camsrc = read_text(os.path.join(repo_root(), "src", "d3d11", "native_preview_camera.cpp"))   # F233: the Headlook hook's arming lines
-        previewsrc = read_text(os.path.join(repo_root(), "src", "d3d11", "preview_camera_core.h"))   # F231: the preview camera patch's and the two hooks' lines
         f212src = read_text(os.path.join(repo_root(), "src", "d3d11", "native_on_foot_f212.h"))   # F212: the conversation look's run and summary lines
         probesrc = read_text(probe_path)
     except OSError as e:
@@ -20434,15 +20238,6 @@ def self_test_health():
             fmts[key] = health_c_format(rostersrc, needle)
         if fmts[key] is None:
             raise AssertionError("native_preview_camera_core.h has no format holding %r: the --health rule that reads it is out of date" % needle)
-        return health_render(fmts[key], vals)
-
-    def RP(needle, *vals):
-        """F231's lines (the patch's events, the key and the two hooks' calls in preview_camera_core.h), from their own format literals."""
-        key = "preview:" + needle
-        if key not in fmts:
-            fmts[key] = health_c_format(previewsrc, needle)
-        if fmts[key] is None:
-            raise AssertionError("preview_camera_core.h has no format holding %r: the --health rule that reads it is out of date" % needle)
         return health_render(fmts[key], vals)
 
     def R212(needle, *vals):
@@ -22730,8 +22525,7 @@ def self_test_health():
         WLSHOW209 = RS(": +0x79 %d -> %d (this", TAG209, "HumanoidWeaponLiveryActivity", "Show", 0, 1, 0x5E6F7081, 7)
         LON209 = RS("the shop signal is %s (suit", TAG209, "ON: F107 holds the camera away", "closed", "closed", "not running", "suit open", 1)
         LOFF209 = RS("the shop signal is %s (suit", TAG209, "OFF", "closed", "closed", "not running", "closed", 2)
-        LOPEN_HELD209 = RS("opened: %s (%s is %s)", TAG209, "HumanoidLiveryActivity", "F107 holds the camera away, the view is the game's own", "experimental.native_on_foot_livery_game_view", "on")
-        LOPEN_WATCH209 = RS("opened: %s (%s is %s)", TAG209, "HumanoidWeaponLiveryActivity", "only watched, the camera is not held away", "experimental.native_on_foot_livery_game_view", "off")
+        LOPEN_HELD209 = RS("opened: F107 holds the camera away, the view is the game's own", TAG209, "HumanoidLiveryActivity")
         STATE209 = RS('SuitUIStateMachine: \\"%s\\" -> \\"%s\\"', TAG209, "OnFoot", "Suit Vendor", 7)
         KSTART209 = RS(": +0x1F8 %d -> %d (this", TAG209, "ArmouryVendorActivity", "started", 0, 1, 0x3C4D5E6F, 7)
         KSTOP209 = RS(": +0x1F8 %d -> %d (this", TAG209, "ArmouryVendorActivity", "stopped", 1, 0, 0x3C4D5E6F, 7)
@@ -22773,14 +22567,11 @@ def self_test_health():
               has=["1 Show(s) left the byte +0x79 not set (read 0)"], lacks=["UNPARSED"])
         check("F209: a signal that went on more often than it went off may have stuck", [neck(), SHOW209, ON209, AWAY_LEFT_SHOP, OFF209, ON209, ON209, AWAY_END_SHOP, neck()], 0, [("PARTIAL", S209)],
               has=["the signal went on 3 times and off 1: it may have stuck"], lacks=["UNPARSED"])
-        check("F228: a suit Livery screen opened and closed with the key on, F107 held the camera away by the shop screen, and the lines are counted by class",
+        check("F228: a suit Livery screen opened and closed, F107 held the camera away by the shop screen, and the lines are counted by class",
               [neck(), LSHOW209, LOPEN_HELD209, LON209, AWAY_LEFT_SHOP, LSEC209, LSEC209, LCLOSE209, LOFF209, AWAY_END_SHOP, neck()], 0, [("OK", S209), ("OK", F107)],
-              has=["1 Show / 1 Close (HumanoidLiveryActivity 1)", "1 Livery screen(s) opened (1 held by the camera-away signal, 0 only watched; key on)", "2 one-second line(s)"], lacks=["UNPARSED"])
-        check("F228: the weapon Livery with the key off is only watched: Show and Close are counted, the signal never goes on, and that is not a fault",
-              [neck(), WLSHOW209, LOPEN_WATCH209, LCLOSE209, neck()], 0, [("OK", S209)],
-              has=["HumanoidWeaponLiveryActivity 1", "1 Livery screen(s) opened (0 held by the camera-away signal, 1 only watched; key off)"], lacks=["never went on", "UNPARSED"])
-        check("F228: a Livery screen opened with the key on and the signal never went on is PARTIAL",
-              [neck(), LSHOW209, LOPEN_HELD209, LCLOSE209, neck()], 0, [("PARTIAL", S209)], has=["a Livery screen opened with the key on (held) but the signal never went on"])
+              has=["1 Show / 1 Close (HumanoidLiveryActivity 1)", "1 Livery or loadout screen opening(s) held by the camera-away signal (HumanoidLiveryActivity)", "2 one-second line(s)"], lacks=["UNPARSED"])
+        check("F228: a Livery screen opened and the signal never went on is PARTIAL",
+              [neck(), LSHOW209, LOPEN_HELD209, LCLOSE209, neck()], 0, [("PARTIAL", S209)], has=["a Livery screen or the loadout browser opened but the signal never went on"])
         check("F228: the Livery signal went on and F107 logged no episode by the shop screen: the view did not change",
               [neck(), BEGAN209, LSHOW209, LOPEN_HELD209, LON209, AWAY_LEFT_3M7, AWAY_END_3M7, LCLOSE209, LOFF209, neck()], 3, [("NEVER APPLIED", S209)])
         check("F209: a line that drifted from its pattern is unparsed", [neck(), "shop screens (F209): the buy screen is somewhere else"], 4, [("UNPARSED", S209)])
@@ -22790,120 +22581,23 @@ def self_test_health():
         OCLOSE234 = RS(": +0x79 %d -> %d (this", TAG209, "HumanoidOutfittingInteraction", "Close", 1, 0, 0x6F708192, 7)
         OON234 = RS("the shop signal is %s (suit", TAG209, "ON: F107 holds the camera away", "closed", "closed", "not running", "loadout open", 1)
         OOFF234 = RS("the shop signal is %s (suit", TAG209, "OFF", "closed", "closed", "not running", "closed", 2)
-        OOPEN_HELD234 = RS("opened: %s (%s is %s)", TAG209, "HumanoidOutfittingInteraction", "F107 holds the camera away, the view is the game's own", "experimental.native_on_foot_loadout_game_view", "on")
-        OOPEN_WATCH234 = RS("opened: %s (%s is %s)", TAG209, "HumanoidOutfittingInteraction", "only watched, the camera is not held away", "experimental.native_on_foot_loadout_game_view", "off")
-        check("F234: the loadout browser opened and closed with the key on, F107 held the camera away by the shop screen", [neck(), OSHOW234, OOPEN_HELD234, OON234, AWAY_LEFT_SHOP, OCLOSE234, OOFF234, AWAY_END_SHOP, neck()], 0,
-              [("OK", S209), ("OK", F107)], has=["1 loadout browser opening(s) (1 held by the camera-away signal, 0 only watched; key on)", "HumanoidOutfittingInteraction 1"], lacks=["UNPARSED"])
-        check("F234: the loadout browser with the key off is only watched: not a fault", [neck(), OSHOW234, OOPEN_WATCH234, OCLOSE234, neck()], 0, [("OK", S209)],
-              has=["1 loadout browser opening(s) (0 held by the camera-away signal, 1 only watched; key off)"], lacks=["never went on", "UNPARSED"])
-        check("F234: the loadout browser opened with the key on and the signal never went on is PARTIAL", [neck(), OSHOW234, OOPEN_HELD234, OCLOSE234, neck()], 0, [("PARTIAL", S209)],
-              has=["the loadout browser opened with the key on (held) but the signal never went on"])
+        OOPEN_HELD234 = RS("opened: F107 holds the camera away, the view is the game's own", TAG209, "HumanoidOutfittingInteraction")
+        check("F234: the loadout browser opened and closed, F107 held the camera away by the shop screen", [neck(), OSHOW234, OOPEN_HELD234, OON234, AWAY_LEFT_SHOP, OCLOSE234, OOFF234, AWAY_END_SHOP, neck()], 0,
+              [("OK", S209), ("OK", F107)], has=["1 Livery or loadout screen opening(s) held by the camera-away signal (HumanoidOutfittingInteraction)", "HumanoidOutfittingInteraction 1"], lacks=["UNPARSED"])
+        check("F234: the loadout browser opened and the signal never went on is PARTIAL", [neck(), OSHOW234, OOPEN_HELD234, OCLOSE234, neck()], 0, [("PARTIAL", S209)],
+              has=["a Livery screen or the loadout browser opened but the signal never went on"])
 
-        # ---- the Livery camera instrument (F229): the preview client's camera fields once a second, the setup's calls, and the loadout browser watched beside the Livery screens ----
-        TAG229 = "livery camera (F229):"
-        ROWS229 = ("-1.0000", "-0.5000", "0.0000", "0.0000", "0.5000", "1.0000", "1.5000", "0.0000", "2.0000", "2.5000", "3.0000", "0.0000", "3.0000", "4.0000", "0.0000", "1.0000")
-
-        def cam229(cls, this, client, orbit_a, orbit_b, rowlen, collen):
-            return RS("1 s: this 0x%08X, client 0x%08X: mode %d", TAG229, cls, this, client, 3, 1, "0.2500", orbit_a, "9.0000", orbit_b, 1, *(ROWS229 + (rowlen, collen)))
-        CAM_L1 = cam229("HumanoidLiveryActivity", 0x4D5E6F70, 0x4D5E75F0, "4.0000", "0.0000", "5.0000", "3.0000")
-        CAM_L2 = cam229("HumanoidLiveryActivity", 0x4D5E6F70, 0x4D5E75F0, "0.0000", "0.0000", "0.0000", "0.0000")
-        CAM_O1 = cam229("HumanoidOutfittingInteraction", 0x6F708192, 0x6F708252, "4.2000", "4.2000", "4.2000", "4.2000")
-        CAM_NAN = cam229("HumanoidLiveryActivity", 0x4D5E6F70, 0x4D5E75F0, "nan", "nan", "nan", "nan")
-        SETUP_L = RS("setup call 0x12714C0: rcx 0x%08X", TAG229, 0x4D5E7648, 0x4D5E75F0, 0x00FF0010, "1", "qword 0x1", 7, "HumanoidLiveryActivity object +0x680, which is client +0x0", "INVALID", "")
-        SETUP_OURS = RS("setup call 0x12714C0: rcx 0x%08X", TAG229, 0x4D5E7648, 0x4D5E75F0, 0x00FF0010, "1", "qword 0x1", 7, "HumanoidLiveryActivity object +0x680, which is client +0x0", "valid", " (EDVR's repair call)")
-        SETUP_NONE = RS("setup call 0x12714C0: rcx 0x%08X", TAG229, 0x12345678, 0x12345620, 0x00FF0010, "unreadable", "qword unreadable", 7, "in no watched screen's object", "not tested", "")
-        UNREAD229 = RS("(this 0x%08X) client 0x%08X: the camera fields %s:", TAG229, "HumanoidLiveryActivity", 0x4D5E6F70, 0x4D5E75F0, "could not be read")
-        NAN229 = RS("(this 0x%08X) client 0x%08X: the camera fields %s:", TAG229, "HumanoidLiveryActivity", 0x4D5E6F70, 0x4D5E75F0, "hold a value that is not a number")
-        CAPPED229 = RS("%s lines in the last 10 s were not written", TAG229, 12, "camera", 40)
-        LOST229 = RS("setup call(s) were not recorded", TAG229, 3)
-        OSHOW209 = RS(": +0x79 %d -> %d (this", TAG209, "HumanoidOutfittingInteraction", "Show", 0, 1, 0x6F708192, 7)
-        OCLOSE209 = RS(": +0x79 %d -> %d (this", TAG209, "HumanoidOutfittingInteraction", "Close", 1, 0, 0x6F708192, 7)
-        HOOK_UP229 = RH("hook armed: EliteDangerous64.exe+0x%llX", "avatar hooks:", "livery-camera-setup", 0x12714C0,
-                        "CustomisationVisual preview client's scene setup (picks the attach and camera nodes from the mode int at r8)", 0x7FF6012714C0, 6, 16, 16, 0x7FF700000000,
-                        RHT("the Livery camera instrument (F229)"))
-        HOOK_DOWN229 = RH("hook stood down: %s. %s", "avatar hooks:", "livery-camera-setup", "the game build differs (the PE timestamp or image size is not build 334925's); EliteDangerous64.exe+0x12714C0 was not touched",
-                          RHT("the Livery preview client's setup calls (F229) are not logged"))
-        check("F229: the setup call and the once-a-second camera lines of a Livery screen and the loadout browser are summarised by class, with the orbit distances' and the translation lengths' ranges",
-              [neck(), HOOK_UP229, LSHOW209, SETUP_L, SETUP_NONE, CAM_L1, CAM_O1, CAM_L2, LCLOSE209, neck()], 0, [("OK", H_LIVCAM)],
-              has=["setup hook armed", "HumanoidLiveryActivity: 2 camera line(s), kind 1, dist 0.0000 to 4.0000", "HumanoidOutfittingInteraction: 1 camera line(s), kind 1, dist 4.2000", "translation length last row 0.0000 to 5.0000",
-                   "1 of 2 game setup call(s) left the camera node INVALID", "2 setup call(s), mode 1 x1, unreadable x1; object HumanoidLiveryActivity client +0x0 x1; in no watched screen's object x1"], lacks=["UNPARSED"])
-        check("F229: the loadout browser's Show and Close are counted by class and are not a buy screen: a Show with no signal is not a fault",
-              [neck(), OSHOW209, OCLOSE209, neck()], 0, [("OK", S209)], has=["HumanoidOutfittingInteraction 1"], lacks=["a buy screen was shown but the signal never went on", "UNPARSED"])
-        check("F229: a client that could not be read, or holds a value that is not a number, is PARTIAL and names the class",
-              [neck(), HOOK_UP229, UNREAD229, CAM_NAN, NAN229], 0, [("PARTIAL", H_LIVCAM)], has=["could not be read or held a value that is not a number (HumanoidLiveryActivity)", "no number"])
-        check("F229: the setup hook stood down is PARTIAL and says the calls are not logged", [neck(), HOOK_DOWN229, CAM_L1], 0, [("PARTIAL", H_LIVCAM)],
-              has=["setup hook stood down", "the setup calls are not logged"])
-        check("F229: setup calls that were not recorded and lines the cap dropped are PARTIAL", [neck(), HOOK_UP229, SETUP_L, LOST229, CAPPED229, CAM_L1], 0, [("PARTIAL", H_LIVCAM)],
-              has=["3 setup call(s) were not recorded", "12 line(s) were not written (the cap of 40 in ten seconds)"])
-        check("F229: a line that drifted from its pattern is unparsed", [neck(), "livery camera (F229): the camera is somewhere else"], 4, [("UNPARSED", H_LIVCAM)])
-
-        # ---- the Livery camera repair (F230): the Update hook, the key, the retries ----
-        TAG230 = "livery camera repair (F230):"
-        HOOK_UP230 = RH("hook armed: EliteDangerous64.exe+0x%llX", "avatar hooks:", "livery-camera-update", 0x1272780,
-                        "CustomisationVisual preview client's per-frame Update (the Livery camera repair runs the setup again from it)", 0x7FF601272780, 7, 16, 16, 0x7FF700000000,
-                        RHT("the Livery camera repair (F230, TEMPORARY key"))
-        HOOK_DOWN230 = RH("hook stood down: %s. %s", "avatar hooks:", "livery-camera-update", "the game build differs (the PE timestamp or image size is not build 334925's); EliteDangerous64.exe+0x1272780 was not touched",
-                          RHT("the Livery camera repair (F230) does not run"))
-        KEY_ON230 = RS("native on foot livery camera (F230, TEMPORARY): %s is %s -- %s", "experimental.native_on_foot_livery_camera_repair", "on", "when a Livery preview's camera node is invalid")
-        KEY_OFF230 = RS("native on foot livery camera (F230, TEMPORARY): %s is %s -- %s", "experimental.native_on_foot_livery_camera_repair", "off", "the Livery preview's camera node is only logged (F229); EDVR runs nothing")
-        RETRY_OK230 = RS("attempt %u of %u: the setup was run again", TAG230, 1, 5, 0x4D5E75F0, 1, 0x1, 7, "valid")
-        RETRY_BAD230 = RS("attempt %u of %u: the setup was run again", TAG230, 2, 5, 0x4D5E75F0, 1, 0x1, 7, "INVALID")
-        LOST230 = RH("repair line(s) were not recorded", TAG230, 2)
-        check("F230: the key on, the Update hook armed and a retry that made the node valid is OK", [neck(), HOOK_UP230, KEY_ON230, LSHOW209, SETUP_L, RETRY_OK230, SETUP_OURS, LCLOSE209, neck()], 0, [("OK", H_LIVREP)],
-              has=["Update hook armed", "key on", "1 retry line(s): 1 left the camera node valid, 0 did not"], lacks=["UNPARSED"])
-        check("F230: the key off with no retry is OK: only the evidence lines (F229) are written", [neck(), HOOK_UP230, KEY_OFF230, LSHOW209, SETUP_L, LCLOSE209, neck()], 0, [("OK", H_LIVREP)],
-              has=["key off", "0 retry line(s)"], lacks=["UNPARSED", "no repair ran"])
-        check("F230: a retry that left the node INVALID is PARTIAL", [neck(), HOOK_UP230, KEY_ON230, SETUP_L, RETRY_BAD230], 0, [("PARTIAL", H_LIVREP)], has=["1 retry(ies) ended with the camera node INVALID"])
-        check("F230: the key on, a Livery setup left the node INVALID and no repair ran is PARTIAL", [neck(), HOOK_UP230, KEY_ON230, LSHOW209, SETUP_L, LCLOSE209], 0, [("PARTIAL", H_LIVREP)],
-              has=["1 Livery setup(s) left the camera node INVALID and no repair ran"])
-        check("F230: the Update hook stood down with the key on is PARTIAL", [neck(), HOOK_DOWN230, KEY_ON230], 0, [("PARTIAL", H_LIVREP)], has=["Update hook stood down", "the repair did not run"])
-        check("F230: retry lines that were not recorded are PARTIAL", [neck(), HOOK_UP230, KEY_ON230, RETRY_OK230, LOST230], 0, [("PARTIAL", H_LIVREP)], has=["2 retry line(s) were not recorded"])
-        check("F230: a line that drifted from its pattern is unparsed", [neck(), "livery camera repair (F230): the setup is somewhere else"], 4, [("UNPARSED", H_LIVREP)])
-
-        # ---- the preview camera patch (F231): the key, the patch's edges, the two hooks' calls ----
-        TAG231P = "native on foot preview camera (F231, TEMPORARY):"
-        TAG231H = "preview camera (F231):"
-        HOOK_UP231 = RH("hook armed: EliteDangerous64.exe+0x%llX", "avatar hooks:", "preview-camera-set", 0x1D7BEC0, "local camera controller SetCamera(name, force) (slot +0x30)", 0x7FF601D7BEC0, 5, 20, 20, 0x7FF700000000,
-                        RHT("the preview camera evidence (F231)"))
-        HOOK_DOWN231 = RH("hook stood down: %s. %s", "avatar hooks:", "preview-camera-release", "the game build differs (the PE timestamp or image size is not build 334925's); EliteDangerous64.exe+0x1D7C1E0 was not touched",
-                          RHT("the camera controller's SetCamera and Release calls (F231) are not logged"))
-        KEY_ON231 = RP("%s %s is %s -- %s", TAG231P, "experimental.native_on_foot_preview_camera", "on", "while native stereo is on foot every preview client's camera request is forced")
-        KEY_OFF231 = RP("%s %s is %s -- %s", TAG231P, "experimental.native_on_foot_preview_camera", "off", "the game's camera request is left as it is")
-        APPLIED231 = RP("45 33 C0 -> 41 B0 01 (every preview client", TAG231P, 0x126FE70)
-        RESTORED231 = RP("41 B0 01 -> 45 33 C0 (restored: %s)", TAG231P, 0x126FE70, "the game session ended")
-        REFUSED231 = RP("NOT patched -- the %u bytes at", TAG231P, 0x126FE70, 21, 0x126FE6C, "48 8B 53 50 44 33 C0", "48 8B 53 50 45 33 C0")
-        SETCAM_PREV231 = RP("SetCamera at %llu ms", TAG231H, 123456, 7, 0x126FE81, "a preview client", "Livery Camera", "", 1)
-        SETCAM_PREV0_231 = RP("SetCamera at %llu ms", TAG231H, 123456, 7, 0x126FE81, "a preview client", "Livery Camera", "", 0)
-        SETCAM_OTHER231 = RP("SetCamera at %llu ms", TAG231H, 123500, 7, 0x2889F95, "another caller", "Cockpit Camera", " (read through a string object)", 0)
-        RELEASE231 = RP("Release at %llu ms", TAG231H, 124000, 7, 0x126FE90)
-        CAPPED231 = RP("%s lines in the last 10 s were not written", TAG231H, 12, "SetCamera", 40)
-        LOST231 = RP("call(s) were not recorded", TAG231H, 3)
-        check("F231: the key on, the patch applied and put back, a preview client's SetCamera forced and a Release is OK",
-              [neck(), HOOK_UP231, KEY_ON231, APPLIED231, SETCAM_PREV231, SETCAM_OTHER231, RELEASE231, RESTORED231, neck()], 0, [("OK", H_PREVCAM)],
-              has=["hooks: 1 armed", "key on", "patch applied 1, restored 1", "2 SetCamera call(s), 1 from a preview client (names \"Livery Camera\" x1; force 1)", "1 Release call(s)"], lacks=["UNPARSED"])
-        check("F231: the key off with only the evidence lines is OK", [neck(), HOOK_UP231, KEY_OFF231, SETCAM_PREV0_231, RELEASE231], 0, [("OK", H_PREVCAM)], has=["key off", "force 0"], lacks=["never applied"])
-        check("F231: the key on, a preview client asked with force 0 and the patch never applied is PARTIAL", [neck(), HOOK_UP231, KEY_ON231, SETCAM_PREV0_231], 0, [("PARTIAL", H_PREVCAM)],
-              has=["a preview client asked for its camera with force 0 and the patch never applied"])
-        check("F231: a refused patch is PARTIAL and says why", [neck(), HOOK_UP231, KEY_ON231, REFUSED231], 0, [("PARTIAL", H_PREVCAM)], has=["the patch was refused 1 time(s)", "the 21 bytes at +0x126FE6C"])
-        check("F231: a hook that stood down is PARTIAL", [neck(), HOOK_DOWN231, KEY_ON231, APPLIED231], 0, [("PARTIAL", H_PREVCAM)], has=["stood down: preview-camera-release"])
-        check("F231: calls that were not recorded and lines the cap dropped are PARTIAL", [neck(), HOOK_UP231, KEY_ON231, APPLIED231, LOST231, CAPPED231], 0, [("PARTIAL", H_PREVCAM)],
-              has=["3 call(s) were not recorded", "12 line(s) were not written (the cap of 40 in ten seconds)"])
-        check("F231: a line that drifted from its pattern is unparsed", [neck(), "preview camera (F231): SetCamera somewhere else"], 4, [("UNPARSED", H_PREVCAM)])
-
-        # ---- the preview camera's roster (F232): the key and the refused roster's line ----
+        # ---- the preview camera's roster (F232): the refused roster's line ----
         TAG232 = "native preview camera (F232):"
-        KEY_ON232 = RP("native on foot preview handover (F232, TEMPORARY): %s is %s -- %s", "experimental.native_on_foot_preview_handover", "on", "the preview camera accepts a Location camera list of two to six producers")
-        KEY_OFF232 = RP("native on foot preview handover (F232, TEMPORARY): %s is %s -- %s", "experimental.native_on_foot_preview_handover", "off", "the preview camera accepts a Location camera list of exactly two producers, as before")
-        HEAD232 = RN("role %s refused: %s; handover %s; roster:", TAG232, "preview", "count", "off", 0x1234ABCD, "3", "0", "1", "+0x8180", "1", "Location")
-        HEAD232U = RN("role %s refused: %s; handover %s; roster:", TAG232, "HMD", "child vtable", "on", 0x0, "unreadable", "unreadable", "unreadable", "unreadable", "unreadable", "unreadable")
-        ENT232 = [RN("; entry %u: ptr 0x%llX iface %s obj-0x20 %s obj-0x60 %s back %s b-4 %s", i, 0x1000 * (i + 1), "+0x8200", "+0x8280", "0x0", "yes", "01") for i in range(3)]
-        TAIL232 = RN("; refusals by reason:") + RN(" %s %llu,", "count", 2)
+        HEAD232 = RN("role %s refused: %s; roster:", TAG232, "preview", "foreign entry", 0x1234ABCD, "2", "0", "1", "+0x8180", "1", "Location")
+        HEAD232U = RN("role %s refused: %s; roster:", TAG232, "HMD", "child vtable", 0x0, "unreadable", "unreadable", "unreadable", "unreadable", "unreadable", "unreadable")
+        ENT232 = [RN("; entry %u: ptr 0x%llX iface %s obj-0x20 %s obj-0x60 %s back %s b-4 %s", i, 0x1000 * (i + 1), "+0x8200", "+0x8280", "0x0", "yes", "01") for i in range(2)]
+        TAIL232 = RN("; refusals by reason:") + RN(" %s %llu,", "foreign entry", 2)
         REFUSED232 = HEAD232 + "".join(ENT232) + TAIL232
         REFUSED232U = HEAD232U + RN("; refusals by reason:") + " none"
-        check("F232: the key on and a refused roster (a count of three with the key off) is OK and names the reason and the roster's size", [neck(), KEY_OFF232, REFUSED232], 0, [("OK", H_PREVROSTER)],
-              has=["key off", "preview: 1 line(s), refused for count x1; newest roster count 3 mode 0, 3 entr(ies)"], lacks=["UNPARSED"])
-        check("F232: no refused roster logged is OK", [neck(), KEY_ON232], 0, [("OK", H_PREVROSTER)], has=["key on", "no refused roster logged"])
-        check("F232: a roster that could not be read is PARTIAL", [neck(), KEY_ON232, REFUSED232U], 0, [("PARTIAL", H_PREVROSTER)], has=["1 roster(s) could not be read"])
+        check("F232: a refused roster is OK and names the reason and the roster's size", [neck(), REFUSED232], 0, [("OK", H_PREVROSTER)],
+              has=["preview: 1 line(s), refused for foreign entry x1; newest roster count 2 mode 0, 2 entr(ies)"], lacks=["UNPARSED"])
+        check("F232: a roster that could not be read is PARTIAL", [neck(), REFUSED232U], 0, [("PARTIAL", H_PREVROSTER)], has=["1 roster(s) could not be read"])
         check("F232: a line that drifted from its pattern is unparsed", [neck(), "native preview camera (F232): the roster is somewhere else"], 4, [("UNPARSED", H_PREVROSTER)])
 
         # ---- the weapon previews' head producer and the eye path (F233) ----
@@ -22914,11 +22608,10 @@ def self_test_health():
         FINAL_HL233 = RN("final child 0x%llX head class %s: %s%s%s%s; output %s", TAG233, 0x4D5E6F70, "Headlook", "refused", " (", "the output is neither the head's nor the preview's pose", ")", "(1.000, 2.000, 3.000)", "(0.000, 0.000, 0.000)", "(1.000, 2.000, 3.000)", "(0.000, 0.000, 0.000)", "3.742", "0.000") + \
             RN("; headlook R rows (%.3f, %.3f, %.3f)", 1.0, 0.0, 0.0)
         EYE233 = RN("eye head %s, %s; published eye head %s, HMD primary %s; distance to published", TAG233, "(3.000, 4.000, 0.000)", "replaced", "(100.000, 200.000, 300.000)", "(1.000, 2.000, 3.000)", "371.248", "5.000", "5.000", "5.000", "5.000", "5.000")
-        KEYLINE233 = "native on foot preview headlook (F233, TEMPORARY): experimental.native_on_foot_preview_headlook is %s -- a HeadlookCamera entry on the Location camera list counts as the head entry"
-        check("F233: the hook armed, the key on, an applied HMD frame, a refused Headlook frame and an eye line are summarised", [neck(), HOOK_UP233, KEYLINE233 % "on", FINAL_HMD233, FINAL_HL233, EYE233], 0, [("OK", H_PREVEYE)],
-              has=["Headlook producer hook armed", "key on", "2 final line(s): HMD applied x1, Headlook refused (the output is neither the head's nor the preview's pose) x1", "1 eye line(s), 1 replaced"], lacks=["UNPARSED"])
-        check("F233: the hook stood down with the key on is PARTIAL", [neck(), HOOK_DOWN233, KEYLINE233 % "on"], 0, [("PARTIAL", H_PREVEYE)], has=["Headlook producer hook stood down", "weapon previews are not handled"])
-        check("F233: finalization snapshots that were all refused are PARTIAL", [neck(), HOOK_UP233, KEYLINE233 % "off", FINAL_HL233], 0, [("PARTIAL", H_PREVEYE)], has=["every finalization snapshot was refused"])
+        check("F233: the hook armed, an applied HMD frame, a refused Headlook frame and an eye line are summarised", [neck(), HOOK_UP233, FINAL_HMD233, FINAL_HL233, EYE233], 0, [("OK", H_PREVEYE)],
+              has=["Headlook producer hook armed", "2 final line(s): HMD applied x1, Headlook refused (the output is neither the head's nor the preview's pose) x1", "1 eye line(s), 1 replaced"], lacks=["UNPARSED"])
+        check("F233: the hook stood down is PARTIAL", [neck(), HOOK_DOWN233], 0, [("PARTIAL", H_PREVEYE)], has=["Headlook producer hook stood down", "weapon previews are not handled"])
+        check("F233: finalization snapshots that were all refused are PARTIAL", [neck(), HOOK_UP233, FINAL_HL233], 0, [("PARTIAL", H_PREVEYE)], has=["every finalization snapshot was refused"])
         check("F233: a line that drifted from its pattern is unparsed", [neck(), "native preview camera (F233): final somewhere else"], 4, [("UNPARSED", H_PREVEYE)])
 
         # ---- the conversation look (F212): the leaf that sets the look springs' targets is held at 0 while native on foot is active ----

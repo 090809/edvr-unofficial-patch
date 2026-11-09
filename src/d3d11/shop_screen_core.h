@@ -19,23 +19,14 @@
 // compared with the class's, and the byte +0x79 is read (guarded): so a missed Close, a freed object or a reused address cannot leave the signal stuck. The answer is handed to the Animate
 // post-hook (where F107 decides) through an atomic.
 //
-// F228 (TEMPORARY A/B): the two Livery screens, the suit's and the weapon's. In VR on foot the Livery screen's commander preview is placed wrongly on one headset, and right while F107 holds the
-// camera away (docs\vr-livery-model-placement-2026-11-09.md: the RE and the Pimax visit). The same reverse-engineering pass (build 334925) found that HumanoidLiveryActivity (vtable 0x5612F30) and
+// F228 (behaviour since the key went): the two Livery screens, the suit's and the weapon's. In VR on foot the Livery screen's commander preview is placed at the commander when the camera is EDVR's, and right
+// while F107 holds the camera away (docs\vr-livery-model-placement-2026-11-09.md). The same reverse-engineering pass (build 334925) found that HumanoidLiveryActivity (vtable 0x5612F30) and
 // HumanoidWeaponLiveryActivity (0x5614328) share the buy screens' Show, IsOpen and Close (their vtable slots +0x70, +0x78 and +0x80 hold 0x9C3960, 0x9C3290 and 0x9C22A0; checked in the exe) and the open
-// byte +0x79. So the hooks above already run for them: the Show/Close filter now also knows these two vtables, and the frame thread re-reads them like the buy screens. While a Livery screen reads open
-// AND experimental.native_on_foot_livery_game_view is on (the default), the shop signal is on and F107 holds the camera away, as it does at a buy screen; with the key off the screens are only watched
-// (Show, Close and the byte are logged, nothing is held). The key is a switch for one flight and goes when the arc closes.
-//
-// F229 (read-only instrument): why the Livery screen's preview camera ends up at the commander. Each of these screens embeds a CustomisationVisual preview client (constructor 0x126B670,
-// called from the screen's own constructor at the offset clientOffset() gives, read from the exe); the camera's state sits in the client: the setup mode (+0x398), the camera kind (+0x39C: 0
-// node distance, 1 avatar-bounds distance, 2 none), the zoom step (+0x570), the current orbit distance (+0x580), the maximum (+0x590) and minimum (+0x5A0) distances, the retry flag (+0x5B0: 1
-// means the game recomputes the distance on its next update) and the pose matrix (+0x5E0). Once a second, for each such screen that reads open, the frame thread reads them (guarded) and logs
-// them; and an exact-build hook on the client's scene setup (0x12714C0: it picks the scene's attach and camera nodes from a mode int read through its third argument; its rcx is the client + 0x58)
-// logs each call and which watched screen's client rcx - 0x58 is. Nothing is written and nothing the game does changes. HumanoidOutfittingInteraction (the loadout browser, whose preview camera
-// is right) is watched the same way for comparison: it shares the base's Show and Close, and never joins the signal.
+// byte +0x79, and so does HumanoidOutfittingInteraction, the loadout browser (vtable 0x524D908; F234). So the hooks above run for them: the Show/Close filter knows these vtables, and the frame thread
+// re-reads them like the buy screens. While a Livery screen or the loadout browser reads open, the shop signal is on and F107 holds the camera away, as it does at a buy screen: the loadout browser's
+// game camera stands a few metres from the neck, and its distance test ended and restarted all through a visit, switching EDVR's on-foot adjustments on and off.
 #pragma once
 
-#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -48,8 +39,7 @@ namespace shop {
 constexpr uintptr_t kShowRva = 0x9C3960, kCloseRva = 0x9C22A0, kSetStateRva = 0xA237B0, kKioskStartRva = 0x1973820, kKioskStopRva = 0x1916440;
 constexpr uintptr_t kSuitVtableRva = 0x5255D20, kWeaponsVtableRva = 0x5255A20, kKioskVtableRva = 0x51E9770;
 constexpr uintptr_t kLiveryVtableRva = 0x5612F30, kWeaponLiveryVtableRva = 0x5614328;   // F228: HumanoidLiveryActivity and HumanoidWeaponLiveryActivity (Show, IsOpen, Close and the byte +0x79 are the buy screens')
-constexpr uintptr_t kOutfittingVtableRva = 0x524D908;   // F229: HumanoidOutfittingInteraction, the loadout browser (watched only)
-constexpr char kLiveryKey[] = "experimental.native_on_foot_livery_game_view";
+constexpr uintptr_t kOutfittingVtableRva = 0x524D908;   // F234: HumanoidOutfittingInteraction, the loadout browser (Show, IsOpen, Close and the byte +0x79 are the buy screens' too)
 constexpr uint32_t kOffOpen = 0x79;        // the interaction's "my screen is open" byte (the base class's Show sets it, Close clears it)
 constexpr uint32_t kOffKiosk = 0x1F8;      // ArmouryVendorActivity's session byte (OnStart sets it, OnStop clears it)
 constexpr uint32_t kOffHandleName = 0x08;  // the state machine handle's pointer to a refcounted Cobra string
@@ -69,29 +59,8 @@ inline constexpr uint8_t kKioskStartPrologue[kKioskStartPrologueBytes] = {0x48, 
 constexpr size_t kKioskStopPrologueBytes = 16;
 inline constexpr uint8_t kKioskStopPrologue[kKioskStopPrologueBytes] = {0x48, 0x89, 0x5C, 0x24, 0x10, 0x57, 0x48, 0x83, 0xEC, 0x20, 0x48, 0x8B, 0xD9, 0x48, 0x81, 0xC1};
 
-// F229: the preview client's scene setup (0x12714C0, a virtual member: rcx the object it runs on, rdx a scene handle, r8 a pointer to the mode int; no stack arguments). The first 16 bytes
-// `mov r11,rsp | push rbp | push r12 | push r15 | lea rbp,[r11-768h]` and the first byte of `sub rsp,850h` carry no relative operand; CodeHook steals the first six (`mov r11,rsp | push rbp | push r12`).
-constexpr uintptr_t kSetupRva = 0x12714C0;
-constexpr size_t kSetupPrologueBytes = 16;
-inline constexpr uint8_t kSetupPrologue[kSetupPrologueBytes] = {0x4C, 0x8B, 0xDC, 0x55, 0x41, 0x54, 0x41, 0x57, 0x49, 0x8D, 0xAB, 0x98, 0xF8, 0xFF, 0xFF, 0x48};
-// F230 (the Livery camera repair, TEMPORARY key kRepairKey): the client's per-frame Update (0x1272780, rcx the client; the first 16 bytes `mov r11,rsp | mov [r11+18h],rbx | push rsi | sub rsp,90h |
-// the first byte of the next instruction` carry no relative operand; CodeHook steals the first seven, `mov r11,rsp | mov [r11+18h],rbx`) and the game's own camera-node test (0x3175B40, rcx = client+0x478:
-// a plain test, no writes; its low byte is the answer). The setup resolves the camera node into client+0x478 once; Livery runs it once at the open and, when its scene is not ready then, the node stays
-// invalid and the per-frame pose step writes an identity pose (the camera lands at the scene origin, at the commander). The repair runs the setup again from the Update, with the mode the game gave.
-constexpr uintptr_t kUpdateRva = 0x1272780, kNodeValidRva = 0x3175B40;
-constexpr size_t kUpdatePrologueBytes = 16;
-inline constexpr uint8_t kUpdatePrologue[kUpdatePrologueBytes] = {0x4C, 0x8B, 0xDC, 0x49, 0x89, 0x5B, 0x18, 0x56, 0x48, 0x81, 0xEC, 0x90, 0x00, 0x00, 0x00, 0x41};
-constexpr uint32_t kOffNode = 0x478, kOffSetupHandle = 0x390;   // the camera node inside the client; the setup's rdx (client + 0x390)
-constexpr char kRepairKey[] = "experimental.native_on_foot_livery_camera_repair";
-constexpr uint32_t kRepairMinMs = 500, kRepairMaxAttempts = 5;   // a repair waits this long after the last setup, and is tried at most this often for one open
-
-// The preview client's camera fields, relative to the client. The setup is reached through the client's interface at +0x58 (the vtable 0x51AA4B8 slot 3, installed there by the client's constructor),
-// so its rcx is the client + 0x58: kClientInterface is subtracted before the client is looked for.
-constexpr uint32_t kOffMode = 0x398, kOffKind = 0x39C, kOffStep = 0x570, kOffDist = 0x580, kOffMax = 0x590, kOffMin = 0x5A0, kOffRetry = 0x5B0, kOffPose = 0x5E0, kClientInterface = 0x58;
-constexpr uint32_t kSetupObjectSpan = 0x1000;   // a pointer at most this far past a watched screen's object is "in" that object
-
 // ---- the classes -----------------------------------------------------------------------------------------------------------------------------------------------------------
-enum Class : int { kSuit = 0, kWeapons = 1, kKiosk = 2, kLivery = 3, kWeaponLivery = 4, kOutfitting = 5, kClassCount = 6, kNotOurs = -1 };   // F229: kOutfitting is watched only
+enum Class : int { kSuit = 0, kWeapons = 1, kKiosk = 2, kLivery = 3, kWeaponLivery = 4, kOutfitting = 5, kClassCount = 6, kNotOurs = -1 };
 inline const char* className(int c) noexcept {
     return c == kSuit ? "SuitVendorInteraction" : c == kWeapons ? "WeaponsVendorInteraction" : c == kKiosk ? "ArmouryVendorActivity" : c == kLivery ? "HumanoidLiveryActivity"
          : c == kWeaponLivery ? "HumanoidWeaponLiveryActivity" : c == kOutfitting ? "HumanoidOutfittingInteraction" : "another class";
@@ -101,16 +70,11 @@ inline uintptr_t vtableRva(int c) noexcept {
          : c == kOutfitting ? kOutfittingVtableRva : 0;
 }
 inline bool isLivery(int c) noexcept { return c == kLivery || c == kWeaponLivery; }
-// F229: where the CustomisationVisual preview client lies in each class's object, from the constructors' `lea rcx,[object+X]` before the call to 0x126B670 (read from build 334925's exe):
-// the two buy screens 0x448, the suit Livery 0x680, the weapon Livery 0x630, the loadout browser 0xC0. 0 for a class with no client (the kiosk).
-inline uint32_t clientOffset(int c) noexcept {
-    return c == kSuit || c == kWeapons ? 0x448u : c == kLivery ? 0x680u : c == kWeaponLivery ? 0x630u : c == kOutfitting ? 0xC0u : 0u;
-}
 // Which of the two buy screens a vtable pointer belongs to (the Show/Close hook's whole filter); kNotOurs for any other class of the 40 that share the base.
 inline int buyScreenOfVtable(uint64_t vtable, uintptr_t base) noexcept {
     return vtable == base + kSuitVtableRva ? kSuit : vtable == base + kWeaponsVtableRva ? kWeapons : kNotOurs;
 }
-// F228: which of the four screens that share the base's Show and Close (the two buy screens and the two Livery screens) a vtable pointer belongs to: the hook's whole filter.
+// F228/F234: which of the five screens that share the base's Show and Close (the two buy screens, the two Livery screens and the loadout browser) a vtable pointer belongs to: the hook's whole filter.
 inline int screenOfVtable(uint64_t vtable, uintptr_t base) noexcept {
     const int buy = buyScreenOfVtable(vtable, base);
     return buy != kNotOurs ? buy : vtable == base + kLiveryVtableRva ? kLivery : vtable == base + kWeaponLiveryVtableRva ? kWeaponLivery : vtable == base + kOutfittingVtableRva ? kOutfitting : kNotOurs;
@@ -146,9 +110,8 @@ struct Signal {
     bool loadout = false;            // F234: the loadout browser (HumanoidOutfittingInteraction)
     bool buyScreenOpen() const noexcept { return open[0] || open[1]; }
     bool liveryOpen() const noexcept { return livery[0] || livery[1]; }
-    // The signal F107 reads: a buy screen, or (F228) a Livery screen while the key says the game's own view holds there.
-    // F234: and the loadout browser while its own key says the game's view holds there.
-    bool holds(bool liveryGameView, bool loadoutGameView = false) const noexcept { return buyScreenOpen() || (liveryGameView && liveryOpen()) || (loadoutGameView && loadout); }
+    // The signal F107 reads: a buy screen, a Livery screen (F228) or the loadout browser (F234) open.
+    bool holds() const noexcept { return buyScreenOpen() || liveryOpen() || loadout; }
 };
 inline Signal signalOf(Verdict suit, Verdict weapons, Verdict kiosk, Verdict livery = Verdict::kNone, Verdict weaponLivery = Verdict::kNone, Verdict loadout = Verdict::kNone) noexcept {
     Signal s;
@@ -226,21 +189,9 @@ inline int formatSignal(char* buf, size_t cap, const Signal& s, bool on, uint32_
     return std::snprintf(buf, cap, "%s the shop signal is %s (suit %s, weapons %s, kiosk %s, livery %s; change %u)", tag(), on ? "ON: F107 holds the camera away" : "OFF", s.open[kSuit] ? "open" : "closed",
                          s.open[kWeapons] ? "open" : "closed", s.kiosk ? "running" : "not running", liveryText(s), seq);
 }
-// F228: said once when a Livery screen opens: whether the key makes it hold the camera away or it is only watched.
-inline int formatLiveryOpened(char* buf, size_t cap, int cls, bool holds) noexcept {
-    return std::snprintf(buf, cap, "%s %s opened: %s (%s is %s)", tag(), className(cls), holds ? "F107 holds the camera away, the view is the game's own" : "only watched, the camera is not held away",
-                         kLiveryKey, holds ? "on" : "off");
-}
-// F234 (TEMPORARY): said once when the loadout browser opens, and when its key changes.
-constexpr char kLoadoutKey[] = "experimental.native_on_foot_loadout_game_view";
-inline int formatLoadoutOpened(char* buf, size_t cap, bool holds) noexcept {
-    return std::snprintf(buf, cap, "%s %s opened: %s (%s is %s)", tag(), className(kOutfitting), holds ? "F107 holds the camera away, the view is the game's own" : "only watched, the camera is not held away",
-                         kLoadoutKey, holds ? "on" : "off");
-}
-inline int formatLoadoutKey(char* buf, size_t cap, bool on) noexcept {
-    return std::snprintf(buf, cap, "native on foot loadout screen (F234, TEMPORARY): %s is %s -- %s", kLoadoutKey, on ? "on" : "off",
-                         on ? "while the loadout browser is open the view is the game's own preview camera and EDVR's on-foot body and view adjustments stand down, as at a buy screen (F107 holds the camera away)"
-                            : "the loadout browser is only watched (Show, Close and the open byte are logged); EDVR's on-foot body and view adjustments run as before F234");
+// F228/F234: said once when a Livery screen or the loadout browser opens: F107 holds the camera away and the view is the game's own.
+inline int formatHeldOpened(char* buf, size_t cap, int cls) noexcept {
+    return std::snprintf(buf, cap, "%s %s opened: F107 holds the camera away, the view is the game's own", tag(), className(cls));
 }
 inline int formatForgotten(char* buf, size_t cap, int cls, Verdict v, uint64_t vtable, uint64_t expected, uint32_t thisLow) noexcept {
     return std::snprintf(buf, cap, "%s the remembered %s (this 0x%08X) is %s (vtable 0x%llX, the class's 0x%llX): the signal does not hold on it", tag(), className(cls), thisLow, verdictText(v),
@@ -276,158 +227,6 @@ struct LineCap {
         return true;
     }
 };
-
-// ---- F229: the preview client's camera fields and its setup calls ---------------------------------------------------------------------------------------------------------------
-// Every line starts with this (--health finds them by it); the class name follows.
-inline const char* camTag() noexcept { return "livery camera (F229):"; }
-// The fields as the frame thread read them: the setup mode, the camera kind, the zoom step, the current, maximum and minimum orbit distances, the retry flag and the 16 floats of the pose matrix.
-struct CamFields {
-    int32_t mode = 0, kind = 0;
-    float step = 0.0f, dist = 0.0f, maxDist = 0.0f, minDist = 0.0f;
-    uint8_t retry = 0;
-    float pose[16] = {};
-};
-inline CamFields camFromBytes(const uint8_t modeKind[8], const uint8_t step[4], const uint8_t dist[4], const uint8_t maxDist[4], const uint8_t minDist[4], uint8_t retry, const uint8_t pose[64]) noexcept {
-    CamFields f;
-    std::memcpy(&f.mode, modeKind, 4);
-    std::memcpy(&f.kind, modeKind + 4, 4);
-    std::memcpy(&f.step, step, 4);
-    std::memcpy(&f.dist, dist, 4);
-    std::memcpy(&f.maxDist, maxDist, 4);
-    std::memcpy(&f.minDist, minDist, 4);
-    f.retry = retry;
-    std::memcpy(f.pose, pose, 64);
-    return f;
-}
-// The four floats and the pose are floats the game keeps; a value that is not a number says the offsets are not what the RE took them for.
-inline bool camFinite(const CamFields& f) noexcept {
-    if (!std::isfinite(f.step) || !std::isfinite(f.dist) || !std::isfinite(f.maxDist) || !std::isfinite(f.minDist)) return false;
-    for (float v : f.pose)
-        if (!std::isfinite(v)) return false;
-    return true;
-}
-// A float as text: four decimals, "nan" or "inf" for what is not a number, an exponent past a billion (so one wild value cannot swell the line).
-inline void floatText(char* out, size_t cap, float v) noexcept {
-    if (std::isnan(v)) std::snprintf(out, cap, "%s", "nan");
-    else if (std::isinf(v)) std::snprintf(out, cap, "%s", v < 0 ? "-inf" : "inf");
-    else if (std::fabs(v) >= 1.0e9f) std::snprintf(out, cap, "%.3e", static_cast<double>(v));
-    else std::snprintf(out, cap, "%.4f", static_cast<double>(v));
-}
-inline float vectorLength(float x, float y, float z) noexcept { return std::sqrt(x * x + y * y + z * z); }
-// The once-a-second line for one open screen: its object and client (low 32 bits), the named fields, the pose as four rows, and the length of the matrix's translation read both ways (the last
-// row, the last column) since the layout is not known.
-inline int formatCamera(char* buf, size_t cap, int cls, uint32_t thisLow, uint32_t clientLow, const CamFields& f) noexcept {
-    char st[24], di[24], mx[24], mn[24], m[16][24], rowLen[24], colLen[24];
-    floatText(st, sizeof(st), f.step);
-    floatText(di, sizeof(di), f.dist);
-    floatText(mx, sizeof(mx), f.maxDist);
-    floatText(mn, sizeof(mn), f.minDist);
-    for (int i = 0; i < 16; ++i) floatText(m[i], sizeof(m[i]), f.pose[i]);
-    floatText(rowLen, sizeof(rowLen), vectorLength(f.pose[12], f.pose[13], f.pose[14]));
-    floatText(colLen, sizeof(colLen), vectorLength(f.pose[3], f.pose[7], f.pose[11]));
-    return std::snprintf(buf, cap,
-                         "%s %s 1 s: this 0x%08X, client 0x%08X: mode %d, kind %d, step %s, dist %s, max %s, min %s, retry %u, pose rows [%s %s %s %s] [%s %s %s %s] [%s %s %s %s] [%s %s %s %s], "
-                         "translation length last row %s, last column %s",
-                         camTag(), className(cls), thisLow, clientLow, f.mode, f.kind, st, di, mx, mn, static_cast<unsigned>(f.retry), m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8], m[9],
-                         m[10], m[11], m[12], m[13], m[14], m[15], rowLen, colLen);
-}
-// Said once per class: the client's memory could not be read, or holds a value that is not a number.
-inline int formatCameraUnreadable(char* buf, size_t cap, int cls, uint32_t thisLow, uint32_t clientLow, bool unreadable) noexcept {
-    return std::snprintf(buf, cap, "%s %s (this 0x%08X) client 0x%08X: the camera fields %s: the offsets +0x398 +0x39C +0x570 +0x580 +0x590 +0x5A0 +0x5B0 +0x5E0 are not this object's camera", camTag(),
-                         className(cls), thisLow, clientLow, unreadable ? "could not be read" : "hold a value that is not a number");
-}
-// A pointer's distance past an object's start, when it lies within kSetupObjectSpan of it.
-inline bool locateInObject(uintptr_t p, uintptr_t obj, int32_t* delta) noexcept {
-    if (obj == 0 || p < obj || p - obj >= kSetupObjectSpan) return false;
-    *delta = static_cast<int32_t>(p - obj);
-    return true;
-}
-// The camera node's state as a word: -1 could not be tested, 0 invalid, 1 valid.
-inline const char* nodeText(int state) noexcept { return state < 0 ? "unreadable" : state == 0 ? "INVALID" : "valid"; }
-// One call of the setup, as the hook saw it. rcx on entry is the client + 0x58: objLow is rcx - 0x58, the CustomisationVisual object.
-struct SetupCall {
-    uint32_t tid = 0;
-    uint32_t rcxLow = 0, objLow = 0, r8Low = 0;
-    bool modeRead = false;      // *(int*)r8 could be read
-    int32_t mode = 0;
-    int8_t cls = kNotOurs;      // the watched screen whose object rcx - 0x58 lies in (kNotOurs: none)
-    int32_t delta = 0;          // rcx - 0x58 minus that screen's object
-    bool qwordRead = false;     // F230: *(uint64_t*)r8 could be read
-    uint64_t qword = 0;
-    int8_t node = -1;           // F230: the camera node after the call: -1 not tested, 0 invalid, 1 valid
-    bool ours = false;          // F230: the call EDVR's repair made
-};
-inline int formatSetup(char* buf, size_t cap, const SetupCall& c) noexcept {
-    char where[120];
-    if (c.cls == kNotOurs) {
-        std::snprintf(where, sizeof(where), "in no watched screen's object");
-    } else {
-        const int32_t rel = c.delta - static_cast<int32_t>(clientOffset(c.cls));
-        std::snprintf(where, sizeof(where), "%s object +0x%X, which is client %c0x%X", className(c.cls), static_cast<unsigned>(c.delta), rel < 0 ? '-' : '+', static_cast<unsigned>(rel < 0 ? -rel : rel));
-    }
-    char mode[24];
-    if (c.modeRead) std::snprintf(mode, sizeof(mode), "%d", c.mode);
-    else std::snprintf(mode, sizeof(mode), "unreadable");
-    char qword[40];
-    if (c.qwordRead) std::snprintf(qword, sizeof(qword), "qword 0x%llX", static_cast<unsigned long long>(c.qword));
-    else std::snprintf(qword, sizeof(qword), "qword unreadable");
-    return std::snprintf(buf, cap, "%s setup call 0x12714C0: rcx 0x%08X, object (rcx - 0x58) 0x%08X, r8 0x%08X, mode %s, %s (thread %u), the object is %s, camera node %s%s", camTag(), c.rcxLow, c.objLow,
-                         c.r8Low, mode, qword, c.tid, where, c.node < 0 ? "not tested" : nodeText(c.node), c.ours ? " (EDVR's repair call)" : "");
-}
-// A window that dropped lines says so once; `what` is "camera" or "setup".
-inline int formatCamCapped(char* buf, size_t cap, const char* what, uint32_t dropped) noexcept {
-    return std::snprintf(buf, cap, "%s %u %s lines in the last 10 s were not written (at most %u in any ten seconds)", camTag(), dropped, what, kLinesPer10s);
-}
-inline int formatSetupLost(char* buf, size_t cap, uint64_t lost) noexcept {
-    return std::snprintf(buf, cap, "%s %llu setup call(s) were not recorded (the ring was full or a second hook thread was in it)", camTag(), static_cast<unsigned long long>(lost));
-}
-
-// ---- F230: the Livery camera repair --------------------------------------------------------------------------------------------------------------------------------------------
-inline const char* repairTag() noexcept { return "livery camera repair (F230):"; }
-// A Livery setup: the low dword of the mode qword is 1 (the suit) or 4 (the weapon), run while a Livery screen reads open. Those are the modes whose node nothing re-resolves.
-inline bool isLiverySetupMode(uint64_t modeQword, bool liveryOpen) noexcept {
-    const uint32_t low = static_cast<uint32_t>(modeQword);
-    return liveryOpen && (low == 1 || low == 4);
-}
-// What the Update hook knows about the client it was called for. The cheap tests come first in repairDecide and the node test last (it calls into the game).
-struct RepairIn {
-    bool keyOn = false;
-    bool remembered = false;      // rcx is a client whose Livery setup was remembered
-    bool liveryOpen = false;      // a Livery screen reads open (F228's reading)
-    bool sameThread = false;      // the thread that runs this Update is the one that ran the remembered setup
-    uint64_t nowMs = 0, lastSetupMs = 0;   // the last setup, the game's or ours
-    uint32_t attempts = 0;        // made for this open
-};
-enum class RepairVerdict : int { kKeyOff = 0, kNotRemembered, kScreenClosed, kOtherThread, kTooSoon, kExhausted, kTestNode, kCount };
-// kTestNode means every cheap condition holds: the caller tests the camera node and repairs only when it is invalid.
-inline RepairVerdict repairDecide(const RepairIn& in) noexcept {
-    if (!in.keyOn) return RepairVerdict::kKeyOff;
-    if (!in.remembered) return RepairVerdict::kNotRemembered;
-    if (!in.liveryOpen) return RepairVerdict::kScreenClosed;
-    if (!in.sameThread) return RepairVerdict::kOtherThread;
-    if (in.nowMs < in.lastSetupMs || in.nowMs - in.lastSetupMs < kRepairMinMs) return RepairVerdict::kTooSoon;
-    if (in.attempts >= kRepairMaxAttempts) return RepairVerdict::kExhausted;
-    return RepairVerdict::kTestNode;
-}
-// One repair attempt as the Update hook made it.
-struct RepairEvent {
-    uint32_t tid = 0;
-    uint32_t attempt = 0;         // 1-based within the open
-    uint32_t clientLow = 0;
-    uint64_t qword = 0;           // the mode qword handed to the setup
-    int8_t after = -1;            // the node after the setup: -1 unreadable, 0 invalid, 1 valid
-    bool faulted = false;         // the setup call faulted
-};
-inline int formatRepair(char* buf, size_t cap, const RepairEvent& e) noexcept {
-    return std::snprintf(buf, cap, "%s attempt %u of %u: the setup was run again by EDVR (client 0x%08X, mode %u, qword 0x%llX, thread %u), camera node INVALID before, %s after", repairTag(), e.attempt,
-                         kRepairMaxAttempts, e.clientLow, static_cast<unsigned>(static_cast<uint32_t>(e.qword)), static_cast<unsigned long long>(e.qword), e.tid,
-                         e.faulted ? "the call faulted" : nodeText(e.after));
-}
-inline int formatRepairKey(char* buf, size_t cap, bool on) noexcept {
-    return std::snprintf(buf, cap, "native on foot livery camera (F230, TEMPORARY): %s is %s -- %s", kRepairKey, on ? "on" : "off",
-                         on ? "when a Livery preview's camera node is invalid (the setup ran before its scene was ready) EDVR runs the game's own setup again, so the preview stands beside the panel"
-                            : "the Livery preview's camera node is only logged (F229); EDVR runs nothing");
-}
 
 }  // namespace shop
 }  // namespace edvr

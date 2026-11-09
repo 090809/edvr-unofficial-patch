@@ -48,7 +48,6 @@
 #include "../../src/d3d11/native_on_foot.h"   // the native flag and the camera signal the controller hook publishes (F93d)
 #include "../../src/d3d11/native_on_foot_logwin.h"
 #include "../../src/d3d11/shop_screen_core.h"   // F209: the buy screens' hooks, signal and lines
-#include "../../src/d3d11/preview_camera_core.h"   // F231: the camera controller hooks and the preview camera patch
 #include "../../src/d3d11/native_on_foot_f212.h"   // F212: the conversation look's leaf, decision, counters and lines
 
 using namespace edvr;
@@ -152,8 +151,8 @@ void testShopPure() {
           "CodeHook steals 6 bytes of Show, Close and SetState (push rbx; sub rsp,20h) and 5 of the kiosk's start (mov rax,rsp; push rbp; push rbx) and stop (mov [rsp+10h],rbx): whole instructions, no displacement");
     check(shop::kSuitVtableRva == 0x5255D20 && shop::kWeaponsVtableRva == 0x5255A20 && shop::kKioskVtableRva == 0x51E9770 && shop::kOffOpen == 0x79 && shop::kOffKiosk == 0x1F8,
           "the buy screens' vtables are +0x5255D20 (suit) and +0x5255A20 (weapons), the kiosk's +0x51E9770; the bytes are +0x79 and +0x1F8");
-    check(shop::kLiveryVtableRva == 0x5612F30 && shop::kWeaponLiveryVtableRva == 0x5614328 && shop::kClassCount == 6 && shop::kLivery == 3 && shop::kWeaponLivery == 4,
-          "F228: the Livery screens' vtables are +0x5612F30 (suit) and +0x5614328 (weapon), classes 3 and 4 of six (F229 adds the loadout browser); they share the buy screens' Show, Close and byte +0x79");
+    check(shop::kLiveryVtableRva == 0x5612F30 && shop::kWeaponLiveryVtableRva == 0x5614328 && shop::kClassCount == 6 && shop::kLivery == 3 && shop::kWeaponLivery == 4 && shop::kOutfitting == 5 && shop::kOutfittingVtableRva == 0x524D908,
+          "F228/F234: the Livery screens' vtables are +0x5612F30 (suit) and +0x5614328 (weapon) and the loadout browser's +0x524D908, classes 3, 4 and 5 of six; they share the buy screens' Show, Close and byte +0x79");
 }
 
 void testFadeGuard() {
@@ -1889,11 +1888,7 @@ void testSkeletonLatch(const CtlPages& p) {
 // (0x5A5E). The objects carry the buy screens' vtable VALUES (base + RVA; the hooks only compare them).
 using FnThis = uint64_t (__fastcall*)(void*);
 using FnState = uint64_t (__fastcall*)(void*, const char*);
-void setupImgInit();   // F229: the Livery setup's synthetic function, below
-void previewImgInit();   // F231: the camera controller's two synthetic functions, below
 void shopImgInit() {
-    setupImgInit();
-    previewImgInit();
     const uint8_t nop = 0x90;
     auto rel32 = [](size_t from, size_t to) { return static_cast<int32_t>(static_cast<int64_t>(to) - static_cast<int64_t>(from)); };
     auto put32 = [](uint8_t* p, size_t at, int32_t v) { std::memcpy(p + at, &v, 4); };
@@ -1962,67 +1957,6 @@ void shopImgInit() {
         std::memcpy(p + n, body, sizeof(body));
     }
 }
-// F229/F230: the Livery preview client's scene setup, Update and camera-node test, with the game's own first 16 prologue bytes where the hooks verify them.
-// The setup (`add rsp,0 | mov al,[fix] | mov [rcx+420h],al | pop r15 | pop r12 | pop rbp | mov eax,5A60h | ret`) stores the rig's "fix" byte into the camera node (client + 0x478, as rcx = client + 0x58 gives
-// it); the node test (`mov al,[rcx] | ret`) reads it; the Update (`push r15 | pop r15 | add rsp,90h | pop rsi | mov rbx,[r11+18h] | mov eax,5A70h | ret`) does nothing else.
-using FnSetup = uint64_t (__fastcall*)(void*, void*, void*, void*);
-constexpr size_t kSetupFixAt = 0x70;   // the "fix" byte's place inside the setup's committed bytes
-void setupImgInit() {
-    cimgCommit(shop::kSetupRva, 0x80);
-    uint8_t* p = g_cimg + shop::kSetupRva;
-    std::memset(p, 0xCC, 0x80);
-    size_t n = 0;
-    for (uint8_t b : shop::kSetupPrologue) p[n++] = b;   // mov r11,rsp; push rbp; push r12; push r15; lea rbp,[r11-768h]; 48h (the first byte of the add that follows)
-    const uint8_t add0[] = {0x83, 0xC4, 0x00, 0x8A, 0x05};   // add rsp,0 | mov al,[rip+rel32]
-    std::memcpy(p + n, add0, sizeof(add0));
-    n += sizeof(add0);
-    const int32_t rel = static_cast<int32_t>(kSetupFixAt) - static_cast<int32_t>(n + 4);
-    std::memcpy(p + n, &rel, 4);
-    n += 4;
-    const uint8_t tail[] = {0x88, 0x81, 0x20, 0x04, 0x00, 0x00, 0x41, 0x5F, 0x41, 0x5C, 0x5D, 0xB8, 0x60, 0x5A, 0x00, 0x00, 0xC3};
-    std::memcpy(p + n, tail, sizeof(tail));
-    p[kSetupFixAt] = 0;
-    cimgCommit(shop::kNodeValidRva, 0x10);
-    const uint8_t node[] = {0x8A, 0x01, 0xC3};
-    std::memcpy(g_cimg + shop::kNodeValidRva, node, sizeof(node));
-    cimgCommit(shop::kUpdateRva, 0x80);
-    uint8_t* u = g_cimg + shop::kUpdateRva;
-    std::memset(u, 0xCC, 0x80);
-    n = 0;
-    for (uint8_t b : shop::kUpdatePrologue) u[n++] = b;   // mov r11,rsp; mov [r11+18h],rbx; push rsi; sub rsp,90h; 41h (the first byte of `push r15`)
-    const uint8_t utail[] = {0x57, 0x41, 0x5F, 0x48, 0x81, 0xC4, 0x90, 0x00, 0x00, 0x00, 0x5E, 0x49, 0x8B, 0x5B, 0x18, 0xB8, 0x70, 0x5A, 0x00, 0x00, 0xC3};
-    std::memcpy(u + n, utail, sizeof(utail));
-}
-// F231: the camera controller's SetCamera (20 prologue bytes, balanced tail, returns 0x5A80) and Release (13 bytes, returns 0x5A90): they write nothing.
-void previewImgInit() {
-    cimgCommit(previewcam::kSetCameraRva, 0x80);
-    uint8_t* p = g_cimg + previewcam::kSetCameraRva;
-    std::memset(p, 0xCC, 0x80);
-    size_t n = 0;
-    for (uint8_t b : previewcam::kSetCameraPrologue) p[n++] = b;   // mov [rsp+18h],rbx; push rbp; push rsi; push r12; push r14; push r15; mov rbp,rsp; sub rsp,50h
-    const uint8_t setTail[] = {0x48, 0x83, 0xC4, 0x50, 0x41, 0x5F, 0x41, 0x5E, 0x41, 0x5C, 0x5E, 0x5D, 0x48, 0x8B, 0x5C, 0x24, 0x18, 0xB8, 0x80, 0x5A, 0x00, 0x00, 0xC3};
-    std::memcpy(p + n, setTail, sizeof(setTail));
-    cimgCommit(previewcam::kReleaseRva, 0x80);
-    uint8_t* r = g_cimg + previewcam::kReleaseRva;
-    std::memset(r, 0xCC, 0x80);
-    n = 0;
-    for (uint8_t b : previewcam::kReleasePrologue) r[n++] = b;     // mov [rsp+10h],rbx; push rdi; sub rsp,20h; mov rdi,rcx
-    const uint8_t relTail[] = {0x48, 0x83, 0xC4, 0x20, 0x5F, 0x48, 0x8B, 0x5C, 0x24, 0x10, 0xB8, 0x90, 0x5A, 0x00, 0x00, 0xC3};
-    std::memcpy(r + n, relTail, sizeof(relTail));
-}
-uint64_t previewSetCamera(const void* name, uint64_t force) { return reinterpret_cast<FnSetup>(g_cimg + previewcam::kSetCameraRva)(nullptr, const_cast<void*>(name), reinterpret_cast<void*>(force), nullptr); }
-uint64_t previewRelease() { return reinterpret_cast<FnSetup>(g_cimg + previewcam::kReleaseRva)(nullptr, nullptr, nullptr, nullptr); }
-void setupFix(uint8_t v) { g_cimg[shop::kSetupRva + kSetupFixAt] = v; }
-uint64_t livUpdate(void* client) { return reinterpret_cast<uint64_t (__fastcall*)(void*)>(g_cimg + shop::kUpdateRva)(client); }
-bool g_withLiveryCam = false;   // installShopTargets also gives the F229 hook its synthetic function
-// A Livery or loadout screen's object with room for its preview client (the largest offset is 0x680 + 0x620).
-struct CamObj {
-    alignas(16) uint8_t b[0x1000] = {};
-    void init(uint64_t vtable) {
-        std::memset(b, 0, sizeof(b));
-        std::memcpy(b, &vtable, 8);
-    }
-};
 uint64_t shopShow(void* o) { return reinterpret_cast<FnThis>(g_cimg + shop::kShowRva)(o); }
 uint64_t shopClose(void* o) { return reinterpret_cast<FnThis>(g_cimg + shop::kCloseRva)(o); }
 uint64_t shopSetState(void* handle, const char* s) { return reinterpret_cast<FnState>(g_cimg + shop::kSetStateRva)(handle, s); }
@@ -2067,12 +2001,6 @@ void installShopTargets(const CtlPages& p, int badShop = -1) {
     tt.shopSetState = at(2, shop::kSetStateRva);
     tt.kioskStart = at(3, shop::kKioskStartRva);
     tt.kioskStop = at(4, shop::kKioskStopRva);
-    if (g_withLiveryCam) {   // F229, F230
-        tt.liveryCameraSetup = b + shop::kSetupRva;
-        tt.liveryCameraUpdate = b + shop::kUpdateRva;
-        tt.previewSetCamera = b + previewcam::kSetCameraRva;   // F231
-        tt.previewRelease = b + previewcam::kReleaseRva;
-    }
     nofoothookstest::setTargets(tt);
     nofoothookstest::setHeadImage(b, kCImgSize);
 }
@@ -2216,19 +2144,20 @@ void testShopGlue(const CtlPages& p) {
         check(!nativeOnFootShopOpen() && rig.cap.count("the shop signal is OFF (suit closed, weapons closed") == 1, "...closing the weapon screen ends it");
         t::reset();
     }
-    {   // F228: the Livery screens: the same Show and Close, held only while the key is on
+    {   // F228/F234: the Livery screens and the loadout browser: the same Show and Close, and F107 held away while one is open
         Rig rig;
         start(rig);
-        static ShopObj livery, wlivery;
+        static ShopObj livery, wlivery, loadout;
         livery.init(base + shop::kLiveryVtableRva);
         wlivery.init(base + shop::kWeaponLiveryVtableRva);
-        check(nativeOnFootShopOpen() == false && !nativeOnFootLiveryOpen(), "F228: nothing open: no signal, no Livery screen");
-        // the key on (the default): the suit Livery's Show holds the signal at once
+        loadout.init(base + shop::kOutfittingVtableRva);
+        check(nativeOnFootShopOpen() == false && !nativeOnFootLiveryOpen() && !nativeOnFootPreviewScreenOpen(), "F228: nothing open: no signal, no Livery screen, no preview screen");
+        // the suit Livery's Show holds the signal at once
         const uint64_t r1 = shopShow(&livery);
-        check(r1 == 0x5A5A && livery.open() == 1 && nativeOnFootShopOpen() && nativeOnFootLiveryOpen(), "F228 LIVERY SHOW, KEY ON: the original ran (0x5A5A), +0x79 is set, the signal is on at once");
+        check(r1 == 0x5A5A && livery.open() == 1 && nativeOnFootShopOpen() && nativeOnFootLiveryOpen() && nativeOnFootPreviewScreenOpen(), "F228 LIVERY SHOW: the original ran (0x5A5A), +0x79 is set, the signal is on at once");
         rig.boundary();
         check(rig.cap.count(shopEventLine("HumanoidLiveryActivity", "Show", 0, 1, &livery).c_str()) == 1 &&
-                  rig.cap.count("shop screens (F209): HumanoidLiveryActivity opened: F107 holds the camera away, the view is the game's own (experimental.native_on_foot_livery_game_view is on)") == 1 &&
+                  rig.cap.count("shop screens (F209): HumanoidLiveryActivity opened: F107 holds the camera away, the view is the game's own") == 1 &&
                   rig.cap.count("the shop signal is ON: F107 holds the camera away (suit closed, weapons closed, kiosk not running, livery suit open; change 1)") == 1,
               "...the Show line names the class, one line says it holds the camera away, and the signal's ON line names the Livery screen");
         const int iShow = rig.cap.indexOf("HumanoidLiveryActivity Show:"), iOpened = rig.cap.indexOf("HumanoidLiveryActivity opened:"), iOn = rig.cap.indexOf("the shop signal is ON");
@@ -2243,45 +2172,42 @@ void testShopGlue(const CtlPages& p) {
         check(rig.cap.count(shopEventLine("HumanoidLiveryActivity", "Close", 1, 0, &livery).c_str()) == 1 &&
                   rig.cap.count("the shop signal is OFF (suit closed, weapons closed, kiosk not running, livery closed; change 2)") == 1,
               "...the Close line and the OFF line, once each");
-        // the weapon Livery, key on
+        // the weapon Livery
         rig.cap.clear();
         shopShow(&wlivery);
         rig.boundary();
         check(nativeOnFootShopOpen() && rig.cap.count(shopEventLine("HumanoidWeaponLiveryActivity", "Show", 0, 1, &wlivery).c_str()) == 1 &&
                   rig.cap.count("HumanoidWeaponLiveryActivity opened: F107 holds the camera away") == 1 && rig.cap.count("livery weapon open; change 3)") == 1,
-              "F228: the weapon Livery's Show holds the signal with the key on, with its own lines");
+              "F228: the weapon Livery's Show holds the signal, with its own lines");
         shopClose(&wlivery);
         rig.boundary();
         check(!nativeOnFootShopOpen() && rig.cap.count(shopEventLine("HumanoidWeaponLiveryActivity", "Close", 1, 0, &wlivery).c_str()) == 1, "...and its Close ends it");
-        // the key off: the screens are still detected and logged, nothing is held
+        // the loadout browser holds too (F234)
         rig.cap.clear();
-        nativeOnFootSetLiveryHold(false);
-        const uint64_t r3 = shopShow(&livery);
-        check(r3 == 0x5A5A && livery.open() == 1 && !nativeOnFootShopOpen() && nativeOnFootLiveryOpen(), "F228 LIVERY SHOW, KEY OFF: the original ran, +0x79 is set, the screen reads open but the signal stays off");
+        const uint64_t r3 = shopShow(&loadout);
+        check(r3 == 0x5A5A && loadout.open() == 1 && nativeOnFootShopOpen() && !nativeOnFootLiveryOpen() && nativeOnFootPreviewScreenOpen(),
+              "F234 LOADOUT SHOW: the original ran, +0x79 is set, the signal is on at once and it is not a Livery screen");
         rig.boundary();
-        check(rig.cap.count(shopEventLine("HumanoidLiveryActivity", "Show", 0, 1, &livery).c_str()) == 1 &&
-                  rig.cap.count("shop screens (F209): HumanoidLiveryActivity opened: only watched, the camera is not held away (experimental.native_on_foot_livery_game_view is off)") == 1 &&
-                  rig.cap.count("the shop signal is") == 0,
-              "...the Show line and the 'only watched' line are written, and no signal edge");
-        check(nativeOnFootShopRead(&rd) && rd.liveryOpen && !rd.signal && rd.liveryByte == 1, "...the reading: open, not held");
-        // flipped on mid-screen: the hold starts at once and the edge is said on the next frame
-        rig.cap.clear();
-        nativeOnFootSetLiveryHold(true);
-        check(nativeOnFootShopOpen(), "F228: the key turned on while the screen is open holds the signal at once");
-        rig.boundary();
-        check(rig.cap.count("the shop signal is ON: F107 holds the camera away (suit closed, weapons closed, kiosk not running, livery suit open; change 5)") == 1, "...and the next frame says so");
-        nativeOnFootSetLiveryHold(false);
-        check(!nativeOnFootShopOpen(), "...and turned off again it lets go at once");
-        rig.boundary();
-        shopClose(&livery);
-        rig.boundary();
-        // a buy screen holds with the key off, as before
+        check(rig.cap.count(shopEventLine("HumanoidOutfittingInteraction", "Show", 0, 1, &loadout).c_str()) == 1 &&
+                  rig.cap.count("shop screens (F209): HumanoidOutfittingInteraction opened: F107 holds the camera away, the view is the game's own") == 1 &&
+                  rig.cap.count("the shop signal is ON: F107 holds the camera away (suit closed, weapons closed, kiosk not running, livery loadout open; change 5)") == 1,
+              "...the Show line, one line saying it holds the camera away, and the ON line naming the loadout browser");
+        shopClose(&loadout);
+        check(loadout.open() == 0 && !nativeOnFootShopOpen() && !nativeOnFootPreviewScreenOpen(), "F234 LOADOUT CLOSE: the signal is off at once");
+        // a buy screen still holds, the kiosk still does not
         rig.cap.clear();
         shopShow(&suit);
-        check(nativeOnFootShopOpen(), "F228: a buy screen holds the signal with the Livery key off (F209 unchanged)");
+        check(nativeOnFootShopOpen() && nativeOnFootPreviewScreenOpen() && !nativeOnFootLiveryOpen(), "F209: a buy screen holds the signal, as before");
+        shopShow(&loadout);
         shopClose(&suit);
+        check(nativeOnFootShopOpen(), "F234: the loadout browser still holds when a buy screen closes");
+        shopClose(&loadout);
+        check(!nativeOnFootShopOpen(), "...and nothing holds when both are closed");
+        shopKioskStart(&kiosk);
+        check(!nativeOnFootShopOpen() && !nativeOnFootPreviewScreenOpen(), "F209: the kiosk does not hold, as before");
+        shopKioskStop(&kiosk);
+        rig.boundary();
         // a Livery object whose vtable changed is forgotten, and the other class's address is not confused
-        nativeOnFootSetLiveryHold(true);
         rig.cap.clear();
         shopShow(&livery);
         livery.setVtable(base + shop::kWeaponLiveryVtableRva);
@@ -2289,8 +2215,7 @@ void testShopGlue(const CtlPages& p) {
         check(!nativeOnFootShopOpen() && rig.cap.count("the remembered HumanoidLiveryActivity (this 0x") == 1 && rig.cap.count("is forgotten: its vtable is no longer the class's") == 1,
               "F228: a Livery object whose vtable changed is forgotten and holds no signal");
         t::reset();
-        check(!nativeOnFootShopOpen() && !nativeOnFootLiveryOpen(), "RESET: the Livery hold is back to its default and nothing is open");
-        nativeOnFootSetLiveryHold(true);
+        check(!nativeOnFootShopOpen() && !nativeOnFootLiveryOpen(), "RESET: nothing is open");
         t::reset();
     }
     {   // the armoury kiosk: start and stop events; it does not hold F107
@@ -2502,326 +2427,6 @@ void testShopGlue(const CtlPages& p) {
         shopShow(&suit);
         rig.boundary();
         check(!nativeOnFootShopOpen() && rig.cap.count("shop screens (F209):") == 0, "...the signal stays off and the log silent: F107 has its distance test alone");
-        t::reset();
-    }
-    {   // F234: the loadout browser joins the hold while its key is on; the buy screens, Livery and the kiosk are as they were
-        Rig rig;
-        start(rig);
-        static ShopObj loadout;
-        loadout.init(base + shop::kOutfittingVtableRva);
-        check(nativeOnFootShopOpen() == false, "F234: nothing open: no signal");
-        const uint64_t r1 = shopShow(&loadout);
-        check(r1 == 0x5A5A && loadout.open() == 1 && nativeOnFootShopOpen() && !nativeOnFootLiveryOpen(), "F234 LOADOUT SHOW, KEY ON (the default): the original ran, +0x79 is set, the signal is on at once and it is not a Livery screen");
-        rig.boundary();
-        check(rig.cap.count(shopEventLine("HumanoidOutfittingInteraction", "Show", 0, 1, &loadout).c_str()) == 1 &&
-                  rig.cap.count("shop screens (F209): HumanoidOutfittingInteraction opened: F107 holds the camera away, the view is the game's own (experimental.native_on_foot_loadout_game_view is on)") == 1 &&
-                  rig.cap.count("the shop signal is ON: F107 holds the camera away (suit closed, weapons closed, kiosk not running, livery loadout open; change 1)") == 1,
-              "...the Show line, one line saying it holds the camera away, and the signal's ON line naming the loadout browser");
-        shopClose(&loadout);
-        check(loadout.open() == 0 && !nativeOnFootShopOpen(), "F234 LOADOUT CLOSE: the signal is off at once");
-        rig.cap.clear();
-        rig.boundary();
-        check(rig.cap.count("the shop signal is OFF (suit closed, weapons closed, kiosk not running, livery closed; change 2)") == 1, "...and says so once");
-        // the key off: watched, not held
-        rig.cap.clear();
-        nativeOnFootSetLoadoutHold(false);
-        shopShow(&loadout);
-        check(loadout.open() == 1 && !nativeOnFootShopOpen(), "F234 LOADOUT SHOW, KEY OFF: the screen reads open but the signal stays off");
-        rig.boundary();
-        check(rig.cap.count("shop screens (F209): HumanoidOutfittingInteraction opened: only watched, the camera is not held away (experimental.native_on_foot_loadout_game_view is off)") == 1 &&
-                  rig.cap.count("the shop signal is") == 0,
-              "...one 'only watched' line and no signal edge");
-        nativeOnFootSetLoadoutHold(true);
-        check(nativeOnFootShopOpen(), "F234: the key turned on while the screen is open holds the signal at once");
-        shopClose(&loadout);
-        // the buy screens and the kiosk are as they were, whatever the loadout key says
-        nativeOnFootSetLoadoutHold(false);
-        shopShow(&suit);
-        check(nativeOnFootShopOpen(), "F234: a buy screen holds the signal with the loadout key off");
-        shopClose(&suit);
-        shopKioskStart(&kiosk);
-        check(!nativeOnFootShopOpen(), "F234: the kiosk does not hold, as before");
-        shopKioskStop(&kiosk);
-        nativeOnFootSetLoadoutHold(true);
-        shopShow(&suit);
-        shopShow(&loadout);
-        shopClose(&suit);
-        check(nativeOnFootShopOpen(), "F234: the loadout browser still holds when a buy screen closes");
-        shopClose(&loadout);
-        check(!nativeOnFootShopOpen(), "F234: and nothing holds when both are closed");
-        t::reset();
-    }
-    {   // F229: the Livery camera instrument: the setup hook over a synthetic function, and the once-a-second camera lines
-        Rig rig;
-        g_withLiveryCam = true;
-        start(rig);
-        g_withLiveryCam = false;
-        check(t::hookState(t::kLiveryCameraSetup) == 1 && t::stolenBytes(t::kLiveryCameraSetup) == 6 && t::gateOpen(t::kLiveryCameraSetup),
-              "F229: the setup hook is armed over the synthetic function (the whole instructions covering five bytes: six), its gate open while the native key is on");
-        static CamObj liv, outf;
-        liv.init(base + shop::kLiveryVtableRva);
-        outf.init(base + shop::kOutfittingVtableRva);
-        const uintptr_t livClient = reinterpret_cast<uintptr_t>(liv.b) + shop::clientOffset(shop::kLivery);
-        uint8_t* cl = liv.b + shop::clientOffset(shop::kLivery);
-        const int32_t modeKind[2] = {3, 1};
-        const float step = 0.25f, dist = 4.0f, maxD = 9.0f, minD = 0.5f;
-        const uint8_t retry = 1;
-        float pose[16];
-        for (int i = 0; i < 16; ++i) pose[i] = static_cast<float>(i) * 0.25f;
-        std::memcpy(cl + shop::kOffMode, modeKind, 8);
-        std::memcpy(cl + shop::kOffStep, &step, 4);
-        std::memcpy(cl + shop::kOffDist, &dist, 4);
-        std::memcpy(cl + shop::kOffMax, &maxD, 4);
-        std::memcpy(cl + shop::kOffMin, &minD, 4);
-        cl[shop::kOffRetry] = retry;
-        std::memcpy(cl + shop::kOffPose, pose, 64);
-        uint8_t mk8[8], s4[4], d4[4], x4[4], n4[4], p64[64];
-        std::memcpy(mk8, modeKind, 8);
-        std::memcpy(s4, &step, 4);
-        std::memcpy(d4, &dist, 4);
-        std::memcpy(x4, &maxD, 4);
-        std::memcpy(n4, &minD, 4);
-        std::memcpy(p64, pose, 64);
-        const shop::CamFields want = shop::camFromBytes(mk8, s4, d4, x4, n4, retry, p64);
-        char expect[1100];
-        shop::formatCamera(expect, sizeof(expect), shop::kLivery, static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&liv)), static_cast<uint32_t>(livClient), want);
-        t::shopClock(100000);
-        shopShow(&liv);
-        rig.boundary();
-        check(rig.cap.count(expect) == 1 && rig.cap.count("livery camera (F229):") == 1, "F229: an open Livery screen's camera fields are read from its client (object +0x680) and written once, as the formatter says");
-        rig.boundary();
-        check(rig.cap.count("livery camera (F229):") == 1, "...and not again within the second");
-        t::shopClock(101000);
-        rig.boundary();
-        check(rig.cap.count(expect) == 2, "...but once more when the second has passed");
-        // the setup call through the hook: the original runs (0x5A60), the line names rcx as the Livery client's interface
-        rig.cap.clear();
-        uint64_t mode = 3;   // the qword r8 points to
-        const uint64_t r = reinterpret_cast<FnSetup>(g_cimg + shop::kSetupRva)(reinterpret_cast<void*>(livClient + shop::kClientInterface), nullptr, &mode, nullptr);
-        shop::SetupCall sc;
-        sc.tid = GetCurrentThreadId();
-        sc.rcxLow = static_cast<uint32_t>(livClient + shop::kClientInterface);
-        sc.objLow = static_cast<uint32_t>(livClient);
-        sc.r8Low = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&mode));
-        sc.modeRead = true;
-        sc.mode = 3;
-        sc.qwordRead = true;
-        sc.qword = 3;
-        sc.node = 0;   // the synthetic setup stores the rig's fix byte (0) in the node
-        sc.cls = static_cast<int8_t>(shop::kLivery);
-        sc.delta = static_cast<int32_t>(shop::clientOffset(shop::kLivery));
-        shop::formatSetup(expect, sizeof(expect), sc);
-        rig.boundary();
-        check(r == 0x5A60 && mode == 3 && rig.cap.count(expect) == 1 && has(expect, "which is client +0x0"), "F229: the setup call is forwarded (its result 0x5A60, the mode int untouched) and logged with rcx - 0x58 as the Livery client");
-        rig.cap.clear();
-        static CamObj elsewhere;
-        elsewhere.init(0);
-        uint8_t* odd = elsewhere.b + 0x58 + 0x100;
-        const uint64_t r2 = reinterpret_cast<FnSetup>(g_cimg + shop::kSetupRva)(odd, nullptr, nullptr, nullptr);   // an rcx in no watched screen, a null r8
-        sc.rcxLow = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(odd));
-        sc.objLow = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(odd) - shop::kClientInterface);
-        sc.r8Low = 0;
-        sc.modeRead = false;
-        sc.qwordRead = false;
-        sc.cls = static_cast<int8_t>(shop::kNotOurs);
-        sc.delta = 0;
-        shop::formatSetup(expect, sizeof(expect), sc);
-        rig.boundary();
-        check(r2 == 0x5A60 && rig.cap.count(expect) == 1 && has(expect, "mode unreadable") && has(expect, "in no watched screen's object"), "F229: an object in no watched screen and an unreadable r8 are logged as such, and the call is still forwarded");
-        // the loadout browser is watched (with the Livery screen closed) and never joins the signal
-        shopClose(&liv);
-        rig.boundary();
-        rig.cap.clear();
-        shopShow(&outf);
-        rig.boundary();
-        check(!nativeOnFootLiveryOpen() && rig.cap.count(shopEventLine("HumanoidOutfittingInteraction", "Show", 0, 1, &outf).c_str()) == 1 &&
-                  rig.cap.count("HumanoidOutfittingInteraction 1 s: this 0x") == 1,
-              "F229: the loadout browser's Show is logged and its client's camera line written, and the Livery reading does not move (the shop signal follows F234's key)");
-        // closed screens are not read
-        shopClose(&outf);
-        rig.boundary();
-        rig.cap.clear();
-        t::shopClock(103000);
-        rig.boundary();
-        check(rig.cap.count("livery camera (F229):") == 0, "F229: a screen that reads closed is not read: no camera line");
-        // an unreadable client is said once: the object's first 0x100 bytes end a readable page, its client (+0x680) lies in the next, which cannot be read
-        {
-            uint8_t* pages = static_cast<uint8_t*>(VirtualAlloc(nullptr, 0x2000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
-            DWORD oldProtect = 0;
-            check(pages && VirtualProtect(pages + 0x1000, 0x1000, PAGE_NOACCESS, &oldProtect), "F229: (the rig's two pages, the second not readable)");
-            if (pages) {
-                uint8_t* obj = pages + 0x1000 - 0x100;
-                const uint64_t vt = base + shop::kLiveryVtableRva;
-                std::memcpy(obj, &vt, 8);
-                rig.cap.clear();
-                shopShow(obj);
-                rig.boundary();
-                t::shopClock(104000);
-                rig.boundary();
-                t::shopClock(105000);
-                rig.boundary();
-                check(rig.cap.count("HumanoidLiveryActivity (this 0x") == 1 && rig.cap.count("the camera fields could not be read") == 1 && rig.cap.count("1 s: this 0x") == 0,
-                      "F229: a client that cannot be read is said once for the class (no camera line, however many seconds pass)");
-                shopClose(obj);
-                rig.boundary();
-                VirtualFree(pages, 0, MEM_RELEASE);
-            }
-        }
-        t::shopClock(0);
-        t::reset();
-    }
-    {   // F230: the Livery camera repair: the Update hook over a synthetic function, the node test, the decision's gates through the real glue
-        Rig rig;
-        g_withLiveryCam = true;
-        start(rig);
-        g_withLiveryCam = false;
-        check(t::hookState(t::kLiveryCameraUpdate) == 1 && t::stolenBytes(t::kLiveryCameraUpdate) == 7 && t::gateOpen(t::kLiveryCameraUpdate) && t::hookState(t::kLiveryCameraSetup) == 1,
-              "F230: the Update hook is armed over the synthetic function (seven bytes stolen: mov r11,rsp; mov [r11+18h],rbx), its gate open while the native key is on");
-        static CamObj liv, loadout;
-        liv.init(base + shop::kLiveryVtableRva);
-        loadout.init(base + shop::kOutfittingVtableRva);
-        uint8_t* cl = liv.b + shop::clientOffset(shop::kLivery);
-        uint8_t* node = cl + shop::kOffNode;
-        uint64_t q = 1;   // a suit Livery setup: mode 1
-        auto gameSetup = [&](CamObj& o, uint32_t cls, uint64_t* qw) {
-            return reinterpret_cast<FnSetup>(g_cimg + shop::kSetupRva)(o.b + shop::clientOffset(static_cast<int>(cls)) + shop::kClientInterface, o.b + shop::clientOffset(static_cast<int>(cls)) + shop::kOffSetupHandle, qw, nullptr);
-        };
-        auto countRepairs = [&] { return rig.cap.count("livery camera repair (F230):"); };
-        shop::RepairEvent ev;
-        ev.tid = GetCurrentThreadId();
-        ev.clientLow = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(cl));
-        ev.qword = 1;
-        auto repairLine = [&](uint32_t attempt, int8_t after) {
-            char buf[400];
-            ev.attempt = attempt;
-            ev.after = after;
-            shop::formatRepair(buf, sizeof(buf), ev);
-            return std::string(buf);
-        };
-        t::shopClock(200000);
-        setupFix(0);
-        nativeOnFootSetLiveryRepair(true);
-        shopShow(&liv);
-        gameSetup(liv, shop::kLivery, &q);   // the game's setup at the open: the scene is not ready, the node stays invalid
-        rig.boundary();
-        check(rig.cap.count("setup call 0x12714C0:") == 1 && rig.cap.count("mode 1, qword 0x1 (thread") == 1 && rig.cap.count("camera node INVALID") == 1 && rig.cap.count("EDVR's repair call") == 0,
-              "F230: the game's Livery setup is logged with its qword and the camera node INVALID after it, and is not marked as ours");
-        // too soon: 100 ms after the setup nothing is run (the node is invalid, the key on, the screen open)
-        rig.cap.clear();
-        t::shopClock(200100);
-        check(livUpdate(cl) == 0x5A70, "F230: the original Update runs and its result is returned (0x5A70)");
-        rig.boundary();
-        check(countRepairs() == 0 && rig.cap.count("setup call") == 0, "F230: under 0.5 s after the setup the Update does not run the setup again");
-        // due: the repair runs the setup again by its own address; the fix byte makes the node valid
-        t::shopClock(200600);
-        setupFix(1);
-        livUpdate(cl);
-        rig.boundary();
-        check(rig.cap.count(repairLine(1, 1).c_str()) == 1 && rig.cap.count("camera node valid (EDVR's repair call)") == 1 && node[0] == 1,
-              "F230: 0.5 s on, the invalid node is repaired: the setup ran again from the Update (nested through its own hook, which logged it as EDVR's call), one retry line says valid after");
-        // the node is valid: nothing more is run, however often the Update comes
-        rig.cap.clear();
-        t::shopClock(201700);
-        livUpdate(cl);
-        livUpdate(cl);
-        rig.boundary();
-        check(countRepairs() == 0 && rig.cap.count("setup call") == 0, "F230: a valid node is left alone");
-        // the key off: an invalid node is only logged, nothing is run
-        node[0] = 0;
-        nativeOnFootSetLiveryRepair(false);
-        t::shopClock(203000);
-        livUpdate(cl);
-        rig.boundary();
-        check(node[0] == 0 && countRepairs() == 0 && rig.cap.count("setup call") == 0, "F230: with the key off the Update runs nothing: the node stays invalid and no line is written");
-        nativeOnFootSetLiveryRepair(true);
-        // five attempts an open, then no more: the setup does not fix the node (fix byte 0); a Livery Show starts the count again
-        setupFix(0);
-        shopShow(&liv);
-        rig.cap.clear();
-        uint32_t clock = 204000;
-        for (int k = 0; k < 8; ++k) {
-            t::shopClock(clock);
-            livUpdate(cl);
-            clock += 600;
-        }
-        rig.boundary();
-        check(countRepairs() == 5 && rig.cap.count(repairLine(1, 0).c_str()) == 1 && rig.cap.count(repairLine(5, 0).c_str()) == 1 && rig.cap.count("of 5: the setup was run again") == 5,
-              "F230: a setup that leaves the node invalid is retried five times for one open and no more, each line saying INVALID after");
-        // another thread's Update is left alone
-        rig.cap.clear();
-        shopShow(&liv);   // the count starts again
-        t::shopClock(clock + 5000);
-        std::thread other([&] { livUpdate(cl); });
-        other.join();
-        rig.boundary();
-        check(countRepairs() == 0, "F230: an Update on another thread than the one that ran the setup runs nothing");
-        // a client whose Livery setup was not remembered (the loadout browser's setup, a mode that is not 1 or 4) is left alone
-        uint64_t q2 = 2;
-        uint8_t* lcl = loadout.b + shop::clientOffset(shop::kOutfitting);
-        shopShow(&loadout);
-        gameSetup(loadout, shop::kOutfitting, &q2);
-        rig.cap.clear();
-        t::shopClock(clock + 7000);
-        livUpdate(lcl);
-        rig.boundary();
-        check(countRepairs() == 0, "F230: a client whose Livery setup was not remembered (the loadout browser) is left alone");
-        // no Livery screen open: nothing is run
-        shopClose(&liv);
-        shopClose(&loadout);
-        rig.boundary();
-        rig.cap.clear();
-        shopShow(&liv);
-        shopClose(&liv);
-        t::shopClock(clock + 9000);
-        livUpdate(cl);
-        rig.boundary();
-        check(countRepairs() == 0, "F230: with the Livery screen closed the Update runs nothing");
-        t::shopClock(0);
-        t::reset();
-    }
-    {   // F231: the camera controller's SetCamera and Release hooks over synthetic functions: log only, forwarded unchanged
-        Rig rig;
-        g_withLiveryCam = true;
-        start(rig);
-        g_withLiveryCam = false;
-        check(t::hookState(t::kPreviewSetCamera) == 1 && t::hookState(t::kPreviewRelease) == 1 && t::stolenBytes(t::kPreviewSetCamera) == 5 && t::stolenBytes(t::kPreviewRelease) == 5 &&
-                  t::gateOpen(t::kPreviewSetCamera) && t::gateOpen(t::kPreviewRelease),
-              "F231: both hooks are armed over their synthetic functions (five bytes stolen from each), their gates open while the native key is on");
-        t::shopClock(300000);
-        const char* camName = "Livery Camera";
-        check(previewSetCamera(camName, 1) == 0x5A80 && previewRelease() == 0x5A90, "F231: the originals run and their results are returned unchanged (0x5A80, 0x5A90)");
-        rig.boundary();
-        const std::string tid = std::to_string(GetCurrentThreadId());
-        check(rig.cap.count(("preview camera (F231): SetCamera at 300000 ms, thread " + tid + ", called from +0x0 (another caller), camera name \"Livery Camera\", force 1").c_str()) == 1 &&
-                  rig.cap.count(("preview camera (F231): Release at 300000 ms, thread " + tid + ", called from +0x0").c_str()) == 1,
-              "F231: each call is logged once with its time, thread, return address (outside the image here: +0x0), the camera name and the force byte");
-        // a name that is a string object (the state machine handle's shape) is read through it
-        static ShopHandle handle;
-        handle.init("Cockpit Camera");
-        rig.cap.clear();
-        check(previewSetCamera(&handle, 0x101) == 0x5A80, "F231: the original runs for a string-object name too");
-        rig.boundary();
-        check(rig.cap.count("camera name \"Cockpit Camera\" (read through a string object), force 1") == 1, "F231: a name that is a string object is read through it, and the force is r8's low byte alone");
-        // a name that cannot be read is '?'
-        rig.cap.clear();
-        previewSetCamera(reinterpret_cast<const void*>(0x10), 0);
-        rig.boundary();
-        check(rig.cap.count("camera name \"?\", force 0") == 1, "F231: an unreadable name is logged as '?' and the call is forwarded");
-        // the cap: 40 SetCamera lines in ten seconds, the rest counted (a fresh window: the earlier lines are in the first)
-        rig.cap.clear();
-        t::shopClock(311000);
-        for (int batch = 0; batch < 5; ++batch) {   // 20 calls a frame, under the ring's 32
-            for (int i = 0; i < 20; ++i) previewSetCamera(camName, 0);
-            rig.boundary();
-        }
-        check(rig.cap.count("preview camera (F231): SetCamera at") == 40, "F231: at most 40 SetCamera lines in ten seconds are written");
-        rig.cap.clear();
-        t::shopClock(322000);
-        previewSetCamera(camName, 0);
-        rig.boundary();
-        check(rig.cap.count("preview camera (F231): 60 SetCamera lines in the last 10 s were not written (at most 40 in any ten seconds)") == 1,
-              "F231: the next window says how many the last one dropped, once");
-        t::shopClock(0);
         t::reset();
     }
     t::reset();

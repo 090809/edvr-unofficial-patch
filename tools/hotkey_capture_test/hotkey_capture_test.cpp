@@ -2165,30 +2165,6 @@ void testLegacyOnFootRowsStayOutOfMenu() {
         const bool beside = hudRow >= 0 && turnRow == hudRow + 1 && strcmp(kMenuRows[turnRow].page, kMenuRows[hudRow].page) == 0 && strcmp(kMenuRows[turnRow].group, kMenuRows[hudRow].group) == 0;
         check(found == 1 && shaped && beside, "Steady body in turns (F222, TEMPORARY) is one [experimental] on/off row right after HUD stays with view, on its page and under its heading: live, shipped on");
     }
-    // F228 (TEMPORARY): "Livery uses game view" is an [experimental] on/off choice right after "Steady body in turns" (F222), on the same page and under the same heading, live, shipped on. It sits with the
-    // other native on-foot switches, where the neck guard's dial is, so the pilot can flip it mid-flight.
-    {
-        int turnRow = -1, liveryRow = -1, found = 0;
-        bool shaped = true;
-        for (int i = 0; i < kCount; ++i) {
-            const MenuRowDef& d = kMenuRows[i];
-            if (strcmp(d.section, "experimental") != 0) continue;
-            if (strcmp(d.key, "native_on_foot_steady_body_in_turns") == 0) turnRow = i;
-            if (strcmp(d.key, "native_on_foot_livery_game_view") == 0) {
-                liveryRow = i;
-                ++found;
-                shaped = shaped && d.kind == MenuKind::Choice && d.tier == MenuTier::Experimental && strcmp(d.label, "Livery uses game view") == 0 && strcmp(d.choices, "on|off") == 0 && strcmp(d.shipped, "on") == 0 &&
-                         d.applies == 1;
-            }
-        }
-        const bool beside = turnRow >= 0 && liveryRow == turnRow + 1 && strcmp(kMenuRows[liveryRow].page, kMenuRows[turnRow].page) == 0 && strcmp(kMenuRows[liveryRow].group, kMenuRows[turnRow].group) == 0;
-        bool samePageAsGuard = false;
-        for (int i = 0; i < kCount; ++i)
-            if (strcmp(kMenuRows[i].section, "experimental") == 0 && strcmp(kMenuRows[i].key, "native_on_foot_neck_guard_cm") == 0 && liveryRow >= 0)
-                samePageAsGuard = strcmp(kMenuRows[i].page, kMenuRows[liveryRow].page) == 0;
-        check(found == 1 && shaped && beside && samePageAsGuard,
-              "Livery uses game view (F228, TEMPORARY) is one [experimental] on/off row right after Steady body in turns, on the page of Neck guard distance and under its heading: live, shipped on");
-    }
     // F170 (TEMPORARY): "Crouched ADS torso square" is the thirteenth number row of the developer tier's native on foot rows (the twelfth before F181 put "Hip elbow swivel max" before it, the tenth before F180 put the two rows of its own between, the eighth before F178 put the two "Standing ADS body" rows between, the seventh before
     // F171 put "Crouched ADS body left / right" before that), right after the hip elbow swivel row on the same page and under the same heading: 0..1 of the shoulder line's blade in steps of 0.05, not signed,
     // live, shipped 0.0 since F173 (1.0 before: the turn was on), labelled without (test). It carries no old value over.

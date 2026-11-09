@@ -145,22 +145,13 @@ NativeOnFootCameraStats nativeOnFootCameraStats();
 // F209: the Pioneer Supplies buy screens (shop_screen_core.h). Five optional, build-gated hooks on the game (the base UI interaction's Show and Close, the UI state machine's SetState and
 // the armoury kiosk's start and stop; each stands down with one line on a build that differs) tell when the suit or the weapon buy screen is open: from its Show to its Close, re-read
 // once a frame from the remembered object (its vtable, then the byte +0x79) so a missed Close cannot leave it stuck. The Animate post-hook's F107 rule holds the camera away while it is.
-// F228 (TEMPORARY A/B): the same hooks also see the two Livery screens (HumanoidLiveryActivity, HumanoidWeaponLiveryActivity: shop_screen_core.h). While one reads open AND
-// nativeOnFootSetLiveryHold(true) (experimental.native_on_foot_livery_game_view, on by default) this returns true too; with the hold off the screens are only watched and logged.
-// Any thread; a few atomic loads. False whenever the hooks are not armed.
+// F228/F234: the same hooks also see the two Livery screens (HumanoidLiveryActivity, HumanoidWeaponLiveryActivity) and the loadout browser (HumanoidOutfittingInteraction): shop_screen_core.h. While one reads
+// open this returns true too: F107 holds the camera away as at a buy screen. Any thread; a few atomic loads. False whenever the hooks are not armed.
 bool nativeOnFootShopOpen() noexcept;
-// F228: a Livery screen reads open (whether or not it is held). Any thread.
+// F228: a Livery screen reads open. Any thread.
 bool nativeOnFootLiveryOpen() noexcept;
-// F228: the key's live value, set by native_on_foot.cpp's frame thread. Default true.
-void nativeOnFootSetLiveryHold(bool on) noexcept;
-// F234 (TEMPORARY): experimental.native_on_foot_loadout_game_view's live value, set by native_on_foot.cpp's frame thread. Default true. On: the loadout browser (HumanoidOutfittingInteraction) open holds the
-// shop signal like a buy screen; off: it is only watched and logged.
-void nativeOnFootSetLoadoutHold(bool on) noexcept;
-// F232: a preview screen F209 watches (a buy screen, a Livery screen, the loadout browser) reads open. Any thread.
+// F232: one of the preview screens F209 watches (a buy screen, a Livery screen, the loadout browser) reads open. Any thread.
 bool nativeOnFootPreviewScreenOpen() noexcept;
-// F230 (TEMPORARY): experimental.native_on_foot_livery_camera_repair's live value, set by native_on_foot.cpp's frame thread. Default true. On: a Livery preview whose camera node is invalid has the game's own
-// setup run again from the client's Update; off: only the evidence lines (F229).
-void nativeOnFootSetLiveryRepair(bool on) noexcept;
 // What the frame thread's once-a-second line reports: the remembered objects' bytes (-1 none or unreadable, 0, 1), the kiosk session, the newest SuitUIStateMachine state ("" until one) and
 // how often the signal has changed. buyScreenOpen is the two buy screens alone; liveryOpen the two Livery screens (F228); signal is nativeOnFootShopOpen(). Frame thread only. False when no shop hook is armed.
 struct NativeOnFootShopRead {
@@ -269,17 +260,11 @@ struct NativeOnFootHooksTestTargets {
     uintptr_t controller = 0, avatarFade = 0, findJoint = 0;
     uintptr_t shopShow = 0, shopClose = 0, shopSetState = 0, kioskStart = 0, kioskStop = 0;   // F209: the shop hooks are tried only for the ones given here (or all, shopTryReal)
     uintptr_t conversationLook = 0;   // F212: the conversation look's hook is tried only when a target is given here
-    uintptr_t liveryCameraSetup = 0;  // F229: the preview client's scene setup hook is tried only when a target is given here
-    uintptr_t liveryCameraUpdate = 0; // F230: the preview client's Update hook (the repair), likewise
-    uintptr_t previewSetCamera = 0, previewRelease = 0;   // F231: the camera controller's SetCamera and Release hooks (log only), likewise
 };
 namespace nofoothookstest {
 constexpr int kController = 0, kFade = 1, kFind = 2;   // the hooks, in the order stolenBytes, hookState and gateOpen take them
 constexpr int kShopShow = 3, kShopClose = 4, kShopSetState = 5, kKioskStart = 6, kKioskStop = 7;   // F209
 constexpr int kConversationLook = 8;   // F212
-constexpr int kLiveryCameraSetup = 9;  // F229
-constexpr int kLiveryCameraUpdate = 10; // F230
-constexpr int kPreviewSetCamera = 11, kPreviewRelease = 12;   // F231
 void setTargets(const NativeOnFootHooksTestTargets& targets);
 void setFadeGlobal(int32_t* mode, float* amount);   // the synthetic dither-fade global and its amount float (null: the build's real addresses)
 void setHeadImage(uintptr_t base, size_t size);     // the rig's synthetic game image for the skeleton reads' arming (base 0: the real module)
@@ -307,7 +292,6 @@ void shopTryReal(bool on);            // F209: try the shop hooks against the re
 void shopClock(uint64_t nowMs);       // F209: the shop lines' clock (ms); 0 restores the system clock
 void conversationClock(uint64_t nowMs);   // F212: the conversation look's clock (ms) for its calls and lines; 0 restores the system clock
 void conversationTryReal(bool on);         // F212: try the conversation look's hook against the real module too (the build-identity refusal); off: only with a target
-void liveryCameraTryReal(bool on);          // F229: try the Livery setup hook against the real module too (the build-identity refusal); off: only with a target
 void reset();                      // every hook uninstalled, every latch and counter cleared
 }  // namespace nofoothookstest
 #endif

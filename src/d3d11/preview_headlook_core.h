@@ -1,5 +1,5 @@
-// F233 (native on-foot VR, TEMPORARY key experimental.native_on_foot_preview_headlook): the weapon preview screens' head-side producer. Constants and the key's line only, header only, no Windows and no
-// game: native_preview_camera.cpp places the hook, native_preview_camera_core.h takes the roster entry as a head, native_on_foot.cpp reads the key.
+// F233 (native on-foot VR): the weapon preview screens' head-side producer. Constants only, header only, no Windows and no game: native_preview_camera.cpp places the hook,
+// native_preview_camera_core.h takes the roster entry as a head.
 //
 // WHY (reverse engineering of build 334925, inbox 20261109-132023-weapon-head-producer, "RE 6" in docs\vr-livery-model-placement-2026-11-09.md). The weapons purchase and the loadout weapon preview
 // have the Location child's roster [preview, HeadlookCamera]. HeadlookCamera (interface vtable 0x518C350, object vtable 0x518C2E0 at entry-0x20) is HMDCamera's sibling: same base class and layout
@@ -11,7 +11,6 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <cstdio>
 
 namespace edvr {
 namespace previewcam {
@@ -20,14 +19,7 @@ namespace headlook {
 constexpr uint32_t kProducerRva = 0x1074650, kIfaceRva = 0x518C350, kObjectRva = 0x518C2E0;
 constexpr size_t kProducerPinBytes = 15;
 inline constexpr uint8_t kProducerPin[kProducerPinBytes] = {0x48, 0x89, 0x5C, 0x24, 0x08, 0x48, 0x89, 0x74, 0x24, 0x10, 0x57, 0x48, 0x83, 0xEC, 0x60};
-constexpr uint32_t kOffLookFirst = 0x250, kOffRotation0 = 0x250, kOffRotation1 = 0x260, kOffRotation2 = 0x270, kOffDisplacement = 0x280;   // the look rotation's rows and the displacement
-constexpr char kKey[] = "experimental.native_on_foot_preview_headlook";
-
-inline int formatKey(char* buf, size_t cap, bool on) noexcept {
-    return std::snprintf(buf, cap, "native on foot preview headlook (F233, TEMPORARY): %s is %s -- %s", kKey, on ? "on" : "off",
-                         on ? "a HeadlookCamera entry on the Location camera list counts as the head entry (with the preview handover key on), so weapon previews (purchase, loadout) keep their camera"
-                            : "a HeadlookCamera entry on the Location camera list is a foreign entry, as before");
-}
+constexpr uint32_t kOffRotation0 = 0x250, kOffRotation1 = 0x260, kOffRotation2 = 0x270, kOffDisplacement = 0x280;   // the look rotation's rows and the displacement
 
 }  // namespace headlook
 }  // namespace previewcam

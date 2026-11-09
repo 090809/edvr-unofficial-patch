@@ -354,8 +354,8 @@ void installHeadlook(uintptr_t base) {
     g_previewGame.headlookIface.store(base+gameRva(hl::kIfaceRva),std::memory_order_release);
     g_previewGame.headlookObject.store(base+gameRva(hl::kObjectRva),std::memory_order_release);
     g_headlookArmed=true;
-    Log::get().note("native preview camera (F233): HeadlookCamera producer hook armed at +0x%X (pin %u bytes); a HeadlookCamera entry is a head entry while experimental.native_on_foot_preview_headlook and "
-        "experimental.native_on_foot_preview_handover are on",hl::kProducerRva,unsigned(hl::kProducerPinBytes));
+    Log::get().note("native preview camera (F233): HeadlookCamera producer hook armed at +0x%X (pin %u bytes); a HeadlookCamera entry is a head entry of the Location camera list",
+        hl::kProducerRva,unsigned(hl::kProducerPinBytes));
 }
 bool previewInstall() {
     // The resolver carries addresses across builds; it does not establish the
@@ -422,8 +422,6 @@ void nativePreviewCameraBoundary(bool wanted,bool active) {
     }
     g_previewLastActive=enabled;g_previewLastApplied=applied;
 }
-void nativePreviewCameraSetHandover(bool on) noexcept {g_previewGame.handover.store(on,std::memory_order_relaxed);}
-void nativePreviewCameraSetHeadlook(bool on) noexcept {g_previewGame.headlook.store(on,std::memory_order_relaxed);}
 void nativePreviewCameraDiagTick(bool screenOpen) {
     const bool wanted=screenOpen&&g_previewInstalled;
     g_previewEngine.diagWanted.store(wanted,std::memory_order_relaxed);
@@ -436,7 +434,7 @@ void nativePreviewCameraDiagTick(bool screenOpen) {
         previewcam::Refusal r;uint64_t counts[size_t(previewcam::Refuse::kRefuseCount)]{};
         if(!g_previewEngine.takeRefusal(role,r,counts)||!g_diagCap.allow(now))continue;
         char line[1100];
-        previewcam::formatRefusal(line,sizeof(line),r,counts,base,g_previewGame.handover.load(std::memory_order_relaxed));
+        previewcam::formatRefusal(line,sizeof(line),r,counts,base);
         Log::get().note("%s",line);
     }
     // F233: the finalizer's and the eye stub's newest snapshots (the eye line's distances are to the finalization's poses)
