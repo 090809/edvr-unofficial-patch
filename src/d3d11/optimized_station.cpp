@@ -2005,6 +2005,297 @@ cc::Judge concourseJudgeHere(const PadSnapshot& s, bool nameReadable, const Node
     return j;
 }
 
+// ---- TEMPORARY (H62 instrument, Flight 56): the VR bake's record diff ------------------------------------------------------------------------------------------------------
+// Observe only. During the VR bake's aim frames that write (the frames the draw diff compares) every record the concourse judge sees whose sphere comes within 60 m of the room's centre,
+// or whose sphere is unreadable, is noted with its name, sphere, verdict and the reason (the rule that decided it). Both judges note: the store's (afterStoreConcourse, path S) and the
+// producer's (concourseProducerVeto, path P). The key is the name plus the sphere's centre rounded to 0.5 m plus the path: the record's address is shown beside each frame's verdict ("rec"),
+// so a reader sees whether it is stable, but is not the key (a store record may be rewritten in another slot from frame to frame).
+// Frames: the window of a frame opens in the aim tick (vrBakeAimTick, present thread) and closes at the next one, whatever thread judged in between; the number printed is the aim's frame,
+// the one the capture and aim lines carry, with g_frameStamp (the judge's own counter, advanced at the top of every tick) read as the window opened beside it. A judge that runs a frame late
+// lands in the next window. The judges only append under g_recMutex (when g_vrRecOn); the present thread's ticks sort and log, off the lock.
+std::atomic<bool> g_vrRecOn{false};
+// The room's centre in the store's world (the bake's origin), set as each window opens. The judges' own distance is from the store's camera, which in VR is the real head, not the
+// centre (the world check: "the store's camera" is where the commander stands), so the band 20 to 50 m from the centre could be past 60 m from it; nearness is measured from here.
+std::atomic<float> g_recCentre[3] = {};
+constexpr float kRecNearM = 60.0f, kRecKeptNearM = 50.0f;
+constexpr size_t kRecKeyCap = 4096, kRecDiffLines = 40, kRecKeptLines = 40;
+struct RecEntry {
+    float r = 0.0f, nearest = 0.0f;   // nearest: the sphere's surface from the centre, negative when the sphere is unreadable
+    uint32_t kept = 0, culled = 0;
+    const char* keptWhy = nullptr;
+    const char* cullWhy = nullptr;
+    uintptr_t rec = 0;                // the first record of the key this frame
+};
+struct RecWin {
+    uint32_t aimFrame = 0, stamp = 0, face = 0, dwell = 0, total = 0, dropped = 0;
+    std::unordered_map<std::string, RecEntry> m;
+};
+struct RecKeptNear {
+    float r = 0.0f, nearest = 0.0f;
+    uint32_t frames = 0;
+    const char* why[2] = {nullptr, nullptr};
+};
+struct RecState {
+    std::mutex m;
+    bool open = false;
+    RecWin cur;                                         // under m
+    std::vector<RecWin> group;                          // present thread only: the face's finished windows
+    std::unordered_map<std::string, RecKeptNear> kept;  // present thread only: the bake's records kept near
+    uint32_t frames = 0;                                // present thread only: windows finished this bake
+};
+RecState& recState() {
+    static RecState* s = new RecState;   // never destroyed: a callback may still be inside it at unload
+    return *s;
+}
+
+const char* recReason(const PadSnapshot& s, cc::Judge j, bool slabbed, const NodeInfo& ni, bool nameReadable) noexcept {
+    const bool allowed = (ni.flags & sealed::kNodeConcourseAllow) != 0;
+    if (slabbed) return "door slab (the rule kept it)";
+    if (s.roomOnly && !s.lift && !s.look) return "room only";
+    if (s.look) {
+        switch (j) {
+            case cc::Judge::kKeepName: return "look: outside the room, kept";
+            case cc::Judge::kKeepUnreadableName: return "look: unreadable-name outside, kept";
+            default: return allowed ? "look: the room's name, culled" : "look: small and in reach, culled";
+        }
+    }
+    switch (j) {
+        case cc::Judge::kKeepName: return "name rule: allowed name";
+        case cc::Judge::kKeepUnreadableName: return "unreadable-name";
+        case cc::Judge::kKeepUnreadableSphere: return "unreadable-sphere";
+        case cc::Judge::kKeepSmallClose: return "small-close";
+        default: break;
+    }
+    if (s.lift) return "lift: not small and near";
+    if (!nameReadable) return "unreadable name past 200 m";
+    return allowed ? "allowed name past 200 m" : "name not allowed, not small-close";
+}
+
+// The judge's side: one record. Cheap when off (the callers test g_vrRecOn first).
+void recNote(const PadSnapshot& s, uintptr_t record, uintptr_t node, const NodeInfo& ni, bool nameReadable, bool sphere, const float c[3], float d, float r, cc::Judge j,
+             bool slabbed, char path) noexcept {
+    try {
+        const bool ok = sphere && std::isfinite(d) && std::isfinite(r) && std::isfinite(c[0]) && std::isfinite(c[1]) && std::isfinite(c[2]);
+        // From the room's centre (g_recCentre), not the judge's d (from the store's camera, the real head in VR).
+        float dc = 0.0f;
+        if (ok) {
+            const float dx = c[0] - g_recCentre[0].load(std::memory_order_relaxed), dy = c[1] - g_recCentre[1].load(std::memory_order_relaxed),
+                        dz = c[2] - g_recCentre[2].load(std::memory_order_relaxed);
+            dc = std::sqrt(dx * dx + dy * dy + dz * dz);
+        }
+        const float nearest = ok ? (dc - r > 0.0f ? dc - r : 0.0f) : -1.0f;
+        if (ok && !(nearest <= kRecNearM)) return;
+        char nm[64] = {};
+        if (!(nameReadable && cachedNameOfNode(node, nm, sizeof(nm), &ni.validator))) std::snprintf(nm, sizeof(nm), "<unreadable>");
+        char key[160];
+        if (ok)
+            std::snprintf(key, sizeof(key), "%s@(%.1f %.1f %.1f)[%c]", nm, std::floor(static_cast<double>(c[0]) * 2.0 + 0.5) / 2.0, std::floor(static_cast<double>(c[1]) * 2.0 + 0.5) / 2.0,
+                          std::floor(static_cast<double>(c[2]) * 2.0 + 0.5) / 2.0, path);
+        else
+            std::snprintf(key, sizeof(key), "%s@(no sphere)[%c]", nm, path);
+        const char* why = recReason(s, j, slabbed, ni, nameReadable);
+        RecState& st = recState();
+        std::lock_guard<std::mutex> lock(st.m);
+        if (!st.open) return;
+        ++st.cur.total;
+        auto it = st.cur.m.find(key);
+        if (it == st.cur.m.end()) {
+            if (st.cur.m.size() >= kRecKeyCap) {
+                ++st.cur.dropped;
+                return;
+            }
+            it = st.cur.m.emplace(key, RecEntry()).first;
+            it->second.r = ok ? r : 0.0f;
+            it->second.nearest = nearest;
+            it->second.rec = record;
+        }
+        RecEntry& e = it->second;
+        if (cc::judgeKeeps(j)) {
+            ++e.kept;
+            e.keptWhy = why;
+        } else {
+            ++e.culled;
+            e.cullWhy = why;
+        }
+    } catch (...) {
+    }
+}
+
+// The present thread's side. A frame's text for one key: absent, or what the judge said of its records.
+std::string recStateText(const RecEntry* e, bool withRec) {
+    if (!e) return "absent";
+    char b[200];
+    std::string t;
+    if (e->kept) {
+        if (e->kept > 1) std::snprintf(b, sizeof(b), "kept x%u (%s)", e->kept, e->keptWhy ? e->keptWhy : "?");
+        else std::snprintf(b, sizeof(b), "kept (%s)", e->keptWhy ? e->keptWhy : "?");
+        t += b;
+    }
+    if (e->culled) {
+        if (!t.empty()) t += ", ";
+        if (e->culled > 1) std::snprintf(b, sizeof(b), "culled x%u (%s)", e->culled, e->cullWhy ? e->cullWhy : "?");
+        else std::snprintf(b, sizeof(b), "culled (%s)", e->cullWhy ? e->cullWhy : "?");
+        t += b;
+    }
+    if (withRec) {
+        std::snprintf(b, sizeof(b), " rec %llX", static_cast<unsigned long long>(e->rec));
+        t += b;
+    }
+    return t;
+}
+
+void recLogGroup(std::vector<RecWin>& g) noexcept {
+    try {
+        if (g.empty()) return;
+        const size_t n = g.size();
+        std::vector<std::string> keys;
+        for (const RecWin& w : g)
+            for (const auto& kv : w.m) keys.push_back(kv.first);
+        std::sort(keys.begin(), keys.end());
+        keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
+        uint32_t within[3] = {}, keptN[3] = {}, dropped = 0, frames[3] = {}, stamps[3] = {};
+        for (size_t f = 0; f < n && f < 3; ++f) {
+            frames[f] = g[f].aimFrame;
+            stamps[f] = g[f].stamp;
+            dropped += g[f].dropped;
+            for (const auto& kv : g[f].m) {
+                within[f] += kv.second.kept + kv.second.culled;
+                keptN[f] += kv.second.kept;
+            }
+        }
+        struct Diff {
+            std::string key;
+            float r, nearest;
+        };
+        std::vector<Diff> diffs;
+        for (const std::string& k : keys) {
+            std::string first;
+            bool differ = false;
+            float r = 0.0f, nearest = 1.0e9f;
+            for (size_t f = 0; f < n; ++f) {
+                auto it = g[f].m.find(k);
+                const std::string t = recStateText(it == g[f].m.end() ? nullptr : &it->second, false);
+                if (f == 0) first = t;
+                else if (t != first) differ = true;
+                if (it != g[f].m.end()) {
+                    if (r == 0.0f) r = it->second.r;
+                    if (it->second.nearest < nearest) nearest = it->second.nearest;
+                }
+            }
+            if (differ) diffs.push_back(Diff{k, r, nearest});
+        }
+        std::stable_sort(diffs.begin(), diffs.end(), [](const Diff& a, const Diff& b) { return a.nearest < b.nearest; });
+        Log::get().note("concourse bake: vr record diff: face %u, frames %u %u %u (the judge's numbering): records within 60 m %u %u %u, kept %u %u %u, keys that differ %u (dropped %u) "
+                        "[the frames are the aim's; the judge's stamps %u %u %u]",
+                        g[0].face, frames[0], frames[1], frames[2], within[0], within[1], within[2], keptN[0], keptN[1], keptN[2], static_cast<unsigned>(diffs.size()), dropped,
+                        stamps[0], stamps[1], stamps[2]);
+        for (size_t i = 0; i < diffs.size() && i < kRecDiffLines; ++i) {
+            std::string line;
+            for (size_t f = 0; f < n; ++f) {
+                auto it = g[f].m.find(diffs[i].key);
+                char b[40];
+                std::snprintf(b, sizeof(b), "%sframe %u ", f ? " | " : "", g[f].aimFrame);
+                line += b;
+                line += recStateText(it == g[f].m.end() ? nullptr : &it->second, true);
+            }
+            Log::get().note("concourse bake: vr record diff: face %u: %s r %.1f nearest %.1f m: %s", g[0].face, diffs[i].key.c_str(), static_cast<double>(diffs[i].r),
+                            static_cast<double>(diffs[i].nearest), line.c_str());
+        }
+    } catch (...) {
+    }
+}
+
+// A window's records into the bake's kept-near table and the face's group (logged when the next face begins).
+void recAccept(RecWin&& w) noexcept {
+    try {
+        RecState& st = recState();
+        ++st.frames;
+        for (const auto& kv : w.m) {
+            if (kv.second.kept == 0 || !(kv.second.nearest <= kRecKeptNearM)) continue;   // an unreadable sphere (nearest -1) is kept in the table
+            RecKeptNear& k = st.kept[kv.first];
+            ++k.frames;
+            k.r = kv.second.r;
+            k.nearest = kv.second.nearest;
+            const char* why = kv.second.keptWhy;
+            if (why != k.why[0] && why != k.why[1]) k.why[k.why[0] ? 1 : 0] = why;
+        }
+        if (!st.group.empty() && (st.group[0].face != w.face || w.dwell == 0 || st.group.size() >= 3)) {
+            recLogGroup(st.group);
+            st.group.clear();
+        }
+        st.group.push_back(std::move(w));
+    } catch (...) {
+    }
+}
+
+// The open window ends: taken out under the lock, handled outside it. Present thread.
+void recClose() noexcept {
+    try {
+        RecState& st = recState();
+        RecWin w;
+        bool had = false;
+        {
+            std::lock_guard<std::mutex> lock(st.m);
+            if (st.open) {
+                g_vrRecOn.store(false, std::memory_order_relaxed);
+                st.open = false;
+                w = std::move(st.cur);
+                st.cur = RecWin();
+                had = true;
+            }
+        }
+        if (had) recAccept(std::move(w));
+    } catch (...) {
+    }
+}
+
+// An aim that writes opens its window; the judge numbering is g_frameStamp as it stands now.
+void recOpen(uint32_t aimFrame, uint32_t face, uint32_t dwell, const float centre[3]) noexcept {
+    try {
+        for (int k = 0; k < 3; ++k) g_recCentre[k].store(centre[k], std::memory_order_relaxed);
+        RecState& st = recState();
+        std::lock_guard<std::mutex> lock(st.m);
+        st.cur = RecWin();
+        st.cur.aimFrame = aimFrame;
+        st.cur.stamp = g_frameStamp.load(std::memory_order_relaxed);
+        st.cur.face = face;
+        st.cur.dwell = dwell;
+        st.open = true;
+        g_vrRecOn.store(true, std::memory_order_relaxed);
+    } catch (...) {
+    }
+}
+
+// The bake's end (and its start, to clear): the last window, the last face, then once the records kept near the centre on any aim frame.
+void recFlush(bool log) noexcept {
+    try {
+        recClose();
+        RecState& st = recState();
+        if (log) {
+            recLogGroup(st.group);
+            struct Row {
+                std::string key;
+                RecKeptNear k;
+            };
+            std::vector<Row> rows;
+            for (const auto& kv : st.kept) rows.push_back(Row{kv.first, kv.second});
+            std::stable_sort(rows.begin(), rows.end(), [](const Row& a, const Row& b) { return a.k.nearest < b.k.nearest; });
+            for (size_t i = 0; i < rows.size() && i < kRecKeptLines; ++i) {
+                char why[160];
+                std::snprintf(why, sizeof(why), "%s%s%s", rows[i].k.why[0] ? rows[i].k.why[0] : "?", rows[i].k.why[1] ? ", " : "", rows[i].k.why[1] ? rows[i].k.why[1] : "");
+                Log::get().note("concourse bake: vr record kept near: %s r %.1f nearest %.1f m: kept on %u of %u frames (%s)", rows[i].key.c_str(), static_cast<double>(rows[i].k.r),
+                                static_cast<double>(rows[i].k.nearest), rows[i].k.frames, st.frames, why);
+            }
+            if (rows.size() > kRecKeptLines)
+                Log::get().note("concourse bake: vr record kept near: %u more not listed", static_cast<unsigned>(rows.size() - kRecKeptLines));
+        }
+        st.group.clear();
+        st.kept.clear();
+        st.frames = 0;
+    } catch (...) {
+    }
+}
+
 bool concourseProducerVeto(uintptr_t rec) noexcept {
     SnapshotPin pin;
     const PadSnapshot& s = pin.get();
@@ -2021,6 +2312,7 @@ bool concourseProducerVeto(uintptr_t rec) noexcept {
     bool slabbed = false;
     const cc::Judge j = concourseJudgeHere(s, nameReadable, ni, sphere, centre, d, radius, &slabbed);
     if (slabbed) ++tc.concRoomProd;
+    if (g_vrRecOn.load(std::memory_order_relaxed)) recNote(s, rec, node, ni, nameReadable, sphere, centre, d, radius, j, slabbed, 'P');   // TEMPORARY (H62 instrument, Flight 56)
     if (cc::judgeKeeps(j)) {
         ++tc.concProdKept;
         concourseCountKept(tc, j);
@@ -3028,6 +3320,7 @@ void afterStoreConcourse(uintptr_t bucket, uintptr_t record) noexcept {
     bool slabbed = false;
     const cc::Judge j = concourseJudgeHere(s, nameReadable, ni, sphere, wr.world, d, sphere ? wr.radius : 0.0f, &slabbed);
     if (slabbed) ++tc.concRoomStore;
+    if (g_vrRecOn.load(std::memory_order_relaxed)) recNote(s, record, node, ni, nameReadable, sphere, wr.world, d, sphere ? wr.radius : 0.0f, j, slabbed, 'S');   // TEMPORARY (H62 instrument, Flight 56)
     const bool keep = cc::judgeKeeps(j);
     // The door rule culls the record, but by default its rig's tally counts it kept, so the rule never vetoes a whole rig: a rig can draw what the store never judges (Flight 44's bridge
     // floor, INFERRED), and its other records here say nothing of where that is.
@@ -3450,8 +3743,9 @@ void vrBakeEnd(bool publish, const char* why, uint64_t now, uint32_t frame) {
     if (g_vr.phase == VrBakePhase::kIdle) return;
     const bool aimed = g_vr.phase == VrBakePhase::kAim;
     vrBakeStopAim();
+    recFlush(true);   // TEMPORARY (H62 instrument, Flight 56): the last window, the last face and the kept-near table
     nativeCameraBakeObserve(false);
-    const bool any = g_vr.written[0] + g_vr.written[1] > 0;
+    const bool any =g_vr.written[0] + g_vr.written[1] > 0;
     char faces[260] = {};
     size_t at = 0;
     for (uint32_t f = 0; f < cvb::kFaces && at + 48 < sizeof(faces); ++f) {
@@ -4856,6 +5150,7 @@ void vrBakeEveryTick(uint32_t frame, bool social) {
 // The window opens: the measure phase begins. False (and the window is closed by the caller) when the cube or the VR shader is not ready.
 bool vrBakeBegin(uint32_t frame, uint64_t now) {
     if (!concoursePaneVrBakeBegin()) return false;
+    recFlush(false);   // TEMPORARY (H62 instrument, Flight 56): nothing of an earlier bake carries over
     g_vr.tick = 0;
     g_vr.startFrame = frame;
     g_vr.aimTicks = g_vr.headMissing = g_vr.logLines = 0;
@@ -4954,6 +5249,7 @@ const float* vrLatestBase() noexcept {
 // One aim: the next face, the base from the latest head, the hold, the near value. What the eyes should show is kept for the rows' lines. False, with nothing aimed or held this
 // tick, when the tone draws have gone kVrRowlessAimsMax aimed ticks in a row without the frame's rows: the caller ends the bake.
 bool vrBakeAimTick(uint32_t frame) {
+    recClose();   // TEMPORARY (H62 instrument, Flight 56): the previous aim's window ends with this tick, whatever this tick does
     {
         const ConcourseVrBakeStats st = concoursePaneVrBakeStats();
         const uint64_t dTone = st.toneDraws - g_vr.lastToneDraws, dNo = st.noRows - g_vr.lastNoRows;
@@ -5002,6 +5298,7 @@ bool vrBakeAimTick(uint32_t frame) {
     g_vr.aimDwell[a] = dwell;
     g_vr.aimWrite[a] = writes;
     concoursePaneVrBakeAimFrame(frame, static_cast<int>(d), dwell, writes);
+    if (writes) recOpen(frame, d, dwell, g_vr.centre);   // TEMPORARY (H62 instrument, Flight 56): the judges' records of this aim's window
     for (int e = 0; e < 2; ++e) cvb::eyeAt(eyeToHead[e], rows, g_vr.aimPred[a][e]);
     g_vr.aimValid[a] = true;
     ++g_vr.aimTicks;

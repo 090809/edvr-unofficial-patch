@@ -18,6 +18,7 @@
 #include "../common/runtime_profile.h"
 #include "binding_shadow.h"
 #include "concourse_cull_core.h"
+#include "concourse_glass_layout.h"
 #include "concourse_vr_bake_core.h"   // TEMPORARY (the VR bake): the capture shader's inverse and its limits
 #include "depth_probe.h"              // TEMPORARY (the VR bake): each eye's scene depth, and a draw's eye by its depth view
 #include "exposure_fix.h"
@@ -92,6 +93,18 @@ constexpr uint32_t kFlagSampler = 1u << 9;      // mirror-backdrop: the sampler 
 std::atomic<uint32_t> g_mode{kModeSteady};
 cc::PaneTriple g_list[cc::kPaneListCap] = {{cc::kPaneFamilyVs, cc::kPaneFamilyPs, 0}};   // entry 0 is the built-in glass family; diag.concourse_panes adds
 std::atomic<uint32_t> g_listN{1};
+// The glass's other pixel shaders: the game builds one per Material Quality level (and for Spot Shadows below High), all with the glass's layout
+// (concourse_glass_layout.h). Learned as each is created, from any thread, so it is static storage and survives the diag key's reload of g_list.
+constexpr uint32_t kLearnedCap = 32;
+std::atomic<uint64_t> g_learnedPs[kLearnedCap];
+std::atomic<uint32_t> g_learnedN{0};
+std::atomic<bool> g_learnedFullSaid{false};
+bool learnedPs(uint64_t ps) noexcept {
+    const uint32_t n = std::min<uint32_t>(g_learnedN.load(std::memory_order_acquire), kLearnedCap);
+    for (uint32_t i = 0; i < n; ++i)
+        if (g_learnedPs[i].load(std::memory_order_relaxed) == ps) return true;
+    return false;
+}
 std::atomic<bool> g_feedMeasure{false}, g_feedTreat{false}, g_feedWithhold{false}, g_feedSealed{false}, g_feedEffects{false};
 std::atomic<bool> g_withholdSealedNow{false};   // the hangar is sealed: only the families marked sealedToo are not issued
 std::atomic<float> g_bayOpacity{1.0f};
@@ -2378,9 +2391,11 @@ void ConcoursePaneScope::beginBody(ID3D11DeviceContext* ctx, UINT indexCount, UI
             listed = true;
             break;
         }
-    if (!listed) return;   // the pixel shader first: the vertex shader's hash is read only for a draw that could be a pane
+    const bool learned = !listed && learnedPs(ps);   // a pixel shader of the glass's layout, learned at creation: the built-in family's, with any index count
+    if (!listed && !learned) return;   // the pixel shader first: the vertex shader's hash is read only for a draw that could be a pane
     const uint64_t vs = vertexShaderHash(ctx);
-    if (cc::paneTripleIndex(g_list, listN, vs, ps, indexCount) < 0) return;
+    const bool learnedGlass = learned && vs == cc::kPaneFamilyVs;
+    if (!learnedGlass && cc::paneTripleIndex(g_list, listN, vs, ps, indexCount) < 0) return;
     ctx_ = ctx;
     calls_ = &calls;
     family_ = true;
@@ -3261,6 +3276,21 @@ ConcoursePaneMirrorStats concoursePaneTakeMirrorStats() noexcept {
 }
 uint32_t concoursePaneClearingN() noexcept { return g_clearN.load(std::memory_order_relaxed); }
 const char* concoursePaneModeName() noexcept { return modeText(g_mode.load(std::memory_order_relaxed)); }
+void concoursePaneNoteShader(uint64_t hash, const void* bytecode, size_t len) noexcept {
+    if (!cc::glassLayoutPs(bytecode, len)) return;
+    static std::mutex writers;   // creation is rare and the draw path never takes this
+    std::lock_guard<std::mutex> lock(writers);
+    if (learnedPs(hash)) return;
+    const uint32_t n = g_learnedN.load(std::memory_order_relaxed);
+    if (n >= kLearnedCap) {
+        if (!g_learnedFullSaid.exchange(true, std::memory_order_relaxed))
+            Log::get().note("concourse pane: the learned glass shader set is full (%u); ps %016llX is not added", kLearnedCap, static_cast<unsigned long long>(hash));
+        return;
+    }
+    g_learnedPs[n].store(hash, std::memory_order_relaxed);
+    g_learnedN.store(n + 1, std::memory_order_release);
+    Log::get().note("concourse pane: a new pixel shader has the glass's layout: ps %016llX joins the glass family (%u known)", static_cast<unsigned long long>(hash), n + 1);
+}
 uint32_t concoursePaneSlotCount() noexcept { return g_listN.load(std::memory_order_relaxed); }
 bool concoursePaneTreating() noexcept { return g_treatNow.load(std::memory_order_relaxed); }
 

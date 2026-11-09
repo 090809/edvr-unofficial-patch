@@ -781,6 +781,7 @@ HRESULT STDMETHODCALLTYPE hookedCreatePS(ID3D11Device* self, const void* bytecod
         captureFlatShader('p', hash, bytecode, len);
         { cross_profile::CaptureScope capture(!runtimeFlatProfile()); rememberFlatProbeShader('p', hash, bytecode, len); }
         registerShaderHash(*out, hash);
+        concoursePaneNoteShader(hash, bytecode, static_cast<size_t>(len));
         engineVelocityRememberPs(static_cast<ID3D11PixelShader*>(*out),hash,bytecode,static_cast<size_t>(len),linkage!=nullptr);
         remlokRememberVisorPs(hash, bytecode, static_cast<size_t>(len));   // F27: the visor shader's bytes, for the per-eye variants
         if (runtimeScopeIncludesFlat()) {

@@ -1,8 +1,9 @@
 #pragma once
 // The concourse's glass panes (docs\concourse-cull-2026-11-05.md, "The panes"). TEMPORARY. While the concourse cull is wanted (key or override on, on foot, in a
 // station's social space, the anchor seen), the station's glass family is treated, and the outside is not drawn while the cull is on: the plume and its twin, which
-// paint over the panes, and the smoke, ship lasers, engine trails, atmosphere and planet (concourse_cull_core.h, kWithheldPs and kWithheldVs), whatever the mode. The glass family is named by its vertex shader and pixel shader (concourse_cull_core.h, kPaneFamilyVs,
-// kPaneFamilyPs, any index count); diag.concourse_panes adds entries. The game's own glass draw is always issued, unchanged; the treatment is a SECOND draw of
+// paint over the panes, and the smoke, ship lasers, engine trails, atmosphere and planet (concourse_cull_core.h, kWithheldPs and kWithheldVs), whatever the mode. The glass family is named by its vertex shader (concourse_cull_core.h, kPaneFamilyVs) and a pixel shader: kPaneFamilyPs, or any pixel
+// shader whose layout is the glass's (concourse_glass_layout.h; the game builds one per Material Quality level, learned as each is created by concoursePaneNoteShader), any index count;
+// diag.concourse_panes adds entries. The game's own glass draw is always issued, unchanged; the treatment is a SECOND draw of
 // the same arguments, right after it, that paints the pane over. The modes (diag.concourse_pane_mode, F4):
 //   mirror       the second draw is the game's shader with three stand-in textures (t8, t9, t10), opaque (RGB only), writing depth
 //   mirror-soft  mirror, and the pixel shader's constant buffer 2 replaced by EDVR's own (roughness scaled to 0.54)
@@ -185,6 +186,7 @@ const char* concoursePaneModeName() noexcept;
 // The index count treated as the clearing pane now (36 until an exterior pane fills the view).
 uint32_t concoursePaneClearingN() noexcept;
 uint32_t concoursePaneSlotCount() noexcept;
+void concoursePaneNoteShader(uint64_t hash, const void* bytecode, size_t len) noexcept;   // a pixel shader was created: one of the glass's layout joins the glass family (any thread)
 // Panes are being treated: the feed says treat, the mode is not off and the replacement states are made.
 bool concoursePaneTreating() noexcept;
 
