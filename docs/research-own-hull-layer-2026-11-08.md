@@ -41,15 +41,13 @@ The smear is terrain that is newly uncovered at the hull edge every frame
   a dump wakes the busy layer; the stage timer holds 4,096 pairs.
 * **Temporary keys of this arc:** `diag.hull_layer` (off | dump | separate).
   Temporary code: the busy governor (`kBusyDraws`, `kBusyDrawsCulled`).
-* **Background:** option (e), the hole-fill, fails (section "Result"). The
-  own ship is one block of hull draws seeded after the cockpit shell, but
-  neighbours interleave, so ownership is per record on the GPU (sections
-  "The eye pass's draw order", "Step 1 flight", "The binding map").
-* **Rig probe** (section "Rig probe", compile-only, not flown): the own
-  ship's t33 slots from vehicle_rig's arrays, the emit, merges and the
-  copier, against the GPU own mask. **Next flight:** `hull layer:
-  rig_probe` lines with `state=ok`, `cpu_only`/`gpu_only` near 0, and one
-  dump's `HullRigProbe.json`; then hyperspace, SRV, on foot. No new key.
+* **Background:** the hole-fill (e) fails ("Result"); neighbours interleave
+  with the own hull draws, so ownership is per record ("The binding map").
+* **Rig seed** (section "Rig seed", 2026-11-10, compile-only, not flown):
+  the own mask grows from the rig probe's own slots (radius their reach +
+  30 m, at most 120); the seed draw only as fallback. Offline, 45 dumps:
+  wrong object 14 -> 0. **Next flight:** `hull layer: own seed:` `draw`
+  near 0; hangar, undock, transport with the mothership airborne.
 * **Ruled out (this study):**
   * ruled out: isolating the hull by stencil, because hull pixels carry
     stencil 0/4 like the world (kinematic doc, 2026-11-02 entry).
@@ -66,6 +64,10 @@ The smear is terrain that is newly uncovered at the hull edge every frame
     the band was not in any recent frame (section "Result").
   * ruled out (21:45): the composite's cover, depth test, TAA or blend as the
     cause of the missing hull, because dlOut after it is correct on 16 frames.
+  * ruled out (2026-11-10, offline): the seed draw as the own seed (wrong
+    object in 14 of 45 dumps); about the rig set, a fixed 120 m sphere
+    (hangar walls), 20 m linkage (splits the ship) and reach x 1.5 (misses
+    the transport's parts): section "Rig seed".
 
 ## 1. How Elite draws the own hull
 
@@ -1158,6 +1160,72 @@ that a view whose first element is not on a record boundary never occurs
 and given up after 30. On job threads the copier takes the probe's own
 mutex for every span while the layer is on (about 5k a second), and an own
 emit takes it once; the emit tap is four atomic loads for any other record.
+
+## Rig seed (2026-11-09/10, offline, then compile-only, not flown)
+
+Flight 2026-11-09 20:26 (build bbdfeb37, 45 readable dumps): the GPU
+mask was on the wrong object in 14 (hangar 204100, station 204126-204146,
+outside 204217-204304, planet 204541, and 205107-205122, 205312, 205323
+in the transport `Lander01` with the mothership airborne). The rig
+probe's CPU set was on the own vehicle in all 45, but small: 12-14
+cockpit-rig slots before supercruise, 44-47 with the ship rig, 7-74 in
+the transport.
+
+**Offline.** `eye_<S>_EnginePool.bin` is the whole t33 pool of the dump
+frame (temporal_pass's engine buffer capture, the same buffer and frame
+as the probe's: every `cpu_only`/`gpu_only` position in 45 JSONs matched
+it). Rules over the full pool, scored against own = within 80 m
+(Anaconda) / 30 m (transport) of the CPU centroid, foreign = past 100 m /
+60 m, the band between uncertain (dumps; own found / missed / foreign /
+band, summed):
+
+| location (dumps) | today's mask | 120 m about CPU | reach + 30 m | 20 m linkage |
+|---|---|---|---|---|
+| hangar (2) | 176/187/23/18, 1 wrong | 363/0/230/245 | 363/0/0/26 | 322/41/1/9 |
+| station (4) | 7/658/202/0, 4 wrong | 665/0/7/8 | 665/0/0/3 | 650/15/0/0 |
+| outside (7) | 640/681/127/113, 3 wrong | 1321/0/90/115 | 1321/0/0/22 | 1296/25/10/10 |
+| supercruise (11) | 2967/0/0/20 | 2967/0/0/20 | 2967/0/0/0 | 2965/2/0/0 |
+| planet (13) | 4611/143/194/220, 2 wrong | 4754/0/66/220 | 4754/0/0/93 | 4522/232/56/192 |
+| transport (8) | 1657/782/2712/0, 5 wrong | 2439/0/5/0 | 2439/0/0/0 | 2439/0/0/0 |
+
+Own records lay 13-25 m past the rig records' reach (Anaconda 71-83 m
+against 54-61; transport 17-28 against 4-6); the nearest record past
+reach + 30 was foreign in every dump. No record of the landed mothership
+lay within 30-110 m of the transport (205230-205251).
+- ruled out: the seed draw as the own seed, because it took another
+  object in 14 of 45 dumps.
+- ruled out: a fixed 120 m sphere about the rig set, because it takes
+  hangar walls and neighbours (230 foreign records in two hangar dumps).
+- ruled out: 20 m single linkage from the rig set, because own parts lie
+  more than 20 m from any other record (109 missed in 204601, 68 at
+  touchdown).
+- ruled out: radius reach x 1.5, because it misses the transport's own
+  records 9-28 m out (92 in 205230).
+
+**Built.** `hullRigProbeOwnSlots` hands the seed the content set of the
+seed's t33 buffer (own items the copier put there; any other copy and a
+DISCARD map clear them) under the probe's mutex, on the render thread at
+the eye's seed, before the dispatch. It is the frame being drawn: the
+copier fills the buffer between its map and the frame's draws, and in
+all 45 dumps the set matched the pool the seed read. The slots go into
+the seed's instance buffer; the seed shader takes their mean (records at
+the origin skipped), their reach, and marks records within
+min(120, reach + 30) m. The reach is held per eye while the own rigs'
+generation stays the same (a frame with few slots keeps the radius).
+No slot (on foot, hyperspace, the buffer not watched): the old seed.
+The probe was already on whenever the layer is; it is now load-bearing.
+Offline, the shader's math ported 1:1 (`port.py`): every dump's CPU set
+inside its mask, no record past 100 m / 60 m; masks of 95-1092 records
+(Anaconda 139-1092 with its hold at 91 m, transport 95-696 at 34-36 m).
+
+Line, every 30 s after `hull layer: state=`: `hull layer: own seed:
+rig=N draw=N hold_resets=N rig_slots=lo/mid/hi radius=lo/mid/hi
+reach=lo/mid/hi`. `--health`: PARTIAL when every seed was the draw's.
+
+**Unverified (not flown):** the rig seed in the headset; the hold across
+a ship/transport switch (it restarts on the rigs' generation); the cost
+of the probe's mutex on the render thread twice a frame (a copier span
+holds it briefly); a view not starting on a record (falls back).
 
 ## Optimisation debt (recorded 2026-11-08 at the pilot's request)
 
