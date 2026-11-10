@@ -352,9 +352,10 @@ and can recentre, keeping the way you face. Boarding your ship or SRV puts you
 back in your stored seat. At a terminal the HUD hides while the terminal's
 interface fills the view, which needs an anti-aliasing mode. On lockers, the
 inventory and other on-foot panels the mouse cursor is drawn where your clicks
-land. Where the game moves the camera away from you (a shop's buy screen, a
-fleet carrier, a terminal) you see the game's camera, and ED-UP takes the view
-back once the camera has stayed with you for 2 seconds.
+land. Where the game moves the camera away from you (a shop's buy screen, the
+loadout and Livery screens, a fleet carrier, a terminal) you see the game's
+camera, with the preview model beside the panel, and ED-UP takes the view back
+once the camera has stayed with you for 2 seconds.
 
 ### The on-foot screen
 
@@ -444,8 +445,10 @@ the game draws it. `visual.desktop_window_aspect` cuts the picture to 1:1, 4:3,
 places the cut as Elite's own mirror does (`native`) or in the centre
 (`center`), `visual.desktop_window_vertical_shift` moves it up or down, and
 `visual.desktop_window_style` makes the window an ordinary one or `borderless`
-full screen. In VR the desktop window never waits for the monitor's vertical
-sync, so it cannot hold the headset to 60 Hz.
+full screen. While Elite shows its flat screen in the headset, as on foot
+with native on-foot VR off, the window keeps the game's own shape, because the
+game sizes that screen's HUD by it. In VR the desktop window never waits for
+the monitor's vertical sync, so it cannot hold the headset to 60 Hz.
 [desktop-window.md](desktop-window.md).
 
 ## Launch and loading
