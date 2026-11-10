@@ -3074,10 +3074,16 @@ struct AdsActionReject {
     bool latched = false;
     uint64_t edgeMs = 0;
     uint64_t statusRevisionAtEdge = 0;
+    bool accepted = false;   // F235: the game has reported ADS while this request was held
 };
-// A veto needs changed Status.json content observed after the request and a 1.5 s acceptance grace. Repeated reads of identical content are not fresh evidence.
-// Changed content can still report a slow transition: a later authoritative ADS=true clears the veto while held. It also starts a new grace, so a later game
-// rejection (for example a reload) can still veto the held request after a new false status. Content freshness is not proof of native weapon readiness.
+// F235: a drop of the game's ADS under a held request it had accepted is the game interrupting the aim, not refusing it: a reload takes the game out of ADS for about
+// 2 s and it takes ADS back by itself while the button is held (Steam, 2026-11-09: Status.json off about 2.0 s at each reload). The 1.5 s grace vetoed the request
+// near the reload's end, so the view left the sights and came back 0.5 s later. Such a drop is held for up to this long from the game's last ADS read; past it the
+// veto latches as before (a drop the game does not end, the request held through a sprint or the like).
+constexpr uint64_t kAdsAcceptedDropMaxMs = 5000;
+// A veto needs changed Status.json content observed after the request and a grace: 1.5 s for a request the game has not accepted, kAdsAcceptedDropMaxMs once it has
+// (F235). Repeated reads of identical content are not fresh evidence. Changed content can still report a slow transition: a later authoritative ADS=true clears the
+// veto while held and starts a new grace. Content freshness is not proof of native weapon readiness.
 inline bool adsActionRejectStep(AdsActionReject& s, bool actionAds, uint64_t nowMs, bool journalKnown, bool journalAds, uint64_t statusRevision) noexcept {
     if (!actionAds) {
         s = AdsActionReject{};
@@ -3085,6 +3091,7 @@ inline bool adsActionRejectStep(AdsActionReject& s, bool actionAds, uint64_t now
     }
     if (journalKnown && journalAds) {
         s.latched = false;
+        s.accepted = true;
         s.edgeMs = nowMs ? nowMs : 1;
         s.statusRevisionAtEdge = statusRevision;
         return false;
@@ -3095,8 +3102,9 @@ inline bool adsActionRejectStep(AdsActionReject& s, bool actionAds, uint64_t now
         s.statusRevisionAtEdge = statusRevision;
         return false;
     }
+    const uint64_t graceMs = s.accepted ? kAdsAcceptedDropMaxMs : kAdsActionRejectGraceMs;
     if (journalKnown && !journalAds && statusRevision != 0 && statusRevision != s.statusRevisionAtEdge && nowMs >= s.edgeMs &&
-        nowMs - s.edgeMs >= kAdsActionRejectGraceMs) s.latched = true;
+        nowMs - s.edgeMs >= graceMs) s.latched = true;
     return s.latched;
 }
 // The bound logical action is the prompt request; the journal is fallback when the action sample is absent/stale. `eligible` is restricted by the caller to an
