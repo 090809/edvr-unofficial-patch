@@ -505,35 +505,59 @@ constexpr char kTaaHlsl[] =
 // softer than DLSS's. A cross unsharp mask on the TAA result, clamped to the cross's range (no halo); only where the whole
 // cross is hull (alpha 1), so the silhouette's anti-aliased edge stays as the TAA left it. The history is not sharpened.
 // hlsl-check: kSharpHlsl hull_layer_sharp_cs cs_5_0
+// hlsl-check: kSharpDirectHlsl hull_layer_sharp_direct_cs cs_5_0
+// Two entry points, one body (HULL_LAYER_SHARP_HLSL's hullLayerSharpPixel): kSharpHlsl reads the world from an SRV of the
+// upscaled eye and writes the composite's own out (c.out, copied whole from the eye first and back over it after);
+// kSharpDirectHlsl (2026-11-10, docs "Bench A/B variants") reads and writes the eye itself through one typed UAV, the world only
+// at the pixel it writes, so the eye's pixels outside the listed tiles are never touched and neither copy runs. Same loads, same
+// arithmetic, same UNORM store.
 constexpr float kSharpAmount = 0.6f;   // c + amount * (c - mean of the 4 neighbours); 0.8 amplified the thin lines' flicker (23:10)
+#define HULL_LAYER_SHARP_HLSL                                                                      \
+    "Texture2D<float4> hist : register(t0);\n"                                                     \
+    "StructuredBuffer<uint> tiles : register(t2);\n"                                               \
+    "RWTexture2D<float4> compOut : register(u0);\n"                                                \
+    "cbuffer HullLayerSharpCb : register(b0) { float4 amount; };\n"                                \
+    "bool hullLayerSharpPixel(uint3 gid, uint3 gt, out int2 p, out float4 res) {\n"                 \
+    "    p = int2(0, 0);\n"                                                                        \
+    "    res = float4(0.0, 0.0, 0.0, 0.0);\n"                                                      \
+    "    uint te = tiles[gid.x];\n"                                                                \
+    "    if ((te & 0x80000000u) == 0u) return false;\n"                                            \
+    "    uint2 id = uint2(te & 0xFFFFu, (te >> 16) & 0x7FFFu) * 8u + gt.xy;\n"                     \
+    "    uint ow, oh; hist.GetDimensions(ow, oh);\n"                                               \
+    "    if (id.x >= ow || id.y >= oh) return false;\n"                                            \
+    "    p = int2(id.xy);\n"                                                                       \
+    "    int2 mx = int2(ow, oh) - 1;\n"                                                            \
+    "    float4 c = hist.Load(int3(p, 0));\n"                                                      \
+    "    float4 l = hist.Load(int3(clamp(p + int2(-1, 0), 0, mx), 0));\n"                          \
+    "    float4 r = hist.Load(int3(clamp(p + int2(1, 0), 0, mx), 0));\n"                           \
+    "    float4 u = hist.Load(int3(clamp(p + int2(0, -1), 0, mx), 0));\n"                          \
+    "    float4 d = hist.Load(int3(clamp(p + int2(0, 1), 0, mx), 0));\n"                           \
+    "    res = c;\n"                                                                               \
+    "    if (min(min(c.a, l.a), min(min(r.a, u.a), d.a)) > 0.999) {\n"                             \
+    "        float3 m = (l.rgb + r.rgb + u.rgb + d.rgb) * 0.25;\n"                                  \
+    "        float3 lo = min(c.rgb, min(min(l.rgb, r.rgb), min(u.rgb, d.rgb)));\n"                   \
+    "        float3 hi = max(c.rgb, max(max(l.rgb, r.rgb), max(u.rgb, d.rgb)));\n"                   \
+    "        res.rgb = clamp(c.rgb + amount.x * (c.rgb - m), lo, hi);\n"                             \
+    "    }\n"                                                                                      \
+    "    return true;\n"                                                                           \
+    "}\n"
 constexpr char kSharpHlsl[] =
-    "Texture2D<float4> hist : register(t0);\n"
+    HULL_LAYER_SHARP_HLSL
     "Texture2D<float4> world : register(t1);\n"
-    "StructuredBuffer<uint> tiles : register(t2);\n"
-    "RWTexture2D<float4> compOut : register(u0);\n"
-    "cbuffer HullLayerSharpCb : register(b0) { float4 amount; };\n"
     // The TAA's tile list: a tile the hull does not reach this frame keeps the world compOut already holds (copied whole first).
     "[numthreads(8, 8, 1)] void hull_layer_sharp_cs(uint3 gid : SV_GroupID, uint3 gt : SV_GroupThreadID) {\n"
-    "    uint te = tiles[gid.x];\n"
-    "    if ((te & 0x80000000u) == 0u) return;\n"
-    "    uint2 id = uint2(te & 0xFFFFu, (te >> 16) & 0x7FFFu) * 8u + gt.xy;\n"
-    "    uint ow, oh; hist.GetDimensions(ow, oh);\n"
-    "    if (id.x >= ow || id.y >= oh) return;\n"
-    "    int2 p = int2(id.xy);\n"
-    "    int2 mx = int2(ow, oh) - 1;\n"
-    "    float4 c = hist.Load(int3(p, 0));\n"
-    "    float4 l = hist.Load(int3(clamp(p + int2(-1, 0), 0, mx), 0));\n"
-    "    float4 r = hist.Load(int3(clamp(p + int2(1, 0), 0, mx), 0));\n"
-    "    float4 u = hist.Load(int3(clamp(p + int2(0, -1), 0, mx), 0));\n"
-    "    float4 d = hist.Load(int3(clamp(p + int2(0, 1), 0, mx), 0));\n"
-    "    float4 res = c;\n"
-    "    if (min(min(c.a, l.a), min(min(r.a, u.a), d.a)) > 0.999) {\n"
-    "        float3 m = (l.rgb + r.rgb + u.rgb + d.rgb) * 0.25;\n"
-    "        float3 lo = min(c.rgb, min(min(l.rgb, r.rgb), min(u.rgb, d.rgb)));\n"
-    "        float3 hi = max(c.rgb, max(max(l.rgb, r.rgb), max(u.rgb, d.rgb)));\n"
-    "        res.rgb = clamp(c.rgb + amount.x * (c.rgb - m), lo, hi);\n"
-    "    }\n"
+    "    int2 p; float4 res;\n"
+    "    if (!hullLayerSharpPixel(gid, gt, p, res)) return;\n"
     "    float4 w = world.Load(int3(p, 0));\n"
+    "    compOut[p] = float4(w.rgb * (1.0 - res.a) + res.rgb, w.a);\n"
+    "}\n";
+// compOut is the eye: a tile the hull does not reach is not written, so it keeps the world.
+constexpr char kSharpDirectHlsl[] =
+    HULL_LAYER_SHARP_HLSL
+    "[numthreads(8, 8, 1)] void hull_layer_sharp_direct_cs(uint3 gid : SV_GroupID, uint3 gt : SV_GroupThreadID) {\n"
+    "    int2 p; float4 res;\n"
+    "    if (!hullLayerSharpPixel(gid, gt, p, res)) return;\n"
+    "    float4 w = compOut[p];\n"
     "    compOut[p] = float4(w.rgb * (1.0 - res.a) + res.rgb, w.a);\n"
     "}\n";
 
@@ -760,6 +784,13 @@ struct Comp {
     ID3D11UnorderedAccessView* tileListUav = nullptr;
     ID3D11Buffer* tileArgs = nullptr;
     bool tilesValid = false;      // the pair and the state keep the tiles' invariant (false after a bench DLSS frame)
+    // The direct composite (kSharpDirectHlsl): a typed R8G8B8A8_UNORM UAV of the eye the composite writes, made for that
+    // texture (directRes, an identity: the view holds the reference) and remade when the texture or its SRV's format changes;
+    // directFail the reason it could not be made for directRes (kCm*), 0 when it was.
+    ID3D11UnorderedAccessView* directUav = nullptr;
+    const void* directRes = nullptr;
+    DXGI_FORMAT directSrvFmt = DXGI_FORMAT_UNKNOWN;
+    int directFail = 0;
     uint32_t outW = 0, outH = 0, renderW = 0, renderH = 0;
     uint32_t read = 0;            // hist[read] holds last frame's
     uint32_t lastFrame = ~0u;
@@ -783,6 +814,9 @@ struct GpuTimer {
 // Step 3: why a frame in separate mode kept the own ship in the main pass, and why an eye's composite declined.
 enum Fallback : int { kFbFrameGen = 0, kFbOutside, kFbMaskPending, kFbMaskLarge, kFbStreak, kFallbacks };
 enum Declined : int { kDcStale = 0, kDcSize, kDcGpu, kDeclines };
+// Why an eye's composite went through c.out and two whole-eye copies rather than straight onto the eye: not applied this frame (the
+// history kept warm), a dump or the TAA sequence reads c.out, and the reasons the eye's UAV could not be had.
+enum CompMethod : int { kCmNotApplied = 0, kCmNeedsOut, kCmNoUav, kCmFormat, kCmTypedLoad, kCmView, kCmShader, kCompMethods };
 
 struct Window {
     ULONGLONG startMs = 0;
@@ -811,6 +845,9 @@ struct Window {
     uint32_t declined[kDeclines] = {};
     uint32_t toned = 0, toneDeclined = 0, historyResets = 0, byIndex = 0, ownMax = 0;
     uint32_t siteAfterResolve = 0, siteUpscalerOut = 0;   // applied composites by where they landed (HullLayerCompositeInputs)
+    // The composite's method (the "composite method" line): eye-composites written straight onto the eye (direct) and through
+    // c.out (copy) by reason (kCm*), and those through the bench's second DLSS (its own copy path).
+    uint32_t compDirect = 0, compCopy[kCompMethods] = {}, compBenchDlss = 0;
     // The AO chain (the "ao" line): eye-frames with a private G-buffer, and those whose whole chain and apply were re-issued;
     // step dispatches and apply draws re-issued; eye-frames where the game ran a step (or the apply) for the eye and it was
     // not re-issued, by step; chain dispatches whose eye could not be named (none of its resources is an eye's).
@@ -894,6 +931,8 @@ struct CompGpu {
     ID3D11ComputeShader* sharpCs = nullptr;
     ID3D11ComputeShader* tileMarkCs = nullptr;
     ID3D11ComputeShader* tileListCs = nullptr;
+    ID3D11ComputeShader* sharpDirectCs = nullptr;   // made apart (ensureDirectCs): a failure leaves the copy path
+    bool directTried = false, directOk = false;
     ID3D11SamplerState* linear = nullptr;
     ID3D11Buffer* coverCb = nullptr;
     ID3D11Buffer* taaCb = nullptr;
@@ -1006,6 +1045,11 @@ bool g_benchTimeAll = false, g_benchSleep = false;
 bool g_benchNoAa = false;          // the variant bench's sep_noaa: the TAA runs with its history off (the 3x3 reconstruct, then the sharpen)
 uint32_t g_benchEvictions = 0;     // private copies dropped (evictStale) while the bench runs
 int g_benchDlss = 0;               // the variant bench's second DLSS on the hull: 0 none, else its variant (dlss_full, dlss_sub)
+// The variant bench's A/B variants: sep_taa with one feature off. sep_norefl: the reflection re-issue (beginReflStep);
+// sep_nopre: Build B's prefill and reset (prefillEye); sep_norect: Build A''s rectangle (eyeRect: the re-issues and the cover
+// whole-eye). Each place that would have run the feature calls benchNoteOff, so a row whose feature never ran says so.
+bool g_benchNoRefl = false, g_benchNoPre = false, g_benchNoRect = false;
+void benchNoteOff();
 void benchNoteStages(uint32_t frame, const double* sums);
 // Right after an eye's composite, before its history pair flips: the bench's rect cover, mask and applied mark.
 void benchAfterComposite(ID3D11DeviceContext* ctx, int eye, const Eye& e, const Comp& c, const HullLayerCompositeInputs& in, bool applied);
@@ -1185,6 +1229,7 @@ void releaseComp(Comp& c) {
     releaseRef(c.tileListUav);
     releaseRef(c.tileList);
     releaseRef(c.tileArgs);
+    releaseRef(c.directUav);
     c = Comp{};
 }
 
@@ -1267,6 +1312,7 @@ void releaseGpu() {
     releaseRef(g_cgpu.sharpCs);
     releaseRef(g_cgpu.tileMarkCs);
     releaseRef(g_cgpu.tileListCs);
+    releaseRef(g_cgpu.sharpDirectCs);
     releaseRef(g_cgpu.linear);
     releaseRef(g_cgpu.coverCb);
     releaseRef(g_cgpu.taaCb);
@@ -2322,6 +2368,10 @@ void prefillEye(ID3D11DeviceContext* ctx, Eye& e, int ei) {
         ++g_win.preSkipView;
         return;
     }
+    if (g_benchNoPre) {   // the variant bench's sep_nopre: it would have prefilled; the private depth stays at its clear (no reset owed)
+        benchNoteOff();
+        return;
+    }
     if (!ensurePrefillGpu()) {
         ++g_win.preSkipShader;
         return;
@@ -3147,6 +3197,11 @@ bool beginReflStep(ID3D11DeviceContext* ctx, int step) {
     }
     e.reflSeen |= bit;
     if (e.gb != Gb::Done || !e.hdrGame || !findMirror(e.hdrGame)) return decline();   // no private HDR lit this frame
+    if (g_benchNoRefl) {   // the variant bench's sep_norefl: the step would have been re-issued; it is not (not a decline)
+        benchNoteOff();
+        releaseCsSlots(srv, uav);
+        return false;
+    }
     // Targets: the eye's HDR must be one of them (the pass adds into it); it goes to its private twin, made by the lighting.
     // Every other target gets a private copy (the R16 one).
     ID3D11UnorderedAccessView* bindUav[kCsUavSlots] = {};
@@ -3305,6 +3360,76 @@ bool ensureCompGpu() {
 
 bool rgba8Family(DXGI_FORMAT f) {
     return f == DXGI_FORMAT_R8G8B8A8_TYPELESS || f == DXGI_FORMAT_R8G8B8A8_UNORM || f == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+}
+
+// The direct composite's shader, once (a typed UAV load: it may compile and not be creatable on a device without them).
+bool ensureDirectCs() {
+    if (g_cgpu.directTried) return g_cgpu.directOk;
+    g_cgpu.directTried = true;
+    ID3DBlob* code = nullptr;
+    std::string why;
+    if (!compileShader(kSharpDirectHlsl, sizeof(kSharpDirectHlsl) - 1, "hull_layer_sharp_direct_cs", "cs_5_0", &code, &why)) {
+        Log::get().note("hull layer: the hull_layer_sharp_direct_cs shader did not compile (%s); the composite copies the eye this session", why.c_str());
+        if (code) code->Release();
+        return false;
+    }
+    const HRESULT hr = g_device->CreateComputeShader(code->GetBufferPointer(), code->GetBufferSize(), nullptr, &g_cgpu.sharpDirectCs);
+    code->Release();
+    if (FAILED(hr)) {
+        Log::get().note("hull layer: the hull_layer_sharp_direct_cs shader compiled but could not be created (hr 0x%08lX); the composite copies the eye "
+                        "this session",
+                        static_cast<unsigned long>(hr));
+        return false;
+    }
+    g_cgpu.directOk = true;
+    return true;
+}
+
+// The eye's typed UAV for the direct composite, or the reason there is none (kCm*, < 0 never: kCompMethods means ok). The world
+// must decode as today's SRV does it (R8G8B8A8_UNORM) and be stored as c.out's UAV stores it (R8G8B8A8_UNORM), so the result is
+// c.out's bit for bit; the device must load that format through a UAV (D3D11_FORMAT_SUPPORT2_UAV_TYPED_LOAD). Made once a texture.
+int directUavFor(Comp& c, int eye, const HullLayerCompositeInputs& in) {
+    D3D11_SHADER_RESOURCE_VIEW_DESC sd{};
+    in.outputSrv->GetDesc(&sd);
+    if (c.directRes == in.output && c.directSrvFmt == sd.Format) return c.directUav ? kCompMethods : c.directFail;
+    releaseRef(c.directUav);
+    c.directRes = in.output;
+    c.directSrvFmt = sd.Format;
+    c.directFail = kCompMethods;
+    D3D11_TEXTURE2D_DESC td{};
+    in.output->GetDesc(&td);
+    D3D11_FEATURE_DATA_FORMAT_SUPPORT2 fs{};
+    fs.InFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
+    const UINT need = D3D11_FORMAT_SUPPORT2_UAV_TYPED_LOAD | D3D11_FORMAT_SUPPORT2_UAV_TYPED_STORE;
+    if (!(td.BindFlags & D3D11_BIND_UNORDERED_ACCESS))
+        c.directFail = kCmNoUav;
+    else if (sd.Format != DXGI_FORMAT_R8G8B8A8_UNORM || sd.ViewDimension != D3D11_SRV_DIMENSION_TEXTURE2D || td.ArraySize != 1 || td.SampleDesc.Count != 1 ||
+             (td.Format != DXGI_FORMAT_R8G8B8A8_TYPELESS && td.Format != DXGI_FORMAT_R8G8B8A8_UNORM))
+        c.directFail = kCmFormat;
+    else if (FAILED(g_device->CheckFeatureSupport(D3D11_FEATURE_FORMAT_SUPPORT2, &fs, sizeof fs)) || (fs.OutFormatSupport2 & need) != need)
+        c.directFail = kCmTypedLoad;
+    else if (!ensureDirectCs())
+        c.directFail = kCmShader;
+    else {
+        D3D11_UNORDERED_ACCESS_VIEW_DESC ud{};
+        ud.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        ud.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D;
+        ud.Texture2D.MipSlice = sd.Texture2D.MostDetailedMip;
+        if (FAILED(g_device->CreateUnorderedAccessView(in.output, &ud, &c.directUav))) {
+            c.directUav = nullptr;
+            c.directFail = kCmView;
+        }
+    }
+    static const char* const kWhy[kCompMethods] = {"", "", "the eye has no UAV bind flag", "the eye or its view is not R8G8B8A8_UNORM",
+                                                   "the device cannot load R8G8B8A8_UNORM through a UAV", "the eye's UAV could not be made",
+                                                   "the direct shader is missing"};
+    if (c.directUav)
+        Log::get().note("hull layer: composite for eye %d writes the eye directly (%ux%u, format %d, typed UAV load), no whole-eye copies", eye, td.Width,
+                        td.Height, static_cast<int>(td.Format));
+    else
+        Log::get().note("hull layer: composite for eye %d copies the eye whole twice: %s (format %d, view %d, bind 0x%X)", eye, kWhy[c.directFail],
+                        static_cast<int>(td.Format), static_cast<int>(sd.Format), td.BindFlags);
+    return c.directUav ? kCompMethods : c.directFail;
 }
 
 // A 2D texture with a default SRV and, when `uav`, a default UAV (both in the texture's own format).
@@ -3800,7 +3925,9 @@ bool eyeRect(int ei, D3D11_RECT* out) {
             const uint32_t y0 = e.boxRect[1] > m ? e.boxRect[1] - m : 0u;
             const uint32_t x1 = (std::min)(w, e.boxRect[2] + m);
             const uint32_t y1 = (std::min)(h, e.boxRect[3] + m);
-            if (x0 < x1 && y0 < y1) {
+            if (x0 < x1 && y0 < y1 && g_benchNoRect) {
+                benchNoteOff();   // the variant bench's sep_norect: it would have been scissored; the whole eye (not counted as rect)
+            } else if (x0 < x1 && y0 < y1) {
                 e.rect.left = static_cast<LONG>(x0);
                 e.rect.top = static_cast<LONG>(y0);
                 e.rect.right = static_cast<LONG>(x1);
@@ -4447,7 +4574,16 @@ void report() {
                         g_win.failTone, g_win.failComposite, g_win.declined[kDcStale], g_win.declined[kDcSize], g_win.declined[kDcGpu], g_win.toned,
                         g_win.toneDeclined, g_win.historyResets, g_win.byIndex, g_win.ownMax, g_win.siteAfterResolve, g_win.siteUpscalerOut, toneMs,
                         compMs, kHoldFrames);
-        Log::get().note("hull layer: rect: decided=%u rect=%u share=%.3f whole=no_box:%u,stale:%u,empty:%u,probe:%u boxes=%u empty_boxes=%u "
+        Log::get().note("hull layer: composite method: direct=%u copy=%u copy_why=not_applied:%u,dump_or_seq:%u,no_uav:%u,format:%u,typed_load:%u,"
+                        "view:%u,shader:%u bench_dlss=%u (eye-composites: direct = the hull written straight onto the eye's listed tiles "
+                        "through its typed UAV, no whole-eye copy; copy = through the composite's own out and two whole-eye copies, by "
+                        "reason; bench_dlss = the bench's second DLSS, its own copy path; direct=0 copy=0 means no composite ran)",
+                        g_win.compDirect,
+                        g_win.compCopy[kCmNotApplied] + g_win.compCopy[kCmNeedsOut] + g_win.compCopy[kCmNoUav] + g_win.compCopy[kCmFormat] +
+                            g_win.compCopy[kCmTypedLoad] + g_win.compCopy[kCmView] + g_win.compCopy[kCmShader],
+                        g_win.compCopy[kCmNotApplied], g_win.compCopy[kCmNeedsOut], g_win.compCopy[kCmNoUav], g_win.compCopy[kCmFormat],
+                        g_win.compCopy[kCmTypedLoad], g_win.compCopy[kCmView], g_win.compCopy[kCmShader], g_win.compBenchDlss);
+        Log::get().note("hull layer: rect:decided=%u rect=%u share=%.3f whole=no_box:%u,stale:%u,empty:%u,probe:%u boxes=%u empty_boxes=%u "
                         "scissored_draws=%u with_game_scissor=%u no_state=%u (Build A': eye-frames whose re-issues were decided, those scissored "
                         "to the shown hull's box of %u+ frames before grown %u px a frame of its age (at least %u), and their mean share of the "
                         "eye; whole-eye eye-frames by reason, a probe every %u frames; cover boxes read back; draws re-issued scissored; "
@@ -4525,6 +4661,7 @@ struct BenchRun {
     uint32_t left = 0;
     int capIndex = -1;   // Capture: the frame about to run is capture frame capIndex
     uint32_t restarts[hb::kVariants] = {};   // capture runs restarted, by variant
+    uint32_t offCapture = 0;   // an A/B variant's feature switched off in this capture run (benchNoteOff)
     // The frame in progress, from its hooks; judged and cleared at its boundary.
     bool staged0 = false, applied0 = false, discarded = false;
     hb::Frame pendingFrame;
@@ -4564,6 +4701,10 @@ ID3D11Texture2D* g_benchRectStage[2] = {};
 hb::Writer g_benchWriter;
 
 bool benchAsleepVariant(int v) { return v == hb::kOrigA || v == hb::kOrigB; }
+bool benchAbVariant(int v) { return v == hb::kSepNorefl || v == hb::kSepNopre || v == hb::kSepNorect; }
+void benchNoteOff() {
+    if (g_bench.phase == BenchPhase::Capture) ++g_bench.offCapture;
+}
 // What this build runs: the originals, the layer with and without its TAA, the second DLSS whole and as a subrect.
 const char* benchNotBuilt(int v) {
     if (v == hb::kNative || v == hb::kNativeFxaa) return "needs shader dump (feasibility builds A and C)";
@@ -5097,7 +5238,7 @@ void benchReleaseGpu() {
 void benchRestore(const char* abortReason) {
     BenchRun& b = g_bench;
     g_benchSleep = false;
-    g_benchNoAa = false;
+    g_benchNoAa = g_benchNoRefl = g_benchNoPre = g_benchNoRect = false;
     g_benchDlss = 0;
     g_benchTimeAll = false;
     benchDlssRelease();
@@ -5146,6 +5287,7 @@ void benchStartVariant(int v) {
     b.left = benchWarm(v);
     b.capIndex = -1;
     b.restarts[v] = 0;
+    b.offCapture = 0;
     if (v == hb::kDlssFull || v == hb::kDlssSub) {
         dlaaHullRelease();   // never two hull pairs at once: the full pair goes before the subrect pair is made
         g_benchDlssReset[0] = g_benchDlssReset[1] = true;
@@ -5175,6 +5317,14 @@ void benchEndVariant(const char* refusedWhy) {
         const double dx = dxgiUsageMb();
         r.mbDxgi.have = dx >= 0.0;
         r.mbDxgi.v = dx;
+        if (benchAbVariant(b.var)) {   // the A/B row says whether its feature was in fact off (else it is sep_taa again)
+            char why[160];
+            if (b.offCapture)
+                _snprintf_s(why, sizeof why, _TRUNCATE, "feature off %u times in the capture", b.offCapture);
+            else
+                _snprintf_s(why, sizeof why, _TRUNCATE, "NOT SWITCHED OFF: the feature never ran in the capture (this row is sep_taa)");
+            r.reason = why;
+        }
     }
     if (b.var == hb::kDlssFull || b.var == hb::kDlssSub) benchDlssRelease();   // its features and targets go with it
     benchStartVariant(b.var + 1);
@@ -5196,6 +5346,7 @@ void benchRestart(const char* why) {
     b.phase = BenchPhase::Warm;
     b.left = kBenchWarmShort;
     b.capIndex = -1;
+    b.offCapture = 0;
 }
 
 // The next frame's flags from the phase: the layer asleep for the originals, the TAA's history off for sep_noaa.
@@ -5203,6 +5354,9 @@ void benchApplyFrameFlags() {
     const bool run = benchRunning();
     g_benchSleep = run && benchAsleepVariant(g_bench.var);
     g_benchNoAa = run && g_bench.var == hb::kSepNoaa;
+    g_benchNoRefl = run && g_bench.var == hb::kSepNorefl;
+    g_benchNoPre = run && g_bench.var == hb::kSepNopre;
+    g_benchNoRect = run && g_bench.var == hb::kSepNorect;
     g_benchDlss = run && (g_bench.var == hb::kDlssFull || g_bench.var == hb::kDlssSub) ? g_bench.var : 0;
 }
 
@@ -5368,7 +5522,7 @@ void benchFinish() {
     if (drained) g_benchWriter.stop();   // else the thread finishes its queue and is joined at the next bench or at shutdown
     g_benchWriter.resetCounts();
     benchReleaseGpu();
-    g_benchSleep = g_benchNoAa = g_benchTimeAll = false;
+    g_benchSleep = g_benchNoAa = g_benchTimeAll = g_benchNoRefl = g_benchNoPre = g_benchNoRect = false;
     g_benchDlss = 0;
     detail::g_hullBenchOn = false;
     g_bench.phase = BenchPhase::Idle;
@@ -5890,12 +6044,30 @@ void hullLayerCompositeEye(ID3D11DeviceContext* ctx, int eye, const HullLayerCom
     cb.sizes[3] = static_cast<int32_t>(in.outH);
     cb.origin[0] = static_cast<int32_t>(in.regionX);
     cb.origin[1] = static_cast<int32_t>(in.regionY);
+    // Applied only when this frame's main pass discarded the own ship on this eye; otherwise it is made (the history stays warm,
+    // and a miss is seen) and the upscaled eye keeps the game's own ship.
+    const bool apply = g_discard && (e.ownDraws + e.ownDecals) > 0;
     timerBegin(g_compTimer, ctx);
     stageOpen(ctx, kTsTaa, false);   // dump v2: the TAA, the sharpen and the composite's copy
     vScreenUpdateSubresourceRaw(ctx, g_cgpu.taaCb, 0, nullptr, &cb, 0, 0);
     // The variant bench's dlss_full / dlss_sub: the hull through a second DLSS over the hull-free world in place of the TAA and sharpen.
     const bool benchDlss = g_benchDlss && benchHullDlss(ctx, eye, e, c, in);
     if (benchDlss) c.tilesValid = false;   // the TAA's pair and tile state were not kept this frame
+    // The method (docs "Bench A/B variants"): an applied composite writes the hull straight onto the eye's listed tiles through a
+    // typed UAV of the eye (directUavFor), and neither whole-eye copy runs; through c.out when not applied (the eye is not to
+    // change), when the dump or the TAA sequence reads c.out this frame, and when the eye's UAV cannot be had.
+    bool direct = false;
+    if (benchDlss) {
+        ++g_win.compBenchDlss;
+    } else {
+        const bool needsOut = g_dump == Dump::Capturing || (eye == 0 && g_seq.active && !g_seq.end && g_seq.staged < kSeqFrames);
+        const int why = !apply ? kCmNotApplied : needsOut ? kCmNeedsOut : directUavFor(c, eye, in);
+        direct = why == kCompMethods;
+        if (direct)
+            ++g_win.compDirect;
+        else
+            ++g_win.compCopy[why];
+    }
     if (!benchDlss) {
         CsStageSave save;
         save.save(ctx);
@@ -5911,8 +6083,8 @@ void hullLayerCompositeEye(ID3D11DeviceContext* ctx, int eye, const HullLayerCom
             ctx->ClearUnorderedAccessViewUint(c.tileMarkUav, zu);
             c.tilesValid = true;
         }
-        // The out starts as the upscaled eye: the sharpen writes only the tiles the hull reaches.
-        vScreenCopyResourceRaw(ctx, c.out, in.output);
+        // The out starts as the upscaled eye: the sharpen writes only the tiles the hull reaches (direct: the eye is the out).
+        if (!direct) vScreenCopyResourceRaw(ctx, c.out, in.output);
         {
             ID3D11ShaderResourceView* srv = e.coverSrv;
             ID3D11UnorderedAccessView* uavs[CsStageSave::kUavs] = {c.tileMarkUav};
@@ -5953,10 +6125,11 @@ void hullLayerCompositeEye(ID3D11DeviceContext* ctx, int eye, const HullLayerCom
         vScreenUpdateSubresourceRaw(ctx, g_cgpu.sharpCb, 0, nullptr, sharpCb, 0, 0);
         ID3D11ShaderResourceView* noSrv[5] = {};
         ctx->CSSetShaderResources(0, 5, noSrv);   // the history just written comes back as a resource
-        ID3D11ShaderResourceView* sharpSrv[3] = {c.histSrv[c.read ^ 1u], in.outputSrv, c.tileListSrv};
-        ID3D11UnorderedAccessView* sharpUav[CsStageSave::kUavs] = {c.outUav};
+        // Direct: the world is read through the eye's own UAV at the pixel written, so no SRV of the eye is bound (t1 empty).
+        ID3D11ShaderResourceView* sharpSrv[3] = {c.histSrv[c.read ^ 1u], direct ? nullptr : in.outputSrv, c.tileListSrv};
+        ID3D11UnorderedAccessView* sharpUav[CsStageSave::kUavs] = {direct ? c.directUav : c.outUav};
         ctx->CSSetUnorderedAccessViews(0, CsStageSave::kUavs, sharpUav, nullptr);
-        ctx->CSSetShader(g_cgpu.sharpCs, nullptr, 0);
+        ctx->CSSetShader(direct ? g_cgpu.sharpDirectCs : g_cgpu.sharpCs, nullptr, 0);
         ctx->CSSetShaderResources(0, 3, sharpSrv);
         ctx->CSSetConstantBuffers(0, 1, &g_cgpu.sharpCb);
         ctx->DispatchIndirect(c.tileArgs, 0);
@@ -5964,10 +6137,7 @@ void hullLayerCompositeEye(ID3D11DeviceContext* ctx, int eye, const HullLayerCom
         ctx->CSSetUnorderedAccessViews(0, CsStageSave::kUavs, none, nullptr);
         save.restore(ctx);
     }
-    // Applied only when this frame's main pass discarded the own ship on this eye; otherwise it is made (the history stays warm,
-    // and a miss is seen) and the upscaled eye keeps the game's own ship.
-    const bool apply = g_discard && (e.ownDraws + e.ownDecals) > 0;
-    if (apply) vScreenCopyResourceRaw(ctx, in.output, c.out);
+    if (apply && !direct) vScreenCopyResourceRaw(ctx, in.output, c.out);
     stageClose(ctx);
     timerEnd(g_compTimer, ctx);
     if (g_dump == Dump::Capturing) {
@@ -6118,7 +6288,7 @@ void hullLayerShutdown() {
         g_benchWriter.stop();   // its queue written first: the files on disk are whole
         benchReleaseGpu();
         benchDlssRelease();
-        g_benchSleep = g_benchNoAa = g_benchTimeAll = false;
+        g_benchSleep = g_benchNoAa = g_benchTimeAll = g_benchNoRefl = g_benchNoPre = g_benchNoRect = false;
         g_benchDlss = 0;
         g_bench.phase = BenchPhase::Idle;
         detail::g_hullBenchOn = false;

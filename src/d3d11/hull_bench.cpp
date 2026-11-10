@@ -8,7 +8,7 @@ namespace edvr {
 namespace hull_bench {
 
 namespace {
-const char* const kIds[kVariants] = {"orig_a", "sep_taa", "sep_noaa", "dlss_full", "dlss_sub", "native", "native_fxaa", "orig_b"};
+const char* const kIds[kVariants] = {"orig_a", "sep_taa", "sep_norefl", "sep_nopre", "sep_norect", "sep_noaa", "dlss_full", "dlss_sub", "native", "native_fxaa", "orig_b"};
 
 // A JSON string literal of s (the reasons are this file's and hull_layer.cpp's own words; quotes and controls escaped anyway).
 std::string quote(const std::string& s) {

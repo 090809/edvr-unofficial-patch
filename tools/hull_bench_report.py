@@ -19,10 +19,12 @@ values; L_t is frame t's luma, Lm the temporal mean. 8-bit units are luma x 255.
   stair            silhouette: mean over frames of |L_t - G1(L_t)| (G1 a 1-px Gaussian), / local contrast (5x5 range of Lm)
   crawl            silhouette: temporal std of L_t - G1(L_t), / the same local contrast
   smear            wing band: mean |Lm - R| / mean |R - mean R|, R the per-pixel median of the hull-free variants'
-                   Lm (sep_noaa, sep_taa, dlss_full, dlss_sub; orig_a when none of them was captured)
+                   Lm (HULL_FREE: the sep_* variants, dlss_full, dlss_sub; orig_a when none of them was captured)
   band hf          wing band Laplacian energy of Lm / R's (1 = the terrain's detail kept, < 1 smeared)
   dluma / drgb     interior: mean Lm / orig_a's, and mean |RGB mean - orig_a's| (8-bit units)
   still            the variant's largest head rotation (deg/frame, from the manifest)
+  stages / A/B     the layer's GPU ms by stage (layer_stage); sep_norefl, sep_nopre, sep_norect against sep_taa: dluma,
+                   layer ms and each stage's ms as differences (the row's reason says whether its feature was in fact off)
 The press is UNRELIABLE (pilot moved) when orig_a and orig_b differ by more than 1 8-bit unit and more than 3 times
 their temporal noise / sqrt(frames) on interior + silhouette + wing band.
 
@@ -41,8 +43,13 @@ import struct
 import sys
 import zlib
 
-ORDER = ('orig_a', 'sep_taa', 'sep_noaa', 'dlss_full', 'dlss_sub', 'native', 'native_fxaa', 'orig_b')
-HULL_FREE = ('sep_noaa', 'sep_taa', 'dlss_full', 'dlss_sub')
+ORDER = ('orig_a', 'sep_taa', 'sep_norefl', 'sep_nopre', 'sep_norect', 'sep_noaa', 'dlss_full', 'dlss_sub', 'native', 'native_fxaa',
+         'orig_b')
+HULL_FREE = ('sep_noaa', 'sep_taa', 'sep_norefl', 'sep_nopre', 'sep_norect', 'dlss_full', 'dlss_sub')
+# sep_taa with one feature off (hull_bench.h): the reflection re-issue, Build B's depth prefill, Build A''s rectangle. The
+# A/B lines give each one's dluma, layer ms and stage ms against sep_taa's.
+AB = ('sep_norefl', 'sep_nopre', 'sep_norect')
+STAGES = ('gbuffer', 'mask_filter', 'screen', 'light', 'tone', 'taa')   # hull_layer.cpp TStage, the manifest's layer_stage order
 ZOOM = 256
 OVERVIEW_MAX = 960
 MOVED_MIN = 1.0       # 8-bit units
@@ -348,6 +355,8 @@ def analyse(prefix, eye=0):
                'reason': (e or {}).get('reason') or ''}
         g, mb = (e or {}).get('gpu_ms') or {}, (e or {}).get('mb') or {}
         row['layer_ms'] = num(g.get('layer_stage'))
+        ls = g.get('layer_stage')
+        row['stages'] = [num(x) for x in ls] if isinstance(ls, (list, tuple)) and len(ls) == len(STAGES) else None
         row['hull_dlss'] = num(g.get('hull_dlss'))
         row['main_dlss'] = num(g.get('main_dlss'))
         row['frame_ms'] = num(g.get('frame_span'))
@@ -480,6 +489,29 @@ def still_line(s):
     return 'stillness: %s; %s' % (rot, tail)
 
 
+def stage_lines(res):
+    """The stage split of every row that has one, then each A/B variant against sep_taa (differences, '-' when unmeasured)."""
+    out = []
+    rows = {r['id']: r for r in res['rows']}
+    split = [r for r in res['rows'] if any(x is not None for x in r.get('stages') or []) and not r['id'].startswith('orig')]
+    if split:
+        out.append('stages ms (%s):' % '/'.join(STAGES))
+        out += ['  %s %s' % (r['id'], '/'.join(fmt(x, 3) for x in r['stages'])) for r in split]
+    base = rows.get('sep_taa')
+    for vid in AB:
+        r = rows.get(vid)
+        if not base or not r:
+            continue
+
+        def diff(a, b, digits):
+            return '-' if a is None or b is None else '%+.*f' % (digits, a - b)
+        st = ', '.join('%s %s' % (n, diff(a, b, 3)) for n, a, b in zip(STAGES, r.get('stages') or [None] * 6, base.get('stages') or [None] * 6))
+        out.append('A/B %s - sep_taa: dluma %s layer_ms %s (%s)%s' % (vid, diff(r.get('dluma'), base.get('dluma'), 3),
+                                                                       diff(r.get('layer_ms'), base.get('layer_ms'), 3), st,
+                                                                       '; ' + r['reason'] if r.get('reason') else ''))
+    return out
+
+
 def table_text(res):
     head = ['variant', 'status'] + [next(c[1] for c in COLUMNS if c[0] == k) for k in STDOUT_COLS]
     lines = [[r['id'], r['status']] + [fmt(r.get(k), next(c[3] for c in COLUMNS if c[0] == k)) for k in STDOUT_COLS] for r in res['rows']]
@@ -487,6 +519,7 @@ def table_text(res):
     out = ['  '.join(h.ljust(w) for h, w in zip(head, widths))]
     out += ['  '.join(x.ljust(w) for x, w in zip(line, widths)) for line in lines]
     out += ['  %s: %s' % (r['id'], r['reason']) for r in res['rows'] if r.get('reason')]
+    out += stage_lines(res)
     out.append(still_line(res['still']))
     return '\n'.join(out)
 
@@ -530,6 +563,9 @@ def html(res):
     p.append('</table><p class="mute">Bold: the best measured variant per column, the originals left out. shimmer and drgb in 8-bit units; '
              'sharp / sep_taa; stair and crawl / local contrast; smear / the reference\'s spread; band hf and dluma best at 1; still in '
              'deg/frame. Definitions in tools\\hull_bench_report.py.</p>')
+    sl = stage_lines(res)
+    if sl:
+        p.append('<pre>%s</pre>' % esc('\n'.join(sl)))
     views = []
     for r in res['rows']:
         for v in r.get('img', {}):
@@ -652,6 +688,9 @@ def synthetic(prefix, moved=False, drop=()):
         frames['sep_noaa'].append(hj + (1 - aj)[..., None] * terrain)
         frames['dlss_full'].append(aa + np.where(deep, rng.normal(0, 0.08, (H, W)), 0)[..., None])
     frames['dlss_sub'] = [gauss(hc, 2.0) + (1 - gauss(a, 2.0))[..., None] * terrain] * T
+    # The A/B variants: sep_norefl and sep_nopre as sep_taa; sep_norect's hull 10% darker (a dluma the A/B line must show).
+    frames['sep_norefl'] = frames['sep_nopre'] = [aa] * T
+    frames['sep_norect'] = [0.9 * hc + (1 - a)[..., None] * terrain] * T
     mask = np.concatenate([hc, a[..., None]], axis=-1)
     _write_tex(prefix + '_Bench_Mask.bin', mask, fmt=10)
     _write_tex(prefix + '_Bench_Mask_e1.bin', mask, fmt=10, eye=1)
@@ -673,9 +712,12 @@ def synthetic(prefix, moved=False, drop=()):
             fl.append({'index': k, 'layer_frame': 500 + 100 * i + k, 'file': name, 'jitter': [0, 0], 'head_rot_deg': 0.01 * (i + 1),
                        'tanNow': [-1, 1, 1, -1]})
         sep = not vid.startswith('orig')
-        variants.append({'id': vid, 'status': 'ok', 'reason': '', 'warm_frames': 60, 'fallback_frames': 0, 'frames': fl,
+        reason = {'sep_norefl': 'feature off 32 times in the capture',
+                  'sep_nopre': 'NOT SWITCHED OFF: the feature never ran in the capture (this row is sep_taa)'}.get(vid, '')
+        gbuf = 0.3 if vid == 'sep_norect' else 0.1   # sep_norect: the whole eye shaded, a dearer G-buffer stage
+        variants.append({'id': vid, 'status': 'ok', 'reason': reason, 'warm_frames': 60, 'fallback_frames': 0, 'frames': fl,
                          'final_files': [os.path.basename(prefix) + '_Bench_%s_final.bin' % vid, ''],
-                         'gpu_ms': {'layer_stage': [0.1 * sep, 0.05 * sep, 0.2 * sep, 0.1 * sep, 0.02 * sep, 0.3 * sep],
+                         'gpu_ms': {'layer_stage': [gbuf * sep, 0.05 * sep, 0.2 * sep, 0.1 * sep, 0.02 * sep, 0.3 * sep],
                                     'hull_dlss': 0.9 if vid.startswith('dlss') else 0.0, 'main_dlss': 1.5, 'frame_span': 9.0 + i, 'cpu_ms': 0.1},
                          'mb': {'own': 40.0 * sep + i, 'ngx': 120.0 if vid.startswith('dlss') else 0.0, 'dxgi': 9000.0}})
     js = {'schema': 1, 'stamp': os.path.basename(prefix)[4:], 'build': 'v0.30.0-5-gabcdef1', 'render': [54, 54], 'output': [72, 72],
@@ -729,7 +771,12 @@ def self_test():
                'the smeared terrain is not the worst smear: %r' % {k: (r.get('smear'), r.get('band_hf')) for k, r in rows.items()})
         expect('drgb', rows['orig_b']['drgb'] < 0.5 and rows['dlss_sub']['drgb'] > 1.0 and abs(rows['orig_b']['dluma'] - 1) < 1e-3,
                'drgb orig_b %r dlss_sub %r' % (rows['orig_b'].get('drgb'), rows['dlss_sub'].get('drgb')))
-        expect('still', not res['still']['moved'] and abs(res['still']['max_rot'] - 0.08) < 1e-9, res['still'])
+        expect('still', not res['still']['moved'] and abs(res['still']['max_rot'] - 0.01 * len(ORDER)) < 1e-9, res['still'])
+        # The A/B variants against sep_taa: sep_norect's darker hull and dearer G-buffer, sep_nopre's not-switched-off reason.
+        ab = '\n'.join(stage_lines(res))
+        expect('a/b', rows['sep_norect']['dluma'] < 0.95 and abs(rows['sep_norefl']['dluma'] - 1) < 1e-3
+               and re.search(r'^A/B sep_norect - sep_taa: dluma -0\.\d+ layer_ms \+0\.200 \(gbuffer \+0\.200, mask_filter \+0\.000', ab, re.M)
+               and re.search(r'^A/B sep_nopre - sep_taa: .*NOT SWITCHED OFF', ab, re.M) and re.search(r'^  sep_taa 0\.100/0\.050/', ab, re.M), ab)
         expect('refused', rows['native_fxaa']['status'] == 'refused' and 'img' not in rows['native_fxaa'], rows['native_fxaa'])
         # The manifest round trip: ms and MB as written.
         expect('manifest', abs(rows['sep_taa']['layer_ms'] - 0.77) < 1e-9 and abs(rows['dlss_full']['var_ms'] - 1.67) < 1e-9
@@ -767,7 +814,7 @@ def self_test():
     for f in failures:
         print('hull bench report self-test FAILED: ' + f)
     if not failures:
-        print('hull bench report self-test passed (20 checks)')
+        print('hull bench report self-test passed (21 checks)')
     return 1 if failures else 0
 
 

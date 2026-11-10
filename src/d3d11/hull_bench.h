@@ -17,7 +17,9 @@ namespace edvr {
 namespace hull_bench {
 
 // The variants, in the bench's order (hull_bench_report.py ORDER).
-enum Variant : int { kOrigA = 0, kSepTaa, kSepNoaa, kDlssFull, kDlssSub, kNative, kNativeFxaa, kOrigB, kVariants };
+// sep_norefl, sep_nopre, sep_norect: sep_taa with one feature off (the reflection re-issue, the depth prefill, the Build A'
+// rectangle), to find which moves dluma (docs "Bench A/B variants").
+enum Variant : int { kOrigA = 0, kSepTaa, kSepNorefl, kSepNopre, kSepNorect, kSepNoaa, kDlssFull, kDlssSub, kNative, kNativeFxaa, kOrigB, kVariants };
 const char* variantId(int v);
 
 constexpr int kCaptureFrames = 8;   // eye 0 frames a variant; eye 1 and the headset frame on its frame 0

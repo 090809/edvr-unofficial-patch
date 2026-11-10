@@ -195,7 +195,7 @@ int main(int argc, char** argv) {
 
     const std::string json = manifestJson(m);
     expect(json.find("\"schema\": 1") != std::string::npos && json.find("\"aborted\": null") != std::string::npos, "manifest header");
-    expect(json.find("\"order\": [\"orig_a\", \"sep_taa\", \"sep_noaa\", \"dlss_full\", \"dlss_sub\", \"native\", \"native_fxaa\", \"orig_b\"]") !=
+    expect(json.find("\"order\": [\"orig_a\", \"sep_taa\", \"sep_norefl\", \"sep_nopre\", \"sep_norect\", \"sep_noaa\", \"dlss_full\", \"dlss_sub\", \"native\", \"native_fxaa\", \"orig_b\"]") !=
                std::string::npos,
            "manifest order");
     expect(json.find("{\"id\": \"native\", \"status\": \"refused\", \"reason\": \"needs shader dump") != std::string::npos, "a refused variant");
