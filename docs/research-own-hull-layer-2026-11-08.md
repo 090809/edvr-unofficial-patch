@@ -27,8 +27,8 @@ The smear is terrain that is newly uncovered at the hull edge every frame
   b30a1c6f"): reflections, Build A', Build B and the TAA tiles all run; no
   seam, no lost hull in fast turns, no smear in a turn. `gpu_ms` total
   1.83-1.99 (taa 0.43-0.49, was 0.8; gbuffer 0.55-0.66, no drop). dlss_sub
-  runs: 1.80 ms, 414 MB. **Open:** sep variants' dluma 1.14 (was 1.06 here);
-  dlss_full sharp 0.61, shimmer 1.85 (was like the original).
+  runs: 1.80 ms, 414 MB. **Open:** sep dluma 1.14 (was 1.06). **Next F11** (section
+  "Bench A/B variants"): the A/B lines name the feature; `composite method: direct`.
 * **Night vision state** (not flown): **next dump** night vision on,
   compare median ~1.0, `night_vision=N/N`. **Station fixes** (not flown):
   a docking dump, `culled_draws` high, `filter_draws` 0, `busy=` 0.
@@ -1632,6 +1632,66 @@ check flagged it, as every press so far: orig_a vs orig_b 6.64).
   untouched by the diff), A' (the cover is zero outside the box; the full
   feature evaluates the whole eye), the TAA tiles. Not chased: dlss_full
   is not a candidate.
+
+## Bench A/B variants (2026-11-10, compile-only, not flown)
+
+Two changes after the b30a1c6f flight: three bench variants to find what
+moved dluma, and the composite without its two whole-eye copies.
+
+- **The variants.** `sep_norefl`, `sep_nopre`, `sep_norect` run after
+  sep_taa (same long warm, 8 capture frames), each sep_taa with one feature
+  off for that variant only: the reflection re-issue (`beginReflStep` returns
+  before the swap), Build B's prefill and so its reset (`prefillEye` returns
+  after its checks; the private depth stays at its clear, as before Build
+  B), Build A''s rectangle (`eyeRect` leaves the eye whole: re-issues, the
+  prefill rectangle and the cover unlimited). Each place counts a switch-off
+  that would otherwise have run; the row's reason says `feature off N times
+  in the capture` (expect about 32 for refl: two steps, two eyes; about 16
+  for the other two, fewer probe frames), or `NOT SWITCHED OFF` when the
+  feature never ran (then the row is sep_taa again). orig_b stays last.
+- **The report** (`hull_bench_report.py`) prints the stage split of every
+  separate row and an `A/B <id> - sep_taa:` line: dluma, layer ms and each
+  stage's ms as differences. The stage medians were already in the
+  manifest's `layer_stage`; only the sum was shown.
+- **What the next F11 press should show.** The variant whose dluma drops
+  from about 1.14 to about 1.06 or below is the cause. Expected cost
+  (estimates): sep_norefl light about -0.2 ms (0.34-0.46 now holds the
+  re-issue); sep_nopre gbuffer about +-0.1 (the prefill did not lower it, so
+  its three passes may cost what they save); sep_norect gbuffer, light, tone
+  and screen up about 0.3-0.4 ms total (Build A''s estimate in reverse).
+- **The direct composite.** In `hullLayerCompositeEye` (TAA path) the
+  composite copied the upscaled eye into `c.out`, sharpened over the tile
+  list, then copied `c.out` back: two full copies of a 3756x3264 RGBA8 eye
+  per eye a frame. Now an applied composite writes the hull straight onto
+  the eye's listed tiles: `hull_layer_sharp_direct_cs` reads the world
+  through a typed R8G8B8A8_UNORM UAV of the eye itself, at the pixel it
+  writes only (the sharpen's cross reads the history, never the world), so
+  the read and write cannot race and the pixels outside the tiles are not
+  touched. Same body as `hull_layer_sharp_cs` (one macro), the same UNORM
+  decode and store, so the eye equals `c.out` bit for bit. Chosen over a
+  blend onto an RTV (the blend unit's arithmetic is not the shader's, so not
+  bit-equal, and a draw needs separate indirect arguments) and over copying
+  only the tiles (their list is on the GPU). The eye (`dlSubmit` after the
+  UI resolve, or `dlOut`) must carry the UAV bind flag, an R8G8B8A8
+  TYPELESS/UNORM texture with a UNORM view, and the device
+  `D3D11_FORMAT_SUPPORT2_UAV_TYPED_LOAD` and `_STORE` for R8G8B8A8_UNORM;
+  else the copy path, said once a texture (`composite for eye N writes the
+  eye directly` / `copies the eye whole twice: <why>`).
+- **Still through `c.out`:** a composite not applied (the eye must not
+  change; the history stays warm), the dump's capture frame and the TAA
+  sequence's frames (they stage `c.out`), and the bench's dlss_full and
+  dlss_sub (their own copy). The bench's other captures read the submitted
+  eye, so they measure the direct path.
+- **Log:** `hull layer: composite method: direct=N copy=N
+  copy_why=not_applied:..,dump_or_seq:..,no_uav:..,format:..,typed_load:..,view:..,shader:..
+  bench_dlss=..` every 30 s. Expect direct near composited_eyes and copy
+  only not_applied. `gpu_ms` taa (both eyes, estimate at about 0.8-1 TB/s):
+  0.43-0.49 to about 0.1-0.2 (four copies of 49 MB read and written gone).
+  A difference from b30a1c6f's look would be a bug: the output is meant
+  to be identical.
+- **Risk:** binding the eye's UAV to the compute stage unbinds the eye
+  where it is still bound as a shader resource in another stage (the copy
+  never did); the compute slots are put back as before.
 
 ## Optimisation debt (recorded 2026-11-08 at the pilot's request)
 
