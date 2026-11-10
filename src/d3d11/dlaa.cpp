@@ -824,7 +824,17 @@ bool dlaaHullEvaluate(ID3D11DeviceContext* ctx, int eye, ID3D11Texture2D* colour
     }
     EyeFeature& f = g_hullFeature[eye];
     const bool wantSub = sub != nullptr;
-    if (!f.handle || f.w != w || f.h != h || f.outW != outW || f.outH != outH || f.presetGen != g_presetGen || g_hullSub[eye] != wantSub) {
+    // NGX has no output subrect size: the output region is the feature's target size at the output base. A feature made at
+    // the whole eye with a base past 0 overran the output (0xBAD00005 on every press, bench 071513090001-071633624003), so a
+    // subrect feature is made at the subrect's own render and output size; the textures stay whole-eye.
+    const uint32_t fw = wantSub ? sub->renderW : w, fh = wantSub ? sub->renderH : h;
+    const uint32_t fOutW = wantSub ? static_cast<uint32_t>(uint64_t{sub->renderW} * outW / w) : outW;
+    const uint32_t fOutH = wantSub ? static_cast<uint32_t>(uint64_t{sub->renderH} * outH / h) : outH;
+    if (wantSub && (!fOutW || !fOutH || sub->outX + fOutW > outW || sub->outY + fOutH > outH)) {
+        if (reason) *reason = "the output subrect is outside the output";
+        return false;
+    }
+    if (!f.handle || f.w != fw || f.h != fh || f.outW != fOutW || f.outH != fOutH || f.presetGen != g_presetGen || g_hullSub[eye] != wantSub) {
         if (f.handle) {
             NVSDK_NGX_D3D11_ReleaseFeature(f.handle);
             f.handle = nullptr;
@@ -832,12 +842,12 @@ bool dlaaHullEvaluate(ID3D11DeviceContext* ctx, int eye, ID3D11Texture2D* colour
         // The eyes' own creation, minus the range walk: the same flags (LDR, low-res unjittered motion, reversed-Z depth), the
         // mode by the size ratio, the same preset hints. Output subrects are a creation-time switch.
         NVSDK_NGX_DLSS_Create_Params cp{};
-        cp.Feature.InWidth = w;
-        cp.Feature.InHeight = h;
-        cp.Feature.InTargetWidth = outW;
-        cp.Feature.InTargetHeight = outH;
-        cp.Feature.InPerfQualityValue = outW == w && outH == h ? NVSDK_NGX_PerfQuality_Value_DLAA
-                                                              : kNgxLadder[static_cast<int>(dlssModeByRatio(w, outW))];
+        cp.Feature.InWidth = fw;
+        cp.Feature.InHeight = fh;
+        cp.Feature.InTargetWidth = fOutW;
+        cp.Feature.InTargetHeight = fOutH;
+        cp.Feature.InPerfQualityValue = fOutW == fw && fOutH == fh ? NVSDK_NGX_PerfQuality_Value_DLAA
+                                                              : kNgxLadder[static_cast<int>(dlssModeByRatio(fw, fOutW))];
         cp.InFeatureCreateFlags = static_cast<int>(flatDlssCreateFlags(false, runtimeFlatProfile()));
         cp.InEnableOutputSubrects = wantSub;
         applyPresetHints();
@@ -848,19 +858,19 @@ bool dlaaHullEvaluate(ID3D11DeviceContext* ctx, int eye, ID3D11Texture2D* colour
         if (NVSDK_NGX_FAILED(cr) || !f.handle) {
             f.handle = nullptr;
             snprintf(g_reasonBuf, sizeof(g_reasonBuf), "the hull's DLSS feature%s would not be created at %ux%u: %s (0x%08X)",
-                     wantSub ? " with output subrects" : "", w, h, ngxResultName(cr), static_cast<unsigned>(cr));
+                     wantSub ? " with output subrects" : "", fw, fh, ngxResultName(cr), static_cast<unsigned>(cr));
             if (reason) *reason = g_reasonBuf;
             return false;
         }
-        f.w = w;
-        f.h = h;
-        f.outW = outW;
-        f.outH = outH;
+        f.w = fw;
+        f.h = fh;
+        f.outW = fOutW;
+        f.outH = fOutH;
         f.presetGen = g_presetGen;
         g_hullSub[eye] = wantSub;
         Log::get().note("dlss: the hull bench's feature for eye %d is created (TEMPORARY): %ux%u in, %ux%u out, %s, preset %s, flags 0x%X, output "
                         "subrects %s; made in %.0f ms",
-                        eye, w, h, outW, outH, qualityName(cp.Feature.InPerfQualityValue), presetName(presetFor(cp.Feature.InPerfQualityValue)),
+                        eye, fw, fh, fOutW, fOutH, qualityName(cp.Feature.InPerfQualityValue), presetName(presetFor(cp.Feature.InPerfQualityValue)),
                         static_cast<unsigned>(cp.InFeatureCreateFlags), wantSub ? "on" : "off", ms);
     }
     NVSDK_NGX_D3D11_DLSS_Eval_Params ep{};

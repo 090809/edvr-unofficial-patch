@@ -17,7 +17,8 @@ The smear is terrain that is newly uncovered at the hull edge every frame
   **Open:** the 6 own forward draws still draw in the world.
 * **Variant bench FLOWN** (2026-11-10, 44d83543 and 4fd502ad; section
   "Bench flown"): works; sep_taa 2.1-2.9 ms layer, dlss_full 7.2-8.5 ms
-  (+0.9 GB NGX), dlss_sub refused (0xBAD00005). Found: cockpit decals lost
+  (+0.9 GB NGX), dlss_sub refused (0xBAD00005: feature made at the whole
+  eye; fixed after, untested). Found: cockpit decals lost
   in the main pass; the hull at 0.30-0.39 on a station pad.
 * **Next flight (fold into normal play, no dump):** HEAD with the decal
   fix and the reflection re-issue. One `hotkey.hull_bench` (F11) press on
@@ -1430,6 +1431,15 @@ DLSS preset K quality, FG off. 14 presses; `hull_bench_report.py` on each.
   total 7.2-8.5 ms, NGX 890 MB, sharpness 1.27-1.48 (sep_taa = 1, the
   original 1.12-1.41), shimmer like the original. dlss_sub still
   `0xBAD00005` (open).
+- **dlss_sub's `0xBAD00005`: the feature size** (2026-11-10, after the
+  flight, untested). NGX has no output-subrect size; the output region is
+  the feature's target size at the output base. The subrect feature was
+  made at the whole eye (2817x2448 to 3756x3264), so any base past 0
+  overran the output. It is now made at the subrect's own render and
+  output size (`dlaaHullEvaluate`); a new bench rect remakes it. The
+  signature on the next press: a `dlss_sub` row with `hull_dlss_ms` and
+  no refusal. Why it matters: if the subrect DLSS costs near sep_taa, it
+  becomes the layer's AA and the TAA the fallback, as in the eyes' path.
 - Still presses (071557, 071633): sep_taa 2.1-2.9 ms, about as sharp as the
   original, less shimmer; sep_noaa 1.8-2.4 ms, shimmer 4-9x. Memory own
   1.2-1.3 GB both eyes. The report's `frame ms` doubles on every layer

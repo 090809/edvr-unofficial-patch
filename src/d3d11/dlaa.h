@@ -208,7 +208,8 @@ unsigned dlaaPresetNow();
 // The hull variant bench's second DLSS (TEMPORARY; hull_layer.h, docs\research-own-hull-layer-2026-11-08.md "Variant bench"): a
 // private feature pair beside the eyes' (not upscaler slots: FSR, the stats and the switch release key off kUpscalerSlots), on
 // the shared parameter block, created like the eyes' (the same flags, mode by the size ratio, the same preset). `sub` non-null
-// evaluates only that render subrect into the output at (outX, outY) -- a feature created with output subrects, so the full and
+// evaluates only that render subrect into the output at (outX, outY) -- a feature created with output subrects at the subrect's
+// own size (NGX takes the output region's size from the feature), so a new rect remakes it, and the full and
 // the subrect variants are separate features: the caller releases one pair before the other is made. createMs: a creation's
 // duration this call, else 0. False with its reason on a refusal (the bench records it and carries on).
 struct DlaaSubrect {
