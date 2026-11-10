@@ -325,10 +325,9 @@ constexpr char kTaaHlsl[] =
     "Texture2D<float4> cover : register(t0);\n"
     "Texture2D<float> coverDepth : register(t1);\n"
     "Texture2D<float4> histIn : register(t2);\n"
-    "Texture2D<float4> world : register(t3);\n"
+    "StructuredBuffer<uint> tiles : register(t4);\n"
     "SamplerState lin : register(s0);\n"
     "RWTexture2D<float4> histOut : register(u0);\n"
-    "RWTexture2D<float4> compOut : register(u1);\n"
     // The history read: Catmull-Rom through nine bilinear taps, not one bilinear tap. A bilinear history fetch blurs a
     // little every frame and, at a current weight of 0.1, the blur accumulated: the pilot found the hull's textures soft
     // (2026-11-08 22:20). The 3x3 range clamp after it removes the kernel's overshoot.
@@ -358,10 +357,16 @@ constexpr char kTaaHlsl[] =
     "    r += histIn.SampleLevel(lin, float2(t3.x, t3.y), 0) * (w3.x * w3.y);\n"
     "    return r;\n"
     "}\n"
-    "[numthreads(8, 8, 1)] void hull_layer_taa_cs(uint3 id : SV_DispatchThreadID) {\n"
+    // One group an 8x8 output tile from the tile list (kTileListHlsl): bit 31 says the hull's 3x3 reaches the tile this frame.
+    // A listed tile without it (hull there one or two frames ago) gets zero history: what the whole-eye TAA wrote there, since
+    // a 3x3 of empty cover clamps any history to 0. Unlisted tiles stay zero in both history textures (see kTileListHlsl).
+    "[numthreads(8, 8, 1)] void hull_layer_taa_cs(uint3 gid : SV_GroupID, uint3 gt : SV_GroupThreadID) {\n"
+    "    uint te = tiles[gid.x];\n"
+    "    uint3 id = uint3(uint2(te & 0xFFFFu, (te >> 16) & 0x7FFFu) * 8u + gt.xy, 0u);\n"
     "    int2 rsz = sizes.xy;\n"
     "    int2 osz = sizes.zw;\n"
     "    if (id.x >= (uint)osz.x || id.y >= (uint)osz.y) return;\n"
+    "    if ((te & 0x80000000u) == 0u) { histOut[id.xy] = 0.0; return; }\n"
     "    float2 pr = (float2(id.xy) + 0.5) * float2(rsz) / float2(osz) - 0.5;\n"
     "    int2 c = int2(round(pr + jit.xy));\n"
     "    float4 cur = 0.0;\n"
@@ -429,9 +434,7 @@ constexpr char kTaaHlsl[] =
     "            if (all(uv >= 0.0) && all(uv <= 1.0)) res = lerp(clamp(histCatmullRom(uv), lo, hi), cur, weight);\n"
     "        }\n"
     "    }\n"
-    "    histOut[id.xy] = res;\n"
-    "    float4 w = world[id.xy];\n"
-    "    compOut[id.xy] = float4(w.rgb * (1.0 - res.a) + res.rgb, w.a);\n"
+    "    histOut[id.xy] = res;\n"   // the composite is the sharpen's (kSharpHlsl), which always follows
     "}\n";
 
 // The sharpen and composite, after the TAA (2026-11-08 22:35): the TAA output measured 0.7 output px softer than one frame
@@ -443,9 +446,14 @@ constexpr float kSharpAmount = 0.6f;   // c + amount * (c - mean of the 4 neighb
 constexpr char kSharpHlsl[] =
     "Texture2D<float4> hist : register(t0);\n"
     "Texture2D<float4> world : register(t1);\n"
+    "StructuredBuffer<uint> tiles : register(t2);\n"
     "RWTexture2D<float4> compOut : register(u0);\n"
     "cbuffer HullLayerSharpCb : register(b0) { float4 amount; };\n"
-    "[numthreads(8, 8, 1)] void hull_layer_sharp_cs(uint3 id : SV_DispatchThreadID) {\n"
+    // The TAA's tile list: a tile the hull does not reach this frame keeps the world compOut already holds (copied whole first).
+    "[numthreads(8, 8, 1)] void hull_layer_sharp_cs(uint3 gid : SV_GroupID, uint3 gt : SV_GroupThreadID) {\n"
+    "    uint te = tiles[gid.x];\n"
+    "    if ((te & 0x80000000u) == 0u) return;\n"
+    "    uint2 id = uint2(te & 0xFFFFu, (te >> 16) & 0x7FFFu) * 8u + gt.xy;\n"
     "    uint ow, oh; hist.GetDimensions(ow, oh);\n"
     "    if (id.x >= ow || id.y >= oh) return;\n"
     "    int2 p = int2(id.xy);\n"
@@ -464,6 +472,54 @@ constexpr char kSharpHlsl[] =
     "    }\n"
     "    float4 w = world.Load(int3(p, 0));\n"
     "    compOut[p] = float4(w.rgb * (1.0 - res.a) + res.rgb, w.a);\n"
+    "}\n";
+
+// The TAA's tiles (2026-11-10): the TAA and sharpen ran on every output pixel of the eye while the shown hull is 6-11% of it.
+// hull_layer_tile_mark_cs, one thread a render pixel of the eye's region: a cover pixel with the hull marks every 8x8 output
+// tile whose TAA 3x3 (kTaaHlsl: render taps round(pr + jit) +- 1) can reach it, with a pixel of margin. hull_layer_tile_list_cs,
+// one thread a tile: state = (state << 1 | mark) & 7 and the mark cleared; a tile with a bit set (the hull reaches it now, or
+// did one or two frames ago) is appended as x | y << 16 | now << 31. A tile listed without `now` gets zero history; one
+// unlisted stays zero in both textures of the pair, since its last write into each was a zero. A history reset clears the
+// pair and the state.
+// hlsl-check: kTileMarkHlsl hull_layer_tile_mark_cs cs_5_0
+// hlsl-check: kTileListHlsl hull_layer_tile_list_cs cs_5_0
+constexpr char kTileMarkHlsl[] =
+    "cbuffer HullLayerTaaCb : register(b0) {\n"
+    "    float4 tanNow; float4 tanPrev; float4 dRow0; float4 dRow1; float4 dRow2;\n"
+    "    float4 headT; float4 jit; float4 depthAB; int4 sizes; int4 origin;\n"
+    "};\n"
+    "Texture2D<float4> cover : register(t0);\n"
+    "RWTexture2D<uint> mark : register(u0);\n"
+    "[numthreads(8, 8, 1)] void hull_layer_tile_mark_cs(uint3 id : SV_DispatchThreadID) {\n"
+    "    int2 rsz = sizes.xy;\n"
+    "    int2 osz = sizes.zw;\n"
+    "    if (id.x >= (uint)rsz.x || id.y >= (uint)rsz.y) return;\n"
+    "    if (cover.Load(int3(origin.xy + int2(id.xy), 0)).a <= 0.0) return;\n"
+    "    float2 q = float2(id.xy);\n"
+    "    float2 s = float2(osz) / float2(rsz);\n"
+    "    int2 o0 = int2(floor((q - 1.0 - jit.xy) * s - 0.5)) - 1;\n"
+    "    int2 o1 = int2(ceil((q + 2.0 - jit.xy) * s - 0.5)) + 1;\n"
+    "    int2 t0 = clamp(o0, 0, osz - 1) / 8;\n"
+    "    int2 t1 = clamp(o1, 0, osz - 1) / 8;\n"
+    "    for (int ty = t0.y; ty <= t1.y; ++ty)\n"
+    "        for (int tx = t0.x; tx <= t1.x; ++tx) InterlockedOr(mark[uint2(tx, ty)], 1u);\n"
+    "}\n";
+constexpr char kTileListHlsl[] =
+    "cbuffer HullLayerTaaCb : register(b0) {\n"
+    "    float4 tanNow; float4 tanPrev; float4 dRow0; float4 dRow1; float4 dRow2;\n"
+    "    float4 headT; float4 jit; float4 depthAB; int4 sizes; int4 origin;\n"
+    "};\n"
+    "RWTexture2D<uint> mark : register(u0);\n"
+    "RWTexture2D<uint> state : register(u1);\n"
+    "AppendStructuredBuffer<uint> list : register(u2);\n"
+    "[numthreads(8, 8, 1)] void hull_layer_tile_list_cs(uint3 id : SV_DispatchThreadID) {\n"
+    "    uint2 tn = (uint2(sizes.zw) + 7u) / 8u;\n"
+    "    if (id.x >= tn.x || id.y >= tn.y) return;\n"
+    "    uint now = mark[id.xy] & 1u;\n"
+    "    mark[id.xy] = 0u;\n"
+    "    uint b = ((state[id.xy] << 1) | now) & 7u;\n"
+    "    state[id.xy] = b;\n"
+    "    if (b != 0u) list.Append(id.x | (id.y << 16) | (now << 31));\n"
     "}\n";
 
 // A private copy of one game texture: the same desc, default usage, nothing shared. `game` is an identity only.
@@ -605,6 +661,17 @@ struct Comp {
     ID3D11UnorderedAccessView* histUav[2] = {};
     ID3D11Texture2D* out = nullptr;
     ID3D11UnorderedAccessView* outUav = nullptr;
+    // The TAA's 8x8 output tiles (kTileMarkHlsl, kTileListHlsl): this frame's mark, the 3-frame state, the list and its
+    // indirect arguments.
+    ID3D11Texture2D* tileMark = nullptr;
+    ID3D11UnorderedAccessView* tileMarkUav = nullptr;
+    ID3D11Texture2D* tileState = nullptr;
+    ID3D11UnorderedAccessView* tileStateUav = nullptr;
+    ID3D11Buffer* tileList = nullptr;
+    ID3D11ShaderResourceView* tileListSrv = nullptr;
+    ID3D11UnorderedAccessView* tileListUav = nullptr;
+    ID3D11Buffer* tileArgs = nullptr;
+    bool tilesValid = false;      // the pair and the state keep the tiles' invariant (false after a bench DLSS frame)
     uint32_t outW = 0, outH = 0, renderW = 0, renderH = 0;
     uint32_t read = 0;            // hist[read] holds last frame's
     uint32_t lastFrame = ~0u;
@@ -722,6 +789,8 @@ struct CompGpu {
     ID3D11ComputeShader* coverCs = nullptr;
     ID3D11ComputeShader* taaCs = nullptr;
     ID3D11ComputeShader* sharpCs = nullptr;
+    ID3D11ComputeShader* tileMarkCs = nullptr;
+    ID3D11ComputeShader* tileListCs = nullptr;
     ID3D11SamplerState* linear = nullptr;
     ID3D11Buffer* coverCb = nullptr;
     ID3D11Buffer* taaCb = nullptr;
@@ -957,6 +1026,14 @@ void releaseComp(Comp& c) {
     }
     releaseRef(c.outUav);
     releaseRef(c.out);
+    releaseRef(c.tileMarkUav);
+    releaseRef(c.tileMark);
+    releaseRef(c.tileStateUav);
+    releaseRef(c.tileState);
+    releaseRef(c.tileListSrv);
+    releaseRef(c.tileListUav);
+    releaseRef(c.tileList);
+    releaseRef(c.tileArgs);
     c = Comp{};
 }
 
@@ -1029,6 +1106,8 @@ void releaseGpu() {
     releaseRef(g_cgpu.coverCs);
     releaseRef(g_cgpu.taaCs);
     releaseRef(g_cgpu.sharpCs);
+    releaseRef(g_cgpu.tileMarkCs);
+    releaseRef(g_cgpu.tileListCs);
     releaseRef(g_cgpu.linear);
     releaseRef(g_cgpu.coverCb);
     releaseRef(g_cgpu.taaCb);
@@ -2810,9 +2889,11 @@ bool ensureCompGpu() {
         const char* entry;
         ID3D11ComputeShader** out;
     };
-    const Item items[3] = {{kCoverHlsl, sizeof(kCoverHlsl) - 1, "hull_layer_cover_cs", &g_cgpu.coverCs},
+    const Item items[5] = {{kCoverHlsl, sizeof(kCoverHlsl) - 1, "hull_layer_cover_cs", &g_cgpu.coverCs},
                            {kTaaHlsl, sizeof(kTaaHlsl) - 1, "hull_layer_taa_cs", &g_cgpu.taaCs},
-                           {kSharpHlsl, sizeof(kSharpHlsl) - 1, "hull_layer_sharp_cs", &g_cgpu.sharpCs}};
+                           {kSharpHlsl, sizeof(kSharpHlsl) - 1, "hull_layer_sharp_cs", &g_cgpu.sharpCs},
+                           {kTileMarkHlsl, sizeof(kTileMarkHlsl) - 1, "hull_layer_tile_mark_cs", &g_cgpu.tileMarkCs},
+                           {kTileListHlsl, sizeof(kTileListHlsl) - 1, "hull_layer_tile_list_cs", &g_cgpu.tileListCs}};
     for (const Item& it : items) {
         ID3DBlob* code = nullptr;
         std::string why;
@@ -3056,13 +3137,41 @@ bool ensureCompTargets(int eye, uint32_t w, uint32_t h) {
     bool ok = true;
     for (int i = 0; i < 2 && ok; ++i) ok = makeTexture(w, h, DXGI_FORMAT_R16G16B16A16_FLOAT, true, &c.hist[i], &c.histSrv[i], &c.histUav[i]);
     ok = ok && makeTexture(w, h, DXGI_FORMAT_R8G8B8A8_UNORM, true, &c.out, nullptr, &c.outUav);
+    // The TAA's tiles: two R32_UINT tile maps, an append list of every tile, and the indirect arguments {count, 1, 1}.
+    const uint32_t tw = (w + 7u) / 8u, th = (h + 7u) / 8u;
+    ok = ok && makeTexture(tw, th, DXGI_FORMAT_R32_UINT, true, &c.tileMark, nullptr, &c.tileMarkUav);
+    ok = ok && makeTexture(tw, th, DXGI_FORMAT_R32_UINT, true, &c.tileState, nullptr, &c.tileStateUav);
+    if (ok) {
+        D3D11_BUFFER_DESC bd{};
+        bd.ByteWidth = tw * th * 4u;
+        bd.Usage = D3D11_USAGE_DEFAULT;
+        bd.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
+        bd.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
+        bd.StructureByteStride = 4u;
+        D3D11_UNORDERED_ACCESS_VIEW_DESC ud{};
+        ud.Format = DXGI_FORMAT_UNKNOWN;
+        ud.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
+        ud.Buffer.NumElements = tw * th;
+        ud.Buffer.Flags = D3D11_BUFFER_UAV_FLAG_APPEND;
+        D3D11_BUFFER_DESC ad{};
+        ad.ByteWidth = 12u;
+        ad.Usage = D3D11_USAGE_DEFAULT;
+        ad.MiscFlags = D3D11_RESOURCE_MISC_DRAWINDIRECT_ARGS;
+        const uint32_t args[3] = {0u, 1u, 1u};
+        D3D11_SUBRESOURCE_DATA init{args, 0, 0};
+        ok = SUCCEEDED(g_device->CreateBuffer(&bd, nullptr, &c.tileList)) && c.tileList &&
+             SUCCEEDED(g_device->CreateShaderResourceView(c.tileList, nullptr, &c.tileListSrv)) && c.tileListSrv &&
+             SUCCEEDED(g_device->CreateUnorderedAccessView(c.tileList, &ud, &c.tileListUav)) && c.tileListUav &&
+             SUCCEEDED(g_device->CreateBuffer(&ad, &init, &c.tileArgs)) && c.tileArgs;
+    }
     if (!ok) {
         releaseComp(c);
         return false;
     }
     c.outW = w;
     c.outH = h;
-    Log::get().note("hull layer: composite targets made for eye %d: %ux%u (history R16G16B16A16_FLOAT x2, out R8G8B8A8_UNORM)", eye, w, h);
+    Log::get().note("hull layer: composite targets made for eye %d: %ux%u (history R16G16B16A16_FLOAT x2, out R8G8B8A8_UNORM, %ux%u TAA tiles)", eye,
+                    w, h, tw, th);
     return true;
 }
 
@@ -5220,33 +5329,72 @@ void hullLayerCompositeEye(ID3D11DeviceContext* ctx, int eye, const HullLayerCom
     vScreenUpdateSubresourceRaw(ctx, g_cgpu.taaCb, 0, nullptr, &cb, 0, 0);
     // The variant bench's dlss_full / dlss_sub: the hull through a second DLSS over the hull-free world in place of the TAA and sharpen.
     const bool benchDlss = g_benchDlss && benchHullDlss(ctx, eye, e, c, in);
+    if (benchDlss) c.tilesValid = false;   // the TAA's pair and tile state were not kept this frame
     if (!benchDlss) {
         CsStageSave save;
         save.save(ctx);
-        ID3D11ShaderResourceView* srvs[4] = {e.coverSrv, e.coverZSrv, c.histSrv[c.read], in.outputSrv};
-        // Every saved UAV slot is set: one the caller left bound over the upscaler's output would null its view at t3.
-        ID3D11UnorderedAccessView* uavs[CsStageSave::kUavs] = {c.histUav[c.read ^ 1u], c.outUav};
+        ID3D11UnorderedAccessView* none[CsStageSave::kUavs] = {};
+        // The TAA's tiles (kTileMarkHlsl): a history reset zeroes the pair and the tile state, so every unlisted tile is zero;
+        // so does the first TAA frame after the bench's second DLSS, which wrote neither.
+        if (!history || !c.tilesValid) {
+            const float zf[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+            const UINT zu[4] = {0u, 0u, 0u, 0u};
+            ctx->ClearUnorderedAccessViewFloat(c.histUav[0], zf);
+            ctx->ClearUnorderedAccessViewFloat(c.histUav[1], zf);
+            ctx->ClearUnorderedAccessViewUint(c.tileStateUav, zu);
+            ctx->ClearUnorderedAccessViewUint(c.tileMarkUav, zu);
+            c.tilesValid = true;
+        }
+        // The out starts as the upscaled eye: the sharpen writes only the tiles the hull reaches.
+        vScreenCopyResourceRaw(ctx, c.out, in.output);
+        {
+            ID3D11ShaderResourceView* srv = e.coverSrv;
+            ID3D11UnorderedAccessView* uavs[CsStageSave::kUavs] = {c.tileMarkUav};
+            ctx->CSSetUnorderedAccessViews(0, CsStageSave::kUavs, uavs, nullptr);
+            ctx->CSSetShader(g_cgpu.tileMarkCs, nullptr, 0);
+            ctx->CSSetShaderResources(0, 1, &srv);
+            ctx->CSSetConstantBuffers(0, 1, &g_cgpu.taaCb);
+            ctx->Dispatch((in.renderW + 7u) / 8u, (in.renderH + 7u) / 8u, 1);
+            ID3D11ShaderResourceView* noSrv = nullptr;
+            ctx->CSSetShaderResources(0, 1, &noSrv);
+            ctx->CSSetUnorderedAccessViews(0, CsStageSave::kUavs, none, nullptr);
+        }
+        {
+            static_assert(CsStageSave::kUavs >= 3, "the tile list binds three UAVs");
+            ID3D11UnorderedAccessView* uavs[CsStageSave::kUavs] = {c.tileMarkUav, c.tileStateUav, c.tileListUav};
+            UINT counts[CsStageSave::kUavs];
+            for (UINT& n : counts) n = ~0u;
+            counts[2] = 0u;   // the append list starts empty
+            ctx->CSSetUnorderedAccessViews(0, CsStageSave::kUavs, uavs, counts);
+            ctx->CSSetShader(g_cgpu.tileListCs, nullptr, 0);
+            ctx->CSSetConstantBuffers(0, 1, &g_cgpu.taaCb);
+            ctx->Dispatch((in.outW + 63u) / 64u, (in.outH + 63u) / 64u, 1);
+            ctx->CSSetUnorderedAccessViews(0, CsStageSave::kUavs, none, nullptr);
+            ctx->CopyStructureCount(c.tileArgs, 0, c.tileListUav);
+        }
+        ID3D11ShaderResourceView* srvs[5] = {e.coverSrv, e.coverZSrv, c.histSrv[c.read], nullptr, c.tileListSrv};
+        // Every saved UAV slot is set: one the caller left bound over the upscaler's output would null its view.
+        ID3D11UnorderedAccessView* uavs[CsStageSave::kUavs] = {c.histUav[c.read ^ 1u]};
         ctx->CSSetUnorderedAccessViews(0, CsStageSave::kUavs, uavs, nullptr);
         ctx->CSSetShader(g_cgpu.taaCs, nullptr, 0);
-        ctx->CSSetShaderResources(0, 4, srvs);
+        ctx->CSSetShaderResources(0, 5, srvs);
         ctx->CSSetConstantBuffers(0, 1, &g_cgpu.taaCb);
         ctx->CSSetSamplers(0, 1, &g_cgpu.linear);
-        ctx->Dispatch((in.outW + 7u) / 8u, (in.outH + 7u) / 8u, 1);
-        ID3D11UnorderedAccessView* none[CsStageSave::kUavs] = {};
+        ctx->DispatchIndirect(c.tileArgs, 0);
         ctx->CSSetUnorderedAccessViews(0, CsStageSave::kUavs, none, nullptr);   // the history and the out off before the caller's views come back
         // The sharpen and composite over the TAA result just written (kSharpHlsl): it rewrites the out the TAA made.
         const float sharpCb[4] = {kSharpAmount, 0.0f, 0.0f, 0.0f};
         vScreenUpdateSubresourceRaw(ctx, g_cgpu.sharpCb, 0, nullptr, sharpCb, 0, 0);
-        ID3D11ShaderResourceView* noSrv[4] = {};
-        ctx->CSSetShaderResources(0, 4, noSrv);   // the history just written comes back as a resource
-        ID3D11ShaderResourceView* sharpSrv[2] = {c.histSrv[c.read ^ 1u], in.outputSrv};
+        ID3D11ShaderResourceView* noSrv[5] = {};
+        ctx->CSSetShaderResources(0, 5, noSrv);   // the history just written comes back as a resource
+        ID3D11ShaderResourceView* sharpSrv[3] = {c.histSrv[c.read ^ 1u], in.outputSrv, c.tileListSrv};
         ID3D11UnorderedAccessView* sharpUav[CsStageSave::kUavs] = {c.outUav};
         ctx->CSSetUnorderedAccessViews(0, CsStageSave::kUavs, sharpUav, nullptr);
         ctx->CSSetShader(g_cgpu.sharpCs, nullptr, 0);
-        ctx->CSSetShaderResources(0, 2, sharpSrv);
+        ctx->CSSetShaderResources(0, 3, sharpSrv);
         ctx->CSSetConstantBuffers(0, 1, &g_cgpu.sharpCb);
-        ctx->Dispatch((in.outW + 7u) / 8u, (in.outH + 7u) / 8u, 1);
-        ctx->CSSetShaderResources(0, 4, noSrv);
+        ctx->DispatchIndirect(c.tileArgs, 0);
+        ctx->CSSetShaderResources(0, 5, noSrv);
         ctx->CSSetUnorderedAccessViews(0, CsStageSave::kUavs, none, nullptr);
         save.restore(ctx);
     }
