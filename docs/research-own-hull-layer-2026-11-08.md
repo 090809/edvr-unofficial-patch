@@ -19,8 +19,8 @@ The smear is terrain that is newly uncovered at the hull edge every frame
   the AA (least shimmer); dlss_sub 1.80 ms; A', B, tiles run, no seam.
 * **5bf8f651 FLOWN** (section "Flight 5bf8f651", HMD 0.5, preset M): the
   wing hazy, "see-through": dluma 1.41-1.44, 0.42 without the reflection
-  re-issue. **Next:** a dump with the HDRs after the reflection pass and
-  both stencils at hull pixels; clear the private u1. Pad check pending.
+  re-issue. **Built** (section "Reflection dump", not flown): the u1 clear,
+  and both sides of the pass dumped. **Next:** that dump, `--refl`; pad.
 * **Night vision state** (not flown): **next dump** night vision on,
   compare median ~1.0, `night_vision=N/N`. **Station fixes** (not flown):
   a docking dump, `culled_draws` high, `filter_draws` 0, `busy=` 0.
@@ -1720,6 +1720,57 @@ and `eye_212754918002` (both flagged by the stillness check):
   private R16 u1, made with no data and never cleared (nothing reads it).
 - Next: stage the game's HDR and the private HDR after the reflection pass,
   and both stencils at hull pixels, in one dump; clear the private u1.
+
+## Reflection dump (2026-11-10, compile-only, not flown)
+
+Built for the four candidates of "Flight 5bf8f651", in one capture.
+
+- **Stages (capture frame only).** Right after the game's dispatch of each
+  reflection step (`beginReflStep`, before any decline): the game's HDR
+  (last step wins, so after both), once an eye the textures under t4 (the
+  stencil) and t11, and the bound CS cb1 (a staging copy of the whole
+  buffer; the 11.1 first constant kept). Right after each re-issue
+  (`hullLayerEndDispatch`): the private HDR. At the re-issue's bind: the
+  private t4 and t11 (the game's own where an input has no private copy).
+- **Files** (`_e1` for eye 1): `eye_<stamp>_GameHdrRefl.bin`,
+  `_HullHdrRefl.bin`, `_GameStencil.bin` / `_HullStencil.bin` (the depth-
+  stencil raw; the compare takes its 8-bit plane), `_GameT11.bin` /
+  `_HullT11.bin`, and `_Refl.json`: `game_steps`, `hull_steps`, `cb1_26`
+  (y: the mask the pass tests), the u1 clear value, `why`.
+- **If a stage never ran:** its `.bin` is absent, `Refl.json` has
+  `game_steps` or `hull_steps` 0 and `why` (no dispatch for the eye, no
+  private HDR lit, a view not made, sep_norefl, not re-issued), and the
+  log line `hull layer: dump <stamp> eye N: reflection: ...` says `missing`
+  per file and `not staged: <why>`. `cb1[26].y=unread:` when cb1 was not
+  copied. The compare prints `NOT STAGED` and exits 2.
+- **Dump mode too:** the reflection re-issue now also runs on a dump-mode
+  capture frame (only then), so either mode gives both sides.
+- **u1 clear (the fix, candidate 4):** before an eye's first re-issue each
+  frame, the private copies of the pass's other targets (the R16 u1) are
+  cleared, to the game's own last clear of its u1 when one is seen (the
+  RTV clears are already mirrored onto a private copy), else 0. The 30 s
+  line: `reflections: ... u1_cleared=N u1_game_clears=N u1_clear=game:|default:V`.
+  `u1_game_clears` > 0 answers whether the game clears that target.
+
+**Next capture** (the as-flown path is separate mode, a reference frame):
+keep `diag.hull_layer = separate` (or set it to `dump`), press
+`hotkey.dump_eyes` once over the wing, then set the key back if changed.
+Then `python tools\hull_layer_compare.py <edvr_logs>\eyes\eye_<stamp>
+--refl` (and `--eye 1`). It prints, on the hull pixels the game shows:
+luma private/game before the pass, after it, and of the pass's own
+addition (median and sum); the stencil's equal share, the share where the
+test `(s & cb1[26].y) == cb1[26].y` agrees, true on each side, and the top
+(game, private) mismatches; t11.w medians and their difference.
+
+| candidate | shows as |
+|---|---|
+| (1) stencil | test agreement under 95%; the pairs name the values |
+| (2) surplus before | before-pass median above 1.15 |
+| (3) t11.w | median abs. difference above 0.02 |
+| (4) u1 | after the clear, a pass addition still about 2x with (1)-(3) agreeing: INCONCLUSIVE, the pass's other inputs |
+
+Exit: MATCHES 0 (after-pass median 0.9-1.15), DIFFERS 3 (names the
+input), INCONCLUSIVE 1, NOT STAGED or bad input 2.
 
 ## Optimisation debt (recorded 2026-11-08 at the pilot's request)
 

@@ -57,7 +57,7 @@ def _load(path):
         raise ValueError('Unsupported version or incomplete capture')
     fmt, w, h = meta['format'], meta['width'], meta['height']
     pixel_bytes = {2: 16, 10: 8, 16: 8, 23: 4, 26: 4, 27: 4, 28: 4, 29: 4, 34: 4, 39: 4, 40: 4, 41: 4,
-                   42: 4, 19: 8, 20: 8, 44: 4, 45: 4, 53: 2, 55: 2, 61: 1}
+                   42: 4, 19: 8, 20: 8, 44: 4, 45: 4, 53: 2, 55: 2, 60: 1, 61: 1, 62: 1}
     if not w or not h or fmt not in pixel_bytes or meta['row_bytes'] != w * pixel_bytes[fmt]:
         raise ValueError('Unsupported format or invalid packed row extent')
     return meta, data
@@ -133,7 +133,7 @@ def read(path):
         image = (np.frombuffer(data, '<u4', offset=44).reshape(h, w) & 0xffffff) / 16777215.0
     elif fmt in (53, 55):
         image = np.frombuffer(data, '<u2', offset=44).reshape(h, w) / 65535.0
-    elif fmt == 61:
+    elif fmt in (60, 61, 62):  # R8: also a one-byte stencil copy (the hull layer's reflection dump)
         image = np.frombuffer(data, 'u1', offset=44).reshape(h, w)
     else:
         raise ValueError(f'Unsupported DXGI format {fmt}')

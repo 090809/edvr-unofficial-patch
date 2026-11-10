@@ -3,6 +3,7 @@
 
 Usage: python tools/hull_layer_compare.py <edvr_logs\\eyes\\eye_<stamp>> [--eye 1] [--tol 0.05] [--clear-depth 0] [--log <edvr_gfx_*.log>]
        python tools/hull_layer_compare.py <edvr_logs\\eyes\\eye_<stamp>> --lights
+       python tools/hull_layer_compare.py <edvr_logs\\eyes\\eye_<stamp>> --refl [--eye 1]
        python tools/hull_layer_compare.py --self-test
 
 Reads eye_<stamp>_HullHdr.bin (the private HDR after the eye's last private lighting draw), eye_<stamp>_GameHdrLit.bin
@@ -30,6 +31,15 @@ and the share nearer (the cockpit or a neighbour in front). Verdict: TAKEN OUT 0
 Since dump v2 ("Dump v2") a separate-mode dump's frame is a reference frame: the main pass kept the own ship, the files are
 eye_<stamp>_RefGbuf0.bin and _RefDepth.bin instead of GameGbuf0 and GameDepth, and the tool runs the lighting comparison
 above, with RefDepth (the same frame's main depth, both eyes) in place of the eye run's Z as the mask.
+
+--refl (the reflection dump, 2026-11-10: "Reflection dump") reads eye_<stamp>_Refl.json and, beside the files above,
+_GameHdrRefl / _HullHdrRefl (the HDRs right after the game's reflection dispatches and the private re-issue), _GameStencil /
+_HullStencil (the texture under the pass's t4; its 8-bit stencil plane) and _GameT11 / _HullT11. On the hull pixels the game
+shows it prints the luma ratio private/game before and after the pass and of the pass's own addition, the stencil's equal
+share and that of the pass's test (s & cb1[26].y) == cb1[26].y with the top mismatching (game, private) pairs, and the t11.w
+difference. Verdict: MATCHES 0 (after the pass median 0.9..1.15), DIFFERS 3 (and names the input that differs: a surplus
+before the pass, the stencil test, t11.w), INCONCLUSIVE 1 (those agree: the pass's other inputs), NOT STAGED 2 (Refl.json says
+a side was not staged, and why), bad input 2.
 
 --lights reads eye_<stamp>_HullLights.json instead (dump v2: the draws of the dump frame's lighting windows) and lists the
 draws that write the eye's HDR, by eye and vertex shader: how many, how many the layer re-issued and how many were unknown
@@ -96,22 +106,13 @@ def within_fraction(priv, game, mask, tol):
     return float((rel <= tol).mean())
 
 
-def compare(prefix, eye=0, tol=0.05, clear_depth=0.0):
-    """The measurement and verdict as a dict; raises ValueError on missing or mismatched files."""
+def shown_mask(prefix, eye, depth, clear_depth, out):
+    """The hull pixels the game shows: the private depth not at its clear value and, when a scene depth is there, equal to it."""
     import numpy as np
     import eye_inputs
     suffix = '_e1' if eye else ''
-    paths = {k: '%s_%s%s.bin' % (prefix, k, suffix) for k in ('HullHdr', 'GameHdrLit', 'HullDepth')}
-    for k, p in paths.items():
-        if not os.path.exists(p):
-            raise ValueError('missing %s: %s' % (k, p))
-    _, hull = eye_inputs.read(paths['HullHdr'])
-    _, game = eye_inputs.read(paths['GameHdrLit'])
-    _, depth = eye_inputs.read(paths['HullDepth'])
-    if hull.ndim != 3 or game.ndim != 3 or hull.shape != game.shape or depth.shape != hull.shape[:2]:
-        raise ValueError('the three files do not share one eye size (%s, %s, %s)' % (hull.shape, game.shape, depth.shape))
     mask = depth != np.float32(clear_depth)
-    out = {'eye': eye, 'tol': tol, 'private_pixels': int(mask.sum())}
+    out['private_pixels'] = int(mask.sum())
     # Where the game shows the hull: the eye run's scene depth (eye_<stamp>_Z.bin, written for eye 0) equals the private
     # depth. Elsewhere the cockpit or canopy is in front in the game's image, and the two HDRs differ by design (the
     # 2026-11-08 20:30 flight: 27% of the private pixels visible, 85-98% of those bit-exact).
@@ -133,6 +134,25 @@ def compare(prefix, eye=0, tol=0.05, clear_depth=0.0):
             z = np.asarray(z, np.float32)
             mask &= np.abs(z - depth) <= 1e-6 * np.maximum(np.abs(depth), np.float32(1e-9)) + np.float32(1e-9)
             out['visible_only'] = True
+    return mask
+
+
+def compare(prefix, eye=0, tol=0.05, clear_depth=0.0):
+    """The measurement and verdict as a dict; raises ValueError on missing or mismatched files."""
+    import numpy as np
+    import eye_inputs
+    suffix = '_e1' if eye else ''
+    paths = {k: '%s_%s%s.bin' % (prefix, k, suffix) for k in ('HullHdr', 'GameHdrLit', 'HullDepth')}
+    for k, p in paths.items():
+        if not os.path.exists(p):
+            raise ValueError('missing %s: %s' % (k, p))
+    _, hull = eye_inputs.read(paths['HullHdr'])
+    _, game = eye_inputs.read(paths['GameHdrLit'])
+    _, depth = eye_inputs.read(paths['HullDepth'])
+    if hull.ndim != 3 or game.ndim != 3 or hull.shape != game.shape or depth.shape != hull.shape[:2]:
+        raise ValueError('the three files do not share one eye size (%s, %s, %s)' % (hull.shape, game.shape, depth.shape))
+    out = {'eye': eye, 'tol': tol}
+    mask = shown_mask(prefix, eye, depth, clear_depth, out)
     lh, lg = luma(np.nan_to_num(hull)), luma(np.nan_to_num(game))
     n = int(mask.sum())
     out['hull_pixels'] = n
@@ -212,6 +232,160 @@ def report(r):
     if 'within' in r:
         line += ('; %.1f%% within %.0f%% of the game, ratio private/game median %.3f p95 %.3f, black %.1f%%, best shift %s (%.1f%% within)'
                  % (100 * r['within'], 100 * r['tol'], r['median'], r['p95'], 100 * r['black'], r['shift'], 100 * r['shift_within']))
+    return line + '\n%s: %s' % (r['verdict'], r['why'])
+
+
+REFL_MATCH = (0.9, 1.15)   # --refl: the private HDR after the pass within this of the game's (median ratio): it matches
+REFL_SURPLUS = 1.15        # --refl: a median ratio before the pass above this is a surplus from before it
+REFL_STENCIL = 0.95        # --refl: the stencil test agreeing on fewer hull pixels than this differs
+REFL_T11 = 0.02            # --refl: a median |t11.w| difference above this differs
+
+
+def stencil_plane(path):
+    """The 8-bit stencil plane of a dumped depth-stencil (D32S8, D24S8) or one-byte copy, as uint8 (h, w)."""
+    import numpy as np
+    import eye_inputs
+    meta, data = eye_inputs._load(path)
+    fmt, w, h = meta['format'], meta['width'], meta['height']
+    if fmt in (19, 20):
+        return np.frombuffer(data, 'u1', offset=44).reshape(h, w, 8)[..., 4].copy()
+    if fmt in (44, 45):
+        return (np.frombuffer(data, '<u4', offset=44).reshape(h, w) >> 24).astype(np.uint8)
+    if fmt in (60, 61, 62):
+        return np.frombuffer(data, 'u1', offset=44).reshape(h, w).copy()
+    raise ValueError('%s: DXGI format %d carries no stencil plane' % (path, fmt))
+
+
+def reflection(prefix, eye=0, clear_depth=0.0):
+    """--refl: the private HDR against the game's before and after the reflection pass, and the pass's inputs, on the hull pixels."""
+    import json
+    import numpy as np
+    import eye_inputs
+    from collections import Counter
+    suffix = '_e1' if eye else ''
+    jpath = '%s_Refl%s.json' % (prefix, suffix)
+    if not os.path.exists(jpath):
+        raise ValueError('missing %s: no reflection dump (a build before the reflection dump, or no eye staged)' % jpath)
+    try:
+        with open(jpath, encoding='utf-8') as f:
+            meta = json.load(f)
+    except (OSError, ValueError) as e:
+        raise ValueError('%s: %s' % (jpath, e))
+    cb = meta.get('cb1_26')
+    out = {'eye': eye, 'mode': 'reflection', 'game_steps': meta.get('game_steps', 0), 'hull_steps': meta.get('hull_steps', 0),
+           'stencil_mask': cb[1] if isinstance(cb, list) and len(cb) == 4 else None, 'u1_clear': meta.get('u1_clear'),
+           'u1_from_game': meta.get('u1_clear_from_game')}
+    if not out['game_steps'] or not out['hull_steps']:
+        out.update(verdict='NOT STAGED', why='the reflection pass was not staged on both sides (game %s, private %s steps): %s'
+                   % (out['game_steps'], out['hull_steps'], meta.get('why') or 'no reason given'))
+        return out
+    paths = {k: '%s_%s%s.bin' % (prefix, k, suffix) for k in ('HullHdr', 'GameHdrLit', 'HullDepth', 'HullHdrRefl', 'GameHdrRefl')}
+    for k, p in paths.items():
+        if not os.path.exists(p):
+            raise ValueError('missing %s: %s' % (k, p))
+    img = {k: np.nan_to_num(np.asarray(eye_inputs.read(p)[1], np.float32)) for k, p in paths.items()}
+    depth = img['HullDepth']
+    for k in ('HullHdr', 'GameHdrLit', 'HullHdrRefl', 'GameHdrRefl'):
+        if img[k].ndim != 3 or img[k].shape[:2] != depth.shape:
+            raise ValueError('%s %s and HullDepth %s are not one eye size' % (k, img[k].shape, depth.shape))
+    mask = shown_mask(prefix, eye, depth, clear_depth, out)
+    n = int(mask.sum())
+    out['hull_pixels'] = n
+    if n < MIN_HULL:
+        out.update(verdict='INCONCLUSIVE', why='%d hull pixels the game shows (under %d): nothing to measure' % (n, MIN_HULL))
+        return out
+    lh, lg = luma(img['HullHdr']), luma(img['GameHdrLit'])
+    lhr, lgr = luma(img['HullHdrRefl']), luma(img['GameHdrRefl'])
+
+    def median_ratio(a, b, where):
+        sel = where & (b > 1e-4)
+        return float(np.median(a[sel] / b[sel])) if sel.any() else None
+
+    out['before'] = median_ratio(lh, lg, mask)
+    out['after'] = median_ratio(lhr, lgr, mask)
+    ch, cg = lhr - lh, lgr - lg   # the pass's own addition on each side
+    out['pass_median'] = median_ratio(ch, cg, mask)
+    sg = float(cg[mask].sum())
+    out['pass_sum'] = float(ch[mask].sum()) / sg if sg > 1e-6 else None
+    out['pass_share_game'] = float(cg[mask].sum() / max(float(lgr[mask].sum()), 1e-6))
+    cand = []
+    if out['before'] is not None and out['before'] > REFL_SURPLUS:
+        cand.append('a surplus before the pass (median %.3f)' % out['before'])
+    st = {k: '%s_%s%s.bin' % (prefix, k, suffix) for k in ('GameStencil', 'HullStencil')}
+    if all(os.path.exists(p) for p in st.values()):
+        g, h = stencil_plane(st['GameStencil']), stencil_plane(st['HullStencil'])
+        if g.shape != depth.shape or h.shape != depth.shape:
+            raise ValueError('the stencils %s %s and HullDepth %s are not one eye size' % (g.shape, h.shape, depth.shape))
+        g, h = g[mask], h[mask]
+        out['stencil_equal'] = float((g == h).mean())
+        m = out['stencil_mask']
+        if m is not None:
+            m &= 0xff
+            tg, th = (g & m) == m, (h & m) == m
+            out['stencil_test_equal'] = float((tg == th).mean())
+            out['stencil_test_game'], out['stencil_test_hull'] = float(tg.mean()), float(th.mean())
+        diff = g != h
+        out['stencil_pairs'] = Counter(zip(g[diff].tolist(), h[diff].tolist())).most_common(5)
+        agree = out.get('stencil_test_equal', out['stencil_equal'])
+        if agree < REFL_STENCIL:
+            cand.append('the stencil (%s agrees on %.1f%%)' % ('the mask test' if m is not None else 'the value', 100 * agree))
+    else:
+        out['stencil_missing'] = True
+    tp = {k: '%s_%s%s.bin' % (prefix, k, suffix) for k in ('GameT11', 'HullT11')}
+    if all(os.path.exists(p) for p in tp.values()):
+        g, h = (np.nan_to_num(np.asarray(eye_inputs.read(p)[1], np.float32)) for p in (tp['GameT11'], tp['HullT11']))
+        if g.ndim == 3 and h.ndim == 3 and g.shape == h.shape and g.shape[2] >= 4 and g.shape[:2] == depth.shape:
+            dw = h[..., 3][mask] - g[..., 3][mask]
+            out['t11w_median_abs'], out['t11w_mean'] = float(np.median(np.abs(dw))), float(dw.mean())
+            out['t11w_game'], out['t11w_hull'] = float(np.median(g[..., 3][mask])), float(np.median(h[..., 3][mask]))
+            if out['t11w_median_abs'] > REFL_T11:
+                cand.append('t11.w (median |difference| %.3f)' % out['t11w_median_abs'])
+        else:
+            out['t11_unread'] = 'shapes %s %s' % (g.shape, h.shape)
+    else:
+        out['t11_missing'] = True
+    out['candidates'] = cand
+    after = 'n/a' if out['after'] is None else '%.3f' % out['after']
+    lo, hi = REFL_MATCH
+    if out['after'] is not None and lo <= out['after'] <= hi:
+        out.update(verdict='MATCHES', why='the private HDR after the reflection pass matches the game\'s on the hull (median %s)' % after)
+    elif cand:
+        out.update(verdict='DIFFERS', why='after the pass median %s; the differing input(s): %s' % (after, '; '.join(cand)))
+    else:
+        out.update(verdict='INCONCLUSIVE', why='after the pass median %s, but the stencil, t11.w and the light before it agree: the pass\'s other '
+                   'inputs (the probes, the cubemaps, u1 if it reads it)' % after)
+    return out
+
+
+def reflection_report(r):
+    def f(v):
+        return 'n/a' if v is None else '%.3f' % v
+    line = 'hull layer compare (reflection pass): eye %d, steps staged game %s private %s' % (r['eye'], r['game_steps'], r['hull_steps'])
+    if 'hull_pixels' in r:
+        line += ', %d hull pixel(s) the game shows (of %d private)' % (r['hull_pixels'], r.get('private_pixels', 0))
+    if 'before' in r:
+        line += ('\n  luma private/game: before the pass median %s, after it %s; the pass\'s own addition private/game median %s, sum %s '
+                 '(the pass is %.0f%% of the game\'s light after it)' % (f(r['before']), f(r['after']), f(r['pass_median']), f(r['pass_sum']),
+                                                                         100 * r['pass_share_game']))
+    if 'stencil_equal' in r:
+        line += '\n  stencil (t4): equal on %.1f%%' % (100 * r['stencil_equal'])
+        if 'stencil_test_equal' in r:
+            m = r['stencil_mask'] & 0xff
+            line += (', the test (s & 0x%02X) == 0x%02X agrees on %.1f%% (true on %.1f%% game, %.1f%% private)'
+                     % (m, m, 100 * r['stencil_test_equal'], 100 * r['stencil_test_game'], 100 * r['stencil_test_hull']))
+        else:
+            line += ', cb1[26].y not read'
+        if r['stencil_pairs']:
+            line += '; top (game, private) mismatches: ' + ', '.join('(%d, %d) x%d' % (a, b, c) for (a, b), c in r['stencil_pairs'])
+    elif r.get('stencil_missing'):
+        line += '\n  stencil (t4): not dumped'
+    if 't11w_median_abs' in r:
+        line += ('\n  t11.w: median game %.3f private %.3f, |difference| median %.3f, mean private-game %+.3f'
+                 % (r['t11w_game'], r['t11w_hull'], r['t11w_median_abs'], r['t11w_mean']))
+    elif r.get('t11_missing') or r.get('t11_unread'):
+        line += '\n  t11: %s' % ('not dumped' if r.get('t11_missing') else 'no w channel to compare (%s)' % r['t11_unread'])
+    if r.get('u1_clear') is not None:
+        line += '\n  u1 (R16): the private copy cleared to %g (%s)' % (r['u1_clear'], 'the game\'s clear' if r.get('u1_from_game') else 'no game clear seen')
     return line + '\n%s: %s' % (r['verdict'], r['why'])
 
 
@@ -394,10 +568,57 @@ def self_test():
             failures.append('--lights accepted a missing file')
         except ValueError:
             pass
+    # --refl: the reflection dump. The game's hull at `base`, the pass adding `add` on each side; stencils in the D32S8 (game) and
+    # D24S8 (private) layouts; t11 as RGBA8; Refl.json as writeReflection prints it.
+    def refl_case(name, want, before=1.0, pass_gain=1.0, hull_stencil=0x04, t11w=1.0, steps=(2, 2), mask=4, eye=0, check=None):
+        with tempfile.TemporaryDirectory() as temp:
+            prefix = os.path.join(temp, 'eye_123456789001')
+            sfx = '_e1' if eye else ''
+            lit, add = game * 0.4, game * 0.6
+            write(prefix + '_GameHdrLit%s.bin' % sfx, 26, eye, pack_r11g11b10(lit).tobytes(), w, h, 4)
+            write(prefix + '_GameHdrRefl%s.bin' % sfx, 26, eye, pack_r11g11b10(lit + add).tobytes(), w, h, 4)
+            write(prefix + '_HullHdr%s.bin' % sfx, 26, eye, pack_r11g11b10(lit * before).tobytes(), w, h, 4)
+            write(prefix + '_HullHdrRefl%s.bin' % sfx, 26, eye, pack_r11g11b10(lit * before + add * pass_gain).tobytes(), w, h, 4)
+            d = np.zeros((h, w, 2), dtype=np.float32)
+            d[..., 0] = depth
+            write(prefix + '_HullDepth%s.bin' % sfx, 19, eye, d.tobytes(), w, h, 8)
+            gs = np.zeros((h, w, 8), dtype=np.uint8)
+            gs[..., 4] = 0x04
+            write(prefix + '_GameStencil%s.bin' % sfx, 20, eye, gs.tobytes(), w, h, 8)
+            hs = (np.full((h, w), hull_stencil, dtype=np.uint32) << 24) | 0x123456
+            write(prefix + '_HullStencil%s.bin' % sfx, 44, eye, hs.astype('<u4').tobytes(), w, h, 4)
+            for label, a in (('GameT11', 1.0), ('HullT11', t11w)):
+                t = np.zeros((h, w, 4), dtype=np.uint8)
+                t[..., 3] = int(round(a * 255))
+                write(prefix + '_%s%s.bin' % (label, sfx), 28, eye, t.tobytes(), w, h, 4)
+            with open(prefix + '_Refl%s.json' % sfx, 'w', encoding='utf-8') as f:
+                f.write('{"version": 1, "stamp": "123456789001", "frame": 7, "eye": %d, "game_steps": %d, "hull_steps": %d, "cb1_first": 0, '
+                        '"cb1_26": [0, %d, 0, 0], "u1_clear": 0.000000, "u1_clear_from_game": false, "why": "%s"}\n'
+                        % (eye, steps[0], steps[1], mask, '' if steps[1] else 'the step was not re-issued'))
+            r = reflection(prefix, eye=eye)
+            text = reflection_report(r)
+            if r['verdict'] != want:
+                failures.append('--refl %s: %s, wanted %s (%s)' % (name, r['verdict'], want, text))
+            elif check and check not in text:
+                failures.append('--refl %s: %r not in the report: %s' % (name, check, text))
+    refl_case('the private pass like the game\'s', 'MATCHES', check='before the pass median 1.000, after it 1.000')
+    refl_case('eye 1', 'MATCHES', eye=1)
+    refl_case('the pass adds twice, same inputs', 'INCONCLUSIVE', pass_gain=2.0, check='own addition private/game median 1.99')
+    refl_case('a surplus before the pass', 'DIFFERS', before=2.0, check='a surplus before the pass')
+    refl_case('the private stencil fails the mask test', 'DIFFERS', pass_gain=2.0, hull_stencil=0x00, check='(4, 0) x1600')
+    refl_case('a stencil differing outside the mask', 'INCONCLUSIVE', pass_gain=2.0, hull_stencil=0x0C, check='agrees on 100.0%')
+    refl_case('t11.w differs', 'DIFFERS', pass_gain=2.0, t11w=0.5, check='t11.w (median |difference| 0.49')
+    refl_case('the re-issue never ran', 'NOT STAGED', steps=(2, 0), check='the step was not re-issued')
+    with tempfile.TemporaryDirectory() as temp:
+        try:
+            reflection(os.path.join(temp, 'eye_x'))
+            failures.append('--refl accepted a dump with no Refl.json')
+        except ValueError:
+            pass
     for f in failures:
         print('hull layer compare self-test FAILED: ' + f)
     if not failures:
-        print('hull layer compare self-test passed (20 cases)')
+        print('hull layer compare self-test passed (29 cases)')
     return 1 if failures else 0
 
 
@@ -409,6 +630,7 @@ def main(argv=None):
     p.add_argument('--clear-depth', type=float, default=0.0, help='the private depth\'s clear value (reversed Z: 0)')
     p.add_argument('--log', help='the graphics log holding the dump\'s line (default: the newest edvr_gfx_*.log beside the eyes folder)')
     p.add_argument('--lights', action='store_true', help='list HullLights.json\'s HDR writers by eye and VS instead of comparing')
+    p.add_argument('--refl', action='store_true', help='compare the two sides of the reflection pass (eye_<stamp>_Refl.json and its files)')
     p.add_argument('--self-test', action='store_true')
     a = p.parse_args(argv)
     if a.self_test:
@@ -422,6 +644,14 @@ def main(argv=None):
             print('hull layer compare: %s' % e)
             return 2
         return 0
+    if a.refl:
+        try:
+            r = reflection(a.prefix, eye=a.eye, clear_depth=a.clear_depth)
+        except ValueError as e:
+            print('hull layer compare: %s' % e)
+            return 2
+        print(reflection_report(r))
+        return {'MATCHES': 0, 'DIFFERS': 3, 'NOT STAGED': 2}.get(r['verdict'], 1)
     try:
         separate = os.path.exists('%s_GameDepth%s.bin' % (a.prefix, '_e1' if a.eye else ''))
         r = main_pass(a.prefix, eye=a.eye, clear_depth=a.clear_depth) if separate else compare(a.prefix, eye=a.eye, tol=a.tol, clear_depth=a.clear_depth)

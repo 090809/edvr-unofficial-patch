@@ -5,6 +5,7 @@
 
 #include <windows.h>
 #include <d3d11.h>
+#include <d3d11_1.h>          // the reflection dump: CSGetConstantBuffers1, the offset cb1 is bound at
 #include <dxgi1_4.h>          // the variant bench's VRAM sample (IDXGIAdapter3::QueryVideoMemoryInfo)
 
 #include <algorithm>
@@ -680,6 +681,8 @@ struct Eye {
     const void* aoOut[kAoOwned] = {};
     uint8_t aoOutCount = 0, aoDone = 0, aoSeen = 0;
     uint8_t reflSeen = 0;   // the reflection pair's steps the game ran for this eye this frame (kReflCs)
+    bool reflCleared = false;   // this frame: the private copies of the pass's other targets (the R16 u1) cleared before its first re-issue
+    const void* reflU1Game = nullptr;   // across frames: the game's target at the pass's u1 (identity), for the game's own clears of it
     float clearDepth = 0.0f;
     uint32_t records = 0, seedInstances = 0;
     uint32_t rigGen = ~0u;   // the own rigs' generation the eye's held reach (stats word 7) belongs to
@@ -703,6 +706,19 @@ struct Eye {
     ID3D11Texture2D* stageDepth = nullptr;
     ID3D11Buffer* stageStats = nullptr;
     uint32_t dumpHull = 0, dumpLight = 0;
+    // The reflection pass on the capture frame (kReflCs): the game's HDR right after its dispatch and the private HDR right after
+    // the re-issue (the last step wins), the stencil (t4) and G-buffer (t11) the pass read, game and private, and the pass's cb1 at
+    // the dispatch (first constant: the 11.1 offset it was bound at). The steps staged on each side, and why the private side was not.
+    ID3D11Texture2D* stageGameRefl = nullptr;
+    ID3D11Texture2D* stageHullRefl = nullptr;
+    ID3D11Texture2D* stageGameStencil = nullptr;
+    ID3D11Texture2D* stageHullStencil = nullptr;
+    ID3D11Texture2D* stageGameT11 = nullptr;
+    ID3D11Texture2D* stageHullT11 = nullptr;
+    ID3D11Buffer* stageReflCb = nullptr;
+    UINT reflCbFirst = 0;
+    uint32_t dumpReflGame = 0, dumpReflHull = 0;
+    const char* reflWhy = nullptr;
     // Separate mode. This frame: the main-pass draws given the own discard (hull, decals), and the decals re-issued.
     uint32_t ownDraws = 0, ownDecals = 0, decals = 0;
     // The capture frame only: the game's G-buffer RT0 and eye depth (references from the seed to the frame's end), and
@@ -853,6 +869,7 @@ struct Window {
     // not re-issued, by step; chain dispatches whose eye could not be named (none of its resources is an eye's).
     uint32_t aoEyeFrames = 0, aoFull = 0, aoDispatches = 0, aoApplied = 0, aoMissed[kAoSteps + 1] = {}, aoNoEye = 0;
     uint32_t reflDispatches = 0, reflNoEye = 0, reflDeclined = 0;
+    uint32_t reflU1Clears = 0, reflU1GameClears = 0;   // eye-frames whose private u1 was cleared before the re-issue; the game's clears of its own u1
     // The rig seed (the "own seed" line): eye-frames seeded from the rig probe's own slots and from the seed draw (the fallback),
     // the hold restarted (the own rigs changed); the rig seeds' slot counts, and from their readbacks the radius and reach (metres).
     uint32_t rigSeeds = 0, drawSeeds = 0, holdResets = 0;
@@ -901,6 +918,7 @@ struct Pending {
 // The pending AO step re-issue: the compute slots Begin bound over, which End puts back.
 struct DispatchPending {
     bool active = false;
+    int reflEye = -1;   // a reflection step's re-issue: its eye, for the capture frame's private stage after it
     ID3D11ShaderResourceView* srv[kCsSrvSlots] = {};
     ID3D11UnorderedAccessView* uav[kCsUavSlots] = {};
 };
@@ -1074,6 +1092,11 @@ bool g_lightsCapped = false;
 // made and not applied), so GameHdrLit holds the game's own hull beside HullHdr. g_refWould: that frame would have discarded.
 bool g_refFrame = false, g_refWould = false;
 
+// The reflection pass's u1 (an R16 target, also the lighting's RT1): the colour the game last cleared its own to, when it does
+// (hullLayerNoteClearRtv), which the private copy is cleared to before the first re-issue an eye-frame; 0 until one is seen.
+float g_reflU1Clear[4] = {};
+bool g_reflU1ClearSeen = false;
+
 // The TAA sequence (separate mode, eye 0, from the dump's capture frame): per frame the cover and its depth at render size (the
 // eye's region, cropped on the CPU to the cover's extent), the composite at output size (cropped likewise), the TAA's constants,
 // and on the first frame the history it read. Staged into kSeqRing sets and written kSeqLag frames later, so the GPU is not waited
@@ -1151,6 +1174,16 @@ void releaseStaging(Eye& e) {
     releaseRef(e.stageMainDepth);
     releaseRef(e.stageTone);
     releaseRef(e.stageComp);
+    releaseRef(e.stageGameRefl);
+    releaseRef(e.stageHullRefl);
+    releaseRef(e.stageGameStencil);
+    releaseRef(e.stageHullStencil);
+    releaseRef(e.stageGameT11);
+    releaseRef(e.stageHullT11);
+    releaseRef(e.stageReflCb);
+    e.reflCbFirst = 0;
+    e.dumpReflGame = e.dumpReflHull = 0;
+    e.reflWhy = nullptr;
     e.dumpHull = e.dumpLight = 0;
     e.dumpApplied = false;
 }
@@ -1283,6 +1316,7 @@ void resetFrame(Eye& e) {
     for (auto& o : e.aoOut) o = nullptr;
     e.aoOutCount = e.aoDone = e.aoSeen = 0;
     e.reflSeen = 0;
+    e.reflCleared = false;
     e.clearDepth = 0.0f;
     e.records = e.seedInstances = 0;
     e.ownDraws = e.ownDecals = e.decals = 0;
@@ -3168,15 +3202,56 @@ bool beginAoStep(ID3D11DeviceContext* ctx, int step) {
 // its private-copied inputs swapped. Separate mode only, once per eye and step a frame, and only on an eye whose private
 // G-buffer and HDR are this frame's. True: the caller dispatches the same indirect arguments again (the game's tile list)
 // and calls hullLayerEndDispatch.
+// The reflection dump: a staging copy of the 2D texture under a bound SRV (null, or not a 2D texture: nothing).
+void stageSrvTexture(ID3D11DeviceContext* ctx, ID3D11ShaderResourceView* v, ID3D11Texture2D*& stage) {
+    if (!v) return;
+    ID3D11Resource* res = nullptr;
+    v->GetResource(&res);
+    D3D11_RESOURCE_DIMENSION dim = D3D11_RESOURCE_DIMENSION_UNKNOWN;
+    if (res) res->GetType(&dim);
+    if (res && dim == D3D11_RESOURCE_DIMENSION_TEXTURE2D) copyToStaging(ctx, static_cast<ID3D11Texture2D*>(res), stage);
+    releaseRef(res);
+}
+
+// The reflection dump: the whole buffer bound at CS cb1 (the pass's stencil mask is cb1[26].y), and the constant it starts at.
+void stageReflCb(ID3D11DeviceContext* ctx, Eye& e) {
+    ID3D11Buffer* cb = nullptr;
+    UINT first = 0, num = 0;
+    ID3D11DeviceContext1* ctx1 = nullptr;
+    if (SUCCEEDED(ctx->QueryInterface(__uuidof(ID3D11DeviceContext1), reinterpret_cast<void**>(&ctx1))) && ctx1) {
+        ctx1->CSGetConstantBuffers1(1, 1, &cb, &first, &num);
+        ctx1->Release();
+    } else {
+        ctx->CSGetConstantBuffers(1, 1, &cb);
+    }
+    if (!cb) return;
+    D3D11_BUFFER_DESC d{};
+    cb->GetDesc(&d);
+    if (e.stageReflCb) {
+        D3D11_BUFFER_DESC s{};
+        e.stageReflCb->GetDesc(&s);
+        if (s.ByteWidth != d.ByteWidth) releaseRef(e.stageReflCb);
+    }
+    if (!e.stageReflCb) e.stageReflCb = makeStagingBuffer(d.ByteWidth);
+    if (e.stageReflCb) {
+        vScreenCopyResourceRaw(ctx, e.stageReflCb, cb);
+        e.reflCbFirst = first;
+    }
+    cb->Release();
+}
+
 bool beginReflStep(ID3D11DeviceContext* ctx, int step) {
-    if (!detail::g_hullLayerSeparate) return false;
+    // Separate mode; in dump mode the capture frame only, so the dump holds the private HDR after the pass too.
+    if (!detail::g_hullLayerSeparate && g_dump != Dump::Capturing) return false;
     QueryPerformanceCounter(&g_entryQpc);   // dump v2: the item's CPU time starts here
     ID3D11ShaderResourceView* srv[kCsSrvSlots] = {};
     ID3D11UnorderedAccessView* uav[kCsUavSlots] = {};
     ctx->CSGetShaderResources(0, kCsSrvSlots, srv);
     ctx->CSGetUnorderedAccessViews(0, kCsUavSlots, uav);
-    const auto decline = [&] {
+    Eye* ep = nullptr;
+    const auto decline = [&](const char* why) {
         ++g_win.reflDeclined;
+        if (ep) ep->reflWhy = why;
         releaseCsSlots(srv, uav);
         return false;
     };
@@ -3196,31 +3271,82 @@ bool beginReflStep(ID3D11DeviceContext* ctx, int step) {
         return false;
     }
     e.reflSeen |= bit;
-    if (e.gb != Gb::Done || !e.hdrGame || !findMirror(e.hdrGame)) return decline();   // no private HDR lit this frame
+    ep = &e;
+    const bool capture = g_dump == Dump::Capturing;
+    if (capture) {
+        // The capture frame: the game's HDR right after the game's dispatch of this step (the last step wins: after both), and
+        // once an eye what the pass reads, the stencil (t4) and the G-buffer's t11, and its cb1 (the stencil mask, cb1[26].y).
+        for (UINT i = 0; i < kCsUavSlots; ++i)
+            if (uav[i] && resourceOf(uav[i]) == e.hdrGame) {
+                ID3D11Resource* res = nullptr;
+                uav[i]->GetResource(&res);
+                D3D11_RESOURCE_DIMENSION dim = D3D11_RESOURCE_DIMENSION_UNKNOWN;
+                if (res) res->GetType(&dim);
+                if (res && dim == D3D11_RESOURCE_DIMENSION_TEXTURE2D) {
+                    copyToStaging(ctx, static_cast<ID3D11Texture2D*>(res), e.stageGameRefl);
+                    ++e.dumpReflGame;
+                }
+                releaseRef(res);
+                break;
+            }
+        if (!e.stageGameStencil) stageSrvTexture(ctx, srv[4], e.stageGameStencil);
+        if (!e.stageGameT11) stageSrvTexture(ctx, srv[11], e.stageGameT11);
+        if (!e.stageReflCb) stageReflCb(ctx, e);
+    }
+    if (e.gb != Gb::Done || !e.hdrGame || !findMirror(e.hdrGame)) return decline("no private HDR lit this frame");
     if (g_benchNoRefl) {   // the variant bench's sep_norefl: the step would have been re-issued; it is not (not a decline)
         benchNoteOff();
+        e.reflWhy = "the variant bench's sep_norefl";
         releaseCsSlots(srv, uav);
         return false;
     }
     // Targets: the eye's HDR must be one of them (the pass adds into it); it goes to its private twin, made by the lighting.
     // Every other target gets a private copy (the R16 one).
     ID3D11UnorderedAccessView* bindUav[kCsUavSlots] = {};
-    bool hdr = false;
+    bool hdr = false, other[kCsUavSlots] = {};
     for (UINT i = 0; i < kCsUavSlots; ++i) {
         if (!uav[i]) continue;
         const bool isHdr = resourceOf(uav[i]) == e.hdrGame;
         hdr = hdr || isHdr;
+        other[i] = !isHdr;
+        if (!isHdr && i == 1) e.reflU1Game = resourceOf(uav[i]);
         bindUav[i] = static_cast<ID3D11UnorderedAccessView*>(privateView(ViewKind::Uav, uav[i], !isHdr));
-        if (!bindUav[i]) return decline();
+        if (!bindUav[i]) return decline("a target's private copy or view could not be made");
     }
-    if (!hdr) return decline();
+    if (!hdr) return decline("the eye's HDR is not one of the pass's targets");
     ID3D11ShaderResourceView* bindSrv[kCsSrvSlots] = {};
     for (UINT i = 0; i < kCsSrvSlots; ++i) {
         bindSrv[i] = srv[i];
         if (!srv[i] || !findMirror(resourceOf(srv[i]))) continue;
         auto* p = static_cast<ID3D11ShaderResourceView*>(privateView(ViewKind::Srv, srv[i], false));
-        if (!p) return decline();
+        if (!p) return decline("an input's private view could not be made");
         bindSrv[i] = p;
+    }
+    if (capture) {
+        // The private side of what the pass reads (the game's own where an input has no private copy).
+        if (!e.stageHullStencil) stageSrvTexture(ctx, bindSrv[4], e.stageHullStencil);
+        if (!e.stageHullT11) stageSrvTexture(ctx, bindSrv[11], e.stageHullT11);
+    }
+    if (!e.reflCleared) {
+        // The private copies of the pass's other targets (the R16 u1) are made with no data, and the pass adds into them: cleared
+        // before the eye's first re-issue each frame, to the game's own clear of it when one has been seen, else 0.
+        e.reflCleared = true;
+        VrWorldInternalScope internal;   // the layer's own clear
+        for (UINT i = 0; i < kCsUavSlots; ++i) {
+            if (!other[i] || !bindUav[i]) continue;
+            D3D11_UNORDERED_ACCESS_VIEW_DESC ud{};
+            bindUav[i]->GetDesc(&ud);
+            const bool integer = ud.Format == DXGI_FORMAT_R16_UINT || ud.Format == DXGI_FORMAT_R16_SINT || ud.Format == DXGI_FORMAT_R32_UINT ||
+                                 ud.Format == DXGI_FORMAT_R32_SINT || ud.Format == DXGI_FORMAT_R8_UINT;
+            if (integer) {
+                const UINT zero[4] = {0u, 0u, 0u, 0u};
+                ctx->ClearUnorderedAccessViewUint(bindUav[i], zero);
+            } else {
+                const float zero[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+                ctx->ClearUnorderedAccessViewFloat(bindUav[i], g_reflU1ClearSeen ? g_reflU1Clear : zero);
+            }
+        }
+        ++g_win.reflU1Clears;
     }
     UINT keep[kCsUavSlots];
     for (auto& k : keep) k = ~0u;
@@ -3228,6 +3354,7 @@ bool beginReflStep(ID3D11DeviceContext* ctx, int step) {
     ctx->CSSetUnorderedAccessViews(0, kCsUavSlots, bindUav, keep);
     g_dispatch = DispatchPending{};
     g_dispatch.active = true;
+    g_dispatch.reflEye = ei;
     for (UINT i = 0; i < kCsSrvSlots; ++i) g_dispatch.srv[i] = srv[i];   // the references pass to End
     for (UINT i = 0; i < kCsUavSlots; ++i) g_dispatch.uav[i] = uav[i];
     ++g_win.reflDispatches;
@@ -4035,6 +4162,8 @@ const char* writeTexture(ID3D11DeviceContext* ctx, ID3D11Texture2D* staging, con
     case DXGI_FORMAT_R10G10B10A2_TYPELESS: case DXGI_FORMAT_R10G10B10A2_UNORM: case DXGI_FORMAT_R10G10B10A2_UINT: bytes = 4; break;
     case DXGI_FORMAT_R8G8B8A8_TYPELESS: case DXGI_FORMAT_R8G8B8A8_UNORM: case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB: bytes = 4; break;
     case DXGI_FORMAT_B8G8R8A8_TYPELESS: case DXGI_FORMAT_B8G8R8A8_UNORM: case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB: bytes = 4; break;
+    // The reflection dump's stencil, should the pass read a one-byte copy of it.
+    case DXGI_FORMAT_R8_TYPELESS: case DXGI_FORMAT_R8_UNORM: case DXGI_FORMAT_R8_UINT: bytes = 1; break;
     default: return "format unsupported";
     }
     D3D11_MAPPED_SUBRESOURCE map{};
@@ -4093,13 +4222,62 @@ void writeLights(const std::wstring& dir) {
     g_lightsCapped = false;
 }
 
+// The reflection dump of eye `i`: eye_<stamp>_GameHdrRefl / _HullHdrRefl (the HDRs right after the game's reflection dispatch and
+// the private re-issue), _GameStencil / _HullStencil (the texture under the pass's t4, raw: the stencil is its 8-bit plane) and
+// _GameT11 / _HullT11 (under t11), each with _e1 for eye 1; a stage that never ran writes no file. eye_<stamp>_Refl[_e1].json:
+// the steps staged a side, cb1[26] at the dispatch (y: the stencil mask the pass tests) and why the private side was not staged.
+void writeReflection(ID3D11DeviceContext* ctx, Eye& e, const std::wstring& dir, int i) {
+    const char* gameHdr = writeTexture(ctx, e.stageGameRefl, dir, L"GameHdrRefl", i);
+    const char* hullHdr = writeTexture(ctx, e.stageHullRefl, dir, L"HullHdrRefl", i);
+    const char* gameSt = writeTexture(ctx, e.stageGameStencil, dir, L"GameStencil", i);
+    const char* hullSt = writeTexture(ctx, e.stageHullStencil, dir, L"HullStencil", i);
+    const char* gameT11 = writeTexture(ctx, e.stageGameT11, dir, L"GameT11", i);
+    const char* hullT11 = writeTexture(ctx, e.stageHullT11, dir, L"HullT11", i);
+    uint32_t cb[4] = {};
+    bool haveCb = false;
+    D3D11_MAPPED_SUBRESOURCE map{};
+    if (e.stageReflCb && SUCCEEDED(ctx->Map(e.stageReflCb, 0, D3D11_MAP_READ, 0, &map))) {
+        D3D11_BUFFER_DESC d{};
+        e.stageReflCb->GetDesc(&d);
+        const size_t at = (static_cast<size_t>(e.reflCbFirst) + 26u) * 16u;
+        if (at + sizeof cb <= d.ByteWidth) {
+            std::memcpy(cb, static_cast<const char*>(map.pData) + at, sizeof cb);
+            haveCb = true;
+        }
+        ctx->Unmap(e.stageReflCb, 0);
+    }
+    const char* why = e.reflWhy                                      ? e.reflWhy
+                      : !e.dumpReflGame                              ? "the game ran no reflection dispatch for this eye on the capture frame"
+                      : !e.dumpReflHull                              ? "the step was not re-issued"
+                                                                     : "";
+    wchar_t path[MAX_PATH];
+    _snwprintf_s(path, MAX_PATH, _TRUNCATE, L"%s\\eye_%s_Refl%s.json", dir.c_str(), g_dumpStamp, i ? L"_e1" : L"");
+    FILE* f = nullptr;
+    bool ok = false;
+    char cbText[64] = "null";
+    if (haveCb) std::snprintf(cbText, sizeof cbText, "[%u, %u, %u, %u]", cb[0], cb[1], cb[2], cb[3]);
+    if (_wfopen_s(&f, path, L"wb") == 0 && f) {
+        ok = std::fprintf(f,
+                          "{\"version\": 1, \"stamp\": \"%ls\", \"frame\": %u, \"eye\": %d, \"game_steps\": %u, \"hull_steps\": %u, \"cb1_first\": %u, "
+                          "\"cb1_26\": %s, \"u1_clear\": %.6f, \"u1_clear_from_game\": %s, \"why\": \"%s\"}\n",
+                          g_dumpStamp, g_dumpFrame, i, e.dumpReflGame, e.dumpReflHull, static_cast<unsigned>(e.reflCbFirst), cbText,
+                          static_cast<double>(g_reflU1Clear[0]), g_reflU1ClearSeen ? "true" : "false", why) > 0;
+        ok = (std::fclose(f) == 0) && ok;
+    }
+    Log::get().note("hull layer: dump %ls eye %d: reflection: game_steps=%u hull_steps=%u cb1[26].y=%s%u; GameHdrRefl %s, HullHdrRefl %s, GameStencil %s, "
+                    "HullStencil %s, GameT11 %s, HullT11 %s, Refl.json %s%s%s",
+                    g_dumpStamp, i, e.dumpReflGame, e.dumpReflHull, haveCb ? "" : "unread:", cb[1], gameHdr, hullHdr, gameSt, hullSt, gameT11, hullT11,
+                    ok ? "written" : "write failed", *why ? "; not staged: " : "", why);
+}
+
 void writeDump(ID3D11DeviceContext* ctx) {
     const std::wstring dir = Log::get().dir() + L"\\eyes";
     CreateDirectoryW(dir.c_str(), nullptr);
     bool any = false;
     for (int i = 0; i < 2; ++i) {
         Eye& e = g_eyes[i];
-        if (!e.stageHull && !e.stageGame && !e.stageDepth && !e.stageGbuf0 && !e.stageMainDepth && !e.stageTone && !e.stageComp) continue;
+        if (!e.stageHull && !e.stageGame && !e.stageDepth && !e.stageGbuf0 && !e.stageMainDepth && !e.stageTone && !e.stageComp && !e.stageGameRefl)
+            continue;
         any = true;
         uint32_t w = 0, h = 0, fmt = 0;
         if (e.stageHull) {
@@ -4127,6 +4305,7 @@ void writeDump(ID3D11DeviceContext* ctx) {
         Log::get().note("hull layer: dump %ls eye %d frame %u: HullHdr %ux%u format %u %s, GameHdrLit %s, HullDepth %s; own=%ld filtered_px=%ld "
                         "seed=%ld/%ld hull_draws=%u light_draws=%u",
                         g_dumpStamp, i, g_dumpFrame, w, h, fmt, hull, game, depth, own, filtered, seedRead, seedInst, e.dumpHull, e.dumpLight);
+        writeReflection(ctx, e, dir, i);
         if (detail::g_hullLayerSeparate && g_refFrame) {
             // Dump v2: the capture frame was a reference frame. The main pass kept the own ship, so GameHdrLit holds the game's own
             // hull beside HullHdr (tools\hull_layer_compare.py's lighting comparison), and the main depth after the eye's G-buffer
@@ -4549,10 +4728,14 @@ void report() {
                     g_win.aoMissed[1], g_win.aoMissed[2], g_win.aoMissed[kAoSteps], g_win.aoNoEye, kAoSteps);
     reportStages();
     if (detail::g_hullLayerSeparate) {
-        Log::get().note("hull layer: reflections: dispatches=%u no_eye=%u declined=%u (the game's reflection pass, two indirect dispatches an eye, "
+        Log::get().note("hull layer: reflections: dispatches=%u no_eye=%u declined=%u u1_cleared=%u u1_game_clears=%u u1_clear=%s%.4f "
+                        "(the game's reflection pass, two indirect dispatches an eye, "
                         "re-issued into the private HDR with the game's tile list; no_eye: pass dispatches no eye's G-buffer named; declined: an "
-                        "eye's dispatch not re-issued, no private HDR this frame or a view that could not be made)",
-                        g_win.reflDispatches, g_win.reflNoEye, g_win.reflDeclined);
+                        "eye's dispatch not re-issued, no private HDR this frame or a view that could not be made; u1_cleared: eye-frames whose "
+                        "private u1 (R16) was cleared before the first re-issue; u1_game_clears: the game's own clears of its u1 in the window; "
+                        "u1_clear: the value the private one is cleared to, the game's last clear or 0 before one is seen)",
+                        g_win.reflDispatches, g_win.reflNoEye, g_win.reflDeclined, g_win.reflU1Clears, g_win.reflU1GameClears,
+                        g_reflU1ClearSeen ? "game:" : "default:", static_cast<double>(g_reflU1Clear[0]));
         Log::get().note("hull layer: main pass: own_draws=%u decal_draws=%u no_variant_draws=%u fallback_frames=%u decals_reissued=%u decal_no_slot=%u "
                         "(separate mode: draws issued with the own discard; window draws that could not take it; eye-frames whose main pass kept the own "
                         "ship, no mask)",
@@ -5906,6 +6089,15 @@ bool hullLayerBeginDispatch(ID3D11DeviceContext* ctx, uint64_t cs) {
 void hullLayerEndDispatch(ID3D11DeviceContext* ctx) {
     if (!g_dispatch.active) return;
     stageClose(ctx);   // dump v2: right after the re-dispatch
+    if (ctx && g_dump == Dump::Capturing && g_dispatch.reflEye >= 0) {
+        // The reflection dump: the private HDR right after the re-issued step (the last step wins: after both).
+        Eye& e = g_eyes[g_dispatch.reflEye];
+        Mirror* m = findMirror(e.hdrGame);
+        if (m) {
+            copyToStaging(ctx, m->priv, e.stageHullRefl);
+            ++e.dumpReflHull;
+        }
+    }
     if (ctx) {
         // The game's inputs first (none is a private copy still bound as a UAV), then its UAVs with their counters kept.
         UINT keep[kCsUavSlots];
@@ -5944,6 +6136,12 @@ void hullLayerAfterCopy(ID3D11DeviceContext* ctx, ID3D11Resource* dst, ID3D11Res
 
 void hullLayerNoteClearRtv(ID3D11DeviceContext* ctx, ID3D11RenderTargetView* rtv, const float colour[4]) {
     if (!detail::g_hullLayerOn || !rtv || !colour || !g_device || g_busy || g_benchSleep || !findMirror(resourceOf(rtv))) return;   // asleep: the copies age out
+    const void* res = resourceOf(rtv);
+    if (res == g_eyes[0].reflU1Game || res == g_eyes[1].reflU1Game) {   // the game clears the reflection pass's u1 itself: its colour
+        ++g_win.reflU1GameClears;
+        std::memcpy(g_reflU1Clear, colour, sizeof g_reflU1Clear);
+        g_reflU1ClearSeen = true;
+    }
     auto* priv = static_cast<ID3D11RenderTargetView*>(privateView(ViewKind::Rtv, rtv, false));
     if (priv) vScreenClearRenderTargetViewRaw(ctx, priv, colour);
 }
