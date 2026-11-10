@@ -20,16 +20,15 @@ The smear is terrain that is newly uncovered at the hull edge every frame
   (+0.9 GB NGX), dlss_sub refused (0xBAD00005: feature made at the whole
   eye; fixed after, untested). Found: cockpit decals lost
   in the main pass; the hull at 0.30-0.39 on a station pad.
-* **Next flight (fold into normal play, no dump):** HEAD with the decal
-  fix and the reflection re-issue. One `hotkey.hull_bench` (F11) press on
-  a station pad with the consoles in view: `dluma` near 1 (was 0.30-0.39),
-  the console grilles and strut details in sep_taa; log
-  `hull layer: reflections: dispatches=` > 0, `declined=` 0.
+* **Next (normal play):** one F11 on a station pad, consoles in view:
+  `dluma` near 1 (was 0.30-0.39), console grilles present in sep_taa.
 * **Alternatives reviewed** (section): checkerboard promising, synthetic only.
-  **Build A'** (compile-only; section): re-issues scissored to the hull's box;
-  next: `hull layer: rect:` `rect` near `decided`, `gpu_ms` ~0.3-0.4 lower.
-  **Build B** (compile-only; section): depth prefill and reset; next: `hull
-  layer: prefill:` prefilled = reset = seeds, `unreset=0`; gbuffer ms lower.
+* **b30a1c6f FLOWN** (2026-11-10 20:49-20:53, near a planet; section "Flight
+  b30a1c6f"): reflections, Build A', Build B and the TAA tiles all run; no
+  seam, no lost hull in fast turns, no smear in a turn. `gpu_ms` total
+  1.83-1.99 (taa 0.43-0.49, was 0.8; gbuffer 0.55-0.66, no drop). dlss_sub
+  runs: 1.80 ms, 414 MB. **Open:** sep variants' dluma 1.14 (was 1.06 here);
+  dlss_full sharp 0.61, shimmer 1.85 (was like the original).
 * **Night vision state** (not flown): **next dump** night vision on,
   compare median ~1.0, `night_vision=N/N`. **Station fixes** (not flown):
   a docking dump, `culled_draws` high, `filter_draws` 0, `busy=` 0.
@@ -1590,6 +1589,49 @@ shaded into the private G-buffer. Separate mode only, render scale.
   Look for the cockpit shell painted as hull (a reset that missed) and hull
   holes at the shell's edges. Risk: a hull PS that turns off early depth
   (writes depth or a UAV) gains nothing.
+
+## Flight b30a1c6f (2026-11-10 20:46-20:53, near a planet)
+
+Build b30a1c6f (compile-only; `--expect-build HEAD` matched), OpenXR (EDVR
+runtime), 2817x2448 to 3756x3264 per eye, DLSS 310.9.1 preset K, FG off.
+The pilot looked around and turned fast: no seam at the rectangle's edge,
+no consoles painted as hull, no hull lost at the edge, no smear band in a
+turn over the planet. One bench press, `eye_205053107001` (the stillness
+check flagged it, as every press so far: orig_a vs orig_b 6.64).
+
+- Log, 30 s windows 20:51:15-20:53:15: `reflections: dispatches` 6108-7816,
+  `declined=0`; `rect:` rect 95% of decided, share 0.41-0.60, `no_state=0`,
+  whole eye 83-102 no_box plus a 50-62 probe a window; `prefill:` prefilled
+  = reset = seeds, `unreset=0`, no skips.
+- `gpu_ms` (both eyes): gbuffer 0.55-0.66, mask 0.07, screen 0.18-0.19,
+  light 0.34-0.46 (now holds the reflection re-issue), tone 0.15-0.17, taa
+  0.43-0.49; total 1.83-1.99. Against the 07:13 flight (station, 4fd502ad):
+  taa -40%, screen -35%, total -10-15%. The gbuffer did not drop with the
+  prefill (128 hull items a window here against 108 there; no A/B).
+- Bench (frame_ms untrusted as before):
+
+  | variant | layer ms | hull DLSS ms | MB own/ngx | shimmer int | sharp | dluma |
+  |---|---|---|---|---|---|---|
+  | orig_a / orig_b | 0 | 0 | 0 | 0.42 / 0.31 | 1.29 / 1.38 | 1.00 |
+  | sep_taa | 1.95 | 0 | 1249 / 0 | 0.23 | 1.00 | 1.14 |
+  | sep_noaa | 1.83 | 0 | 1249 / 0 | 1.02 | 0.95 | 1.14 |
+  | dlss_full | 5.77 | 3.94 | 1500 / 890 | 1.85 | 0.61 | 1.14 |
+  | dlss_sub | 3.54 | 1.80 | 1500 / 414 | 0.45 | 1.25 | 1.15 |
+
+- dlss_sub works with the subrect-sized feature (af3b03c4): about half of
+  dlss_full's DLSS time, at the original's shimmer and sharpness, still
+  4x the TAA's.
+- **Open:** dluma 1.14 on every separate variant (1.06 over a planet before
+  the reflection re-issue, Build A' and Build B). Candidates: the
+  reflection pass added where the game's own hull had less; the AO losing
+  the hidden hull (Build B resets it, Build A' does not draw it outside
+  the box). Discriminator: a dump compare by stage, or the bench with the
+  prefill and the reflection re-issue as variants.
+- **Open:** dlss_full sharp 0.61 and shimmer 1.85, against 1.27-1.48 and
+  the original's shimmer on 4fd502ad. Changed since: af3b03c4 (full path
+  untouched by the diff), A' (the cover is zero outside the box; the full
+  feature evaluates the whole eye), the TAA tiles. Not chased: dlss_full
+  is not a candidate.
 
 ## Optimisation debt (recorded 2026-11-08 at the pilot's request)
 
