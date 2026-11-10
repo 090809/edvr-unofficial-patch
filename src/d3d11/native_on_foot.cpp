@@ -1102,8 +1102,8 @@ void readKey() {
     if (first || logDetail != g_logDetailLast) {
         const unsigned long long capMb = Log::get().maxBytes() / (1024ull * 1024ull);
         char cap[64];
-        if (capMb) std::snprintf(cap, sizeof(cap), "a size cap of %llu MB", capMb);
-        else std::snprintf(cap, sizeof(cap), "no size cap");
+        if (capMb) std::snprintf(cap, sizeof(cap), "a size bound of %llu MB (the head and four rotating tail segments)", capMb);
+        else std::snprintf(cap, sizeof(cap), "no size bound");
         Log::get().note("native on foot log (F125): detail %s, summary window %u s (live, log.on_foot_detail: %s); the log has %s, set when it opened",
                         logDetail ? "on" : "off", nofoot::logwin::windowSeconds(logDetail),
                         logDetail ? "every on-foot line as before, about 4 MB a minute on foot"

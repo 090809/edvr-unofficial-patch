@@ -1649,6 +1649,500 @@ static void switchProfileCases(const std::wstring& scratch) {
     runtimeProfileSet(savedProfile);
 }
 
+// --- log.max_mb: the bound, the head, the tail segments, the kept lines (src\common\log_rotate.h) -----------------------------------------------
+//
+// With log.max_mb in force a session keeps its start in its own file (the head, a quarter of max_mb), goes on in rotating tail segments beside it
+// (<head>.tail-NNN.log, the newest four kept) and keeps in the head, after it has ended, the first line of each kind written later and the memory
+// watch's lines. These cases drive the real Log at max_mb = 1 (H 256 KB, K 128 KB, S 160 KB) and pin what is written: the markers' exact texts, where
+// the cut falls, how many segments stay, a segment that cannot be deleted and goes at a later rotation, the budget of kept lines, drops and the volume
+// line. The sessions are left in <scratch>\logrot with a rotation.expect file, and the build hands that directory to tools\edvr_log.py
+// (--check-rotation-dir), which reads each session back with the stitching reader every tool uses and checks it again from the Python side.
+namespace logcases {
+
+const uint64_t kMiB = 1024ull * 1024ull;
+const uint64_t kHead = kMiB / 4, kKept = kMiB / 8, kSegment = (kMiB - kHead - kKept) / 4;
+
+std::string slurp(const std::wstring& path) {
+    std::string body;
+    HANDLE f = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+                           FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return body;
+    char chunk[65536];
+    DWORD got = 0;
+    while (ReadFile(f, chunk, sizeof(chunk), &got, nullptr) && got) body.append(chunk, got);
+    CloseHandle(f);
+    return body;
+}
+
+bool exists(const std::wstring& path) { return GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES; }
+
+std::vector<std::wstring> glob(const std::wstring& dir, const std::wstring& pattern) {
+    std::vector<std::wstring> out;
+    WIN32_FIND_DATAW fd{};
+    HANDLE h = FindFirstFileW((dir + L"\\" + pattern).c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) return out;
+    do {
+        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) out.push_back(fd.cFileName);
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+    std::sort(out.begin(), out.end());
+    return out;
+}
+
+// The session's head log: the one file edvr_<tag>_*.log that is not a tail segment.
+std::wstring headOf(const std::wstring& dir, const wchar_t* tag) {
+    for (const std::wstring& name : glob(dir, std::wstring(L"edvr_") + tag + L"_*.log")) {
+        if (name.find(L".tail-") == std::wstring::npos) return name;
+    }
+    return std::wstring();
+}
+
+std::wstring tailName(const std::wstring& head, unsigned n) {
+    wchar_t suffix[24];
+    _snwprintf_s(suffix, _TRUNCATE, L".tail-%03u.log", n);
+    return head.substr(0, head.size() - 4) + suffix;
+}
+
+std::vector<unsigned> tailsOnDisk(const std::wstring& dir, const std::wstring& head) {
+    std::vector<unsigned> out;
+    const std::wstring prefix = head.substr(0, head.size() - 4) + L".tail-";
+    for (const std::wstring& name : glob(dir, prefix + L"*.log")) {
+        out.push_back(static_cast<unsigned>(std::wcstoul(name.c_str() + prefix.size(), nullptr, 10)));
+    }
+    return out;
+}
+
+std::string narrow(const std::wstring& w) {
+    std::string out;
+    for (wchar_t c : w) out.push_back(static_cast<char>(c));
+    return out;
+}
+
+size_t count(const std::string& text, const std::string& needle) {
+    size_t n = 0, from = 0;
+    while ((from = text.find(needle, from)) != std::string::npos) {
+        ++n;
+        from += needle.size();
+    }
+    return n;
+}
+
+template <class F>
+bool waitFor(F ready, ULONGLONG ms = 120000) {
+    const ULONGLONG started = GetTickCount64();
+    while (!ready()) {
+        if (GetTickCount64() - started > ms) return false;
+        Sleep(10);
+    }
+    return true;
+}
+
+void removeSession(const std::wstring& dir, const wchar_t* tag) {
+    for (const std::wstring& name : glob(dir, std::wstring(L"edvr_") + tag + L"_*")) DeleteFileW((dir + L"\\" + name).c_str());
+}
+
+bool openSession(const std::wstring& dir, const wchar_t* tag, const char* iniLines) {
+    std::string ini = "[log]\r\nenabled = 1\r\n";
+    ini += iniLines;
+    if (!writeIni(dir, ini.c_str())) return false;
+    Config::get().init(dir);
+    Log::get().close();
+    removeSession(dir, tag);
+    return Log::get().open(dir, tag);
+}
+
+// The head's end notice, exact, for max_mb = 1.
+std::string headMarker(const std::string& firstSegment) {
+    return "[edvr] log head ends here at 256 KB (a quarter of log.max_mb = 1 MB); the log continues in " + firstSegment +
+           ", only the newest 4 tail segments are kept, and what follows below is the first line of each kind written after this point and the "
+           "memory watch's lines, up to 128 KB.\r\n";
+}
+
+const char* const kSpentText =
+    "[edvr] the kept-lines budget is spent (the first lines of new kinds, or the memory watch's lines, no longer fit here); later ones are only in the "
+    "tail segments still on disk.\r\n";
+
+// The head up to its end notice, the notice's line and what follows it (the kept lines).
+struct Head {
+    std::string text;
+    size_t markerAt = std::string::npos;
+    std::string after() const { return markerAt == std::string::npos ? std::string() : text.substr(text.find('\n', markerAt) + 1); }
+};
+
+Head readHead(const std::wstring& dir, const std::wstring& head) {
+    Head h;
+    h.text = slurp(dir + L"\\" + head);
+    h.markerAt = h.text.find("[edvr] log head ends here at ");
+    return h;
+}
+
+// The kept-lines marker's segment number in force at `pos` of the head (0: none before it).
+unsigned keptSegmentAt(const std::string& text, size_t pos) {
+    const char* const mark = "[edvr] kept lines from tail segment ";
+    const size_t at = text.rfind(mark, pos);
+    return at == std::string::npos ? 0u : static_cast<unsigned>(std::strtoul(text.c_str() + at + std::strlen(mark), nullptr, 10));
+}
+
+std::string fillerLine(int width) { return std::string(static_cast<size_t>(width), 'y'); }
+
+void run(const std::wstring& scratch) {
+    const std::wstring dir = scratch + L"\\logrot";
+    CreateDirectoryW(scratch.c_str(), nullptr);
+    CreateDirectoryW(dir.c_str(), nullptr);
+    std::string expect;
+    auto expectLine = [&](const char* tag, const char* key, const std::string& value) { expect += std::string(tag) + "\t" + key + "\t" + value + "\n"; };
+    const std::string filler = fillerLine(900);
+
+    // The numbers: at max_mb = 1 the head is 256 KB, the kept lines 128 KB (64 KB each way) and a segment 160 KB, and they add up to the bound.
+    check(kHead == 262144 && kKept == 131072 && kSegment == 163840 && kHead + kKept + 4 * kSegment == kMiB,
+          "at max_mb = 1: head 256 KB, kept lines 128 KB, four tail segments of 160 KB, together the 1 MB");
+
+    // --- a session that stays under the head: one file, no notice, no segment -----------------------------------------------------------------
+    {
+        if (!openSession(dir, L"rotsmall", "max_mb = 1\r\nbuffer_mb = 16\r\n")) {
+            fail("log rotation: a small session", "the log would not open in the scratch dir");
+        } else {
+            for (int i = 0; i < 100; ++i) Log::get().note("rotsmall line %d %s", i, filler.c_str());
+            Log::get().close();
+            const std::wstring head = headOf(dir, L"rotsmall");
+            const Head h = readHead(dir, head);
+            check(!head.empty() && h.markerAt == std::string::npos && tailsOnDisk(dir, head).empty() && count(h.text, "rotsmall line ") == 100,
+                  "a session that stays under the head's share is one file, whole, with no end notice and no tail segment");
+            check(count(h.text, "paste this whole file and the .tail-NNN.log files beside it.\r\n") == 1,
+                  "the log's second line asks for the tail segments too");
+        }
+    }
+
+    // --- a 1.3 MB burst, then one more line, at the default cap and at max_mb = 1 -------------------------------------------------------------
+    {
+        const std::string burstFiller(1000, 'y');
+        auto burst = [&](const char* ini, const wchar_t* tag) {
+            if (!openSession(dir, tag, ini)) return false;
+            for (int i = 0; i < 1300; ++i) Log::get().note("capfill %d %s", i, burstFiller.c_str());
+            Log::get().note("capmarker after the first burst");
+            Log::get().close();   // joins the flusher and runs the last passes: everything noted is decided before the files are read
+            return true;
+        };
+        if (!burst("buffer_mb = 16\r\n", L"capdefault")) {
+            fail("log.max_mb default", "the log would not open in the scratch dir");
+        } else {
+            const std::wstring head = headOf(dir, L"capdefault");
+            const Head h = readHead(dir, head);
+            check(Log::get().maxBytes() == 16 * kMiB, "with no max_mb line the bound in force is 16 MB", std::to_string(Log::get().maxBytes()) + " bytes");
+            check(count(h.text, "capmarker after the first burst") == 1 && h.markerAt == std::string::npos && tailsOnDisk(dir, head).empty(),
+                  "...and a 1.3 MB session is one file under it: a 4 MB head is not passed");
+        }
+        if (!burst("max_mb = 1\r\nbuffer_mb = 16\r\n", L"capsmall")) {
+            fail("log.max_mb = 1", "the log would not open in the scratch dir");
+        } else {
+            const std::wstring head = headOf(dir, L"capsmall");
+            const Head h = readHead(dir, head);
+            const std::vector<unsigned> tails = tailsOnDisk(dir, head);
+            check(Log::get().maxBytes() == 1 * kMiB, "an explicit max_mb = 1 is a 1 MB bound", std::to_string(Log::get().maxBytes()) + " bytes");
+            check(h.markerAt != std::string::npos && h.markerAt <= kHead && count(h.text, "[edvr] log head ends here at ") == 1,
+                  "a session past the head's share ends its head once, within that share", std::to_string(h.markerAt) + " bytes in");
+            check(h.markerAt != std::string::npos && h.text.find(headMarker(narrow(tailName(head, 1)))) == h.markerAt,
+                  "...with the exact notice: where the head ends, which file the log continues in, the four segments kept, what follows");
+            check(h.markerAt != std::string::npos && h.markerAt > 0 && h.text[h.markerAt - 1] == '\n' && h.text[h.markerAt - 2] == '\r',
+                  "...cut between two lines, never inside one");
+            check(!tails.empty() && tails.size() <= 4 && tails.back() >= 5, "the burst's later lines are in tail segments, only the newest four on disk",
+                  std::to_string(tails.size()) + " on disk, newest " + std::to_string(tails.empty() ? 0 : tails.back()));
+            uint64_t total = h.text.size();
+            bool opens = true, small = true, wholeLines = true;
+            for (unsigned n : tails) {
+                const std::string body = slurp(dir + L"\\" + tailName(head, n));
+                total += body.size();
+                char want[300];
+                _snprintf_s(want, _TRUNCATE, "[edvr] tail segment %u of %s.", n, narrow(head).c_str());
+                opens = opens && body.compare(0, std::strlen(want), want) == 0;
+                small = small && body.size() <= kSegment + 4096;
+                wholeLines = wholeLines && body.size() >= 2 && body.compare(body.size() - 2, 2, "\r\n") == 0;
+            }
+            check(opens && small && wholeLines, "each segment opens with its own notice, ends at a line and is no larger than its share (160 KB)");
+            check(total <= kMiB + 8192, "the head, its kept lines and the segments together are within the 1 MB bound", std::to_string(total) + " bytes");
+            check(!exists(dir + L"\\" + tailName(head, 1)) && !tails.empty() && tails.front() > 1,
+                  "the oldest segments are deleted as later ones open");
+            // The notice of the newest segment names what was deleted before it.
+            if (!tails.empty()) {
+                const std::string top = slurp(dir + L"\\" + tailName(head, tails.back())).substr(0, 1200);
+                check(top.find(" Deleted so far: segment 1 (") != std::string::npos && top.find(" bytes, ") != std::string::npos && top.find(" to ") != std::string::npos,
+                      "...and the newest segment's notice lists the deleted ones, with their bytes and the clock span each covered");
+            }
+            // The one line noted after the burst is first of its kind after the cut: in a segment, and kept in the head under that segment's number.
+            unsigned holder = 0;
+            for (unsigned n : tails) {
+                if (slurp(dir + L"\\" + tailName(head, n)).find("capmarker after the first burst") != std::string::npos) holder = n;
+            }
+            const size_t keptAt = h.text.find("capmarker after the first burst", h.markerAt == std::string::npos ? 0 : h.markerAt);
+            check(holder != 0 && keptAt != std::string::npos && count(h.text, "capmarker after the first burst") == 1 &&
+                      keptAt > h.markerAt && keptSegmentAt(h.text, keptAt) == holder,
+                  "the first line of a new kind after the cut is kept in the head, under a marker naming the segment that holds it",
+                  "holder " + std::to_string(holder) + ", marker " + std::to_string(keptAt == std::string::npos ? 0 : keptSegmentAt(h.text, keptAt)));
+        }
+    }
+
+    // --- max_mb = 0: one file with no bound, as before ----------------------------------------------------------------------------------------
+    {
+        if (!openSession(dir, L"rotnone", "max_mb = 0\r\nbuffer_mb = 16\r\n")) {
+            fail("log.max_mb = 0", "the log would not open in the scratch dir");
+        } else {
+            for (int i = 0; i < 1300; ++i) Log::get().note("nonefill %d %s", i, fillerLine(1000).c_str());
+            Log::get().noteReserved("nonereserved line");
+            Log::get().close();
+            const std::wstring head = headOf(dir, L"rotnone");
+            const Head h = readHead(dir, head);
+            check(h.markerAt == std::string::npos && tailsOnDisk(dir, head).empty() && count(h.text, "nonefill ") == 1300 && count(h.text, "nonereserved line") == 1 &&
+                      h.text.size() > kMiB,
+                  "max_mb = 0 is one file with no bound: past a megabyte, no notice, no segment, every line once");
+        }
+    }
+
+    // --- rotA: the structure, the kinds and a segment that cannot be deleted ----------------------------------------------------------------
+    {
+        const wchar_t* const tag = L"rotA";
+        if (!openSession(dir, tag, "max_mb = 1\r\nbuffer_mb = 16\r\n")) {
+            fail("log rotation rotA", "the log would not open in the scratch dir");
+        } else {
+            int reserved = 0;
+            auto kindLine = [&](const char* name) { Log::get().note("rotA kind %s #%d", name, 0); expectLine("rotA", "once", std::string("rotA kind ") + name + " #0"); };
+            auto pctLine = [&](const char* name) {   // many call sites say note("%s", ...): the text is what tells the kinds apart
+                const std::string text = std::string("rotA pcts ") + name + " #0";
+                Log::get().note("%s", text.c_str());
+                expectLine("rotA", "once", text);
+            };
+            auto reservedLines = [&](int n) {
+                for (int i = 0; i < n; ++i, ++reserved) {
+                    Log::get().noteReserved("rotA reserved #%d", reserved);
+                    expectLine("rotA", "once", "rotA reserved #" + std::to_string(reserved));
+                }
+            };
+            auto fill = [&](const char* name, int lines) {
+                for (int i = 0; i < lines; ++i) Log::get().note("rotA %s fill %d %s", name, i, filler.c_str());
+            };
+            // Before the cut: kinds that live in the head (written once, not kept again), then enough to pass the head's 256 KB.
+            kindLine("headone");
+            pctLine("headtwo");
+            reservedLines(3);
+            fill("zero", 300);
+            // After the cut, into segment 1 and 2: first lines of new kinds, repeats of a kind, a reserved line among them.
+            kindLine("alpha");
+            pctLine("bravo");
+            pctLine("charlie");
+            for (int i = 0; i < 30; ++i) Log::get().note("rotA repeat #%d", i);   // one kind: only the first line, #0, is a first line
+            expectLine("rotA", "once", "rotA repeat #0");
+            reservedLines(6);
+            fill("one", 140);
+            kindLine("delta");
+            fill("one", 40);
+            const std::wstring head = headOf(dir, tag);
+            bool second = waitFor([&] { return exists(dir + L"\\" + tailName(head, 2)); });
+            check(second, "rotA: the second tail segment opens", "tail-002 never appeared in 120 s");
+            if (second) {
+                // The kept lines say which segment they came from, and the number is the segment that holds the line.
+                bool matched = true;
+                std::string why;
+                for (const char* token : {"rotA kind alpha #0", "rotA pcts bravo #0", "rotA pcts charlie #0", "rotA repeat #0"}) {
+                    unsigned holder = 0;
+                    for (unsigned n : {1u, 2u}) {
+                        if (slurp(dir + L"\\" + tailName(head, n)).find(token) != std::string::npos) holder = n;
+                    }
+                    size_t keptAt = std::string::npos;
+                    const bool arrived = waitFor([&] {
+                        const Head h = readHead(dir, head);
+                        keptAt = h.markerAt == std::string::npos ? std::string::npos : h.text.find(token, h.markerAt);
+                        return keptAt != std::string::npos;
+                    }, 30000);
+                    const Head h = readHead(dir, head);
+                    keptAt = h.markerAt == std::string::npos ? std::string::npos : h.text.find(token, h.markerAt);
+                    if (!arrived || holder == 0 || keptSegmentAt(h.text, keptAt) != holder) {
+                        matched = false;
+                        why += std::string(" ") + token + ": holder " + std::to_string(holder) + ", marker " + std::to_string(keptAt == std::string::npos ? 0 : keptSegmentAt(h.text, keptAt));
+                    }
+                }
+                check(matched, "rotA: each kept line is under the marker of the segment that holds it", why);
+            }
+            // A reader holds segment 1 open without sharing delete: the log cannot delete it when the fifth segment opens, and does not stop.
+            HANDLE holdFirst = CreateFileW((dir + L"\\" + tailName(head, 1)).c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
+                                           FILE_ATTRIBUTE_NORMAL, nullptr);
+            check(holdFirst != INVALID_HANDLE_VALUE, "rotA: segment 1 can be held open by a reader that does not share delete");
+            kindLine("echo");
+            pctLine("foxtrot");
+            reservedLines(5);
+            fill("two", 800);
+            kindLine("golf");
+            const bool sixth = waitFor([&] { return exists(dir + L"\\" + tailName(head, 6)); });
+            check(sixth, "rotA: later segments open while segment 1 is held", "tail-006 never appeared in 120 s");
+            check(exists(dir + L"\\" + tailName(head, 1)) && !exists(dir + L"\\" + tailName(head, 2)),
+                  "rotA: the held segment 1 is still there (its delete failed and nothing waited), segment 2 was deleted past it");
+            if (holdFirst != INVALID_HANDLE_VALUE) CloseHandle(holdFirst);
+            // Released: the next rotation takes it, with the one that is now the fifth oldest.
+            fill("three", 500);
+            kindLine("hotel");
+            reservedLines(4);
+            const bool eighth = waitFor([&] { return exists(dir + L"\\" + tailName(head, 8)); });
+            check(eighth, "rotA: more segments open after the release", "tail-008 never appeared in 120 s");
+            check(!exists(dir + L"\\" + tailName(head, 1)) && !exists(dir + L"\\" + tailName(head, 3)),
+                  "rotA: segment 1 is deleted at the next rotation after its reader let go, with segment 3");
+            Log::get().note("rotA newest line");
+            Log::get().close();
+            const Head h = readHead(dir, head);
+            const std::vector<unsigned> tails = tailsOnDisk(dir, head);
+            check(tails.size() == 4 && tails.front() >= 5 && tails.back() >= 8 && tails.back() - tails.front() == 3,
+                  "rotA: four consecutive segments are on disk at the end", std::to_string(tails.size()) + " segments, " + std::to_string(tails.empty() ? 0 : tails.front()) + ".." +
+                                                                                 std::to_string(tails.empty() ? 0 : tails.back()));
+            const std::string newestTop = tails.empty() ? std::string() : slurp(dir + L"\\" + tailName(head, tails.back())).substr(0, 1500);
+            check(newestTop.find("Deleted so far:") != std::string::npos && newestTop.find("segment 1 (") != std::string::npos &&
+                      newestTop.find("segment 2 (") != std::string::npos && newestTop.find("segment 3 (") != std::string::npos,
+                  "rotA: the newest segment's notice lists segments 1, 2 and 3 as deleted");
+            check(count(h.text, kSpentText) == 0, "rotA: a session that keeps few lines does not say its kept-lines budget is spent");
+            check(count(h.text, "[edvr] log head ends here at ") == 1, "rotA: the head ends once");
+            expectLine("rotA", "max_bytes", std::to_string(kMiB));
+            expectLine("rotA", "newest", "rotA newest line");
+            expectLine("rotA", "min_segments", "8");
+        }
+    }
+
+    // --- rotB: a burst far past the buffer (drops) and the volume line ------------------------------------------------------------------------
+    {
+        const wchar_t* const tag = L"rotB";
+        if (!openSession(dir, tag, "max_mb = 1\r\nbuffer_mb = 1\r\n")) {
+            fail("log rotation rotB", "the log would not open in the scratch dir");
+        } else {
+            Log::get().setVolumeIntervalMsForTest(400);
+            const uint64_t droppedBefore = Log::get().dropped();
+            for (int i = 0; i < 6000; ++i) Log::get().note("rotB burst %d %s", i, filler.c_str());
+            check(Log::get().dropped() > droppedBefore, "rotB: a 5 MB burst into a 1 MB buffer drops lines (and counts them)", std::to_string(Log::get().dropped()) + " dropped");
+            for (int round = 0; round < 6; ++round) {
+                for (int i = 0; i < 40; ++i) Log::get().note("rotB steady %d %s", i, filler.c_str());
+                Sleep(300);
+            }
+            Log::get().setVolumeIntervalMsForTest(0);
+            Sleep(800);   // two passes, so a volume line the flusher was about to note is already in
+            Log::get().note("rotB newest line");
+            Log::get().setVolumeIntervalMsForTest(300000);
+            Log::get().close();
+            const std::wstring head = headOf(dir, tag);
+            std::string all = slurp(dir + L"\\" + head);
+            for (unsigned n : tailsOnDisk(dir, head)) all += slurp(dir + L"\\" + tailName(head, n));
+            const size_t volumeAt = all.find("log volume (last 400 ms): ");
+            check(count(all, " log line(s) were DROPPED here -- ") >= 1, "rotB: the drop notice is written, into whatever file is current");
+            check(volumeAt != std::string::npos && all.find(" lines. Top kinds by size: \"rotB ", volumeAt) != std::string::npos,
+                  "rotB: the flusher notes a volume line: the window's size and lines, then the biggest kinds, from the kind's own text");
+            check(all.find(" MB in 0 lines.") == std::string::npos, "rotB: and no volume line is written for an empty window");
+            expectLine("rotB", "max_bytes", std::to_string(kMiB));
+            expectLine("rotB", "dropped", "1");
+            expectLine("rotB", "volume", "1");
+            expectLine("rotB", "newest", "rotB newest line");
+        }
+    }
+
+    // --- rotC: the name a second process takes (_mmm_pid): the segments carry it ----------------------------------------------------------------
+    {
+        const wchar_t* const tag = L"rotC";
+        bool pidForm = false;
+        std::wstring head;
+        for (int attempt = 0; attempt < 6 && !pidForm; ++attempt) {
+            if (!writeIni(dir, "[log]\r\nenabled = 1\r\nmax_mb = 1\r\nbuffer_mb = 16\r\n")) break;
+            Config::get().init(dir);
+            Log::get().close();
+            removeSession(dir, tag);
+            SYSTEMTIME st;
+            GetLocalTime(&st);
+            wchar_t clash[MAX_PATH];
+            _snwprintf_s(clash, _TRUNCATE, L"%s\\edvr_%s_%04u%02u%02u_%02u%02u%02u.log", dir.c_str(), tag, st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+            HANDLE c = CreateFileW(clash, GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
+            if (c != INVALID_HANDLE_VALUE) CloseHandle(c);
+            if (!Log::get().open(dir, tag)) break;
+            for (int i = 0; i < 600; ++i) Log::get().note("rotC line %d %s", i, filler.c_str());
+            Log::get().note("rotC newest line");
+            Log::get().close();
+            DeleteFileW(clash);   // the empty file that made the name clash is not a session
+            for (const std::wstring& name : glob(dir, std::wstring(L"edvr_") + tag + L"_*.log")) {
+                if (name.find(L".tail-") == std::wstring::npos && name.size() > 25 && name[25] == L'_') {
+                    head = name;
+                    pidForm = true;
+                }
+            }
+        }
+        check(pidForm, "rotC: a second log in the same second takes the _mmm_pid name", "never took it in 6 tries");
+        if (pidForm) {
+            const std::vector<unsigned> tails = tailsOnDisk(dir, head);
+            const Head h = readHead(dir, head);
+            check(!tails.empty() && h.markerAt != std::string::npos && h.text.find(headMarker(narrow(tailName(head, 1)))) == h.markerAt,
+                  "rotC: its end notice names its first segment with the _mmm_pid form", narrow(head));
+            check(!tails.empty() &&
+                      slurp(dir + L"\\" + tailName(head, tails.back())).find("[edvr] tail segment " + std::to_string(tails.back()) + " of " + narrow(head) + ".") == 0,
+                  "rotC: and so does each segment's notice");
+            expectLine("rotC", "max_bytes", std::to_string(kMiB));
+            expectLine("rotC", "pidform", "1");
+            expectLine("rotC", "newest", "rotC newest line");
+        }
+    }
+
+    // --- rotD: the kept-lines budget: 64 KB for each half, one notice when the first is spent -----------------------------------------------
+    {
+        const wchar_t* const tag = L"rotD";
+        if (!openSession(dir, tag, "max_mb = 1\r\nbuffer_mb = 16\r\n")) {
+            fail("log rotation rotD", "the log would not open in the scratch dir");
+        } else {
+            for (int i = 0; i < 300; ++i) Log::get().note("rotD headfill %d %s", i, filler.c_str());
+            // A flood of reserved lines (the memory watch's), over its half.
+            const std::string wide = fillerLine(1000);
+            for (int i = 0; i < 300; ++i) Log::get().noteReserved("rotD reserved #%d %s", i, wide.c_str());
+            // And more kinds than the other half holds: one distinct kind per line (the text before its first digit differs), about 100 bytes each.
+            for (int i = 0; i < 1500; ++i) {
+                char name[16] = {};
+                int v = i;
+                for (int k = 0; k < 8; ++k, v /= 26) name[k] = static_cast<char>('a' + v % 26);
+                Log::get().note("%s", (std::string("rotD kind ") + name + " " + fillerLine(40)).c_str());
+            }
+            Log::get().note("rotD newest line");
+            Log::get().close();
+            const std::wstring head = headOf(dir, tag);
+            const Head h = readHead(dir, head);
+            const std::string kept = h.after();
+            check(count(h.text, kSpentText) == 1, "rotD: the head says once that the kept-lines budget is spent, though both halves ran over");
+            size_t reservedBytes = 0, reservedLines = 0, keptKindBytes = 0;
+            bool consecutive = true;
+            for (size_t at = kept.find("rotD reserved #"); at != std::string::npos; at = kept.find("rotD reserved #", at + 1)) {
+                const size_t lineEnd = kept.find('\n', at);
+                const size_t lineStart = kept.rfind('\n', at) + 1;
+                if (lineEnd == std::string::npos || std::atoi(kept.c_str() + at + 15) != static_cast<int>(reservedLines)) consecutive = false;
+                reservedBytes += lineEnd - lineStart + 1;
+                ++reservedLines;
+            }
+            for (size_t at = kept.find("rotD kind "); at != std::string::npos; at = kept.find("rotD kind ", at + 1)) {
+                const size_t lineEnd = kept.find('\n', at);
+                keptKindBytes += lineEnd - (kept.rfind('\n', at) + 1) + 1;
+            }
+            check(reservedLines > 40 && reservedLines < 300 && consecutive, "rotD: the reserved lines kept are whole, consecutive from the first, and cut off partway",
+                  std::to_string(reservedLines) + " lines");
+            check(reservedBytes <= kKept / 2 && reservedBytes + 1100 > kKept / 2, "rotD: ...at their half of the kept room: no more than 64 KB, and not a line's width short of it",
+                  std::to_string(reservedBytes) + " bytes");
+            check(keptKindBytes <= kKept / 2 + 1 && keptKindBytes + 200 > kKept / 2, "rotD: the first lines of new kinds fill their half the same way",
+                  std::to_string(keptKindBytes) + " bytes");
+            check(kept.size() <= kKept + 2048, "rotD: the head after its end is no larger than the kept room and its notices", std::to_string(kept.size()) + " bytes");
+            expectLine("rotD", "max_bytes", std::to_string(kMiB));
+            expectLine("rotD", "spent", "1");
+            expectLine("rotD", "newest", "rotD newest line");
+        }
+    }
+    Log::get().close();
+    Log::get().setVolumeIntervalMsForTest(300000);
+
+    // The sessions and what is expected of them, for tools\edvr_log.py --check-rotation-dir (build.bat runs it after this exe).
+    HANDLE f = CreateFileW((dir + L"\\rotation.expect").c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f == INVALID_HANDLE_VALUE) {
+        fail("log rotation", "could not write rotation.expect");
+    } else {
+        DWORD w = 0;
+        WriteFile(f, expect.data(), static_cast<DWORD>(expect.size()), &w, nullptr);
+        CloseHandle(f);
+    }
+}
+
+}  // namespace logcases
+
 int main(int argc, char** argv) {
     // Unbuffered, so a crash does not take the output with it: the first run of
     // this test appeared to die before its first printf, which was only the
@@ -2497,11 +2991,10 @@ int main(int argc, char** argv) {
     //
     // The shipped edvr.ini documents the default commented out ("#max_mb = 16"), so for every install that has not written the line the
     // CODE's fallback is the cap; tools\check_config_contract.py holds a commented default to the code's in the build. This pins the
-    // number itself and then what the log does with it, at sizes that keep the test fast: the default must not stop a 1.3 MB session
-    // (past a 1 MB cap), an explicit max_mb = 1 must stop it with the one line that says so, and an explicit max_mb = 4 keeps 4 and
-    // 0 is no cap (those two by the cap in force, with no writing). The writer has no rotation: a log that reaches its cap says so
-    // once and stops, and the next session opens a new file; the flat profile reads this key the same way (the "log." keys are
-    // allowed in both profiles, and the fallback is one line of one class).
+    // number itself and then what the log does with it, at sizes that keep the test fast (logcases::run above): the default keeps a
+    // 1.3 MB session in one file, an explicit max_mb = 1 gives it a head and rotating tail segments, 0 is one unbounded file, and an
+    // explicit max_mb = 4 keeps 4 (by the bound in force, with no writing). The flat profile reads this key the same way (the "log."
+    // keys are allowed in both profiles, and the fallback is one line of one class).
     {
         const std::string iniText = readRepoFile(dir, L"edvr.ini");
         const std::string logSource = readRepoFile(dir, L"src\\common\\log.cpp");
@@ -2540,253 +3033,30 @@ int main(int argc, char** argv) {
                   "readKey reads log.on_foot_detail with the default off and announces it (the line --health reads)");
         }
     }
+    // The bound in force, and what the log does with it (the head, the tail segments, the kept lines, the volume line): the cases above pin the numbers
+    // without writing; these write real sessions. They leave them in <scratch>\logrot for tools\edvr_log.py --check-rotation-dir, which build.bat runs next.
     if (argc >= 3) {
         const std::wstring scratch = widen(argv[2]);
-        struct CapRun {
-            bool opened = false;
-            uint64_t maxBytes = ~0ull;
-            std::string body;
-        };
-        // One session in the scratch directory: the given [log] lines (a max_mb line or none), one 1.3 MB burst (the flusher's first pass
-        // writes all of it), then a marker line a second pass can only write if the cap has not been reached. `write` false opens and
-        // closes without writing, to read the cap in force.
-        const auto session = [&](const char* maxMbLine, const wchar_t* tag, bool write) {
-            CapRun run;
+        const auto bound = [&](const char* iniLine, const wchar_t* tag, uint64_t want, const char* what) {
             std::string ini = "[log]\r\nenabled = 1\r\nbuffer_mb = 16\r\n";
-            ini += maxMbLine;
-            if (!writeIni(scratch, ini.c_str())) return run;
+            ini += iniLine;
+            if (!writeIni(scratch, ini.c_str())) return;
             Config::get().init(scratch);
             Log::get().close();
-            const std::wstring pattern = std::wstring(L"edvr_") + tag + L"_*.log";
-            {
-                WIN32_FIND_DATAW old{};
-                HANDLE oh = FindFirstFileW((scratch + L"\\" + pattern).c_str(), &old);
-                if (oh != INVALID_HANDLE_VALUE) {
-                    do {
-                        DeleteFileW((scratch + L"\\" + old.cFileName).c_str());
-                    } while (FindNextFileW(oh, &old));
-                    FindClose(oh);
-                }
-            }
-            if (!Log::get().open(scratch, tag)) return run;
-            run.opened = true;
-            run.maxBytes = Log::get().maxBytes();
-            if (write) {
-                const std::string filler(1000, 'y');
-                for (int i = 0; i < 1300; ++i) Log::get().note("capfill %d %s", i, filler.c_str());
-                // The marker must be written AFTER the pass that carried the burst over the cap, or it rides the same write and is
-                // not "after the cap". That used to be two Sleep(700)s against the flusher's 250 ms passes: a wall-clock assumption
-                // that failed in nearly every copy when the machine was loaded (a starved flusher had not yet passed when the marker
-                // went in). Now the test waits on the fact itself: the file on disk has reached the cap, which means a pass has
-                // written bytes and the next pass that has anything to write will see the cap. The wait has no schedule in it, only
-                // a ceiling far past any real stall so a logger that never flushes fails the case rather than hanging the build.
-                if (run.maxBytes && run.maxBytes < 1300ull * 1000ull) {
-                    const ULONGLONG started = GetTickCount64();
-                    for (;;) {
-                        WIN32_FILE_ATTRIBUTE_DATA info{};
-                        WIN32_FIND_DATAW ff{};
-                        HANDLE fh = FindFirstFileW((scratch + L"\\" + pattern).c_str(), &ff);
-                        uint64_t onDisk = 0;
-                        if (fh != INVALID_HANDLE_VALUE) {
-                            FindClose(fh);
-                            if (GetFileAttributesExW((scratch + L"\\" + ff.cFileName).c_str(), GetFileExInfoStandard, &info))
-                                onDisk = (static_cast<uint64_t>(info.nFileSizeHigh) << 32) | info.nFileSizeLow;
-                        }
-                        if (onDisk >= run.maxBytes) break;
-                        if (GetTickCount64() - started > 120000ull) {
-                            fail("log.max_mb wait", "the burst never reached the cap on disk in 120 s: " + std::to_string(onDisk) + " bytes");
-                            break;
-                        }
-                        Sleep(5);
-                    }
-                }
-                Log::get().note("capmarker after the first burst");
-                // No sleep: close() joins the flusher and runs the final passes, so everything noted is decided before the file is read.
-            }
+            if (!Log::get().open(scratch, tag)) { fail(what, "the log would not open in the scratch dir"); return; }
+            check(Log::get().maxBytes() == want, what, std::to_string(Log::get().maxBytes()) + " bytes");
             Log::get().close();
-            WIN32_FIND_DATAW fd{};
-            HANDLE h = FindFirstFileW((scratch + L"\\" + pattern).c_str(), &fd);
-            if (h != INVALID_HANDLE_VALUE) {
-                const std::wstring name = fd.cFileName;
-                FindClose(h);
-                HANDLE f = CreateFileW((scratch + L"\\" + name).c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
-                                       FILE_ATTRIBUTE_NORMAL, nullptr);
-                if (f != INVALID_HANDLE_VALUE) {
-                    char chunk[65536];
-                    DWORD got = 0;
-                    while (ReadFile(f, chunk, sizeof(chunk), &got, nullptr) && got) run.body.append(chunk, got);
-                    CloseHandle(f);
-                }
-            }
-            return run;
         };
-        const auto count = [](const std::string& text, const char* needle) {
-            size_t n = 0, from = 0;
-            while ((from = text.find(needle, from)) != std::string::npos) {
-                ++n;
-                from += 1;
-            }
-            return n;
-        };
-        const char* const kCapLine = "log size cap reached; only lines noted as reserved";
-        const uint64_t kMiB = 1024ull * 1024ull;
-
-        const CapRun byDefault = session("", L"capdefault", true);
-        if (!byDefault.opened) {
-            fail("log.max_mb default", "the log would not open in the scratch dir");
-        } else {
-            check(byDefault.maxBytes == 16 * kMiB, "with no max_mb line the cap in force is 16 MB",
-                  std::to_string(byDefault.maxBytes) + " bytes");
-            check(count(byDefault.body, "capmarker after the first burst") == 1 && count(byDefault.body, kCapLine) == 0,
-                  "...and a 1.3 MB session is not stopped by it (the old 4 MB default would not have stopped it either; a 1 MB cap does)");
-        }
-        const CapRun small = session("max_mb = 1\r\n", L"capsmall", true);
-        if (!small.opened) {
-            fail("log.max_mb = 1", "the log would not open in the scratch dir");
-        } else {
-            check(small.maxBytes == 1 * kMiB, "an explicit max_mb = 1 is a 1 MB cap", std::to_string(small.maxBytes) + " bytes");
-            check(count(small.body, kCapLine) == 1 && count(small.body, "capmarker after the first burst") == 0,
-                  "a session past its cap says so exactly once and writes nothing after it (the cap is the truncation: there is no rotation)");
-            check(small.body.size() > 1 * kMiB && small.body.size() < 2 * kMiB,
-                  "...and the file ends at the burst that crossed the cap (past 1 MB, under 2 MB), not at the default's 16 MB",
-                  std::to_string(small.body.size()) + " bytes");
-        }
-        const CapRun four = session("max_mb = 4\r\n", L"capfour", false);
-        check(four.opened && four.maxBytes == 4 * kMiB, "an ini that says max_mb = 4 keeps 4 MB", std::to_string(four.maxBytes) + " bytes");
-        const CapRun none = session("max_mb = 0\r\n", L"capnone", false);
-        check(none.opened && none.maxBytes == 0, "max_mb = 0 is no cap", std::to_string(none.maxBytes) + " bytes");
-        // F125: with the detailed on-foot log on when the log opens, a cap nobody set is 64 MB; one written down wins, 16 included.
-        const CapRun detail = session("on_foot_detail = on\r\n", L"capdetail", false);
-        check(detail.opened && detail.maxBytes == 64 * kMiB, "on_foot_detail = on with no max_mb line is a 64 MB cap (F125)",
-              std::to_string(detail.maxBytes) + " bytes");
-        const CapRun detailOff = session("on_foot_detail = off\r\n", L"capdetailoff", false);
-        check(detailOff.opened && detailOff.maxBytes == 16 * kMiB, "on_foot_detail = off keeps the 16 MB default",
-              std::to_string(detailOff.maxBytes) + " bytes");
-        const CapRun detailFour = session("on_foot_detail = on\r\nmax_mb = 4\r\n", L"capdetailfour", false);
-        check(detailFour.opened && detailFour.maxBytes == 4 * kMiB, "on_foot_detail = on with max_mb = 4 keeps 4 MB (a cap written down wins)",
-              std::to_string(detailFour.maxBytes) + " bytes");
-        const CapRun detailSixteen = session("on_foot_detail = on\r\nmax_mb = 16\r\n", L"capdetail16", false);
-        check(detailSixteen.opened && detailSixteen.maxBytes == 16 * kMiB,
-              "on_foot_detail = on with max_mb = 16 written down keeps 16 MB (the 64 is only for a cap nobody set)",
-              std::to_string(detailSixteen.maxBytes) + " bytes");
-        const CapRun detailEmpty = session("on_foot_detail = on\r\nmax_mb =\r\n", L"capdetailempty", false);
-        check(detailEmpty.opened && detailEmpty.maxBytes == 64 * kMiB, "on_foot_detail = on with an empty max_mb line is 64 MB (an empty value is not set)",
-              std::to_string(detailEmpty.maxBytes) + " bytes");
-        Log::get().close();
-
-        // --- Log::noteReserved: a line that outlives the cap, from a reserve of 1 MiB (2026-10-22, the memory watch's mem: lines) ----------
-        //
-        // Before the cap it is an ordinary line. After it, the lines go on from the reserve, in order, until the reserve cannot take the
-        // next one; the log says so once and writes no more of them. The reserve's arithmetic is held by tools\mem_watch_test; this is
-        // the file: that the lines are on disk, in order, that an ordinary line after the cap still is not, that the notice is the end.
-        const auto readLog = [&](const wchar_t* tag) {
-            std::string body;
-            WIN32_FIND_DATAW fd{};
-            HANDLE h = FindFirstFileW((scratch + L"\\edvr_" + tag + L"_*.log").c_str(), &fd);
-            if (h == INVALID_HANDLE_VALUE) return body;
-            const std::wstring name = fd.cFileName;
-            FindClose(h);
-            HANDLE f = CreateFileW((scratch + L"\\" + name).c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
-                                   FILE_ATTRIBUTE_NORMAL, nullptr);
-            if (f == INVALID_HANDLE_VALUE) return body;
-            char chunk[65536];
-            DWORD got = 0;
-            while (ReadFile(f, chunk, sizeof(chunk), &got, nullptr) && got) body.append(chunk, got);
-            CloseHandle(f);
-            return body;
-        };
-        const auto openLog = [&](const char* maxMbLine, const wchar_t* tag) {
-            std::string ini = "[log]\r\nenabled = 1\r\nbuffer_mb = 16\r\n";
-            ini += maxMbLine;
-            if (!writeIni(scratch, ini.c_str())) return false;
-            Config::get().init(scratch);
-            Log::get().close();
-            WIN32_FIND_DATAW old{};
-            HANDLE oh = FindFirstFileW((scratch + L"\\edvr_" + tag + L"_*.log").c_str(), &old);
-            if (oh != INVALID_HANDLE_VALUE) {
-                do {
-                    DeleteFileW((scratch + L"\\" + old.cFileName).c_str());
-                } while (FindNextFileW(oh, &old));
-                FindClose(oh);
-            }
-            return Log::get().open(scratch, tag);
-        };
-
-        // Under the default cap a reserved line is an ordinary line: written, timestamped, in order with the notes around it, no cap notice.
-        if (!openLog("", L"resdefault")) {
-            fail("log reserve default", "the log would not open in the scratch dir");
-        } else {
-            Log::get().note("resdefault plain before");
-            Log::get().noteReserved("resdefault reserved %d", 7);
-            Log::get().note("resdefault plain after");
-            Log::get().close();
-            const std::string body = readLog(L"resdefault");
-            const size_t a = body.find("resdefault plain before"), b = body.find("resdefault reserved 7"), c = body.find("resdefault plain after");
-            check(a != std::string::npos && b != std::string::npos && c != std::string::npos && a < b && b < c && count(body, kCapLine) == 0,
-                  "noteReserved under the cap is note(): the line is written in order with the ordinary ones, and no cap is mentioned");
-            const size_t lineStart = b == std::string::npos ? 0 : body.rfind('\n', b) + 1;
-            check(b != std::string::npos && body.size() > lineStart + 14 && body[lineStart] == '[' && body[lineStart + 3] == ':' && body[lineStart + 13] == ']',
-                  "...and it is stamped like the others ([hh:mm:ss.mmm])");
-        }
-
-        // Past a 1 MB cap: the burst crosses it; once the cap notice is on disk, a reserved line, then 1.3 MB of them.
-        if (!openLog("max_mb = 1\r\n", L"respast")) {
-            fail("log reserve past the cap", "the log would not open in the scratch dir");
-        } else {
-            const std::string filler(1000, 'y');
-            for (int i = 0; i < 1300; ++i) Log::get().note("capfill %d %s", i, filler.c_str());
-            const auto waitForBody = [&](const char* needle, const char* why) {
-                const ULONGLONG started = GetTickCount64();
-                while (readLog(L"respast").find(needle) == std::string::npos) {
-                    if (GetTickCount64() - started > 120000ull) {
-                        fail("log reserve wait", std::string("never reached disk in 120 s: ") + why);
-                        return false;
-                    }
-                    Sleep(20);
-                }
-                return true;
-            };
-            // The burst is on disk, then one ordinary line gives the next pass something to write, and that pass finds the cap.
-            const bool burstWritten = waitForBody("capfill 1299 ", "the burst");
-            Log::get().note("resmarker the pass that finds the cap");
-            const bool capSeen = burstWritten && waitForBody(kCapLine, "the cap notice");
-            Log::get().noteReserved("resfirst reserved line after the cap");
-            Log::get().note("resplain ordinary line after the cap");
-            for (int i = 0; i < 1300; ++i) Log::get().noteReserved("resflood %05d %s", i, filler.c_str());
-            Log::get().noteReserved("resnever a line after the flood");
-            Log::get().close();   // joins the flusher and runs the last passes: everything noted is decided before the file is read
-            const std::string body = readLog(L"respast");
-            if (capSeen) {
-                const size_t capAt = body.find(kCapLine), firstAt = body.find("resfirst reserved line after the cap"), floodAt = body.find("resflood 00000 ");
-                check(count(body, kCapLine) == 1 && firstAt != std::string::npos && floodAt != std::string::npos && capAt < firstAt && firstAt < floodAt,
-                      "a reserved line noted after the cap is still written, once, after the cap notice and before the lines that follow it");
-                check(count(body, "resplain ordinary line after the cap") == 0 && count(body, "resmarker") == 0 && count(body, "resnever") == 0,
-                      "...while an ordinary line after the cap is not (the cap is still the cap)");
-                // The reserved lines on disk: whole, consecutive from 0, in order, adding up to no more than 1 MiB.
-                size_t floodLines = 0, reservedBytes = 0;
-                bool consecutive = true;
-                for (size_t at = body.find("resflood "); at != std::string::npos; at = body.find("resflood ", at + 1)) {
-                    const size_t lineStart = body.rfind('\n', at) + 1;
-                    const size_t lineEnd = body.find('\n', at);
-                    if (lineEnd == std::string::npos || body.find(filler, at) == std::string::npos || body.find(filler, at) > lineEnd) consecutive = false;
-                    if (std::atoi(body.c_str() + at + 9) != static_cast<int>(floodLines)) consecutive = false;
-                    reservedBytes += lineEnd - lineStart + 1;
-                    ++floodLines;
-                }
-                const size_t firstBytes = body.find('\n', firstAt) + 1 - (body.rfind('\n', firstAt) + 1);
-                reservedBytes += firstBytes;
-                check(floodLines > 900 && floodLines < 1300 && consecutive,
-                      "the flood is cut off partway (a whole number of lines, consecutive from 0, none missing), not written to its end",
-                      std::to_string(floodLines) + " lines");
-                check(reservedBytes <= kMiB && reservedBytes + 1100 > kMiB,
-                      "...at the reserve: no more than 1 MiB of reserved lines, and not a line's width short of it",
-                      std::to_string(reservedBytes) + " bytes");
-                const char* const spent = "[edvr] the post-cap reserve of 1 MiB for reserved lines is spent; nothing further will be written.";
-                const size_t spentAt = body.find(spent);
-                check(count(body, spent) == 1 && spentAt != std::string::npos && body.size() == spentAt + std::strlen(spent) + 2,
-                      "the reserve says it is spent exactly once, and that notice is the end of the file");
-            }
-        }
+        const uint64_t mib = 1024ull * 1024ull;
+        bound("max_mb = 4\r\n", L"capfour", 4 * mib, "an ini that says max_mb = 4 keeps 4 MB");
+        bound("max_mb = 0\r\n", L"capnone", 0, "max_mb = 0 is no bound");
+        // F125: with the detailed on-foot log on when the log opens, a bound nobody set is 64 MB; one written down wins, 16 included.
+        bound("on_foot_detail = on\r\n", L"capdetail", 64 * mib, "on_foot_detail = on with no max_mb line is a 64 MB bound (F125)");
+        bound("on_foot_detail = off\r\n", L"capdetailoff", 16 * mib, "on_foot_detail = off keeps the 16 MB default");
+        bound("on_foot_detail = on\r\nmax_mb = 4\r\n", L"capdetailfour", 4 * mib, "on_foot_detail = on with max_mb = 4 keeps 4 MB (a size written down wins)");
+        bound("on_foot_detail = on\r\nmax_mb = 16\r\n", L"capdetail16", 16 * mib, "on_foot_detail = on with max_mb = 16 written down keeps 16 MB (the 64 is only for a size nobody set)");
+        bound("on_foot_detail = on\r\nmax_mb =\r\n", L"capdetailempty", 64 * mib, "on_foot_detail = on with an empty max_mb line is 64 MB (an empty value is not set)");
+        logcases::run(scratch);
         Log::get().close();
     }
 

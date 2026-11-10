@@ -266,6 +266,7 @@ python tools\run_jobs.py ^
     --gate "tools\check_tool_conventions.py --self-test" ^
     --gate "tools\check_tool_conventions.py" ^
     --gate "tools\dump_io.py --self-test" ^
+    --gate "tools\log_session.py --self-test" ^
     --gate "tools\layer_fixtures.py --self-test" ^
     --gate "tools\blackhole_optics.py --self-test" ^
     --gate "tools\sgra_optics.py --self-test" ^
@@ -1925,6 +1926,12 @@ if "%EDVR_RIG_STEP%"=="build" exit /b 0
 :config_test_run
 "%BUILD%\config_test.exe" "%ROOT%" "%BUILD%\cfgscratch" || (
     echo [edvr] ERROR: the shipped edvr.ini does not parse as documented
+    exit /b 1
+)
+REM The sessions the exe wrote with log.max_mb = 1 (head, tail segments, kept lines), read back by the reader every tool uses and checked from the
+REM Python side: sizes, segment count, deleted ranges, kept lines once each, order, whole lines, the newest line (tools\log_session.py).
+python "tools\edvr_log.py" --check-rotation-dir "%BUILD%\cfgscratch\logrot" || (
+    echo [edvr] ERROR: the log's head, tail segments or kept lines are not as the log promises
     exit /b 1
 )
 exit /b 0

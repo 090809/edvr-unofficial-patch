@@ -50,6 +50,11 @@ import argparse
 import re
 import sys
 
+try:
+    from tools import log_session
+except ImportError:
+    import log_session
+
 LINE_RE = re.compile(r'^\[\d{2}:\d{2}:\d{2}\.\d{3}\] (DCO? .*)$')
 # Display names for the two draw tags. DC is the eye-texture draw, DCO the
 # offscreen draw; recordDraw() writes both with the same field layout.
@@ -182,8 +187,8 @@ def parse_logs(paths):
     """Every complete census in the given logs, in encounter order."""
     censuses = []
     for path in paths:
-        with open(path, encoding='utf-8', errors='replace') as f:
-            lines = [m.group(1) for m in map(LINE_RE.match, f) if m]
+        # The whole session: a head log and its tail segments (tools\log_session.py).
+        lines = [m.group(1) for m in map(LINE_RE.match, log_session.read_log_text(path).splitlines()) if m]
         censuses.extend(parse_dc_lines(lines, path))
     return censuses
 
