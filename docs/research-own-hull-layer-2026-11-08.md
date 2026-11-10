@@ -15,20 +15,12 @@ The smear is terrain that is newly uncovered at the hull edge every frame
   Step 1 CONFIRMED (20:30, cfa4e5f5: median 1.000). Steps 2-3, AO, dump
   v2, station fixes, night vision state: their sections; not all flown.
   **Open:** the 6 own forward draws still draw in the world.
-* **Variant bench FLOWN** (2026-11-10, 44d83543 and 4fd502ad; section
-  "Bench flown"): works; sep_taa 2.1-2.9 ms layer, dlss_full 7.2-8.5 ms
-  (+0.9 GB NGX), dlss_sub refused (0xBAD00005: feature made at the whole
-  eye; fixed after, untested). Found: cockpit decals lost
-  in the main pass; the hull at 0.30-0.39 on a station pad.
-* **Next (normal play):** one F11 on a station pad, consoles in view:
-  `dluma` near 1 (was 0.30-0.39), console grilles present in sep_taa.
-* **Alternatives reviewed** (section): checkerboard promising, synthetic only.
-* **b30a1c6f FLOWN** (2026-11-10 20:49-20:53, near a planet; section "Flight
-  b30a1c6f"): reflections, Build A', Build B and the TAA tiles all run; no
-  seam, no lost hull in fast turns, no smear in a turn. `gpu_ms` total
-  1.83-1.99 (taa 0.43-0.49, was 0.8; gbuffer 0.55-0.66, no drop). dlss_sub
-  runs: 1.80 ms, 414 MB. **Open:** sep dluma 1.14 (was 1.06). **Next F11** (section
-  "Bench A/B variants"): the A/B lines name the feature; `composite method: direct`.
+* **Benches FLOWN** (sections "Bench flown", "Flight b30a1c6f"): sep_taa is
+  the AA (least shimmer); dlss_sub 1.80 ms; A', B, tiles run, no seam.
+* **5bf8f651 FLOWN** (section "Flight 5bf8f651", HMD 0.5, preset M): the
+  wing hazy, "see-through": dluma 1.41-1.44, 0.42 without the reflection
+  re-issue. **Next:** a dump with the HDRs after the reflection pass and
+  both stencils at hull pixels; clear the private u1. Pad check pending.
 * **Night vision state** (not flown): **next dump** night vision on,
   compare median ~1.0, `night_vision=N/N`. **Station fixes** (not flown):
   a docking dump, `culled_draws` high, `filter_draws` 0, `busy=` 0.
@@ -44,6 +36,10 @@ The smear is terrain that is newly uncovered at the hull edge every frame
   wrong object 14 -> 0. **Next flight:** `hull layer: own seed:` `draw`
   near 0; hangar, undock, transport with the mothership airborne.
 * **Ruled out (this study):**
+  * ruled out (2026-11-10, offline): the reflection pass's cluster lists as
+    the cause of the bright, hazy hull, because its cluster index takes the
+    pixel's own depth (t3, the private one) and the list builders
+    (593EA04A, 074CB657, F7CED662) read no depth.
   * ruled out: isolating the hull by stencil, because hull pixels carry
     stencil 0/4 like the world (kinematic doc, 2026-11-02 entry).
   * ruled out: a separate DLSS feature for the hull alone (b) as a fix,
@@ -1692,6 +1688,38 @@ moved dluma, and the composite without its two whole-eye copies.
 - **Risk:** binding the eye's UAV to the compute stage unbinds the eye
   where it is still bound as a shader resource in another stage (the copy
   never did); the compute slots are put back as before.
+
+## Flight 5bf8f651 (2026-11-10 21:23-21:28, HMD 0.5, preset M)
+
+Render 1878x1632 to 3756x3264 per eye (x2), DLSS preset M, the rest as
+before. The pilot saw the wing "see-through". Benches `eye_212720335001`
+and `eye_212754918002` (both flagged by the stillness check):
+
+| variant | dluma | layer ms |
+|---|---|---|
+| sep_taa | 1.41-1.44 | 1.09-1.10 |
+| sep_norefl | 0.42 | 0.91-0.92 |
+| sep_nopre | 1.40-1.43 | 0.99 |
+| sep_norect | 1.39-1.44 | 1.10 |
+
+- The wing in the side window, sep_taa against orig_a: hazy, a soft bright
+  blob across it, its shadow band mostly gone; without the reflection
+  re-issue it is nearly black. So the game's reflection pass carries most
+  of the wing's light, and the re-issue adds about the original's whole
+  luminance on top of 0.42.
+- Composite `direct` on all 3892 eye-composites, no fallback; prefill and
+  rect as before. Prefill saved 0.04-0.05 ms gbuffer and cost 0.04 ms
+  screen; the rect nothing measurable at this size.
+- Reflection pass (offline, scratchpad `cluster\` notes): t2 the tile list,
+  the cluster = tile plus a log-depth slice of t3, t0 per-cluster records,
+  t1 object data, t5 the SH probe grid. Candidates left for the 1.44 and the
+  blob: (1) the stencil t4 (`(stencil & cb1[26].y) == cb1[26].y` takes the
+  last volume and probe only, else blends every local probe); (2) a surplus
+  from before the pass (GameHdrLit is staged before it, so no dump compare
+  has seen it); (3) the G-buffer occlusion `1-(1-t11.w)*cb1[24].zw`; (4) the
+  private R16 u1, made with no data and never cleared (nothing reads it).
+- Next: stage the game's HDR and the private HDR after the reflection pass,
+  and both stencils at hull pixels, in one dump; clear the private u1.
 
 ## Optimisation debt (recorded 2026-11-08 at the pilot's request)
 
