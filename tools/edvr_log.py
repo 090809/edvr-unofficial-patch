@@ -331,8 +331,14 @@ try:
     from tools import steam_library
 except ImportError:
     import steam_library
+try:
+    from tools import log_session
+except ImportError:
+    import log_session
 
 GAME_EXE = "EliteDangerous64.exe"
+# A session's head log. A tail segment (edvr_<tag>_YYYYMMDD_HHMMSS.tail-NNN.log, tools\log_session.py) must NOT match: a segment is read with its head,
+# never taken for a session of its own, so --list, --nth and the newest-log pick never see one.
 LOG_RE = re.compile(r"^edvr_(?P<tag>[a-z0-9]+)_(?P<stamp>\d{8}_\d{6})"
                     r"(?:_(?P<ms>\d{3})_(?P<pid>\d+))?\.log$",
                     re.IGNORECASE)
@@ -386,6 +392,13 @@ def read_text(path):
     issue comment once."""
     with open(path, "rb") as f:
         return f.read().decode("utf-8", errors="replace")
+
+
+def read_log_text(path):
+    """A flight log's text. For a head log whose session was cut (log.max_mb), the stitched session: the head up to its end marker, then each tail
+    segment in order, a deleted one as a GAP line and the lines the head kept from it (tools\\log_session.py). Anything else is read_text. Every
+    reader of a flight log goes through this; read_text stays for ini files and sources."""
+    return log_session.read_log_text(path)
 
 
 def config_log_dir(game_dir):
@@ -4275,7 +4288,7 @@ def open_runtime_log(gfx_path, gfx_ver, want, runtime_file, native_dirs,
         rt_path, rt_why = pair_runtime_log(gfx_path, native_dirs)
     rt_text = None
     if rt_path:
-        rt_text = read_text(rt_path)
+        rt_text = read_log_text(rt_path)
         print("[edvr] runtime log: %s  (%d lines, %.1f KB)"
               % (rt_path, rt_text.count("\n") + 1, len(rt_text) / 1024.0))
         rt_line, rt_ver, _ = version_line(rt_text)
@@ -18728,7 +18741,7 @@ def health_runtime_text(gfx_path, native_dirs, runtime_file):
             return None, 1
     else:
         rt_path, _ = pair_runtime_log(gfx_path, native_dirs)
-    return (read_text(rt_path) if rt_path else None), None
+    return (read_log_text(rt_path) if rt_path else None), None
 
 
 def health_verdicts(scan, rules=None):
@@ -19184,12 +19197,17 @@ def main(argv=None):
                          "logged times only")
     ap.add_argument("--root", default=None,
                     help="repository to resolve --expect-build against")
+    ap.add_argument("--check-rotation-dir", default=None, metavar="DIR",
+                    help="the build gate's handoff from tools\\config_test: check the sessions it wrote to DIR (rotation.expect names them) "
+                         "against what the log promises of its head, tail segments and kept lines; exit 1 on any failure (tools\\log_session.py)")
     ap.add_argument("--self-test", action="store_true",
                     help="check this script against itself and exit")
     args = ap.parse_args(argv)
 
     if args.self_test:
         return self_test()
+    if args.check_rotation_dir:
+        return 1 if log_session.check_dir(args.check_rotation_dir, LOG_RE, os.path.join(args.check_rotation_dir, "rotation.expect")) else 0
 
     # The pose-gap lines are written by the runtime, not the graphics half: --tally pose reads its log when no tag was named. The default is
     # None rather than "gfx" so that a tag named on the command line, gfx included, is never mistaken for the default and overridden.
@@ -19246,8 +19264,9 @@ def main(argv=None):
         if args.list:
             print("[edvr] %d log(s) in %s:" % (len(logs), ", ".join(directories)))
             for stamp, tag, p in logs:
-                print("       %-4s %s  %s"
-                      % (tag, stamp, os.path.basename(p)))
+                tail = log_session.describe(p)
+                print("       %-4s %s  %s%s"
+                      % (tag, stamp, os.path.basename(p), ("  [" + tail + "]") if tail else ""))
             return 0
         if args.nth >= len(logs):
             print("[edvr] only %d log(s); --nth %d is past the end"
@@ -19256,9 +19275,12 @@ def main(argv=None):
         logs = [logs[args.nth]]
 
     path = logs[0][2]
-    text = read_text(path)
+    text = read_log_text(path)
     print("[edvr] %s  (%d lines, %.1f KB)"
           % (path, text.count("\n") + 1, len(text) / 1024.0))
+    tail_note = log_session.describe(path) if LOG_RE.match(os.path.basename(path)) else ""
+    if tail_note:
+        print("[edvr] read as one session with its tail: %s" % tail_note)
 
     line, ver, stamp = version_line(text)
     if line:
@@ -19323,7 +19345,7 @@ def main(argv=None):
                 return 1
         else:
             rt_path, rt_why = pair_runtime_log(path, native_dirs)
-        rt_text = read_text(rt_path) if rt_path else None
+        rt_text = read_log_text(rt_path) if rt_path else None
         print("[edvr] runtime log: %s" % (rt_path if rt_path else "NONE FOUND (%s); only the draw hook figure is reported" % rt_why))
         return print_perf_windows(text, path, rt_text, rt_path, since, until)
     if args.maps_sharp:
@@ -26627,6 +26649,8 @@ def self_test():
         ok = False
     if not self_test_health():
         ok = False
+    if not self_test_log_session():
+        ok = False
 
     print("self-test: %s" % ("ok" if ok else "FAILED"))
     return 0 if ok else 1
@@ -26659,6 +26683,99 @@ def _wl_pair(text):
     if len(parts) != 2:
         raise ValueError(text)
     return tuple(_wl_value(p) for p in parts)
+
+
+def self_test_log_session():
+    """The stitched session through the CLI (tools\\log_session.py holds the reader and its own cases; this drives it the way a flight is read):
+    no cut, a cut, deleted segments with kept lines, the _mmm_pid name, a segment missing in the middle, and the marker texts Log writes."""
+    import contextlib
+    import io
+    import shutil
+
+    ok = True
+
+    def fail(msg):
+        nonlocal ok
+        print("log session: " + msg)
+        ok = False
+
+    if not log_session.self_test():
+        ok = False
+    # Marker texts, pinned a second time here where the CLI is (config_test pins the C++ side).
+    pins = {
+        "HEAD_CUT": (log_session.HEAD_CUT, "[edvr] log head ends here at "),
+        "SEGMENT_TOP": (log_session.SEGMENT_TOP, "[edvr] tail segment "),
+        "KEPT_FROM": (log_session.KEPT_FROM, "[edvr] kept lines from tail segment "),
+        "KEPT_SPENT": (log_session.KEPT_SPENT, "[edvr] the kept-lines budget is spent (the first lines of new kinds, or the memory watch's lines, no "
+                                               "longer fit here); later ones are only in the tail segments still on disk."),
+        "GAP": (log_session.GAP_FORMAT % 3, "[edvr_log] GAP: tail segment 3 was deleted; the first line of each kind kept from it follows"),
+    }
+    for name, (got, want) in pins.items():
+        if got != want:
+            fail("%s is %r, want %r" % (name, got, want))
+    for name in ("edvr_gfx_20261110_060503.tail-001.log", "edvr_gfx_20261110_060503_123_4567.tail-012.log", "edvr_openxr_20261110_060503_123_77.tail-001.log"):
+        if LOG_RE.match(name):
+            fail("LOG_RE takes the segment %s for a session" % name)
+    for name, want in (("edvr_gfx_20261110_060503_123_4567.log", "gfx"), ("edvr_gfx_20261110_060503.log", "gfx")):
+        m = LOG_RE.match(name)
+        if not m or m.group("tag") != want:
+            fail("LOG_RE no longer takes the head %s" % name)
+
+    tmp = tempfile.mkdtemp(prefix="edvr_log_session_")
+    try:
+        def run(args):
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = main(args)
+            return rc, buf.getvalue()
+
+        def put(name, text):
+            with open(os.path.join(tmp, name), "wb") as f:
+                f.write(text.encode("utf-8"))
+
+        def seg_top(stem, n, deleted=""):
+            return "[edvr] tail segment %d of %s.log.%s\r\n" % (n, stem, deleted)
+
+        cut = ("[edvr] log head ends here at 256 KB (a quarter of log.max_mb = 1 MB); the log continues in %s.tail-001.log, only the newest 4 tail "
+               "segments are kept, and what follows below is the first line of each kind written after this point and the memory watch's lines, up "
+               "to 128 KB.\r\n")
+        version = "[06:05:03.100] version 0.22.0-5-gabcdef0 (build 01234567)\r\n"
+        # A session whose segments 1 and 2 were deleted (3..6 are on disk), the plain name, and one in the _mmm_pid form with 4 missing.
+        for stem, present in (("edvr_gfx_20261110_060503", (3, 4, 5, 6)), ("edvr_gfx_20261110_070000_321_9876", (3, 5, 6))):
+            put(stem + ".log", version + "[06:05:03.200] head line\r\n" + cut % stem +
+                "[edvr] kept lines from tail segment 1\r\n[06:06:00.000] alpha #0\r\n[edvr] kept lines from tail segment 2\r\n[06:07:00.000] beta #0\r\n" +
+                "[edvr] kept lines from tail segment 4\r\n[06:09:00.000] delta #0\r\n")
+            for n in present:
+                put("%s.tail-%03d.log" % (stem, n), seg_top(stem, n, "" if n < 5 else " Deleted so far: segment 1 (163840 bytes, 06:06:00.000 to 06:06:30.000).") +
+                    "[06:%02d:00.000] segment %d line\r\n" % (n + 4, n))
+        rc, out = run(["--dir", tmp, "--tag", "gfx", "--list"])
+        if rc != 0 or "2 log(s)" not in out or "[4 tail segment(s) on disk (3-6), deleted 1-2]" not in out or \
+                "[3 tail segment(s) on disk (3, 5-6), deleted 1-2, 4]" not in out or ".tail-" in out.replace("tail segment", ""):
+            fail("--list does not show each head with its segments and the deleted range, or lists a segment:\n" + out)
+        rc, out = run(["--dir", tmp, "--tag", "gfx", "--nth", "1", "--version"])
+        if rc != 0 or "version 0.22.0-5-gabcdef0" not in out:
+            fail("--version does not read the head: %s" % out)
+        rc, out = run(["--dir", tmp, "--tag", "gfx", "--nth", "1", "--grep", r"alpha|beta|GAP|segment \d line"])
+        want = ["[edvr_log] GAP: tail segment 1 was deleted", "alpha #0", "[edvr_log] GAP: tail segment 2 was deleted", "beta #0", "segment 3 line", "segment 4 line",
+                "segment 5 line", "segment 6 line"]
+        got = [l for l in out.splitlines() if not l.startswith("[edvr] ") or "[edvr_log]" in l]
+        if rc != 0 or len(got) != len(want) or any(w not in g for w, g in zip(want, got)):
+            fail("--grep on a stitched session: %r" % out)
+        rc, out = run(["--dir", tmp, "--tag", "gfx", "--nth", "0", "--tail", "40"])
+        lines = out.splitlines()
+        if rc != 0 or lines.count("[edvr_log] GAP: tail segment 4 was deleted; the first line of each kind kept from it follows") != 1 or \
+                lines[lines.index("[edvr_log] GAP: tail segment 4 was deleted; the first line of each kind kept from it follows") + 1].find("delta #0") < 0:
+            fail("a segment missing in the middle is not a GAP with its kept line: %r" % out)
+        # --file on a head reads the stitched session; on a lone segment, only that.
+        rc, out = run(["--file", os.path.join(tmp, "edvr_gfx_20261110_060503.log"), "--grep", "segment 4 line"])
+        if rc != 0 or "1 line(s) match" not in out:
+            fail("--file on a head does not read its segments: %r" % out)
+        rc, out = run(["--file", os.path.join(tmp, "edvr_gfx_20261110_060503.tail-004.log"), "--grep", "segment"])
+        if rc != 0 or "segment 4 line" not in out or "segment 3 line" in out:
+            fail("--file on a segment reads more than that file: %r" % out)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    return ok
 
 
 def self_test_owner_invoke():

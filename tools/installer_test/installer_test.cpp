@@ -6208,9 +6208,18 @@ static void testLogBundle(const std::wstring& scratch) {
     // write time it would be the newest log by weeks, alone in its session,
     // and the three above would be left out.
     writeAll(joinPath(logs, L"edvr_gfx_20260827_140000_500_9.log"), "a second process, same second");
+    // A long session's tail segments (log.max_mb; src\common\log_rotate.h) sit beside their head and are part of its session: bundled with it, in
+    // either name form, and never taken for the newest log. The orphan one names a head (absent) that would be the newest by its stamp; if a segment
+    // could be the newest log, the session above would be left out as "older" and this lone segment bundled instead.
+    writeAll(joinPath(logs, L"edvr_gfx_20260827_140000.tail-001.log"), "segment 1 of the session that matters");
+    writeAll(joinPath(logs, L"edvr_gfx_20260827_140000.tail-002.log"), "segment 2 of the session that matters");
+    writeAll(joinPath(logs, L"edvr_gfx_20260827_140000_500_9.tail-001.log"), "segment 1 of the second process");
+    writeAll(joinPath(logs, L"edvr_gfx_20260101_100000.tail-001.log"), "segment of an old session");
+    writeAll(joinPath(logs, L"edvr_gfx_20260828_090000.tail-001.log"), "an orphan segment, its head gone");
 
     for(const auto* name:{L"edvr_gfx_20260827_140000.log",L"edvr_vr_20260827_140003.log",
-                          L"edvr_openxr_20260827_140004_123_4567.log",L"edvr_gfx_20260827_140000_500_9.log"})
+                          L"edvr_openxr_20260827_140004_123_4567.log",L"edvr_gfx_20260827_140000_500_9.log",
+                          L"edvr_gfx_20260827_140000.tail-001.log",L"edvr_gfx_20260827_140000.tail-002.log",L"edvr_gfx_20260827_140000_500_9.tail-001.log"})
         bundleStamp(joinPath(logs,name),27,12);
     const auto packetRoot=joinPath(logs,L"flat_draw_packets");
     auto packetFixture=[&](const wchar_t* folder,WORD minute,bool manifest=true){
@@ -6262,6 +6271,20 @@ static void testLogBundle(const std::wstring& scratch) {
           "and the same-second gfx log, dated by its name not its write time");
     check(!bundleHas(names, "edvr_gfx_20260101_100000.log"),
           "the previous session is left out");
+    check(bundleHas(names, "edvr_gfx_20260827_140000.tail-001.log") && bundleHas(names, "edvr_gfx_20260827_140000.tail-002.log") &&
+              bundleHas(names, "edvr_gfx_20260827_140000_500_9.tail-001.log"),
+          "a session's tail segments are bundled with their head, in both name forms");
+    check(!bundleHas(names, "edvr_gfx_20260101_100000.tail-001.log") && !bundleHas(names, "edvr_gfx_20260828_090000.tail-001.log"),
+          "a segment is dated by its head's name: the old session's is left out, and a segment that would be the newest by its stamp is not taken for the newest log");
+    {
+        bool segmentNote = false, countNote = false;
+        for (const std::string& note : bundle.notes) {
+            segmentNote = segmentNote || note.find("3 tail segments of those logs") != std::string::npos;
+            countNote = countNote || note.find("4 logs from the most recent session (of 6 in the folder)") != std::string::npos;
+        }
+        check(segmentNote, "the bundle says how many tail segments it carries");
+        check(countNote, "and its log count is of session logs only: segments are not logs of their own");
+    }
     check(bundleHas(names, "edvr_breadcrumbs.txt"), "the breadcrumbs are in");
     check(bundleHas(names, "edvr_FATAL.txt"), "the fatal note is in");
     check(bundleHas(names, "edvr.ini"), "the settings file is in");
