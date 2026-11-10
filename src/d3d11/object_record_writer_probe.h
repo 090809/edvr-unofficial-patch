@@ -4,6 +4,7 @@
 // calling the original dictionary lookup; this class only records evidence.
 #include <windows.h>
 #include "native_on_foot.h"
+#include "../common/dump_file.h"   // writeBinary appends to the classification .bin, which goes out as .z
 #include <array>
 #include <atomic>
 #include <cstdint>
@@ -137,7 +138,7 @@ public:
     const char* hookStatusText() const noexcept;
     const std::vector<Record>& recordsForTest() const noexcept{return records_;}
     const std::vector<Ownership>& ownershipsForTest() const noexcept{return ownerships_;}
-    bool writeBinary(FILE* file,uint64_t& offset,bool& binOk) noexcept;
+    bool writeBinary(dump_file::Writer* file,uint64_t& offset,bool& binOk) noexcept;   // null = the file did not open
     void writeJson(std::ostringstream& json) const;
 
 private:

@@ -31,6 +31,8 @@ import struct
 import sys
 import tempfile
 
+import dump_io   # tools\dump_io.py: the eye dump's .bin files are NAME or NAME.z
+
 
 SCHEMA_V3 = "edvr_object_classification_v3"
 POOL_STRIDE = 336
@@ -738,10 +740,10 @@ def _validate_record_ownership_contents(binary, diagnostic, records, ownerships)
 def _capture_binary(path, binary_name, total_packed_bytes, binary_ok):
     binary_path = path.with_name(binary_name)
     try:
-        if binary_path.exists():
-            if binary_path.stat().st_size > MAX_BINARY_BYTES:
+        if dump_io.exists(binary_path):   # classification_<stamp>.bin or its .z: the bound is on the decoded size
+            if dump_io.getsize(binary_path) > MAX_BINARY_BYTES:
                 raise CaptureError("binary exceeds reader safety bound")
-            binary = binary_path.read_bytes()
+            binary = dump_io.read_bytes(binary_path)
         else:
             binary = None
     except OSError as exc:
@@ -1109,6 +1111,14 @@ def self_test():
             raise AssertionError("%s accepted" % what)
 
         capture = load(root)
+        # The same capture with the binary stored as NAME.bin.z, the way the dump writes it.
+        zdir = temp / "z"
+        zdir.mkdir()
+        zmarker = zdir / "classification_fixture.json"
+        zmarker.write_text(json.dumps(root), encoding="utf-8")
+        dump_io.write_z(zdir / root["binary"], binary)
+        assert not (zdir / root["binary"]).exists()
+        assert load_capture(zmarker)["binary"] == capture["binary"], "a compressed classification binary loads the same"
         v4 = copy.deepcopy(root)
         v4section = v4["record_writers"]
         v4section["version"] = 4

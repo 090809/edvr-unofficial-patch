@@ -23,6 +23,7 @@ the median turn of the drawn ones and of the undrawn, the skinned records' turn 
 bone composed in, and the big instanced draws that were NOT the pool's, for the next look.
 """
 import argparse, glob, math, os, struct, sys, tempfile, json
+import dump_io   # tools\dump_io.py: the eye dump's .bin files are NAME or NAME.z
 import numpy as np
 
 REC = 336
@@ -84,7 +85,7 @@ def join_weapon_ui_records(writer_json,eye_drawstate,draws,pools,insts,inst_stri
     section=root.get('record_writers',{})
     if section.get('version')!=4:
         raise ValueError('UI writer capture must use record_writers version 4')
-    packed=open(os.path.join(os.path.dirname(writer_json),root['binary']),'rb').read()
+    packed=dump_io.read_bytes(os.path.join(os.path.dirname(writer_json),root['binary']))
     eye=eye_draw_snapshot.read(eye_drawstate)
     eye_draws=attach_candidate_issues(eye)
     records=[]
@@ -136,7 +137,7 @@ def load_draws(path):
     and n rows of the version's width. Returns (ver, frames, frame0,
     instStride, bonesStride, poolBytes, crop, draws) with draws[frame] a
     structured array whose dtype is ROW_V1 or ROW_V2."""
-    b = open(path, 'rb').read()
+    b = dump_io.read_bytes(path)
     magic, ver, frames, frame0, instStride, bonesStride, poolBytes = struct.unpack('<8sIIIIII', b[:32])
     assert magic == b'EDVRLDGR', path
     if ver == 1:
@@ -273,6 +274,12 @@ def self_test():
         assert r['rt'][0] == 3 and r['rt'][1] == 4 and r['rt'][0] != r['rt'][1]
         assert r['rt'][2] == -1
         assert r['vs'][1] == 0x2222222222222222 and r['count'][2] == 4 and r['kind'][2] == ord('D')
+        # The same draws file as the compressed container the dump writes (NAME.bin.z), read under its original name.
+        want = load_draws(p2)
+        dump_io.write_z(p2, open(p2, 'rb').read())
+        os.remove(p2)
+        got = load_draws(p2)
+        assert got[:7] == want[:7] and all((got[7][k] == want[7][k]).all() for k in want[7]), "a compressed draws file reads the same"
         # an unknown version must fail loudly, not mis-parse
         bad = os.path.join(tmp, 'draws_v9.bin')
         with open(bad, 'wb') as f:
@@ -289,7 +296,7 @@ def self_test():
 
 
 def load_pool(path):
-    b = open(path, 'rb').read()
+    b = dump_io.read_bytes(path)
     magic, ver, frame, poolBytes, sceneBytes, recBytes, records = struct.unpack('<8sIIIIII', b[:32])
     assert magic == b'EDVRPOOL' and recBytes == REC, path
     raw = np.frombuffer(b, dtype=np.uint8, count=records * REC, offset=32 + sceneBytes).reshape(records, REC)
@@ -376,7 +383,7 @@ def fit_axis(p0, p1, ang, axis, mask):
     return u, c, th, m
 
 def load_aux(path):
-    b = open(path, 'rb').read()
+    b = dump_io.read_bytes(path)
     magic, ver, frame, entries, pad = struct.unpack('<8sIIII', b[:24])
     assert magic == b'EDVRLAUX', path
     off = 24; out = []
@@ -424,16 +431,16 @@ def main():
     pools = {}; insts = {}; bones = {}; auxes = {}
     for frame in range(frame0, frame0 + frames):
         p = os.path.join(a.dir, f'pool_{a.stamp}_{frame}.bin')
-        if os.path.exists(p): pools[frame] = load_pool(p)
+        if dump_io.exists(p): pools[frame] = load_pool(p)
         p = os.path.join(a.dir, f'inst_{a.stamp}_{frame}.bin')
-        if os.path.exists(p): insts[frame] = np.frombuffer(open(p, 'rb').read(), dtype=np.uint32)
+        if dump_io.exists(p): insts[frame] = np.frombuffer(dump_io.read_bytes(p), dtype=np.uint32)
         for pi in range(4):
             p = os.path.join(a.dir, f'bones{pi}_{a.stamp}_{frame}.bin')
-            if os.path.exists(p): bones.setdefault(frame, {})[pi] = open(p, 'rb').read()
+            if dump_io.exists(p): bones.setdefault(frame, {})[pi] = dump_io.read_bytes(p)
         p = os.path.join(a.dir, f'bones_{a.stamp}_{frame}.bin')   # the first build's single palette
-        if os.path.exists(p): bones.setdefault(frame, {})[0] = open(p, 'rb').read()
+        if dump_io.exists(p): bones.setdefault(frame, {})[0] = dump_io.read_bytes(p)
         p = os.path.join(a.dir, f'aux_{a.stamp}_{frame}.bin')
-        if os.path.exists(p): auxes[frame] = load_aux(p)
+        if dump_io.exists(p): auxes[frame] = load_aux(p)
     print(f"on disk: {len(pools)} pool frames, {len(insts)} instance streams, {len(bones)} frames of palettes, {len(auxes)} aux files, {sum(len(v) for v in draws.values())} draw rows")
     stride_u32 = max(1, instStride // 4)
 

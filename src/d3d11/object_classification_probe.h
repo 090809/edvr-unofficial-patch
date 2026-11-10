@@ -73,9 +73,9 @@ public:
         // touching its BIN so a failed rewrite cannot leave stale success
         // metadata pointing at new or partial bytes.
         if(!DeleteFileW(jsonPath.c_str())&&GetLastError()!=ERROR_FILE_NOT_FOUND)return false;
-        FILE* bin=nullptr;bool binOk=_wfopen_s(&bin,binPath.c_str(),L"wb")==0&&bin;uint64_t offset=0;
-        objectRecordWriterProbe.writeBinary(bin,offset,binOk);
-        if(bin && fclose(bin)!=0)binOk=false;
+        dump_file::Writer bin;bool binOk=bin.open(binPath.c_str());uint64_t offset=0;   // classification_<stamp>.bin.z when it compresses
+        objectRecordWriterProbe.writeBinary(binOk?&bin:nullptr,offset,binOk);
+        if(bin.isOpen() && !bin.close())binOk=false;
         uint32_t peTimestamp=0,peImageSize=0;executableIdentity(peTimestamp,peImageSize);
         if(testIdentityOverride_)gameBuildIdentity(&peTimestamp,&peImageSize);
         std::ostringstream j;

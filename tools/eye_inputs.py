@@ -44,9 +44,11 @@ import json
 import struct
 import sys
 
+import dump_io   # tools\dump_io.py: a dump file is NAME or NAME.z (the eye dump compresses its .bin files)
+
 
 def _load(path):
-    data = Path(path).read_bytes()
+    data = dump_io.read_bytes(path)
     if data[:8] != b'EDVRTEX1' or len(data) < 44:
         raise ValueError('Not an EDVRTEX1 capture')
     keys = ('version', 'width', 'height', 'format', 'row_bytes', 'frame', 'eye', 'ui_bound', 'ui_flags')
@@ -69,7 +71,7 @@ def _load_buffer(path):
     resource unchanged; EngineNow row 276 carries the actual engine stamp.
     Availability is explicit in the companion EngineBuffers.json manifest.
     """
-    data = Path(path).read_bytes()
+    data = dump_io.read_bytes(path)
     if len(data) < 40 or data[:8] != b'EDVRBUF1':
         raise ValueError('Not an EDVRBUF1 capture')
     keys = ('version', 'bytes', 'stride', 'format', 'first_element', 'num_elements', 'frame', 'reserved')
@@ -126,6 +128,10 @@ def self_test():
         buffer.write_bytes(b'EDVRBUF1' + struct.pack('<8I', 1, 672, 336, 0, 1, 1, 17, 0) + words)
         meta, data = _load_buffer(buffer)
         assert meta['first_element'] == 1 and data[40:] == words
+        # The same buffer as the compressed container the eye dump writes (NAME.z, read under the original name).
+        zbuffer = Path(temp) / 'pool_z.bin'
+        dump_io.write_z(zbuffer, buffer.read_bytes())
+        assert not zbuffer.exists() and _load_buffer(zbuffer) == (meta, data)
         try:
             import numpy as np
         except ImportError:
@@ -147,6 +153,9 @@ def self_test():
         meta, data = _load(path)
         assert meta['ui_flags'] == 32 and meta['frame'] == 17
         assert data[44:] == pixels
+        zpath = Path(temp) / 'screen_z.bin'
+        dump_io.write_z(zpath, payload)
+        assert _load(zpath)[0] == meta and _load(zpath)[1] == data   # compressed, read under the original name
         # Analysis returns NumPy arrays, but validating the file contract
         # must not add a NumPy dependency to the normal DLL build.
         try:

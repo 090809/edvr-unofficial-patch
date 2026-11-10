@@ -1,4 +1,5 @@
 #include "depth_writer_probe.h"
+#include "../common/dump_file.h"   // depthwriter_<stamp>_e<eye>.bin goes out as .z
 
 #include <windows.h>
 #include <d3d11.h>
@@ -297,13 +298,13 @@ void writeJson(const std::wstring& path) {
 }
 
 bool writeMap(const std::wstring& path, uint32_t w, uint32_t h, uint32_t eye, const std::vector<uint32_t>& pixels) {
-    FILE* f = nullptr;
-    if (_wfopen_s(&f, path.c_str(), L"wb") || !f) return false;
+    dump_file::Writer f;
+    if (!f.open(path.c_str())) return false;
     // EDVRTEX1: the magic, then version, width, height, DXGI format (42 R32_UINT), row bytes, frame, eye, UI-bound, UI-flags (tools/eye_inputs.py).
     const uint32_t header[9] = {1u, w, h, 42u, w * 4u, g_targetFrame, eye, 0u, 0u};
-    bool ok = std::fwrite("EDVRTEX1", 1, 8, f) == 8 && std::fwrite(header, sizeof(header), 1, f) == 1 &&
-              std::fwrite(pixels.data(), 4, pixels.size(), f) == pixels.size();
-    ok = (std::fclose(f) == 0) && ok;
+    bool ok = f.write("EDVRTEX1", 8) && f.write(header, sizeof(header)) &&
+              f.write(pixels.data(), 4 * pixels.size());
+    ok = f.close() && ok;
     return ok;
 }
 

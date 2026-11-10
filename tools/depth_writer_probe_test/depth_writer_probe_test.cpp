@@ -17,6 +17,7 @@
 #include <vector>
 
 #include "../../src/common/log.h"
+#include "../../src/common/dump_file.h"
 
 namespace edvr {
 namespace {
@@ -204,16 +205,17 @@ std::wstring tempDir() {
 
 std::vector<uint32_t> readMap(const std::wstring& path, uint32_t* w, uint32_t* h, uint32_t* fmt) {
     std::vector<uint32_t> out;
-    FILE* f = nullptr;
-    if (_wfopen_s(&f, path.c_str(), L"rb") || !f) return out;
-    char magic[8];
+    // The probe writes depthwriter_<stamp>_e<eye>.bin through the dump container: NAME.z on disk, read back decoded.
+    std::string bytes;
+    if (!dump_file::readDecoded(path.c_str(), bytes)) return out;
     uint32_t header[9];
-    if (std::fread(magic, 1, 8, f) == 8 && std::memcmp(magic, "EDVRTEX1", 8) == 0 && std::fread(header, sizeof(header), 1, f) == 1) {
+    if (bytes.size() >= 8 + sizeof(header) && std::memcmp(bytes.data(), "EDVRTEX1", 8) == 0) {
+        std::memcpy(header, bytes.data() + 8, sizeof(header));
         *w = header[1]; *h = header[2]; *fmt = header[3];
         out.resize(static_cast<size_t>(*w) * *h);
-        if (std::fread(out.data(), 4, out.size(), f) != out.size()) out.clear();
+        if (bytes.size() - 8 - sizeof(header) < out.size() * 4) out.clear();
+        else std::memcpy(out.data(), bytes.data() + 8 + sizeof(header), out.size() * 4);
     }
-    std::fclose(f);
     return out;
 }
 
