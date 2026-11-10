@@ -3980,6 +3980,11 @@ struct BenchDlssEye {
     ID3D11UnorderedAccessView* depUav = nullptr;
     ID3D11Texture2D* mv = nullptr;
     ID3D11UnorderedAccessView* mvUav = nullptr;
+    // NGX reads its inputs through shader views of its own, so the inputs need the shader-resource bind flag that
+    // makeTexture sets only when it is asked for a view (without it every evaluation failed, 0xBAD00002, flight 2026-11-10).
+    ID3D11ShaderResourceView* colSrv = nullptr;
+    ID3D11ShaderResourceView* depSrv = nullptr;
+    ID3D11ShaderResourceView* mvSrv = nullptr;
     ID3D11Texture2D* out = nullptr;
     ID3D11UnorderedAccessView* outUav = nullptr;
     ID3D11ShaderResourceView* outSrv = nullptr;
@@ -3999,6 +4004,9 @@ BenchDlssGpu g_benchDlssGpu;
 
 void benchDlssRelease() {
     for (auto& d : g_benchDlssEye) {
+        releaseRef(d.colSrv);
+        releaseRef(d.depSrv);
+        releaseRef(d.mvSrv);
         releaseRef(d.colUav);
         releaseRef(d.col);
         releaseRef(d.depUav);
@@ -4078,6 +4086,9 @@ bool benchDlssTargets(BenchDlssEye& d, uint32_t w, uint32_t h, uint32_t outW, ui
     if (d.out && d.w == w && d.h == h && d.outW == outW && d.outH == outH) return true;
     const void* keepOf[3] = {d.srvOf[0], d.srvOf[1], d.srvOf[2]};
     ID3D11ShaderResourceView* keep[3] = {d.srv[0], d.srv[1], d.srv[2]};
+    releaseRef(d.colSrv);
+    releaseRef(d.depSrv);
+    releaseRef(d.mvSrv);
     releaseRef(d.colUav);
     releaseRef(d.col);
     releaseRef(d.depUav);
@@ -4087,9 +4098,9 @@ bool benchDlssTargets(BenchDlssEye& d, uint32_t w, uint32_t h, uint32_t outW, ui
     releaseRef(d.outSrv);
     releaseRef(d.outUav);
     releaseRef(d.out);
-    bool ok = makeTexture(w, h, DXGI_FORMAT_R8G8B8A8_UNORM, true, &d.col, nullptr, &d.colUav) &&
-              makeTexture(w, h, DXGI_FORMAT_R32_FLOAT, true, &d.dep, nullptr, &d.depUav) &&
-              makeTexture(w, h, DXGI_FORMAT_R16G16_FLOAT, true, &d.mv, nullptr, &d.mvUav) &&
+    bool ok = makeTexture(w, h, DXGI_FORMAT_R8G8B8A8_UNORM, true, &d.col, &d.colSrv, &d.colUav) &&
+              makeTexture(w, h, DXGI_FORMAT_R32_FLOAT, true, &d.dep, &d.depSrv, &d.depUav) &&
+              makeTexture(w, h, DXGI_FORMAT_R16G16_FLOAT, true, &d.mv, &d.mvSrv, &d.mvUav) &&
               makeTexture(outW, outH, DXGI_FORMAT_R8G8B8A8_UNORM, true, &d.out, &d.outSrv, &d.outUav);
     for (int k = 0; k < 3; ++k) {
         d.srvOf[k] = keepOf[k];
