@@ -223,15 +223,19 @@ inline unsigned run() {
            resolved < copiedAt && copiedAt < donorAt && donorAt < matchAt && matchAt < repairAt,
            "the donor is chosen after CB2 is copied and before the match and the repair that use it");
     const auto picker = deferred_witness_test::between(verifier, "const auto donor=[&]()->FlatDeferredDonor {", "const auto match=donor && copied");
-    expect(!picker.empty() && picker.find("if(!resolved.pairSelectable)return resolved;") != std::string::npos &&
+    // The pair's part of the picker: after the pool pick (flat_deferred_pool_pick_tests.h), from its own qualified-pass refusal on.
+    const size_t pairAt = picker.find("if(!qualifiedPass){pick=SecondCameraPick::Unqualified;return resolved;}");
+    const std::string pair = pairAt == std::string::npos ? std::string{} : picker.substr(pairAt);
+    expect(!picker.empty() && !pair.empty() && picker.find("if(!resolved.pairSelectable && !resolved.poolSelectable)return resolved;") != std::string::npos &&
            picker.find("actual && input && copied && !foreignWork") != std::string::npos &&
            picker.find("flatMatchDeferredCamera(camera,raw)==FlatDeferredCameraMatch::Match") != std::string::npos &&
            picker.find("flatRepairDeferredMissingPhase(camera,raw,jitter,scratch)") != std::string::npos &&
            picker.find("flatRepairDeferredWholeOmission(camera,raw,jitter,scratch)") != std::string::npos &&
-           picker.find("if(holdsFirst==holdsOffender)return resolved;") != std::string::npos &&
-           picker.find("holdsFirst?resolved.entryCamera:resolved.offenderCamera") != std::string::npos,
+           pair.find("if(holdsFirst==holdsOffender)return resolved;") != std::string::npos &&
+           pair.find("holdsFirst?resolved.entryCamera:resolved.offenderCamera") != std::string::npos,
            "the verifier selects only a qualified pass, only when exactly one camera holds, by the relations the repairs certify");
-    expect(deferred_witness_test::countOf(picker, "flatRuntimeDeferredDonor(") == 1 && picker.find("certified") == std::string::npos && picker.find("draw.") == std::string::npos,
+    expect(deferred_witness_test::countOf(pair, "flatRuntimeDeferredDonor(") == 1 && deferred_witness_test::countOf(picker, "flatRuntimeDeferredDonor(") == 2 &&
+           picker.find("certified") == std::string::npos && picker.find("draw.") == std::string::npos,
            "the choice touches no certified upload and no draw: the repair runs afterwards, on the donor");
     expect(deferred_witness_test::countOf(source, "flatRuntimeDeferredDonor(s.prefix,k,s.prefix.sequence+1,nullptr,d.camera)") == 1, "the binding failure report names the draw's camera");
     std::ifstream modelIn("src/d3d11/flat_runtime_model.h"); std::string model;

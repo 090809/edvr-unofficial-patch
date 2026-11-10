@@ -565,6 +565,7 @@ struct State {
     uint64_t deferredSecondCameras = 0, deferredSecondCameraLastLog = 0;
     uint32_t deferredSecondCamerasLogged = 0;
     uint64_t deferredSecondPicks[6]{};   // by SecondCameraPick
+    uint64_t deferredPoolPicks[5]{};     // by PoolCameraPick
     bool deferredCameraNonzeroLogged = false;
     FlatCameraProbe cameraProbe{};
     struct CopyProvenanceSample {
@@ -2217,6 +2218,18 @@ static const char* secondCameraPickName(SecondCameraPick p) {
     default: return "not-selectable";
     }
 }
+// Two or more source records on the pass's depth, one per camera (FlatDeferredDonor::poolSelectable): which of their cameras held
+// against CB2. One names the donor; none or several leave the pass without one, as before.
+enum class PoolCameraPick : uint8_t { NotApplicable, Unqualified, One, Several, Neither };
+static const char* poolCameraPickName(PoolCameraPick p) {
+    switch(p) {
+    case PoolCameraPick::Unqualified: return "unqualified";
+    case PoolCameraPick::One: return "one";
+    case PoolCameraPick::Several: return "several-hold";
+    case PoolCameraPick::Neither: return "none-holds";
+    default: return "not-selectable";
+    }
+}
 static void noteSecondCamera(State& s, uint64_t frame, uint32_t q, unsigned width, unsigned height, const FlatDeferredDonor& donor,
         const unsigned char* cb2, float phaseX, float phaseY, FlatDeferredCameraMatch relation, SecondCameraPick pick, double ndcX, double ndcY) {
     ++s.deferredSecondCameras;
@@ -2338,16 +2351,30 @@ const FlatProjectionBindingPlan* verifyDeferredHdrCamera(State& s, FlatRuntimeDr
     // it matches or one of the two certified phase omissions (the rays alone, or the whole camera) repairs it. Exactly one holding names
     // the donor; none, or both, leave the pass without one, refused as before. The resolver still demands that the entry be the depth's
     // only one, clean (every writer bound one of the two cameras) and current, so a third camera or a stale one is never chosen.
+    // The same question where two or more SOURCE records stand on the depth, one per camera (poolSelectable): a supported tool held in the
+    // first person draws into the G-buffer under its own camera beside the world's (2026-11-10, flights on two rigs). Every record's camera
+    // is known, so asking each one leaves none out; exactly one holding names the donor, by its bytes.
     SecondCameraPick pick=SecondCameraPick::NotApplicable;
+    PoolCameraPick poolPick=PoolCameraPick::NotApplicable;
     const auto donor=[&]()->FlatDeferredDonor {
-        if(!resolved.pairSelectable)return resolved;
-        if(!(actual && input && copied && !foreignWork.load(std::memory_order_acquire))){pick=SecondCameraPick::Unqualified;return resolved;}
+        if(!resolved.pairSelectable && !resolved.poolSelectable)return resolved;
+        const bool qualifiedPass=actual && input && copied && !foreignWork.load(std::memory_order_acquire);
         unsigned char scratch[kFlatDeferredCameraBytes];
         const auto holds=[&](const unsigned char* camera) {
             return flatMatchDeferredCamera(camera,raw)==FlatDeferredCameraMatch::Match ||
                 (jitterReady && (flatRepairDeferredMissingPhase(camera,raw,jitter,scratch) ||
                                  flatRepairDeferredWholeOmission(camera,raw,jitter,scratch)));
         };
+        if(resolved.poolSelectable) {
+            const unsigned char* named=nullptr;uint32_t held=0;
+            if(qualifiedPass)
+                for(uint32_t i=0;i<resolved.poolCameraCount;++i)if(holds(resolved.poolCameras[i])){++held;named=resolved.poolCameras[i];}
+            poolPick=!qualifiedPass?PoolCameraPick::Unqualified:held==1?PoolCameraPick::One:held?PoolCameraPick::Several:PoolCameraPick::Neither;
+            ++s.deferredPoolPicks[static_cast<unsigned>(poolPick)];
+            if(poolPick!=PoolCameraPick::One)return resolved;
+            return flatRuntimeDeferredDonor(s.prefix,k,s.prefix.sequence+1,gbuffer,named);
+        }
+        if(!qualifiedPass){pick=SecondCameraPick::Unqualified;return resolved;}
         const bool holdsFirst=holds(resolved.entryCamera),holdsOffender=holds(resolved.offenderCamera);
         pick=holdsFirst&&holdsOffender?SecondCameraPick::Both:holdsFirst?SecondCameraPick::First:
             holdsOffender?SecondCameraPick::Offender:SecondCameraPick::Neither;
@@ -2481,12 +2508,16 @@ const FlatProjectionBindingPlan* verifyDeferredHdrCamera(State& s, FlatRuntimeDr
             jitterReady?jitter.ndcX:0.0,jitterReady?jitter.ndcY:0.0);
     if(s.deferredCameraChecks<=8 ||
        (nonzero && !s.deferredCameraNonzeroLogged) || now-s.deferredCameraLastLog>=5000) {
-        Log::get().note("flat deferred HDR camera: frame=%llu q=%u H=%p actual-b1=%p CB2=%p first=%u count=%u original=%u current=%u write-frame=%llu write-q=%u donor-b1=%p donor-last=%u donor-role=%s source=%p actual=%u input=%u relation=%s accepted=%u repair=%s missing-phase=%u prepared=%u warmed=%u phase=(%.9g,%.9g) checks=%llu accepted-total=%llu refused-total=%llu empty-gbuffer-total=%llu work=%s; actual H CB2 witness, donor identity separate; prepared admission awaits verified binding",
+        Log::get().note("flat deferred HDR camera: frame=%llu q=%u H=%p actual-b1=%p CB2=%p first=%u count=%u original=%u current=%u write-frame=%llu write-q=%u donor-b1=%p donor-last=%u donor-role=%s source=%p actual=%u input=%u relation=%s accepted=%u repair=%s missing-phase=%u prepared=%u warmed=%u phase=(%.9g,%.9g) checks=%llu accepted-total=%llu refused-total=%llu empty-gbuffer-total=%llu pool-cameras=%u pool-pick=%s pool-picks=one:%llu,several:%llu,none:%llu,unqualified:%llu work=%s; actual H CB2 witness, donor identity separate; prepared admission awaits verified binding; pool-cameras counts the source records on the depth when more than one, pool-pick which of their cameras held against CB2",
             (unsigned long long)s.prefix.frame,s.prefix.sequence+1,k.color,k.b1,buffer.Get(),first,count,original?1u:0u,current?1u:0u,
             (unsigned long long)metadata.writeFrame,metadata.writeSequence,donor.b1,donor.last,flatDeferredDonorRoleName(donor.role),source.Get(),
             actual?1u:0u,input?1u:0u,flatDeferredCameraMatchName(match),draw.deferredHdrVerified?1u:0u,repairName,missingPhase?1u:0u,prepared?1u:0u,warmed?1u:0u,s.phase.currentX,s.phase.currentY,
             (unsigned long long)s.deferredCameraChecks,(unsigned long long)s.deferredCameraAccepted,(unsigned long long)s.deferredCameraRefused,
-            (unsigned long long)s.deferredEmptyGBuffer,flatWorkName(s.work));
+            (unsigned long long)s.deferredEmptyGBuffer,resolved.poolCameraCount,poolCameraPickName(poolPick),
+            (unsigned long long)s.deferredPoolPicks[static_cast<unsigned>(PoolCameraPick::One)],
+            (unsigned long long)s.deferredPoolPicks[static_cast<unsigned>(PoolCameraPick::Several)],
+            (unsigned long long)s.deferredPoolPicks[static_cast<unsigned>(PoolCameraPick::Neither)],
+            (unsigned long long)s.deferredPoolPicks[static_cast<unsigned>(PoolCameraPick::Unqualified)],flatWorkName(s.work));
         s.deferredCameraLastLog=now;if(nonzero)s.deferredCameraNonzeroLogged=true;
     }
     return deferredPlan;

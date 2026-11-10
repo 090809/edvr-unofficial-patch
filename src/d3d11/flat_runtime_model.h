@@ -633,6 +633,14 @@ struct FlatDeferredDonor {
     // The first other entry on the depth that carried another camera (why == OtherCamera): its colour, b1 and camera hash.
     const void* vetoColor = nullptr, *vetoB1 = nullptr;
     uint64_t vetoHash = 0;
+    // Two or more source records on the depth, each a qualified pool record of the pass's SRV0 in its layout (poolSelectable). Records are
+    // one per camera, so these are as many cameras: the held tool's first person beside the world's (2026-11-10). The verifier, which holds
+    // CB2, may name the one CB2 belongs to (`select`), as it does for a two-camera witness entry. poolCameras are the records' 96 bytes, in
+    // record order; selected then says the donor is the named one.
+    static constexpr uint32_t kPoolCameras = 4;
+    uint32_t poolCameraCount = 0;
+    const unsigned char* poolCameras[kPoolCameras] = {};
+    bool poolSelectable = false;
     explicit operator bool() const { return role != FlatDeferredDonorRole::None; }
 };
 // A laser-family H draw is normally an alternate-camera weapon draw. It may
@@ -642,7 +650,8 @@ struct FlatDeferredDonor {
 // names the same scene depth. The image copy's bound b1 is never evidence.
 
 // The one donor resolver: the verifier, its binding-failure path and the model's qualification all ask it, so they cannot disagree.
-// (a) The pool rule is the single qualified source record on the depth, writing the draw's SRV0. (b) Only where no source record of any
+// (a) The pool rule is the single qualified source record on the depth, writing the draw's SRV0, or, where every record on the depth is
+// one, the record whose camera the caller names from CB2 (poolSelectable). (b) Only where no source record of any
 // kind exists on the depth does the witness stand in. (c) It must be an unconflicted entry for (depth, SRV0) of another target, of the
 // draw's dsv, depth format and extent, with a full viewport and a current camera, written before q; (d) and no other entry on the
 // depth may carry a different camera, so a second camera on the depth fails closed. (e) Where no source record and no entry stand on the
@@ -662,15 +671,30 @@ inline FlatDeferredDonor flatRuntimeDeferredDonor(const FlatRuntimePrefix& p,
        !k.srvView[0] || !k.srvResource[0] || !fullViewport(k,k.width,k.height))return out;
     if(out.poolRecords) {
         out.why=FlatDeferredDonorWhy::PoolRule;
-        const FlatContractRecord* donor=nullptr;
+        // Every source record on the depth must be a qualified pool record of the pass's SRV0 in its layout, current, and before q; one
+        // such record is the donor. Records are one per camera (flatRuntimeSameCamera), so two or more are as many cameras, all of them
+        // known: then only the camera the caller names from CB2 (`select`) is the donor, by its 96 bytes, and only when exactly one record
+        // carries them. Unnamed, or named to none or to two, there is no donor, as before. More records than kPoolCameras: none.
+        const FlatContractRecord* candidates[FlatDeferredDonor::kPoolCameras]{};
+        uint32_t n=0;
         for(uint32_t i=0;i<p.sourcesUsed;++i) {
             const auto& r=p.sources[i];if(r.key.depth!=k.depth)continue;
-            if(donor || r.key.kind!=kFlatContractPool || !r.key.color || !r.key.rtv ||
+            if(n==FlatDeferredDonor::kPoolCameras || r.key.kind!=kFlatContractPool || !r.key.color || !r.key.rtv ||
                r.key.color!=k.srvResource[0] || r.key.color==k.color || r.key.dsv!=k.dsv ||
                r.key.depthFormat!=k.depthFormat || r.key.width!=k.width || r.key.height!=k.height ||
                r.key.depthWidth!=k.width || r.key.depthHeight!=k.height ||
                !fullViewport(r.key,k.width,k.height) || !cameraCurrent(r,p.frame) || r.last>=q)return out;
-            donor=&r;
+            candidates[n++]=&r;
+        }
+        const FlatContractRecord* donor=n==1?candidates[0]:nullptr;
+        if(n>1) {
+            out.poolSelectable=true;out.poolCameraCount=n;
+            for(uint32_t i=0;i<n;++i)out.poolCameras[i]=candidates[i]->camera;
+            if(!select)return out;
+            for(uint32_t i=0;i<n;++i)
+                if(std::memcmp(select,candidates[i]->camera,kFlatCameraBytes)==0){if(donor)return out;donor=candidates[i];}
+            if(!donor)return out;
+            out.selected=true;
         }
         if(!donor)return out;
         out.role=FlatDeferredDonorRole::Pool;out.why=FlatDeferredDonorWhy::None;

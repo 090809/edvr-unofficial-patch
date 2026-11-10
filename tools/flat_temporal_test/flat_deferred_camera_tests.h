@@ -11,6 +11,7 @@
 #include "flat_deferred_reject_tests.h"
 #include "flat_deferred_second_camera_tests.h"
 #include "flat_deferred_second_pick_tests.h"
+#include "flat_deferred_pool_pick_tests.h"
 #include "flat_deferred_landed_phase_tests.h"
 #include "flat_deferred_generated_tests.h"
 namespace deferred_camera_test {
@@ -185,6 +186,7 @@ inline unsigned run(){
  failures+=deferred_reject::run();
  failures+=deferred_second_camera::run();
  failures+=deferred_second_pick::run();
+ failures+=deferred_pool_pick::run();
  failures+=deferred_landed_phase::run();
  failures+=deferred_generated::run();
  std::ifstream cameraHeader("src/d3d11/flat_deferred_camera.h");std::string cameraSource,cameraLine;
