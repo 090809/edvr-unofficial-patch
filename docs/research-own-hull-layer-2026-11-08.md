@@ -25,8 +25,9 @@ The smear is terrain that is newly uncovered at the hull edge every frame
   a station pad with the consoles in view: `dluma` near 1 (was 0.30-0.39),
   the console grilles and strut details in sep_taa; log
   `hull layer: reflections: dispatches=` > 0, `declined=` 0.
-* **Alternatives reviewed** (2026-11-10, section of that name): the
-  checkerboard hull (no re-lighting) is promising offline, synthetic only.
+* **Alternatives reviewed** (section): checkerboard promising, synthetic only.
+  **Build A'** (compile-only; section): re-issues scissored to the hull's box;
+  next: `hull layer: rect:` `rect` near `decided`, `gpu_ms` ~0.3-0.4 lower.
 * **Night vision state** (not flown): **next dump** night vision on,
   compare median ~1.0, `night_vision=N/N`. **Station fixes** (not flown):
   a docking dump, `culled_draws` high, `filter_draws` 0, `busy=` 0.
@@ -1506,6 +1507,45 @@ alternative, however wild.
   consecutive hull-free world frames; a real test needs `HullSeq` to also
   write the main-pass HDR and MV per frame, flown in a turn, or the mode
   built and looked at.
+
+## Build A' (2026-11-10, compile-only, not flown): the re-issues scissored
+
+Every private target stays full-eye and every coordinate unchanged; only
+the layer's re-issued draws are scissored to a per-eye rectangle. Inside it
+the output must equal the previous build's.
+
+- **The rectangle.** The cover CS (`kCoverHlsl`) writes the shown pixels'
+  box into a 16-byte buffer (one atomic set an 8x8 group), copied to a
+  staging ring and read back without a stall 2+ frames later. The eye-frame
+  uses the newest box grown by 50 render px per frame of its age, at least
+  150 (head rotation max 50 px a frame), clamped to the eye. Whole eye:
+  no box yet or since the last probe, a box over 8 frames old, an empty
+  box, and a probe every 64 frames (the rectangle then waits for the probe
+  frame's box, so hull appearing far outside it is found).
+- **Scissored:** the hull and decal G-buffer re-issues, shadow mask, AO
+  apply, light volumes, sun, night vision and tonemap. A clone of the
+  game's rasterizer state with `ScissorEnable` (cached by the game's state)
+  is bound for the re-issue and the game's state and scissor rects put back
+  after; a game scissor already on is intersected. The cover CS writes 0
+  outside the rectangle.
+- **Not scissored:** the depth copy (the AO's compute steps read the private
+  depth copy over the whole eye; a scissored copy would leave old depths
+  outside), the AO and reflection compute steps, the cover CS's dispatch.
+- **Known difference from the previous build:** outside the rectangle the
+  private layer now holds no hull (the hidden hull behind the cockpit was
+  drawn there before), so an AO kernel or a reflection ray from inside the
+  rectangle that reaches outside finds no hull there. Shown pixels are at
+  least 150 px minus the head's motion from the edge.
+- **No key.** A comparison uses the previous build's logs; dumps run the
+  rectangle too, so their compare checks it against the game's hull.
+- **Next flight log:** `hull layer: rect: decided=N rect=R share=S
+  whole=no_box:..,stale:..,empty:..,probe:.. boxes=.. scissored_draws=..`.
+  Expect R near 0.95 N, share about 0.45-0.65, `no_state=0`, `stale` near
+  0; `decided=0` means it never ran. `gpu_ms` expected (estimate, both
+  eyes): gbuffer 0.47-0.6 to about 0.3-0.45, light 0.17 to about 0.1, tone
+  0.2 to about 0.13, screen 0.29 to about 0.22; total about 0.3-0.4 ms
+  less. Look for a seam at the rectangle's edges and hull missing in a
+  fast head turn.
 
 ## Optimisation debt (recorded 2026-11-08 at the pilot's request)
 

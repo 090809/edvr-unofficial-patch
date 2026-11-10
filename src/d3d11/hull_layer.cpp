@@ -111,6 +111,17 @@ constexpr uint32_t kHoldFrames = 120;
 constexpr float kTaaCurrent = 0.1f;       // the hull layer's TAA: this frame's weight against the clamped history
 constexpr UINT kTimerRing = 8;            // timestamp sets a timer keeps in flight
 constexpr int kToneStage = 10;            // Pending::stage of the tonemap re-issue (not a Stage)
+// Build A' (docs "Build A'", 2026-11-10): the layer's re-issued draws are scissored to a per-eye rectangle, the box of the
+// shown cover (alpha > 0) of an earlier frame, read back without a stall and grown by the head's rotation since: at most 50
+// render px a frame (motion.csv max 2.32 degrees), and never under 150 px (3 frames). Past kRectMaxAge frames, with no box
+// since the last probe, or an empty box, the eye-frame is whole. Every kRectProbeEvery frames an eye-frame is whole, and the
+// rectangle waits for that frame's box, so a part of the hull appearing far outside it (a hardpoint deploying) is found.
+constexpr uint32_t kRectMarginMin = 150;
+constexpr uint32_t kRectPerFrame = 50;
+constexpr uint32_t kRectMaxAge = 8;
+constexpr uint32_t kRectProbeEvery = 64;
+constexpr uint32_t kBoxBytes = 16;        // an eye's box: max(65535 - x), max(65535 - y), max(x + 1), max(y + 1) of shown pixels
+constexpr size_t kMaxScissorStates = 64;  // rasterizer clones with the scissor on, by the game's state
 
 // The ambient occlusion chain (docs "AO on the hull layer"; census 3 of 2026-11-08 21:59, capture 220517898003): per eye, after
 // the eye's depth copy, three compute steps make the 704x612 AO, and the apply draw (DEF19B03/06CD42A9, kAo) blends it into
@@ -294,21 +305,39 @@ constexpr char kCountHlsl[] = HULL_LAYER_PASS_HLSL
 // Z) and at least as near as the game's main depth, which holds the cockpit shell and no longer the hull -- with alpha 1,
 // else 0 (premultiplied); and the private depth wherever the hull is, for the TAA's reprojection. The tonemap is read through
 // a UNORM view: the bytes the game's tonemap would have written, the encoding the upscaler's input and output carry.
+// Build A': outside this frame's rectangle (rect: x0, y0, x1, y1 exclusive; the whole eye when none) the cover and Z are 0,
+// since the scissored passes drew nothing there. The shown pixels' box goes into `box` (kBoxBytes: every word a max, so a
+// clear to 0 starts it), one atomic set an 8x8 group, for the next rectangles.
 constexpr char kCoverHlsl[] =
-    "cbuffer HullLayerCoverCb : register(b0) { float clearDepth; uint width; uint height; uint coverPad; };\n"
+    "cbuffer HullLayerCoverCb : register(b0) { float clearDepth; uint width; uint height; uint coverPad; uint4 rect; };\n"
     "Texture2D<float4> tone : register(t0);\n"
     "Texture2D<float> hullDepth : register(t1);\n"
     "Texture2D<float> mainDepth : register(t2);\n"
     "RWTexture2D<float4> cover : register(u0);\n"
     "RWTexture2D<float> coverDepth : register(u1);\n"
-    "[numthreads(8, 8, 1)] void hull_layer_cover_cs(uint3 id : SV_DispatchThreadID) {\n"
-    "    if (id.x >= width || id.y >= height) return;\n"
-    "    float hz = hullDepth.Load(int3(id.xy, 0));\n"
-    "    float mz = mainDepth.Load(int3(id.xy, 0));\n"
-    "    bool hull = hz > clearDepth;\n"
-    "    bool shown = hull && hz >= mz;\n"
-    "    cover[id.xy] = shown ? float4(tone.Load(int3(id.xy, 0)).rgb, 1.0) : float4(0.0, 0.0, 0.0, 0.0);\n"
-    "    coverDepth[id.xy] = hull ? hz : 0.0;\n"
+    "RWByteAddressBuffer box : register(u2);\n"
+    "groupshared uint gBox[4];\n"
+    "[numthreads(8, 8, 1)] void hull_layer_cover_cs(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {\n"
+    "    if (gi < 4) gBox[gi] = 0;\n"
+    "    GroupMemoryBarrierWithGroupSync();\n"
+    "    bool inside = id.x < width && id.y < height;\n"
+    "    if (inside) {\n"
+    "        bool inRect = id.x >= rect.x && id.y >= rect.y && id.x < rect.z && id.y < rect.w;\n"
+    "        float hz = hullDepth.Load(int3(id.xy, 0));\n"
+    "        float mz = mainDepth.Load(int3(id.xy, 0));\n"
+    "        bool hull = inRect && hz > clearDepth;\n"
+    "        bool shown = hull && hz >= mz;\n"
+    "        cover[id.xy] = shown ? float4(tone.Load(int3(id.xy, 0)).rgb, 1.0) : float4(0.0, 0.0, 0.0, 0.0);\n"
+    "        coverDepth[id.xy] = hull ? hz : 0.0;\n"
+    "        if (shown) {\n"
+    "            InterlockedMax(gBox[0], 65535u - id.x);\n"
+    "            InterlockedMax(gBox[1], 65535u - id.y);\n"
+    "            InterlockedMax(gBox[2], id.x + 1u);\n"
+    "            InterlockedMax(gBox[3], id.y + 1u);\n"
+    "        }\n"
+    "    }\n"
+    "    GroupMemoryBarrierWithGroupSync();\n"
+    "    if (gi < 4 && gBox[2] != 0) { uint prev; box.InterlockedMax(gi * 4, gBox[gi], prev); }\n"
     "}\n";
 
 // The hull layer's TAA and composite, one thread an output pixel. This frame: the cover's 3x3 around the pixel's unjittered
@@ -637,6 +666,19 @@ struct Eye {
     ID3D11Texture2D* coverZ = nullptr;
     ID3D11ShaderResourceView* coverZSrv = nullptr;
     ID3D11UnorderedAccessView* coverZUav = nullptr;
+    // Build A': the cover pass's box of the shown hull (kBoxBytes), its readback ring, the last box read (render px, x1/y1
+    // exclusive; empty when x1 is 0) and the frame it was drawn on; the probe epoch (a box older than it is not used); and this
+    // frame's rectangle, decided at the eye's first re-issue (rectOn false: whole eye).
+    ID3D11Buffer* box = nullptr;
+    ID3D11UnorderedAccessView* boxUav = nullptr;
+    Readback boxRing[kRing];
+    uint32_t boxRect[4] = {};
+    uint32_t boxFrame = 0;
+    bool haveBox = false;
+    uint32_t rectEpoch = 0;
+    uint32_t rectFrame = ~0u;
+    bool rectOn = false;
+    D3D11_RECT rect{};
     // Shader views over the private depth and the game's eye depth, kept while the texture is the same (a view holds its texture).
     ID3D11ShaderResourceView* privZSrv = nullptr;
     const void* privZOf = nullptr;
@@ -732,6 +774,12 @@ struct Window {
     // the hold restarted (the own rigs changed); the rig seeds' slot counts, and from their readbacks the radius and reach (metres).
     uint32_t rigSeeds = 0, drawSeeds = 0, holdResets = 0;
     std::vector<uint32_t> rigSlots, rigRadius, rigReach;
+    // Build A' (the "rect" line): eye-frames decided, those scissored and the sum of their rectangles' share of the eye; those
+    // left whole by reason; boxes read back (and empty ones); re-issues scissored, those intersected with the game's own
+    // scissor, and those not scissored for want of a clone.
+    uint32_t rectDecided = 0, rectFrames = 0, wholeNoBox = 0, wholeEmpty = 0, wholeProbe = 0, wholeStale = 0;
+    double rectShare = 0.0;
+    uint32_t boxesRead = 0, boxesEmpty = 0, scissorDraws = 0, scissorGame = 0, scissorNoState = 0;
 };
 
 // Separate mode: what hullLayerBeforeMainDraw bound over the game's issue, which hullLayerAfterMainDraw puts back.
@@ -756,6 +804,11 @@ struct Pending {
     ID3D11VertexShader* vs = nullptr;
     ID3D11ShaderResourceView* vsMask = nullptr;
     bool keepOwn = false;
+    // Build A': the re-issue ran scissored to the eye's rectangle; the game's rasterizer state (a reference) and scissor rects.
+    bool scissored = false;
+    ID3D11RasterizerState* raster = nullptr;
+    UINT scissorCount = 0;
+    D3D11_RECT scissors[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE] = {};
 };
 
 // The pending AO step re-issue: the compute slots Begin bound over, which End puts back.
@@ -797,6 +850,12 @@ struct CompGpu {
     ID3D11Buffer* sharpCb = nullptr;
 };
 
+// Build A': the game's rasterizer states (references held, so an address is not reused) and their clones with ScissorEnable.
+struct ScissorState {
+    ID3D11RasterizerState* game = nullptr;   // null: the default state
+    ID3D11RasterizerState* clone = nullptr;
+};
+
 std::string g_mode = "off";
 ID3D11Device* g_device = nullptr;   // a reference
 std::vector<Mirror> g_mirrors;
@@ -833,6 +892,7 @@ bool g_discard = false;
 uint32_t g_hold = 0;
 Comp g_comp[2];
 CompGpu g_cgpu;
+std::vector<ScissorState> g_scissorStates;
 GpuTimer g_toneTimer, g_compTimer;
 bool g_saidFrameGen = false, g_saidMaskLarge = false, g_saidToneDecline = false, g_saidDecline[kDeclines] = {};
 // Station fixes: the busy governor (decided at the frame boundary, before the next frame's draws), the calm frames counted while it
@@ -1016,6 +1076,25 @@ void releaseTone(Eye& e) {
     e.privZOf = e.mainZOf = nullptr;
     e.toneRtvFmt = DXGI_FORMAT_UNKNOWN;
     e.toneW = e.toneH = 0;
+    // Build A': the box is the cover's, so it goes with it; the next rectangles wait for a box of the remade cover.
+    releaseRef(e.boxUav);
+    releaseRef(e.box);
+    for (auto& r : e.boxRing) {
+        releaseRef(r.staging);
+        r.pending = false;
+    }
+    e.haveBox = false;
+    e.rectFrame = ~0u;
+    e.rectOn = false;
+}
+
+// Build A': the rasterizer clones.
+void releaseScissorStates() {
+    for (auto& s : g_scissorStates) {
+        releaseRef(s.game);
+        releaseRef(s.clone);
+    }
+    g_scissorStates.clear();
 }
 
 void releaseComp(Comp& c) {
@@ -1114,6 +1193,7 @@ void releaseGpu() {
     releaseRef(g_cgpu.sharpCb);
     g_cgpu = CompGpu{};
     for (auto& c : g_comp) releaseComp(c);
+    releaseScissorStates();
     releaseTimer(g_toneTimer);
     releaseTimer(g_compTimer);
     releaseStageTimes();
@@ -2916,7 +2996,7 @@ bool ensureCompGpu() {
     sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
     sd.ComparisonFunc = D3D11_COMPARISON_NEVER;
     sd.MaxLOD = D3D11_FLOAT32_MAX;
-    g_cgpu.coverCb = makeConstantBuffer(16);
+    g_cgpu.coverCb = makeConstantBuffer(32);
     g_cgpu.taaCb = makeConstantBuffer(160);
     g_cgpu.sharpCb = makeConstantBuffer(16);
     if (FAILED(g_device->CreateSamplerState(&sd, &g_cgpu.linear)) || !g_cgpu.coverCb || !g_cgpu.taaCb || !g_cgpu.sharpCb) {
@@ -3107,14 +3187,31 @@ void coverPass(ID3D11DeviceContext* ctx, int ei, const void* toneOut) {
         sayToneDeclined("the eye depth and the tonemap's output differ in size");
         return;
     }
-    uint32_t cb[4] = {0u, e.toneW, e.toneH, 0u};
+    // Build A': the rectangle the eye's re-issues were scissored to this frame (the whole eye when none), and the box made
+    // fresh for the readback (the buffer and its ring are made at the first cover pass of these tone targets).
+    const bool rectOn = e.rectOn && e.rectFrame == g_frame;
+    uint32_t cb[8] = {0u, e.toneW, e.toneH, 0u, 0u, 0u, e.toneW, e.toneH};
+    if (rectOn) {
+        cb[4] = static_cast<uint32_t>(e.rect.left);
+        cb[5] = static_cast<uint32_t>(e.rect.top);
+        cb[6] = static_cast<uint32_t>(e.rect.right);
+        cb[7] = static_cast<uint32_t>(e.rect.bottom);
+    }
     std::memcpy(&cb[0], &e.clearDepth, sizeof e.clearDepth);
     vScreenUpdateSubresourceRaw(ctx, g_cgpu.coverCb, 0, nullptr, cb, 0, 0);
+    if (!e.box && !makeRawBuffer(kBoxBytes, true, &e.box, nullptr, &e.boxUav)) {
+        releaseRef(e.boxUav);
+        releaseRef(e.box);
+    }
+    if (e.boxUav) {
+        static const UINT zero[4] = {0u, 0u, 0u, 0u};
+        ctx->ClearUnorderedAccessViewUint(e.boxUav, zero);
+    }
     {
         CsStageSave save;
         save.save(ctx);
         ID3D11ShaderResourceView* srvs[3] = {e.toneSrv, e.privZSrv, e.mainZSrv};
-        ID3D11UnorderedAccessView* uavs[CsStageSave::kUavs] = {e.coverUav, e.coverZUav};
+        ID3D11UnorderedAccessView* uavs[CsStageSave::kUavs] = {e.coverUav, e.coverZUav, e.boxUav};
         ctx->CSSetUnorderedAccessViews(0, CsStageSave::kUavs, uavs, nullptr);
         ctx->CSSetShader(g_cgpu.coverCs, nullptr, 0);
         ctx->CSSetShaderResources(0, 3, srvs);
@@ -3123,6 +3220,21 @@ void coverPass(ID3D11DeviceContext* ctx, int ei, const void* toneOut) {
         ID3D11UnorderedAccessView* none[CsStageSave::kUavs] = {};
         ctx->CSSetUnorderedAccessViews(0, CsStageSave::kUavs, none, nullptr);   // C and Z off before the game's views come back
         save.restore(ctx);
+    }
+    // The box into a free staging buffer of the ring (none free: this frame's box is not read; the readback says nothing).
+    if (e.box) {
+        Readback* slot = nullptr;
+        for (auto& r : e.boxRing)
+            if (!r.pending) {
+                slot = &r;
+                break;
+            }
+        if (slot && !slot->staging) slot->staging = makeStagingBuffer(kBoxBytes);
+        if (slot && slot->staging) {
+            vScreenCopyResourceRaw(ctx, slot->staging, e.box);
+            slot->frame = g_frame;
+            slot->pending = true;
+        }
     }
     e.toneFrame = g_frame;
     e.toneOut = toneOut;
@@ -3345,7 +3457,146 @@ void readBacks(ID3D11DeviceContext* ctx) {
             g_lastOwn = v[0];
             g_haveOwn = true;
         }
+        // Build A': the cover's boxes, the newest one kept (render px; an empty box keeps x1 = 0).
+        for (auto& r : e.boxRing) {
+            if (!r.pending || !r.staging || g_frame - r.frame < kReadbackLag) continue;
+            D3D11_MAPPED_SUBRESOURCE map{};
+            const HRESULT hr = ctx->Map(r.staging, 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &map);
+            if (hr == DXGI_ERROR_WAS_STILL_DRAWING) continue;
+            r.pending = false;
+            if (FAILED(hr)) continue;
+            uint32_t v[kBoxBytes / 4] = {};
+            std::memcpy(v, map.pData, sizeof v);
+            ctx->Unmap(r.staging, 0);
+            ++g_win.boxesRead;
+            if (e.haveBox && r.frame < e.boxFrame) continue;   // an older box than the one held
+            const bool empty = v[2] == 0u || v[3] == 0u;
+            if (empty) ++g_win.boxesEmpty;
+            e.boxRect[0] = empty ? 0u : 65535u - v[0];
+            e.boxRect[1] = empty ? 0u : 65535u - v[1];
+            e.boxRect[2] = empty ? 0u : v[2];
+            e.boxRect[3] = empty ? 0u : v[3];
+            e.boxFrame = r.frame;
+            e.haveBox = true;
+        }
     }
+}
+
+// Build A': this frame's rectangle for eye `ei`, decided at its first re-issue: the newest box read back, drawn on or after
+// the probe epoch, grown by kRectPerFrame a frame of its age (at least kRectMarginMin), clamped to the eye. False: the whole eye.
+bool eyeRect(int ei, D3D11_RECT* out) {
+    Eye& e = g_eyes[ei];
+    if (e.rectFrame != g_frame) {
+        e.rectFrame = g_frame;
+        e.rectOn = false;
+        ++g_win.rectDecided;
+        const uint32_t w = e.w, h = e.h;
+        if (g_frame - e.rectEpoch >= kRectProbeEvery) {
+            e.rectEpoch = g_frame;   // the probe: this frame whole, then a box of it or later
+            ++g_win.wholeProbe;
+        } else if (!e.haveBox || e.boxFrame < e.rectEpoch || !w || !h || e.toneW != w || e.toneH != h) {
+            ++g_win.wholeNoBox;
+        } else if (g_frame - e.boxFrame > kRectMaxAge) {
+            ++g_win.wholeStale;
+        } else if (e.boxRect[2] == 0u) {
+            ++g_win.wholeEmpty;
+        } else {
+            const uint32_t m = (std::max)(kRectMarginMin, kRectPerFrame * (g_frame - e.boxFrame));
+            const uint32_t x0 = e.boxRect[0] > m ? e.boxRect[0] - m : 0u;
+            const uint32_t y0 = e.boxRect[1] > m ? e.boxRect[1] - m : 0u;
+            const uint32_t x1 = (std::min)(w, e.boxRect[2] + m);
+            const uint32_t y1 = (std::min)(h, e.boxRect[3] + m);
+            if (x0 < x1 && y0 < y1) {
+                e.rect.left = static_cast<LONG>(x0);
+                e.rect.top = static_cast<LONG>(y0);
+                e.rect.right = static_cast<LONG>(x1);
+                e.rect.bottom = static_cast<LONG>(y1);
+                e.rectOn = true;
+                ++g_win.rectFrames;
+                g_win.rectShare += static_cast<double>(x1 - x0) * (y1 - y0) / (static_cast<double>(w) * h);
+            } else {
+                ++g_win.wholeEmpty;
+            }
+        }
+    }
+    if (e.rectOn) *out = e.rect;
+    return e.rectOn;
+}
+
+// Build A': the game's rasterizer state's clone with ScissorEnable, made once and kept (null: none could be made).
+ID3D11RasterizerState* scissorClone(ID3D11RasterizerState* game) {
+    for (const auto& s : g_scissorStates)
+        if (s.game == game) return s.clone;
+    if (g_scissorStates.size() >= kMaxScissorStates) releaseScissorStates();   // a churn of the game's states: start over
+    D3D11_RASTERIZER_DESC d{};
+    if (game) {
+        game->GetDesc(&d);
+    } else {
+        d.FillMode = D3D11_FILL_SOLID;   // the default state's desc
+        d.CullMode = D3D11_CULL_BACK;
+        d.DepthClipEnable = TRUE;
+    }
+    d.ScissorEnable = TRUE;
+    ScissorState s;
+    if (FAILED(g_device->CreateRasterizerState(&d, &s.clone))) s.clone = nullptr;
+    s.game = game;
+    if (game) game->AddRef();
+    g_scissorStates.push_back(s);
+    return s.clone;
+}
+
+// Build A': right after a re-issue was set up (g_pending), before it is issued: scissor it to its eye's rectangle, the
+// game's own scissor intersected when its state has one on. The depth copy stays whole: the AO's compute steps read the
+// private depth copy over the whole eye, and a scissored copy would leave last frames' depths outside the rectangle.
+void scissorPending(ID3D11DeviceContext* ctx) {
+    Pending& p = g_pending;
+    if (!p.active || p.eye < 0 || p.stage == kCopy || !g_device) return;
+    D3D11_RECT r{};
+    if (!eyeRect(p.eye, &r)) return;
+    ID3D11RasterizerState* game = nullptr;
+    ctx->RSGetState(&game);
+    ID3D11RasterizerState* clone = scissorClone(game);
+    if (!clone) {
+        ++g_win.scissorNoState;
+        releaseRef(game);
+        return;
+    }
+    D3D11_RASTERIZER_DESC gd{};
+    if (game) game->GetDesc(&gd);
+    p.scissorCount = D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
+    ctx->RSGetScissorRects(&p.scissorCount, p.scissors);
+    D3D11_RECT set[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE] = {};
+    UINT n = 1;
+    set[0] = r;
+    if (game && gd.ScissorEnable && p.scissorCount) {
+        // The game's scissor applies already: each of its rects intersected with the eye's (an empty one stays empty).
+        n = p.scissorCount;
+        for (UINT i = 0; i < n; ++i) {
+            const D3D11_RECT& g = p.scissors[i];
+            set[i].left = (std::max)(g.left, r.left);
+            set[i].top = (std::max)(g.top, r.top);
+            set[i].right = (std::max)(set[i].left, (std::min)(g.right, r.right));
+            set[i].bottom = (std::max)(set[i].top, (std::min)(g.bottom, r.bottom));
+        }
+        ++g_win.scissorGame;
+    }
+    p.raster = game;   // the reference passes to hullLayerEnd
+    p.scissored = true;
+    ctx->RSSetState(clone);
+    ctx->RSSetScissorRects(n, set);
+    ++g_win.scissorDraws;
+}
+
+// Build A': the game's rasterizer state and scissor rects back after the re-issue.
+void unscissorPending(ID3D11DeviceContext* ctx) {
+    Pending& p = g_pending;
+    if (!p.scissored) return;
+    if (ctx) {
+        ctx->RSSetState(p.raster);
+        ctx->RSSetScissorRects(p.scissorCount, p.scissorCount ? p.scissors : nullptr);
+    }
+    releaseRef(p.raster);
+    p.scissored = false;
 }
 
 const char* writeTexture(ID3D11DeviceContext* ctx, ID3D11Texture2D* staging, const std::wstring& dir, const wchar_t* name, int eye) {
@@ -3902,6 +4153,15 @@ void report() {
                         g_win.failTone, g_win.failComposite, g_win.declined[kDcStale], g_win.declined[kDcSize], g_win.declined[kDcGpu], g_win.toned,
                         g_win.toneDeclined, g_win.historyResets, g_win.byIndex, g_win.ownMax, g_win.siteAfterResolve, g_win.siteUpscalerOut, toneMs,
                         compMs, kHoldFrames);
+        Log::get().note("hull layer: rect: decided=%u rect=%u share=%.3f whole=no_box:%u,stale:%u,empty:%u,probe:%u boxes=%u empty_boxes=%u "
+                        "scissored_draws=%u with_game_scissor=%u no_state=%u (Build A': eye-frames whose re-issues were decided, those scissored "
+                        "to the shown hull's box of %u+ frames before grown %u px a frame of its age (at least %u), and their mean share of the "
+                        "eye; whole-eye eye-frames by reason, a probe every %u frames; cover boxes read back; draws re-issued scissored; "
+                        "decided=0 means the rectangle never ran)",
+                        g_win.rectDecided, g_win.rectFrames, g_win.rectFrames ? g_win.rectShare / g_win.rectFrames : -1.0, g_win.wholeNoBox,
+                        g_win.wholeStale, g_win.wholeEmpty, g_win.wholeProbe, g_win.boxesRead, g_win.boxesEmpty,
+                        g_win.scissorDraws, g_win.scissorGame, g_win.scissorNoState, kReadbackLag, kRectPerFrame, kRectMarginMin,
+                        kRectProbeEvery);
         g_saidMaskLarge = false;   // the large-mask line once a window
     }
 }
@@ -5106,13 +5366,18 @@ bool hullLayerBegin(ID3D11DeviceContext* ctx, char kind, UINT count, UINT instan
     if (!detail::g_hullLayerOn || !ctx || g_pending.active) return false;
     if (g_benchSleep) return false;   // the variant bench's original: asleep, and not counted as busy
     if (g_busy) return busyDraw(ctx);
-    if (g_dump != Dump::Capturing) return beginDraw(ctx, kind, count, instances, startInstance);
+    if (g_dump != Dump::Capturing) {
+        if (!beginDraw(ctx, kind, count, instances, startInstance)) return false;
+        scissorPending(ctx);   // Build A': the re-issue scissored to its eye's rectangle
+        return true;
+    }
     // Dump v2, the dump frame: the draw's bindings before the hook (it may bind the private ones), and after it the lighting
     // window's record (HullLights.json).
     ++g_drawSeq;
     const DrawSnap snap = snapDraw(ctx);
     const bool reissue = beginDraw(ctx, kind, count, instances, startInstance);
     recordLight(snap, kind, count, instances, startInstance, reissue);
+    if (reissue) scissorPending(ctx);   // the capture frame too: its comparison checks the rectangle against the game's hull
     return reissue;
 }
 
@@ -5143,6 +5408,7 @@ void hullLayerEnd(ID3D11DeviceContext* ctx) {
     if (!g_pending.active) return;
     Pending& p = g_pending;
     if (p.stage != kToneStage) stageClose(ctx);   // dump v2: right after the re-issue (the tonemap's closes after its cover pass)
+    unscissorPending(ctx);   // Build A': the game's rasterizer state and scissor back
     if (p.keepOwn) {
         vScreenVSSetShaderRaw(ctx, p.vs, nullptr, 0);
         ctx->VSSetShaderResources(kKeepOwnVsSlot, 1, &p.vsMask);
