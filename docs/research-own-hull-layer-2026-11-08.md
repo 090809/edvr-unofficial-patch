@@ -15,21 +15,15 @@ The smear is terrain that is newly uncovered at the hull edge every frame
   Step 1 CONFIRMED (20:30, cfa4e5f5: median 1.000). Steps 2-3, AO, dump
   v2, station fixes, night vision state: their sections; not all flown.
   **Open:** the 6 own forward draws still draw in the world.
-* **Variant bench** (section "Variant bench", 2026-11-10, compile-only,
-  not flown): one press of `hotkey.hull_bench` runs orig_a, sep_taa,
-  sep_noaa, dlss_full, dlss_sub, orig_b live (native, native_fxaa refused:
-  shader dump first) to `eye_<stamp>_Bench*`, for `hull_bench_report.py`.
-* **Next flight (morning):** compile-only install of this branch's HEAD.
-  In the game dir's `edvr.ini`: `[diag] hull_layer = separate`,
-  `[hotkey] hull_bench = <a bare key Elite does not bind>`,
-  `[advanced] glare_shader_dump = 1` (stage 3: the native rect's PS; needs
-  the game started with it; set 0 after), FG off. Landed (or hovering,
-  throttle 0) over terrain with the wing edges in view in both eyes, not
-  at a station; press, hold the head still until "Hull bench done" (~10 s).
-  Then one `hotkey.dump_eyes` press (HullLights.json) and the night-vision
-  and docking checks below. Read: `edvr_log.py --health` ("hull layer
-  bench" row), then `hull_bench_report.py <edvr_logs>\eyes\eye_<stamp>
-  --expect-build HEAD`.
+* **Variant bench FLOWN** (2026-11-10, 44d83543 and 4fd502ad; section
+  "Bench flown"): works; sep_taa 2.1-2.9 ms layer, dlss_full 7.2-8.5 ms
+  (+0.9 GB NGX), dlss_sub refused (0xBAD00005). Found: cockpit decals lost
+  in the main pass; the hull at 0.30-0.39 on a station pad.
+* **Next flight (fold into normal play, no dump):** HEAD with the decal
+  fix and the reflection re-issue. One `hotkey.hull_bench` (F11) press on
+  a station pad with the consoles in view: `dluma` near 1 (was 0.30-0.39),
+  the console grilles and strut details in sep_taa; log
+  `hull layer: reflections: dispatches=` > 0, `declined=` 0.
 * **Night vision state** (not flown): **next dump** night vision on,
   compare median ~1.0, `night_vision=N/N`. **Station fixes** (not flown):
   a docking dump, `culled_draws` high, `filter_draws` 0, `busy=` 0.
@@ -66,6 +60,9 @@ The smear is terrain that is newly uncovered at the hull edge every frame
     the transport's parts): section "Rig seed".
   * ruled out (2026-11-10, offline): unknown lights as the cause of the
     ~0% compares, because those 15 dumps are exactly the night-vision ones.
+  * ruled out (2026-11-10, bench): exposure as the cause of the dark hull on
+    the pad, because the world moved 0.94-1.03 while the hull moved 0.30-0.39
+    and the tonemap takes exposure from its VS for both.
 
 ## 1. How Elite draws the own hull
 
@@ -1420,6 +1417,47 @@ particular:
   as their UNORM);
 - the writer's throughput (about 1.7 GB a press);
 - the memcpy hitch on the render thread during capture.
+
+## Bench flown (2026-11-10 07:00-07:17, builds 44d83543 and 4fd502ad)
+
+Env: OpenXR (EDVR runtime), 2817x2448 render, 3756x3264 output an eye,
+DLSS preset K quality, FG off. 14 presses; `hull_bench_report.py` on each.
+
+- **Second DLSS refused** on 44d83543 in all 11 presses: `0xBAD00002` full,
+  `0xBAD00005` subrect. Cause: its colour, depth and motion inputs had no
+  shader-resource bind flag (`makeTexture` sets it only for a view). Fixed
+  in 4fd502ad; dlss_full then ran: hull DLSS 3.6-4.2 ms both eyes, layer
+  total 7.2-8.5 ms, NGX 890 MB, sharpness 1.27-1.48 (sep_taa = 1, the
+  original 1.12-1.41), shimmer like the original. dlss_sub still
+  `0xBAD00005` (open).
+- Still presses (071557, 071633): sep_taa 2.1-2.9 ms, about as sharp as the
+  original, less shimmer; sep_noaa 1.8-2.4 ms, shimmer 4-9x. Memory own
+  1.2-1.3 GB both eyes. The report's `frame ms` doubles on every layer
+  variant, which the layer's ms do not explain: not trusted yet.
+- **Cockpit details lost** (pilot: the beam above the glass): the console
+  grilles and the strut details vanish in every separate variant, at
+  pixels outside the composite cover (`Bench_Mask`). The main pass gave
+  every own-slot decal (BBE5) the own discard; own records also carry the
+  decals on the cockpit's consoles and struts, which the layer does not
+  draw, so they were in neither image. Fix (HEAD): decals stay in the main
+  pass; a decal over the removed hull projects nothing, the world behind
+  is outside its box. The layer still re-issues them on its hull.
+  `decal_draws=` in the main-pass line is now always 0.
+- **Hull dark on a station pad**, not in the hangar: dluma 0.30-0.39
+  (065707, 065728) against 1.05 docked and 1.06 over a planet; the cover
+  (our tonemap, before TAA) is already dark. Leading cause: the game's
+  reflection pass after the last light volume (`cs_5998146D`,
+  `cs_EB0245DE`, indirect over 120 px tiles: depth copy, stencil,
+  G-buffer, an environment cubemap array, a BRDF table; adds into the HDR
+  at u0 and an R16 target at u1), which the layer did not re-issue.
+  `GameHdrLit` is staged before it, so the compares never saw it. Fix
+  (HEAD, untested): the pair re-issued like an AO step into the private HDR
+  with the game's tile list (`hull layer: reflections:` line). Risk: the
+  game's tiles come from the main pass without the hull; a tile with only
+  space behind the hull may be skipped.
+- Also seen, not acted on: six own forward draws (glass candidates) still
+  draw in the world; a 6-vertex overlay `5DAD41AA` after the tonemap; the
+  report's stillness test flags every flight press (the world moves).
 
 ## Optimisation debt (recorded 2026-11-08 at the pilot's request)
 

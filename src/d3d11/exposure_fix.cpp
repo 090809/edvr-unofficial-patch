@@ -709,9 +709,18 @@ void STDMETHODCALLTYPE hookedDispatchIndirect(ID3D11DeviceContext* self,
     if (drawCensusArmed()) {
         drawCensusDispatch(self, 0, 0, 0, foreignContext(self), args, off);
     }
-    if (!foreignContext(self)) s->computeThisFrame = true;
+    const bool owner = !foreignContext(self);
+    if (owner) s->computeThisFrame = true;
 
     s->realDispatchIndirect(self, args, off);
+    // diag.hull_layer (TEMPORARY): the game's reflection pass re-issued into the hull layer's private HDR with the same arguments.
+    if (owner && args && hullLayerWanted()) {
+        VrWorldInternalScope internal;
+        if (hullLayerBeginDispatch(self, hashOf(bindingGet(BindSlot::Cs)))) {
+            s->realDispatchIndirect(self, args, off);
+            hullLayerEndDispatch(self);
+        }
+    }
 }
 
 // F2: is the bound compute shader the skinning palette chain (skin_join.h kChainHash)? Asked of every owner dispatch while the second skin

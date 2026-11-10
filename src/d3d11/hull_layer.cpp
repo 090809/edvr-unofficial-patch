@@ -121,6 +121,13 @@ constexpr uint64_t kAoCs[3] = {0xFB277B33F0865348ull,    // the depth copy deint
                                0x9347F8FC2DCE0248ull,    // the HBAO a slice (11x10x16): the slices, G-buffer RT0, the kernel buffer
                                0xD31E7812990B19A6ull};   // the slices put back together: the 704x612 AO the apply draw reads
 constexpr int kAoSteps = 3;
+// The game's reflection pass after the last light volume: two indirect dispatches over screen tiles that read the depth copy,
+// the stencil and the G-buffer, sample the environment cubemap array along the reflection vector and a BRDF table, and add
+// the result into the eye's HDR (u0) and an R16 target (u1) (shader dump 2026-11-10). It lights the hull wherever reflections
+// matter (a station pad: the hull at 0.30-0.39 of the original without it, bench 065707/065728), so separate mode re-issues
+// it like an AO step, into the private HDR, with the game's own tile list. The pair, in issue order.
+constexpr uint64_t kReflCs[2] = {0x5998146D464F5C0Eull, 0xEB0245DE0BB23BB6ull};
+constexpr int kReflSteps = 2;
 constexpr uint8_t kAoApplyBit = static_cast<uint8_t>(1u << kAoSteps);
 constexpr uint8_t kAoAllSteps = static_cast<uint8_t>(kAoApplyBit - 1u);
 constexpr UINT kCsSrvSlots = 16;                               // CS resource slots a step is searched and restored over (it uses t0-t2)
@@ -529,6 +536,7 @@ struct Eye {
     const void* copyGame = nullptr;
     const void* aoOut[kAoOwned] = {};
     uint8_t aoOutCount = 0, aoDone = 0, aoSeen = 0;
+    uint8_t reflSeen = 0;   // the reflection pair's steps the game ran for this eye this frame (kReflCs)
     float clearDepth = 0.0f;
     uint32_t records = 0, seedInstances = 0;
     uint32_t rigGen = ~0u;   // the own rigs' generation the eye's held reach (stats word 7) belongs to
@@ -652,6 +660,7 @@ struct Window {
     // step dispatches and apply draws re-issued; eye-frames where the game ran a step (or the apply) for the eye and it was
     // not re-issued, by step; chain dispatches whose eye could not be named (none of its resources is an eye's).
     uint32_t aoEyeFrames = 0, aoFull = 0, aoDispatches = 0, aoApplied = 0, aoMissed[kAoSteps + 1] = {}, aoNoEye = 0;
+    uint32_t reflDispatches = 0, reflNoEye = 0, reflDeclined = 0;
     // The rig seed (the "own seed" line): eye-frames seeded from the rig probe's own slots and from the seed draw (the fallback),
     // the hold restarted (the own rigs changed); the rig seeds' slot counts, and from their readbacks the radius and reach (metres).
     uint32_t rigSeeds = 0, drawSeeds = 0, holdResets = 0;
@@ -997,6 +1006,7 @@ void resetFrame(Eye& e) {
     e.copyGame = nullptr;
     for (auto& o : e.aoOut) o = nullptr;
     e.aoOutCount = e.aoDone = e.aoSeen = 0;
+    e.reflSeen = 0;
     e.clearDepth = 0.0f;
     e.records = e.seedInstances = 0;
     e.ownDraws = e.ownDecals = e.decals = 0;
@@ -2650,6 +2660,73 @@ bool beginAoStep(ID3D11DeviceContext* ctx, int step) {
     return true;
 }
 
+// Right after the game's indirect dispatch of reflection step `step` (kReflCs), with its bindings still bound: the eye by its
+// inputs (the G-buffer, the depth copy), its HDR at a UAV swapped for the private HDR, its other targets given private copies,
+// its private-copied inputs swapped. Separate mode only, once per eye and step a frame, and only on an eye whose private
+// G-buffer and HDR are this frame's. True: the caller dispatches the same indirect arguments again (the game's tile list)
+// and calls hullLayerEndDispatch.
+bool beginReflStep(ID3D11DeviceContext* ctx, int step) {
+    if (!detail::g_hullLayerSeparate) return false;
+    QueryPerformanceCounter(&g_entryQpc);   // dump v2: the item's CPU time starts here
+    ID3D11ShaderResourceView* srv[kCsSrvSlots] = {};
+    ID3D11UnorderedAccessView* uav[kCsUavSlots] = {};
+    ctx->CSGetShaderResources(0, kCsSrvSlots, srv);
+    ctx->CSGetUnorderedAccessViews(0, kCsUavSlots, uav);
+    const auto decline = [&] {
+        ++g_win.reflDeclined;
+        releaseCsSlots(srv, uav);
+        return false;
+    };
+    int ei = -1;
+    bool both = false;
+    for (UINT i = 0; i < kCsSrvSlots; ++i)
+        if (srv[i]) noteAoEye(aoEyeOf(resourceOf(srv[i])), &ei, &both);
+    if (ei < 0 || both) {
+        if (g_eyes[0].gb == Gb::Done || g_eyes[1].gb == Gb::Done) ++g_win.reflNoEye;
+        releaseCsSlots(srv, uav);
+        return false;
+    }
+    Eye& e = g_eyes[ei];
+    const uint8_t bit = static_cast<uint8_t>(1u << step);
+    if (e.reflSeen & bit) {   // once per eye per frame: a later use of the shader is not the eye's pass
+        releaseCsSlots(srv, uav);
+        return false;
+    }
+    e.reflSeen |= bit;
+    if (e.gb != Gb::Done || !e.hdrGame || !findMirror(e.hdrGame)) return decline();   // no private HDR lit this frame
+    // Targets: the eye's HDR must be one of them (the pass adds into it); it goes to its private twin, made by the lighting.
+    // Every other target gets a private copy (the R16 one).
+    ID3D11UnorderedAccessView* bindUav[kCsUavSlots] = {};
+    bool hdr = false;
+    for (UINT i = 0; i < kCsUavSlots; ++i) {
+        if (!uav[i]) continue;
+        const bool isHdr = resourceOf(uav[i]) == e.hdrGame;
+        hdr = hdr || isHdr;
+        bindUav[i] = static_cast<ID3D11UnorderedAccessView*>(privateView(ViewKind::Uav, uav[i], !isHdr));
+        if (!bindUav[i]) return decline();
+    }
+    if (!hdr) return decline();
+    ID3D11ShaderResourceView* bindSrv[kCsSrvSlots] = {};
+    for (UINT i = 0; i < kCsSrvSlots; ++i) {
+        bindSrv[i] = srv[i];
+        if (!srv[i] || !findMirror(resourceOf(srv[i]))) continue;
+        auto* p = static_cast<ID3D11ShaderResourceView*>(privateView(ViewKind::Srv, srv[i], false));
+        if (!p) return decline();
+        bindSrv[i] = p;
+    }
+    UINT keep[kCsUavSlots];
+    for (auto& k : keep) k = ~0u;
+    ctx->CSSetShaderResources(0, kCsSrvSlots, bindSrv);
+    ctx->CSSetUnorderedAccessViews(0, kCsUavSlots, bindUav, keep);
+    g_dispatch = DispatchPending{};
+    g_dispatch.active = true;
+    for (UINT i = 0; i < kCsSrvSlots; ++i) g_dispatch.srv[i] = srv[i];   // the references pass to End
+    for (UINT i = 0; i < kCsUavSlots; ++i) g_dispatch.uav[i] = uav[i];
+    ++g_win.reflDispatches;
+    stageOpen(ctx, kTsLight, true);   // dump v2: timed with the lighting; hullLayerEndDispatch closes it
+    return true;
+}
+
 // ---- Step 3: the tonemap re-issue, the cover, the composite -----------------------------------------------------------
 
 void sayToneDeclined(const char* why) {
@@ -3691,6 +3768,10 @@ void report() {
                     g_win.aoMissed[1], g_win.aoMissed[2], g_win.aoMissed[kAoSteps], g_win.aoNoEye, kAoSteps);
     reportStages();
     if (detail::g_hullLayerSeparate) {
+        Log::get().note("hull layer: reflections: dispatches=%u no_eye=%u declined=%u (the game's reflection pass, two indirect dispatches an eye, "
+                        "re-issued into the private HDR with the game's tile list; no_eye: pass dispatches no eye's G-buffer named; declined: an "
+                        "eye's dispatch not re-issued, no private HDR this frame or a view that could not be made)",
+                        g_win.reflDispatches, g_win.reflNoEye, g_win.reflDeclined);
         Log::get().note("hull layer: main pass: own_draws=%u decal_draws=%u no_variant_draws=%u fallback_frames=%u decals_reissued=%u decal_no_slot=%u "
                         "(separate mode: draws issued with the own discard; window draws that could not take it; eye-frames whose main pass kept the own "
                         "ship, no mask)",
@@ -4828,8 +4909,11 @@ void hullLayerConfigure(Config& cfg) {
 bool hullLayerBeforeMainDraw(ID3D11DeviceContext* ctx, UINT instances, UINT startInstance) {
     if (!detail::g_hullLayerSeparate || !ctx || g_pending.active || g_main.active || g_busy || g_benchSleep) return false;   // asleep: no seed, no discard
     const uint64_t vs = bindingShaderHash(BindSlot::Vs);
-    const bool hull = isHullVs(vs), decal = vs == kDecalVs;
-    if (!hull && !decal) return false;
+    // Hull-family draws only. The own decals stay in the main pass: own records also carry the decals on the cockpit's
+    // consoles and struts, whose surfaces the layer does not draw, so discarding them lost those details in both images
+    // (bench 071557771002, 2026-11-10). A decal over a removed hull projects nothing: the world behind lies outside its box.
+    // The layer still re-issues the own decals onto its own hull.
+    if (!isHullVs(vs)) return false;
     ID3D11RenderTargetView* rtv[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT] = {};
     ID3D11DepthStencilView* dsv = nullptr;
     ctx->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, rtv, &dsv);
@@ -4842,11 +4926,10 @@ bool hullLayerBeforeMainDraw(ID3D11DeviceContext* ctx, UINT instances, UINT star
     if (ei < 0) return decline();
     Eye& e = g_eyes[ei];
     // The seed draw is the own ship's: its mask is made before it is issued, so the seed draw is discarded too.
-    if (hull && e.gb == Gb::Before && e.shell && !seedEye(ctx, rtv, dsv, ei, instances, startInstance)) return decline();
+    if (e.gb == Gb::Before && e.shell && !seedEye(ctx, rtv, dsv, ei, instances, startInstance)) return decline();
     // Step 3's safety: on a frame decided as a fallback (decideNext) the layer is still made, and the ship stays in the main pass.
     if (!g_discard) return decline();
-    const bool decalWindow = decal && e.gb == Gb::Done && e.decalOpen;   // the decals after the depth copy (decalOpen)
-    if ((!decalWindow && (e.gb != Gb::In || g_inEye != ei)) || !e.maskSrv) return decline();   // no mask this eye-frame: the draw is the game's
+    if (e.gb != Gb::In || g_inEye != ei || !e.maskSrv) return decline();   // no mask this eye-frame: the draw is the game's
     // The draw must be engine motion's substitute: its slot target at RT6, and its patched pixel shader bound.
     if (!(rtv[kSlotTarget] && resourceOf(rtv[kSlotTarget]) == e.slotGame)) {
         ++g_win.noVariant;
@@ -4860,8 +4943,8 @@ bool hullLayerBeforeMainDraw(ID3D11DeviceContext* ctx, UINT instances, UINT star
         ++g_win.noVariant;
         if (!g_saidNoVariant) {
             g_saidNoVariant = true;
-            Log::get().note("hull layer: a %s draw in the window got no own-discard variant (%s); such draws keep the own ship in the main pass (said once)",
-                            decal ? "decal" : "hull", why ? why : "?");
+            Log::get().note("hull layer: a hull draw in the window got no own-discard variant (%s); such draws keep the own ship in the main pass (said once)",
+                            why ? why : "?");
         }
         releaseRef(ps);
         return decline();
@@ -4871,13 +4954,8 @@ bool hullLayerBeforeMainDraw(ID3D11DeviceContext* ctx, UINT instances, UINT star
     ctx->PSGetShaderResources(kEngineVelocityOwnMaskPsSlot, 1, &g_main.srv);
     vScreenPSSetShaderResourcesRaw(ctx, kEngineVelocityOwnMaskPsSlot, 1, &e.maskSrv);
     vScreenPSSetShaderRaw(ctx, variant, nullptr, 0);
-    if (decal) {
-        ++e.ownDecals;
-        ++g_win.ownDecals;
-    } else {
-        ++e.ownDraws;
-        ++g_win.ownDraws;
-    }
+    ++e.ownDraws;
+    ++g_win.ownDraws;
     releaseTargets(rtv, dsv);   // the targets' references go; the variant stays bound for the game's issue
     return true;
 }
@@ -4991,6 +5069,8 @@ bool hullLayerBeginDispatch(ID3D11DeviceContext* ctx, uint64_t cs) {
     if (!detail::g_hullLayerOn || !ctx || !g_device || g_pending.active || g_main.active || g_dispatch.active || g_busy || g_benchSleep) return false;
     for (int s = 0; s < kAoSteps; ++s)
         if (kAoCs[s] == cs) return beginAoStep(ctx, s);
+    for (int s = 0; s < kReflSteps; ++s)
+        if (kReflCs[s] == cs) return beginReflStep(ctx, s);
     return false;
 }
 

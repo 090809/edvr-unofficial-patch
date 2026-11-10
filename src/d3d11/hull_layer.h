@@ -127,6 +127,8 @@ void hullLayerNoteNightVisionState();
 // bound and the bound compute shader's content hash: a step of the game's AO chain (kAoCs in hull_layer.cpp) whose eye has a
 // private G-buffer gets private UAV targets and its private-copied inputs. True: the caller dispatches the same groups once
 // more (raw), then calls hullLayerEndDispatch, which puts the game's compute views back. Both modes (dump and separate).
+// Also after an owner-context DispatchIndirect (hookedDispatchIndirect): the game's reflection pass (kReflCs), separate mode
+// only, re-issued into the private HDR; the caller then dispatches the same indirect arguments again.
 bool hullLayerBeginDispatch(ID3D11DeviceContext* ctx, uint64_t csHash);
 void hullLayerEndDispatch(ID3D11DeviceContext* ctx);
 
