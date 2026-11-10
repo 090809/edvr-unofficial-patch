@@ -68,7 +68,7 @@ LAUNCHER_LICENSE_RESOURCE = 120
 KEYS_HEADER = ("src", "installer", "update_keys.h")
 CORE_NAMES = ("d3d11.dll", "openvr/openvr_api.dll", "openvr/openxr_loader.dll",
               "openvr/OPENXR-LOADER-LICENSE.txt", "edvr.ini", "edvr-flat.ini", "edvr_profile.ini",
-              "LICENSE.txt", "DXBC-HASH-LICENSE.txt", "FIDELITYFX-SDK-DX11-LICENSE.txt",
+              "LICENSE.txt", "DXBC-HASH-LICENSE.txt", "MINIZ-LICENSE.txt", "FIDELITYFX-SDK-DX11-LICENSE.txt",
               "MIN-ED-LAUNCHER-LICENSE.txt")
 DLSS_NAMES = ("nvngx_dlss.dll", "NVIDIA-DLSS-LICENSE.txt")
 XESS_NAMES = ("libxess.dll", "INTEL-XESS-LICENSE.txt", "INTEL-XESS-THIRD-PARTY.txt")
@@ -125,6 +125,7 @@ def _files(root, no_dlss):
                    (build / "edvr-flat.ini", "edvr-flat.ini"),
                    (root / "LICENSE", "LICENSE.txt")])
     result.append((root / "third_party" / "dxbc_hash" / "LICENSE.TXT", "DXBC-HASH-LICENSE.txt"))
+    result.append((root / "third_party" / "miniz" / "LICENSE", "MINIZ-LICENSE.txt"))
     result.append((root.joinpath(*LAUNCHER_LICENSE_FILE), LAUNCHER_LICENSE_NAME))
     # AMD's FSR3 D3D11 port (MIT). Unlike NVIDIA's runtime it ships no DLL --
     # it is statically linked into d3d11.dll -- so its presence in a build is
@@ -926,7 +927,7 @@ def self_test():
                                  "openvr/OPENXR-LOADER-LICENSE.txt", "edvr-installer.exe",
                                  "README.txt", "openvr/READ-ME-FIRST.txt", "edvr.ini", "edvr-flat.ini",
                                   "README-linux.txt", LINUX_WRAPPER, LINUX_LAUNCHER,
-                                  "LICENSE.txt", "DXBC-HASH-LICENSE.txt", LAUNCHER_LICENSE_NAME}
+                                  "LICENSE.txt", "DXBC-HASH-LICENSE.txt", "MINIZ-LICENSE.txt", LAUNCHER_LICENSE_NAME}
                 assert archive.read(LINUX_WRAPPER) == wrapper_source.read_bytes()
                 assert archive.getinfo(LINUX_WRAPPER).external_attr >> 16 == 0o100755
                 assert archive.read(LINUX_LAUNCHER) == launcher_source.read_bytes()
@@ -1077,7 +1078,7 @@ def self_test():
             xess_names = set(xess_files.values())
             core_names = {"d3d11.dll", "openvr/openvr_api.dll", "openvr/openxr_loader.dll",
                           "openvr/OPENXR-LOADER-LICENSE.txt", "edvr.ini", "edvr-flat.ini",
-                          "edvr_profile.ini", "LICENSE.txt", "DXBC-HASH-LICENSE.txt", LAUNCHER_LICENSE_NAME}
+                          "edvr_profile.ini", "LICENSE.txt", "DXBC-HASH-LICENSE.txt", "MINIZ-LICENSE.txt", LAUNCHER_LICENSE_NAME}
 
             def snapshot():
                 return {path.relative_to(dist).as_posix(): (path.read_bytes() if path.is_file() else None)

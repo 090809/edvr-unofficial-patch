@@ -265,6 +265,7 @@ python tools\run_jobs.py ^
     --gate "tools\check_agent_material.py" ^
     --gate "tools\check_tool_conventions.py --self-test" ^
     --gate "tools\check_tool_conventions.py" ^
+    --gate "tools\dump_io.py --self-test" ^
     --gate "tools\layer_fixtures.py --self-test" ^
     --gate "tools\blackhole_optics.py --self-test" ^
     --gate "tools\sgra_optics.py --self-test" ^
@@ -654,6 +655,7 @@ python tools\compile_cache.py --prune --keep thunks.obj --keep weapon_ui_getter_
     "src\common\hotkey.cpp" "src\common\proxy.cpp" ^
     "src\common\frame_flag.cpp" "src\common\game_build.cpp" ^
     "src\common\iat_hook.cpp" "src\common\iniedit.cpp" ^
+    "src\common\dump_file.cpp" "src\common\dump_file_log.cpp" "src\common\miniz_impl.cpp" ^
     "src\d3d11\input_gate.cpp" "src\d3d11\joy_watch.cpp" "src\d3d11\hotkey_capture.cpp" "src\d3d11\menu.cpp" ^
     "src\d3d11\oculus_route.cpp" ^
     "src\d3d11\menu_keys.cpp" ^
@@ -739,6 +741,8 @@ REM gdi32.lib: the settings menu's panel is rasterised with GDI (the game
 REM already imports GDI32, so the DLL adds no module to the process).
 rc.exe /nologo /fo "%OBJ%\d3d11\dxbc_notice.res" "third_party\dxbc_hash\notice.rc"
 if errorlevel 1 ( echo [edvr] ERROR: DXBC notice resource failed & exit /b 1 )
+rc.exe /nologo /fo "%OBJ%\d3d11\miniz_notice.res" "third_party\miniz\notice.rc"
+if errorlevel 1 ( echo [edvr] ERROR: miniz notice resource failed & exit /b 1 )
 
 REM Version resources for both shipped DLLs. Until now only the installer
 REM carried a VERSIONINFO; an unsigned DLL with no FileVersion, CompanyName or
@@ -759,7 +763,7 @@ if errorlevel 1 ( echo [edvr] ERROR: rc.exe failed on the runtime version resour
 
 link.exe /nologo /DLL /MACHINE:X64 /INCREMENTAL:NO %EDVR_CPU_LINK% /PDB:"%BUILD%\d3d11.pdb" ^
     /DEF:"%GEN%\edvr_d3d11.def" /OUT:"%BUILD%\d3d11.dll" ^
-    "%OBJ%\d3d11\*.obj" "%OBJ%\d3d11\dxbc_notice.res" "%OBJ%\d3d11\version.res" kernel32.lib user32.lib gdi32.lib version.lib d3dcompiler.lib bcrypt.lib %NGXLIB% %FSRLIB%
+    "%OBJ%\d3d11\*.obj" "%OBJ%\d3d11\dxbc_notice.res" "%OBJ%\d3d11\miniz_notice.res" "%OBJ%\d3d11\version.res" kernel32.lib user32.lib gdi32.lib version.lib d3dcompiler.lib bcrypt.lib %NGXLIB% %FSRLIB%
 if errorlevel 1 ( echo [edvr] ERROR: link failed & exit /b 1 )
 
 echo [edvr] built %BUILD%\d3d11.dll
@@ -1475,6 +1479,7 @@ if not exist "%OBJ%\skinledger" mkdir "%OBJ%\skinledger"
     /D_CRT_SECURE_NO_WARNINGS /I"src\d3d11" ^
     /Fo"%OBJ%\skinledger"\ /Fe"%OBJ%\skinledger\skin_ledger_test.exe" ^
     "tools\skin_ledger_test\skin_ledger_test.cpp" ^
+    "src\common\dump_file.cpp" "src\common\miniz_impl.cpp" ^
     /link /INCREMENTAL:NO
 if errorlevel 1 ( echo [edvr] ERROR: skin_ledger_test build failed & exit /b 1 )
 "%OBJ%\skinledger\skin_ledger_test.exe" --dry-run || exit /b 1
@@ -2130,6 +2135,7 @@ if not exist "%OBJ%\uidepthtest" mkdir "%OBJ%\uidepthtest"
     /DWIN32_LEAN_AND_MEAN /DNOMINMAX /D_CRT_SECURE_NO_WARNINGS ^
     /Fo"%OBJ%\uidepthtest\\" /Fe"%OBJ%\uidepthtest\ui_depth_test.exe" ^
     "tools\ui_depth_test\ui_depth_test.cpp" ^
+    "src\common\dump_file.cpp" "src\common\miniz_impl.cpp" ^
     "src\d3d11\gpu_timing.cpp" "src\d3d11\gpu_span_d3d11.cpp" ^
     /link /INCREMENTAL:NO /OPT:REF d3d11.lib d3dcompiler.lib
 if errorlevel 1 ( echo [edvr] ERROR: ui_depth_test build failed & exit /b 1 )
@@ -2199,6 +2205,7 @@ if not exist "%OBJ%\holodepthtest" mkdir "%OBJ%\holodepthtest"
     /DWIN32_LEAN_AND_MEAN /DNOMINMAX /D_CRT_SECURE_NO_WARNINGS ^
     /Fo"%OBJ%\holodepthtest\\" /Fe"%OBJ%\holodepthtest\hologram_depth_test.exe" ^
     "tools\hologram_depth_test\hologram_depth_test.cpp" ^
+    "src\common\dump_file.cpp" "src\common\miniz_impl.cpp" ^
     "src\d3d11\gpu_timing.cpp" "src\d3d11\gpu_span_d3d11.cpp" ^
     /link /INCREMENTAL:NO /OPT:REF d3d11.lib d3dcompiler.lib
 if errorlevel 1 ( echo [edvr] ERROR: hologram_depth_test build failed & exit /b 1 )
@@ -2478,6 +2485,7 @@ if errorlevel 1 ( echo [edvr] ERROR: unwind fixture build failed & exit /b 1 )
     "src\d3d11\scheduler_stack_probe.cpp" "src\d3d11\scheduler_stack_hook.cpp" ^
     "src\common\code_hook.cpp" "src\common\log.cpp" "src\common\config.cpp" ^
     "src\common\proxy.cpp" "src\common\guard.cpp" ^
+    "src\common\dump_file.cpp" "src\common\miniz_impl.cpp" ^
     "%OBJ%\classification\unwind_stubs.obj" ^
     /link /INCREMENTAL:NO d3d11.lib d3dcompiler.lib user32.lib version.lib
 if errorlevel 1 ( echo [edvr] ERROR: object classification test build failed & exit /b 1 )
@@ -2493,6 +2501,7 @@ if not exist "%OBJ%\drawsnapshot" mkdir "%OBJ%\drawsnapshot"
     /DWIN32_LEAN_AND_MEAN /DNOMINMAX /D_CRT_SECURE_NO_WARNINGS ^
     /Fo"%OBJ%\drawsnapshot\\" /Fe"%OBJ%\drawsnapshot\eye_draw_snapshot_test.exe" ^
     "tools\eye_draw_snapshot_test\eye_draw_snapshot_test.cpp" ^
+    "src\common\dump_file.cpp" "src\common\miniz_impl.cpp" ^
     /link /INCREMENTAL:NO d3d11.lib d3dcompiler.lib
 if errorlevel 1 ( echo [edvr] ERROR: eye draw snapshot test build failed & exit /b 1 )
 "%OBJ%\drawsnapshot\eye_draw_snapshot_test.exe" "%OBJ%\drawsnapshot\fixture.bin" || exit /b 1
@@ -2518,9 +2527,27 @@ if not exist "%OBJ%\drawsnapshotunload" mkdir "%OBJ%\drawsnapshotunload"
     /DWIN32_LEAN_AND_MEAN /DNOMINMAX /D_CRT_SECURE_NO_WARNINGS ^
     /Fo"%OBJ%\drawsnapshotunload\\" /Fe"%OBJ%\drawsnapshotunload\eye_draw_snapshot_unload_test.exe" ^
     "tools\eye_draw_snapshot_unload_test\eye_draw_snapshot_unload_test.cpp" ^
+    "src\common\dump_file.cpp" "src\common\miniz_impl.cpp" ^
     /link /INCREMENTAL:NO d3d11.lib
 if errorlevel 1 ( echo [edvr] ERROR: eye draw snapshot unload test build failed & exit /b 1 )
 "%OBJ%\drawsnapshotunload\eye_draw_snapshot_unload_test.exe" || exit /b 1
+exit /b 0
+
+REM The eye dump's compressed container (src\common\dump_file.cpp): the production writer's files are decoded here by an
+REM independent miniz-inflate reader inside the exe, and then by tools\dump_io.py, the reader every tool uses, from the .expect
+REM files the exe leaves beside them. Covers the data-never-lost path (a chunk made to fail leaves a plain file) and the deltas.
+:rig_dump_file
+echo [edvr] === dump file container, C++ writer to Python reader ===
+if not exist "%OBJ%\dumpfile" mkdir "%OBJ%\dumpfile"
+%CC% /nologo /O2 /MT /std:c++17 /EHsc /W4 ^
+    /DWIN32_LEAN_AND_MEAN /DNOMINMAX /D_CRT_SECURE_NO_WARNINGS ^
+    /Fo"%OBJ%\dumpfile\\" /Fe"%OBJ%\dumpfile\dump_file_test.exe" ^
+    "tools\dump_file_test\dump_file_test.cpp" "src\common\dump_file.cpp" "src\common\miniz_impl.cpp" ^
+    /link /INCREMENTAL:NO
+if errorlevel 1 ( echo [edvr] ERROR: dump file test build failed & exit /b 1 )
+if exist "%OBJ%\dumpfile\out" rmdir /s /q "%OBJ%\dumpfile\out"
+"%OBJ%\dumpfile\dump_file_test.exe" "%OBJ%\dumpfile\out" || exit /b 1
+python "tools\dump_io.py" --check-dir "%OBJ%\dumpfile\out" || exit /b 1
 exit /b 0
 
 :rig_eye_tonemap_snapshot
@@ -2530,6 +2557,7 @@ if not exist "%OBJ%\tonemapsnapshot" mkdir "%OBJ%\tonemapsnapshot"
     /DWIN32_LEAN_AND_MEAN /DNOMINMAX /D_CRT_SECURE_NO_WARNINGS ^
     /Fo"%OBJ%\tonemapsnapshot\\" /Fe"%OBJ%\tonemapsnapshot\eye_tonemap_snapshot_test.exe" ^
     "tools\eye_tonemap_snapshot_test\eye_tonemap_snapshot_test.cpp" ^
+    "src\common\dump_file.cpp" "src\common\miniz_impl.cpp" ^
     /link /INCREMENTAL:NO d3d11.lib d3dcompiler.lib
 if errorlevel 1 ( echo [edvr] ERROR: tone-map snapshot test build failed & exit /b 1 )
 "%OBJ%\tonemapsnapshot\eye_tonemap_snapshot_test.exe" "%OBJ%\tonemapsnapshot\fixture.bin" || exit /b 1
@@ -2544,6 +2572,7 @@ if not exist "%OBJ%\panelsnapshot" mkdir "%OBJ%\panelsnapshot"
     /DWIN32_LEAN_AND_MEAN /DNOMINMAX /D_CRT_SECURE_NO_WARNINGS ^
     /Fo"%OBJ%\panelsnapshot\\" /Fe"%OBJ%\panelsnapshot\eye_panel_snapshot_test.exe" ^
     "tools\eye_panel_snapshot_test\eye_panel_snapshot_test.cpp" ^
+    "src\common\dump_file.cpp" "src\common\miniz_impl.cpp" ^
     /link /INCREMENTAL:NO d3d11.lib d3dcompiler.lib
 if errorlevel 1 ( echo [edvr] ERROR: panel snapshot test build failed & exit /b 1 )
 "%OBJ%\panelsnapshot\eye_panel_snapshot_test.exe" "%OBJ%\panelsnapshot\fixture.bin" || exit /b 1
@@ -3834,7 +3863,7 @@ if not exist "%OBJ%\cullgate" mkdir "%OBJ%\cullgate"
     /D_CRT_SECURE_NO_WARNINGS /DUNICODE /D_UNICODE /utf-8 ^
     /Fo"%OBJ%\cullgate\\" /Fe"%BUILD%\cull_gate_probe_test.exe" ^
     "tools\cull_gate_probe_test\cull_gate_probe_test.cpp" ^
-    "src\d3d11\cull_gate_probe.cpp" ^
+    "src\d3d11\cull_gate_probe.cpp" "src\common\dump_file.cpp" "src\common\miniz_impl.cpp" ^
     /link /INCREMENTAL:NO kernel32.lib user32.lib
 if errorlevel 1 ( echo [edvr] ERROR: cull gate probe test build failed & exit /b 1 )
 "%BUILD%\cull_gate_probe_test.exe" --dry-run || exit /b 1
@@ -4292,7 +4321,7 @@ if not exist "%OBJ%\depthwriter" mkdir "%OBJ%\depthwriter"
 %CC% /nologo /O2 /MT /std:c++17 /EHsc /W4 ^
     /DWIN32_LEAN_AND_MEAN /DNOMINMAX /D_CRT_SECURE_NO_WARNINGS ^
     /Fo"%OBJ%\depthwriter\\" /Fe"%OBJ%\depthwriter\depth_writer_probe_test.exe" ^
-    "tools\depth_writer_probe_test\depth_writer_probe_test.cpp" "src\d3d11\depth_writer_probe.cpp" ^
+    "tools\depth_writer_probe_test\depth_writer_probe_test.cpp" "src\d3d11\depth_writer_probe.cpp" "src\common\dump_file.cpp" "src\common\miniz_impl.cpp" ^
     /link /INCREMENTAL:NO d3d11.lib d3dcompiler.lib
 if errorlevel 1 ( echo [edvr] ERROR: depth writer probe test build failed & exit /b 1 )
 "%OBJ%\depthwriter\depth_writer_probe_test.exe" --dry-run || exit /b 1

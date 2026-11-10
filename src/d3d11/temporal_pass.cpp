@@ -29,6 +29,7 @@
 #include "../common/temporal_mode.h"
 #include "../common/guard.h"
 #include "../common/log.h"
+#include "../common/dump_file.h"   // the eye dump's .z container: every .bin and two BMP deltas
 #include "device_hook.h"   // the auto mip bias's source, to check against a real frame
 #include "ui_surfaces.h"   // nativeTemporalRecommended: what Elite was told, for that check
 #include "../common/native_render_settings.h"   // the published per-eye render size, for the NGX warm-up
@@ -1410,8 +1411,38 @@ void writeEyeMotionTrace(const std::wstring& dir) {
     Log::get().note("temporal aa: eye motion trace %ls: %u eye evaluations, %s (scene-frame IDs link both eyes to the crop sequence).",
                     path, g_eyeMotionTraceCount, wrote && closed == 0 ? "written" : "write failed");
 }
+// What writeEyeBmp did with a delta request (deltaBase non-null), for the caller's tally.
+struct EyeBmpWrite {
+    bool deltaUsed = false;      // the file is NAME.bmp.z, an XOR against deltaBase
+    char declinedWhy[96] = {};   // set when a delta was asked for and the file went out plain
+};
 bool writeEyeBmp(ID3D11DeviceContext* ctx, ID3D11Texture2D* st, const D3D11_TEXTURE2D_DESC& d, int eye,
-                 const wchar_t* pathIn);
+                 const wchar_t* pathIn, const wchar_t* deltaBase = nullptr, EyeBmpWrite* info = nullptr);
+
+// The two BMP pairs stored as deltas. P## goes against T## (T is written first, in writeEyeRun's loop,
+// P later in writeEyeDecisionArtifacts). The overview is L0 (writeEyeRun) and FinalCrisp_LOverview
+// (writeFinalEyeRun), and whichever of those reaches disk second is the delta against the first; in a
+// normal run that is FinalCrisp, which the run writes last. The base is always a plain file written in
+// this run under the same stamp, and writeWhole() declines the delta, leaving the second file plain,
+// unless the base is exactly as long.
+struct PlainBmp {
+    wchar_t path[MAX_PATH];
+    wchar_t stamp[16];
+    bool valid;
+};
+PlainBmp g_overviewPlain[2][2] = {};   // [eye][0 = L0/R0 of the eye run, 1 = FinalCrisp overview]
+uint32_t g_eyePTried = 0, g_eyePDelta = 0;   // P files written / stored as a delta, this run
+char g_eyeOverviewNote[2][160] = {};         // what became of L0/R0, for the run's summary line
+const wchar_t* overviewBase(int eye, int self, const wchar_t* stamp) {
+    const PlainBmp& other = g_overviewPlain[eye][1 - self];
+    return other.valid && wcscmp(other.stamp, stamp) == 0 ? other.path : nullptr;
+}
+void overviewNotePlain(int eye, int self, const wchar_t* path, const wchar_t* stamp) {
+    PlainBmp& mine = g_overviewPlain[eye][self];
+    wcsncpy_s(mine.path, MAX_PATH, path, _TRUNCATE);
+    wcsncpy_s(mine.stamp, 16, stamp, _TRUNCATE);
+    mine.valid = true;
+}
 
 float halfToFloat(uint16_t h) {
     const uint32_t s = (h >> 15) & 1u, e = (h >> 10) & 0x1Fu, m = h & 0x3FFu;
@@ -1435,8 +1466,11 @@ uint8_t dumpByte(float v, bool linear) {
 
 // The staging copy's pixels to a BMP: the given path, or the timestamped
 // one (eye_HHMMSS_L.bmp). The staging texture is the caller's to release.
+// With deltaBase (a plain BMP written earlier in this run) the file is stored as
+// NAME.bmp.z, an XOR against it, when that file is exactly as long; otherwise it
+// goes out as a plain BMP, as it always did.
 bool writeEyeBmp(ID3D11DeviceContext* ctx, ID3D11Texture2D* st, const D3D11_TEXTURE2D_DESC& d, int eye,
-                 const wchar_t* pathIn) {
+                 const wchar_t* pathIn, const wchar_t* deltaBase, EyeBmpWrite* info) {
     D3D11_MAPPED_SUBRESOURCE ms{};
     if (FAILED(ctx->Map(st, 0, D3D11_MAP_READ, 0, &ms))) {
         Log::get().note("temporal aa: the eye dump could not map its staging copy; nothing written.");
@@ -1529,11 +1563,6 @@ bool writeEyeBmp(ID3D11DeviceContext* ctx, ID3D11Texture2D* st, const D3D11_TEXT
                      static_cast<unsigned>(stm.wHour), static_cast<unsigned>(stm.wMinute),
                      static_cast<unsigned>(stm.wSecond), eye == 0 ? L'L' : L'R');
     }
-    HANDLE f = CreateFileW(path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (f == INVALID_HANDLE_VALUE) {
-        Log::get().note("temporal aa: the eye dump could not open %ls for writing.", path);
-        return false;
-    }
     const uint32_t bytes = rowBytes * h;
     BITMAPFILEHEADER fh{};
     BITMAPINFOHEADER ih{};
@@ -1547,6 +1576,29 @@ bool writeEyeBmp(ID3D11DeviceContext* ctx, ID3D11Texture2D* st, const D3D11_TEXT
     ih.biBitCount = 24;
     ih.biCompression = BI_RGB;
     ih.biSizeImage = bytes;
+    if (deltaBase && *deltaBase) {
+        std::vector<uint8_t> file(sizeof(fh) + sizeof(ih) + static_cast<size_t>(bytes));
+        memcpy(file.data(), &fh, sizeof(fh));
+        memcpy(file.data() + sizeof(fh), &ih, sizeof(ih));
+        memcpy(file.data() + sizeof(fh) + sizeof(ih), out.data(), bytes);
+        const dump_file::WholeResult r = dump_file::writeWhole(path, file.data(), file.size(), deltaBase);
+        if (info) {
+            info->deltaUsed = r.delta;
+            strncpy_s(info->declinedWhy, r.deltaWhy.c_str(), _TRUNCATE);
+        }
+        Log::get().note("temporal aa: eye %d dumped to %ls -- %ux%u, DXGI format %d, the treated frame as the "
+                        "compositor receives it; %s%s%s%s%s.",
+                        eye, r.writtenPath.c_str(), w, h, static_cast<int>(d.Format),
+                        r.delta ? "stored as an XOR delta against its plain twin" : "stored plain",
+                        r.deltaDeclined ? " (delta declined: " : "", r.deltaDeclined ? r.deltaWhy.c_str() : "",
+                        r.deltaDeclined ? ")" : "", r.ok ? "" : " (the write FAILED)");
+        return r.ok;
+    }
+    HANDLE f = CreateFileW(path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f == INVALID_HANDLE_VALUE) {
+        Log::get().note("temporal aa: the eye dump could not open %ls for writing.", path);
+        return false;
+    }
     DWORD wrote = 0;
     bool ok = WriteFile(f, &fh, sizeof(fh), &wrote, nullptr) != 0;
     if (ok) ok = WriteFile(f, &ih, sizeof(ih), &wrote, nullptr) != 0;
@@ -1798,9 +1850,9 @@ void writeEyeInputs(ID3D11DeviceContext* ctx,const std::wstring& dir) {
             D3D11_MAPPED_SUBRESOURCE mapped{};
             if(SUCCEEDED(ctx->Map(g_eyeEngineBuffers[k],0,D3D11_MAP_READ,0,&mapped))){
                 wchar_t path[MAX_PATH];_snwprintf_s(path,MAX_PATH,_TRUNCATE,L"%s\\eye_%s_%s.bin",dir.c_str(),g_eyeRunStamp,kEyeEngineBufferNames[k]);
-                FILE* f=nullptr;_wfopen_s(&f,path,L"wb");
-                if(f){const auto* m=g_eyeEngineBufferMeta[k];const uint32_t header[8]={1,m[0],m[1],m[2],m[3],m[4],g_eyeInputsFrame,0};
-                    const bool ok=fwrite("EDVRBUF1",1,8,f)==8 && fwrite(header,sizeof(header),1,f)==1 && fwrite(mapped.pData,1,m[0],f)==m[0];fclose(f);
+                dump_file::Writer f;
+                if(f.open(path)){const auto* m=g_eyeEngineBufferMeta[k];const uint32_t header[8]={1,m[0],m[1],m[2],m[3],m[4],g_eyeInputsFrame,0};
+                    bool ok=f.write("EDVRBUF1",8) && f.write(header,sizeof(header)) && f.write(mapped.pData,m[0]);if(!f.close())ok=false;
                     outcome=ok?"written":"write_failed";
                 }else outcome="file_creation_failed";
                 ctx->Unmap(g_eyeEngineBuffers[k],0);
@@ -1835,12 +1887,12 @@ void writeEyeInputs(ID3D11DeviceContext* ctx,const std::wstring& dir) {
         D3D11_MAPPED_SUBRESOURCE map{};
         if(bytes && SUCCEEDED(ctx->Map(texture,0,D3D11_MAP_READ,0,&map))) {
             wchar_t path[MAX_PATH];_snwprintf_s(path,MAX_PATH,_TRUNCATE,L"%s\\eye_%s_%s.bin",dir.c_str(),g_eyeRunStamp,kEyeInputNames[k]);
-            FILE* f=nullptr;_wfopen_s(&f,path,L"wb");
-            if(f) {
+            dump_file::Writer f;
+            if(f.open(path)) {
                 const uint32_t header[9]={1,d.Width,d.Height,static_cast<uint32_t>(d.Format),d.Width*bytes,g_eyeInputsFrame,0,g_eyeInputsUiBound,g_eyeInputsUiFlags};
-                bool ok=fwrite("EDVRTEX1",1,8,f)==8 && fwrite(header,sizeof(header),1,f)==1;
-                for(uint32_t y=0;y<d.Height && ok;++y)ok=fwrite(static_cast<const char*>(map.pData)+y*map.RowPitch,1,d.Width*bytes,f)==d.Width*bytes;
-                fclose(f);
+                bool ok=f.write("EDVRTEX1",8) && f.write(header,sizeof(header));
+                for(uint32_t y=0;y<d.Height && ok;++y)ok=f.write(static_cast<const char*>(map.pData)+y*map.RowPitch,d.Width*bytes);
+                if(!f.close())ok=false;
                 Log::get().note("eye capture: %ls input %ls %ux%u format %u, scene frame %u: %s.",g_eyeRunStamp,kEyeInputNames[k],d.Width,d.Height,static_cast<unsigned>(d.Format),g_eyeInputsFrame,ok?"written":"write failed");
             } else if(k>=16) Log::get().note("eye capture: %ls input %ls unavailable on disk: file creation failed.",g_eyeRunStamp,kEyeInputNames[k]);
             // The MV input's census of the history the pass invalidated
@@ -2320,18 +2372,16 @@ bool writeEyeDecisionBin(ID3D11DeviceContext* ctx, ID3D11Texture2D* texture,
     if (d.Format != DXGI_FORMAT_R32G32B32A32_FLOAT) return false;
     D3D11_MAPPED_SUBRESOURCE map{};
     if (FAILED(ctx->Map(texture, 0, D3D11_MAP_READ, 0, &map))) return false;
-    FILE* f = nullptr;
-    _wfopen_s(&f, path, L"wb");
-    bool ok = f != nullptr;
-    if (f) {
+    dump_file::Writer f;
+    bool ok = f.open(path);
+    if (ok) {
         const uint32_t rowBytes = d.Width * 16;
         const uint32_t header[9] = {1, d.Width, d.Height, static_cast<uint32_t>(d.Format),
                                     rowBytes, frame, 0, 0, 0};
-        ok = fwrite("EDVRTEX1", 1, 8, f) == 8 && fwrite(header, sizeof(header), 1, f) == 1;
+        ok = f.write("EDVRTEX1", 8) && f.write(header, sizeof(header));
         for (uint32_t y = 0; y < d.Height && ok; ++y)
-            ok = fwrite(static_cast<const char*>(map.pData) + y * map.RowPitch,
-                        1, rowBytes, f) == rowBytes;
-        if (fclose(f) != 0) ok = false;
+            ok = f.write(static_cast<const char*>(map.pData) + y * map.RowPitch, rowBytes);
+        if (!f.close()) ok = false;
     }
     ctx->Unmap(texture, 0);
     return ok;
@@ -2344,7 +2394,16 @@ void writeEyeDecisionArtifacts(ID3D11DeviceContext* ctx, const std::wstring& dir
         if (d.preUi && g_eyePreUiStaging[k]) {
             _snwprintf_s(path, MAX_PATH, _TRUNCATE, L"%s\\eye_%s_P%02d.bmp", dir.c_str(), g_eyeRunStamp, k);
             D3D11_TEXTURE2D_DESC desc{}; g_eyePreUiStaging[k]->GetDesc(&desc);
-            if (!writeEyeBmp(ctx, g_eyePreUiStaging[k], desc, 0, path)) {
+            // P is 97.5% the same bytes as T (the UI layer is all that differs), so it is stored
+            // against it; T was written plain, earlier in this run, when g_eyeTreatedWritten says so.
+            wchar_t treatedPath[MAX_PATH];
+            _snwprintf_s(treatedPath, MAX_PATH, _TRUNCATE, L"%s\\eye_%s_T%02d.bmp", dir.c_str(), g_eyeRunStamp, k);
+            EyeBmpWrite pInfo;
+            ++g_eyePTried;
+            const bool pWritten = writeEyeBmp(ctx, g_eyePreUiStaging[k], desc, 0, path,
+                                              g_eyeTreatedWritten[k] ? treatedPath : nullptr, &pInfo);
+            if (pWritten && pInfo.deltaUsed) ++g_eyePDelta;
+            if (!pWritten) {
                 d.preUi = false;
                 d.error = "pre_ui_write_failed";
             }
@@ -2442,12 +2501,12 @@ void writeEyeJumpLattice(ID3D11DeviceContext* ctx,const std::wstring& dir,const 
     wchar_t binPath[MAX_PATH],jsonPath[MAX_PATH];
     _snwprintf_s(binPath,MAX_PATH,_TRUNCATE,L"%s\\eye_%s_JumpLattice.bin",dir.c_str(),g_eyeFinalStamp);
     _snwprintf_s(jsonPath,MAX_PATH,_TRUNCATE,L"%s\\eye_%s_JumpLattice.json",dir.c_str(),g_eyeFinalStamp);
-    FILE* bin=nullptr;_wfopen_s(&bin,binPath,L"wb");
-    bool binOk=bin!=nullptr;
-    if(bin){
+    dump_file::Writer bin;
+    bool binOk=bin.open(binPath);
+    if(binOk){
         const char magic[8]={'E','D','V','R','J','M','P','1'};const uint32_t header[7]={1,Count,Stride,20,SkinFormat,MotionFormat,SlotFormat};
-        binOk=fwrite(magic,1,sizeof(magic),bin)==sizeof(magic)&&fwrite(header,sizeof(header),1,bin)==1&&
-              fwrite(&Budget,sizeof(Budget),1,bin)==1;
+        binOk=bin.write(magic,sizeof(magic))&&bin.write(header,sizeof(header))&&
+              bin.write(&Budget,sizeof(Budget));
     }
     FILE* json=nullptr;_wfopen_s(&json,jsonPath,L"wb");bool manifestOk=json!=nullptr;
     if(json)fprintf(json,"{\"schema\":2,\"stamp\":\"%ls\",\"capture_type\":\"%s\",\"parent_stamp\":\"%ls\",\"trigger_status\":\"%s\",\"trigger_generation\":%llu,\"trigger_source_frame\":%u,\"trigger_qpc\":%llu,\"trigger_age_qpc\":%llu,\"trigger_root\":[%.6f,%.6f,%.6f],\"trigger_raw_vy_mps\":%.6f,\"trigger_filtered_vy_mps\":%.6f,\"reason\":\"%s\",\"data_file\":\"eye_%ls_JumpLattice.bin\",\"stride\":%u,\"coordinate_rule\":\"source=(2*x,2*y), valid sampled points only\",\"sample_record_bytes\":20,\"budget_bytes\":%llu,\"reserved_bytes\":%llu,\"frames\":[\n",
@@ -2489,9 +2548,9 @@ void writeEyeJumpLattice(ID3D11DeviceContext* ctx,const std::wstring& dir,const 
                     for(unsigned k=0;k<3;++k)ctx->Unmap(sources[k],0);
                     const uint32_t rowHeader[9]={i,row.sceneFrame,row.renderFrame,row.epoch,row.width,row.height,row.sampleWidth,row.sampleHeight,Written};
                     const uint64_t sampleCount=payload.size(),payloadBytes=sampleCount*sizeof(PackedSample);
-                    binOk=fwrite(rowHeader,sizeof(rowHeader),1,bin)==1&&fwrite(&sequence,sizeof(sequence),1,bin)==1&&
-                          fwrite(&payloadBytes,sizeof(payloadBytes),1,bin)==1&&
-                          fwrite(payload.data(),sizeof(PackedSample),payload.size(),bin)==payload.size();
+                    binOk=bin.write(rowHeader,sizeof(rowHeader))&&bin.write(&sequence,sizeof(sequence))&&
+                          bin.write(&payloadBytes,sizeof(payloadBytes))&&
+                          bin.write(payload.data(),sizeof(PackedSample)*payload.size());
                     if(binOk){row.status=Written;++written;}else row.status=WriteFailed;
                 }
             }
@@ -2505,7 +2564,7 @@ void writeEyeJumpLattice(ID3D11DeviceContext* ctx,const std::wstring& dir,const 
             first=false;
         }
     }
-    if(bin){if(fclose(bin)!=0)binOk=false;}
+    if(bin.isOpen()){if(!bin.close())binOk=false;}
     if(json){fprintf(json,"\n],\"data_status\":\"%s\"}\n",binOk?"complete":"write_failed");const bool clean=!ferror(json);const int closed=fclose(json);if(!clean||closed!=0)manifestOk=false;}
     Log::get().note("native on-foot jump lattice (F83): run %ls reason=%s stride=%u scheduled=%u staged=%u written=%u refused=%u not-reached=%u bytes=%llu/%llu; data=%s manifest=%s. Exact stride-two points sample SkinE/MV half values and preserve EngineSlots float bits; no per-frame CPU readback.",
         g_eyeFinalStamp,reason,Stride,g_eyeJumpLatticeRun.count,staged,written,refused,notReached,
@@ -2525,23 +2584,35 @@ void writeFinalEyeRun(ID3D11DeviceContext* ctx,const char* reason) {
     if(g_eyeFinalRun.captureDevice){const bool ran=guarded("eye capture/final flush context",[&]{g_eyeFinalRun.captureDevice->GetImmediateContext(&ownedContext);});ctx=ran?ownedContext:nullptr;}
     const std::wstring dir=Log::get().dir()+L"\\eyes";
     CreateDirectoryW(dir.c_str(),nullptr);
+    dump_file::Tally dumpTally;
+    dump_file::TallyScope dumpScope(dumpTally);
     writeEyeJumpLattice(ctx,dir,reason);
     unsigned copied=0,written=0,missing=0;
-    auto write=[&](eye_final_capture::Image& image,const wchar_t* suffix,int eye) {
+    char overviewNote[2][160]={"LOverview not written","ROverview not written"};
+    // FinalCrisp's overview is the second of its pair with L0/R0 (see overviewBase), so it is the delta.
+    auto write=[&](eye_final_capture::Image& image,const wchar_t* suffix,int eye,bool overview) {
         if(!image.sequence){++missing;return;}
         if(!image.writable())return; // published resource alone does not prove Copy completed
         ++copied;
         wchar_t path[MAX_PATH];
         _snwprintf_s(path,MAX_PATH,_TRUNCATE,L"%s\\eye_%s_FinalCrisp_%s.bmp",dir.c_str(),g_eyeFinalStamp,suffix);
         bool ok=false;
-        const bool ran=guarded("eye capture/final readback",[&]{D3D11_TEXTURE2D_DESC d{};image.staging->GetDesc(&d);ok=ctx&&writeEyeBmp(ctx,image.staging,d,eye,path);});
+        const wchar_t* base=overview?overviewBase(eye,1,g_eyeFinalStamp):nullptr;EyeBmpWrite info;
+        const bool ran=guarded("eye capture/final readback",[&]{D3D11_TEXTURE2D_DESC d{};image.staging->GetDesc(&d);ok=ctx&&writeEyeBmp(ctx,image.staging,d,eye,path,base,&info);});
         ok=ran&&ok;
         image.status=ok?"written":"readback_or_write_failed";
         if(ok)++written;
+        if(overview){
+            if(ok&&!info.deltaUsed)overviewNotePlain(eye,1,path,g_eyeFinalStamp);
+            snprintf(overviewNote[eye],sizeof(overviewNote[eye]),"%ls %s",suffix,
+                     !ok?"write FAILED":info.deltaUsed?(eye?"stored as a delta against R0":"stored as a delta against L0"):
+                     base?(eye?"plain (delta against R0 declined)":"plain (delta against L0 declined)"):
+                     (eye?"plain (no R0 on disk from this run to delta against)":"plain (no L0 on disk from this run to delta against)"));
+        }
     };
     for(unsigned k=0;k<eye_final_capture::Count;++k)
-        for(unsigned eye=0;eye<2;++eye){wchar_t suffix[16];_snwprintf_s(suffix,16,_TRUNCATE,L"%c%02u",eye?L'R':L'L',k);write(g_eyeFinalRun.rows[k].eye[eye],suffix,int(eye));}
-    for(unsigned eye=0;eye<2;++eye)write(g_eyeFinalRun.overview[eye],eye?L"ROverview":L"LOverview",int(eye));
+        for(unsigned eye=0;eye<2;++eye){wchar_t suffix[16];_snwprintf_s(suffix,16,_TRUNCATE,L"%c%02u",eye?L'R':L'L',k);write(g_eyeFinalRun.rows[k].eye[eye],suffix,int(eye),false);}
+    for(unsigned eye=0;eye<2;++eye)write(g_eyeFinalRun.overview[eye],eye?L"ROverview":L"LOverview",int(eye),true);
     wchar_t path[MAX_PATH];_snwprintf_s(path,MAX_PATH,_TRUNCATE,L"%s\\eye_%s_FinalCrisp.json",dir.c_str(),g_eyeFinalStamp);
     FILE* f=nullptr;_wfopen_s(&f,path,L"wb");bool manifest=false;
     if(f){
@@ -2565,6 +2636,7 @@ void writeFinalEyeRun(ID3D11DeviceContext* ctx,const char* reason) {
         fputs("\n]}\n",f);const bool clean=!ferror(f);const int closed=fclose(f);manifest=clean&&closed==0;
     }
     Log::get().note("eye capture: FinalCrisp run %ls: reason=%s, scheduled=%u/16, copied=%u, written=%u, missing=%u, unmatched=%u, duplicate=%u, bytes=%llu/%llu; manifest %s. Separate native-pixel crops after crisp composition; T/P/L0 retain temporal-stage semantics.",g_eyeFinalStamp,reason,g_eyeFinalRun.count,copied,written,missing,g_eyeFinalRun.unmatched,g_eyeFinalRun.duplicates,(unsigned long long)g_eyeFinalRun.bytes,(unsigned long long)eye_final_capture::Budget,manifest?"written":"write failed");
+    Log::get().note("eye capture: dump compression, FinalCrisp run %ls: %s; overviews: %s; %s.",g_eyeFinalStamp,dump_file::tallyText(dumpTally).c_str(),overviewNote[0],overviewNote[1]);
     g_eyeFinalRun.reset();
     if(ownedContext)guarded("eye capture/final flush context release",[&]{ownedContext->Release();});
 }
@@ -2577,6 +2649,11 @@ void writeEyeRun(ID3D11DeviceContext* ctx, uint32_t cw, uint32_t ch) {
         CreateDirectoryW(dir.c_str(), nullptr);
     }
     const bool paired = !g_eyeRunUntreated;
+    dump_file::Tally dumpTally;
+    dump_file::TallyScope dumpScope(dumpTally);
+    g_eyePTried = g_eyePDelta = 0;
+    snprintf(g_eyeOverviewNote[0], sizeof(g_eyeOverviewNote[0]), "no left overview was staged");
+    snprintf(g_eyeOverviewNote[1], sizeof(g_eyeOverviewNote[1]), "not written in this run");
     writeEyeInputs(ctx,dir);
     const bool treated = !g_eyeRunUntreated;
     ID3D11Texture2D** ring = treated ? g_eyeTreatedStaging : g_eyeRawStaging;
@@ -2608,14 +2685,30 @@ void writeEyeRun(ID3D11DeviceContext* ctx, uint32_t cw, uint32_t ch) {
         _snwprintf_s(path, MAX_PATH, _TRUNCATE, L"%s\\eye_%s_L0.bmp", dir.c_str(), g_eyeRunStamp);
         D3D11_TEXTURE2D_DESC sd{};
         g_eyeRunStaging[0]->GetDesc(&sd);
-        if (writeEyeBmp(ctx, g_eyeRunStaging[0], sd, 0, path)) ++wroteTreated;
+        // Normally FinalCrisp_LOverview is not on disk yet and L0 goes out plain, as the base for it.
+        const wchar_t* base = overviewBase(0, 0, g_eyeRunStamp);
+        EyeBmpWrite info;
+        const bool l0Written = writeEyeBmp(ctx, g_eyeRunStaging[0], sd, 0, path, base, &info);
+        if (l0Written) ++wroteTreated;
+        if (l0Written && !info.deltaUsed) overviewNotePlain(0, 0, path, g_eyeRunStamp);
+        snprintf(g_eyeOverviewNote[0], sizeof(g_eyeOverviewNote[0]), "%s",
+                 !l0Written ? "L0 write FAILED"
+                 : info.deltaUsed ? "L0 stored as a delta against FinalCrisp_LOverview"
+                 : base ? "L0 plain (delta against FinalCrisp_LOverview declined)"
+                        : "L0 plain, the base for FinalCrisp_LOverview");
     }
     writeMarkerCrops(ctx, dir);   // F53: the marker crops staged with the overviews (none unless the marker probe was on)
     if (g_eyeRunUntreated) {
         if (g_eyeOverviewTaken[1] && g_eyeRunStaging[1]) {
             wchar_t path[MAX_PATH];D3D11_TEXTURE2D_DESC sd{};
             _snwprintf_s(path,MAX_PATH,_TRUNCATE,L"%s\\eye_%s_R0.bmp",dir.c_str(),g_eyeRunStamp);
-            g_eyeRunStaging[1]->GetDesc(&sd);writeEyeBmp(ctx,g_eyeRunStaging[1],sd,1,path);
+            g_eyeRunStaging[1]->GetDesc(&sd);
+            const wchar_t* base=overviewBase(1,0,g_eyeRunStamp);EyeBmpWrite info;
+            const bool r0Written=writeEyeBmp(ctx,g_eyeRunStaging[1],sd,1,path,base,&info);
+            if(r0Written&&!info.deltaUsed)overviewNotePlain(1,0,path,g_eyeRunStamp);
+            snprintf(g_eyeOverviewNote[1],sizeof(g_eyeOverviewNote[1]),"%s",
+                     !r0Written?"R0 write FAILED":info.deltaUsed?"R0 stored as a delta against FinalCrisp_ROverview":
+                     base?"R0 plain (delta against FinalCrisp_ROverview declined)":"R0 plain, the base for FinalCrisp_ROverview");
         }
         wchar_t path[MAX_PATH];_snwprintf_s(path,MAX_PATH,_TRUNCATE,L"%s\\eye_%s_capture.csv",dir.c_str(),g_eyeRunStamp);
         FILE* file=nullptr;_wfopen_s(&file,path,L"wb");
@@ -2635,6 +2728,12 @@ void writeEyeRun(ID3D11DeviceContext* ctx, uint32_t cw, uint32_t ch) {
                         "Copies were taken together; files written after both eyes completed.",
                         g_eyeRunStamp, wrote, g_eyeRunTaken - 1, cw, ch, wroteTreated, g_eyeRunStamp);
     }
+    // The run's one compression line, printed whether or not anything was compressed, so a build whose
+    // writers never ran reads differently from one that did. FinalCrisp's files, written after this
+    // (and possibly later still), have their own line in writeFinalEyeRun.
+    Log::get().note("eye capture: dump compression, run %ls: %s; P stored as a delta against T: %u of %u; overview: %s%s%s.",
+                    g_eyeRunStamp, dump_file::tallyText(dumpTally).c_str(), g_eyePDelta, g_eyePTried,
+                    g_eyeOverviewNote[0], g_eyeRunUntreated ? "; " : "", g_eyeRunUntreated ? g_eyeOverviewNote[1] : "");
     g_eyeRunTaken = 0;
     if(g_eyeFinalRun.complete())writeFinalEyeRun(ctx,"complete");
 }
@@ -6839,6 +6938,7 @@ static bool beginEyeRun(bool companion,const edvr::NativeOnFootAirborneSnapshot*
     g_eyeRunUntreated=false;
     memset(g_eyeOverviewTaken,0,sizeof(g_eyeOverviewTaken));
     memset(g_eyeMarkerTaken,0,sizeof(g_eyeMarkerTaken));   // F53: the marker crops
+    memset(g_overviewPlain,0,sizeof(g_overviewPlain));     // no plain overview on disk yet: the pair's base
     memset(g_eyeTreatedWritten,0,sizeof(g_eyeTreatedWritten));
     memset(g_eyeTreatedTaken,0,sizeof(g_eyeTreatedTaken));
     memset(g_eyeRawWritten,0,sizeof(g_eyeRawWritten));

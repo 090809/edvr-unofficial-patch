@@ -31,6 +31,7 @@
 #include "../common/runtime_profile.h"
 #include "../common/guard.h"
 #include "../common/log.h"
+#include "../common/dump_file.h"   // the eye dump's .z container (Chrome<i>.bin, Holo.bin)
 #include "binding_shadow.h"
 #include "classifier_memo.h"   // the eye-draw classifiers' memo of their plain decline (built 2026-10-27)
 #include "depth_probe.h"    // depthProbeIsSceneDepth, ...Format: where the pass reads
@@ -4327,12 +4328,12 @@ void writeChromeDump(ID3D11DeviceContext* ctx,const wchar_t* directory,const wch
             copy.Reset(); continue;
         }
         wchar_t path[MAX_PATH]; _snwprintf_s(path,MAX_PATH,_TRUNCATE,L"%s\\eye_%s_Chrome%u.bin",directory,stamp,i);
-        FILE* f=nullptr; _wfopen_s(&f,path,L"wb"); bool ok=false;
-        if(f) {
+        dump_file::Writer f; bool ok=false;
+        if(f.open(path)) {
             const uint32_t header[9]={1,d.Width,d.Height,static_cast<uint32_t>(d.Format),d.Width*bytes,0,0,0,0};
-            ok=fwrite("EDVRTEX1",1,8,f)==8 && fwrite(header,sizeof(header),1,f)==1;
-            for(uint32_t y=0;y<d.Height && ok;++y) ok=fwrite(static_cast<const char*>(map.pData)+y*map.RowPitch,1,d.Width*bytes,f)==d.Width*bytes;
-            if(fclose(f)!=0) ok=false;
+            ok=f.write("EDVRTEX1",8) && f.write(header,sizeof(header));
+            for(uint32_t y=0;y<d.Height && ok;++y) ok=f.write(static_cast<const char*>(map.pData)+y*map.RowPitch,d.Width*bytes);
+            if(!f.close()) ok=false;
         }
         ctx->Unmap(copy.Get(),0);
         Log::get().note("eye capture: %ls chrome %u -- the scanner's chrome surface %ux%u DXGI format %u, as sampled by the screen's composite this run: %s.",stamp,i,d.Width,d.Height,unsigned(d.Format),ok?"written":"write failed");
@@ -4348,8 +4349,8 @@ void uiDepthHoloWriteDump(ID3D11DeviceContext* ctx,const wchar_t* directory,cons
         unsigned valid=0,matched=0;
         for(unsigned i=0;i<g_holoDumpCount;++i) { const auto* p=static_cast<const float*>(map.pData)+i*60; valid+=p[56]==1; matched+=p[59]==1; }
         wchar_t path[MAX_PATH]; _snwprintf_s(path,MAX_PATH,_TRUNCATE,L"%s\\eye_%s_Holo.bin",directory,stamp);
-        FILE* file=nullptr; _wfopen_s(&file,path,L"wb"); bool ok=false;
-        if(file) { const uint32_t header[2]={g_holoDumpCount,240}; ok=fwrite("EDVRHLO1",1,8,file)==8 && fwrite(header,8,1,file)==1 && fwrite(map.pData,240,g_holoDumpCount,file)==g_holoDumpCount; if(fclose(file)!=0) ok=false; }
+        dump_file::Writer file; bool ok=false;
+        if(file.open(path)) { const uint32_t header[2]={g_holoDumpCount,240}; ok=file.write("EDVRHLO1",8) && file.write(header,8) && file.write(map.pData,size_t(240)*g_holoDumpCount); if(!file.close()) ok=false; }
         ctx->Unmap(g_holoDump.Get(),0);
         Log::get().note("holo motion: eye run %ls matched %u/%u eligible transforms (%u total); record file %s.",stamp,matched,valid,g_holoDumpCount,ok?"written":"FAILED");
     } else Log::get().note("holo motion: eye run %ls readback unavailable (0x%08X).",stamp,unsigned(result));

@@ -52,12 +52,14 @@ import struct
 import tempfile
 import math
 
+import dump_io   # tools\dump_io.py: drawstate_/candidates_/menu_ .bin are NAME or NAME.z
+
 MENU_FAMILIES=(0x5DAD41AA66757CE3,0xC4B4B334B26E81A9)
 MENU_SCENES=(0x4435F2E50020E7F3,0xDE545DC8EE4FBB87,0xAACFDCF2FB9AD809,0x61AE8EB05FDC18DD)
 
 
 def read(path):
-    data = Path(path).read_bytes()
+    data = dump_io.read_bytes(path)
     stream = io.BytesIO(data)
 
     def take(n):
@@ -1448,6 +1450,9 @@ def self_test():
         good = h4+draw+refs+table+blob
         p.write_bytes(good)
         assert len(read(p)['mesh_buffers'][0]['data']) == 336
+        zp = Path(td)/'sample_z.bin'
+        dump_io.write_z(zp, good)   # the compressed container the dump writes, read under the original name
+        assert not zp.exists() and read(zp) == read(p)
         h5 = b'EDVRDRW1' + struct.pack('<4I',5,1,0,0)
         layout = b'POSITION'.ljust(64,b'\0')+struct.pack('<6I',0,2,1,16,1,1)
         v5 = h5+draw+refs+struct.pack('<I',1)+layout+table+blob
@@ -1606,13 +1611,13 @@ def main():
     if a.verify_fixture:
         verify_fixture(c)
         sprite_path = Path(str(a.path) + '.sprite')
-        assert sprite_path.exists(), 'sprite diagnostic fixture is required'
+        assert dump_io.exists(sprite_path), 'sprite diagnostic fixture is required'   # NAME or NAME.z: the rig's writer compresses it
         verify_sprite_fixture(read(sprite_path))
         candidate_path=Path(str(a.path)+'.candidate')
-        assert candidate_path.exists(),'nonempty targeted-candidate fixture is required'
+        assert dump_io.exists(candidate_path),'nonempty targeted-candidate fixture is required'
         verify_candidate_fixture(read(candidate_path))
         capacity_path=Path(str(a.path)+'.capacity')
-        assert capacity_path.exists(),'full-window targeted-candidate fixture is required'
+        assert dump_io.exists(capacity_path),'full-window targeted-candidate fixture is required'
         verify_candidate_capacity_fixture(read(capacity_path))
         menu=read_menu(str(a.path)+'.menu.json')
         assert len(menu['draws'])==8 and menu['late_menu']['anchor_status']=='both_eyes'

@@ -15,6 +15,8 @@ from pathlib import Path
 import struct
 import sys
 
+import dump_io   # tools\dump_io.py: every .bin is NAME or NAME.z, and P/L0 may be an XOR delta against T/FinalCrisp
+
 # 4-7 and 9 are retired paths (body, body2, stepped, terrain -- 7 went 2026-10-01 with terrain
 # motion -- and mesh), kept so an older dump still reads; the shader writes none of them now. 7 is
 # deliberately not reused. 12 is the planet patch motion (2026-10-06): a world-path pixel with a depth
@@ -53,7 +55,7 @@ def capture_file(base, name, expected):
 
 
 def read_decisions(path, frame, extent):
-    data = path.read_bytes()
+    data = dump_io.read_bytes(path)
     if len(data) < 44 or data[:8] != b'EDVRTEX1':
         raise ValueError('invalid decision texture header')
     version, w, h, fmt, row, scene, eye, _, _ = struct.unpack_from('<9I', data, 8)
@@ -67,7 +69,7 @@ def read_decisions(path, frame, extent):
 
 
 def read_bmp(path, extent):
-    data = path.read_bytes()
+    data = dump_io.read_bytes(path)   # a plain BMP, or P/L0 stored as an XOR delta (NAME.bmp.z)
     if len(data) < 54 or data[:2] != b'BM':
         raise ValueError('invalid BMP header')
     offset = struct.unpack_from('<I', data, 10)[0]
@@ -424,7 +426,7 @@ def rim_pair(np, d, prev_d, cur, prev, out, prev_out, input_size, output_size, d
 
 def _rim_capture(np, path, label, dtype, fmt, channels, input_size, dc):
     """A whole-render EDVRTEX1 capture (4 bytes a texel), cropped to the decision crop: (h, w, channels)."""
-    data = Path(path).read_bytes()
+    data = dump_io.read_bytes(path)
     if data[:8] != b'EDVRTEX1' or len(data) < 44:
         raise ValueError(f'{label} input: not an EDVRTEX1 capture')
     version, w, h, got, row = struct.unpack_from('<5I', data, 8)
@@ -528,8 +530,8 @@ def rim_report(manifest_path):
         if index == 0:
             mv_path = manifest_path.parent / f'{prefix}MV.bin'
             z_path = manifest_path.parent / f'{prefix}Z.bin'
-            result['first_frame_mv'] = (rim_first_frame(np, mv_path, current['d'], input_size, dc, z_path if z_path.exists() else None)
-                                        if mv_path.exists() else {'unavailable': True})
+            result['first_frame_mv'] = (rim_first_frame(np, mv_path, current['d'], input_size, dc, z_path if dump_io.exists(z_path) else None)
+                                        if dump_io.exists(mv_path) else {'unavailable': True})
         if previous and previous['frame'] + 1 == current['frame'] and previous['geometry'] == current['geometry']:
             pair = {'index': index, 'frame': current['frame']}
             pair.update(rim_pair(np, current['d'], previous['d'], current['c'], previous['c'], current['p'], previous['p'], input_size, output_size, dc, oc))
@@ -769,6 +771,17 @@ def self_test():
             dpath.write_bytes(payload)
             assert not run()['complete']
         dpath.write_bytes(original)
+        # The dump's compressed forms read the same: D as NAME.z, and P stored as an XOR delta against T.
+        ppath = base / frames[0]['pre_ui_file']
+        plain_p = ppath.read_bytes()
+        reference = run()
+        dump_io.write_z(dpath, original); dpath.unlink()
+        dump_io.write_z(ppath, plain_p, base=base / frames[0]['treated_file']); ppath.unlink()
+        assert not dpath.exists() and not ppath.exists()
+        assert run() == reference, 'a compressed D and a delta P give the same report as the plain files'
+        (base / (dpath.name + '.z')).unlink(); (base / (ppath.name + '.z')).unlink()
+        assert not run()['complete'], 'a missing D and P is still incomplete'
+        dpath.write_bytes(original); ppath.write_bytes(plain_p)
         # Path 12, `celestial`: the second pixel (path 10, screen, above) takes its body's own motion instead. 13 is still no path.
         celestial = bytearray(original)
         struct.pack_into('<f', celestial, 56 + 16, 12 | 1024)
