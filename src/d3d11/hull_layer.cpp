@@ -284,6 +284,40 @@ constexpr char kFilterPsHlsl[] = HULL_LAYER_PASS_HLSL
     "    o.depth = clearDepth;\n"
     "    return o;\n"
     "}\n";
+// Build B (docs "Build B"), compiled at the first prefill (a failure leaves the layer running without it); the build compiles them too:
+// hlsl-check: kPrefillPsHlsl hull_layer_prefill_ps ps_5_0
+// hlsl-check: kMarkPsHlsl hull_layer_mark_ps ps_5_0
+// hlsl-check: kResetPsHlsl hull_layer_reset_ps ps_5_0
+//
+// The prefill: right before the eye's first hull draw, the game's eye depth (the prepass, the cockpit shell and every draw
+// before the own ship's block, no hull: the main pass discards it) into the private depth and into P, its copy. A float
+// depth, so both hold the same bits. The private stencil is left at its clear.
+constexpr char kPrefillPsHlsl[] =
+    "Texture2D<float> mainDepth : register(t0);\n"
+    "struct HullLayerPrefillOut { float z : SV_Target0; float depth : SV_Depth; };\n"
+    "HullLayerPrefillOut hull_layer_prefill_ps(float4 pos : SV_Position) {\n"
+    "    HullLayerPrefillOut o;\n"
+    "    o.z = mainDepth.Load(int3(int2(pos.xy), 0));\n"
+    "    o.depth = o.z;\n"
+    "    return o;\n"
+    "}\n";
+// The mark: after the hull, 1 where no hull wrote -- the private depth not nearer than P (reversed Z): equal, or a draw with
+// its own depth test put something farther -- else 0.
+constexpr char kMarkPsHlsl[] =
+    "Texture2D<float> privDepth : register(t0);\n"
+    "Texture2D<float> prefill : register(t1);\n"
+    "float hull_layer_mark_ps(float4 pos : SV_Position) : SV_Target0 {\n"
+    "    int3 p = int3(int2(pos.xy), 0);\n"
+    "    return privDepth.Load(p) > prefill.Load(p) ? 0.0 : 1.0;\n"
+    "}\n";
+// The reset: where marked, the private depth and stencil back to their clear (the stencil by the state's REPLACE).
+constexpr char kResetPsHlsl[] =
+    "cbuffer HullLayerResetCb : register(b0) { uint resetRecords; float clearDepth; uint resetW; uint resetH; };\n"
+    "Texture2D<float> resetMark : register(t0);\n"
+    "float hull_layer_reset_ps(float4 pos : SV_Position) : SV_Depth {\n"
+    "    if (resetMark.Load(int3(int2(pos.xy), 0)) < 0.5) discard;\n"
+    "    return clearDepth;\n"
+    "}\n";
 // The count: the filtered pixels, into stats[1].
 constexpr char kCountHlsl[] = HULL_LAYER_PASS_HLSL
     "RWByteAddressBuffer stats : register(u0);\n"
@@ -679,6 +713,18 @@ struct Eye {
     uint32_t rectFrame = ~0u;
     bool rectOn = false;
     D3D11_RECT rect{};
+    // Build B: the prefill's copy P (R32_FLOAT) and the reset's mark M (R8_UNORM), kept across frames at the eye's render size;
+    // this frame: prefilled (the reset still owed), the rectangle both ran in (preRectOn false: the whole eye), the clear stencil.
+    ID3D11Texture2D* pre = nullptr;
+    ID3D11RenderTargetView* preRtv = nullptr;
+    ID3D11ShaderResourceView* preSrv = nullptr;
+    ID3D11Texture2D* preMark = nullptr;
+    ID3D11RenderTargetView* preMarkRtv = nullptr;
+    ID3D11ShaderResourceView* preMarkSrv = nullptr;
+    uint32_t preW = 0, preH = 0;
+    bool prefilled = false, preRectOn = false;
+    D3D11_RECT preRect{};
+    uint8_t clearStencil = 0;
     // Shader views over the private depth and the game's eye depth, kept while the texture is the same (a view holds its texture).
     ID3D11ShaderResourceView* privZSrv = nullptr;
     const void* privZOf = nullptr;
@@ -780,6 +826,10 @@ struct Window {
     uint32_t rectDecided = 0, rectFrames = 0, wholeNoBox = 0, wholeEmpty = 0, wholeProbe = 0, wholeStale = 0;
     double rectShare = 0.0;
     uint32_t boxesRead = 0, boxesEmpty = 0, scissorDraws = 0, scissorGame = 0, scissorNoState = 0;
+    // Build B (the "prefill" line): eye-frames seeded, prefilled (and of those in a rectangle), reset; prefilled but never reset
+    // (the frame moved on first); not prefilled by reason.
+    uint32_t preSeeds = 0, preFrames = 0, preRect = 0, preResets = 0, preUnreset = 0;
+    uint32_t preSkipMode = 0, preSkipFormat = 0, preSkipView = 0, preSkipTargets = 0, preSkipShader = 0;
 };
 
 // Separate mode: what hullLayerBeforeMainDraw bound over the game's issue, which hullLayerAfterMainDraw puts back.
@@ -850,6 +900,15 @@ struct CompGpu {
     ID3D11Buffer* sharpCb = nullptr;
 };
 
+// Build B's device objects, made once at the first prefill (apart from Gpu, so a failure here leaves the layer running unprefilled).
+struct PrefillGpu {
+    bool tried = false, ok = false;
+    ID3D11PixelShader* prefillPs = nullptr;
+    ID3D11PixelShader* markPs = nullptr;
+    ID3D11PixelShader* resetPs = nullptr;
+    ID3D11DepthStencilState* resetDss = nullptr;   // depth ALWAYS written, stencil ALWAYS REPLACE (the ref: the clear stencil)
+};
+
 // Build A': the game's rasterizer states (references held, so an address is not reused) and their clones with ScissorEnable.
 struct ScissorState {
     ID3D11RasterizerState* game = nullptr;   // null: the default state
@@ -892,6 +951,7 @@ bool g_discard = false;
 uint32_t g_hold = 0;
 Comp g_comp[2];
 CompGpu g_cgpu;
+PrefillGpu g_pgpu;
 std::vector<ScissorState> g_scissorStates;
 GpuTimer g_toneTimer, g_compTimer;
 bool g_saidFrameGen = false, g_saidMaskLarge = false, g_saidToneDecline = false, g_saidDecline[kDeclines] = {};
@@ -1088,6 +1148,18 @@ void releaseTone(Eye& e) {
     e.rectOn = false;
 }
 
+// Build B: the eye's prefill copy and mark.
+void releasePrefill(Eye& e) {
+    releaseRef(e.preRtv);
+    releaseRef(e.preSrv);
+    releaseRef(e.pre);
+    releaseRef(e.preMarkRtv);
+    releaseRef(e.preMarkSrv);
+    releaseRef(e.preMark);
+    e.preW = e.preH = 0;
+    e.prefilled = false;
+}
+
 // Build A': the rasterizer clones.
 void releaseScissorStates() {
     for (auto& s : g_scissorStates) {
@@ -1141,12 +1213,15 @@ void releaseEyeGpu(Eye& e) {
     releaseRef(e.slotSrv);
     e.slotSrvOf = nullptr;
     releaseTone(e);
+    releasePrefill(e);
     releaseStaging(e);
 }
 
 // The per-frame fields back to the start of a frame (the identity and the GPU objects stay).
 void resetFrame(Eye& e) {
     releaseSeedViews(e);
+    if (e.prefilled) ++g_win.preUnreset;   // Build B: never (finishGbuffer resets it); counted so a hole in that shows
+    e.prefilled = false;
     e.seen = false;
     e.shell = false;
     e.gb = Gb::Before;
@@ -1182,6 +1257,11 @@ void releaseGpu() {
     releaseRef(g_gpu.poolSrv);
     releaseRef(g_gpu.pool);
     g_gpu = Gpu{};
+    releaseRef(g_pgpu.prefillPs);
+    releaseRef(g_pgpu.markPs);
+    releaseRef(g_pgpu.resetPs);
+    releaseRef(g_pgpu.resetDss);
+    g_pgpu = PrefillGpu{};
     releaseRef(g_cgpu.coverCs);
     releaseRef(g_cgpu.taaCs);
     releaseRef(g_cgpu.sharpCs);
@@ -1636,6 +1716,8 @@ struct GfxSave {
     ID3D11RasterizerState* raster = nullptr;
     UINT viewportCount = D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
     D3D11_VIEWPORT viewports[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE] = {};
+    UINT scissorCount = D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;   // Build B's passes are scissored
+    D3D11_RECT scissors[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE] = {};
     ID3D11InputLayout* layout = nullptr;
     D3D11_PRIMITIVE_TOPOLOGY topology = D3D11_PRIMITIVE_TOPOLOGY_UNDEFINED;
     ID3D11VertexShader* vs = nullptr;
@@ -1651,6 +1733,7 @@ struct GfxSave {
         c->OMGetDepthStencilState(&depth, &stencilRef);
         c->RSGetState(&raster);
         c->RSGetViewports(&viewportCount, viewports);
+        c->RSGetScissorRects(&scissorCount, scissors);
         c->IAGetInputLayout(&layout);
         c->IAGetPrimitiveTopology(&topology);
         c->VSGetShader(&vs, nullptr, nullptr);
@@ -1667,6 +1750,7 @@ struct GfxSave {
         vScreenOMSetDepthStencilStateRaw(c, depth, stencilRef);
         c->RSSetState(raster);
         vScreenRSSetViewportsRaw(c, viewportCount, viewportCount ? viewports : nullptr);
+        c->RSSetScissorRects(scissorCount, scissorCount ? scissors : nullptr);
         c->IASetInputLayout(layout);
         c->IASetPrimitiveTopology(topology);
         vScreenVSSetShaderRaw(c, vs, nullptr, 0);
@@ -2105,6 +2189,213 @@ bool seedOwnMask(ID3D11DeviceContext* ctx, Eye& e, UINT instances, UINT startIns
 
 void noteShell(ID3D11DeviceContext* ctx);
 void finishGbuffer(ID3D11DeviceContext* ctx, int ei, End why);
+bool eyeRect(int ei, D3D11_RECT* out);
+ID3D11RasterizerState* scissorClone(ID3D11RasterizerState* game);
+bool depthView(ID3D11Resource* res, ID3D11ShaderResourceView*& srv, const void*& of);
+
+// ---- Build B: the depth prefill and its reset (docs "Build B") -------------------------------------------------------------
+//
+// Before the eye's first hull draw the private depth takes the game's eye depth (the prepass, the cockpit shell and the draws
+// before the own ship's block; the main pass discards the own ship, so no hull), so a hull pixel behind any of it fails the
+// early depth test and is not shaded. Before the eye's G-buffer window ends (finishGbuffer, ahead of the depth copy, the decals,
+// the AO and every lighting stage), every pixel the hull did not make nearer goes back to the clear depth and stencil: from
+// there on the private depth is hull-only, as before, except the hull pixels hidden behind what the prefill held, which are now
+// clear. Both passes run in the eye's Build A' rectangle (outside it the private depth stays at its clear and nothing is drawn).
+
+// The prefill pass's shaders and the reset's state, once.
+bool ensurePrefillGpu() {
+    if (g_pgpu.tried) return g_pgpu.ok;
+    g_pgpu.tried = true;
+    struct Item {
+        const char* src;
+        size_t len;
+        const char* entry;
+        ID3D11PixelShader** out;
+    };
+    const Item items[3] = {{kPrefillPsHlsl, sizeof(kPrefillPsHlsl) - 1, "hull_layer_prefill_ps", &g_pgpu.prefillPs},
+                           {kMarkPsHlsl, sizeof(kMarkPsHlsl) - 1, "hull_layer_mark_ps", &g_pgpu.markPs},
+                           {kResetPsHlsl, sizeof(kResetPsHlsl) - 1, "hull_layer_reset_ps", &g_pgpu.resetPs}};
+    for (const Item& it : items) {
+        ID3DBlob* code = nullptr;
+        std::string why;
+        if (!compileShader(it.src, it.len, it.entry, "ps_5_0", &code, &why)) {
+            Log::get().note("hull layer: the %s shader did not compile (%s); no depth prefill this session", it.entry, why.c_str());
+            if (code) code->Release();
+            return false;
+        }
+        const HRESULT hr = g_device->CreatePixelShader(code->GetBufferPointer(), code->GetBufferSize(), nullptr, it.out);
+        code->Release();
+        if (FAILED(hr) || !*it.out) {
+            Log::get().note("hull layer: the %s shader compiled but could not be made (hr 0x%08lX); no depth prefill this session", it.entry,
+                            static_cast<unsigned long>(hr));
+            return false;
+        }
+    }
+    D3D11_DEPTH_STENCIL_DESC dd{};
+    dd.DepthEnable = TRUE;
+    dd.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ALL;
+    dd.DepthFunc = D3D11_COMPARISON_ALWAYS;
+    dd.StencilEnable = TRUE;
+    dd.StencilReadMask = 0xFF;
+    dd.StencilWriteMask = 0xFF;
+    dd.FrontFace.StencilFunc = D3D11_COMPARISON_ALWAYS;
+    dd.FrontFace.StencilPassOp = D3D11_STENCIL_OP_REPLACE;
+    dd.FrontFace.StencilFailOp = D3D11_STENCIL_OP_KEEP;
+    dd.FrontFace.StencilDepthFailOp = D3D11_STENCIL_OP_KEEP;
+    dd.BackFace = dd.FrontFace;
+    if (FAILED(g_device->CreateDepthStencilState(&dd, &g_pgpu.resetDss)) || !g_pgpu.resetDss) {
+        g_pgpu.resetDss = nullptr;
+        Log::get().note("hull layer: the depth prefill's reset state could not be made; no depth prefill this session");
+        return false;
+    }
+    Log::get().note("hull layer: the depth prefill's shaders compiled and made");
+    g_pgpu.ok = true;
+    return true;
+}
+
+// The eye's P (R32_FLOAT) and mark (R8_UNORM), render targets and shader resources, at its render size.
+bool ensurePrefillTargets(Eye& e, uint32_t w, uint32_t h) {
+    if (e.pre && e.preMark && e.preW == w && e.preH == h) return true;
+    releasePrefill(e);
+    const auto make = [&](DXGI_FORMAT fmt, ID3D11Texture2D** tex, ID3D11RenderTargetView** rtv, ID3D11ShaderResourceView** srv) {
+        D3D11_TEXTURE2D_DESC td{};
+        td.Width = w;
+        td.Height = h;
+        td.MipLevels = 1;
+        td.ArraySize = 1;
+        td.Format = fmt;
+        td.SampleDesc.Count = 1;
+        td.Usage = D3D11_USAGE_DEFAULT;
+        td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+        return SUCCEEDED(g_device->CreateTexture2D(&td, nullptr, tex)) && *tex && SUCCEEDED(g_device->CreateRenderTargetView(*tex, nullptr, rtv)) &&
+               *rtv && SUCCEEDED(g_device->CreateShaderResourceView(*tex, nullptr, srv)) && *srv;
+    };
+    if (!make(DXGI_FORMAT_R32_FLOAT, &e.pre, &e.preRtv, &e.preSrv) || !make(DXGI_FORMAT_R8_UNORM, &e.preMark, &e.preMarkRtv, &e.preMarkSrv)) {
+        releasePrefill(e);
+        return false;
+    }
+    e.preW = w;
+    e.preH = h;
+    Log::get().note("hull layer: depth prefill targets made: %ux%u (R32_FLOAT copy, R8_UNORM mark)", w, h);
+    return true;
+}
+
+// The graphics state Build B's full-screen passes share: the eye's viewport, the full-screen triangle, the rectangle's scissor.
+void bindPrefillPass(ID3D11DeviceContext* ctx, const Eye& e) {
+    vScreenOMSetBlendStateRaw(ctx, nullptr, nullptr, 0xFFFFFFFFu);
+    ID3D11RasterizerState* rs = e.preRectOn ? scissorClone(g_gpu.noCull) : nullptr;
+    ctx->RSSetState(rs ? rs : g_gpu.noCull);
+    if (rs) ctx->RSSetScissorRects(1, &e.preRect);
+    D3D11_VIEWPORT vp{};
+    vp.Width = static_cast<float>(e.w);
+    vp.Height = static_cast<float>(e.h);
+    vp.MaxDepth = 1.0f;
+    vScreenRSSetViewportsRaw(ctx, 1, &vp);
+    ctx->IASetInputLayout(nullptr);
+    ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    vScreenVSSetShaderRaw(ctx, g_gpu.filterVs, nullptr, 0);
+    ctx->HSSetShader(nullptr, nullptr, 0);
+    ctx->DSSetShader(nullptr, nullptr, 0);
+    ctx->GSSetShader(nullptr, nullptr, 0);
+}
+
+// The prefill, at the seed (separate mode only: in dump mode the main pass keeps the hull, which the prefill would then hold).
+// Counted by outcome; the private depth stays at its clear when it does not run.
+void prefillEye(ID3D11DeviceContext* ctx, Eye& e, int ei) {
+    ++g_win.preSeeds;
+    if (!detail::g_hullLayerSeparate || !e.mainDepth) {
+        ++g_win.preSkipMode;
+        return;
+    }
+    D3D11_TEXTURE2D_DESC md{};
+    e.mainDepth->GetDesc(&md);
+    // A float depth only: the prefill's SV_Depth and P then hold the same bits, so the mark finds every pixel no hull wrote.
+    if (md.Format != DXGI_FORMAT_R32G8X24_TYPELESS && md.Format != DXGI_FORMAT_R32_TYPELESS) {
+        ++g_win.preSkipFormat;
+        return;
+    }
+    ID3D11Resource* privRes = nullptr;
+    e.privDsv->GetResource(&privRes);
+    const bool views = md.Width == e.w && md.Height == e.h && depthView(e.mainDepth, e.mainZSrv, e.mainZOf) && depthView(privRes, e.privZSrv, e.privZOf);
+    releaseRef(privRes);
+    if (!views) {
+        ++g_win.preSkipView;
+        return;
+    }
+    if (!ensurePrefillGpu()) {
+        ++g_win.preSkipShader;
+        return;
+    }
+    if (!ensurePrefillTargets(e, e.w, e.h)) {
+        ++g_win.preSkipTargets;
+        return;
+    }
+    e.preRectOn = eyeRect(ei, &e.preRect);   // this frame's, decided now: the hull re-issues use the same one
+    const bool timed = g_st.cpuStage < 0 && g_st.scope < 0;
+    if (timed) stageOpen(ctx, kTsGbuf, false);
+    {
+        GfxSave save;
+        save.capture(ctx);
+        vScreenSetRenderTargetsRaw(ctx, 1, &e.preRtv, e.privDsv);
+        vScreenOMSetDepthStencilStateRaw(ctx, g_gpu.depthAlways, 0);   // stencil off: the private stencil stays at its clear
+        bindPrefillPass(ctx, e);
+        vScreenPSSetShaderRaw(ctx, g_pgpu.prefillPs, nullptr, 0);
+        ID3D11ShaderResourceView* srvs[2] = {e.mainZSrv, nullptr};
+        vScreenPSSetShaderResourcesRaw(ctx, 0, 2, srvs);
+        vScreenDrawRaw(ctx, 3, 0);
+        ID3D11ShaderResourceView* none[2] = {};
+        vScreenPSSetShaderResourcesRaw(ctx, 0, 2, none);   // off before the game's eye depth is bound back as its target
+        save.restore(ctx);
+    }
+    if (timed) stageClose(ctx);
+    e.prefilled = true;
+    ++g_win.preFrames;
+    if (e.preRectOn) ++g_win.preRect;
+}
+
+// The reset, at the end of the eye's G-buffer window (before the filter, the depth copy and everything after).
+void resetPrefill(ID3D11DeviceContext* ctx, Eye& e) {
+    e.prefilled = false;
+    if (!e.privDsv || !e.privZSrv || !e.preSrv || !e.preMarkRtv || !g_pgpu.ok) {
+        // Never expected (the prefill needed all of them). Left prefilled, the cover would take the cockpit shell for hull, so
+        // the private depth goes back to its clear: no hull this eye-frame (counted as unreset on the prefill line).
+        ++g_win.preUnreset;
+        if (e.privDsv) ctx->ClearDepthStencilView(e.privDsv, D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, e.clearDepth, e.clearStencil);
+        return;
+    }
+    const bool timed = g_st.cpuStage < 0 && g_st.scope < 0;
+    if (timed) stageOpen(ctx, kTsGbuf, false);
+    {
+        GfxSave save;
+        save.capture(ctx);
+        bindPrefillPass(ctx, e);
+        // The mark: the private depth read, so no depth target.
+        ID3D11RenderTargetView* markRtv[1] = {e.preMarkRtv};
+        vScreenSetRenderTargetsRaw(ctx, 1, markRtv, nullptr);
+        vScreenOMSetDepthStencilStateRaw(ctx, nullptr, 0);
+        vScreenPSSetShaderRaw(ctx, g_pgpu.markPs, nullptr, 0);
+        ID3D11ShaderResourceView* srvs[2] = {e.privZSrv, e.preSrv};
+        vScreenPSSetShaderResourcesRaw(ctx, 0, 2, srvs);
+        vScreenDrawRaw(ctx, 3, 0);
+        // The reset: depth and stencil back to their clear where marked.
+        ID3D11ShaderResourceView* none[2] = {};
+        vScreenPSSetShaderResourcesRaw(ctx, 0, 2, none);
+        vScreenSetRenderTargetsRaw(ctx, 0, nullptr, e.privDsv);
+        vScreenOMSetDepthStencilStateRaw(ctx, g_pgpu.resetDss, e.clearStencil);
+        uint32_t cb[4] = {e.records, 0u, e.w, e.h};
+        std::memcpy(&cb[1], &e.clearDepth, sizeof e.clearDepth);
+        vScreenUpdateSubresourceRaw(ctx, g_gpu.passCb, 0, nullptr, cb, 0, 0);
+        vScreenPSSetConstantBuffersRaw(ctx, 0, 1, &g_gpu.passCb);
+        vScreenPSSetShaderRaw(ctx, g_pgpu.resetPs, nullptr, 0);
+        ID3D11ShaderResourceView* mark[2] = {e.preMarkSrv, nullptr};
+        vScreenPSSetShaderResourcesRaw(ctx, 0, 2, mark);
+        vScreenDrawRaw(ctx, 3, 0);
+        vScreenPSSetShaderResourcesRaw(ctx, 0, 2, none);
+        save.restore(ctx);
+    }
+    if (timed) stageClose(ctx);
+    ++g_win.preResets;
+}
 
 // The seed: eye `ei`'s first hull-family G-buffer draw after the shell, with that draw's targets (`rtv`, `dsv`: the
 // caller's references) and instance window bound. The own mask is dispatched, the private G-buffer made and cleared, and
@@ -2185,6 +2476,7 @@ bool seedEye(ID3D11DeviceContext* ctx, ID3D11RenderTargetView* const* rtv, ID3D1
         uint8_t stencil = 0;
         e.clearDepth = clearDepthOf(depthRes, &stencil);
         ctx->ClearDepthStencilView(e.privDsv, D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, e.clearDepth, stencil);
+        e.clearStencil = stencil;
         ++g_win.clears;
         e.hdrGame = resourceOf(rtv[3]);
         e.slotGame = resourceOf(rtv[kSlotTarget]);
@@ -2206,6 +2498,7 @@ bool seedEye(ID3D11DeviceContext* ctx, ID3D11RenderTargetView* const* rtv, ID3D1
             if (res && FAILED(res->QueryInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&e.gameDepth)))) e.gameDepth = nullptr;
             releaseRef(res);
         }
+        prefillEye(ctx, e, ei);   // Build B: the game's eye depth into the private depth, before the first hull draw
         e.gb = Gb::In;
         g_inEye = ei;
         g_seededFrame = true;
@@ -2370,6 +2663,7 @@ void finishGbuffer(ID3D11DeviceContext* ctx, int ei, End why) {
     e.gb = Gb::Done;
     e.decalOpen = why == kEndCopy;   // the hull decals follow the depth copy (decalOpen)
     ++g_win.ended[why];
+    if (e.prefilled) resetPrefill(ctx, e);   // Build B: hull-only again before the filter, the dump's copy and the depth copy
     if (!e.privDsv || !e.maskSrv || !e.stats) return;
     ID3D11Resource* slotRes = nullptr;
     if (e.privSlot) e.privSlot->GetResource(&slotRes);
@@ -4162,6 +4456,12 @@ void report() {
                         g_win.wholeStale, g_win.wholeEmpty, g_win.wholeProbe, g_win.boxesRead, g_win.boxesEmpty,
                         g_win.scissorDraws, g_win.scissorGame, g_win.scissorNoState, kReadbackLag, kRectPerFrame, kRectMarginMin,
                         kRectProbeEvery);
+        Log::get().note("hull layer: prefill: seeds=%u prefilled=%u in_rect=%u reset=%u unreset=%u skip=mode:%u,format:%u,view:%u,shader:%u,"
+                        "targets:%u (Build B: eye-frames seeded; those whose private depth took the game's eye depth before the hull, "
+                        "and of them in the Build A' rectangle; resets of it to hull-only before the depth copy; prefilled and never "
+                        "reset, expected 0; not prefilled by reason, mode = not separate; seeds=0 means it never ran)",
+                        g_win.preSeeds, g_win.preFrames, g_win.preRect, g_win.preResets, g_win.preUnreset, g_win.preSkipMode,
+                        g_win.preSkipFormat, g_win.preSkipView, g_win.preSkipShader, g_win.preSkipTargets);
         g_saidMaskLarge = false;   // the large-mask line once a window
     }
 }

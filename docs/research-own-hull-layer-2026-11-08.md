@@ -28,6 +28,8 @@ The smear is terrain that is newly uncovered at the hull edge every frame
 * **Alternatives reviewed** (section): checkerboard promising, synthetic only.
   **Build A'** (compile-only; section): re-issues scissored to the hull's box;
   next: `hull layer: rect:` `rect` near `decided`, `gpu_ms` ~0.3-0.4 lower.
+  **Build B** (compile-only; section): depth prefill and reset; next: `hull
+  layer: prefill:` prefilled = reset = seeds, `unreset=0`; gbuffer ms lower.
 * **Night vision state** (not flown): **next dump** night vision on,
   compare median ~1.0, `night_vision=N/N`. **Station fixes** (not flown):
   a docking dump, `culled_draws` high, `filter_draws` 0, `busy=` 0.
@@ -64,9 +66,8 @@ The smear is terrain that is newly uncovered at the hull edge every frame
     the transport's parts): section "Rig seed".
   * ruled out (2026-11-10, offline): unknown lights as the cause of the
     ~0% compares, because those 15 dumps are exactly the night-vision ones.
-  * ruled out (2026-11-10, bench): exposure as the cause of the dark hull on
-    the pad, because the world moved 0.94-1.03 while the hull moved 0.30-0.39
-    and the tonemap takes exposure from its VS for both.
+  * ruled out (2026-11-10, bench): exposure for the dark pad hull, because the
+    world moved 0.94-1.03, the hull 0.30-0.39, under one tonemap exposure.
 
 ## 1. How Elite draws the own hull
 
@@ -1546,6 +1547,49 @@ the output must equal the previous build's.
   0.2 to about 0.13, screen 0.29 to about 0.22; total about 0.3-0.4 ms
   less. Look for a seam at the rectangle's edges and hull missing in a
   fast head turn.
+
+## Build B (2026-11-10, compile-only, not flown): the depth prefill
+
+83-87% of the hull's pixels are behind the cockpit shell, yet every one was
+shaded into the private G-buffer. Separate mode only, render scale.
+
+- **Prefill, by copy, not by re-issuing the shell.** At the seed (before the
+  eye's first hull draw) the game's eye depth holds the prepass, the shell
+  (BFE5) and the draws before the own block, and no hull (the main pass
+  discards it). At render scale it has the private depth's raster, so it is
+  exact. A full-screen pass in the Build A' rectangle writes it to the
+  private depth (SV_Depth, depth ALWAYS, stencil off: the private stencil
+  stays at its clear, so the hull draws' stencil sees what it saw) and to P,
+  an R32_FLOAT copy. Float depth only (R32G8X24 or R32): SV_Depth and P then
+  hold the same bits. A hull pixel behind any of it fails the depth test.
+- **Reset**, at the start of `finishGbuffer` (the end of the window: before
+  the neighbour filter, the dump's depth copy, the game's depth copy, the
+  decals, AO, reflections and lighting): a mark pass (the private depth read
+  as a texture) marks every pixel the hull did not make nearer than P; a
+  reset pass writes the clear depth there (SV_Depth) and the clear stencil
+  (REPLACE). "Not nearer" rather than "equal": a draw with its own depth
+  test that wrote something farther is behind the prefill anyway.
+- **Ordering: reset before the depth copy**, so the AO, the reflections and
+  the lighting see a hull-only private depth as before. The AO's cockpit
+  contact occlusion (the feasibility's plus) is left for later. The only
+  difference from Build A': hull pixels hidden behind what the prefill held
+  are now clear in the private depth and G-buffer, so an AO kernel or
+  reflection ray from a shown hull pixel no longer finds the hidden hull
+  just behind the shell edge, and the TAA's 3x3 nearest reprojection depth
+  (`coverDepth`) is 0 there instead of the hidden hull's. The cover is
+  unchanged (it already showed only hull at least as near as the main
+  depth, which is never farther than the prefill).
+- **Not changed:** dump mode (`diag.hull_layer = dump`) does not prefill:
+  its main pass keeps the hull. The separate dump copies the private depth
+  after the reset. Cost: P and the mark add 5 bytes a render pixel an eye.
+- **Next flight log:** `hull layer: prefill: seeds=N prefilled=P in_rect=..
+  reset=R unreset=0 skip=mode:0,format:0,view:0,shader:0,targets:0`. Expect
+  P = R = N; `seeds=0` means it never ran; `format>0` means the eye depth is
+  not float on that rig. `gpu_ms` gbuffer (it now includes the three passes;
+  estimate, both eyes) from Build A''s about 0.3-0.45 to about 0.15-0.25.
+  Look for the cockpit shell painted as hull (a reset that missed) and hull
+  holes at the shell's edges. Risk: a hull PS that turns off early depth
+  (writes depth or a UAV) gains nothing.
 
 ## Optimisation debt (recorded 2026-11-08 at the pilot's request)
 
