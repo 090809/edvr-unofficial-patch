@@ -581,8 +581,8 @@ inline unsigned run() {
         const std::string binding = between(runtime, "        if(!deferredProjection->active()) {", "    // Typed light authority");
         const std::string qualified = between(model, "inline bool flatRuntimeQualifiedDeferredCamera(", "// Runtime's exact-resource/used-transform attestation");
         const std::string observe = between(model, "if(flatRuntimeQualifiedDeferredCamera(p,*t,d,q)) {", "if (k.camera) {");
-        expect(countOf(verifier, "flatRuntimeDeferredDonor(") == 2 && countOf(binding, "flatRuntimeDeferredDonor(") == 1 && countOf(runtime, "flatRuntimeDeferredDonor(") == 3,
-               "the verifier (to resolve, and once more to name the second camera the pass uses) and its binding-failure path ask the shared resolver, and nothing else in the runtime does");
+        expect(countOf(verifier, "flatRuntimeDeferredDonor(") == 3 && countOf(binding, "flatRuntimeDeferredDonor(") == 1 && countOf(runtime, "flatRuntimeDeferredDonor(") == 4,
+               "the verifier (to resolve, and once more to name the camera the pass uses, of the source records or of a witness pair) and its binding-failure path ask the shared resolver, and nothing else in the runtime does");
         expect(countOf(qualified, "flatRuntimeDeferredDonor(") == 1 && countOf(observe, "flatRuntimeDeferredDonor(") == 1 && countOf(model, "flatRuntimeDeferredDonor(") == 3,
                "the model's qualification and the donor it records ask the same resolver (a definition and two uses)");
         expect(model.find("inline FlatDeferredDonor flatRuntimeDeferredDonor(") != std::string::npos &&
