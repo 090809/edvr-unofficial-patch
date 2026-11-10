@@ -25,6 +25,8 @@ The smear is terrain that is newly uncovered at the hull edge every frame
   a station pad with the consoles in view: `dluma` near 1 (was 0.30-0.39),
   the console grilles and strut details in sep_taa; log
   `hull layer: reflections: dispatches=` > 0, `declined=` 0.
+* **Alternatives reviewed** (2026-11-10, section of that name): the
+  checkerboard hull (no re-lighting) is promising offline, synthetic only.
 * **Night vision state** (not flown): **next dump** night vision on,
   compare median ~1.0, `night_vision=N/N`. **Station fixes** (not flown):
   a docking dump, `culled_draws` high, `filter_draws` 0, `busy=` 0.
@@ -1468,6 +1470,42 @@ DLSS preset K quality, FG off. 14 presses; `hull_bench_report.py` on each.
 - Also seen, not acted on: six own forward draws (glass candidates) still
   draw in the world; a 6-vertex overlay `5DAD41AA` after the tonemap; the
   report's stillness test flags every flight press (the world moves).
+
+## Alternatives reviewed (2026-11-10, after the bench)
+
+The pilot asked whether the layer's cost and fragility (every missed
+lighting pass is a visible hull bug) are justified, and for every
+alternative, however wild.
+
+- Measured cost, flight 07:13 (4fd502ad), both eyes: layer 1.2-1.4 ms GPU
+  without its TAA, 2.0-2.3 ms with it (gbuffer 0.47-0.6, mask 0.07, screen
+  0.29, light 0.17, tone 0.2, taa+composite 0.8); CPU 0.16-0.27 ms. Most of
+  it is whole-eye passes, so a ship with little hull in view (Chieftain)
+  pays nearly the same. The GPU frame was 11-12 ms at 45-50 fps (CPU-bound,
+  low-confidence profile), so the GPU part may not cost frames; not measured.
+- ruled out: a DisocclusionMask or bias-current-colour input as a fix,
+  because EDVR already marks disoccluded background with the MV sentinel
+  (`temporal_shader_source.h` 1082) and preset K reads only that; a mask
+  cannot create the history that is missing.
+- ruled out: DLSS-G or another vendor FG, because none has a D3D11 path, it
+  interpolates (a period of latency) and it would see the same hole.
+- **Checkerboard (candidate, offline synthetic only).** The main pass
+  discards 1 of every 4 hull pixels (2x2 pattern rotating per frame); the
+  game lights the hull itself, nothing is re-lit. The world under the hull
+  is rebuilt for DLSS from the last 4 frames' sparse samples; the hull's
+  missing quarter comes from its own previous frame. Synthetic test (real
+  hull mask 204552648029, real terrain 205107507039, pure pan with exact
+  MVs; scripts in the session scratchpad `checker\`): in the trailing band
+  today has no sample at all; this frame's quarter alone gives mean 2.1-3.3
+  / p95 8-14 (0-255 luma; the true world varies 30-80 across the band); 4
+  frames give 0.03-2.4 / 0-9, exact only at whole-pixel speeds. Hull fill
+  from the previous frame: 0.13-0.43 mean still, 11.3 / p95 35 at 0.6
+  deg/frame head turn, so it needs head-delta reprojection (the layer TAA
+  has it). Untested: parallax, lighting change, jitter, the game's
+  screen-space effects (AO, reflections) seeing a holed hull. No dump holds
+  consecutive hull-free world frames; a real test needs `HullSeq` to also
+  write the main-pass HDR and MV per frame, flown in a turn, or the mode
+  built and looked at.
 
 ## Optimisation debt (recorded 2026-11-08 at the pilot's request)
 
