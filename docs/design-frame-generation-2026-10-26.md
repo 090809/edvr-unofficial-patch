@@ -1837,6 +1837,12 @@ each frame carries more of it; per second the GPU does less (0.86 against
   would. Not excluded: the compositor's 90 Hz work pre-empting long compute
   passes and stretching their timestamps; the discriminator is the
   dispatch sizes, which the profile does not record.
+- At a station (`-212627` FG on, `-212635` off, 8 s apart): 20.78 against
+  21.38, but the forward passes jumped in the off capture (236 calls against
+  161, 4.06 ms against 0.47: the scene changed, the pilot was attacked).
+  Without them: +3.0; EDVR +1.15, compute +0.97, probe_cube +0.39, the rest
+  +0.15 or less; G-buffer, shadows, lighting volumes flat. The later pair
+  (`-212722`, `-212727`) is the attack (Elite 42 ms a frame): not used.
 
 ### 2026-11-11: the own hull as its own layer in S (built, not flown)
 
