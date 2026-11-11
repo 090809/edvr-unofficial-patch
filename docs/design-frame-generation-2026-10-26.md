@@ -1843,6 +1843,18 @@ each frame carries more of it; per second the GPU does less (0.86 against
   Without them: +3.0; EDVR +1.15, compute +0.97, probe_cube +0.39, the rest
   +0.15 or less; G-buffer, shadows, lighting volumes flat. The later pair
   (`-212722`, `-212727`) is the attack (Elite 42 ms a frame): not used.
+- Busy scenes (`-213447`/`-213455` a carrier fight, `-213740`/`-213747`
+  docked): a real frame 51-84 ms, Elite 41-73 of it, EDVR 9-10. Shadows
+  18-25 ms, the G-buffer 13-32 ms (5.7-6.2 ms an eye docked, 414 draws, 0.78 M
+  triangles). The shadows are one set a frame, not one an eye: four 512x512
+  local maps (1.4-3.1 ms each with 38-125 draws, 0.2-0.6 M triangles) and
+  four 3072x3072 cascades (up to 5.8 ms, 1097 draws, 1.6 M triangles); over
+  the planet the same eight passes cost 0.02-0.05 ms each. Two local maps
+  with identical draw lists show in some frames (two lights over the same
+  objects), not in all. Vertex-bound game geometry: no FG or hull layer
+  lever; the game's model and shadow settings are.
+- ruled out: per-eye shadow maps in VR, because each frame has one set of
+  the eight shadow passes, unpaired by eye.
 
 ### 2026-11-11: the own hull as its own layer in S (built, not flown)
 
