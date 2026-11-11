@@ -797,7 +797,8 @@ unsigned dlaaPresetNow() {
 // ---- the hull variant bench's private DLSS pair (TEMPORARY; dlaa.h) ------------------------------------------------------
 #ifdef EDVR_HAVE_NGX
 namespace {
-EyeFeature g_hullFeature[2];
+constexpr int kHullPair = 2;   // the bench's private pair, one per VR eye (not upscaler slots)
+EyeFeature g_hullFeature[kHullPair];
 bool g_hullSub[2] = {};        // created with output subrects
 bool g_hullNoted[2] = {};
 }  // namespace
@@ -813,7 +814,7 @@ bool dlaaHullEvaluate(ID3D11DeviceContext* ctx, int eye, ID3D11Texture2D* colour
     if (reason) *reason = "this build has no NVIDIA DLSS SDK";
     return false;
 #else
-    if (eye < 0 || eye > 1 || !g_available || !g_params || !g_caps || !ctx || !colour || !depth || !motion || !output || !w || !h || !outW ||
+    if (eye < 0 || eye >= kHullPair || !g_available || !g_params || !g_caps || !ctx || !colour || !depth || !motion || !output || !w || !h || !outW ||
         !outH) {
         if (reason) *reason = g_available ? "a missing input" : g_reason;
         return false;
