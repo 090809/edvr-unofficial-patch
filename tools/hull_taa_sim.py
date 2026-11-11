@@ -2,7 +2,7 @@
 """Reproduce the hull layer's TAA offline from a dump's TAA sequence (diag.hull_layer = separate, TEMPORARY; docs/research-own-hull-layer-2026-11-08.md "Dump v2").
 
 Usage: python tools/hull_taa_sim.py <edvr_logs\\eyes\\eye_<stamp>> [--current 0.1] [--interior-scale 0.5] [--kernel 3.5]
-           [--clip-interior 3.0] [--clip-edge 1.25] [--sharpen 0.6] [--last 8] [--compare]
+           [--clip-interior 3.0] [--clip-edge 1.25] [--sharpen 0.3] [--shader 1|2] [--last 8] [--compare]
        python tools/hull_taa_sim.py --self-test
 
 Reads eye_<stamp>_HullSeq.json and, per frame nn, eye_<stamp>_HullSeq_<nn>_Cover.bin (the layer's cover at render size: the
@@ -17,6 +17,11 @@ nearest depth), read through the 9-tap Catmull-Rom; clamped to mean +- clip_inte
 current weight times interior_scale), else to the min/max box inside mean +- clip_edge sigma; then kSharpHlsl's cross unsharp
 mask where the whole cross is hull. The history is kept as float16, as the GPU keeps it. Every parameter is a flag; the defaults
 are this build's (the self-test checks them against hull_layer.cpp).
+
+--shader picks the TAA's version, so --compare fits the build that made the dump:
+  2 (default): builds after b85d728c (2026-11-12). At the silhouette a history whose coverage lies within the 3x3's alpha range
+     +- 0.05 is taken unclamped (saturated) at the interior's current weight; sharpen 0.3.
+  1: builds up to b85d728c. The silhouette always clipped to mean +- clip_edge sigma; sharpen 0.6.
 
 Reports, on the hull interior (coverage 1):
   * shimmer: the per-pixel standard deviation of luma over the last --last frames, in 8-bit units (mean and p95), for the
@@ -34,7 +39,10 @@ import re
 import struct
 import sys
 
-DEFAULTS = {'current': 0.1, 'interior_scale': 0.5, 'kernel': 3.5, 'clip_interior': 3.0, 'clip_edge': 1.25, 'sharpen': 0.6}
+SHADER = 2             # the kTaaHlsl version this build has; --shader picks the one a dump was made with
+DEFAULTS = {'current': 0.1, 'interior_scale': 0.5, 'kernel': 3.5, 'clip_interior': 3.0, 'clip_edge': 1.25, 'sharpen': 0.3,
+            'coverage_tol': 0.05, 'shader': SHADER}
+SHADER_SHARPEN = {1: 0.6, 2: 0.3}   # kSharpAmount with each version: the default of --sharpen
 LUMA = (0.2126, 0.7152, 0.0722)
 BAND = 128             # output rows a band: the arrays stay small at headset sizes
 MATCH_MEAN = 1.0       # 8-bit units
@@ -154,6 +162,7 @@ def taa_band(cover, cdepth, hist, fr, P, ys, xs):
     m1 /= 9.0
     sd = np.sqrt(np.maximum(m2 / 9.0 - m1 * m1, 0.0))
     interior = lo[..., 3] > 0.999
+    a_lo, a_hi = lo[..., 3].copy(), hi[..., 3].copy()   # the 3x3's coverage range, before the clip tightens lo and hi
     weight = np.where(interior, P['current'] * P['interior_scale'], P['current']).astype(np.float32)[..., None]
     lo_i, hi_i = m1 - P['clip_interior'] * sd, m1 + P['clip_interior'] * sd
     lo_i[..., 3] = 1.0
@@ -166,7 +175,15 @@ def taa_band(cover, cdepth, hist, fr, P, ys, xs):
         u = (ppx + 0.5) / rw
         v = (ppy + 0.5) / rh
         ok = valid & (u >= 0) & (u <= 1) & (v >= 0) & (v <= 1)
-        h = np.minimum(np.maximum(catmull_rom(hist, u, v), lo), hi)
+        hraw = catmull_rom(hist, u, v)
+        h = np.minimum(np.maximum(hraw, lo), hi)
+        if P.get('shader', SHADER) >= 2:
+            # Shader 2: at the silhouette, a history whose coverage agrees with the 3x3's is taken unclamped in colour
+            # (saturated), at the interior's current weight; any other keeps the clip above.
+            tol = P['coverage_tol']
+            agree = ~interior & (hraw[..., 3] >= a_lo - tol) & (hraw[..., 3] <= a_hi + tol)
+            h = np.where(agree[..., None], np.clip(hraw, 0.0, 1.0), h)
+            weight = np.where(agree[..., None], np.float32(P['current'] * P['interior_scale']), weight)
         res = np.where(ok[..., None], h + (cur - h) * weight, cur)
     return res.astype(np.float32)
 
@@ -382,9 +399,9 @@ def simulate(seq, P, last=8, compare=False):
 
 def report(prefix, r):
     P = r['params']
-    lines = ['hull taa sim: %s: %d frame(s), render %dx%d, output %dx%d, window %s; current %g interior_scale %g kernel %g clip %g/%g sharpen %g'
-             % (os.path.basename(prefix), r['frames'], r['render'][0], r['render'][1], r['output'][0], r['output'][1], r['window'], P['current'],
-                P['interior_scale'], P['kernel'], P['clip_interior'], P['clip_edge'], P['sharpen'])]
+    lines = ['hull taa sim: %s: %d frame(s), render %dx%d, output %dx%d, window %s; shader %d current %g interior_scale %g kernel %g clip %g/%g sharpen %g'
+             % (os.path.basename(prefix), r['frames'], r['render'][0], r['render'][1], r['output'][0], r['output'][1], r['window'],
+                P.get('shader', SHADER), P['current'], P['interior_scale'], P['kernel'], P['clip_interior'], P['clip_edge'], P['sharpen'])]
     if 'shimmer_sim' in r:
         line = ('shimmer (luma std over the last frames, 8-bit units, %d interior px): sim mean %.3f p95 %.3f'
                 % (r['interior_px'], r['shimmer_sim'][0], r['shimmer_sim'][1]))
@@ -413,7 +430,9 @@ def shader_defaults(src):
             'clip_edge': num(r'lo = max\(lo, m1 - ([\d.]+) \* sd\)'),
             'interior_scale': num(r'weight = jit\.w \* ([\d.]+);'),
             'current': num(r'constexpr float kTaaCurrent = ([\d.]+)f;'),
-            'sharpen': num(r'constexpr float kSharpAmount = ([\d.]+)f;')}
+            'sharpen': num(r'constexpr float kSharpAmount = ([\d.]+)f;'),
+            'coverage_tol': num(r'h\.a >= aLo - ([\d.]+) && h\.a <= aHi \+ \1'),
+            'shader': 2.0 if re.search(r'res = lerp\(saturate\(h\), cur, jit\.w \* 0\.5\)', src) else 1.0}
 
 
 def crop_of(alpha, margin, w, h):
@@ -553,6 +572,16 @@ def self_test():
     got = catmull_rom(t, np.array([(3 + 0.5) / 7]), np.array([(2 + 0.5) / 6]))
     if not np.allclose(got[0], t[2, 3], atol=1e-5):
         failures.append('Catmull-Rom at a texel centre returned %r, wanted %r' % (got[0], t[2, 3]))
+    # Shader 2 against 1: the silhouette's coverage test changes edge pixels and leaves the hull's inside as it was.
+    frames, hist0 = synthetic(n=2, history0=True, moving=True)
+    f1 = frames[1]
+    ys, xs = np.arange(42), np.arange(52)
+    band = [taa_band(f1['cover'].astype(np.float32), f1['depth'].astype(np.float32), hist0, f1, dict(DEFAULTS, shader=v), ys, xs)
+            for v in (1, 2)]
+    delta = np.abs(band[1] - band[0]).max(axis=-1)
+    if not (delta.max() > 1e-3 and delta[12:31, 14:39].max() == 0.0):
+        failures.append('shader 2 against 1: largest change %.4g, inside the hull %.4g (wanted > 0 and 0)'
+                        % (delta.max(), delta[12:31, 14:39].max()))
 
     def main_code(argv):
         import io
@@ -607,7 +636,7 @@ def self_test():
     for f in failures:
         print('hull taa sim self-test FAILED: ' + f)
     if not failures:
-        print('hull taa sim self-test passed (11 checks)')
+        print('hull taa sim self-test passed (12 checks)')
     return 1 if failures else 0
 
 
@@ -619,7 +648,11 @@ def main(argv=None):
     p.add_argument('--kernel', type=float, default=DEFAULTS['kernel'], help='the per-frame kernel exp(-k d^2), render pixels')
     p.add_argument('--clip-interior', type=float, default=DEFAULTS['clip_interior'], help='the interior box, sigmas about the 3x3 mean')
     p.add_argument('--clip-edge', type=float, default=DEFAULTS['clip_edge'], help='the silhouette\'s variance clip, sigmas (inside min/max)')
-    p.add_argument('--sharpen', type=float, default=DEFAULTS['sharpen'], help='the cross unsharp mask\'s amount (kSharpAmount)')
+    p.add_argument('--sharpen', type=float, default=None,
+                   help='the cross unsharp mask\'s amount (kSharpAmount; default the --shader version\'s: 0.3 for 2, 0.6 for 1)')
+    p.add_argument('--shader', type=int, choices=sorted(SHADER_SHARPEN), default=SHADER,
+                   help='the TAA version: 2 (default) for builds after b85d728c, the silhouette\'s coverage test; '
+                        '1 for builds up to b85d728c, the silhouette always variance-clipped')
     p.add_argument('--last', type=int, default=8, help='frames the shimmer is measured over (default 8)')
     p.add_argument('--compare', action='store_true', help='compare with the composites the GPU wrote')
     p.add_argument('--self-test', action='store_true')
@@ -630,7 +663,7 @@ def main(argv=None):
         p.error('give the eye run prefix, or --self-test')
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     P = {'current': a.current, 'interior_scale': a.interior_scale, 'kernel': a.kernel, 'clip_interior': a.clip_interior, 'clip_edge': a.clip_edge,
-         'sharpen': a.sharpen}
+         'sharpen': SHADER_SHARPEN[a.shader] if a.sharpen is None else a.sharpen, 'coverage_tol': DEFAULTS['coverage_tol'], 'shader': a.shader}
     try:
         seq = load_sequence(a.prefix)
         r = simulate(seq, P, last=max(2, a.last), compare=a.compare)

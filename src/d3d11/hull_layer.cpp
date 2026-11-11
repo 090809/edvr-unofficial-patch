@@ -478,8 +478,14 @@ constexpr char kTaaHlsl[] =
     // Inside the hull (the whole 3x3 is hull) the layer moves only by the head's motion, which the reprojection carries
     // exactly, so the history may be trusted far more: a loose box (mean +- 3 sigma) and a lower current weight let a
     // sub-pixel panel line converge to a steady line instead of the staircase the pilot saw flicker (23:20, dump
-    // 232023684003). At the silhouette the tight box stays: there the world behind changes.
+    // 232023684003). At the silhouette the tight box stays for a history whose coverage disagrees: there the world behind
+    // changes. A history whose coverage agrees with this frame's (h.a within the 3x3's alpha range +- 0.05) is the same edge,
+    // carried by the reprojection, and is taken unclamped in colour at the interior's weight (2026-11-12): the 1.25-sigma clip
+    // swung with the jitter and was the edge's flicker (offline, 4 moving sequences: pixels changing > 4/255 between frames
+    // 2.0% to 0.4%; the interior's lighting lag unchanged; docs "Silhouette coverage test").
     "    float weight = jit.w;\n"
+    "    float aLo = lo.a, aHi = hi.a;\n"
+    "    bool edge = !(lo.a > 0.999);\n"
     "    if (lo.a > 0.999) {\n"
     "        lo = m1 - 3.0 * sd;\n"
     "        hi = m1 + 3.0 * sd;\n"
@@ -503,7 +509,11 @@ constexpr char kTaaHlsl[] =
     "            pp.x = (dp.x / -dp.z - tanPrev.x) / (tanPrev.y - tanPrev.x) * float(rsz.x) - 0.5;\n"
     "            pp.y = (tanPrev.w - dp.y / -dp.z) / (tanPrev.w - tanPrev.z) * float(rsz.y) - 0.5;\n"
     "            float2 uv = (pp + 0.5) / float2(rsz);\n"
-    "            if (all(uv >= 0.0) && all(uv <= 1.0)) res = lerp(clamp(histCatmullRom(uv), lo, hi), cur, weight);\n"
+    "            if (all(uv >= 0.0) && all(uv <= 1.0)) {\n"
+    "                float4 h = histCatmullRom(uv);\n"
+    "                if (edge && h.a >= aLo - 0.05 && h.a <= aHi + 0.05) res = lerp(saturate(h), cur, jit.w * 0.5);\n"
+    "                else res = lerp(clamp(h, lo, hi), cur, weight);\n"
+    "            }\n"
     "        }\n"
     "    }\n"
     "    histOut[id.xy] = res;\n"   // the composite is the sharpen's (kSharpHlsl), which always follows
@@ -520,7 +530,10 @@ constexpr char kTaaHlsl[] =
 // kSharpDirectHlsl (2026-11-10, docs "Bench A/B variants") reads and writes the eye itself through one typed UAV, the world only
 // at the pixel it writes, so the eye's pixels outside the listed tiles are never touched and neither copy runs. Same loads, same
 // arithmetic, same UNORM store.
-constexpr float kSharpAmount = 0.6f;   // c + amount * (c - mean of the 4 neighbours); 0.8 amplified the thin lines' flicker (23:10)
+// c + amount * (c - mean of the 4 neighbours); 0.8 amplified the thin lines' flicker (23:10). 0.3 since 2026-11-12: offline, the
+// share of thin-line pixels changing > 4/255 between frames was 0.39% at 0, 0.57% at 0.3, 1.14% at 0.6 (4 moving sequences).
+// The frame-generation overlay reads the same constant through hullLayerSharpAt.
+constexpr float kSharpAmount = 0.3f;
 #define HULL_LAYER_SHARP_HLSL                                                                      \
     "Texture2D<float4> hist : register(t0);\n"                                                     \
     "StructuredBuffer<uint> tiles : register(t2);\n"                                               \

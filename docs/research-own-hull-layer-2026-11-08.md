@@ -15,9 +15,8 @@ The smear is terrain that is newly uncovered at the hull edge every frame
   Step 1 CONFIRMED (20:30, cfa4e5f5: median 1.000). Steps 2-3, AO, dump
   v2, station fixes, night vision state: their sections; not all flown.
   **Open:** the 6 own forward draws still draw in the world.
-* **Benches FLOWN** (sections "Bench flown", "Flight b30a1c6f"): sep_taa is
-  the AA (least shimmer); dlss_sub 1.80 ms; A', B, tiles run, no seam.
-* **5bf8f651 FLOWN** (section "Flight 5bf8f651"): the wing hazy; reflection
+* **Benches FLOWN** ("Bench flown", "Flight b30a1c6f"): sep_taa is the AA;
+  A', B, tiles run. 5bf8f651 ("Flight 5bf8f651"): wing hazy; reflection
   dump 192439364002: private = game around the pass (median 1.000).
 * **Planet through the wing FIXED** (2026-11-11 20:07, 98276da2, sections
   "Unmirrored inputs", "Two input leaks"): the tone's bloom zeroed
@@ -28,15 +27,16 @@ The smear is terrain that is newly uncovered at the hull edge every frame
   = `s_frames` (2676), 0 declines; 45.5 real fps to 90; layer 0.97 ms, synth
   1.57 ms; GPU 21.3/18.9 ms (late 0-4/90). Pilot: slight smear, "overall
   OK". Not flown: S first (no world copy), S overlay over tiles ("S first").
-* **Not flown:** night vision state (dump: median ~1.0,
-  `night_vision=N/N`); station fixes (docking dump: `filter_draws` 0).
+* **Not flown:** night vision state; station fixes. **TAA flicker**
+  (2026-11-12, "Silhouette coverage test"): edge history kept when its
+  coverage agrees, sharpen 0.6 -> 0.3; offline edge flicker 2.0% -> 0.4%,
+  lines 1.14% -> 0.57%, lag unchanged; fly: thin lines, edge, head turns.
 * **Temporary keys of this arc:** `diag.hull_layer` (off | dump | separate),
   `hotkey.hull_bench`. Temporary code: the busy governor (`kBusyDraws`,
   `kBusyDrawsCulled`), `hull_bench.cpp` and the bench in `hull_layer.cpp`,
   `g_hullFeature` (dlaa.cpp), the bench's `hull_dlss` timer.
-* **Background:** the hole-fill (e) fails ("Result"); neighbours interleave
-  with the own hull draws, so ownership is per record ("The binding map").
-* **Rig seed** (not flown): offline wrong object 14 -> 0; `own seed:` `draw` ~0.
+* **Background:** ownership is per record ("The binding map"). Rig seed
+  (not flown): offline wrong object 14 -> 0; `own seed:` `draw` ~0.
 * **Ruled out (this study):**
   * ruled out (2026-11-11, flight of 223a4cda): the direct composite as the
     cause of the planet through the wing, because with it off
@@ -1972,6 +1972,59 @@ lost= overlay=tiles:,whole:`. `lost` > 0: an eye went out without the hull
 `world_copies` near 0 (only `copy_why` cases), `hull_after_s` =
 `before_hull`, `lost=0`, `overlay=tiles` = `hull_in_s`, `whole=0`; the
 composite's `gpu_ms` back near 0.10-0.11; the hull in B and S as before.
+
+## Silhouette coverage test (2026-11-12, compile-only, not flown)
+
+The pilot: since the hull went through the layer's own TAA, its thin
+lines and edges flicker (render scale x2, 1878x1632 to 3756x3264).
+
+**Change** (`kTaaHlsl`, `kSharpAmount`):
+
+- Silhouette only (the 3x3 not all hull): the 3x3's alpha range is kept
+  before the 1.25-sigma clip tightens `lo`/`hi`. A history whose coverage
+  agrees (`h.a` within that range +- 0.05) is taken unclamped in colour
+  (saturated) at the interior's current weight (`jit.w * 0.5`); any other
+  keeps the clip. The interior branch and its 3-sigma clamp are unchanged.
+- Sharpen 0.6 -> 0.3 (the FG overlay shares it through `hullLayerSharpAt`).
+- `tools\hull_taa_sim.py --shader 2` (default) fits builds after b85d728c;
+  `--shader 1` (sharpen 0.6) fits the dumps of older builds.
+
+**Offline numbers** (the study's harness on recorded 16-frame TAA
+sequences; frames 8-15 against a jitter-free reference; flicker = share of
+pixels whose luma changes by more than 4/255 against the reprojected last
+frame). Mean of the moving sequences 192439364002, 204234585011,
+204757684033, 212720335001; the still sequence 212754918002 separately:
+
+| | line, moving | silhouette, moving | silhouette, still |
+|---|---|---|---|
+| shipped, sharpen 0.6 | 1.14% | 2.01% | 2.10% |
+| shipped, sharpen 0.3 | 0.57% | 2.00% | 2.09% |
+| shipped, sharpen 0 | 0.39% | 2.00% | 2.09% |
+| new, sharpen 0.6 | 1.14% | 0.44% | 0.05% |
+| new, sharpen 0.3 | 0.57% | 0.44% | 0.05% |
+| new, sharpen 0 | 0.39% | 0.44% | 0.05% |
+
+One sequence went the other way: 192439364002's silhouette barely
+flickered before (0.01%) and does a little now (0.13%).
+
+Lighting step (still sequence looped, colour x 0.6 at frame 32), share of
+the step left on the interior after 1 / 4 / 8 / 16 frames: shipped 0.33 /
+0.23 / 0.18 / 0.12, new 0.34 / 0.23 / 0.18 / 0.12. On line pixels (which
+include pixels next to the edge) 0.83 / 0.65 / 0.50 / 0.33 against 0.88 /
+0.68 / 0.53 / 0.35. The silhouette's mean error against the reference rose,
+2.55 -> 3.19 (8-bit) moving, and fell, 0.94 -> 0.76, still: the edge
+follows the history more and the jitter less.
+
+**Limits of the offline data:** the sequences move little (no fast head
+motion: at most a few output pixels a frame), and none holds a frame
+generation frame, so neither the edge under a fast turn nor the FG
+overlay's sharpen was measured.
+
+**Next flight, the pilot looks at:** the thin panel lines (steadier, a
+little softer) and the hull's edge against the world while turning the
+head: no smear or trailing edge, no ghost of the hull where it was.
+`--expect-build` the branch commit; a dump's TAA sequence checks with
+`hull_taa_sim.py --compare` (shader 2).
 
 ## Optimisation debt (recorded 2026-11-08 at the pilot's request)
 
