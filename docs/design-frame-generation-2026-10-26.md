@@ -1829,6 +1829,14 @@ each frame carries more of it; per second the GPU does less (0.86 against
   16.13 (+2.4); EDVR +0.83; compute +0.71, probe_cube +0.32 (52 calls
   against 36), post +0.25, other +0.23 (167 against 150); G-buffer +0.03,
   shadows +0.01, forward +0.02. Same pattern.
+- A third pair (`-212303` on, `-212309` off): 18.22 against 15.48 (+2.7);
+  EDVR +1.09; compute +0.73 (45 calls against 42), other +0.46, probe_cube
+  +0.25 at the SAME 34.6 calls, post +0.13; the flat-call passes +0.05 or
+  less. So the game's extra is not only more calls: some time-sliced passes
+  do more per call (larger dispatches or faces), as a per-frame time budget
+  would. Not excluded: the compositor's 90 Hz work pre-empting long compute
+  passes and stretching their timestamps; the discriminator is the
+  dispatch sizes, which the profile does not record.
 
 ### 2026-11-11: the own hull as its own layer in S (built, not flown)
 
