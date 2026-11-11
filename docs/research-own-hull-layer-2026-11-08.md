@@ -23,11 +23,11 @@ The smear is terrain that is newly uncovered at the hull edge every frame
   "Unmirrored inputs", "Two input leaks"): the tone's bloom zeroed
   (`tone bloom: zeroed=3478 declined=0`), `eye_sized=0`; the pilot: the
   planet no longer shows on the wing. Direct composite on (`direct=3478`).
-* **Frame generation integrated** (2026-11-11, compile-only, not flown;
-  section "Frame generation integration"): separate mode no longer stands
-  aside; S warps the world-only eye and gets the hull layer by the head's
-  step. **Next flight:** FG on over a planet, `hull layer: framegen:`
-  `hull_in_s` near `s_frames`, no hull-edge smear in a head or ship turn.
+* **Frame generation integrated, FLOWN** (2026-11-11 21:02, 9dc9bd31, HMD
+  0.5, FG forced on; section "Frame generation integration"): `hull_in_s`
+  = `s_frames` (2676), 0 declines; 45.5 real fps to 90; layer 0.97 ms, synth
+  1.57 ms; real-frame GPU 21.3 ms against an 18.9 ms budget (late 0-4/90).
+  The pilot: only a very slight smear in head motion; "overall OK".
 * **Not flown:** night vision state (dump: median ~1.0,
   `night_vision=N/N`); station fixes (docking dump: `filter_draws` 0).
 * **Temporary keys of this arc:** `diag.hull_layer` (off | dump | separate),
