@@ -10682,7 +10682,7 @@ H_HULL_OTHER = (r"hull layer: (?:dump \S+ armed|private copy (?:made|of a)|\d+ p
                 r"diag\.hull_layer=\S+ is not off, dump or separate|separate mode hides the own ship|own-discard variant (?:made|declined)|"
                 r"a \w+ draw in the window got no own-discard variant|dump \S+ eye \d: GameGbuf0|"
                 # Step 3 (separate): the mode's note, its fallbacks said once, the tonemap re-issue's and the composite's facts and refusals.
-                r"separate mode (?:takes the own ship out|stands aside|falls back)|tonemap re-issue declined|composite declined for eye|"
+                r"separate mode (?:takes the own ship out|falls back)|tonemap re-issue declined|composite declined for eye|"
                 r"the tone cover and composite shaders|the composite's sampler|(?:tone|composite) targets made|dump \S+ eye \d: HullTone|"
                 # Dump v2: separate mode's reference frame, and a dump that could not start its TAA sequence.
                 r"dump \S+ eye \d: reference frame|dump \S+: no HullSeq|" +
@@ -27060,7 +27060,7 @@ def self_test_health():
                              reissued=0, light=0, ld=(0, 0, 0), nocp=(2700, 2700, 2700))
 
         def hl_dump(eye=0, hull="written"):
-            return RH("hull layer: dump %ls eye %d", "123456789001", eye, 1234, 2816, 2448, 26, hull, "written", "written", 54, 3000, 3, 3, 84, 11)
+            return RH("hull layer: dump %ls eye %d frame", "123456789001", eye, 1234, 2816, 2448, 26, hull, "written", "written", 54, 3000, 3, 3, 84, 11)
 
         HL, hl_base = H_HULL, [f90_part()]
         check("hull layer: no line at all, nothing said (the key off)", hl_base, 0, [("OK", F90S)], lacks=["hull layer"])
@@ -27163,7 +27163,7 @@ def self_test_health():
                          RH("hull layer: the tone cover and composite shaders", 0.1), RH("hull layer: tone targets made", 0, 2816, 2448, 28),
                          RH("hull layer: composite targets made", 0, 3520, 3060),
                          RH("hull layer: separate mode falls back: the own mask holds", 612, 400, 120.0),
-                         RH("hull layer: separate mode stands aside"), RH("hull layer: tonemap re-issue declined:", "x"),
+                         RH("hull layer: tonemap re-issue declined:", "x"),
                          RH("hull layer: composite declined for eye", 1, "x"),
                          RH("hull layer: dump %ls eye %d: GameGbuf0", "123456789001", 0, "written", "written", 40, 22, 22),
                          RH("hull layer: dump %ls eye %d: HullTone", "123456789001", 0, "written", "written", "applied"), hl_comp()], 0, [("OK", HL)],
