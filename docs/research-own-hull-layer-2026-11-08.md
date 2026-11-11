@@ -17,26 +17,26 @@ The smear is terrain that is newly uncovered at the hull edge every frame
   **Open:** the 6 own forward draws still draw in the world.
 * **Benches FLOWN** (sections "Bench flown", "Flight b30a1c6f"): sep_taa is
   the AA (least shimmer); dlss_sub 1.80 ms; A', B, tiles run, no seam.
-* **5bf8f651 FLOWN** (section "Flight 5bf8f651", HMD 0.5, preset M): the
-  wing hazy, "see-through": dluma 1.41-1.44, 0.42 without the reflection
-  re-issue. Reflection dump 192439364002 (reference frame): private =
-  game before and after the pass (median 1.000), u1 cleared. Pad pending.
+* **5bf8f651 FLOWN** (section "Flight 5bf8f651"): the wing hazy; reflection
+  dump 192439364002: private = game around the pass (median 1.000).
 * **Planet through the wing FIXED** (2026-11-11 20:07, 98276da2, sections
   "Unmirrored inputs", "Two input leaks"): the tone's bloom zeroed
-  (`tone bloom: zeroed=3478 declined=0`), no eye-sized unmirrored input
-  left (`eye_sized=0`); the pilot: the planet no longer shows on the wing.
-  The direct composite back on (`direct=3478`).
-* **Night vision state** (not flown): **next dump** night vision on,
-  compare median ~1.0, `night_vision=N/N`. **Station fixes** (not flown):
-  a docking dump, `culled_draws` high, `filter_draws` 0, `busy=` 0.
+  (`tone bloom: zeroed=3478 declined=0`), `eye_sized=0`; the pilot: the
+  planet no longer shows on the wing. Direct composite on (`direct=3478`).
+* **Frame generation integrated** (2026-11-11, compile-only, not flown;
+  section "Frame generation integration"): separate mode no longer stands
+  aside; S warps the world-only eye and gets the hull layer by the head's
+  step. **Next flight:** FG on over a planet, `hull layer: framegen:`
+  `hull_in_s` near `s_frames`, no hull-edge smear in a head or ship turn.
+* **Not flown:** night vision state (dump: median ~1.0,
+  `night_vision=N/N`); station fixes (docking dump: `filter_draws` 0).
 * **Temporary keys of this arc:** `diag.hull_layer` (off | dump | separate),
   `hotkey.hull_bench`. Temporary code: the busy governor (`kBusyDraws`,
   `kBusyDrawsCulled`), `hull_bench.cpp` and the bench in `hull_layer.cpp`,
   `g_hullFeature` (dlaa.cpp), the bench's `hull_dlss` timer.
 * **Background:** the hole-fill (e) fails ("Result"); neighbours interleave
   with the own hull draws, so ownership is per record ("The binding map").
-* **Rig seed** (section "Rig seed", not flown): mask from the rig probe's
-  slots; offline wrong object 14 -> 0. **Next:** `own seed:` `draw` near 0.
+* **Rig seed** (not flown): offline wrong object 14 -> 0; `own seed:` `draw` ~0.
 * **Ruled out (this study):**
   * ruled out (2026-11-11, flight of 223a4cda): the direct composite as the
     cause of the planet through the wing, because with it off
@@ -1862,6 +1862,77 @@ above 0 and `declined=0`; `overlay_t3=` `unbound` above 0; and no planet
 visible on the wing. If the planet still shows, the leak is not an input of
 a re-issued pass.
 
+## Frame generation integration (2026-11-11, compile-only, not flown)
+
+Option (e)'s note, now on separate mode: frame generation's S warps the
+world layer with the world's motion and the hull layer with the head's,
+then composites, so the hull edge has no disocclusion in S. Until now
+separate mode stood aside while any FG key was on (`fallback=framegen`).
+
+Environment: OpenXR (EDVR's runtime), DLSS, FG `auto` or `on` (Phase 2.4),
+S built on the game device in the temporal pass right after B's eye.
+
+Design (`hull_layer.cpp`, `framegen_synth.cpp`, `temporal_pass.cpp`):
+
+- **The stand-aside is gone** (`decideNext`). `fallback=framegen` stays in
+  the composite line and reads 0. The variant bench still refuses, and
+  aborts, while FG is on (bench runs with FG off only).
+- **S's world-only input.** In separate mode the DLSS inputs hold no own
+  ship, so the upscaler's output (`dlOut`) is world-only; the hull goes onto
+  the submitted eye (`dlSubmit`) after the UI resolve. S reads `dlOut` when
+  B's door does not finish S, which is already world-only (`direct`). When
+  the door finishes S, S reads `dlSubmit`: the composite then copies the
+  eye before it writes the hull (`HullLayerCompositeInputs::keepWorld`, one
+  whole-eye copy into `Comp::world`) and `hullLayerSInput` hands S that
+  copy (`copy`). Reordering S before the composite was not taken: S needs
+  this frame's hull TAA result, which the composite makes.
+- **The hull layer in S.** The layer is the composite's TAA result,
+  `hist[read]` after the flip (premultiplied colour, coverage in alpha, at
+  output size). S is built in the same treat right after the composite, and
+  the next write to that texture is the next frame's TAA, so no texture is
+  kept for S. Right after S's resample (before the kept luma, the eye
+  dump's stage and B's door finish) the synthesizer calls an overlay
+  (`FrameGenSynthFrame::overlay` = `hullLayerCompositeS`) with the head's
+  step S was built with (`cb.rs`: the runtime's slot pose, else the
+  extrapolation). `hull_layer_s_cs`, one thread an S pixel over the whole
+  eye: the B position by the step's inverse (rotation, then once more at the
+  hull's cover depth when the step carries a translation), the layer
+  sharpened as B's composite sharpens it (`hullLayerSharpAt`, shared with
+  the composite's shader) at the four texels around it, bilinear, over S.
+  The real frame B keeps today's composite unchanged.
+- **UI** stays on its own path (B's door finish draws it over S).
+- **Dumps:** the eye dump stages S after the overlay. A hull dump's capture
+  frame is a reference frame (the main pass keeps the ship): its S takes no
+  layer (`not_applied`). The FG replay capture records the world-only input
+  without the hull; the replay bench does not draw the layer.
+
+Cost (estimates, not measured): the overlay, a full-eye dispatch, about
+0.05-0.1 ms an eye, inside the synth's `synth_ms`; the copy, only when the
+door finishes S, about 0.1 ms an eye inside the composite's `gpu_ms`, and
+one texture an eye in the eye's format at output size (RGBA8: 47 MB at
+3756x3264), made on first use. No new key.
+
+Log, every 30 s in separate mode: `hull layer: framegen: fg=<off|auto|on|
+shadow> s_frames= hull_in_s= world_only_inputs=copy:,direct: world_copies=
+declined=not_applied:,no_composite:,no_world_copy:,size:,unsupported:`.
+`s_frames=0` with FG on: S never reached the layer. Said once: `hull layer:
+framegen: the hull layer drawn into frame generation's S` and `world-only
+copy made for eye N`. `s_frames` minus `hull_in_s` minus the declines: S
+builds the synthesizer abandoned (busy producer texture).
+
+Risks: S's hull goes through one more resample (bilinear) than B's, so it
+may look a little softer every other frame; the hull's parallax against the
+cockpit in S uses one depth per pixel; with a fallback frame (hold, mask
+large) S warps the game's ship with the world, as before.
+
+**Next flight** (FG `auto` or `on`, in a ship over a planet):
+`--expect-build HEAD`; `hull layer: framegen:` `hull_in_s` close to
+`s_frames`, declines near 0 (`not_applied` only on hold frames);
+`world_only_inputs` names the source; the composite line's
+`fallback=framegen:0` and `composited_eyes` above 0; the FG gate line still
+admits. The pilot: no smear at the hull edge in S in a head turn and a ship
+turn, and the hull not doubled. Then FG off: the bench still runs.
+
 ## Optimisation debt (recorded 2026-11-08 at the pilot's request)
 
 The layer was built to work first. Before it ships as anything but a
@@ -1886,8 +1957,9 @@ diagnostic, measure it, then cut. Ordered by expected size:
    the G-buffer, lighting and post windows.
 5. **The neighbour filter pass** runs every eye-frame even with no
    neighbour. Skip it when the seed's pool region has no foreign hull draws.
-6. **Frame generation** is not integrated: separate mode stands aside while
-   FG is on. FG needs the hull composited into generated frames too.
+6. **Frame generation**: integrated 2026-11-11 (section "Frame generation
+   integration"); left: the overlay is a whole-eye dispatch (tile-limit it
+   to the hull's box moved by the step) and the world-only copy.
 
 ## Night vision on the hull (2026-11-08 ~22:15, build 1a1b6c60)
 

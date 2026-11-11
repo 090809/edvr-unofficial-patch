@@ -5240,6 +5240,12 @@ void* temporalInner(void* srcTex, int eye, const float* bounds,
                         hc.dlColour = e.dlColour;   // the hull bench's second DLSS reads the eye's own inputs (TEMPORARY)
                         hc.dlDepth = e.dlDepth;
                         hc.dlMv = e.dlMv;
+                        // Frame generation (hull doc "Frame generation integration"): the synthesizer below builds S of this eye-frame (the same test as
+                        // its idle branch) and reads the texture the composite writes -- the submitted eye when B's door finishes S, or dlOut when no
+                        // resolve can run -- so the composite keeps the world-only eye first (hullLayerSInput hands it to S).
+                        const bool fgBuildsNow = (frameGenShadowOn() || frameGenLockSynth()) &&
+                                                 (frameGenSynthEveryFrame() || g_eyeRunLeft > 0 || frameGenSynthSampleDue(static_cast<uint32_t>(eye)));
+                        hc.keepWorld = fgBuildsNow && (nativeSharpenActive() || !intoSubmit);
                         hullLayerCompositeEye(ctx, eye, hc);
                         if (!intoSubmit) ctx->CopyResource(e.dlSubmit, e.dlOut);
                     }
@@ -5315,6 +5321,13 @@ void* temporalInner(void* srcTex, int eye, const float* bounds,
                                 if (e.dlSubmitSrv) sy.outSrv = e.dlSubmitSrv;
                                 sy.finishSharpen = nativeSharpenWillSharpen();
                                 sy.dumpIndex = dumpFrame ? g_eyeRunTaken : -1;
+                            }
+                            // diag.hull_layer = separate (hull doc "Frame generation integration"): S warps the world without the own ship and the hull layer
+                            // is drawn into it by the head's step (hull_layer.h hullLayerSInput, hullLayerCompositeS); otherwise S reads B as before.
+                            if (hullLayerCompositeWanted()) {
+                                bool hullOverlay = false;
+                                sy.outSrv = hullLayerSInput(eye, sy.outSrv, &hullOverlay);
+                                if (hullOverlay) sy.overlay = hullLayerCompositeS;
                             }
                             sy.depthSrv = e.dlDepthSrv;
                             sy.mvSrv = e.dlMvSrv;

@@ -57,7 +57,8 @@
   the value meant to stay).
 - **Declined in design (re-open on new evidence):** ## Declined, including AFW
   as a replacement and flat-profile frame generation (2026-10-27).
-- **Open:** ## Open questions.
+- **Open:** ## Open questions. The own hull's layer in S (`diag.hull_layer =
+  separate`): built 2026-11-11, not flown (2026-11-11 entry).
 
 ## The ask
 
@@ -1801,6 +1802,20 @@ Environment: OpenXR (EDVR's runtime), left eye, render 2817x2448, output
   report says `frames=2/0` a second; `synth_ms` stays a number (not `-`,
   not `no_synth_cost`); the runtime's lock line reads `auto_gate`, not
   `no_s`. EDVR's GPU total drops by about the synthesizer's cost.
+
+### 2026-11-11: the own hull as its own layer in S (built, not flown)
+
+The hull layer's separate mode (`docs\research-own-hull-layer-2026-11-08.md`,
+section "Frame generation integration") no longer stands aside under frame
+generation. With it on, S is built from the world-only eye (the upscaler's
+output, or a copy of the submitted eye taken before the hull composite when
+B's door finishes S), and the hull layer is drawn over S right after the
+resample, moved by S's head step alone: the hull edge has no disocclusion in
+S. The module gained one hook, `FrameGenSynthFrame::overlay`, called after
+the resample inside the build's timer, so `synth_ms` carries it; the report
+lines are unchanged. The evidence is the hull layer's 30 s line `hull layer:
+framegen: ... hull_in_s=`. Flight: FG on over a planet, no hull-edge smear
+in a head and a ship turn.
 ### 2026-11-07: Phase 2.3, flight 11, the first Lock flight (same build)
 
 `fix.frame_generation = on`, about 12 minutes. Pilot: "a slight flicker",

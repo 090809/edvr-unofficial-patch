@@ -935,7 +935,18 @@ void frameGenSynthEyeFrame(ID3D11Device* dev, ID3D11DeviceContext* ctx, uint32_t
     v.statsUav = r.statsUav;
     v.linear = g.linear;
     v.rw = r.rw; v.rh = r.rh; v.ow = r.ow; v.oh = r.oh; v.qw = r.qw; v.qh = r.qh;
-    frameGenSynthRunPasses(ctx, g.cs, v, score, true, keep);
+    // The caller's overlay (the own hull layer) right after the resample, so the kept luma, the dump and the finish see it; inside the build's timer.
+    const auto afterStep = [&](int step) {
+        if (step != kFgSynResample || !f.overlay) return;
+        float rot[9], t[3];
+        for (int i = 0; i < 3; ++i) {
+            for (int k = 0; k < 3; ++k) rot[i * 3 + k] = cb.rs[i][k];
+            t[i] = cb.rs[i][3];
+        }
+        f.overlay(ctx, eye, target.uav, r.ow, r.oh, rot, t);
+        ctx->CSSetConstantBuffers(0, 1, &g.cb);
+    };
+    frameGenSynthRunPasses(ctx, g.cs, v, score, true, keep, afterStep);
     ctx->CopyResource(r.staging[slot], r.stats);
     r.pending[slot] = true;
     r.slotKind[slot] = half ? 0 : 1;

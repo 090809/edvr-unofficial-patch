@@ -24,7 +24,7 @@
 #include "cs_stage_save.h"    // Step 3's dispatches: the compute stage put back as the game (or the temporal pass) left it
 #include "dlaa.h"             // the variant bench's manifest: the eyes' DLSS preset and mode
 #include "engine_velocity.h" // engineVelocityLiveNow, engineVelocityOwnDiscardPs and its mask slot (kEngineVelocityOwnMaskPsSlot)
-#include "framegen_shadow.h"  // frameGenShadowOn: Step 3 stands aside while any frame generation key is on
+#include "framegen_shadow.h"  // frameGenShadowOn: the variant bench stands aside while any frame generation key is on; the framegen line
 #include "gpu_census.h"       // the variant bench: gpuCensusFrameSpan, the frame's GPU span
 #include "hull_bench.h"       // the variant bench's manifest, file names and writer thread (TEMPORARY)
 #include "hull_rig_probe.h"   // the rig probe: the own ship's pool slots from the engine's rigs, against the own mask (diagnostic only)
@@ -526,6 +526,21 @@ constexpr float kSharpAmount = 0.6f;   // c + amount * (c - mean of the 4 neighb
     "StructuredBuffer<uint> tiles : register(t2);\n"                                               \
     "RWTexture2D<float4> compOut : register(u0);\n"                                                \
     "cbuffer HullLayerSharpCb : register(b0) { float4 amount; };\n"                                \
+    "float4 hullLayerSharpAt(int2 p, int2 mx) {\n"                                                 \
+    "    float4 c = hist.Load(int3(p, 0));\n"                                                      \
+    "    float4 l = hist.Load(int3(clamp(p + int2(-1, 0), 0, mx), 0));\n"                          \
+    "    float4 r = hist.Load(int3(clamp(p + int2(1, 0), 0, mx), 0));\n"                           \
+    "    float4 u = hist.Load(int3(clamp(p + int2(0, -1), 0, mx), 0));\n"                          \
+    "    float4 d = hist.Load(int3(clamp(p + int2(0, 1), 0, mx), 0));\n"                           \
+    "    float4 res = c;\n"                                                                        \
+    "    if (min(min(c.a, l.a), min(min(r.a, u.a), d.a)) > 0.999) {\n"                             \
+    "        float3 m = (l.rgb + r.rgb + u.rgb + d.rgb) * 0.25;\n"                                  \
+    "        float3 lo = min(c.rgb, min(min(l.rgb, r.rgb), min(u.rgb, d.rgb)));\n"                   \
+    "        float3 hi = max(c.rgb, max(max(l.rgb, r.rgb), max(u.rgb, d.rgb)));\n"                   \
+    "        res.rgb = clamp(c.rgb + amount.x * (c.rgb - m), lo, hi);\n"                             \
+    "    }\n"                                                                                      \
+    "    return res;\n"                                                                            \
+    "}\n"                                                                                          \
     "bool hullLayerSharpPixel(uint3 gid, uint3 gt, out int2 p, out float4 res) {\n"                 \
     "    p = int2(0, 0);\n"                                                                        \
     "    res = float4(0.0, 0.0, 0.0, 0.0);\n"                                                      \
@@ -535,19 +550,7 @@ constexpr float kSharpAmount = 0.6f;   // c + amount * (c - mean of the 4 neighb
     "    uint ow, oh; hist.GetDimensions(ow, oh);\n"                                               \
     "    if (id.x >= ow || id.y >= oh) return false;\n"                                            \
     "    p = int2(id.xy);\n"                                                                       \
-    "    int2 mx = int2(ow, oh) - 1;\n"                                                            \
-    "    float4 c = hist.Load(int3(p, 0));\n"                                                      \
-    "    float4 l = hist.Load(int3(clamp(p + int2(-1, 0), 0, mx), 0));\n"                          \
-    "    float4 r = hist.Load(int3(clamp(p + int2(1, 0), 0, mx), 0));\n"                           \
-    "    float4 u = hist.Load(int3(clamp(p + int2(0, -1), 0, mx), 0));\n"                          \
-    "    float4 d = hist.Load(int3(clamp(p + int2(0, 1), 0, mx), 0));\n"                           \
-    "    res = c;\n"                                                                               \
-    "    if (min(min(c.a, l.a), min(min(r.a, u.a), d.a)) > 0.999) {\n"                             \
-    "        float3 m = (l.rgb + r.rgb + u.rgb + d.rgb) * 0.25;\n"                                  \
-    "        float3 lo = min(c.rgb, min(min(l.rgb, r.rgb), min(u.rgb, d.rgb)));\n"                   \
-    "        float3 hi = max(c.rgb, max(max(l.rgb, r.rgb), max(u.rgb, d.rgb)));\n"                   \
-    "        res.rgb = clamp(c.rgb + amount.x * (c.rgb - m), lo, hi);\n"                             \
-    "    }\n"                                                                                      \
+    "    res = hullLayerSharpAt(p, int2(ow, oh) - 1);\n"                                           \
     "    return true;\n"                                                                           \
     "}\n"
 constexpr char kSharpHlsl[] =
@@ -568,6 +571,54 @@ constexpr char kSharpDirectHlsl[] =
     "    if (!hullLayerSharpPixel(gid, gt, p, res)) return;\n"
     "    float4 w = compOut[p];\n"
     "    compOut[p] = float4(w.rgb * (1.0 - res.a) + res.rgb, w.a);\n"
+    "}\n";
+
+// Frame generation (2026-11-11, docs "Frame generation integration"): the hull layer drawn into S, the frame the synthesizer
+// extrapolated from the world-only eye. The hull is rigid with the ship, so from B to S it moves by the head's step alone (x_S =
+// rot x_B + t, the step S was built with; rows s0-s2, t in their w). Each S output pixel finds its B position by the step's inverse:
+// the rotation first, then, when the step carries a translation, again at the hull's depth read there. The layer (the TAA result,
+// premultiplied) is sharpened as B's composite sharpens it (hullLayerSharpAt) at the four texels around that position, blended
+// bilinearly and put over S. One thread an S pixel over the whole eye; one without hull in its four texels returns after four loads.
+// compOut is S (a typed UAV load, as kSharpDirectHlsl); the TAA tiles (t2) are not read. depthAB: A, B, -, translation on.
+// hlsl-check: kSHlsl hull_layer_s_cs cs_5_0
+constexpr char kSHlsl[] =
+    HULL_LAYER_SHARP_HLSL
+    "cbuffer HullLayerSCb : register(b1) { float4 tanB; float4 s0; float4 s1; float4 s2; float4 depthAB; int4 sizes; int4 origin; };\n"
+    "Texture2D<float> coverDepth : register(t1);\n"
+    "float2 hullSPixel(float3 b, int2 osz) {\n"
+    "    if (b.z > -1e-6) return float2(-1e9, -1e9);\n"
+    "    float2 q = b.xy / -b.z;\n"
+    "    return float2((q.x - tanB.x) / (tanB.y - tanB.x) * float(osz.x) - 0.5, (tanB.w - q.y) / (tanB.w - tanB.z) * float(osz.y) - 0.5);\n"
+    "}\n"
+    "float3 hullSBack(float3 v) { return v.x * s0.xyz + v.y * s1.xyz + v.z * s2.xyz; }\n"
+    "[numthreads(8, 8, 1)] void hull_layer_s_cs(uint3 id : SV_DispatchThreadID) {\n"
+    "    int2 rsz = sizes.xy;\n"
+    "    int2 osz = sizes.zw;\n"
+    "    if (id.x >= (uint)osz.x || id.y >= (uint)osz.y) return;\n"
+    "    float2 uv = (float2(id.xy) + 0.5) / float2(osz);\n"
+    "    float3 dS = float3(tanB.x + uv.x * (tanB.y - tanB.x), tanB.w - uv.y * (tanB.w - tanB.z), -1.0);\n"
+    "    float2 pb = hullSPixel(hullSBack(dS), osz);\n"
+    "    if (depthAB.w != 0.0 && pb.x > -1e8) {\n"
+    "        int2 rp = clamp(int2(round((pb + 0.5) * float2(rsz) / float2(osz) - 0.5)), int2(0, 0), rsz - 1);\n"
+    "        float z = coverDepth.Load(int3(origin.xy + rp, 0));\n"
+    "        float den = z - depthAB.x;\n"
+    "        if (z > 0.0 && den > 0.0) pb = hullSPixel(hullSBack(dS * (depthAB.y / den) - float3(s0.w, s1.w, s2.w)), osz);\n"
+    "    }\n"
+    "    int2 mx = osz - 1;\n"
+    "    if (pb.x < -1.0 || pb.y < -1.0 || pb.x > float(osz.x) || pb.y > float(osz.y)) return;\n"
+    "    int2 i0 = int2(floor(pb));\n"
+    "    float2 f = pb - float2(i0);\n"
+    "    float4 h = 0.0;\n"
+    "    [unroll] for (int k = 0; k < 4; ++k) {\n"
+    "        int2 q = i0 + int2(k & 1, k >> 1);\n"
+    "        float wq = ((k & 1) != 0 ? f.x : 1.0 - f.x) * ((k >> 1) != 0 ? f.y : 1.0 - f.y);\n"
+    "        if (any(q < 0) || any(q > mx) || wq <= 0.0) continue;\n"
+    "        if (hist.Load(int3(q, 0)).a <= 0.0) continue;\n"
+    "        h += hullLayerSharpAt(q, mx) * wq;\n"
+    "    }\n"
+    "    if (h.a <= 0.0) return;\n"
+    "    float4 w = compOut[id.xy];\n"
+    "    compOut[id.xy] = float4(w.rgb * (1.0 - h.a) + h.rgb, w.a);\n"
     "}\n";
 
 // The TAA's tiles (2026-11-10): the TAA and sharpen ran on every output pixel of the eye while the shown hull is 6-11% of it.
@@ -822,6 +873,22 @@ struct Comp {
     uint32_t read = 0;            // hist[read] holds last frame's
     uint32_t lastFrame = ~0u;
     bool have = false;
+    // Frame generation (docs "Frame generation integration"): this frame's composite, for the S the synthesizer builds right after it in
+    // the same treat. sFrame: the layer frame of the last composite (hist[read] is its TAA result after the flip); sApplied: it went
+    // onto the eye (the main pass discarded the own ship); sHull: the hull eye whose cover depth it read; sOutSrv: the view it wrote
+    // through (an identity). world: the eye before the composite (HullLayerCompositeInputs::keepWorld), copied on frame worldFrame.
+    uint32_t sFrame = ~0u;
+    bool sApplied = false;
+    int sHull = -1;
+    float sTan[4] = {};
+    float sDepthA = 0.0f, sDepthB = 0.0f;
+    uint32_t sRegionX = 0, sRegionY = 0, sRenderW = 0, sRenderH = 0;
+    const void* sOutSrv = nullptr;
+    ID3D11Texture2D* world = nullptr;
+    ID3D11ShaderResourceView* worldSrv = nullptr;
+    D3D11_TEXTURE2D_DESC worldDesc{};
+    DXGI_FORMAT worldSrvFmt = DXGI_FORMAT_UNKNOWN;
+    uint32_t worldFrame = ~0u;
 };
 
 // Step 3: a GPU time by D3D11 timestamps, read back a few frames later (never a stall); kTimerRing sets in flight.
@@ -844,6 +911,11 @@ enum Declined : int { kDcStale = 0, kDcSize, kDcGpu, kDeclines };
 // Why an eye's composite went through c.out and two whole-eye copies rather than straight onto the eye: not applied this frame (the
 // history kept warm), a dump or the TAA sequence reads c.out, and the reasons the eye's UAV could not be had.
 enum CompMethod : int { kCmNotApplied = 0, kCmNeedsOut, kCmNoUav, kCmFormat, kCmTypedLoad, kCmView, kCmShader, kCmOff, kCompMethods };
+// Frame generation (the "framegen" line): why an S was built without the hull layer drawn into it. not_applied: the main pass kept the
+// own ship this frame (a fallback, the hold, a dump's reference frame), so S warps the game's ship with the world as before; no_composite:
+// no composite ran for the eye this frame (asleep, declined); no_world_copy: S reads the eye the composite wrote and no world-only copy
+// was kept; size: S is not the composite's size; unsupported: the shader, its constants or a typed UAV load of S's format are missing.
+enum FgDecline : int { kFgNotApplied = 0, kFgNoComposite, kFgNoWorldCopy, kFgSize, kFgUnsupported, kFgDeclines };
 // TEMPORARY A/B (2026-11-11): the pilot saw the planet through the wing from 5bf8f651 on, the build that added the direct
 // composite, and saw it go away while a dump's frames took the copy path. Off: every applied composite takes the copy path.
 // Ruled out as the cause (223a4cda: copy_why off=3396, the planet still showed); the cause was the tone's bloom. On again.
@@ -886,6 +958,10 @@ struct Window {
     // The composite's method (the "composite method" line): eye-composites written straight onto the eye (direct) and through
     // c.out (copy) by reason (kCm*), and those through the bench's second DLSS (its own copy path).
     uint32_t compDirect = 0, compCopy[kCompMethods] = {}, compBenchDlss = 0;
+    // Frame generation (the "framegen" line): S builds the synthesizer was about to make in separate mode (hullLayerSInput), those
+    // with the hull layer drawn in (hullLayerCompositeS), their world-only input by source (the copy kept before the composite, or the
+    // eye the composite did not write), the copies made, and the builds left without the layer by reason.
+    uint32_t fgS = 0, fgHullInS = 0, fgWorldCopy = 0, fgWorldDirect = 0, fgCopies = 0, fgDeclined[kFgDeclines] = {};
     // The AO chain (the "ao" line): eye-frames with a private G-buffer, and those whose whole chain and apply were re-issued;
     // step dispatches and apply draws re-issued; eye-frames where the game ran a step (or the apply) for the eye and it was
     // not re-issued, by step; chain dispatches whose eye could not be named (none of its resources is an eye's).
@@ -973,6 +1049,13 @@ struct CompGpu {
     ID3D11ComputeShader* tileListCs = nullptr;
     ID3D11ComputeShader* sharpDirectCs = nullptr;   // made apart (ensureDirectCs): a failure leaves the copy path
     bool directTried = false, directOk = false;
+    // Frame generation: the hull layer into S (kSHlsl, made apart by ensureSCs) and its constants; the typed UAV load of S's format,
+    // checked once a format (sFmt).
+    ID3D11ComputeShader* sCs = nullptr;
+    ID3D11Buffer* sCb = nullptr;
+    bool sTried = false, sOk = false;
+    DXGI_FORMAT sFmt = DXGI_FORMAT_UNKNOWN;
+    bool sFmtOk = false;
     ID3D11SamplerState* linear = nullptr;
     ID3D11Buffer* coverCb = nullptr;
     ID3D11Buffer* taaCb = nullptr;
@@ -1042,7 +1125,7 @@ CompGpu g_cgpu;
 PrefillGpu g_pgpu;
 std::vector<ScissorState> g_scissorStates;
 GpuTimer g_toneTimer, g_compTimer;
-bool g_saidFrameGen = false, g_saidMaskLarge = false, g_saidToneDecline = false, g_saidDecline[kDeclines] = {};
+bool g_saidFrameGenS = false, g_saidMaskLarge = false, g_saidToneDecline = false, g_saidDecline[kDeclines] = {};
 // Station fixes: the busy governor (decided at the frame boundary, before the next frame's draws), the calm frames counted while it
 // sleeps and the limit it slept at; the keep-own VS's refusals said once.
 bool g_busy = false;
@@ -1294,6 +1377,8 @@ void releaseComp(Comp& c) {
     releaseRef(c.tileList);
     releaseRef(c.tileArgs);
     releaseRef(c.directUav);
+    releaseRef(c.worldSrv);
+    releaseRef(c.world);
     c = Comp{};
 }
 
@@ -1380,6 +1465,8 @@ void releaseGpu() {
     releaseRef(g_cgpu.tileMarkCs);
     releaseRef(g_cgpu.tileListCs);
     releaseRef(g_cgpu.sharpDirectCs);
+    releaseRef(g_cgpu.sCs);
+    releaseRef(g_cgpu.sCb);
     releaseRef(g_cgpu.linear);
     releaseRef(g_cgpu.coverCb);
     releaseRef(g_cgpu.taaCb);
@@ -3806,6 +3893,81 @@ int directUavFor(Comp& c, int eye, const HullLayerCompositeInputs& in) {
     return c.directUav ? kCompMethods : c.directFail;
 }
 
+// Frame generation: the eye's world-only copy (Comp::world), made in the eye's own desc (default usage, SRV only, so CopyResource takes
+// it) with the composite's view format, and the copy itself. False: no copy (S then reads the composited eye: no_world_copy).
+bool keepWorldCopy(ID3D11DeviceContext* ctx, int eye, Comp& c, const HullLayerCompositeInputs& in) {
+    D3D11_TEXTURE2D_DESC td{};
+    in.output->GetDesc(&td);
+    D3D11_SHADER_RESOURCE_VIEW_DESC sd{};
+    in.outputSrv->GetDesc(&sd);
+    if (td.SampleDesc.Count != 1) return false;
+    const D3D11_TEXTURE2D_DESC& w = c.worldDesc;
+    if (!c.world || !c.worldSrv || w.Width != td.Width || w.Height != td.Height || w.Format != td.Format || w.MipLevels != td.MipLevels ||
+        w.ArraySize != td.ArraySize || c.worldSrvFmt != sd.Format) {
+        releaseRef(c.worldSrv);
+        releaseRef(c.world);
+        c.worldDesc = D3D11_TEXTURE2D_DESC{};
+        D3D11_TEXTURE2D_DESC wd = td;
+        wd.Usage = D3D11_USAGE_DEFAULT;
+        wd.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        wd.CPUAccessFlags = 0;
+        wd.MiscFlags = 0;
+        if (FAILED(g_device->CreateTexture2D(&wd, nullptr, &c.world)) || !c.world ||
+            FAILED(g_device->CreateShaderResourceView(c.world, &sd, &c.worldSrv)) || !c.worldSrv) {
+            releaseRef(c.worldSrv);
+            releaseRef(c.world);
+            return false;
+        }
+        c.worldDesc = td;
+        c.worldSrvFmt = sd.Format;
+        Log::get().note("hull layer: framegen: world-only copy made for eye %d (%ux%u, format %d, view %d, %.1f MB): frame generation's S reads the eye "
+                        "from before the hull composite",
+                        eye, td.Width, td.Height, static_cast<int>(td.Format), static_cast<int>(sd.Format),
+                        static_cast<double>(td.Width) * td.Height * 4.0 / (1024.0 * 1024.0));
+    }
+    vScreenCopyResourceRaw(ctx, c.world, in.output);
+    ++g_win.fgCopies;
+    return true;
+}
+
+// Frame generation: the S shader and its constants, once; and whether S's UAV format can be loaded through a UAV (checked once a format).
+bool ensureSCs() {
+    if (g_cgpu.sTried) return g_cgpu.sOk;
+    g_cgpu.sTried = true;
+    ID3DBlob* code = nullptr;
+    std::string why;
+    if (!compileShader(kSHlsl, sizeof(kSHlsl) - 1, "hull_layer_s_cs", "cs_5_0", &code, &why)) {
+        Log::get().note("hull layer: the hull_layer_s_cs shader did not compile (%s); frame generation's S gets no hull layer this session", why.c_str());
+        if (code) code->Release();
+        return false;
+    }
+    const HRESULT hr = g_device->CreateComputeShader(code->GetBufferPointer(), code->GetBufferSize(), nullptr, &g_cgpu.sCs);
+    code->Release();
+    g_cgpu.sCb = makeConstantBuffer(112);
+    if (FAILED(hr) || !g_cgpu.sCs || !g_cgpu.sCb) {
+        Log::get().note("hull layer: the hull_layer_s_cs shader or its constants could not be made (hr 0x%08lX); frame generation's S gets no hull layer "
+                        "this session",
+                        static_cast<unsigned long>(hr));
+        return false;
+    }
+    g_cgpu.sOk = true;
+    return true;
+}
+bool sFormatLoads(ID3D11UnorderedAccessView* s) {
+    D3D11_UNORDERED_ACCESS_VIEW_DESC ud{};
+    s->GetDesc(&ud);
+    if (ud.ViewDimension != D3D11_UAV_DIMENSION_TEXTURE2D) return false;
+    if (ud.Format == g_cgpu.sFmt) return g_cgpu.sFmtOk;
+    g_cgpu.sFmt = ud.Format;
+    D3D11_FEATURE_DATA_FORMAT_SUPPORT2 fs{};
+    fs.InFormat = ud.Format;
+    const UINT need = D3D11_FORMAT_SUPPORT2_UAV_TYPED_LOAD | D3D11_FORMAT_SUPPORT2_UAV_TYPED_STORE;
+    g_cgpu.sFmtOk = SUCCEEDED(g_device->CheckFeatureSupport(D3D11_FEATURE_FORMAT_SUPPORT2, &fs, sizeof fs)) && (fs.OutFormatSupport2 & need) == need;
+    if (!g_cgpu.sFmtOk)
+        Log::get().note("hull layer: framegen: S's format %d cannot be loaded through a UAV on this device; S gets no hull layer while it is", static_cast<int>(ud.Format));
+    return g_cgpu.sFmtOk;
+}
+
 // A 2D texture with a default SRV and, when `uav`, a default UAV (both in the texture's own format).
 bool makeTexture(uint32_t w, uint32_t h, DXGI_FORMAT fmt, bool uav, ID3D11Texture2D** tex, ID3D11ShaderResourceView** srv, ID3D11UnorderedAccessView** uavOut) {
     D3D11_TEXTURE2D_DESC td{};
@@ -4272,15 +4434,10 @@ Fallback decideNext() {
         return kFbStreak;
     }
     Fallback why = kFallbacks;
+    // Frame generation no longer stands the mode aside (2026-11-11, docs "Frame generation integration"): S is built from the world-only
+    // eye and the hull layer is drawn into it (hullLayerSInput, hullLayerCompositeS). kFbFrameGen stays in the composite line, always 0.
     if (!runtimeVrProfile() || nativeOnFootActive()) {
         why = kFbOutside;
-    } else if (frameGenOn()) {
-        why = kFbFrameGen;
-        if (!g_saidFrameGen) {
-            g_saidFrameGen = true;
-            Log::get().note("hull layer: separate mode stands aside while frame generation is on (fix.frame_generation or fix.frame_generation_shadow): the own "
-                            "ship stays in the main pass (said once)");
-        }
     } else if (!g_haveOwn) {
         why = kFbMaskPending;
     } else if (g_lastOwn > kOwnMaskMax) {
@@ -4301,7 +4458,7 @@ Fallback decideNext() {
         ++g_win.separateFrames;
     else
         ++g_win.fallback[why];
-    // A fallback other than the hold itself (mask pending or large, frame generation, outside) re-arms the hold, so
+    // A fallback other than the hold itself (mask pending or large, outside) re-arms the hold, so
     // separate resumes only after kHoldFrames clean frames, never on the first frame the reason clears.
     if (!g_discard && why != kFbStreak) g_hold = kHoldFrames;
     return g_discard ? kFallbacks : why;
@@ -5110,6 +5267,18 @@ void report() {
                         g_win.compCopy[kCmNotApplied], g_win.compCopy[kCmNeedsOut], g_win.compCopy[kCmNoUav], g_win.compCopy[kCmFormat],
                         g_win.compCopy[kCmTypedLoad], g_win.compCopy[kCmView], g_win.compCopy[kCmShader], g_win.compCopy[kCmOff],
                         g_win.compBenchDlss);
+        {
+            const uint8_t fgMode = temporalPassFrameGenMode();
+            const char* fg = fgMode == 1 ? "auto" : fgMode == 2 ? "on" : frameGenShadowOn() ? "shadow" : "off";
+            Log::get().note("hull layer: framegen: fg=%s s_frames=%u hull_in_s=%u world_only_inputs=copy:%u,direct:%u world_copies=%u "
+                            "declined=not_applied:%u,no_composite:%u,no_world_copy:%u,size:%u,unsupported:%u (frame generation's S in separate "
+                            "mode: S builds handed the eye, those with the hull layer drawn in by the head's step, their world-only input by "
+                            "source -- the copy kept before the composite, or the upscaler's output the composite did not write -- and S built "
+                            "without the layer by reason, warping the eye as it was; s_frames=0 with fg on: S never reached the layer)",
+                            fg, g_win.fgS, g_win.fgHullInS, g_win.fgWorldCopy, g_win.fgWorldDirect, g_win.fgCopies,
+                            g_win.fgDeclined[kFgNotApplied], g_win.fgDeclined[kFgNoComposite], g_win.fgDeclined[kFgNoWorldCopy],
+                            g_win.fgDeclined[kFgSize], g_win.fgDeclined[kFgUnsupported]);
+        }
         Log::get().note("hull layer: rect:decided=%u rect=%u share=%.3f whole=no_box:%u,stale:%u,empty:%u,probe:%u boxes=%u empty_boxes=%u "
                         "scissored_draws=%u with_game_scissor=%u no_state=%u (Build A': eye-frames whose re-issues were decided, those scissored "
                         "to the shown hull's box of %u+ frames before grown %u px a frame of its age (at least %u), and their mean share of the "
@@ -6595,6 +6764,9 @@ void hullLayerCompositeEye(ID3D11DeviceContext* ctx, int eye, const HullLayerCom
     // and a miss is seen) and the upscaled eye keeps the game's own ship.
     const bool apply = g_discard && (e.ownDraws + e.ownDecals) > 0;
     timerBegin(g_compTimer, ctx);
+    // Frame generation: the eye before the hull goes onto it, for the S that reads this very texture (keepWorld). Inside the composite's
+    // timer, so its gpu_ms carries the copy.
+    const bool worldKept = apply && in.keepWorld && !g_benchDlss && keepWorldCopy(ctx, eye, c, in);
     stageOpen(ctx, kTsTaa, false);   // dump v2: the TAA, the sharpen and the composite's copy
     vScreenUpdateSubresourceRaw(ctx, g_cgpu.taaCb, 0, nullptr, &cb, 0, 0);
     // The variant bench's dlss_full / dlss_sub: the hull through a second DLSS over the hull-free world in place of the TAA and sharpen.
@@ -6699,10 +6871,114 @@ void hullLayerCompositeEye(ID3D11DeviceContext* ctx, int eye, const HullLayerCom
     c.renderW = in.renderW;
     c.renderH = in.renderH;
     c.have = true;
+    // Frame generation: what the S built right after this (same treat) needs; hist[read] is now this frame's TAA result. A frame the
+    // bench's second DLSS made has no TAA result, so S takes nothing from it.
+    c.sFrame = g_frame;
+    c.sApplied = apply && !benchDlss;
+    c.sHull = hi;
+    std::memcpy(c.sTan, in.tanNow, sizeof c.sTan);
+    c.sDepthA = in.depthA;
+    c.sDepthB = in.depthB;
+    c.sRegionX = in.regionX;
+    c.sRegionY = in.regionY;
+    c.sRenderW = in.renderW;
+    c.sRenderH = in.renderH;
+    c.sOutSrv = in.outputSrv;
+    if (worldKept) c.worldFrame = g_frame;
     e.compFrame = g_frame;
     e.compApplied = apply;
     if (byIndex) ++g_win.byIndex;
     if (apply) ++(in.afterUiResolve ? g_win.siteAfterResolve : g_win.siteUpscalerOut);
+}
+
+ID3D11ShaderResourceView* hullLayerSInput(int eye, ID3D11ShaderResourceView* proposed, bool* overlay) {
+    if (overlay) *overlay = false;
+    if (!detail::g_hullLayerSeparate || eye < 0 || eye > 1 || !proposed || !overlay) return proposed;
+    ++g_win.fgS;
+    const Comp& c = g_comp[eye];
+    if (c.sFrame != g_frame || c.sHull < 0) {
+        ++g_win.fgDeclined[kFgNoComposite];
+        return proposed;
+    }
+    if (!c.sApplied) {
+        ++g_win.fgDeclined[kFgNotApplied];
+        return proposed;
+    }
+    if (proposed == c.sOutSrv) {   // the very eye the composite wrote: S reads the copy from before it
+        if (c.worldFrame != g_frame || !c.worldSrv) {
+            ++g_win.fgDeclined[kFgNoWorldCopy];
+            return proposed;
+        }
+        ++g_win.fgWorldCopy;
+        *overlay = true;
+        return c.worldSrv;
+    }
+    ++g_win.fgWorldDirect;   // another texture (the upscaler's output while the composite went onto the submitted eye): world-only as it is
+    *overlay = true;
+    return proposed;
+}
+
+bool hullLayerCompositeS(ID3D11DeviceContext* ctx, uint32_t eye, ID3D11UnorderedAccessView* s, uint32_t w, uint32_t h, const float rot[9], const float t[3]) {
+    if (!ctx || eye > 1 || !s || !rot || !t || !g_device) return false;
+    const Comp& c = g_comp[eye];
+    if (c.sFrame != g_frame || !c.sApplied || c.sHull < 0) {
+        ++g_win.fgDeclined[kFgNoComposite];
+        return false;
+    }
+    const Eye& e = g_eyes[c.sHull];
+    if (w != c.outW || h != c.outH || !c.histSrv[c.read] || !e.coverZSrv) {
+        ++g_win.fgDeclined[kFgSize];
+        return false;
+    }
+    if (!g_cgpu.ok || !g_cgpu.sharpCb || !ensureSCs() || !sFormatLoads(s)) {
+        ++g_win.fgDeclined[kFgUnsupported];
+        return false;
+    }
+    VrWorldInternalScope internal;   // the layer's own dispatch
+    struct SCb {
+        float tan[4], s0[4], s1[4], s2[4], depthAB[4];
+        int32_t sizes[4], origin[4];
+    };
+    static_assert(sizeof(SCb) == 112, "kSHlsl's HullLayerSCb is 112 bytes");
+    SCb cb{};
+    std::memcpy(cb.tan, c.sTan, sizeof cb.tan);
+    float* rows[3] = {cb.s0, cb.s1, cb.s2};
+    for (int r = 0; r < 3; ++r) {
+        for (int k = 0; k < 3; ++k) rows[r][k] = rot[r * 3 + k];
+        rows[r][3] = t[r];
+    }
+    cb.depthAB[0] = c.sDepthA;
+    cb.depthAB[1] = c.sDepthB;
+    cb.depthAB[3] = (std::fabs(t[0]) + std::fabs(t[1]) + std::fabs(t[2])) > 1e-7f ? 1.0f : 0.0f;
+    cb.sizes[0] = static_cast<int32_t>(c.sRenderW);
+    cb.sizes[1] = static_cast<int32_t>(c.sRenderH);
+    cb.sizes[2] = static_cast<int32_t>(w);
+    cb.sizes[3] = static_cast<int32_t>(h);
+    cb.origin[0] = static_cast<int32_t>(c.sRegionX);
+    cb.origin[1] = static_cast<int32_t>(c.sRegionY);
+    vScreenUpdateSubresourceRaw(ctx, g_cgpu.sCb, 0, nullptr, &cb, 0, 0);
+    // The caller's (the synthesizer's) passes bind S as a UAV elsewhere: every slot is cleared before S goes to u0. The caller restores its
+    // own stage after (framegen_synth.cpp re-binds its b0; its CsStageSave puts the rest back).
+    ID3D11UnorderedAccessView* none[D3D11_PS_CS_UAV_REGISTER_COUNT] = {};
+    ctx->CSSetUnorderedAccessViews(0, D3D11_PS_CS_UAV_REGISTER_COUNT, none, nullptr);
+    ID3D11ShaderResourceView* srvs[2] = {c.histSrv[c.read], e.coverZSrv};
+    ID3D11Buffer* cbs[2] = {g_cgpu.sharpCb, g_cgpu.sCb};
+    ctx->CSSetShader(g_cgpu.sCs, nullptr, 0);
+    ctx->CSSetShaderResources(0, 2, srvs);
+    ctx->CSSetConstantBuffers(0, 2, cbs);
+    ctx->CSSetUnorderedAccessViews(0, 1, &s, nullptr);
+    ctx->Dispatch((w + 7u) / 8u, (h + 7u) / 8u, 1);
+    ID3D11ShaderResourceView* noSrv[2] = {};
+    ctx->CSSetShaderResources(0, 2, noSrv);
+    ctx->CSSetUnorderedAccessViews(0, 1, none, nullptr);
+    ++g_win.fgHullInS;
+    if (!g_saidFrameGenS) {
+        g_saidFrameGenS = true;
+        Log::get().note("hull layer: framegen: the hull layer drawn into frame generation's S (eye %u, %ux%u): S warps the world-only eye and the hull "
+                        "moves by the head's step alone (said once)",
+                        eye, w, h);
+    }
+    return true;
 }
 
 void hullLayerFrameBoundary(ID3D11DeviceContext* ctx) {

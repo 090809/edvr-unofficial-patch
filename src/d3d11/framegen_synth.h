@@ -63,6 +63,10 @@ struct FrameGenSynthFrame {
     bool finish = false;
     bool finishSharpen = false;
     int dumpIndex = -1;
+    // An overlay drawn into S right after the resample, before the kept luma, the dump's stage and the finish (every build, f = 0.5 and
+    // f = 1): the own hull layer (hull_layer.h hullLayerCompositeS), moved by the head's step S was built with (x_S = rot x_B + t). It
+    // may bind anything on the compute stage; the module re-binds its constant buffer after it. Null: none.
+    bool (*overlay)(ID3D11DeviceContext* ctx, uint32_t eye, ID3D11UnorderedAccessView* s, uint32_t w, uint32_t h, const float rot[9], const float t[3]) = nullptr;
 };
 
 // Once per treated eye-frame (usedDlaa, key on). `frame` is the pass's frame counter: the f = 1 S is scored only against the frame right after it.

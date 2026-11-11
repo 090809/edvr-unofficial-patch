@@ -54,7 +54,7 @@
 //      reprojected by the head's motion alone (the pass's head delta and translation, at the cover's depth) and clamped to
 //      the 3x3's range, blended 0.1; then composited over the upscaled eye (premultiplied), before the UI layer's door.
 //  11. Safety: the main pass discards the own ship only on a frame decided at the frame boundary before it: the VR profile
-//      and not on foot, frame generation off, an own mask read back and of at most 400 records, and no miss (an eye that
+//      and not on foot, an own mask read back and of at most 400 records, and no miss (an eye that
 //      seeded but was not lit, tonemapped and composited) in the last 16 frames. On every other frame the layer still runs
 //      and its composite is made but not applied, so a miss is seen without the ship being lost.
 //
@@ -67,6 +67,12 @@
 //      is made, not applied), and the TAA sequence: eye 0's cover, cover depth and composite for 16 frames from it, its constants
 //      and frame 0's history, to eye_<stamp>_HullSeq_<nn>_*.bin and _HullSeq.json (tools\hull_taa_sim.py).
 //  The eye dump also lifts its census to the line ceiling (draw_census.cpp) and arms the GPU pass profile for 4 frames.
+//
+// Frame generation (separate; docs "Frame generation integration", 2026-11-11): the mode no longer stands aside. The synthesizer's S
+// of an eye-frame is built right after its composite, in the same treat, from the world-only eye (hullLayerSInput: the upscaler's
+// output when the composite went onto the submitted eye, else a copy of the eye taken before the composite, keepWorld), and the hull
+// layer (the TAA result, sharpened as the composite does) is drawn over S after the resample, moved by the head's step B -> S alone
+// (hullLayerCompositeS). The real frame keeps the composite as before. The 30 s "framegen" line counts it.
 //
 // Station fixes (both modes unless said; docs "Station fixes"):
 //  15. The re-issue into the private G-buffer (2 and 7) binds the keep-own variant of the draw's vertex shader
@@ -170,11 +176,24 @@ struct HullLayerCompositeInputs {
     ID3D11Texture2D* dlColour = nullptr;
     ID3D11Texture2D* dlDepth = nullptr;
     ID3D11Texture2D* dlMv = nullptr;
+    // Frame generation: S is built from this eye-frame and reads `output` itself (B's door finishes S, or no UI resolve ran): an applied
+    // composite first copies `output` (the world without the own ship) for hullLayerSInput. One whole-eye copy an S build.
+    bool keepWorld = false;
 };
 
 // Step 3: right after the upscaler wrote VR eye `eye` (temporal_pass.cpp). A no-op unless diag.hull_layer = separate.
 inline bool hullLayerCompositeWanted() { return detail::g_hullLayerSeparate; }
 void hullLayerCompositeEye(ID3D11DeviceContext* ctx, int eye, const HullLayerCompositeInputs& in);
+
+// Frame generation (separate mode), right before the synthesizer builds S of VR eye `eye` this frame, after hullLayerCompositeEye.
+// `proposed` is the view S would read B through. Returns the view S must read: the world-only copy when `proposed` is the eye the
+// composite wrote, else `proposed`; *overlay true when the hull layer is to be drawn into S (pass hullLayerCompositeS to the
+// synthesizer). *overlay false (S warps `proposed` as before, the ship in it): separate mode off, no composite this frame, the main
+// pass kept the ship, or no copy. Counted on the 30 s "framegen" line.
+ID3D11ShaderResourceView* hullLayerSInput(int eye, ID3D11ShaderResourceView* proposed, bool* overlay);
+// The synthesizer's overlay (FrameGenSynthFrame::overlay), right after its resample wrote S (w x h, the typed UAV s): the eye's hull
+// layer moved by the head's step B -> S (x_S = rot x_B + t) and composited over S. False: nothing drawn (counted by reason).
+bool hullLayerCompositeS(ID3D11DeviceContext* ctx, uint32_t eye, ID3D11UnorderedAccessView* s, uint32_t w, uint32_t h, const float rot[9], const float t[3]);
 
 // Once per frame on the owner thread: the per-eye bookkeeping, the readbacks, the dump's write, the auto dump, the 30 s line.
 void hullLayerFrameBoundary(ID3D11DeviceContext* ctx);
