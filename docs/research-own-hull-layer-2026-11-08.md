@@ -19,11 +19,13 @@ The smear is terrain that is newly uncovered at the hull edge every frame
   the AA (least shimmer); dlss_sub 1.80 ms; A', B, tiles run, no seam.
 * **5bf8f651 FLOWN** (section "Flight 5bf8f651", HMD 0.5, preset M): the
   wing hazy, "see-through": dluma 1.41-1.44, 0.42 without the reflection
-  re-issue. **Built** (section "Reflection dump", not flown): the u1 clear,
-  and both sides of the pass dumped. **Next:** that dump, `--refl`; pad.
-* **Planet through the wing** (sections "Unmirrored inputs", "Two input
-  leaks", compile-only): the tone's bloom zeroed, the decals' t3 handled.
-  **Next:** `tone bloom:` zeroed > 0; no `D0A16B9E` t2 / `DB3E8D20` t3 key.
+  re-issue. Reflection dump 192439364002 (reference frame): private =
+  game before and after the pass (median 1.000), u1 cleared. Pad pending.
+* **Planet through the wing FIXED** (2026-11-11 20:07, 98276da2, sections
+  "Unmirrored inputs", "Two input leaks"): the tone's bloom zeroed
+  (`tone bloom: zeroed=3478 declined=0`), no eye-sized unmirrored input
+  left (`eye_sized=0`); the pilot: the planet no longer shows on the wing.
+  The direct composite back on (`direct=3478`).
 * **Night vision state** (not flown): **next dump** night vision on,
   compare median ~1.0, `night_vision=N/N`. **Station fixes** (not flown):
   a docking dump, `culled_draws` high, `filter_draws` 0, `busy=` 0.
