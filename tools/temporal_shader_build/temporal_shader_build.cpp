@@ -445,11 +445,23 @@ static std::string mapEasuSource() {
 // The map SMAA 1x source for one entry (2026-10-10): the prologue (the SMAA macros, samplers and the metrics constant buffer), then the
 // vendored SMAA.hlsl text (smaa_hlsl_gen.h), then that entry. One source per entry: the three entries reuse register names, which
 // D3DCompile rejects in one unit.
-static std::string mapSmaaSource(const char* entryHlsl) {
+static std::string mapSmaaSource(const std::string& entryHlsl) {
     std::string out = edvr::kMapSmaaPrologueHlsl;
     for (const char* const* c = edvr::kSmaaChunks; *c; ++c) out += *c;
     out += entryHlsl;
     return out;
+}
+
+// The HUD layer SMAA's tiled entries (ui_layer_smaa_shader.h, 2026-11-11), each over the text of the full entry it shares declarations with: the edge
+// test and its mark; the tile list; the map's weights and blend declarations with the list reader and the tiled entry; the copy back with the list reader.
+struct UiLayerSmaaTiledTexts {
+    std::string edgesMark, tileList, weights, blend, copyBack;
+};
+static UiLayerSmaaTiledTexts uiLayerSmaaTiledTexts() {
+    const std::string tiles = edvr::kUiLayerSmaaTilesHlsl;
+    return {mapSmaaSource(std::string(edvr::kUiLayerSmaaEdgesHlsl) + edvr::kUiLayerSmaaEdgesMarkHlsl), mapSmaaSource(edvr::kUiLayerSmaaTileListHlsl),
+            mapSmaaSource(edvr::kMapSmaaWeightsHlsl + tiles + edvr::kUiLayerSmaaWeightsTiledHlsl),
+            mapSmaaSource(edvr::kMapSmaaBlendHlsl + tiles + edvr::kUiLayerSmaaBlendTiledHlsl), mapSmaaSource(tiles + edvr::kUiLayerSmaaCopyBackHlsl)};
 }
 
 // The concourse cull's seven fixed shaders (src/d3d11/concourse_pane_shaders.h). Each was a runtime D3DCompile on the render thread at every concourse entry (perf audit
@@ -483,6 +495,7 @@ static int generateTemporal(const Options& o) {
     const std::string mapSmaaWeights = mapSmaaSource(edvr::kMapSmaaWeightsHlsl);
     const std::string mapSmaaBlend = mapSmaaSource(edvr::kMapSmaaBlendHlsl);
     const std::string uiLayerSmaaEdges = mapSmaaSource(edvr::kUiLayerSmaaEdgesHlsl);
+    const UiLayerSmaaTiledTexts uiSmaaTiled = uiLayerSmaaTiledTexts();
     std::vector<Variant> variants = {
         {"kEyeJumpLatticeBytecode", "eye_jump_lattice_cs", "main", nullptr, {}, false, edvr::kEyeJumpLatticeHlsl},
         // F85c: the reticle's hit depth (reticle_depth_shader.h): one thread marches the aim line through an eye's scene depth. Its own source, entry "main".
@@ -533,6 +546,12 @@ static int generateTemporal(const Options& o) {
         // The HUD layer's edge smoothing (ui_layer_smaa_shader.h): the one pass that is not the map's, SMAA's colour edge test over four channels. Its
         // weights and blend are kFlatMapSmaaWeightsBytecode and kFlatMapSmaaBlendBytecode above (plain SMAA, no colour transform).
         {"kUiLayerSmaaEdgesBytecode", "ui_layer_smaa_edges_cs", "uiSmaaEdges", nullptr, {}, false, uiLayerSmaaEdges.c_str()},
+        // Its tiled path (2026-11-11): the edges with the tile marks, the tile list, and the weights, blend and copy back over the listed tiles.
+        {"kUiLayerSmaaEdgesMarkBytecode", "ui_layer_smaa_edges_mark_cs", "uiSmaaEdgesMark", nullptr, {}, false, uiSmaaTiled.edgesMark.c_str()},
+        {"kUiLayerSmaaTileListBytecode", "ui_layer_smaa_tile_list_cs", "uiSmaaTileList", nullptr, {}, false, uiSmaaTiled.tileList.c_str()},
+        {"kUiLayerSmaaWeightsTiledBytecode", "ui_layer_smaa_weights_tiled_cs", "uiSmaaWeightsTiled", nullptr, {}, false, uiSmaaTiled.weights.c_str()},
+        {"kUiLayerSmaaBlendTiledBytecode", "ui_layer_smaa_blend_tiled_cs", "uiSmaaBlendTiled", nullptr, {}, false, uiSmaaTiled.blend.c_str()},
+        {"kUiLayerSmaaCopyBackBytecode", "ui_layer_smaa_copy_back_cs", "uiSmaaCopyBack", nullptr, {}, false, uiSmaaTiled.copyBack.c_str()},
         // The HDR route's pixel-shader half (section 81): the result goes back into the game's HDR target, a render
         // target, so the finish and the spatial recovery are draws: one triangle vertex shader and two pixel shaders.
         {"kFlatMonoHdrVsBytecode", "flat_mono_hdr_vs", "hdrVs", nullptr, {}, true, nullptr, "vs_5_0"},
@@ -1695,6 +1714,15 @@ static void selfTest() {
             const std::string source = mapSmaaSource(s.text);
             Variant mono{"kMapSmaaSelfTest", "flat_map_smaa_self_test", s.entry, nullptr, {}, false, source.c_str()};
             check(compile(compiler.fn, source.c_str(), mono), "production map SMAA shader compilation");
+        }
+        // The HUD layer SMAA's tiled entries, each over its assembled text.
+        const UiLayerSmaaTiledTexts tiled = uiLayerSmaaTiledTexts();
+        const struct { const char* entry; const std::string* text; } tiledEntries[] = {
+            {"uiSmaaEdgesMark", &tiled.edgesMark}, {"uiSmaaTileList", &tiled.tileList}, {"uiSmaaWeightsTiled", &tiled.weights},
+            {"uiSmaaBlendTiled", &tiled.blend}, {"uiSmaaCopyBack", &tiled.copyBack}};
+        for (const auto& s : tiledEntries) {
+            Variant mono{"kMapSmaaSelfTest", "ui_layer_smaa_tiled_self_test", s.entry, nullptr, {}, false, s.text->c_str()};
+            check(compile(compiler.fn, s.text->c_str(), mono), "production HUD layer SMAA tiled shader compilation");
         }
     }
     // The HDR route's three graphics entry points, each under its own profile.
