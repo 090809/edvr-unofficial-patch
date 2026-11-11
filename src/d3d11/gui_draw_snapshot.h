@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include "../common/dump_file.h"   // gui_<stamp>.bin goes out as .z
 
 namespace edvr {
 class GuiDrawSnapshot {
@@ -197,13 +198,13 @@ public:
         ++routeCounts[coverageIndex][eyeBucket];
     }
     bool write(ID3D11DeviceContext* c,const wchar_t* path,const wchar_t* directory){
-        FILE* file=nullptr;if(_wfopen_s(&file,path,L"wb") || !file)return false;bool ok=fwrite("EDVRGUI1",1,8,file)==8;
-        auto u32=[&](uint32_t v){ok=fwrite(&v,4,1,file)==1 && ok;};auto text=[&](const std::string& s){u32(UINT(s.size()));ok=fwrite(s.data(),1,s.size(),file)==s.size()&&ok;};
+        dump_file::Writer file;if(!file.open(path))return false;bool ok=file.write("EDVRGUI1",8);
+        auto u32=[&](uint32_t v){ok=file.write(&v,4) && ok;};auto text=[&](const std::string& s){u32(UINT(s.size()));ok=file.write(s.data(),s.size())&&ok;};
         u32(2);u32(UINT(draws.size()));u32(UINT(blobs.size()));u32(declined);u32(missingLayouts);u32(UINT(routes.size()));
         for(const auto& d:draws)text(d.meta);
         for(const auto& r:routes)text(r.meta);
         for(auto& b:blobs){text(b.meta);D3D11_MAPPED_SUBRESOURCE m{};bool mapped=SUCCEEDED(c->Map(b.stage.Get(),b.subresource,D3D11_MAP_READ,D3D11_MAP_FLAG_DO_NOT_WAIT,&m));bool valid=mapped && m.pData && (!b.row || m.RowPitch>=b.row);u32(valid?b.bytes:0);
-            if(valid){if(!b.row)ok=fwrite(m.pData,1,b.bytes,file)==b.bytes&&ok;else for(UINT row=0;row<b.rows;++row)ok=fwrite(static_cast<const char*>(m.pData)+row*m.RowPitch,1,b.row,file)==b.row&&ok;}else ++failures;
+            if(valid){if(!b.row)ok=file.write(m.pData,b.bytes)&&ok;else for(UINT row=0;row<b.rows;++row)ok=file.write(static_cast<const char*>(m.pData)+row*m.RowPitch,b.row)&&ok;}else ++failures;
             if(mapped)c->Unmap(b.stage.Get(),b.subresource);
         }
         std::lock_guard<std::mutex> lock(mutex());std::map<uint64_t,bool> seen;
@@ -212,7 +213,7 @@ public:
             if(_wfopen_s(&shader,name,L"wb") || !shader){++failures;return;}bool wrote=fwrite(it->second.data(),1,it->second.size(),shader)==it->second.size();if(fclose(shader)!=0 || !wrote)++failures;};
         for(const auto& d:draws){dump(d.vs,L"vs");dump(d.ps,L"ps");}
         for(const auto& r:routes){dump(r.vs,L"vs");dump(r.ps,L"ps");}
-        u32(failures);ok=!ferror(file)&&ok;return fclose(file)==0&&ok;
+        u32(failures);return file.close()&&ok;
     }
 };
 }

@@ -87,6 +87,7 @@
 #include "f224_checks.h"    // F224: the whole-body move loses its call of lag: the recorded jitter through F215 and the lead, the limit, a taken jump, the line, the sites
 #include "f225_checks.h"    // F225: the shoulder reach margin ramps: a sweep across the threshold, the exact move at full weight, the timing, a flicker, the line, the sites
 #include "f226_checks.h"    // F226: the head pitch no longer holds the whole-body shift: the landing armed and unarmed, the flag at the gate, a stale call, no state change at the gate, the line, the sites
+#include "f235_checks.h"    // F235: a held ADS request rides through the game's drop once accepted (a reload): the flight's reload, a refused press, a drop past the bridge, a release, the sites
 #include "f216_checks.h"    // F216: the view bob (user setting): the filter on a 3.4 Hz sine, a ramp, the clamp, the weight, the speed gate, the key on, the resets, the seated sign through adsUnlockedCam, the history by serial, the line, the sites
 #include "f183_checks.h"    // F183: the pin's stable horizontal heading (the eye's while level-ish bit for bit, blended toward the body's forward from 60 to 80 deg, the body's forward past vertical; the pin's own target on random eyes, the band's continuity, F168's axis), the neck guard bounded (distance + 10 cm, the filtered error +-5 cm, reset on a 20 deg turn), the counters and lines, the source sites
 #include "f182_checks.h"    // F182: the shotgun's ADS eye 9.5 cm forward baked, the spine straighten one-sided per bone (written = animated - share x max(0, animated - reference); toy skeleton with a roll: the flight's numbers, hunched, mixed, share 0), the left hand kept on a two-handed gun aimed steeply up (the gate, the held point in the item's frame, the 3 s limit, the release), the counters and lines, the source sites
@@ -4763,18 +4764,21 @@ int wmain(int argc, wchar_t** argv) {
                     const nf::AdsInputChoice accepted = nf::adsInputChoice(true, true, true, true, true, 100, recovered);
                     check(!recovered && !reject.latched && accepted.ads && !accepted.journalVeto,
                           "RC1 sniper replay: veto at +1.508 s recovers on authoritative ADS acceptance at +2.713 s while the same request stays held");
+                    // F235: after the game's acceptance a drop (a reload) is held for kAdsAcceptedDropMaxMs from the acceptance, not the 1.5 s grace; past it a changed false
+                    // status still rejects the held request.
                     const bool reloadEarly = nf::adsActionRejectStep(reject, true, 3714, true, false, 10);
-                    const bool reloadBefore = nf::adsActionRejectStep(reject, true, 5212, true, false, 10);
-                    const bool reloadVeto = nf::adsActionRejectStep(reject, true, 5213, true, false, 10);
-                    check(!reloadEarly && !reloadBefore && reloadVeto,
-                          "F70b: acceptance starts a new grace; a later changed false status (reload/rejection) can still reject the held request");
-                    const bool released = nf::adsActionRejectStep(reject, false, 5300, true, false, 10);
-                    const bool repress = nf::adsActionRejectStep(reject, true, 6000, true, false, 10);
-                    const bool old = nf::adsActionRejectStep(reject, true, 8000, true, false, 10);
-                    const bool newBlocked = nf::adsActionRejectStep(reject, true, 8001, true, false, 11);
-                    check(!released && !repress && !old && newBlocked,
-                          "F70b: logical release resets the veto and revision baseline; a new press requires its own changed false status");
-                    const bool acceptedWithoutFreshAction = nf::adsActionRejectStep(reject, true, 8100, true, true, 12);
+                    const bool reloadAtOldGrace = nf::adsActionRejectStep(reject, true, 5213, true, false, 10);
+                    const bool reloadBefore = nf::adsActionRejectStep(reject, true, 3712 + nf::kAdsAcceptedDropMaxMs, true, false, 10);
+                    const bool reloadVeto = nf::adsActionRejectStep(reject, true, 3713 + nf::kAdsAcceptedDropMaxMs, true, false, 10);
+                    check(!reloadEarly && !reloadAtOldGrace && !reloadBefore && reloadVeto && reject.accepted,
+                          "F70b/F235: acceptance starts the accepted drop's longer grace; a reload-length drop is held, a changed false status past it still rejects");
+                    const bool released = nf::adsActionRejectStep(reject, false, 9300, true, false, 10);
+                    const bool repress = nf::adsActionRejectStep(reject, true, 10000, true, false, 10);
+                    const bool old = nf::adsActionRejectStep(reject, true, 12000, true, false, 10);
+                    const bool newBlocked = nf::adsActionRejectStep(reject, true, 12001, true, false, 11);
+                    check(!released && !repress && !old && newBlocked && !reject.accepted,
+                          "F70b: logical release resets the veto and revision baseline; a new press requires its own changed false status (and the 1.5 s grace again)");
+                    const bool acceptedWithoutFreshAction = nf::adsActionRejectStep(reject, true, 12100, true, true, 12);
                     const nf::AdsInputChoice acceptedJournal = nf::adsInputChoice(true, true, true, false, true, nf::kAdsActionFreshUs + 1, acceptedWithoutFreshAction);
                     check(!acceptedWithoutFreshAction && acceptedJournal.ads && acceptedJournal.source == nf::kAdsInputJournal,
                           "F70b: authoritative acceptance also clears a veto when the action sample is stale and the journal is the fallback");
@@ -7869,6 +7873,8 @@ int wmain(int argc, wchar_t** argv) {
     f225test::run225(check);
     // F226: the head pitch and the whole-body shift: the landing with the head down armed and unarmed, the flag, a non-fresh call, the gate is no change of state, the line, the sites.
     f226test::run226(check);
+    // F235: the held ADS request through a game drop: the flight's reload held through, a refused press at 1.5 s, a drop past the 5 s bridge, a release between presses, the sites.
+    f235test::run235(check);
     // F216: the view bob filter on a sprint (a sine, a ramp, the clamp, the weight, the speed gate, the key on, the resets), the seated sign, the history by serial, the line, the sites.
     f216test::run216(check);
     // F205: the effective sight eye and the ADS view circle.

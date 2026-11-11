@@ -7,6 +7,8 @@ from pathlib import Path
 import struct
 import tempfile
 
+import dump_io   # tools\dump_io.py: the eye dump's .bin files are NAME or NAME.z
+
 COUNT, STRIDE, SAMPLE_BYTES = 16, 2, 20
 FORMATS = (2, 34, 16)  # R32G32B32A32_FLOAT, R16G16_FLOAT, R32G32_FLOAT: the source textures; E's samples are half-float words either way
 OLD_SKIN_FORMAT = 10  # dumps from before target 7 went to 32 bits: R16G16B16A16_FLOAT, the same samples
@@ -18,7 +20,9 @@ STATUSES = {'not_reached', 'staged', 'missing_input', 'source_shape', 'source_fo
 
 def read(path):
     path = Path(path)
-    data = path.read_bytes()
+    if path.suffix == dump_io.Z_SUFFIX:
+        path = path.with_suffix('')   # named by its .z: the original name is the manifest's and the JSON's stem
+    data = dump_io.read_bytes(path)
     if len(data) < 44 or data[:8] != b'EDVRJMP1':
         raise ValueError('Invalid jump lattice header')
     version, count, stride, sample_bytes, skin, motion, slots = struct.unpack_from('<7I', data, 8)
@@ -172,6 +176,10 @@ def self_test():
         companion_path.write_bytes(header)
         companion_path.with_suffix('.json').write_text(json.dumps(companion_manifest), encoding='utf-8')
         assert read(companion_path)['manifest']['parent_stamp'] == '123456789011'
+        # The same companion lattice as the compressed container the dump writes (NAME.bin.z), named either way.
+        dump_io.write_z(companion_path, header)
+        companion_path.unlink()
+        assert read(companion_path)['manifest']['parent_stamp'] == '123456789011' and read(str(companion_path) + '.z')['manifest']['stamp'] == stamp
         for bad in (dict(companion_manifest, parent_stamp=''), dict(companion_manifest, trigger_age_qpc=101),
                     dict(companion_manifest, trigger_status='manual_no_airborne_snapshot')):
             companion_path.with_suffix('.json').write_text(json.dumps(bad), encoding='utf-8')

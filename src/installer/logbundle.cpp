@@ -119,6 +119,21 @@ struct Found {
 // than the write time, which changes when a folder is copied, restored from
 // a backup or pulled out of somebody else's zip -- exactly the things that
 // happen to a folder on its way into a bug report.
+// With log.max_mb in force a long session is a head log and tail segments beside it, edvr_<tag>_YYYYMMDD_HHMMSS[_mmm_<pid>].tail-NNN.log
+// (src\common\log_rotate.h, tools\log_session.py). A segment is part of its head's session, never a session of its own: it takes its head's stamp,
+// goes into the bundle with it, and is never the newest log. True when `name` is a segment's, with the head's name in `head`.
+bool segmentHead(const std::wstring& name, std::wstring* head) {
+    static const wchar_t kMark[] = L".tail-";
+    const size_t at = name.rfind(kMark);
+    if (at == std::wstring::npos) return false;
+    size_t i = at + (sizeof(kMark) / sizeof(kMark[0]) - 1);
+    const size_t digits = i;
+    while (i < name.size() && name[i] >= L'0' && name[i] <= L'9') ++i;
+    if (i - digits < 3 || name.compare(i, std::wstring::npos, L".log") != 0) return false;
+    if (head) *head = name.substr(0, at) + L".log";
+    return true;
+}
+
 bool stampFromName(const std::wstring& name, FILETIME* out) {
     const size_t dot = name.rfind(L'.');
     if (dot == std::wstring::npos || dot < 15) return false;
@@ -742,6 +757,7 @@ LogBundle collectLogs(const std::wstring& gameDir, const std::wstring& outDir,
         std::wstring path;
         FILETIME     written{};
         FILETIME     actualWritten{};
+        bool         segment = false;   // a tail segment: it follows its head and is never the newest log
     };
     FILETIME newestLog{};
     FILETIME sessionStart{}, sessionEnd{};
@@ -759,37 +775,46 @@ LogBundle collectLogs(const std::wstring& gameDir, const std::wstring& outDir,
             log.actualWritten = fd.ftLastWriteTime;
             // The name first, the write time only when the name does not carry
             // a stamp -- a log from a custom log.dir, or one somebody renamed.
-            if (!stampFromName(log.name, &log.written)) log.written = fd.ftLastWriteTime;
+            std::wstring headName;
+            log.segment = segmentHead(log.name, &headName);
+            if (!stampFromName(log.segment ? headName : log.name, &log.written)) log.written = fd.ftLastWriteTime;
             logs.push_back(log);
         } while (FindNextFileW(h, &fd));
         FindClose(h);
     }
 
-    if (logs.empty()) {
+    const LogFile* newest = nullptr;
+    int headCount = 0;
+    for (const LogFile& log : logs) {
+        if (log.segment) continue;
+        ++headCount;
+        if (!newest || CompareFileTime(&log.written, &newest->written) > 0) newest = &log;
+    }
+    if (!newest) {
         std::string where;
         for (const std::wstring& dir : logDirs) where += (where.empty() ? "" : " or ") + toUtf8(dir);
         bundle.notes.push_back("No logs in " + where + " -- has the game been started since ED-UP was installed?");
     } else {
-        const LogFile* newest = &logs.front();
-        for (const LogFile& log : logs) {
-            if (CompareFileTime(&log.written, &newest->written) > 0) newest = &log;
-        }
         newestLog = newest->written;
         sessionStart = newestLog;
         sessionEnd = newestLog;
         haveNewestLog = true;
-        int sessionCount = 0;
+        int sessionCount = 0, segmentCount = 0;
         for (const LogFile& log : logs) {
             if (secondsBetween(log.written, newest->written) > kSessionWindowSeconds) continue;
             if(CompareFileTime(&log.written,&sessionStart)<0) sessionStart=log.written;
             if(CompareFileTime(&log.actualWritten,&sessionEnd)>0) sessionEnd=log.actualWritten;
             take.push_back({log.path, log.name});
-            ++sessionCount;
+            if (log.segment) ++segmentCount; else ++sessionCount;
         }
         char line[160];
         sprintf_s(line, "%d log%s from the most recent session (of %d in the folder)",
-                  sessionCount, sessionCount == 1 ? "" : "s", static_cast<int>(logs.size()));
+                  sessionCount, sessionCount == 1 ? "" : "s", headCount);
         bundle.notes.push_back(line);
+        if (segmentCount) {
+            sprintf_s(line, "%d tail segment%s of those logs (a long session's later lines, beside its head log)", segmentCount, segmentCount == 1 ? "" : "s");
+            bundle.notes.push_back(line);
+        }
     }
 
     // ---- everything else worth having ---------------------------------

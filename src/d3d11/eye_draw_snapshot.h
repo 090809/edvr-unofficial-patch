@@ -17,6 +17,7 @@
 #include <map>
 #include <mutex>
 #include "vr_world_route.h" // VrWorldInternalScope keeps helper dispatches out of the game's census/hooks
+#include "../common/dump_file.h"   // drawstate_/candidates_/menu_ .bin go out as .z
 #include <cstring>
 #include "holo_material.h"
 
@@ -1236,11 +1237,11 @@ public:
     // unavailable copies get zero payload and an explicit failure count.
     // On-disk integers are little-endian, individually written (no ABI padding).
     bool write(ID3D11DeviceContext* ctx, const wchar_t* path) {
-        FILE* f = nullptr;
-        if (_wfopen_s(&f, path, L"wb") || !f) return false;
-        bool ok = fwrite("EDVRDRW1", 1, 8, f) == 8;
-        auto u32 = [&](uint32_t v) { ok = fwrite(&v, 4, 1, f) == 1 && ok; };
-        auto u64 = [&](uint64_t v) { ok = fwrite(&v, 8, 1, f) == 1 && ok; };
+        dump_file::Writer f;   // NAME.z when it compresses, the plain name when it cannot
+        if (!f.open(path)) return false;
+        bool ok = f.write("EDVRDRW1", 8);
+        auto u32 = [&](uint32_t v) { ok = f.write(&v, 4) && ok; };
+        auto u64 = [&](uint64_t v) { ok = f.write(&v, 8) && ok; };
         // Version 16 uses the same bounded binary layout as 15, with late-menu/scene candidate associations and optional native frame.
         u32(lateMenuEvidence?16u:15u); u32(static_cast<uint32_t>(draws.size())); u32(static_cast<uint32_t>(surfaces.size())); u32(dropped);
         auto payload = [&](ID3D11Resource* resource, uint32_t bytes, uint32_t row, uint32_t height) {
@@ -1250,10 +1251,10 @@ public:
             const bool valid = mapped && m.pData && (!row || m.RowPitch >= row);
             u32(valid ? bytes : 0);
             if (valid) {
-                if (!row) ok = fwrite(m.pData, 1, bytes, f) == bytes && ok;
+                if (!row) ok = f.write(m.pData, bytes) && ok;
                 else for (uint32_t y = 0; y < height; ++y)
-                    ok = fwrite(static_cast<const uint8_t*>(m.pData) + static_cast<size_t>(y) * m.RowPitch,
-                                1, row, f) == row && ok;
+                    ok = f.write(static_cast<const uint8_t*>(m.pData) + static_cast<size_t>(y) * m.RowPitch,
+                                 row) && ok;
             } else if (bytes) ++failures;
             if (mapped) ctx->Unmap(resource, 0);
             return valid;
@@ -1265,7 +1266,7 @@ public:
             u32(d.meshSelected);
             u32(d.join.sceneFrame);u32(d.join.epoch);u32(d.join.scheduledIndex);u32(d.join.scheduledRenderFrame);
             u32(d.join.fpFrame);u32(d.join.fpSequence);u32(d.join.gGameFrame);u32(d.join.itemSerial);u32(d.join.rigGeneration);
-            ok=fwrite(d.join.armJoints,sizeof(d.join.armJoints),1,f)==1&&ok;
+            ok=f.write(d.join.armJoints,sizeof(d.join.armJoints))&&ok;
             u64(d.join.rig);u64(d.join.poseQpc);u64(d.join.drawQpc);u64(d.join.captureSequence);u32(d.join.validFlags);u32(d.join.sourceJobLookupStatus);
             u32(d.width); u32(d.height); u32(d.texture);
             for (int i = 0; i < 4; ++i) {
@@ -1277,7 +1278,7 @@ public:
             for(unsigned i=0;i<4;++i){u32(d.mesh[i]);u64(d.meshSource[i]);u64(d.meshView[i]);u32(d.meshRangeStart[i]);u32(d.meshRangeCount[i]);u32(d.meshStatus[i]);}
             u32(uint32_t(d.layout.size()));
             for(const auto& e:d.layout) {
-                ok=fwrite(e.semantic,1,64,f)==64 && ok;
+                ok=f.write(e.semantic,64) && ok;
                 u32(e.index);u32(e.format);u32(e.slot);u32(e.offset);u32(e.classification);u32(e.step);
             }
         }
@@ -1313,7 +1314,7 @@ public:
         // of the format so a parser can reject a future ABI drift rather than
         // silently treating a different state as equivalent.
         u32(uint32_t(spriteDiagnostics.size()));u32(spriteImageDeclined);
-        auto blob=[&](const void* p,uint32_t n){u32(n);if(n)ok=fwrite(p,1,n,f)==n&&ok;};
+        auto blob=[&](const void* p,uint32_t n){u32(n);if(n)ok=f.write(p,n)&&ok;};
         for(auto& s:spriteDiagnostics) {
             u32(s.frame);u32(s.draw);u32(s.x);u32(s.y);u32(s.width);u32(s.height);u32(s.sourceWidth);u32(s.sourceHeight);
             u32(s.rtFormat);u32(s.srvFormat);u32(s.srvMostDetailedMip);u32(s.srvMipLevels);u32(s.srvWidth);u32(s.srvHeight);u32(s.srvArraySize);u32(s.srvMipCount);
@@ -1340,7 +1341,7 @@ public:
             u32(m.vCapture);payload(m.vStage.Get(),m.vBytes,0,0);
             u32(m.iCapture);payload(m.iStage.Get(),m.iBytes,0,0);
             u32(uint32_t(m.layout.size()));
-            for(const auto& e:m.layout){ok=fwrite(e.semantic,1,64,f)==64 && ok;u32(e.index);u32(e.format);u32(e.slot);u32(e.offset);u32(e.classification);u32(e.step);}
+            for(const auto& e:m.layout){ok=f.write(e.semantic,64) && ok;u32(e.index);u32(e.format);u32(e.slot);u32(e.offset);u32(e.classification);u32(e.step);}
         }
         u32(uint32_t(geoStates.size()));
         for(const auto& s:geoStates) {
@@ -1379,7 +1380,7 @@ public:
                 const bool valid=mapped && m.pData && layout && m.RowPitch>=rowBytes;
                 const uint32_t subBytes=layout?rowBytes*rows:0;u32(valid?subBytes:0);
                 if(valid)for(uint32_t row=0;row<rows;++row)
-                    ok=fwrite(static_cast<const uint8_t*>(m.pData)+size_t(row)*m.RowPitch,1,rowBytes,f)==rowBytes&&ok;
+                    ok=f.write(static_cast<const uint8_t*>(m.pData)+size_t(row)*m.RowPitch,rowBytes)&&ok;
                 else if(subBytes)++failures;
                 if(mapped)ctx->Unmap(c.textureStage.Get(),sub);
             }
@@ -1394,8 +1395,7 @@ public:
         u32(uint32_t(candidateSamplers.size()));
         for(const auto& c:candidateSamplers){u32(c.draw);u32(c.present);blob(&c.desc,sizeof(c.desc));}
         u32(failures);
-        ok = !ferror(f) && ok;
-        return fclose(f) == 0 && ok;
+        return f.close() && ok;
     }
 
 private:

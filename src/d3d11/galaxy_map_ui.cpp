@@ -367,9 +367,12 @@ float arrowDepth() { return g_bodies.depth; }
 void setSystemOpen(bool system) {
     const bool was = g_systemOpen.exchange(system, std::memory_order_relaxed);
     if (system != was) {
-        // Open: a new system's bodies start a new table. Shut: the arrow's depth goes back to infinity for the Galaxy Map.
+        // Open: a new system's bodies start a new table. Shut: the arrow's depth goes back to infinity for the Galaxy Map. The arrow's ray origin is the open map's, not the table's: it stays.
         while (g_bodies.busy.exchange(true, std::memory_order_acquire)) {}
+        float from[3];
+        std::memcpy(from, &g_bodies.rows[kMapArrowRow][1], sizeof(from));
         std::memset(g_bodies.rows, 0, sizeof(g_bodies.rows));
+        std::memcpy(&g_bodies.rows[kMapArrowRow][1], from, sizeof(from));
         g_bodies.n = 0;
         g_bodies.oldest = 0;
         g_bodies.depth = 0.0f;
@@ -396,6 +399,15 @@ void updateArrowDepth(const float cameraPosition[3], const float ray[3], const f
     const bool closeView = bodyFillsView(cameraPosition, forward, g_bodies.rows, g_bodies.n);
     g_bodies.busy.store(false, std::memory_order_release);
     temporalMapCloseView().store(closeView, std::memory_order_relaxed);
+    if (changed) g_bodies.generation.fetch_add(1, std::memory_order_release);
+}
+
+void setArrowOrigin(const float from[3]) {
+    while (g_bodies.busy.exchange(true, std::memory_order_acquire)) {}
+    float* arrowRow = g_bodies.rows[kMapArrowRow];
+    const bool changed = std::memcmp(&arrowRow[1], from, 3 * sizeof(float)) != 0;
+    if (changed) std::memcpy(&arrowRow[1], from, 3 * sizeof(float));
+    g_bodies.busy.store(false, std::memory_order_release);
     if (changed) g_bodies.generation.fetch_add(1, std::memory_order_release);
 }
 

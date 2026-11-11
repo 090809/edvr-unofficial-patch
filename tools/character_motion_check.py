@@ -32,6 +32,8 @@ import os
 import sys
 import tempfile
 
+import dump_io   # tools\dump_io.py: the eye dump's .bin files are NAME or NAME.z
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 PATH_HEAD, PATH_WORLD, PATH_ENGINE = 1, 2, 11   # eye_decisions.py PATHS
@@ -134,8 +136,8 @@ def owner_regions(logs, stamp, crop, draw_vs, draw_count):
     import numpy as np
     import eye_inputs
     table = os.path.join(logs, 'pool', 'depthwriter_%s.json' % stamp)
-    writer = os.path.join(logs, 'pool', 'depthwriter_%s_e0.bin' % stamp)
-    if not os.path.exists(table) or not os.path.exists(writer):
+    writer = os.path.join(logs, 'pool', 'depthwriter_%s_e0.bin' % stamp)   # NAME or NAME.z: eye_inputs reads through dump_io
+    if not os.path.exists(table) or not dump_io.exists(writer):
         return None, None
     with open(table, 'r', encoding='utf-8') as f:
         rows = [r for r in json.load(f)['draws'] if r['eye'] == 0]
@@ -186,7 +188,7 @@ def measure(logs, stamp, first=4, draw=DEFAULT_DRAW):
 
     skin_e = None
     skin_path = os.path.join(eyes, 'eye_%s_SkinE.bin' % stamp)
-    if os.path.exists(skin_path):
+    if dump_io.exists(skin_path):
         meta, e = eye_inputs.read(skin_path)
         valid = e[..., 3] > 0
         skin_e = dict(format=meta['format'], pixels=int(valid.sum()),
@@ -281,10 +283,10 @@ class _Fixture:
     BODY = (50, 135, 130, 168)
     IDS = dict(skin=13, helmet=5, suit=9)
 
-    def __init__(self, root, stamp='111111111001', helmet_fixed=False, planted=None, step_frame=None, owners=True, engine=True, skin_format=2):
+    def __init__(self, root, stamp='111111111001', helmet_fixed=False, planted=None, step_frame=None, owners=True, engine=True, skin_format=2, compress=False):
         import numpy as np
         from PIL import Image
-        self.root, self.stamp = root, stamp
+        self.root, self.stamp, self.compress = root, stamp, compress   # compress: every .bin as NAME.z, the way the eye dump writes them
         eyes = os.path.join(root, 'eyes')
         pool = os.path.join(root, 'pool')
         os.makedirs(eyes)
@@ -367,13 +369,16 @@ class _Fixture:
                     dict(id=self.IDS['suit'], eye=0, vs='01DA82F8D0EA0C99', count=23430),
                     dict(id=self.IDS['helmet'] + 100, eye=1, vs='01DA82F8D0EA0C99', count=16122)]), f)
 
-    @staticmethod
-    def _texture(path, array, fmt, frame):
+    def _texture(self, path, array, fmt, frame):
         import struct
         h, w = array.shape[:2]
         pixel = array.dtype.itemsize * (array.shape[2] if array.ndim == 3 else 1)
+        data = b'EDVRTEX1' + struct.pack('<9I', 1, w, h, fmt, w * pixel, frame, 0, 0, 0) + array.tobytes()
+        if self.compress:
+            dump_io.write_z(path, data)
+            return
         with open(path, 'wb') as f:
-            f.write(b'EDVRTEX1' + struct.pack('<9I', 1, w, h, fmt, w * pixel, frame, 0, 0, 0) + array.tobytes())
+            f.write(data)
 
 
 def _files_state(root):
@@ -433,6 +438,13 @@ def self_test():
         expect(code == 0, 'a right dump exits 0: %s' % lines)
         expect(all(r['draw_paths']['engine'] > 0.99 for r in result['rows']), 'the fixed helmet is on the engine path')
         expect(all(r['draw']['error'] <= 0.3 for r in result['rows']), 'the fixed helmet reads zero')
+
+        # The compressed dump (every .bin as NAME.z) measures identically to the plain one.
+        root = os.path.join(tmp, 'compressed')
+        _Fixture(root, helmet_fixed=True, compress=True)
+        expect(not os.path.exists(os.path.join(root, 'eyes', 'eye_111111111001_D04.bin')) and os.path.exists(os.path.join(root, 'eyes', 'eye_111111111001_D04.bin.z')), 'the fixture wrote .z files only')
+        zresult = measure(root, '111111111001')
+        expect(zresult['has_owners'] and zresult['skin_e'] is not None and zresult['rows'] == result['rows'], 'a compressed dump measures the same as the plain one, depth writer map and SkinE included')
 
         # A dump from before target 7 went to 32 bits still reads.
         root = os.path.join(tmp, 'old')

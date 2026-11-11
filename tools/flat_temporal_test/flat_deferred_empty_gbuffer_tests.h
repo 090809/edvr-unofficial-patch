@@ -336,7 +336,8 @@ inline unsigned run() {
                countOf(verifier, "reportFailure(\"deferred-inverse-unproven\");") == 1 && countOf(verifier, "failPhase(s,\"deferred-inverse-unproven\");") == 1,
                "an empty pass is not the failure that fails the phase and marks the prefix uncertain");
         expect(countOf(verifier, "} else if(emptyGBuffer)++s.deferredEmptyGBuffer;\n    else ++s.deferredCameraRefused;") == 1 &&
-               countOf(verifier, "empty-gbuffer-total=%llu work=%s") == 1 && countOf(verifier, "(unsigned long long)s.deferredEmptyGBuffer,flatWorkName(s.work));") == 1,
+               countOf(verifier, "empty-gbuffer-total=%llu pool-cameras=%u") == 1 &&
+               countOf(verifier, "(unsigned long long)s.deferredEmptyGBuffer,resolved.poolCameraCount,poolCameraPickName(poolPick),") == 1,
                "the outcome is counted apart from a refusal, and the HDR camera line carries the total");
         expect(countOf(verifier, "draw.deferredHdrVerified=firstWitness && executionCoherent;") == 1,
                "(and the pass is still not verified: the repairs and the donor-based qualification are untouched)");
@@ -346,7 +347,7 @@ inline unsigned run() {
         expect(verifier.find("if(s.work==FlatWork::Probe && nonzero)return nullptr;") != std::string::npos &&
                verifier.find("if(flatCameraInjectUpstreamOwns() && !flatDeferredVerifyInPhase(nonzero,phaseDomain))return nullptr;") != std::string::npos,
                "the early returns, the Probe work path's and the phase domain's, are where they were");
-        expect(runtime.find("flatRuntimeDeferredDonor(s.prefix,k,s.prefix.sequence+1,nullptr,d.camera)") != std::string::npos && countOf(runtime, "flatRuntimeDeferredDonor(") == 3,
+        expect(runtime.find("flatRuntimeDeferredDonor(s.prefix,k,s.prefix.sequence+1,nullptr,d.camera)") != std::string::npos && countOf(runtime, "flatRuntimeDeferredDonor(") == 4,
                "the binding-failure path asks the resolver without the inputs: it never reports an empty pass");
         // the hooks that say a write is a clear
         expect(countOf(vscreen, "flatRuntimeWritten(static_cast<ID3D11Resource*>(info.resource), FlatOverlayMutationOp::Written, true);") == 1 &&

@@ -4,7 +4,8 @@
 //
 // WHY. Players say Elite leaks memory over a long session, most of all in VR. A static reading of the exe and of this
 // repository found nothing that grows by gigabytes, and the only number EDVR logged was the GPU's (vram_watch.h), which
-// stops when the graphics log reaches its size cap. The next flight needs one line that tells three explanations
+// stopped when the graphics log reached its size cap (until 2026-11-10, when the log began keeping a rolling tail, and
+// these lines a share of its kept-lines budget: log_rotate.h). The next flight needs one line that tells three explanations
 // apart: Elite's own CPU memory growing, one kind of Elite GPU resource growing, or another process growing (the VR
 // runtime, whose growth a player sees in Task Manager as the game's).
 //

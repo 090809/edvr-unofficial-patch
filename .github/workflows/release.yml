@@ -319,15 +319,27 @@ jobs:
           $names += 'ed-up-manifest.json'
           $names += @($manifest.assets | ForEach-Object { $_.name })
           if ($manifest.launcher) { $names += $manifest.launcher.asset }
-          $lines = @()
+          # package_native.py writes SHA256SUMS. Check it lists exactly these names,
+          # each with its file's hash, so the packager and this list cannot drift apart.
+          $sumsPath = Join-Path 'dist' 'SHA256SUMS'
+          if (-not (Test-Path -LiteralPath $sumsPath)) { throw "Missing $sumsPath" }
+          $listed = @{}
+          foreach ($line in [IO.File]::ReadAllLines((Resolve-Path -LiteralPath $sumsPath).Path)) {
+            if ($line -notmatch '^([0-9a-f]{64})  (\S+)$') { throw "Malformed SHA256SUMS line: $line" }
+            $listed[$Matches[2]] = $Matches[1]
+          }
+          $missing = @($names | Where-Object { -not $listed.ContainsKey($_) })
+          $extra = @($listed.Keys | Where-Object { $names -notcontains $_ })
+          if ($missing.Count -or $extra.Count) {
+            throw "SHA256SUMS names differ: missing [$($missing -join ', ')] extra [$($extra -join ', ')]"
+          }
           foreach ($name in $names) {
             $path = Join-Path 'dist' $name
             if (-not (Test-Path -LiteralPath $path)) { throw "Missing package $path" }
             $hash = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant()
-            $lines += "$hash  $name"
+            if ($hash -ne $listed[$name]) { throw "SHA256SUMS hash differs for $name" }
           }
-          [IO.File]::WriteAllLines((Join-Path 'dist' 'SHA256SUMS'), $lines, (New-Object Text.UTF8Encoding($false)))
-          Get-Content -LiteralPath 'dist\SHA256SUMS'
+          Get-Content -LiteralPath $sumsPath
 
       - name: Upload diagnostics
         if: always()

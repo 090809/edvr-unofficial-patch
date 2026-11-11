@@ -261,8 +261,10 @@ if ($LASTEXITCODE -ne 0) { throw 'Draft release creation failed' }
 For a prerelease tag, add `--prerelease` to `gh release create` as well.
 
 On native Windows, where `package.bat <version>` packages the release without
-Actions, the same assets land in `dist\`. `package.bat` prints the signing
-command when it finishes. Run `python tools\sign_manifest.py sign
+Actions, the same assets land in `dist\`, `SHA256SUMS` included:
+`package_native.py` writes it, and the workflow only checks that it lists the
+files above with their hashes. `package.bat` prints the signing command when
+it finishes. Run `python tools\sign_manifest.py sign
 dist\ed-up-manifest.json` and then `python tools\sign_manifest.py verify dist`,
 and attach the files from `dist\` the same way. `package_native.py` writes the
 split zips with fixed timestamps and file order, so packaging twice gives the

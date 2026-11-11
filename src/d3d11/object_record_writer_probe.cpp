@@ -511,19 +511,19 @@ ObjectRecordWriterProbe::OwnershipSummary ObjectRecordWriterProbe::ownershipSumm
 ObjectRecordWriterProbe::HookStatus ObjectRecordWriterProbe::hookStatus() const noexcept {std::lock_guard<std::mutex> lock(mutex_);return hookStatus_;}
 const char* ObjectRecordWriterProbe::hookStatusText() const noexcept {std::lock_guard<std::mutex> lock(mutex_);return hookStatusName(hookStatus_);}
 
-bool ObjectRecordWriterProbe::writeBinary(FILE* file,uint64_t& offset,bool& binOk) noexcept {
+bool ObjectRecordWriterProbe::writeBinary(dump_file::Writer* file,uint64_t& offset,bool& binOk) noexcept {
     std::lock_guard<std::mutex> lock(mutex_);
     for(auto& r:records_)for(Snapshot* s:{&r.record,&r.keySnapshot,&r.builderSnapshot,&r.objectSnapshot,&r.entrySnapshot}) {
         s->offset=offset;if(s->status!="available")continue;
         if(!file||!binOk){s->status=file?"bin_write_failed":"bin_open_failed";s->data.clear();continue;}
-        if(fwrite(s->data.data(),1,s->data.size(),file)!=s->data.size()){s->status="bin_write_failed";s->data.clear();binOk=false;continue;}
+        if(!file->write(s->data.data(),s->data.size())){s->status="bin_write_failed";s->data.clear();binOk=false;continue;}
         offset+=s->data.size();
     }
     for(auto& o:ownerships_)for(Snapshot* s:{&o.outerSnapshot,&o.collectionSnapshot,&o.contextSnapshot,&o.recordTailSnapshot,
         &o.gameObjectPrefix,&o.descriptorPrefix,&o.providerPrefix,&o.parentPrefix}) {
         s->offset=offset;if(s->status!="available")continue;
         if(!file||!binOk){s->status=file?"bin_write_failed":"bin_open_failed";s->data.clear();o.status="partial";continue;}
-        if(fwrite(s->data.data(),1,s->data.size(),file)!=s->data.size()){s->status="bin_write_failed";s->data.clear();o.status="partial";binOk=false;continue;}
+        if(!file->write(s->data.data(),s->data.size())){s->status="bin_write_failed";s->data.clear();o.status="partial";binOk=false;continue;}
         offset+=s->data.size();
     }
     recountRetainedBytesLocked();

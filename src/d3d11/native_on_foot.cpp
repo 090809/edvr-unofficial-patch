@@ -1102,8 +1102,8 @@ void readKey() {
     if (first || logDetail != g_logDetailLast) {
         const unsigned long long capMb = Log::get().maxBytes() / (1024ull * 1024ull);
         char cap[64];
-        if (capMb) std::snprintf(cap, sizeof(cap), "a size cap of %llu MB", capMb);
-        else std::snprintf(cap, sizeof(cap), "no size cap");
+        if (capMb) std::snprintf(cap, sizeof(cap), "a size bound of %llu MB (the head and four rotating tail segments)", capMb);
+        else std::snprintf(cap, sizeof(cap), "no size bound");
         Log::get().note("native on foot log (F125): detail %s, summary window %u s (live, log.on_foot_detail: %s); the log has %s, set when it opened",
                         logDetail ? "on" : "off", nofoot::logwin::windowSeconds(logDetail),
                         logDetail ? "every on-foot line as before, about 4 MB a minute on foot"
@@ -8038,6 +8038,27 @@ bool g_adsHoldThisPress = false, g_adsHoldKeyLast = false, g_adsHoldKeyInit = fa
 nofoot::AdsRamp g_adsRamp;
 double g_adsW = 0.0;                  // the weight this tick
 nofoot::AdsActionReject g_adsActionReject; // frame thread only: rejected held action recovers on logical release or authoritative ADS acceptance
+// F235: a drop of the game's ADS under a held request it had accepted (a reload), held through (adsActionRejectStep, kAdsAcceptedDropMaxMs). adsAimTick opens and
+// closes it and writes one line at its end; adsSightTick notes how far the sight lock moved the eye during it. Frame thread only.
+struct F235Drop {
+    bool active = false, haveBase = false;
+    uint64_t startMs = 0;
+    double base[3] = {};
+    double maxMm = 0.0;
+    uint32_t count = 0;
+};
+F235Drop g_f235;
+constexpr uint32_t kF235LineCap = 200;
+void f235SightNote(const double pos[3]) noexcept {
+    if (!g_f235.active) return;
+    if (!g_f235.haveBase) {
+        for (int i = 0; i < 3; ++i) g_f235.base[i] = pos[i];
+        g_f235.haveBase = true;
+        return;
+    }
+    const double dx = pos[0] - g_f235.base[0], dy = pos[1] - g_f235.base[1], dz = pos[2] - g_f235.base[2];
+    g_f235.maxMm = std::max(g_f235.maxMm, 1000.0 * std::sqrt(dx * dx + dy * dy + dz * dz));
+}
 int g_adsActionSourceLast = -1;
 int g_adsActionCompareLast = -1;
 bool g_adsActionEligibleLast = false;
@@ -9141,6 +9162,28 @@ void adsAimTick(uint64_t now, bool session) noexcept {
                         action.value ? "on" : "off", journalKnown ? (journalValue ? "on" : "off") : "unknown", status.polls,
                         static_cast<unsigned long long>(status.contentRevision), static_cast<unsigned long long>(g_adsIncidentInput.contentAgeMs), heldName);
         if (actionVeto) adsIncidentDump(now, "held request rejected by changed false Status content after grace");
+    }
+    {   // F235: the game's ADS dropped under a held request it had accepted, and the veto has not latched: the request is held through it (a reload). One line at its end.
+        const bool dropping = actionEligible && actionFresh && action.value && g_adsActionReject.accepted && !actionVeto && journalKnown && !journalValue;
+        if (dropping && !g_f235.active) {
+            g_f235.active = true;
+            g_f235.haveBase = false;
+            g_f235.startMs = now;
+            g_f235.maxMm = 0.0;
+        } else if (!dropping && g_f235.active) {
+            g_f235.active = false;
+            ++g_f235.count;
+            const char* how = actionVeto ? "the bridge ran out, so the request is rejected and ADS releases"
+                              : journalKnown && journalValue ? "the game reported ADS again, so the view stayed in the sights"
+                              : !actionEligible ? "native on foot's full body ended"
+                              : !actionFresh ? "the request's sample went stale, so the journal decides"
+                              : "the request was released";
+            if (g_f235.count <= kF235LineCap)
+                Log::get().note("native on foot ADS held through a game drop (F235): the game reported no ADS for %llu ms while the request stayed on (a reload or the like; held up "
+                                "to %.1f s); ended: %s; the sight lock moved the eye at most %.1f mm meanwhile; item %.63s; drop %u this session%s",
+                                static_cast<unsigned long long>(now >= g_f235.startMs ? now - g_f235.startMs : 0), static_cast<double>(nofoot::kAdsAcceptedDropMaxMs) / 1000.0, how,
+                                g_f235.maxMm, heldName, g_f235.count, g_f235.count == kF235LineCap ? " (the last such line)" : "");
+        }
     }
     const nofoot::f91::ItemGate itemGate = nofoot::f91::adsItemGate(nativePrimary, heldKind, heldName);
     struct InputSnapshot {
@@ -13072,6 +13115,7 @@ void adsSightTick(uint64_t now, double dt, const EyeSample& s) noexcept {
                     g_adsSight.target[i] = 0.0;
                 }
         }
+        f235SightNote(g_adsSight.pos);   // F235: how far the sight lock moved the eye while a held request rode through a game drop
         {   // F93b: the eye chain, per frame (this tick's figures for the trace) and summed for the 1 s line, while ADS is active
             F93Frame& q = g_f93Frame;
             const double head[3] = {g_adsHeadNow[0], g_adsHeadNow[1], g_adsHeadNow[2]};
@@ -15036,12 +15080,12 @@ shop::Pacer g_shopSecondPacer;   // F209: the once-a-second line (frame thread)
 // the hooks' own event lines are written by native_on_foot_hooks.cpp's frame boundary). Silent when none of them is set, or when the shop hooks are not armed.
 void shopSecondLine(uint64_t now, bool away, uint32_t episodes) noexcept {
     NativeOnFootShopRead r;
-    if (!nativeOnFootShopRead(&r) || !shop::anySet(r.buyScreenOpen, r.kiosk, r.state) || !g_shopSecondPacer.due(now)) return;
+    if (!nativeOnFootShopRead(&r) || !shop::anySet(r.buyScreenOpen, r.kiosk, r.state, r.liveryOpen) || !g_shopSecondPacer.due(now)) return;
     char f107[200];
     std::snprintf(f107, sizeof(f107), "%s (episode %u, %u calls refused, %u with a buy screen open)", away ? "away" : "not away", episodes,
                   g_f107Calls.load(std::memory_order_relaxed), g_f107ShopCalls.load(std::memory_order_relaxed));
     char line[512];
-    shop::formatSecond(line, sizeof(line), r.suitByte, r.weaponsByte, r.kioskByte, r.state, r.buyScreenOpen, f107);
+    shop::formatSecond(line, sizeof(line), r.suitByte, r.weaponsByte, r.kioskByte, r.liveryByte, r.weaponLiveryByte, r.state, r.signal, f107);
     Log::get().note("%s", line);
 }
 bool f107Tick(uint64_t now) noexcept {
@@ -17976,7 +18020,7 @@ bool pinStage0(const pfz::ArmPlan& pl, const PfzSpan& sp, bool froze, uint64_t n
         {   // F107: the game's camera away from the commander (a terminal's or a screen's own camera): the pin, the neck reference and the standing calibration
             // take nothing from this call (native_on_foot_f107.h); the edges and the episode go to the frame thread, which logs them
             const double eyeNeckM = nofoot::f107::eyeNeckDistance(E, N0);
-            g_f107Away.step(eyeNeckM, static_cast<double>(f30QpcUs(in.qpc)) * 1e-6, nativeOnFootShopOpen());   // F209: a Pioneer Supplies buy screen open holds the camera away at any distance
+            g_f107Away.step(eyeNeckM, static_cast<double>(f30QpcUs(in.qpc)) * 1e-6, nativeOnFootShopOpen());   // F209: a Pioneer Supplies buy screen open holds the camera away at any distance; F228, F234: so does a Livery screen or the loadout browser
             if (g_f107Away.away) {
                 refusal = kPinRefCameraAway;
                 g_f107ShopCalls.store(g_f107Away.shopCalls, std::memory_order_relaxed);
@@ -38435,6 +38479,7 @@ void nativeOnFootFrameBoundary(uint32_t frameNo) {
     nativeOnFootHooksBody(keyOn, nativeOnFootActive(), bodyWhy);
     cameraGateTick(now);   // F93d: the game's camera (first person or its third-person suite) gates every body change; its lines
     nativePreviewCameraBoundary(keyOn && session, nativeOnFootActive() && !nativeOnFootCameraExternal());
+    nativePreviewCameraDiagTick(nativeOnFootPreviewScreenOpen());   // F232: the refused roster, once a second while a preview screen is open
     headShadowTick(now);   // F95c: the head kept in the shadows; its lines
     f142Tick(now);         // F142: the outfit census (a change), and the full outfit's window while the key is on
     coatPackTick(now);     // F157: whether the coat outfit is armed, to the draw path; the draws left out of the eyes, written once a window

@@ -1058,18 +1058,19 @@ int wmain(int argc, wchar_t** argv) {
         struct DepthHeader{char magic[8];uint32_t version,frame,eye,width,height,format,constFirstFloat,constFloats;};
         static_assert(sizeof(DepthHeader)==40,"tools/eye_depth_dump.py reads a 40-byte version-2 header");
         auto readDepthFile=[&](const wchar_t* name,DepthHeader& hd,std::vector<float>& constants,std::vector<float>& grid)->bool{
-            FILE* f=nullptr;if(_wfopen_s(&f,(depthDir+L"\\"+name).c_str(),L"rb")||!f)return false;
-            bool ok=fread(&hd,1,sizeof(hd),f)==sizeof(hd) && std::memcmp(hd.magic,"EDVRDEPT",8)==0;
+            // The writer stores depth_<stamp>_f<n>_<A|B>.bin as NAME.z; read it back decoded, by its original name.
+            std::string bytes;if(!dump_file::readDecoded((depthDir+L"\\"+name).c_str(),bytes))return false;
+            size_t at=0;
+            auto take=[&](void* to,size_t n){if(at+n>bytes.size())return false;std::memcpy(to,bytes.data()+at,n);at+=n;return true;};
+            bool ok=take(&hd,sizeof(hd)) && std::memcmp(hd.magic,"EDVRDEPT",8)==0;
             uint32_t depthBytes=0;uint32_t fileFaults=0;
             if(ok) {
                 constants.resize(hd.constFloats);
-                ok=hd.constFloats<=(336-256)*4 && (constants.empty() ||
-                   fread(constants.data(),4,constants.size(),f)==constants.size());
+                ok=hd.constFloats<=(336-256)*4 && (constants.empty() || take(constants.data(),4*constants.size()));
             }
-            if(ok) ok=fread(&depthBytes,4,1,f)==1 && depthBytes==hd.width*hd.height*4;
-            if(ok) {grid.resize(depthBytes/4);ok=fread(grid.data(),4,grid.size(),f)==grid.size();}
-            if(ok) ok=fread(&fileFaults,4,1,f)==1 && fileFaults==0;
-            if(fclose(f)!=0)ok=false;
+            if(ok) ok=take(&depthBytes,4) && depthBytes==hd.width*hd.height*4;
+            if(ok) {grid.resize(depthBytes/4);ok=take(grid.data(),4*grid.size());}
+            if(ok) ok=take(&fileFaults,4) && fileFaults==0;
             return ok;
         };
         for(unsigned eye=0;eye<2;++eye) {

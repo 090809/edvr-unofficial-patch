@@ -14,6 +14,7 @@
 #include "../common/game_build.h"
 #include "../common/guard.h"
 #include "../common/log.h"
+#include "../common/dump_file.h"   // the ledger's .bin files go out as .z
 #include "../common/temporal_mode.h"
 #include "../common/runtime_profile.h"
 #include "../common/timing.h"
@@ -430,8 +431,8 @@ bool writeDump(const uint8_t* pool, uint32_t poolBytes, const uint8_t* scene, ui
                      static_cast<unsigned>(st.wHour), static_cast<unsigned>(st.wMinute),
                      static_cast<unsigned>(st.wSecond), frame);
     }
-    HANDLE h = CreateFileW(path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (h == INVALID_HANDLE_VALUE) {
+    dump_file::Writer h;
+    if (!h.open(path)) {
         path[0] = 0;
         return false;
     }
@@ -447,11 +448,11 @@ bool writeDump(const uint8_t* pool, uint32_t poolBytes, const uint8_t* scene, ui
     static_assert(sizeof(Header) == 32, "the reader assumes a 32-byte header");
     Header hd = {{'E', 'D', 'V', 'R', 'P', 'O', 'O', 'L'}, 1u, frame, poolBytes, sceneBytes,
                  kRecordBytes, poolBytes / kRecordBytes};
-    DWORD w = 0;
-    bool ok = WriteFile(h, &hd, sizeof(hd), &w, nullptr) != 0;
-    if (ok && sceneBytes) ok = WriteFile(h, scene, sceneBytes, &w, nullptr) != 0;
-    if (ok) ok = WriteFile(h, pool, poolBytes, &w, nullptr) != 0;
-    CloseHandle(h);
+    bool ok = h.write(&hd, sizeof(hd));
+    if (ok && sceneBytes) ok = h.write(scene, sceneBytes);
+    if (ok) ok = h.write(pool, poolBytes);
+    if (!h.close()) ok = false;
+    wcsncpy_s(path, pathN, h.writtenPath().c_str(), _TRUNCATE);   // NAME.z when it compressed
     return ok;
 }
 
@@ -1037,11 +1038,10 @@ void ledgerPoll(ID3D11DeviceContext* ctx) {
 bool writeRaw(const wchar_t* dir, const wchar_t* prefix, uint32_t frame, const std::vector<uint8_t>& bytes,
               wchar_t* path, size_t pathN) {
     _snwprintf_s(path, pathN, _TRUNCATE, L"%s\\%s_%s_%u.bin", dir, prefix, g_ledgerStamp, frame);
-    HANDLE h = CreateFileW(path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (h == INVALID_HANDLE_VALUE) return false;
-    DWORD w = 0;
-    const bool ok = WriteFile(h, bytes.data(), static_cast<DWORD>(bytes.size()), &w, nullptr) != 0;
-    CloseHandle(h);
+    dump_file::Writer h;
+    if (!h.open(path)) return false;
+    bool ok = h.write(bytes.data(), bytes.size());
+    if (!h.close()) ok = false;
     return ok;
 }
 
@@ -1055,6 +1055,8 @@ void writeLedger(ID3D11DeviceContext* ctx) {
         g_dumpDirMade = true;
         CreateDirectoryW(dir.c_str(), nullptr);
     }
+    dump_file::Tally dumpTally;
+    dump_file::TallyScope dumpScope(dumpTally);   // every .bin below goes out as .z; the line at the end says what that bought
     int pools = 0, insts = 0, bones = 0, auxes = 0;
     wchar_t path[MAX_PATH];
     for (int i = 0; i < kLedgerFrames; ++i) {
@@ -1077,13 +1079,12 @@ void writeLedger(ID3D11DeviceContext* ctx) {
         // four buffers' sizes and strides, and the bytes.
         if (!g_ledgerAux[i].empty()) {
             _snwprintf_s(path, MAX_PATH, _TRUNCATE, L"%s\\aux_%s_%u.bin", dir.c_str(), g_ledgerStamp, frame);
-            HANDLE h = CreateFileW(path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-            if (h != INVALID_HANDLE_VALUE) {
-                DWORD w = 0;
+            dump_file::Writer h;
+            if (h.open(path)) {
                 struct AuxHeader { char magic[8]; uint32_t version, frame, entries, pad; };
                 AuxHeader ah = {{'E', 'D', 'V', 'R', 'L', 'A', 'U', 'X'}, 1u, frame,
                                 static_cast<uint32_t>(g_ledgerAux[i].size()), 0u};
-                bool ok = WriteFile(h, &ah, sizeof(ah), &w, nullptr) != 0;
+                bool ok = h.write(&ah, sizeof(ah));
                 for (const AuxFrame& f : g_ledgerAux[i]) {
                     struct Entry { uint64_t vs; uint32_t instances, count, bytes[kAuxWhat], stride[kAuxWhat]; };
                     Entry e = {f.vs, f.instances, f.count, {}, {}};
@@ -1091,14 +1092,14 @@ void writeLedger(ID3D11DeviceContext* ctx) {
                         e.bytes[k] = static_cast<uint32_t>(f.bytes[k].size());
                         e.stride[k] = f.stride[k];
                     }
-                    ok = ok && WriteFile(h, &e, sizeof(e), &w, nullptr) != 0;
+                    ok = ok && h.write(&e, sizeof(e));
                     for (int k = 0; ok && k < kAuxWhat; ++k) {
                         if (!f.bytes[k].empty()) {
-                            ok = WriteFile(h, f.bytes[k].data(), static_cast<DWORD>(f.bytes[k].size()), &w, nullptr) != 0;
+                            ok = h.write(f.bytes[k].data(), f.bytes[k].size());
                         }
                     }
                 }
-                CloseHandle(h);
+                if (!h.close()) ok = false;
                 if (ok) ++auxes;
             }
         }
@@ -1118,23 +1119,21 @@ void writeLedger(ID3D11DeviceContext* ctx) {
                  g_instStride, 48u, g_poolBytes, {}};   // the palettes are 48-byte rows; version 2 rows carry ps and rt
     memcpy(hd.crop, g_ledgerCropFrame, sizeof(hd.crop));
     _snwprintf_s(path, MAX_PATH, _TRUNCATE, L"%s\\draws_%s.bin", dir.c_str(), g_ledgerStamp);
-    HANDLE h = CreateFileW(path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-    bool drawsOk = h != INVALID_HANDLE_VALUE;
+    dump_file::Writer h;
+    bool drawsOk = h.open(path);
     uint32_t rows = 0;
     if (drawsOk) {
-        DWORD w = 0;
-        drawsOk = WriteFile(h, &hd, sizeof(hd), &w, nullptr) != 0;
+        drawsOk = h.write(&hd, sizeof(hd));
         for (int i = 0; drawsOk && i < kLedgerFrames; ++i) {
             const uint32_t n = static_cast<uint32_t>(g_ledgerDraws[i].size());
             const uint32_t frame = g_ledgerFrame0 + static_cast<uint32_t>(i);
-            drawsOk = WriteFile(h, &frame, 4, &w, nullptr) != 0 && WriteFile(h, &n, 4, &w, nullptr) != 0;
+            drawsOk = h.write(&frame, 4) && h.write(&n, 4);
             if (drawsOk && n) {
-                drawsOk = WriteFile(h, g_ledgerDraws[i].data(), static_cast<DWORD>(n * sizeof(LedgerDraw)), &w,
-                                    nullptr) != 0;
+                drawsOk = h.write(g_ledgerDraws[i].data(), n * sizeof(LedgerDraw));
             }
             rows += n;
         }
-        CloseHandle(h);
+        if (!h.close()) drawsOk = false;
     }
     int first = -1, last = -1;
     for (int k = 0; k < kLedgerCrops; ++k) {
@@ -1186,7 +1185,7 @@ void writeLedger(ID3D11DeviceContext* ctx) {
     _snwprintf_s(panelPath,MAX_PATH,_TRUNCATE,L"%s\\panels_%s.bin",dir.c_str(),g_ledgerStamp);
     const bool panelOk=g_panelSnapshot.write(ctx,panelPath);
     Log::get().note("object probe: panel snapshots %ls: %u draws, actual first matching frame %u, target %llX, %llu reserved bytes, %u declines, %u readback/capture failures, %u other-eye draws, %u skipped/replaced candidates; %s. First matching eye/frame only, 16 draws, 768 MiB payload cap; actual native draw inputs and before/after HDR/depth retained. No rendering changes.",
-        panelPath,g_panelSnapshot.count(),g_panelSnapshot.firstFrame(),
+        dump_file::onDisk(panelPath).c_str(),g_panelSnapshot.count(),g_panelSnapshot.firstFrame(),
         static_cast<unsigned long long>(g_panelSnapshot.target()),
         static_cast<unsigned long long>(g_panelSnapshot.bytes),g_panelSnapshot.declined,
         g_panelSnapshot.failures,g_panelSnapshot.ignoredOtherEye,g_panelSkipped,
@@ -1239,7 +1238,7 @@ void writeLedger(ID3D11DeviceContext* ctx) {
                             "%u..%u; builder plane test %s; %s. Pool-draw geometry for frame %u: %u draws mapped, "
                             "%u distinct meshes, %u states, %u declined, %u draws over the cap (drawstate_%ls.eyemesh.bin, "
                             "version 9). tools/cull_gate_probe.py reads them with the run's depth, pool and ledger.",
-                            gatePath, gc.gateCalls, gc.gateKept, gc.gateDropped, gc.builderCalls,
+                            dump_file::onDisk(gatePath).c_str(), gc.gateCalls, gc.gateKept, gc.gateDropped, gc.builderCalls,
                             cullGateProbe.distinctRecords(), gc.builderKept, gc.builderDropped, gc.dumps,
                             gc.dumpsDropped, gc.entriesDropped, gc.subItemsDropped, gc.faults, gc.recordMismatch,
                             cullGateProbe.firstFrame(), cullGateProbe.lastFrame(),
@@ -1285,11 +1284,11 @@ void writeLedger(ID3D11DeviceContext* ctx) {
                             g_gateGeoFrame, geo.geoFrame);
         g_gateRun = false;
     }
-    Log::get().note("object probe: tone-map snapshots %ls: %u draws, actual first matching frame %u, %u reserved bytes, %u declines, %u failed copies/shaders; %s. At most two eye draws; exposure, colour LUT, HDR input and converted output retained for target colour replay. No rendering changes.",tonePath,unsigned(g_tonemapSnapshot.count()),g_tonemapSnapshot.firstFrame(),g_tonemapSnapshot.bytes,g_tonemapSnapshot.declined,g_tonemapSnapshot.failures,toneOk?"written":"WRITE FAILED");
+    Log::get().note("object probe: tone-map snapshots %ls: %u draws, actual first matching frame %u, %u reserved bytes, %u declines, %u failed copies/shaders; %s. At most two eye draws; exposure, colour LUT, HDR input and converted output retained for target colour replay. No rendering changes.",dump_file::onDisk(tonePath).c_str(),unsigned(g_tonemapSnapshot.count()),g_tonemapSnapshot.firstFrame(),g_tonemapSnapshot.bytes,g_tonemapSnapshot.declined,g_tonemapSnapshot.failures,toneOk?"written":"WRITE FAILED");
     const uint32_t missingShaders = g_drawSnapshot.writeShaders(dir.c_str());
     Log::get().note("object probe: eye draw snapshots %ls: %u draws, %u holo surfaces, %u capped draws, "
                     "%u failed copies, %u missing shader files; %s. VS b0/b1/b2 and PS b2 are captured at each watched draw; "
-                    "surface alpha is from its first draw only.", path,
+                    "surface alpha is from its first draw only.", dump_file::onDisk(path).c_str(),
                     static_cast<uint32_t>(g_drawSnapshot.draws.size()),
                     static_cast<uint32_t>(g_drawSnapshot.surfaces.size()), g_drawSnapshot.dropped,
                     g_drawSnapshot.failures, missingShaders, snapshotOk ? "written" : "WRITE FAILED");
@@ -1350,7 +1349,7 @@ void writeLedger(ID3D11DeviceContext* ctx) {
                     static_cast<unsigned long long>(ownership.ancestorTraceOverflow));
     const uint32_t eyeMeshMissing=g_eyeMeshSnapshot.writeShaders(dir.c_str());
     Log::get().note(EyeDrawSnapshot::kBodyCaptureReport,
-                    path,g_eyeMeshSnapshot.meshDraws,g_eyeMeshSnapshot.meshCaptureSnapshots,g_eyeMeshSnapshot.meshNonBodyDraws,
+                    dump_file::onDisk(path).c_str(),g_eyeMeshSnapshot.meshDraws,g_eyeMeshSnapshot.meshCaptureSnapshots,g_eyeMeshSnapshot.meshNonBodyDraws,
                     g_eyeMeshSnapshot.meshCaptureDeclined,unsigned(g_eyeMeshSnapshot.meshBuffers.size()),g_eyeMeshSnapshot.meshBytes,
                     g_eyeMeshSnapshot.meshDeclined,g_eyeMeshSnapshot.dropped,g_eyeMeshSnapshot.failures,eyeMeshMissing,
                     eyeMeshOk?"written":"WRITE FAILED",EyeDrawSnapshot::kEyeMeshFrames,g_eyeMeshSnapshot.vertexBytes,g_eyeMeshSnapshot.vertexDeclined);
@@ -1366,7 +1365,7 @@ void writeLedger(ID3D11DeviceContext* ctx) {
         candidateRoiPairs+=c.roiCaptured!=0;
     }
     Log::get().note("F77 targeted candidate snapshots %ls: %u matching draws (%u capped), %u missing render-frame mappings, %u outside first-three-frame window; %u total optic-pair matches (%u evidence attempts), %u issued/%u not issued/%u issue unknown; %u pool buffers/%u bytes (%u declines), %u stream bytes (%u declines), %u PS inputs/%u bytes (%u declines, %u refused descriptors, %u mip levels omitted); %u reserved ROI pairs (%u complete, %u incomplete, %u ROI declines, %u bytes), %u copy failures, %u missing shader files; %s. VS 154FB5A453F3D2E9 is an unproven candidate family. Bounds: 192 draws, 64 MiB pool, 32 MiB streams, 24 MiB PS inputs split into equal 12 MiB per-optic-attempt budgets plus 8 MiB centered ROI; full array slices are retained from the highest-resolution mip chain that fits, with source/requested mip metadata and refusal reasons in the snapshot. At most two optic draws receive inputs/ROI. Ledger and native render frames are separate fields.",
-                    path,unsigned(g_f77CandidateSnapshot.candidateFrames.size()),g_f77CandidateSnapshot.candidateDropped,
+                    dump_file::onDisk(path).c_str(),unsigned(g_f77CandidateSnapshot.candidateFrames.size()),g_f77CandidateSnapshot.candidateDropped,
                     g_f77CandidateSnapshot.candidateMissingRenderFrame,g_f77CandidateSnapshot.candidateOutsideFrameWindow,
                     g_f77CandidateSnapshot.candidateOpticDraws,(std::min)(g_f77CandidateSnapshot.candidateOpticDraws,EyeDrawSnapshot::kCandidateMaxOpticDraws),
                     candidateIssued,candidateNotIssued,candidateIssueUnknown,
@@ -1387,7 +1386,7 @@ void writeLedger(ID3D11DeviceContext* ctx) {
     Log::get().note("eye-run camera companion %ls: %s; absent/refused callbacks are reported in the companion, not an inferred preview camera",cameraPath,cameraOk?"written":"WRITE FAILED");
     const uint32_t menuMissingShaders=g_lateMenuSnapshot.evidence.writeShaders(dir.c_str());
     Log::get().note("late menu snapshots %ls: selected complete ledger frame %u, %u rows, %u structured bytes, %u stream bytes, %u buffer declines, %u stream declines, %u copy failures, %u missing shaders; %s. Selection, per-eye anchor/sibling quotas, scene-before-menu availability and binding identities are in the JSON companion; a six-index-only family is not a complete menu. Independent whole-run caps 128 MiB structured and 8 MiB streams; diagnostic only, shared menu families are not object identity.",
-        path,g_lateMenuSnapshot.window.frame,unsigned(g_lateMenuSnapshot.rows.size()),g_lateMenuSnapshot.evidence.meshBytes,
+        dump_file::onDisk(path).c_str(),g_lateMenuSnapshot.window.frame,unsigned(g_lateMenuSnapshot.rows.size()),g_lateMenuSnapshot.evidence.meshBytes,
         g_lateMenuSnapshot.evidence.vertexBytes,g_lateMenuSnapshot.evidence.meshDeclined,g_lateMenuSnapshot.evidence.vertexDeclined,
         g_lateMenuSnapshot.evidence.failures,menuMissingShaders,menuOk?"written":"WRITE FAILED");
     uint32_t sourceCameras=0,screenDraws=0,sourceDepths=0,effectDraws=0,effectVertices=0,effectLayouts=0;
@@ -1422,7 +1421,11 @@ void writeLedger(ID3D11DeviceContext* ctx) {
     if(screenDraws)Log::get().note("object probe: source mesh snapshots: %u draws, %u frame-local buffers, %u bytes, %u range/format/budget declines. Drawstate v4 records original draw cameras, full t33/t38 and VB0 at first use per resource per frame; firstDraw identifies that copy. No render or pacing changes.",g_drawSnapshot.meshDraws,unsigned(g_drawSnapshot.meshBuffers.size()),g_drawSnapshot.meshBytes,g_drawSnapshot.meshDeclined);
     _snwprintf_s(path,MAX_PATH,_TRUNCATE,L"%s\\gui_%s.bin",dir.c_str(),g_ledgerStamp);
     const bool guiOk=g_guiSnapshot.write(ctx,path,dir.c_str());
-    Log::get().note("object probe: GUI source snapshot %ls: %u draws, eye route=%s (%u source-resource candidates; native part identity unmatched), %u route-cap refusals, %u range/budget/format declines, %u failed copies/shaders, %u missing layouts; %s. GUI source targets matched against actual eye-draw PS resources; candidate eye comes from the scene DSV mapping when known.",path,unsigned(g_guiSnapshot.count()),g_guiSnapshot.routeStatus(),unsigned(g_guiSnapshot.routeCount()),g_guiSnapshot.routeDeclines,g_guiSnapshot.declined,g_guiSnapshot.failures,g_guiSnapshot.missingLayouts,guiOk?"written":"WRITE FAILED");
+    Log::get().note("object probe: GUI source snapshot %ls: %u draws, eye route=%s (%u source-resource candidates; native part identity unmatched), %u route-cap refusals, %u range/budget/format declines, %u failed copies/shaders, %u missing layouts; %s. GUI source targets matched against actual eye-draw PS resources; candidate eye comes from the scene DSV mapping when known.",dump_file::onDisk(path).c_str(),unsigned(g_guiSnapshot.count()),g_guiSnapshot.routeStatus(),unsigned(g_guiSnapshot.routeCount()),g_guiSnapshot.routeDeclines,g_guiSnapshot.declined,g_guiSnapshot.failures,g_guiSnapshot.missingLayouts,guiOk?"written":"WRITE FAILED");
+    // One line per ledger, printed even when nothing was compressed (a build whose writers never ran must
+    // read differently from one that did). The snapshot writers' own files are inside this count.
+    Log::get().note("object probe: ledger %ls dump compression: %s. A .bin here is stored as NAME.bin.z unless a \"dump file: ... written PLAIN\" line says it fell back; tools\\dump_io.py reads either form and --expand restores plain files.",
+                    g_ledgerStamp, dump_file::tallyText(dumpTally).c_str());
     detail::g_objectProbeLedgerOn = false;
     g_skin.reset();   // its report went out above; a run that never reported is said at shutdown
     ledgerRelease();

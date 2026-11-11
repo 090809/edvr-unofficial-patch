@@ -17,12 +17,14 @@ from pathlib import Path
 import struct
 import tempfile
 
+import dump_io   # tools\dump_io.py: the eye dump's .bin files are NAME or NAME.z
+
 
 def read(path):
     path = Path(path)
-    if path.stat().st_size > 128 * 1024 * 1024:
+    if dump_io.getsize(path) > 128 * 1024 * 1024:   # the decoded size
         raise ValueError('GUI capture exceeds file budget')
-    stream = io.BytesIO(path.read_bytes())
+    stream = io.BytesIO(dump_io.read_bytes(path))
 
     def take(n):
         data = stream.read(n)

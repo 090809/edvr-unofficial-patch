@@ -12,6 +12,10 @@ uncommitted changes (the kind that has reached a field tester twice); a build
 a few commits past the tag ("v0.17.0-2-g650d8a9"), "unknown" (no git), another
 release's tag and a binary with no version stamp are refused as mismatches.
 --dry-run makes the same check and writes nothing.
+
+Beside the archives and split assets it writes SHA256SUMS: one "<sha256>  <name>"
+line, LF-terminated, for every file a release attaches except the manifest's
+.sig, which is made after packaging. release.yml checks it against its own list.
 """
 import argparse
 import hashlib
@@ -53,6 +57,7 @@ STAMP_KEYS = ("FileVersion", "ProductVersion")
 # its asset name from release to release.
 MIN_LAUNCHER = "0.1.0"
 MANIFEST = sign_manifest.MANIFEST_NAME
+SUMS_NAME = "SHA256SUMS"
 LAUNCHER_ASSET = "ed-up-launcher.exe"
 LAUNCHER_VERSION_HEADER = ("src", "installer", "launcher_version.h")
 # The licence of the code direct launch is ported from (min-ed-launcher, MIT). The launcher exe carries it
@@ -63,7 +68,7 @@ LAUNCHER_LICENSE_RESOURCE = 120
 KEYS_HEADER = ("src", "installer", "update_keys.h")
 CORE_NAMES = ("d3d11.dll", "openvr/openvr_api.dll", "openvr/openxr_loader.dll",
               "openvr/OPENXR-LOADER-LICENSE.txt", "edvr.ini", "edvr-flat.ini", "edvr_profile.ini",
-              "LICENSE.txt", "DXBC-HASH-LICENSE.txt", "FIDELITYFX-SDK-DX11-LICENSE.txt",
+              "LICENSE.txt", "DXBC-HASH-LICENSE.txt", "MINIZ-LICENSE.txt", "FIDELITYFX-SDK-DX11-LICENSE.txt",
               "MIN-ED-LAUNCHER-LICENSE.txt")
 DLSS_NAMES = ("nvngx_dlss.dll", "NVIDIA-DLSS-LICENSE.txt")
 XESS_NAMES = ("libxess.dll", "INTEL-XESS-LICENSE.txt", "INTEL-XESS-THIRD-PARTY.txt")
@@ -120,6 +125,7 @@ def _files(root, no_dlss):
                    (build / "edvr-flat.ini", "edvr-flat.ini"),
                    (root / "LICENSE", "LICENSE.txt")])
     result.append((root / "third_party" / "dxbc_hash" / "LICENSE.TXT", "DXBC-HASH-LICENSE.txt"))
+    result.append((root / "third_party" / "miniz" / "LICENSE", "MINIZ-LICENSE.txt"))
     result.append((root.joinpath(*LAUNCHER_LICENSE_FILE), LAUNCHER_LICENSE_NAME))
     # AMD's FSR3 D3D11 port (MIT). Unlike NVIDIA's runtime it ships no DLL --
     # it is statically linked into d3d11.dll -- so its presence in a build is
@@ -428,6 +434,19 @@ def _split_outputs(root, version, files):
     return outputs
 
 
+def _sha256_file(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for block in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def sha256sums_bytes(entries):
+    """[(published name, path holding its bytes)] -> SHA256SUMS, ASCII with LF line ends."""
+    return "".join("%s  %s\n" % (_sha256_file(path), name) for name, path in entries).encode("ascii")
+
+
 def _launcher_linux_members(root):
     """(source, archive name) of the launcher's Linux ZIP."""
     return [(root / "build" / LAUNCHER_ASSET, LAUNCHER_ASSET),
@@ -487,6 +506,8 @@ def package(root, version, no_dlss=False, dry_run=False):
     split = _split_outputs(root, version, files)
     for name, blob in split:
         print("[edvr] split asset plan: %s (%d bytes)" % (dist / name, len(blob)))
+    sums = dist / SUMS_NAME
+    print("[edvr] checksum plan: %s (%d files)" % (sums, 4 + len(split)))
     if dry_run:
         print("[edvr] dry run: wrote nothing."); return 0
     dist.mkdir(parents=True, exist_ok=True)
@@ -495,8 +516,9 @@ def package(root, version, no_dlss=False, dry_run=False):
     temporary_linux_archive = dist / (".edvr-installer-linux-" + version + ".zip.tmp")
     temporary_launcher_linux = dist / (".edvr-launcher-linux-" + version + ".zip.tmp")
     split_temporaries = [dist / (".edvr-" + name + ".tmp") for name, _ in split]
+    temporary_sums = dist / (".edvr-" + SUMS_NAME + ".tmp")
     for temporary in (temporary_archive, temporary_installer_archive, temporary_linux_archive,
-                      temporary_launcher_linux, *split_temporaries):
+                      temporary_launcher_linux, *split_temporaries, temporary_sums):
         if temporary.exists(): temporary.unlink()
     try:
         for (_, blob), temporary in zip(split, split_temporaries):
@@ -516,9 +538,15 @@ def package(root, version, no_dlss=False, dry_run=False):
         with zipfile.ZipFile(temporary_launcher_linux, "w", compression=zipfile.ZIP_DEFLATED) as output:
             for source, name in launcher_linux:
                 _write_zip_entry(output, source, name)
+        # Hashed from the temporaries, which are moved into place unchanged below.
+        sum_entries = [(archive.name, temporary_archive), (installer_archive.name, temporary_installer_archive),
+                       (linux_archive.name, temporary_linux_archive),
+                       (launcher_linux_archive.name, temporary_launcher_linux)]
+        sum_entries += [(name, temporary) for (name, _), temporary in zip(split, split_temporaries)]
+        temporary_sums.write_bytes(sha256sums_bytes(sum_entries))
     except Exception:
         for temporary in (temporary_archive, temporary_installer_archive, temporary_linux_archive,
-                          temporary_launcher_linux, *split_temporaries):
+                          temporary_launcher_linux, *split_temporaries, temporary_sums):
             if temporary.exists(): temporary.unlink()
         raise
     old_stage = dist / (".edvr-old-stage-" + version)
@@ -531,6 +559,8 @@ def package(root, version, no_dlss=False, dry_run=False):
                  dist / (".edvr-old-launcher-linux-" + version + ".zip")))
     archives += tuple((temporary, dist / name, dist / (".edvr-old-" + name))
                       for temporary, (name, _) in zip(split_temporaries, split))
+    # Last, so SHA256SUMS is replaced only once every file it lists has been.
+    archives += ((temporary_sums, sums, dist / (".edvr-old-" + SUMS_NAME)),)
     # DLSS and XeSS zips from earlier packages are named by content, so a changed
     # runtime leaves the old name behind; it goes in the same replace-or-roll-back.
     new_names = {name for name, _ in split}
@@ -567,7 +597,7 @@ def package(root, version, no_dlss=False, dry_run=False):
     for backup in [backup for _, _, backup in archives] + stale_backups:
         if backup.exists(): backup.unlink()
     for written in (archive, installer_archive, linux_archive, launcher_linux_archive,
-                    *(dist / name for name, _ in split)):
+                    *(dist / name for name, _ in split), sums):
         print("[edvr] wrote %s (%d bytes)" % (written, written.stat().st_size))
     return 0
 
@@ -689,6 +719,24 @@ def self_test():
             try: package(root, "../escape", dry_run=True); raise AssertionError("bad version accepted")
             except ValueError: pass
             assert package(root, "1.2.3", no_dlss=True) == 0
+            # SHA256SUMS lists what release.yml's rule lists (the four ZIPs, the manifest, the manifest's
+            # assets and its launcher), each with its hash, in LF lines, and no .sig.
+            sums_bytes = (root / "dist" / SUMS_NAME).read_bytes()
+            assert sums_bytes.endswith(b"\n") and b"\r" not in sums_bytes
+            listed = {}
+            for line in sums_bytes.decode("ascii").splitlines():
+                assert re.fullmatch(r"[0-9a-f]{64}  \S+", line), line
+                digest, name = line.split("  ", 1)
+                listed[name] = digest
+            manifest_doc = json.loads((root / "dist" / MANIFEST).read_text(encoding="ascii"))
+            expected = {name + "-1.2.3.zip" for name in
+                        ("ed-up", "ed-up-installer", "ed-up-installer-linux", "ed-up-launcher-linux")}
+            expected |= {MANIFEST} | {asset["name"] for asset in manifest_doc["assets"]}
+            if manifest_doc.get("launcher"): expected.add(manifest_doc["launcher"]["asset"])
+            assert set(listed) == expected, sorted(listed)
+            for name, digest in listed.items():
+                assert hashlib.sha256((root / "dist" / name).read_bytes()).hexdigest() == digest, name
+            assert not [p for p in (root / "dist").iterdir() if p.name.startswith(".edvr-")]
             with zipfile.ZipFile(root / "dist" / "ed-up-installer-1.2.3.zip") as installer_archive:
                 assert set(installer_archive.namelist()) == {"edvr-installer.exe"}
                 assert installer_archive.read("edvr-installer.exe") == b"payload"
@@ -792,6 +840,7 @@ def self_test():
             assert not (root / "dist" / "ed-up-installer-1.2.3.exe").exists()
             artifacts = [root / "dist" / (name + "-1.2.3.zip") for name in
                          ("ed-up", "ed-up-installer", "ed-up-installer-linux", "ed-up-launcher-linux")]
+            artifacts.append(root / "dist" / SUMS_NAME)
             old_archives = {path: path.read_bytes() for path in artifacts}
             for missing_file in (wrapper_source, launcher_source, root / "release" / "README-linux.txt",
                                  launcher_sh_source, launcher_readme_source):
@@ -878,7 +927,7 @@ def self_test():
                                  "openvr/OPENXR-LOADER-LICENSE.txt", "edvr-installer.exe",
                                  "README.txt", "openvr/READ-ME-FIRST.txt", "edvr.ini", "edvr-flat.ini",
                                   "README-linux.txt", LINUX_WRAPPER, LINUX_LAUNCHER,
-                                  "LICENSE.txt", "DXBC-HASH-LICENSE.txt", LAUNCHER_LICENSE_NAME}
+                                  "LICENSE.txt", "DXBC-HASH-LICENSE.txt", "MINIZ-LICENSE.txt", LAUNCHER_LICENSE_NAME}
                 assert archive.read(LINUX_WRAPPER) == wrapper_source.read_bytes()
                 assert archive.getinfo(LINUX_WRAPPER).external_attr >> 16 == 0o100755
                 assert archive.read(LINUX_LAUNCHER) == launcher_source.read_bytes()
@@ -1029,7 +1078,7 @@ def self_test():
             xess_names = set(xess_files.values())
             core_names = {"d3d11.dll", "openvr/openvr_api.dll", "openvr/openxr_loader.dll",
                           "openvr/OPENXR-LOADER-LICENSE.txt", "edvr.ini", "edvr-flat.ini",
-                          "edvr_profile.ini", "LICENSE.txt", "DXBC-HASH-LICENSE.txt", LAUNCHER_LICENSE_NAME}
+                          "edvr_profile.ini", "LICENSE.txt", "DXBC-HASH-LICENSE.txt", "MINIZ-LICENSE.txt", LAUNCHER_LICENSE_NAME}
 
             def snapshot():
                 return {path.relative_to(dist).as_posix(): (path.read_bytes() if path.is_file() else None)

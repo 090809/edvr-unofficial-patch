@@ -77,8 +77,13 @@ struct State {
     std::atomic<uint64_t> heldCalls{0};
     std::atomic<uint64_t> passed[kPassCount] = {};
     PointerHold held;                        // the System Map's held answer: the game's update thread only
+    SharedPoint rayFrom;                     // the arrow's ray origin in the UI frame (HeadLatch's point; zero before it): written on the frame thread
+    std::atomic<uint64_t> liveFrom{0};       // replaced calls that took the live head, the arrow being on a panel, since the last 30 s line
 
     // Frame thread only.
+    HeadLatch latch;
+    unsigned latchNotes = 0;
+    bool latchedInWindow = false;            // a point was held at some time since the last 30 s line
     unsigned tries = 0;
     uint64_t lastTryMs = 0;
     bool stood = false;
@@ -142,7 +147,11 @@ uint64_t pointerCall(State& s, Project original, void* k, const float* in, int i
     float game[4];
     if (!readMem(reinterpret_cast<uintptr_t>(in), game, sizeof(game))) return pass(s, original, kBadInput, k, in, idx, out);
     alignas(16) float farIn[4];
-    if (farPoint(pose.rows, pose.position, arrow, game[3], farIn) != Why::kOk) return pass(s, original, kBadArrow, k, in, idx, out);
+    // The ray's origin: the head as the map opened while the arrow is at star depth; the live head while it is on a panel, the game's own arrow (galaxy_map_pointer_core.h liveHead).
+    float from[3], eyes[2][3];
+    if (mapui::over() && mapCameraEyes(eyes, nullptr) && liveHead(eyes, from)) s.liveFrom.fetch_add(1, std::memory_order_relaxed);
+    else s.rayFrom.load(from);
+    if (farPoint(pose.rows, pose.position, arrow, from, game[3], farIn) != Why::kOk) return pass(s, original, kBadArrow, k, in, idx, out);
     s.replaced.fetch_add(1, std::memory_order_relaxed);
     if (!hold) return original(k, farIn, idx, out);
     // The System Map's click wants the same bits at press and release (galaxy_map_pointer_core.h, THE HELD POINTER). Its call passes a 16-byte out.
@@ -231,11 +240,43 @@ bool tryInstall(State& s, bool& transient) {
     return true;
 }
 
+// The arrow's ray origin to the hover's readers and the arrow's shader (the MapBodies row).
+void publishRayFrom(State& s) noexcept {
+    s.rayFrom.store(s.latch.at);
+    mapui::setArrowOrigin(s.latch.at);
+}
+
 void closeGate(State& s) noexcept {
     s.gate.store(0, std::memory_order_release);
     mapui::setSystemOpen(false);
     mapui::setGates(false, false);
     s.open = false;
+    if (s.latch.open || s.latch.have) {   // the flat profile calls this every frame: once is enough
+        latchClose(s.latch);
+        publishRayFrom(s);
+    }
+}
+
+// One frame of the head-as-the-map-opened point while a map is open (galaxy_map_pointer_core.h HeadLatch), said when it is taken or dropped.
+void latchFrame(State& s) noexcept {
+    float eyes[2][3] = {};
+    uint64_t generation = 0;
+    const bool ok = mapCameraEyes(eyes, &generation);
+    const uint32_t recentresBefore = s.latch.afterRecentre;
+    if (latchOffer(s.latch, ok, eyes, generation)) {
+        publishRayFrom(s);
+        if (s.latchNotes < 16) {
+            ++s.latchNotes;
+            if (s.latch.have)
+                Log::get().note("map pointer: the arrow's ray now starts at the head as the map opened: %.4f %.4f %.4f from the tracking origin in the UI frame (the eyes %.4f apart); "
+                                "the hover and the arrow at star depth take their direction from there for this map",
+                                s.latch.at[0], s.latch.at[1], s.latch.at[2], s.latch.apart);
+            else if (s.latch.afterRecentre != recentresBefore)
+                Log::get().note("map pointer: the view was recentred (the eyes' midpoint jumped more than %.3f to within %.3f of the tracking origin): the arrow's ray is taken again from the next two eye readings",
+                                kRecentreJump, kRecentreNear);
+        }
+    }
+    s.latchedInWindow = s.latchedInWindow || s.latch.have;
 }
 
 void thirtySecondLine(State& s, uint64_t now) {
@@ -304,6 +345,18 @@ void thirtySecondLine(State& s, uint64_t now) {
                     static_cast<unsigned long long>(depthFaults), static_cast<unsigned long long>(depthUnavailable), static_cast<unsigned long long>(writeBackDeclined),
                     s.open && !depthTested && !depthIssued ? " (NO sprite was tested or written in this window: the depth never ran)"
                     : depthTested && !depthIssued ? " (sprites were tested against a depth nothing wrote: the depth issues never ran)" : "");
+    // The arrow's ray origin. A map open in the window with no point held means the ray stayed at the tracking origin, as before this point existed.
+    if (wasOpen) {
+        char where[128];
+        if (s.latch.have)
+            std::snprintf(where, sizeof(where), "held at %.4f %.4f %.4f from the tracking origin (the eyes %.4f apart)", s.latch.at[0], s.latch.at[1], s.latch.at[2], s.latch.apart);
+        else
+            std::snprintf(where, sizeof(where), "%s", s.latchedInWindow ? "none now, held earlier in the window" : "NONE held while the map was open: the ray started at the tracking origin");
+        Log::get().note("map pointer: the arrow's ray origin: %s; points taken %u, after a recentre %u; eye readings refused as not two eyes %llu; hover calls from the live head, the arrow on a panel: %llu of %llu replaced",
+                        where, s.latch.taken, s.latch.afterRecentre, static_cast<unsigned long long>(s.latch.refused), static_cast<unsigned long long>(s.liveFrom.exchange(0, std::memory_order_relaxed)),
+                        static_cast<unsigned long long>(replaced));
+        s.latchedInWindow = s.latch.have;
+    }
 }
 
 } // namespace
@@ -341,7 +394,7 @@ void mapPointerFrame() noexcept {
             const uintptr_t cursor = s.cursorObject.load(std::memory_order_acquire);
             uintptr_t scene = 0;
             float arrow[3], d[3];
-            if (cursor && readMem(cursor + kCursorSceneOffset, &scene, sizeof(scene)) && scene && readMem(scene + kScenePositionOffset, arrow, sizeof(arrow)) && arrowDirection(arrow, d))
+            if (cursor && readMem(cursor + kCursorSceneOffset, &scene, sizeof(scene)) && scene && readMem(scene + kScenePositionOffset, arrow, sizeof(arrow)) && arrowDirectionFrom(arrow, s.latch.at, d))
                 for (int k = 0; k < 3; ++k) ray[k] = d[0] * pose.rows[0][k] + d[1] * pose.rows[1][k] + d[2] * pose.rows[2][k];
             mapui::updateArrowDepth(pose.position, ray, pose.rows[2]);
         }
@@ -377,12 +430,21 @@ void mapPointerFrame() noexcept {
     if (open != s.open) {
         if (open) s.openedInWindow = true;
         s.open = open;
+        if (open) {
+            float eyes[2][3];
+            uint64_t generation = 0;
+            latchOpen(s.latch, mapCameraEyes(eyes, &generation) ? generation : 0);
+        } else {
+            latchClose(s.latch);
+        }
+        publishRayFrom(s);
         if (s.edgeNotes < 16) {
             ++s.edgeNotes;
             Log::get().note("map pointer: a map %s (%s): the hover reads the arrow's direction, the arrow is at star depth off the panels and the game's on them, and the panel mask is %s",
                             open ? "opened" : "closed", galaxy ? "the Galaxy Map" : open ? "the System Map" : "none now", open ? "kept" : "let go");
         }
     }
+    if (open) latchFrame(s);
     s.gate.store(open ? 1 : 0, std::memory_order_release);
     mapui::setGates(galaxy, open);
     if (!s.cursorSaid && s.cursorObject.load(std::memory_order_acquire)) {

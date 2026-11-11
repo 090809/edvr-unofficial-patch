@@ -663,15 +663,15 @@ void sourcePins(const std::string& root) {
     check(glueLine, "M11.build: build.bat compiles the glue into d3d11.dll, on a line of its own");
     check(rigLabel && at(bat, "tools\\mem_watch_test\\mem_watch_test.cpp") != none, "M11.build: build.bat builds and runs this rig");
 
-    // The log: a reserved line is noted through noteReserved, written when the cap has been reached, and the process-exit path is
-    // not touched by any of it.
-    check(at(logH, "void noteReserved(const char* fmt, ...);") != none && at(logCpp, "void Log::noteReserved(") != none && at(logCpp, "writeReserved(index);") != none,
-          "M11.log: Log::noteReserved exists and writeBuffer writes the reserve once the cap is reached");
+    // The log: a reserved line is noted through noteReserved, written again to the head once the head has ended (a kept line), and the
+    // process-exit path is not touched by any of it.
+    check(at(logH, "void noteReserved(const char* fmt, ...);") != none && at(logCpp, "void Log::noteReserved(") != none && at(logCpp, "writeKept(index, headEnd);") != none,
+          "M11.log: Log::noteReserved exists and writeRotating writes the kept lines once the head has ended");
     const std::string detach = between(logCpp, "void Log::detachDuringProcessExit() {", "void Log::close() {");
-    check(!detach.empty() && !contains(detach, "eserve") && !contains(detach, "spans"),
-          "M11.log: detachDuringProcessExit does not use the reserve");
-    check(contains(logCpp, "log size cap reached; only lines noted as reserved") && !contains(logCpp, "log size cap reached; nothing further"),
-          "M11.log: the cap notice says the reserved lines go on");
+    check(!detach.empty() && !contains(detach, "eserve") && !contains(detach, "spans") && !contains(detach, "writeKept"),
+          "M11.log: detachDuringProcessExit does not use the kept lines");
+    check(contains(logCpp, "log head ends here at") && contains(logCpp, "the memory watch's lines") && !contains(logCpp, "log size cap reached"),
+          "M11.log: the head's end notice says the memory watch's lines go on, and no notice says the log stops");
 }
 
 }  // namespace

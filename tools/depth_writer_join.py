@@ -144,6 +144,24 @@ def self_test():
             result = report(tmp, 'T9', 0, 5)
         text = buf.getvalue()
         assert result['stale'] == 2 and 'AAAA000000000002' in text and 'bias -100' in text, text
+        # The same run with every .bin stored as NAME.z, the way the eye dump writes them: the same report.
+        import dump_io
+        for folder in ('pool', 'eyes'):
+            for name in os.listdir(os.path.join(tmp, folder)):
+                if name.endswith('.bin'):
+                    target = os.path.join(tmp, folder, name)
+                    with open(target, 'rb') as f:
+                        dump_io.write_z(target, f.read())
+                    os.remove(target)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            assert report(tmp, 'T9', 0, 5)['stale'] == 2
+        assert buf.getvalue() == text, 'a compressed dump joins to the same report'
+        write_texture(os.path.join(tmp, 'pool', 'depthwriter_T9_e0.bin'), writer, 42)   # the later cases write plain again
+        for folder in ('pool', 'eyes'):
+            for name in os.listdir(os.path.join(tmp, folder)):
+                if name.endswith('.bin.z') and os.path.exists(os.path.join(tmp, folder, name[:-2])):
+                    os.remove(os.path.join(tmp, folder, name))
         # eye 1's map against eye 0's slot and Z captures, same shapes: the old code joined them silently
         write_texture(os.path.join(tmp, 'pool', 'depthwriter_T9_e1.bin'), writer, 42, eye=1)
         try:

@@ -479,7 +479,8 @@ __declspec(noinline) void __fastcall conversationLookHooked(void* iface, float y
 std::atomic<uintptr_t> g_shopBase{0};                      // the game image's base: the armed shop hooks' target minus its RVA (the vtables are compared as base + RVA)
 std::atomic<uintptr_t> g_shopObj[shop::kClassCount];       // the object each class's Show / start last remembered (0: none); hook threads store, the frame thread clears
 std::atomic<uint8_t> g_shopOpen[shop::kClassCount];        // 1 while that class's object reads open: the callbacks set it at once, the frame thread re-derives it every frame
-std::atomic<int8_t> g_shopByte[shop::kClassCount] = {{-1}, {-1}, {-1}};   // the frame thread's last read of each remembered byte (-1 none, 0, 1), for the once-a-second line
+std::atomic<int8_t> g_shopByte[shop::kClassCount] = {{-1}, {-1}, {-1}, {-1}, {-1}, {-1}};   // the frame thread's last read of each remembered byte (-1 none, 0, 1), for the once-a-second line; one initializer per class
+static_assert(shop::kClassCount == 6, "g_shopByte's initializer lists one -1 per class: extend it with the enum");
 std::atomic<bool> g_shopBusy{false};                       // the ring's try-flag: a second concurrent producer drops its event (counted) rather than wait
 std::atomic<uint64_t> g_shopBusyDrops{0};
 avh::Ring<shop::Event, 32> g_shopRing;
@@ -508,11 +509,11 @@ __declspec(noinline) bool sehCopyCString(uintptr_t at, char* out, size_t cap) no
         return false;
     }
 }
-// The buy screen the object at `self` is, by its vtable (the first qword), for the base's Show and Close: kNotOurs for any other class or an unreadable object.
+// The buy screen or (F228) Livery screen the object at `self` is, by its vtable (the first qword), for the base's Show and Close: kNotOurs for any other class or an unreadable object.
 inline int shopClassOf(uintptr_t self, uintptr_t base) noexcept {
     uint64_t vtable = 0;
     if (!base || !plausibleUserPointer(self) || !sehReadU64At(self, &vtable)) return shop::kNotOurs;
-    return shop::buyScreenOfVtable(vtable, base);
+    return shop::screenOfVtable(vtable, base);
 }
 inline int shopByteAt(uintptr_t self, uint32_t off) noexcept {
     uint8_t b = 0;
@@ -2879,6 +2880,10 @@ void shopFrameTick(const avh::Sink& sink) {
         }
         shop::formatEvent(line, sizeof(line), e);
         shopWrite(f, sink, now, line);
+        if (e.kind == shop::kShow && (shop::isLivery(e.cls) || e.cls == shop::kOutfitting) && e.after == 1) {   // F228/F234: said once per opening
+            shop::formatHeldOpened(line, sizeof(line), e.cls);
+            shopWrite(f, sink, now, line);
+        }
     }
     const uint64_t lost = g_shopRing.lost() + g_shopBusyDrops.load(std::memory_order_relaxed);
     if (lost != f.lostSeen) {
@@ -2907,8 +2912,8 @@ void shopFrameTick(const avh::Sink& sink) {
         g_shopOpen[c].store(verdict[c] == shop::Verdict::kOpen ? 1u : 0u, std::memory_order_release);
         g_shopByte[c].store(static_cast<int8_t>(verdict[c] == shop::Verdict::kOpen ? 1 : verdict[c] == shop::Verdict::kClosed ? 0 : -1), std::memory_order_relaxed);
     }
-    const shop::Signal s = shop::signalOf(verdict[shop::kSuit], verdict[shop::kWeapons], verdict[shop::kKiosk]);
-    const bool on = s.buyScreenOpen();
+    const shop::Signal s = shop::signalOf(verdict[shop::kSuit], verdict[shop::kWeapons], verdict[shop::kKiosk], verdict[shop::kLivery], verdict[shop::kWeaponLivery], verdict[shop::kOutfitting]);
+    const bool on = s.holds();
     if (on != f.signalLogged) {
         ++f.seq;
         f.signalLogged = on;
@@ -3169,19 +3174,34 @@ avh::Sink g_frameSink{&logSink, nullptr};   // the production wrapper's lines (t
 
 void nativeOnFootHooksFrameBoundary() { boundaryAt(g_frameSink); }
 
-// F209: the Pioneer Supplies buy screens' signal. Any thread (two atomics); true while the suit or the weapon buy screen reads open (shop_screen_core.h).
-bool nativeOnFootShopOpen() noexcept {
+// F209: the Pioneer Supplies buy screens' open flags. Any thread (two atomics); true while the suit or the weapon buy screen reads open (shop_screen_core.h).
+static bool shopBuyScreenOpen() noexcept {
     return g_shopOpen[shop::kSuit].load(std::memory_order_acquire) != 0 || g_shopOpen[shop::kWeapons].load(std::memory_order_acquire) != 0;
 }
+// F228: a Livery screen (the suit's or the weapon's) reads open.
+bool nativeOnFootLiveryOpen() noexcept {
+    return g_shopOpen[shop::kLivery].load(std::memory_order_acquire) != 0 || g_shopOpen[shop::kWeaponLivery].load(std::memory_order_acquire) != 0;
+}
+// F232: one of the preview screens F209 watches reads open (the two buy screens, the two Livery screens, the loadout browser). Any thread.
+bool nativeOnFootPreviewScreenOpen() noexcept {
+    return g_shopOpen[shop::kSuit].load(std::memory_order_acquire) != 0 || g_shopOpen[shop::kWeapons].load(std::memory_order_acquire) != 0 || nativeOnFootLiveryOpen() ||
+           g_shopOpen[shop::kOutfitting].load(std::memory_order_acquire) != 0;
+}
+// F107's shop input: a buy screen (F209), a Livery screen (F228) or the loadout browser (F234) is open. Any thread.
+bool nativeOnFootShopOpen() noexcept { return shopBuyScreenOpen() || nativeOnFootLiveryOpen() || g_shopOpen[shop::kOutfitting].load(std::memory_order_acquire) != 0; }
 // The frame thread's reading for the once-a-second line (the frame thread owns the state text). False when no shop hook is armed.
 bool nativeOnFootShopRead(NativeOnFootShopRead* out) noexcept {
     if (!out) return false;
     *out = NativeOnFootShopRead();
     out->armed = shopAnyArmed();
-    out->buyScreenOpen = nativeOnFootShopOpen();
+    out->buyScreenOpen = shopBuyScreenOpen();
+    out->liveryOpen = nativeOnFootLiveryOpen();
+    out->signal = nativeOnFootShopOpen();
     out->suitByte = g_shopByte[shop::kSuit].load(std::memory_order_relaxed);
     out->weaponsByte = g_shopByte[shop::kWeapons].load(std::memory_order_relaxed);
     out->kioskByte = g_shopByte[shop::kKiosk].load(std::memory_order_relaxed);
+    out->liveryByte = g_shopByte[shop::kLivery].load(std::memory_order_relaxed);
+    out->weaponLiveryByte = g_shopByte[shop::kWeaponLivery].load(std::memory_order_relaxed);
     out->kiosk = g_shopOpen[shop::kKiosk].load(std::memory_order_acquire) != 0;
     std::snprintf(out->state, sizeof(out->state), "%s", g_shopFrame.state);
     out->signalChanges = g_shopFrame.seq;

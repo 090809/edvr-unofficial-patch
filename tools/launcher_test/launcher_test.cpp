@@ -2823,7 +2823,10 @@ void testWatcher() {
         const DWORD began = GetTickCount();
         const WatchOutcome out = watchLaunch(names, quick, nullptr, nullptr);
         const DWORD took = GetTickCount() - began;
-        check(out.kind == WatchOutcome::Kind::NeverStarted && took >= 350 && took < 3000, "neither EDLaunch nor the game: it waits out the allowance and says so (" + std::to_string(took) + " ms)");
+        // The allowance counts the watcher's sleeps, not its process-list reads, and on a loaded CI runner
+        // those reads stretched this 400 ms allowance to 4.2 s. So the upper bound only shows that the short
+        // allowance was used rather than the two-minute default; the lower bound shows it was waited out.
+        check(out.kind == WatchOutcome::Kind::NeverStarted && took >= 350 && took < 60000, "neither EDLaunch nor the game: it waits out the allowance and says so (" + std::to_string(took) + " ms)");
     }
     // The game runs and exits, and EDLaunch ignores the request: it is left running.
     {
