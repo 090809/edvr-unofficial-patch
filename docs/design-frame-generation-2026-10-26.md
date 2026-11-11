@@ -1805,6 +1805,54 @@ Environment: OpenXR (EDVR's runtime), left eye, render 2817x2448, output
   not `no_synth_cost`); the runtime's lock line reads `auto_gate`, not
   `no_s`. EDVR's GPU total drops by about the synthesizer's cost.
 
+### 2026-11-12: the frame recomputed from the raw logs (no new flight)
+
+Sources: the six same-spot profiles of 2026-11-11 21:18-21:23, the census
+and `native benchmark` lines of that log and of the release's
+(`edvr_gfx_20261110_210546.log`, v0.22.0), the runtime log's windows.
+1878x1632 to 3756x3264 per eye, RTX 5080, SteamVR/OpenXR.
+
+- **How to read a profile.** A pass's ms is the GPU clock between two
+  boundaries, so the passes tile the frame period: their sum cannot show
+  idle. Work the hooks do not see (NVIDIA's evaluate, EDVR's raw-call
+  passes) is an empty segment, carried into the next pass and listed as the
+  previous pass's `gap_after_ms`. The 7.2-7.6 ms of "gaps" a frame are
+  work: 5.2-5.3 ms is the two DLSS evaluations (the segment before
+  `f0d765e7`, 2.37 ms an eye at its floor), about 0.9 the HDR HUD seeds
+  (before the hud_overlay passes), the rest EDVR's raw passes.
+- **FG off, hull layer on, 63-67 fps (15.0-15.9 ms):** EDVR about 9.5-10 ms,
+  the game about 5.5-6. EDVR by its census (21:19:34, per frame): DLSS M
+  5.1-5.5; UI layer composite with the HUD's SMAA 1.08-1.16; HDR HUD
+  depth-stencil seed 0.73-0.79 (4 a frame, 0.19 each, target 4695x4080
+  D32S8, 153 MB; one of each eye's two is a stale re-seed); UI layer
+  re-issues 0.2-0.4; UI resolve 0.34-0.42; UI depth coverage 0.32-0.38;
+  motion prep 0.26-0.34; engine velocity 0.12-0.14; holograms 0.12; hull
+  layer 0.97-0.98 (its own line). The HUD machinery is 1.1 ms an eye-frame
+  median, 1.8 p95 (`ui quality: layer:` line).
+- **The release build is the same:** v0.22.0, preset M, 68-78 fps, census
+  EDVR 8.5-9.0 ms a frame (upscaler 5.0-5.2, UI composite 1.06-1.11, seed
+  0.70-0.79). The pilot's 12-13 ms there is 13.2 ms (76 fps).
+- **Preset M against K, same session, in a ship (release log):** upscaler
+  3.78-3.86 ms with K (21:11:48-21:13:48, 79-88 fps), 5.0-5.2 with M (from
+  21:14:05, 70-78 fps): M costs 1.25 ms a frame more, about a third, not 5%.
+- **`ui_quality` 125 against 100 (release log, changed at 21:15):** UI
+  composite 0.65-0.70 to 1.08-1.14, seed 0.47-0.65 to 0.70-0.79: about
+  0.7 ms a frame.
+- **Another GPU client takes slices.** The DLSS segment is bimodal in all
+  six captures: 2.34-2.40 ms in 60-70% of 720 samples, 3.0-3.5 in 21%. 21%
+  is the segment's share of an 11.1 ms display period: one slice of
+  0.6-1.1 ms a period (the compositor's, most likely). With FG on the
+  profiler's own delay loop at the frame start runs 1.55x slower (2.6 ns
+  an iteration against 1.6-1.7, three pairs): about 2 ms of other work
+  lands there. So "the game's passes cost more with FG" (entry below) is
+  not established as the game's own work: at least part is this
+  contention, placed at the same point of every locked frame.
+- ruled out: the profile's gaps as GPU idle, because their largest part
+  sits in the fixed place of the DLSS evaluation with its fixed floor.
+- ruled out: the unknown-shader draw at the desktop size after eye 1 as a
+  mirror cost: it carries EDVR's raw passes (0.18 ms median FG off, 1.03
+  with FG on: the synthesis's unseen part).
+
 ### 2026-11-11: FG's cost, same spot (build 9dc9bd31, HMD 0.5, preset M)
 
 Two GPU pass profiles 8 s apart, head still over a planet, hull layer
@@ -1822,8 +1870,9 @@ each frame carries more of it; per second the GPU does less (0.86 against
   same with FG on.
 - The pilot's monitor at the spot: GPU 20 / CPU 10 ms with FG, 15 / 10
   without; hull layer off and FG off 13.5 / 8.5; release 0.22.0 12-13 / ~3.
-  The debug build's CPU cost (+5.5 ms against the release) is its
-  diagnostics; the GPU's is under 1 ms.
+  CORRECTED 2026-11-12: the release's ~3 ms was a menu scene; in a ship its
+  log reads cpu p50 6.5-7.1 ms (`native benchmark`, 2026-11-10 21:11-21:15),
+  ours 7.5-9.0 with the hull layer and FG on. The gap is 1-2.5 ms, not 5.5.
 - An earlier pair (21:09 on, 21:16 off) read +5.2: two different scenes.
 - A second same-spot pair (`-212101` on, `-212107` off): 18.52 against
   16.13 (+2.4); EDVR +0.83; compute +0.71, probe_cube +0.32 (52 calls
