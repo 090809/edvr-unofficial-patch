@@ -14,6 +14,7 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "../common/config.h"
@@ -1534,6 +1535,191 @@ ID3D11View* privateView(ViewKind kind, ID3D11View* gameView, bool make) {
     return out;
 }
 
+// ---- the unmirrored-input census (the blob on the wing, 2026-11-11) -----------------------------------------------------
+// On a separate frame, every input a re-issued pass reads from the game's own resource (no private copy swapped in) is one
+// key {pass, stage, slot, resource, desc}, kept once a session. An eye-sized one (the eye's render size, or half or quarter
+// of it) is watched for a while: the last shader that bound it as a render target, depth target or UAV, or a copy into it,
+// in the frame it was read, names its writer. report() says each new key once, then a count line every window.
+struct UnmirroredKey {
+    uint64_t pass = 0;
+    char stage = 'P';   // 'P' pixel (a draw), 'C' compute (a dispatch)
+    uint32_t slot = 0;
+    const void* res = nullptr;
+    uint32_t dim = 0, w = 0, h = 0, fmt = 0, mips = 0, arr = 0, bind = 0;
+    uint8_t eyeSized = 0;   // 0 no, 1 the eye's size, 2 half, 3 quarter
+    bool mirrored = false;  // a private copy exists but this pass's binding was not swapped (the tonemap's other slots)
+    char writerKind = 0;    // 0 none seen, 'r' a render target, 'd' a depth target, 'u' a compute UAV, 'y' a copy
+    uint64_t writer = 0;
+    uint32_t firstFrame = 0;
+    bool said = false;
+};
+struct WriterWatch {
+    const void* res = nullptr;
+    char kind = 0;
+    uint64_t hash = 0;
+    uint32_t frame = ~0u;    // the layer's frame the writer was seen in
+    uint32_t until = 0;      // the watch ends at this frame (the cost is bounded)
+};
+constexpr size_t kMaxUnmirrored = 256, kMaxWatch = 32;
+constexpr uint32_t kWatchFrames = 600;
+std::vector<UnmirroredKey> g_unm;
+std::vector<WriterWatch> g_watch;
+std::unordered_map<uint64_t, int32_t> g_unmIndex;   // the key's hash -> its index in g_unm, -1 not kept
+uint32_t g_unmChecks = 0, g_unmWinChecks = 0, g_unmCapped = 0;
+
+bool unmirroredWanted() { return detail::g_hullLayerSeparate && g_discard && !g_refFrame; }
+
+WriterWatch* watchOf(const void* res) {
+    for (auto& w : g_watch)
+        if (w.res == res) return &w;
+    return nullptr;
+}
+
+// A pass that read the watched resource this frame takes the frame's writer, if one was seen.
+void takeWriter(UnmirroredKey& k) {
+    const WriterWatch* w = watchOf(k.res);
+    if (w && w->frame == g_frame && w->kind) {
+        k.writerKind = w->kind;
+        k.writer = w->hash;
+    }
+}
+
+void noteUnmirrored(uint64_t pass, char stage, UINT slot, ID3D11ShaderResourceView* srv, int eye, bool sizedOnly = false) {
+    if (!srv || !unmirroredWanted()) return;
+    ++g_unmChecks;
+    ++g_unmWinChecks;
+    ID3D11Resource* res = nullptr;
+    srv->GetResource(&res);
+    if (!res) return;
+    const void* id = res;
+    // One hash lookup a read after the first sighting (-1: a sighting not kept, the cap or a decal's own texture).
+    const uint64_t hk = (pass * 0x9E3779B97F4A7C15ull) ^ (reinterpret_cast<uintptr_t>(id) * 0xC2B2AE3D27D4EB4Full) ^
+                        (static_cast<uint64_t>(slot) << 1) ^ static_cast<uint64_t>(stage == 'C');
+    const auto found = g_unmIndex.find(hk);
+    if (found != g_unmIndex.end()) {
+        if (found->second >= 0 && g_unm[static_cast<size_t>(found->second)].eyeSized) takeWriter(g_unm[static_cast<size_t>(found->second)]);
+        res->Release();
+        return;
+    }
+    UnmirroredKey k;
+    k.pass = pass;
+    k.stage = stage;
+    k.slot = slot;
+    k.res = id;
+    k.firstFrame = g_frame;
+    D3D11_RESOURCE_DIMENSION dim = D3D11_RESOURCE_DIMENSION_UNKNOWN;
+    res->GetType(&dim);
+    k.dim = static_cast<uint32_t>(dim);
+    if (dim == D3D11_RESOURCE_DIMENSION_TEXTURE2D) {
+        D3D11_TEXTURE2D_DESC d{};
+        static_cast<ID3D11Texture2D*>(res)->GetDesc(&d);
+        k.w = d.Width, k.h = d.Height, k.fmt = d.Format, k.mips = d.MipLevels, k.arr = d.ArraySize, k.bind = d.BindFlags;
+    } else if (dim == D3D11_RESOURCE_DIMENSION_TEXTURE3D) {
+        D3D11_TEXTURE3D_DESC d{};
+        static_cast<ID3D11Texture3D*>(res)->GetDesc(&d);
+        k.w = d.Width, k.h = d.Height, k.fmt = d.Format, k.mips = d.MipLevels, k.arr = d.Depth, k.bind = d.BindFlags;
+    } else if (dim == D3D11_RESOURCE_DIMENSION_BUFFER) {
+        D3D11_BUFFER_DESC d{};
+        static_cast<ID3D11Buffer*>(res)->GetDesc(&d);
+        k.w = d.ByteWidth, k.bind = d.BindFlags;
+    }
+    res->Release();
+    for (const auto& m : g_mirrors)
+        if (m.game == id) k.mirrored = true;   // not findMirror: a census must not keep a copy alive
+    if (eye >= 0 && dim == D3D11_RESOURCE_DIMENSION_TEXTURE2D) {
+        const Eye& e = g_eyes[eye];
+        const auto fits = [](uint32_t v, uint32_t full, uint32_t div) { return full && (v == full / div || v == (full + div - 1) / div); };
+        k.eyeSized = fits(k.w, e.w, 1) && fits(k.h, e.h, 1)   ? 1
+                     : fits(k.w, e.w, 2) && fits(k.h, e.h, 2) ? 2
+                     : fits(k.w, e.w, 4) && fits(k.h, e.h, 4) ? 3
+                                                              : 0;
+    }
+    // Past the cap only an eye-sized key is kept (a decal's or a light's own textures must not crowd the suspects out); a
+    // sized-only caller (the decals: their material textures are not the question) keeps eye-sized keys alone.
+    if ((sizedOnly && !k.eyeSized) || (g_unm.size() >= kMaxUnmirrored && (!k.eyeSized || g_unm.size() >= 2 * kMaxUnmirrored))) {
+        if (!sizedOnly) ++g_unmCapped;
+        g_unmIndex.emplace(hk, -1);
+        return;
+    }
+    g_unmIndex.emplace(hk, static_cast<int32_t>(g_unm.size()));
+    if (k.eyeSized && !watchOf(id) && g_watch.size() < kMaxWatch) {
+        WriterWatch w;
+        w.res = id;
+        w.until = g_frame + kWatchFrames;
+        g_watch.push_back(w);
+    }
+    g_unm.push_back(k);
+}
+
+// Every game draw (its targets) and dispatch (its UAVs) while a watch is open: the frame's last writer of a watched resource.
+void noteWriter(const void* res, char kind, uint64_t hash) {
+    if (WriterWatch* w = watchOf(res)) {
+        w->kind = kind;
+        w->hash = hash;
+        w->frame = g_frame;
+    }
+}
+
+void watchDraw(ID3D11DeviceContext* ctx) {
+    if (g_watch.empty()) return;
+    ID3D11RenderTargetView* rtv[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT] = {};
+    ID3D11DepthStencilView* dsv = nullptr;
+    ctx->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, rtv, &dsv);
+    const uint64_t ps = bindingShaderHash(BindSlot::Ps);
+    for (UINT i = 0; i < D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT; ++i)
+        if (rtv[i]) noteWriter(resourceOf(rtv[i]), 'r', ps);
+    if (dsv) noteWriter(resourceOf(dsv), 'd', ps);
+    releaseTargets(rtv, dsv);
+}
+
+void watchDispatch(ID3D11DeviceContext* ctx, uint64_t cs) {
+    if (g_watch.empty()) return;
+    ID3D11UnorderedAccessView* uav[8] = {};
+    ctx->CSGetUnorderedAccessViews(0, 8, uav);   // the game's compute passes bind at most a few
+    for (UINT i = 0; i < 8; ++i)
+        if (uav[i]) {
+            noteWriter(resourceOf(uav[i]), 'u', cs);
+            uav[i]->Release();
+        }
+}
+
+// The frame boundary: a watch past its frames ends (its keys keep the writer they took).
+void unmirroredFrameEnd() {
+    for (size_t i = 0; i < g_watch.size();)
+        if (g_frame >= g_watch[i].until)
+            g_watch.erase(g_watch.begin() + static_cast<std::ptrdiff_t>(i));
+        else
+            ++i;
+}
+
+void reportUnmirrored() {
+    if (!detail::g_hullLayerSeparate) return;
+    static const char* const kSized[4] = {"no", "yes", "half", "quarter"};
+    uint32_t fresh = 0, sized = 0;
+    for (auto& k : g_unm) {
+        if (k.eyeSized) ++sized;
+        if (k.said) continue;
+        // An eye-sized key waits for its writer while its watch is open.
+        if (k.eyeSized && !k.writerKind && watchOf(k.res)) continue;
+        k.said = true;
+        ++fresh;
+        char writer[48] = "-";
+        if (k.writerKind == 'y')
+            std::snprintf(writer, sizeof writer, "copy");
+        else if (k.writerKind)
+            std::snprintf(writer, sizeof writer, "%s:%016llX%s", k.writerKind == 'u' ? "cs" : "ps", static_cast<unsigned long long>(k.writer),
+                          k.writerKind == 'd' ? "(dsv)" : k.writerKind == 'r' ? "(rtv)" : "");
+        Log::get().note("hull layer: unmirrored input: pass=%016llX stage=%s t%u %ux%u %u mips=%u eye_sized=%s written_by=%s dim=%u array=%u "
+                        "bind=0x%X mirrored_unswapped=%s res=%p first_frame=%u",
+                        static_cast<unsigned long long>(k.pass), k.stage == 'C' ? "CS" : "PS", k.slot, k.w, k.h, k.fmt, k.mips,
+                        kSized[k.eyeSized], writer, k.dim, k.arr, k.bind, k.mirrored ? "yes" : "no", k.res, k.firstFrame);
+    }
+    Log::get().note("hull layer: unmirrored inputs: checks=%u (session %u) keys=%u new=%u eye_sized=%u watching=%u capped=%u",
+                    g_unmWinChecks, g_unmChecks, static_cast<unsigned>(g_unm.size()), fresh, sized, static_cast<unsigned>(g_watch.size()),
+                    g_unmCapped);
+    g_unmWinChecks = 0;
+}
+
 // Mirrors whose game texture was not seen for kEvictFrames go (a re-created eye depth leaves its old targets behind).
 void evictStale() {
     for (size_t i = 0; i < g_mirrors.size();) {
@@ -2707,6 +2893,11 @@ bool beginHullDraw(ID3D11DeviceContext* ctx, UINT instances, UINT startInstance,
             vScreenPSSetShaderResourcesRaw(ctx, 0, kSrvSlots, bindSrv);
             ++g_win.decalSrvSwaps;
         }
+        if (unmirroredWanted()) {
+            const uint64_t ps = bindingShaderHash(BindSlot::Ps);
+            for (UINT i = 0; i < kSrvSlots; ++i)
+                if (srv[i] && bindSrv[i] == srv[i]) noteUnmirrored(ps, 'P', i, srv[i], ei, true);
+        }
     }
     vScreenSetRenderTargetsRaw(ctx, n, bind, bindDsv);
     ID3D11ShaderResourceView* gameVsMask = nullptr;
@@ -3044,6 +3235,11 @@ bool beginStage(ID3D11DeviceContext* ctx, Stage stage, uint8_t bit, bool nightVi
         ++swapped;
     }
     if (stage == kAo && !srvSwapped) return decline(true);   // the AO it reads has no private copy: the game's AO is not the hull's
+    if (unmirroredWanted()) {
+        const uint64_t ps = bindingShaderHash(BindSlot::Ps);
+        for (UINT i = 0; i < kSrvSlots; ++i)
+            if (srv[i] && bindSrv[i] == srv[i]) noteUnmirrored(ps, 'P', i, srv[i], ei);
+    }
     if (srvSwapped) vScreenPSSetShaderResourcesRaw(ctx, 0, kSrvSlots, bindSrv);
     vScreenSetRenderTargetsRaw(ctx, boundCount(bindRtv), bindRtv, bindDsv);
     g_win.subst[stage] += swapped;
@@ -3183,6 +3379,8 @@ bool beginAoStep(ID3D11DeviceContext* ctx, int step) {
     }
     // The game's dispatch was hazard-free and the swap is one to one, so no private view is bound twice; the inputs go first
     // (the game's UAVs, still bound, are none of the private copies).
+    for (UINT i = 0; i < kCsSrvSlots; ++i)
+        if (srv[i] && bindSrv[i] == srv[i]) noteUnmirrored(kAoCs[step], 'C', i, srv[i], ei);
     UINT keep[kCsUavSlots];
     for (auto& k : keep) k = ~0u;   // -1: a counter stays as it is
     ctx->CSSetShaderResources(0, kCsSrvSlots, bindSrv);
@@ -3348,6 +3546,8 @@ bool beginReflStep(ID3D11DeviceContext* ctx, int step) {
         }
         ++g_win.reflU1Clears;
     }
+    for (UINT i = 0; i < kCsSrvSlots; ++i)
+        if (srv[i] && bindSrv[i] == srv[i]) noteUnmirrored(kReflCs[step], 'C', i, srv[i], ei);
     UINT keep[kCsUavSlots];
     for (auto& k : keep) k = ~0u;
     ctx->CSSetShaderResources(0, kCsSrvSlots, bindSrv);
@@ -3704,6 +3904,8 @@ bool beginTone(ID3D11DeviceContext* ctx) {
     ID3D11ShaderResourceView* bindSrv[kSrvSlots];
     for (UINT i = 0; i < kSrvSlots; ++i) bindSrv[i] = g_pending.srv[i];
     bindSrv[slot] = privHdr;
+    for (UINT i = 0; i < kSrvSlots; ++i)
+        if (i != slot && bindSrv[i]) noteUnmirrored(ps, 'P', i, bindSrv[i], ei);   // the tonemap swaps the HDR alone
     static const float clear[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     vScreenClearRenderTargetViewRaw(ctx, e.toneRtv, clear);
     vScreenPSSetShaderResourcesRaw(ctx, 0, kSrvSlots, bindSrv);
@@ -6019,6 +6221,7 @@ bool hullLayerBegin(ID3D11DeviceContext* ctx, char kind, UINT count, UINT instan
 }
 
 static bool beginDraw(ID3D11DeviceContext* ctx, char kind, UINT count, UINT instances, UINT startInstance) {
+    watchDraw(ctx);   // the unmirrored-input census: a watched input's writer (nothing while no watch is open)
     // Step 3: the game's tonemap (a 3-vertex, one-instance draw, then admitted by structure and by the HDR it reads).
     if (detail::g_hullLayerSeparate && (kind == 'D' || kind == 'N') && count == 3 && instances == 1 && startInstance == 0 && g_device &&
         (g_eyes[0].gb == Gb::Done || g_eyes[1].gb == Gb::Done) && beginTone(ctx))
@@ -6078,6 +6281,7 @@ void hullLayerNoteNightVisionState() {
 }
 
 bool hullLayerBeginDispatch(ID3D11DeviceContext* ctx, uint64_t cs) {
+    if (detail::g_hullLayerOn && ctx && !g_dispatch.active) watchDispatch(ctx, cs);   // the census's writers, as watchDraw
     if (!detail::g_hullLayerOn || !ctx || !g_device || g_pending.active || g_main.active || g_dispatch.active || g_busy || g_benchSleep) return false;
     for (int s = 0; s < kAoSteps; ++s)
         if (kAoCs[s] == cs) return beginAoStep(ctx, s);
@@ -6110,6 +6314,7 @@ void hullLayerEndDispatch(ID3D11DeviceContext* ctx) {
 }
 
 void hullLayerAfterCopy(ID3D11DeviceContext* ctx, ID3D11Resource* dst, ID3D11Resource* src) {
+    if (detail::g_hullLayerOn && dst && !g_watch.empty()) noteWriter(dst, 'y', 0);   // the census: a copy wrote a watched input
     if (!detail::g_hullLayerOn || !ctx || !dst || !src || !g_device || g_busy || g_benchSleep) return;
     Mirror* ms = findMirror(src);
     if (!ms) return;   // only a copy out of a texture the layer mirrors (the G-buffer, depth, HDR) has a private twin
@@ -6379,6 +6584,7 @@ void hullLayerFrameBoundary(ID3D11DeviceContext* ctx) {
         stageFrameEnd(ctx);   // dump v2: after the last item of the frame (the filter above)
         if (detail::g_hullLayerSeparate) judgeFrame();   // Step 3: before the frame number moves on (the tone and composite marks name it)
         ++g_frame;
+        unmirroredFrameEnd();
         hullRigProbeFrameEnd(ctx, g_frame);   // the rig probe's readbacks and lines (ctx null: no readback this frame)
         if (ctx) {
             readBacks(ctx);
@@ -6473,6 +6679,7 @@ void hullLayerFrameBoundary(ID3D11DeviceContext* ctx) {
     if (!g_win.startMs) g_win.startMs = now;
     if (now - g_win.startMs >= kReportMs) {
         report();
+        reportUnmirrored();
         g_win = Window{};
         g_win.startMs = now;
     }

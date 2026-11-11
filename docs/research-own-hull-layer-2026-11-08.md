@@ -21,6 +21,8 @@ The smear is terrain that is newly uncovered at the hull edge every frame
   wing hazy, "see-through": dluma 1.41-1.44, 0.42 without the reflection
   re-issue. **Built** (section "Reflection dump", not flown): the u1 clear,
   and both sides of the pass dumped. **Next:** that dump, `--refl`; pad.
+* **Wing blob** (section "Unmirrored inputs", not flown): next separate
+  session, grep `unmirrored input`; an eye-sized one a main-pass shader wrote.
 * **Night vision state** (not flown): **next dump** night vision on,
   compare median ~1.0, `night_vision=N/N`. **Station fixes** (not flown):
   a docking dump, `culled_draws` high, `filter_draws` 0, `busy=` 0.
@@ -1771,6 +1773,42 @@ test `(s & cb1[26].y) == cb1[26].y` agrees, true on each side, and the top
 
 Exit: MATCHES 0 (after-pass median 0.9-1.15), DIFFERS 3 (names the
 input), INCONCLUSIVE 1, NOT STAGED or bad input 2.
+
+## Unmirrored inputs (2026-11-11, compile-only, not flown)
+
+The reference-frame dump showed the private HDR after the reflection pass
+equal to the game's (median 1.000), yet on normal separate frames the pilot
+sees a soft bright blob on the wing. **Hypothesis:** a re-issued pass reads
+a game texture the main pass produced (main depth or a pyramid of it, the
+game's AO, fog, SSR, a lit HDR copy) that has no private copy. On a
+reference frame it holds the hull; on a separate frame, the world behind it.
+
+- **Built.** On separate frames only (not the reference frame), at every
+  re-issue (lighting-window draws incl. the depth copy, shadow mask, AO
+  apply and night vision; the AO steps; the reflection CS; the tonemap's
+  slots other than the HDR; the decals, eye-sized inputs only), each bound
+  input left as the game's own is one key {pass hash, stage, slot,
+  resource, desc}, kept once a session (a hash lookup afterwards; 256 keys,
+  eye-sized ones past that up to 512). An eye-sized input (the eye's render
+  size, half or quarter) is watched for 600 frames: the last game draw that
+  bound it as RTV or DSV (its PS), dispatch that bound it as a CS UAV, or
+  full copy into it, in the frame it was read, is its writer. While a watch
+  is open every game draw reads its targets (the only per-draw cost).
+- **Log.** Each new key once, at the 30 s report (an eye-sized one waits for
+  its writer or the watch's end): `hull layer: unmirrored input: pass=<hash>
+  stage=PS|CS t<slot> <w>x<h> <format> mips=N eye_sized=no|yes|half|quarter
+  written_by=ps:<hash>(rtv|dsv)|cs:<hash>|copy|- ... mirrored_unswapped=`.
+  Then always `hull layer: unmirrored inputs: checks=N (session N) keys=N
+  new=N eye_sized=N watching=N capped=N`: `checks=0` means it never ran (no
+  separate frame or no re-issue), `keys=0` with checks above 0 means every
+  input was swapped.
+- **Read next** (separate mode, a few minutes in flight with the wing in
+  view): `python tools\edvr_log.py --target steam --expect-build HEAD`, then
+  the two greps. **Confirms** the hypothesis: an `eye_sized=yes|half|quarter`
+  key on a lighting, AO, reflection or tonemap pass whose `written_by` is a
+  main-pass shader (a draw census names it). `mirrored_unswapped=yes` on a
+  tonemap slot is a second suspect of the same kind. **Refutes** it: no
+  eye-sized key, or only ones whose writer runs before the main pass.
 
 ## Optimisation debt (recorded 2026-11-08 at the pilot's request)
 
