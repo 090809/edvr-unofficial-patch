@@ -58,7 +58,9 @@
 - **Declined in design (re-open on new evidence):** ## Declined, including AFW
   as a replacement and flat-profile frame generation (2026-10-27).
 - **Open:** ## Open questions. The own hull's layer in S (`diag.hull_layer =
-  separate`): built 2026-11-11, not flown (2026-11-11 entry).
+  separate`): FLOWN 2026-11-11 (entry "FG's cost, same spot"): hull in every
+  S; FG adds 1.35 ms of EDVR work a real frame; the game's own +2.3 ms is its
+  time-sliced work (probes, streaming) landing in fewer frames, not FG's.
 
 ## The ask
 
@@ -1802,6 +1804,27 @@ Environment: OpenXR (EDVR's runtime), left eye, render 2817x2448, output
   report says `frames=2/0` a second; `synth_ms` stays a number (not `-`,
   not `no_synth_cost`); the runtime's lock line reads `auto_gate`, not
   `no_s`. EDVR's GPU total drops by about the synthesizer's cost.
+
+### 2026-11-11: FG's cost, same spot (build 9dc9bd31, HMD 0.5, preset M)
+
+Two GPU pass profiles 8 s apart, head still over a planet, hull layer
+separate: `gpu_pass_profile_20261111-211850` (FG on) and `-211858` (FG off).
+A real frame: 19.08 ms against 15.40 (+3.7). EDVR's passes +1.35 (52 calls
+against 38: the synthesis, the world copy, the hull in S). The game's own
+passes +2.3, mostly where its call counts rise: probe_cube 60.7 calls against
+38 (+0.50 ms), other 174 against 134 (+0.41), compute +0.77, post +0.23; the
+G-buffer, shadows and forward passes are flat. Read: the game spreads
+time-sliced work (probe faces, streaming) over its real frames, so at 45 fps
+each frame carries more of it; per second the GPU does less (0.86 against
+1.0 of a second). Not FG's overhead.
+- ruled out: FG slowing the game's own passes, because the passes whose call
+  counts are flat (G-buffer +0.09, shadows +0.03, forward +0.03) cost the
+  same with FG on.
+- The pilot's monitor at the spot: GPU 20 / CPU 10 ms with FG, 15 / 10
+  without; hull layer off and FG off 13.5 / 8.5; release 0.22.0 12-13 / ~3.
+  The debug build's CPU cost (+5.5 ms against the release) is its
+  diagnostics; the GPU's is under 1 ms.
+- An earlier pair (21:09 on, 21:16 off) read +5.2: two different scenes.
 
 ### 2026-11-11: the own hull as its own layer in S (built, not flown)
 
