@@ -61,9 +61,7 @@ The smear is terrain that is newly uncovered at the hull edge every frame
   * ruled out (21:45): the composite's cover, depth test, TAA or blend as the
     cause of the missing hull, because dlOut after it is correct on 16 frames.
   * ruled out (2026-11-10, offline): the seed draw as the own seed (wrong
-    object in 14 of 45 dumps); about the rig set, a fixed 120 m sphere
-    (hangar walls), 20 m linkage (splits the ship) and reach x 1.5 (misses
-    the transport's parts): section "Rig seed".
+    object in 14 of 45 dumps), and three rig-set rules: section "Rig seed".
   * ruled out (2026-11-10, offline): unknown lights as the cause of the
     ~0% compares, because those 15 dumps are exactly the night-vision ones.
   * ruled out (2026-11-10, bench): exposure for the dark pad hull, because the

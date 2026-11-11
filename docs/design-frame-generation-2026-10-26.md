@@ -52,15 +52,13 @@
 - **Next:** fly `auto` in a ship below headset rate and at full rate: the
   `frame generation gate:` line is H1 (budget, margin) and says each
   second why Lock is or is not allowed (2026-11-08 gate and cost entries).
-- **Temporary keys:** `fix.frame_generation_shadow` (off | on, hidden), and
-  `fix.frame_generation`'s `on` (forces Lock, for A/B flights; `auto` is
-  the value meant to stay).
+- **Temporary keys:** `fix.frame_generation_shadow` (off | on, hidden);
+  `fix.frame_generation`'s `on` (forces Lock for A/B; `auto` is to stay).
 - **Declined in design (re-open on new evidence):** ## Declined, including AFW
   as a replacement and flat-profile frame generation (2026-10-27).
-- **Open:** ## Open questions. The own hull's layer in S (`diag.hull_layer =
-  separate`): FLOWN 2026-11-11 (entry "FG's cost, same spot"): hull in every
-  S; FG adds 1.35 ms of EDVR work a real frame; the game's own +2.3 ms is its
-  time-sliced work (probes, streaming) landing in fewer frames, not FG's.
+- **Open:** ## Open questions. The own hull's layer in S: FLOWN 2026-11-11
+  (hull in every S; FG adds 0.8-1.35 ms of EDVR work a real frame). The
+  frame recomputed from the logs: entry 2026-11-12.
 
 ## The ask
 
