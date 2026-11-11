@@ -1825,6 +1825,10 @@ each frame carries more of it; per second the GPU does less (0.86 against
   The debug build's CPU cost (+5.5 ms against the release) is its
   diagnostics; the GPU's is under 1 ms.
 - An earlier pair (21:09 on, 21:16 off) read +5.2: two different scenes.
+- A second same-spot pair (`-212101` on, `-212107` off): 18.52 against
+  16.13 (+2.4); EDVR +0.83; compute +0.71, probe_cube +0.32 (52 calls
+  against 36), post +0.25, other +0.23 (167 against 150); G-buffer +0.03,
+  shadows +0.01, forward +0.02. Same pattern.
 
 ### 2026-11-11: the own hull as its own layer in S (built, not flown)
 
