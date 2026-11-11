@@ -846,7 +846,8 @@ enum Declined : int { kDcStale = 0, kDcSize, kDcGpu, kDeclines };
 enum CompMethod : int { kCmNotApplied = 0, kCmNeedsOut, kCmNoUav, kCmFormat, kCmTypedLoad, kCmView, kCmShader, kCmOff, kCompMethods };
 // TEMPORARY A/B (2026-11-11): the pilot saw the planet through the wing from 5bf8f651 on, the build that added the direct
 // composite, and saw it go away while a dump's frames took the copy path. Off: every applied composite takes the copy path.
-constexpr bool kDirectComposite = false;
+// Ruled out as the cause (223a4cda: copy_why off=3396, the planet still showed); the cause was the tone's bloom. On again.
+constexpr bool kDirectComposite = true;
 
 struct Window {
     ULONGLONG startMs = 0;
