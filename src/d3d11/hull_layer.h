@@ -70,9 +70,11 @@
 //
 // Frame generation (separate; docs "Frame generation integration", 2026-11-11): the mode no longer stands aside. The synthesizer's S
 // of an eye-frame is built right after its composite, in the same treat, from the world-only eye (hullLayerSInput: the upscaler's
-// output when the composite went onto the submitted eye, else a copy of the eye taken before the composite, keepWorld), and the hull
-// layer (the TAA result, sharpened as the composite does) is drawn over S after the resample, moved by the head's step B -> S alone
-// (hullLayerCompositeS). The real frame keeps the composite as before. The 30 s "framegen" line counts it.
+// output when the composite went onto the submitted eye; the submitted eye itself when its hull write waits for S, sFirst and
+// hullLayerCompositeFinish; else a copy of the eye taken before the composite, keepWorld), and the hull layer (the TAA result,
+// sharpened as the composite does) is drawn over S after the resample, moved by the head's step B -> S alone (hullLayerCompositeS,
+// over the S tiles the hull can reach, else the whole eye). The real frame keeps the composite's pixels. The 30 s "framegen" line
+// counts it.
 //
 // Station fixes (both modes unless said; docs "Station fixes"):
 //  15. The re-issue into the private G-buffer (2 and 7) binds the keep-own variant of the draw's vertex shader
@@ -179,15 +181,24 @@ struct HullLayerCompositeInputs {
     // Frame generation: S is built from this eye-frame and reads `output` itself (B's door finishes S, or no UI resolve ran): an applied
     // composite first copies `output` (the world without the own ship) for hullLayerSInput. One whole-eye copy an S build.
     bool keepWorld = false;
+    // Frame generation, the S-first order (2026-11-11): with keepWorld, the caller builds S from `outputSrv` before anything else reads
+    // or writes `output`, and then calls hullLayerCompositeFinish. An applied composite that goes straight onto the eye (direct) then
+    // runs its TAA and tile list now and writes the hull onto the eye in the finish, so S reads the eye world-only and no copy is made.
+    // Where it cannot (not direct: a dump or the TAA sequence, no UAV; the variant bench), it composites whole now with the copy.
+    bool sFirst = false;
 };
 
-// Step 3: right after the upscaler wrote VR eye `eye` (temporal_pass.cpp). A no-op unless diag.hull_layer = separate.
+// Step 3: right after the upscaler wrote VR eye `eye` (temporal_pass.cpp). A no-op unless diag.hull_layer = separate. True: the
+// hull's write onto `output` waits for hullLayerCompositeFinish (in.sFirst; `output` holds the world only until then).
 inline bool hullLayerCompositeWanted() { return detail::g_hullLayerSeparate; }
-void hullLayerCompositeEye(ID3D11DeviceContext* ctx, int eye, const HullLayerCompositeInputs& in);
+bool hullLayerCompositeEye(ID3D11DeviceContext* ctx, int eye, const HullLayerCompositeInputs& in);
+// The S-first order's second half, after S was built from the eye: the hull written onto the eye as the composite would have written
+// it. A no-op (false) when hullLayerCompositeEye returned false for this eye this frame. Always call it when that returned true.
+bool hullLayerCompositeFinish(ID3D11DeviceContext* ctx, int eye);
 
 // Frame generation (separate mode), right before the synthesizer builds S of VR eye `eye` this frame, after hullLayerCompositeEye.
-// `proposed` is the view S would read B through. Returns the view S must read: the world-only copy when `proposed` is the eye the
-// composite wrote, else `proposed`; *overlay true when the hull layer is to be drawn into S (pass hullLayerCompositeS to the
+// `proposed` is the view S would read B through. Returns the view S must read: `proposed` itself when the composite has not yet
+// written the hull onto it (sFirst), the world-only copy when `proposed` is the eye the composite wrote, else `proposed`; *overlay true when the hull layer is to be drawn into S (pass hullLayerCompositeS to the
 // synthesizer). *overlay false (S warps `proposed` as before, the ship in it): separate mode off, no composite this frame, the main
 // pass kept the ship, or no copy. Counted on the 30 s "framegen" line.
 ID3D11ShaderResourceView* hullLayerSInput(int eye, ID3D11ShaderResourceView* proposed, bool* overlay);

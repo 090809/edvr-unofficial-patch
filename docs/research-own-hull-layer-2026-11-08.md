@@ -26,8 +26,8 @@ The smear is terrain that is newly uncovered at the hull edge every frame
 * **Frame generation integrated, FLOWN** (2026-11-11 21:02, 9dc9bd31, HMD
   0.5, FG forced on; section "Frame generation integration"): `hull_in_s`
   = `s_frames` (2676), 0 declines; 45.5 real fps to 90; layer 0.97 ms, synth
-  1.57 ms; real-frame GPU 21.3 ms against an 18.9 ms budget (late 0-4/90).
-  The pilot: only a very slight smear in head motion; "overall OK".
+  1.57 ms; GPU 21.3/18.9 ms (late 0-4/90). Pilot: slight smear, "overall
+  OK". Not flown: S first (no world copy), S overlay over tiles ("S first").
 * **Not flown:** night vision state (dump: median ~1.0,
   `night_vision=N/N`); station fixes (docking dump: `filter_draws` 0).
 * **Temporary keys of this arc:** `diag.hull_layer` (off | dump | separate),
@@ -1932,6 +1932,46 @@ large) S warps the game's ship with the world, as before.
 `fallback=framegen:0` and `composited_eyes` above 0; the FG gate line still
 admits. The pilot: no smear at the hull edge in S in a head turn and a ship
 turn, and the hull not doubled. Then FG off: the bench still runs.
+
+## S first, S tiles (2026-11-11, compile-only, not flown)
+
+Flight of 9dc9bd31 (1878x1632 render, 3756x3264 out, RTX 5080): composite
+`gpu_ms` 0.145-0.163 with FG on against 0.101-0.109 off; the world copy
+(47 MB an eye) about 0.05 ms an eye.
+
+- **S first, no world copy.** `HullLayerCompositeInputs::sFirst`: when the
+  door finishes S from `dlSubmit` and the composite is direct, the
+  composite runs its TAA and tile list, S is built from `dlSubmit` (still
+  world-only), then `hullLayerCompositeFinish` runs the same sharpen onto
+  the eye (`hist[read]` after the flip, the same tile list); the luma
+  probe's stage 1 moves after it. Same pixels in B and S: S reads what the
+  copy held, the sharpen reads the same inputs. Fallback to the copy,
+  counted in `copy_why`: `not_asked` (composite into `dlOut`, the hull
+  bench capture), `not_direct` (dump, TAA sequence, no UAV), `bench`. The
+  composite's `gpu_ms` adds the finish's span to its call.
+- **S overlay over tiles.** Measured offline (scratch bench, this GPU,
+  timestamps, median of 400): the whole-eye `hull_layer_s_cs` costs
+  0.114 ms an eye at 10% hull coverage, 0.134 ms at 25%, so it was built.
+  `hull_layer_s_tile_list_cs`, one thread an S tile, maps the tile's
+  corners back by the step's rotation, grows the box by the translation's
+  reach at the nearest cover depth the tile can read, and lists the tile
+  when a B tile of this frame's TAA (`tileState` bit 0) is in it;
+  `hull_layer_s_tiles_cs` runs the unchanged body by `DispatchIndirect`.
+  Bench: byte for byte equal to the whole-eye pass (old and new shader)
+  on seven steps (still to a 12 deg, 3 cm whip; 7-26% of tiles listed).
+  Cost 0.040 ms an eye at 10% (list 0.012, overlay 0.026), 0.075 at 25%.
+  The whole-eye pass stays the fallback (no tile shaders, no list, tile
+  state not kept).
+
+Log: `hull layer: framegen:` now `world_only_inputs=before_hull:,copy:,
+direct: world_copies= copy_why=not_asked:,not_direct:,bench: hull_after_s=
+lost= overlay=tiles:,whole:`. `lost` > 0: an eye went out without the hull
+(the finish never came).
+
+**Next FG flight** must show: `before_hull` close to `hull_in_s`,
+`world_copies` near 0 (only `copy_why` cases), `hull_after_s` =
+`before_hull`, `lost=0`, `overlay=tiles` = `hull_in_s`, `whole=0`; the
+composite's `gpu_ms` back near 0.10-0.11; the hull in B and S as before.
 
 ## Optimisation debt (recorded 2026-11-08 at the pilot's request)
 

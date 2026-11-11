@@ -5305,6 +5305,7 @@ void* temporalInner(void* srcTex, int eye, const float* bounds,
                     // it, the hull was held to the background -- black over space, specks over lit terrain (the 21:45
                     // flight, docs/research-own-hull-layer-2026-11-08.md). The eye run's P crops and DlssBeforeUi
                     // (dlOut) no longer carry the hull; T, the final eye and HullComposite do.
+                    bool hullFinishAfterS = false;   // the hull composite's write onto dlSubmit waits for S (hullLayerCompositeFinish below)
                     if (usedDlaa && hullLayerCompositeWanted()) {
                         // dlSubmit read through a UNORM view, as frame generation's finish makes it; a game format the
                         // view cannot take (no UAV either, so no resolve ran) composites into dlOut and copies again.
@@ -5345,7 +5346,11 @@ void* temporalInner(void* srcTex, int eye, const float* bounds,
                         const bool fgBuildsNow = (frameGenShadowOn() || frameGenLockSynth()) &&
                                                  (frameGenSynthEveryFrame() || g_eyeRunLeft > 0 || frameGenSynthSampleDue(static_cast<uint32_t>(eye)));
                         hc.keepWorld = fgBuildsNow && (nativeSharpenActive() || !intoSubmit);
-                        hullLayerCompositeEye(ctx, eye, hc);
+                        // The S-first order (2026-11-11): S, built below from dlSubmit through dlSubmitSrv (the door finishes it), reads the eye
+                        // before the hull's write, which hullLayerCompositeFinish makes after the synthesizer -- no whole-eye copy. Not when the
+                        // composite goes into dlOut (copied to dlSubmit right here) or the hull bench captures dlSubmit before S.
+                        hc.sFirst = intoSubmit && nativeSharpenActive() && !hullBenchActive();
+                        hullFinishAfterS = hullLayerCompositeEye(ctx, eye, hc);
                         if (!intoSubmit) ctx->CopyResource(e.dlSubmit, e.dlOut);
                     }
                     // The hull variant bench (hotkey.hull_bench, TEMPORARY): the submitted eye after the composite, outside the
@@ -5354,8 +5359,8 @@ void* temporalInner(void* srcTex, int eye, const float* bounds,
                         hullBenchCaptureEye(ctx, eye, e.dlSubmit, !amdEngine && !intelEngine, w, h, oW, oH, jxNow, jyNow, tanNow, deltaHead);
                     // luma probe stage 1, dlss_out: e.dlSubmit already holds it
                     // here on every usedDlaa path, UI-resolved or copied
-                    // straight from e.dlOut above.
-                    lumaProbeSample(ctx, usedDlaa ? e.dlSubmit : nullptr, eye, 1);
+                    // straight from e.dlOut above (with the hull's write waiting for S, after hullLayerCompositeFinish below).
+                    if (!hullFinishAfterS) lumaProbeSample(ctx, usedDlaa ? e.dlSubmit : nullptr, eye, 1);
                     // I-2, the sky ring (diag.sky_ring, TEMPORARY; docs/sky-flicker-2026-10-13.md): one small dispatch over the eye's far-depth samples,
                     // on the textures this frame's upscaler was handed and what it answered. The key off costs the branch. Timed by the census as
                     // "sky ring" (nested inside the temporal whole, in no total); a window without the key reads "sky ring -".
@@ -5473,6 +5478,11 @@ void* temporalInner(void* srcTex, int eye, const float* bounds,
                             frameGenSynthEyeFrame(dev, ctx, static_cast<uint32_t>(eye), g_rowsFrame, sy);
                             gpuCensusEnd(ctx, GpuCensusSection::DoorFrameGenSynth);
                         }
+                    }
+                    // The S-first order's second half: the hull onto dlSubmit now that S has read it world-only; on every path, built or not.
+                    if (hullFinishAfterS) {
+                        hullLayerCompositeFinish(ctx, eye);
+                        lumaProbeSample(ctx, e.dlSubmit, eye, 1);
                     }
                 }
             }
