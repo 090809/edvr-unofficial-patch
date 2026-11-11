@@ -833,7 +833,10 @@ enum Fallback : int { kFbFrameGen = 0, kFbOutside, kFbMaskPending, kFbMaskLarge,
 enum Declined : int { kDcStale = 0, kDcSize, kDcGpu, kDeclines };
 // Why an eye's composite went through c.out and two whole-eye copies rather than straight onto the eye: not applied this frame (the
 // history kept warm), a dump or the TAA sequence reads c.out, and the reasons the eye's UAV could not be had.
-enum CompMethod : int { kCmNotApplied = 0, kCmNeedsOut, kCmNoUav, kCmFormat, kCmTypedLoad, kCmView, kCmShader, kCompMethods };
+enum CompMethod : int { kCmNotApplied = 0, kCmNeedsOut, kCmNoUav, kCmFormat, kCmTypedLoad, kCmView, kCmShader, kCmOff, kCompMethods };
+// TEMPORARY A/B (2026-11-11): the pilot saw the planet through the wing from 5bf8f651 on, the build that added the direct
+// composite, and saw it go away while a dump's frames took the copy path. Off: every applied composite takes the copy path.
+constexpr bool kDirectComposite = false;
 
 struct Window {
     ULONGLONG startMs = 0;
@@ -4960,14 +4963,15 @@ void report() {
                         g_win.toneDeclined, g_win.historyResets, g_win.byIndex, g_win.ownMax, g_win.siteAfterResolve, g_win.siteUpscalerOut, toneMs,
                         compMs, kHoldFrames);
         Log::get().note("hull layer: composite method: direct=%u copy=%u copy_why=not_applied:%u,dump_or_seq:%u,no_uav:%u,format:%u,typed_load:%u,"
-                        "view:%u,shader:%u bench_dlss=%u (eye-composites: direct = the hull written straight onto the eye's listed tiles "
+                        "view:%u,shader:%u,off:%u bench_dlss=%u (eye-composites: direct = the hull written straight onto the eye's listed tiles "
                         "through its typed UAV, no whole-eye copy; copy = through the composite's own out and two whole-eye copies, by "
                         "reason; bench_dlss = the bench's second DLSS, its own copy path; direct=0 copy=0 means no composite ran)",
                         g_win.compDirect,
                         g_win.compCopy[kCmNotApplied] + g_win.compCopy[kCmNeedsOut] + g_win.compCopy[kCmNoUav] + g_win.compCopy[kCmFormat] +
-                            g_win.compCopy[kCmTypedLoad] + g_win.compCopy[kCmView] + g_win.compCopy[kCmShader],
+                            g_win.compCopy[kCmTypedLoad] + g_win.compCopy[kCmView] + g_win.compCopy[kCmShader] + g_win.compCopy[kCmOff],
                         g_win.compCopy[kCmNotApplied], g_win.compCopy[kCmNeedsOut], g_win.compCopy[kCmNoUav], g_win.compCopy[kCmFormat],
-                        g_win.compCopy[kCmTypedLoad], g_win.compCopy[kCmView], g_win.compCopy[kCmShader], g_win.compBenchDlss);
+                        g_win.compCopy[kCmTypedLoad], g_win.compCopy[kCmView], g_win.compCopy[kCmShader], g_win.compCopy[kCmOff],
+                        g_win.compBenchDlss);
         Log::get().note("hull layer: rect:decided=%u rect=%u share=%.3f whole=no_box:%u,stale:%u,empty:%u,probe:%u boxes=%u empty_boxes=%u "
                         "scissored_draws=%u with_game_scissor=%u no_state=%u (Build A': eye-frames whose re-issues were decided, those scissored "
                         "to the shown hull's box of %u+ frames before grown %u px a frame of its age (at least %u), and their mean share of the "
@@ -6464,7 +6468,7 @@ void hullLayerCompositeEye(ID3D11DeviceContext* ctx, int eye, const HullLayerCom
         ++g_win.compBenchDlss;
     } else {
         const bool needsOut = g_dump == Dump::Capturing || (eye == 0 && g_seq.active && !g_seq.end && g_seq.staged < kSeqFrames);
-        const int why = !apply ? kCmNotApplied : needsOut ? kCmNeedsOut : directUavFor(c, eye, in);
+        const int why = !apply ? kCmNotApplied : needsOut ? kCmNeedsOut : !kDirectComposite ? kCmOff : directUavFor(c, eye, in);
         direct = why == kCompMethods;
         if (direct)
             ++g_win.compDirect;
