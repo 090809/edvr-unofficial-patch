@@ -21,8 +21,9 @@ The smear is terrain that is newly uncovered at the hull edge every frame
   wing hazy, "see-through": dluma 1.41-1.44, 0.42 without the reflection
   re-issue. **Built** (section "Reflection dump", not flown): the u1 clear,
   and both sides of the pass dumped. **Next:** that dump, `--refl`; pad.
-* **Wing blob** (section "Unmirrored inputs", not flown): next separate
-  session, grep `unmirrored input`; an eye-sized one a main-pass shader wrote.
+* **Planet through the wing** (sections "Unmirrored inputs", "Two input
+  leaks", compile-only): the tone's bloom zeroed, the decals' t3 handled.
+  **Next:** `tone bloom:` zeroed > 0; no `D0A16B9E` t2 / `DB3E8D20` t3 key.
 * **Night vision state** (not flown): **next dump** night vision on,
   compare median ~1.0, `night_vision=N/N`. **Station fixes** (not flown):
   a docking dump, `culled_draws` high, `filter_draws` 0, `busy=` 0.
@@ -32,12 +33,12 @@ The smear is terrain that is newly uncovered at the hull edge every frame
   `g_hullFeature` (dlaa.cpp), the bench's `hull_dlss` timer.
 * **Background:** the hole-fill (e) fails ("Result"); neighbours interleave
   with the own hull draws, so ownership is per record ("The binding map").
-* **Rig seed** (section "Rig seed", 2026-11-10, compile-only, not flown):
-  the own mask grows from the rig probe's own slots (radius their reach +
-  30 m, at most 120); the seed draw only as fallback. Offline, 45 dumps:
-  wrong object 14 -> 0. **Next flight:** `hull layer: own seed:` `draw`
-  near 0; hangar, undock, transport with the mothership airborne.
+* **Rig seed** (section "Rig seed", not flown): mask from the rig probe's
+  slots; offline wrong object 14 -> 0. **Next:** `own seed:` `draw` near 0.
 * **Ruled out (this study):**
+  * ruled out (2026-11-11, flight of 223a4cda): the direct composite as the
+    cause of the planet through the wing, because with it off
+    (`copy_why off=3396`) the planet still showed through.
   * ruled out (2026-11-10, offline): the reflection pass's cluster lists as
     the cause of the bright, hazy hull, because its cluster index takes the
     pixel's own depth (t3, the private one) and the list builders
@@ -1809,6 +1810,55 @@ reference frame it holds the hull; on a separate frame, the world behind it.
   main-pass shader (a draw census names it). `mirrored_unswapped=yes` on a
   tonemap slot is a second suspect of the same kind. **Refutes** it: no
   eye-sized key, or only ones whose writer runs before the main pass.
+
+## Two input leaks (2026-11-11, compile-only, not flown)
+
+Flight 2026-11-11 19:40, build 223a4cda (the direct composite off,
+`copy_why off=3396`), HMD 0.5, render 1878x1632: the planet still showed
+through the wing. The unmirrored-input log found exactly two eye-sized
+inputs the re-issues read from the game's world-only frame:
+
+1. `pass=D0A16B9E55BF22CC stage=PS t2 469x408 26 eye_sized=quarter
+   written_by=ps:DED8796049C7BB4A(rtv)`: the tonemap re-issue's bloom
+   (LUT t0, HDR t1, bloom t2), the game's bloom of its own image. In
+   separate mode that is the bloom of the planet behind the hull, which the
+   hull's tone adds onto the hull.
+2. `pass=DB3E8D20CF53FBC0 stage=PS t3 1878x1632 16 eye_sized=yes
+   written_by=copy bind=0x8`, one per eye. Format 16 is R32G32_FLOAT. It is
+   not a game G-buffer copy: it is engine motion's own snapshot of its slot
+   target (`engine_velocity.cpp` `snapshotOverlayBase`, PS t3 =
+   `kEngineVelocityOverlaySnapshotSlot`), taken before the game's decal
+   issue. The guarded decal PS reads it only for MRT6's depth
+   (`dxbc_engine_velocity.h` `guardedTail`), never for colour. It was not
+   mirrored because the copy's source, the slot target, has a private copy
+   only once a re-issue needs the neighbour filter (`filter_draws=0` in that
+   flight: every re-issue was culled).
+
+Fixes (`hull_layer.cpp`):
+
+- The tonemap re-issue binds at t2 a zeroed texture with the game bloom's
+  desc and view (made once per size and format, cleared once), for PS
+  D0A16B9E only. The hull loses the bloom that bright things spill over it,
+  a known, small loss; a reference frame (main pass keeps the hull) now
+  differs from the private tone there by that bloom. Log: `hull layer: tone
+  bloom: zeroed=N declined=N last_declined=<why>` every 30 s; both 0 means
+  no tonemap re-issue ran.
+- The decal t3: `hullLayerAfterCopy` remembers the texture each copy out of
+  an eye's slot target went into. In the decal re-issue, when t3 is that
+  texture: its private copy when one was made at the same copy (MRT6 bound,
+  the filter path), else, with MRT6 not bound, nothing (the PS's only use
+  of it goes to an unbound target). Log: `hull layer: decals: ...
+  overlay_t3=private:N,unbound:N,kept:N`; all 0 with decals re-issued means
+  the snapshot was never seen copied or read. `kept` counts the case still
+  open: MRT6 bound and no private copy (the filter's first eye-frame).
+
+Fix 2 cannot explain a planet on the wing (it touches no colour); fix 1
+can, where the planet's bloom is bright. **Next session** (separate mode,
+the wing over a bright planet): `--expect-build HEAD`; the unmirrored-input
+log lists no `D0A16B9E` t2 and no `DB3E8D20` t3 key; `tone bloom: zeroed`
+above 0 and `declined=0`; `overlay_t3=` `unbound` above 0; and no planet
+visible on the wing. If the planet still shows, the leak is not an input of
+a re-issued pass.
 
 ## Optimisation debt (recorded 2026-11-08 at the pilot's request)
 

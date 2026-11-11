@@ -69,6 +69,13 @@ constexpr uint64_t kLightVs[9] = {0x7E38A6AA1269C901ull, 0x8289669D93A18C1Dull, 
 constexpr uint64_t kNightVisionVs = 0xFCF7BD2896751D96ull;
 constexpr UINT kPoolSlot = 33;            // VS t33: the pool a pool draw reads
 constexpr UINT kSlotTarget = 6;           // engine motion's MRT6 (dxbc_engine_velocity.h kEngineVelocityTarget): float2(2*slot+1, depth)
+// The decal pair's PS t3: engine motion's snapshot of its own slot target (dxbc_engine_velocity.h
+// kEngineVelocityOverlaySnapshotSlot; engine_velocity.cpp snapshotOverlayBase). Its guarded decal PS reads it for MRT6's depth only.
+constexpr UINT kOverlayBaseSlot = 3;
+// The eye's tonemap (2026-11-11 flight, the unmirrored-input log): PS D0A16B9E reads the LUT at t0, the HDR at t1 and, at t2,
+// the game's bloom of its own (world-only, in separate mode) image: a quarter-size R11G11B10 target PS DED87960 wrote.
+constexpr uint64_t kHullTonePs = 0xD0A16B9E55BF22CCull;
+constexpr UINT kToneBloomSlot = 2;
 constexpr uint32_t kRecordBytes = 336;    // a pool record (tools\eye_run_ledger.py REC)
 constexpr uint32_t kMaxSeedInstances = 4096;
 constexpr uint32_t kMaxRecords = 1u << 20;
@@ -774,6 +781,9 @@ struct Eye {
     // This frame: the game's eye depth (a reference from the seed to the frame's end). Across: the layer frame the tonemap
     // re-issue and the composite last ran on, the game's tonemap output then (identity), and whether the composite was applied.
     ID3D11Texture2D* mainDepth = nullptr;
+    // The texture the last copy out of this eye's slot target (slotGame) went into: engine motion's overlay snapshot, the
+    // decals' t3 (an identity only; hullLayerAfterCopy sets it).
+    const void* overlayGame = nullptr;
     uint32_t toneFrame = ~0u, compFrame = ~0u;
     const void* toneOut = nullptr;
     bool compApplied = false;
@@ -856,6 +866,13 @@ struct Window {
     // no slot exported).
     uint32_t ownDraws = 0, ownDecals = 0, noVariant = 0, fallbackFrames = 0, decalsReissued = 0, decalNoSlot = 0;
     uint32_t copiesMirrored = 0, decalSrvSwaps = 0;   // the decals' base: game copies mirrored, decal re-issues with a swapped SRV
+    // The decals' t3 (engine motion's overlay snapshot): re-issues that read its private copy, that read nothing there (MRT6,
+    // its only output, not bound in the re-issue), and that kept the main pass's (MRT6 bound, no private copy made).
+    uint32_t overlaySwapped = 0, overlayUnbound = 0, overlayKept = 0;
+    // The tonemap re-issue's t2 (the game's bloom): re-issues that read the zeroed texture there, and those that kept the game's
+    // with the last reason.
+    uint32_t bloomZeroed = 0, bloomDeclined = 0;
+    const char* bloomWhy = nullptr;
     // Step 3 (the "composite" line): frames decided with the discard on, and kept by reason; eye-frames composited (the
     // discard on) or made ready (a fallback frame); misses by stage (an eye-frame whose seed failed is counted, not held);
     // composites declined; tonemap re-issues made and declined; history restarts; eyes matched by index, not identity;
@@ -1011,6 +1028,15 @@ ULONGLONG g_lastAutoMs = 0;
 bool g_discard = false;
 uint32_t g_hold = 0;
 Comp g_comp[2];
+// The zeroed stand-in for the game's bloom at the tonemap re-issue's t2: the game texture's desc and view, cleared to zero once
+// when made (remade only when the game's bloom changes size or format). Both eyes read it; nothing writes it after the clear.
+struct ZeroBloom {
+    ID3D11Texture2D* tex = nullptr;
+    ID3D11ShaderResourceView* srv = nullptr;
+    D3D11_TEXTURE2D_DESC desc{};
+    D3D11_SHADER_RESOURCE_VIEW_DESC view{};
+};
+ZeroBloom g_zeroBloom;
 CompGpu g_cgpu;
 PrefillGpu g_pgpu;
 std::vector<ScissorState> g_scissorStates;
@@ -1327,6 +1353,8 @@ void resetFrame(Eye& e) {
 }
 
 void releaseGpu() {
+    releaseRef(g_zeroBloom.srv);
+    releaseRef(g_zeroBloom.tex);
     releaseRef(g_gpu.seedCs);
     releaseRef(g_gpu.countCs);
     releaseRef(g_gpu.filterVs);
@@ -2892,10 +2920,25 @@ bool beginHullDraw(ID3D11DeviceContext* ctx, UINT instances, UINT startInstance,
                 srvSwapped = true;
             }
         }
-        if (srvSwapped) {
-            vScreenPSSetShaderResourcesRaw(ctx, 0, kSrvSlots, bindSrv);
-            ++g_win.decalSrvSwaps;
+        // t3 is engine motion's snapshot of its slot target, taken before the game's issue (the 2026-11-11 log: an eye-sized
+        // R32G32_FLOAT a copy wrote): in separate mode the world's slots behind the hull. The guarded decal PS reads it for MRT6's
+        // depth alone, never for colour. With a private slot target bound, hullLayerAfterCopy made the private twin from it at
+        // the same copy and the loop above swapped it in; with MRT6 not bound (no private slot target this eye-frame, as on every
+        // re-issue culled by the keep-own VS) the PS's MRT6 output goes nowhere, so t3 is left empty rather than the world's.
+        const bool mirrorSwap = srvSwapped;
+        if (srv[kOverlayBaseSlot] && e.overlayGame && resourceOf(srv[kOverlayBaseSlot]) == e.overlayGame) {
+            if (bindSrv[kOverlayBaseSlot] != srv[kOverlayBaseSlot]) {
+                ++g_win.overlaySwapped;
+            } else if (n <= kSlotTarget) {
+                bindSrv[kOverlayBaseSlot] = nullptr;
+                srvSwapped = true;
+                ++g_win.overlayUnbound;
+            } else {
+                ++g_win.overlayKept;
+            }
         }
+        if (srvSwapped) vScreenPSSetShaderResourcesRaw(ctx, 0, kSrvSlots, bindSrv);
+        if (mirrorSwap) ++g_win.decalSrvSwaps;
         if (unmirroredWanted()) {
             const uint64_t ps = bindingShaderHash(BindSlot::Ps);
             for (UINT i = 0; i < kSrvSlots; ++i)
@@ -3849,6 +3892,70 @@ bool depthView(ID3D11Resource* res, ID3D11ShaderResourceView*& srv, const void*&
     return true;
 }
 
+// A zeroed texture shaped like the game's view `game` (its texture's desc, the same view), for the tonemap re-issue's bloom.
+// Null with the reason when the view is not a single 2D texture or the copy cannot be made and cleared.
+ID3D11ShaderResourceView* zeroedBloom(ID3D11DeviceContext* ctx, ID3D11ShaderResourceView* game, const char** why) {
+    D3D11_SHADER_RESOURCE_VIEW_DESC vd{};
+    game->GetDesc(&vd);
+    if (vd.ViewDimension != D3D11_SRV_DIMENSION_TEXTURE2D) {
+        *why = "the bloom view is not a 2D texture view";
+        return nullptr;
+    }
+    ID3D11Resource* res = nullptr;
+    game->GetResource(&res);
+    ID3D11Texture2D* tex = nullptr;
+    if (res && FAILED(res->QueryInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&tex)))) tex = nullptr;
+    releaseRef(res);
+    if (!tex) {
+        *why = "the bloom is not a 2D texture";
+        return nullptr;
+    }
+    D3D11_TEXTURE2D_DESC d{};
+    tex->GetDesc(&d);
+    releaseRef(tex);
+    ZeroBloom& z = g_zeroBloom;
+    if (z.srv && std::memcmp(&z.desc, &d, sizeof d) == 0 && std::memcmp(&z.view, &vd, sizeof vd) == 0) return z.srv;
+    releaseRef(z.srv);
+    releaseRef(z.tex);
+    if (d.ArraySize != 1 || d.SampleDesc.Count != 1) {
+        *why = "the bloom is an array or multisampled";
+        return nullptr;
+    }
+    D3D11_TEXTURE2D_DESC pd = d;
+    pd.Usage = D3D11_USAGE_DEFAULT;
+    pd.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;   // render target only for the one clear
+    pd.CPUAccessFlags = 0;
+    pd.MiscFlags = 0;
+    if (FAILED(g_device->CreateTexture2D(&pd, nullptr, &z.tex)) || !z.tex || FAILED(g_device->CreateShaderResourceView(z.tex, &vd, &z.srv)) ||
+        !z.srv) {
+        releaseRef(z.srv);
+        releaseRef(z.tex);
+        *why = "the zeroed texture or its view could not be made";
+        return nullptr;
+    }
+    static const float zero[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    for (UINT m = 0; m < d.MipLevels; ++m) {
+        D3D11_RENDER_TARGET_VIEW_DESC rd{};
+        rd.Format = vd.Format;
+        rd.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+        rd.Texture2D.MipSlice = m;
+        ID3D11RenderTargetView* rtv = nullptr;
+        if (FAILED(g_device->CreateRenderTargetView(z.tex, &rd, &rtv)) || !rtv) {
+            releaseRef(z.srv);
+            releaseRef(z.tex);
+            *why = "the zeroed texture could not be cleared (no render target view)";
+            return nullptr;
+        }
+        vScreenClearRenderTargetViewRaw(ctx, rtv, zero);
+        releaseRef(rtv);
+    }
+    z.desc = d;
+    z.view = vd;
+    Log::get().note("hull layer: the tonemap re-issue's zeroed bloom made: %ux%u format %u mips=%u (view format %u)", d.Width, d.Height,
+                    static_cast<unsigned>(d.Format), d.MipLevels, static_cast<unsigned>(vd.Format));
+    return z.srv;
+}
+
 // Right after the game's own issue of a 3-vertex draw: is it an eye's tonemap (the structure, and a PS slot 0-3 over the
 // HDR an eye's lighting just lit)? True: T is cleared and bound as RT0, the private HDR at that slot; the caller re-issues
 // the draw and hullLayerEnd puts the game's bindings back and runs the cover pass.
@@ -3907,8 +4014,32 @@ bool beginTone(ID3D11DeviceContext* ctx) {
     ID3D11ShaderResourceView* bindSrv[kSrvSlots];
     for (UINT i = 0; i < kSrvSlots; ++i) bindSrv[i] = g_pending.srv[i];
     bindSrv[slot] = privHdr;
-    for (UINT i = 0; i < kSrvSlots; ++i)
-        if (i != slot && bindSrv[i]) noteUnmirrored(ps, 'P', i, bindSrv[i], ei);   // the tonemap swaps the HDR alone
+    // The game's bloom (t2) is the bloom of its own image: in separate mode the world behind the hull, which this tone would add
+    // onto the hull (the 2026-11-11 unmirrored-input log). The re-issue reads zero there instead. The hull loses the bloom that
+    // bright things spill over it (a known, small loss), and a reference frame (main pass keeps the hull) now differs from the
+    // private tone there by that bloom.
+    {
+        const char* why = nullptr;
+        bool zeroed = false;
+        if (ps != kHullTonePs) {
+            why = "the tonemap is not PS D0A16B9E (its bloom slot is not known)";
+        } else if (slot == kToneBloomSlot) {
+            why = "the HDR is at the bloom's slot";
+        } else if (!bindSrv[kToneBloomSlot]) {
+            why = "nothing is bound at the bloom's slot";
+        } else if (ID3D11ShaderResourceView* z = zeroedBloom(ctx, bindSrv[kToneBloomSlot], &why)) {
+            bindSrv[kToneBloomSlot] = z;
+            zeroed = true;
+        }
+        if (zeroed) {
+            ++g_win.bloomZeroed;
+        } else {
+            ++g_win.bloomDeclined;
+            g_win.bloomWhy = why;
+        }
+    }
+    for (UINT i = 0; i < kSrvSlots; ++i)   // the tonemap swaps the HDR and zeroes the bloom; the rest stay the game's
+        if (i != slot && bindSrv[i] && bindSrv[i] == g_pending.srv[i]) noteUnmirrored(ps, 'P', i, bindSrv[i], ei);
     static const float clear[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     vScreenClearRenderTargetViewRaw(ctx, e.toneRtv, clear);
     vScreenPSSetShaderResourcesRaw(ctx, 0, kSrvSlots, bindSrv);
@@ -4945,9 +5076,15 @@ void report() {
                         "(separate mode: draws issued with the own discard; window draws that could not take it; eye-frames whose main pass kept the own "
                         "ship, no mask)",
                         g_win.ownDraws, g_win.ownDecals, g_win.noVariant, g_win.fallbackFrames, g_win.decalsReissued, g_win.decalNoSlot);
-        Log::get().note("hull layer: decals: copies_mirrored=%u srv_swaps=%u (the game's copies out of a mirrored target made between the private "
-                        "copies too; decal re-issues whose base texture was the private copy)",
-                        g_win.copiesMirrored, g_win.decalSrvSwaps);
+        Log::get().note("hull layer: decals: copies_mirrored=%u srv_swaps=%u overlay_t3=private:%u,unbound:%u,kept:%u (the game's copies out of a "
+                        "mirrored target made between the private copies too; decal re-issues whose base texture was the private copy; t3, engine "
+                        "motion's slot snapshot: re-issues that read its private copy, read nothing there with MRT6 unbound, or kept the main "
+                        "pass's with MRT6 bound; all three 0 with decals re-issued: no decal read the snapshot or it was never seen copied)",
+                        g_win.copiesMirrored, g_win.decalSrvSwaps, g_win.overlaySwapped, g_win.overlayUnbound, g_win.overlayKept);
+        Log::get().note("hull layer: tone bloom: zeroed=%u declined=%u last_declined=%s (the tonemap re-issue's t2, the game's bloom of its "
+                        "world-only image: re-issues that read the zeroed texture there, and those that kept the game's; both 0: no tonemap "
+                        "re-issue ran)",
+                        g_win.bloomZeroed, g_win.bloomDeclined, g_win.bloomWhy ? g_win.bloomWhy : "-");
     }
     if (detail::g_hullLayerSeparate) {
         const double toneMs = timerTake(g_toneTimer), compMs = timerTake(g_compTimer);
@@ -6320,6 +6457,8 @@ void hullLayerEndDispatch(ID3D11DeviceContext* ctx) {
 void hullLayerAfterCopy(ID3D11DeviceContext* ctx, ID3D11Resource* dst, ID3D11Resource* src) {
     if (detail::g_hullLayerOn && dst && !g_watch.empty()) noteWriter(dst, 'y', 0);   // the census: a copy wrote a watched input
     if (!detail::g_hullLayerOn || !ctx || !dst || !src || !g_device || g_busy || g_benchSleep) return;
+    for (auto& e : g_eyes)   // a copy out of the eye's slot target: engine motion's overlay snapshot, the decals' t3
+        if (e.slotGame && e.slotGame == static_cast<const void*>(src)) e.overlayGame = dst;
     Mirror* ms = findMirror(src);
     if (!ms) return;   // only a copy out of a texture the layer mirrors (the G-buffer, depth, HDR) has a private twin
     D3D11_RESOURCE_DIMENSION dim = D3D11_RESOURCE_DIMENSION_UNKNOWN;
