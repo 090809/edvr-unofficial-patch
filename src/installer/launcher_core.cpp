@@ -5,33 +5,16 @@
 
 #include <vector>
 
+#include "install_manifest.h"
 #include "mirror.h"
 #include "state.h"
 #include "update_http.h"
+#include "update_json.h"
+#include "update_manifest.h"
 #include "update_util.h"
 
 namespace edvr::installer {
 namespace {
-
-// Item name, then the path inside an unpacked ed-up-<ver>.zip. The same table as ITEM_PATHS in
-// tools\package_native.py, which that tool's self-test compares against this one.
-struct FolderEntry {
-    const char* item;
-    const wchar_t* path;
-};
-const FolderEntry kFolderEntries[] = {
-    {"native_graphics", L"d3d11.dll"},
-    {"native_runtime", L"openvr\\openvr_api.dll"},
-    {"ini", L"edvr.ini"},
-    {"flat_ini", L"edvr-flat.ini"},
-    {"profile", L"edvr_profile.ini"},
-    {"openxr_loader", L"openvr\\openxr_loader.dll"},
-    {"openxr_license", L"openvr\\OPENXR-LOADER-LICENSE.txt"},
-    {"ngx", L"nvngx_dlss.dll"},
-    {"xess", L"libxess.dll"},
-    {"xess_license", L"INTEL-XESS-LICENSE.txt"},
-    {"xess_third_party", L"INTEL-XESS-THIRD-PARTY.txt"},
-};
 
 bool lastWrite(const std::wstring& path, FILETIME* out) {
     WIN32_FILE_ATTRIBUTE_DATA data;
@@ -58,27 +41,45 @@ LauncherRoots launcherRoots(const std::wstring& dataRootArg) {
     return roots;
 }
 
-bool listPayloadFolder(const std::wstring& dir, std::vector<PayloadFile>* files, std::string* version,
-                       std::string* error) {
+bool listPayloadFolder(const std::wstring& dir, Manifest* out, std::vector<PayloadFile>* files, std::string* error) {
     auto fail = [&](const std::string& text) {
         if (error) *error = text;
         return false;
     };
     if (!dirExists(dir)) return fail("the --payload folder does not exist");
+    const std::wstring manifestPath = joinPath(dir, widenUtf8(kManifestAssetName));
+    std::string bytes, readError;
+    if (!readFileBytes(manifestPath, &bytes, kMaxManifestBytes, &readError))
+        return fail(std::string("that folder has no ") + kManifestAssetName + " (" + readError +
+                    "); point --payload at an unpacked ed-up-<version>.zip with its schema-2 manifest beside the files");
+    JsonValue root;
+    std::string parseError;
+    if (!parseJson(bytes, &root, &parseError)) return fail(std::string(kManifestAssetName) + " is not valid JSON: " + parseError);
+    Manifest manifest;
+    long long schemaSeen = 0;
+    const ManifestParse parsed = parseManifest(root, &manifest, &parseError, &schemaSeen);
+    if (parsed == ManifestParse::SchemaTooNew) return fail(kSchemaTooNewMessage);
+    if (parsed != ManifestParse::Ok) return fail(std::string(kManifestAssetName) + " is refused: " + parseError);
+
+    // The manifest is unsigned here: the folder is the user's own, named with --payload. A file the
+    // folder does not hold is skipped, as a folder unpacked from the core zip alone lacks the DLSS and
+    // XeSS ones; usePayloadFiles then simply has no bytes for it.
     std::vector<PayloadFile> found;
-    for (const FolderEntry& entry : kFolderEntries) {
-        const std::wstring path = joinPath(dir, entry.path);
+    for (const ManifestFile& file : manifest.files) {
+        std::wstring relative = widenUtf8(file.path);
+        for (wchar_t& c : relative) {
+            if (c == L'/') c = L'\\';
+        }
+        const std::wstring path = joinPath(dir, relative);
         if (!fileExists(path)) continue;
         PayloadFile f;
-        f.item = entry.item;
+        f.id = file.id;
         f.path = path;
+        f.sha256 = file.sha256;  // usePayloadFiles hashes the file against the manifest's, so a folder that disagrees is refused
         found.push_back(std::move(f));
     }
-    const std::wstring stamp = fileVersionOf(joinPath(dir, L"d3d11.dll"));
-    if (stamp.empty())
-        return fail("that folder has no d3d11.dll with a version; point --payload at an unpacked ed-up-<version>.zip");
     *files = std::move(found);
-    *version = narrowUtf8(stamp);
+    *out = std::move(manifest);
     return true;
 }
 
@@ -87,12 +88,14 @@ PayloadLoad loadLauncherPayload(const LauncherRoots& roots, const std::wstring& 
     std::string error;
     if (!payloadDir.empty()) {
         std::vector<PayloadFile> files;
-        if (!listPayloadFolder(payloadDir, &files, &load.version, &error)) {
+        Manifest folderManifest;
+        if (!listPayloadFolder(payloadDir, &folderManifest, &files, &error)) {
             load.note = error;
             return load;
         }
         load.kind = PayloadKind::Folder;
-        if (!usePayloadFiles(files, load.version, &error)) {
+        load.version = folderManifest.build;
+        if (!usePayloadFiles(folderManifest, files, &error)) {
             load.note = error;
             return load;
         }
@@ -127,7 +130,7 @@ PayloadLoad loadLauncherPayload(const LauncherRoots& roots, const std::wstring& 
     load.kind = PayloadKind::Manifest;
     load.manifestPath = joinPath(joinPath(roots.launcherDir(), L"manifests"), widenUtf8(state.currentManifest())) + L".json";
     load.version = manifest.build;
-    if (!usePayloadFiles(files, manifest.build, &error)) {
+    if (!usePayloadFiles(manifest, files, &error)) {
         load.note = error;
         return load;
     }
@@ -135,7 +138,7 @@ PayloadLoad loadLauncherPayload(const LauncherRoots& roots, const std::wstring& 
     return load;
 }
 
-bool payloadPresent(const PayloadInfo& info) { return info.haveD3d11 || info.haveOpenvr || info.haveIni; }
+bool payloadPresent(const PayloadInfo& info) { return !info.files.empty(); }
 
 bool isDeveloperInstall(const std::wstring& gameDir) {
     FILETIME record{};
