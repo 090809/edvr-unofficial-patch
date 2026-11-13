@@ -54,11 +54,17 @@
 #include <fstream>
 #include <functional>
 #include <iterator>
+#include <atomic>
 #include <limits>
+#include <map>
+#include <mutex>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
+#include <timeapi.h>
+#pragma comment(lib, "winmm.lib")
 #include "../../src/common/log.h"
 #include "../../src/common/system_d3d11.h"
 #include "../../src/d3d11/journal_vehicle_latch.h"
@@ -121,8 +127,67 @@ static ComPtr<ID3D11Device> g_dev;
 static ComPtr<ID3D11DeviceContext> g_ctx;
 static ComPtr<ID3D11InfoQueue> g_messages;
 
+// Where the rig's wall time goes, printed with the verdict: in the build's pool it took 344 s for 79 s of CPU, and which call
+// it waits in decides the fix. Each field is seconds of wall time inside that kind of call, and how many calls.
+struct WaitLedger { double compile = 0, poll = 0, map = 0; unsigned compiles = 0, polls = 0, maps = 0; };
+static WaitLedger g_waits;
+static double nowSeconds() {
+    static const double perSecond = [] { LARGE_INTEGER f; QueryPerformanceFrequency(&f); return double(f.QuadPart); }();
+    LARGE_INTEGER t; QueryPerformanceCounter(&t); return double(t.QuadPart) / perSecond;
+}
+static const double g_started = nowSeconds();
+// A 1 ms timer for the whole run. Each sampled draw waits on a query (awaitQuery: Sleep(1) once its 2 ms of yielding are spent) and Maps its readback, about 18,500
+// and 22,000 times a run, and at the default ~15.6 ms tick both waits round up to a tick: measured 2026-11-13, 183 s in polls and
+// 254 s in Map of a 520 s run, against 15.5 s and 2.3 s of a 55 s run with this. The checks are the same 74,590 either way.
+// Asked for at static initialisation and given back at exit, so the request is paired whichever way main returns.
+static const struct TimerResolution {
+    TimerResolution() { timeBeginPeriod(1); }
+    ~TimerResolution() { timeEndPeriod(1); }
+} g_timerResolution;
+
+// Compiles made ahead of use by precompile(), keyed by profile and source; compileHlsl takes each one out once. A miss (or a source
+// that failed ahead) compiles in place as before, so a failure still reports from the call that needs the shader.
+static std::mutex g_compiledLock;
+static std::map<std::string, ComPtr<ID3DBlob>> g_compiled;
+static std::string compileKey(const std::string& source, const char* profile) { return std::string(profile) + '\n' + source; }
+
+// The mutant loops compile about 400 distinct texts one after another, 25 s of a 46 s run (measured 2026-11-13). Each loop knows
+// all its texts before its first case, and D3DCompile is thread-safe, so the loop compiles them all at once on every core first.
+static void precompile(const std::vector<std::string>& sources, const char* profile) {
+    const double start = nowSeconds();
+    std::atomic<size_t> next{0};
+    auto work = [&] {
+        for (size_t i; (i = next++) < sources.size();) {
+            ComPtr<ID3DBlob> code, error;
+            if (SUCCEEDED(D3DCompile(sources[i].data(), sources[i].size(), "srv turret rig", nullptr, nullptr, "main", profile, 0, 0, &code, &error))) {
+                std::lock_guard<std::mutex> hold(g_compiledLock);
+                g_compiled[compileKey(sources[i], profile)] = code;
+            }
+        }
+    };
+    const unsigned threads = (std::max)(1u, (std::min)(std::thread::hardware_concurrency(), unsigned(sources.size())));
+    std::vector<std::thread> pool;
+    for (unsigned t = 1; t < threads; ++t) pool.emplace_back(work);
+    work();
+    for (auto& t : pool) t.join();
+    g_waits.compile += nowSeconds() - start;
+    g_waits.compiles += unsigned(sources.size());
+}
+
 static ComPtr<ID3DBlob> compileHlsl(const std::string& source, const char* profile, bool* ok = nullptr) {
+    {
+        std::lock_guard<std::mutex> hold(g_compiledLock);
+        const auto found = g_compiled.find(compileKey(source, profile));
+        if (found != g_compiled.end()) {
+            ComPtr<ID3DBlob> code = found->second;
+            g_compiled.erase(found);
+            if (ok) *ok = true;
+            return code;
+        }
+    }
     ComPtr<ID3DBlob> code, error;
+    const double compileStart = nowSeconds();
+    struct CompileTimer { double start; ~CompileTimer() { g_waits.compile += nowSeconds() - start; ++g_waits.compiles; } } compileTimer{compileStart};
     const HRESULT h = D3DCompile(source.data(), source.size(), "srv turret rig", nullptr, nullptr, "main", profile, 0, 0, &code, &error);
     if (ok) *ok = SUCCEEDED(h);
     if (FAILED(h)) {
@@ -131,6 +196,16 @@ static ComPtr<ID3DBlob> compileHlsl(const std::string& source, const char* profi
         return nullptr;
     }
     return code;
+}
+// Waits for a query's data: yields for the first 2 ms (a sampled draw's query is usually ready well inside one 1 ms Sleep), then
+// sleeps 1 ms between polls up to about 2 s. The caller checks the final GetData.
+static void awaitQuery(ID3D11Query* q, void* data, UINT size) {
+    const double spinUntil = nowSeconds() + 0.002;
+    while (g_ctx->GetData(q, data, size, 0) != S_OK) {
+        if (nowSeconds() < spinUntil) { SwitchToThread(); continue; }
+        for (int i = 0; i < 2000 && g_ctx->GetData(q, data, size, 0) != S_OK; ++i) Sleep(1);
+        return;
+    }
 }
 static ComPtr<ID3D11Buffer> makeBuffer(UINT bytes, UINT bind, const void* data) {
     D3D11_BUFFER_DESC bd{};
@@ -258,7 +333,9 @@ struct Target {
     Frame read() {
         g_ctx->CopyResource(stage.Get(), rt.Get());
         D3D11_MAPPED_SUBRESOURCE m{};
+        const double mapStart = nowSeconds();
         ck(g_ctx->Map(stage.Get(), 0, D3D11_MAP_READ, 0, &m), "Map the frame");
+        g_waits.map += nowSeconds() - mapStart; ++g_waits.maps;
         Frame f;
         f.w = w;
         f.h = h;
@@ -429,14 +506,20 @@ static Frame render(const std::vector<Vtx>& verts, const Cam& cam, ID3D11Geometr
     if (scissor.owed()) check(scissor.restore(g_ctx.Get()), "the game's scissor rectangles are put back");
     if (o.sample) {
         g_ctx->Flush();
-        for (int i = 0; i < 2000 && g_ctx->GetData(statsQ.Get(), &o.sample->stats, sizeof(o.sample->stats), 0) != S_OK; ++i) Sleep(1);
+        const double pollStart = nowSeconds();
+        awaitQuery(statsQ.Get(), &o.sample->stats, sizeof(o.sample->stats));
+        g_waits.poll += nowSeconds() - pollStart; ++g_waits.polls;
         check(g_ctx->GetData(statsQ.Get(), &o.sample->stats, sizeof(o.sample->stats), 0) == S_OK, "the pipeline statistics come back");
         if (o.soTarget) {
-            for (int i = 0; i < 2000 && g_ctx->GetData(soQ.Get(), &o.sample->so, sizeof(o.sample->so), 0) != S_OK; ++i) Sleep(1);
+            const double soStart = nowSeconds();
+            awaitQuery(soQ.Get(), &o.sample->so, sizeof(o.sample->so));
+            g_waits.poll += nowSeconds() - soStart; ++g_waits.polls;
             check(g_ctx->GetData(soQ.Get(), &o.sample->so, sizeof(o.sample->so), 0) == S_OK, "the stream-output statistics come back");
             g_ctx->CopyResource(staging.Get(), soBuf.Get());
             D3D11_MAPPED_SUBRESOURCE m{};
+            const double mapStart = nowSeconds();
             ck(g_ctx->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &m), "Map the stream-output copy");
+            g_waits.map += nowSeconds() - mapStart; ++g_waits.maps;
             o.sample->records.resize(kTwinBufferBytes / 4);
             std::memcpy(o.sample->records.data(), m.pData, kTwinBufferBytes);
             g_ctx->Unmap(staging.Get(), 0);
@@ -3091,6 +3174,17 @@ int main(int argc, char** argv) {
             {"the up vector dropped", " + g[278].xyz * d.y", ""},
             {"the lighting position moved by the translation alone", "g[277].xyz * d.x + g[278].xyz * d.y + g[279].xyz * d.z", "g[277].xyz * tr.x + g[278].xyz * tr.y + g[279].xyz * tr.z"},
         };
+        {   // every family's mutants below, compiled ahead on every core (precompile)
+            std::vector<std::string> sources;
+            for (uint32_t fam = 0; fam < st::kSignatureCount; ++fam) {
+                const std::string text = kBytes[fam].text;
+                for (const Mutant& m : mutants) sources.push_back(replaceAll(text, m.from, m.to));
+                if (fam == st::kSceneSignature)
+                    for (const Mutant& m : sceneMutants) sources.push_back(replaceAll(text, m.from, m.to));
+                sources.push_back(replaceAll(text, "o.v = v[i];", "o.v = v[(i == 0) ? 0 : (3 - i)];"));
+            }
+            precompile(sources, "gs_5_0");
+        }
         for (uint32_t fam = 0; fam < st::kSignatureCount; ++fam) {
             g_fam = int(fam);
             const std::string text = kBytes[fam].text;
@@ -3154,16 +3248,6 @@ int main(int argc, char** argv) {
                 {"the edge plane's offset dropped", "dot(kTargetCardNormal, p) + kTargetCardEdgeOffset + kBracketCutM", "dot(kTargetCardNormal, p) + kBracketCutM"},
                 {"the edge taken as vertical (x alone)", "dot(kTargetCardNormal, p) + kTargetCardEdgeOffset + kBracketCutM", "p.x + 0.769"},
             };
-            for (const Mutant& m : clipMutants) {
-                const std::string mutated = replaceAll(text, m.from, m.to);
-                check(mutated != text, "a mutant differs from the production text");
-                const auto mg = twinFromText(sheetSig, mutated);
-                Fails fails;
-                sheetClipCases(mg.Get(), fails);
-                char what[200];
-                std::snprintf(what, sizeof(what), "the mutant \"%s\" of gunner sheet signature %d's shader is caught by the clip cases", m.name, sheetSig);
-                check(fails.n > 0, what);
-            }
             const Mutant shiftMutants[] = {   // the cards' content shifts and region bounds: each edit must fail the shift cases or the clip cases
                 {"the shift dropped", " + shiftClip;", ";"},
                 {"the target shift on the whole sheet", "if (inTarget(p0) && inTarget(p1) && inTarget(p2)) sd", "if (true) sd"},
@@ -3191,6 +3275,22 @@ int main(int argc, char** argv) {
                 {"the target bound too wide (the border back)", "return p.x > -0.835 && p.x < -0.47", "return p.x > -0.90 && p.x < -0.47"},
                 {"the systems bound too wide (the border back)", "p.x < (p.y > -0.33 ? 0.79 : 0.78)", "p.x < 0.84"},
             };
+            {   // this sheet's clip and shift mutants, compiled ahead on every core (precompile)
+                std::vector<std::string> sources;
+                for (const Mutant& m : clipMutants) sources.push_back(replaceAll(text, m.from, m.to));
+                for (const Mutant& m : shiftMutants) sources.push_back(replaceAll(text, m.from, m.to));
+                precompile(sources, "gs_5_0");
+            }
+            for (const Mutant& m : clipMutants) {
+                const std::string mutated = replaceAll(text, m.from, m.to);
+                check(mutated != text, "a mutant differs from the production text");
+                const auto mg = twinFromText(sheetSig, mutated);
+                Fails fails;
+                sheetClipCases(mg.Get(), fails);
+                char what[200];
+                std::snprintf(what, sizeof(what), "the mutant \"%s\" of gunner sheet signature %d's shader is caught by the clip cases", m.name, sheetSig);
+                check(fails.n > 0, what);
+            }
             for (const Mutant& m : shiftMutants) {
                 const std::string mutated = replaceAll(text, m.from, m.to);
                 check(mutated != text, "a mutant differs from the production text");
@@ -3225,6 +3325,8 @@ int main(int argc, char** argv) {
             }
         }
         wiringCases();
+        std::printf("srv_turret_hud_test: waits: %.1f s in %u D3DCompile, %.1f s in %u query polls, %.1f s in %u Map, of %.1f s\n",
+                    g_waits.compile, g_waits.compiles, g_waits.poll, g_waits.polls, g_waits.map, g_waits.maps, nowSeconds() - g_started);
         std::printf("PASS srv_turret_hud_test: %u checks; the turret shaders, binding, constants, maths, anchor and Scorpion latch on WARP, twenty-five shader mutants and the winding mutant in each of eleven signatures, five more in signature H, twelve in each gunner sheet's clip planes and twenty-five in its cards' content shifts and region bounds and one binding mutant caught\n", g_checks);
         return 0;
     } catch (const std::exception& e) {

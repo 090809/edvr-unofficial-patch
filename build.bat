@@ -864,7 +864,12 @@ REM proxy on purpose checks that none came with its exe (reportNoD3D11Mapped).
 REM The --quiet rigs hold wall-clock intervals to tight bounds; they run alone,
 REM after the rest, with the whole machine. Only their test runs need that, so
 REM each is split (see the rig area below): its compiles run in the pool like
-REM any other rig's and only its runs wait their turn.
+REM any other rig's and only its runs wait their turn. srv_turret_hud_test is
+REM quiet for another reason: it waits on WARP after each of about 40,000
+REM sampled draws and readbacks, which took 55 s alone and 341 s in the pool
+REM beside the other WARP rigs (2026-11-13), the pool's longest job. It now
+REM yields between those polls and compiles its mutants on every core, both of
+REM which want the idle machine: 11 s alone.
 REM openxr_module_test loads openxr_export_fixture.dll, which
 REM :rig_openxr_exports_test builds; --after holds the reader back until the
 REM writer has actually finished (see the rig rules below). The same for the five
@@ -881,7 +886,7 @@ REM whose window is a child of a message-only one.
 set "RUN_JOBS_ARGS="
 if defined EDVR_JOBS set "RUN_JOBS_ARGS=--jobs %EDVR_JOBS%"
 python tools\run_jobs.py --script "%ROOT%\build.bat" --times "%BUILD%\rig_times.json" ^
-    --exe-dir "%BUILD%" --quiet native_timing_test,gpu_timing_test,gpu_census_test,gpu_pass_profile_test,vtable_test,stall_sampler_test,config_test ^
+    --exe-dir "%BUILD%" --quiet native_timing_test,gpu_timing_test,gpu_census_test,gpu_pass_profile_test,vtable_test,stall_sampler_test,config_test,srv_turret_hud_test ^
     --after openxr_module_test=openxr_exports_test ^
     --after flat_mono_resolve_shard1=flat_mono_resolve_test ^
     --after flat_mono_resolve_shard2=flat_mono_resolve_test ^
@@ -1093,9 +1098,9 @@ exit /b 0
 :rig_native_frame_test
 echo [edvr] === native_frame_test.exe ===
 if not exist "%OBJ%\native_frame" mkdir "%OBJ%\native_frame"
-ml64.exe /nologo /c /Fo"%OBJ%\native_frame\weapon_ui_getter_probe.obj" "src\d3d11\weapon_ui_getter_probe.asm" >nul
+call :assemble_if_changed "src\d3d11\weapon_ui_getter_probe.asm" "%OBJ%\native_frame\weapon_ui_getter_probe.obj"
 if errorlevel 1 ( echo [edvr] ERROR: weapon UI getter probe assembly build failed & exit /b 1 )
-ml64.exe /nologo /c /Fo"%OBJ%\native_frame\weapon_ui_getter_probe_test.obj" "tools\native_frame_test\weapon_ui_getter_probe_test.asm" >nul
+call :assemble_if_changed "tools\native_frame_test\weapon_ui_getter_probe_test.asm" "%OBJ%\native_frame\weapon_ui_getter_probe_test.obj"
 if errorlevel 1 ( echo [edvr] ERROR: weapon UI getter probe fixture assembly build failed & exit /b 1 )
 %CC% /nologo /O2 /MT /std:c++17 /EHsc /W4 /DWIN32_LEAN_AND_MEAN /DNOMINMAX ^
     /D_CRT_SECURE_NO_WARNINGS /DUNICODE /D_UNICODE ^
@@ -1771,6 +1776,38 @@ if errorlevel 1 ( echo [edvr] ERROR: cannot make %SHARD_DIR% & exit /b 1 )
 copy /y "%BUILD%\flat_mono_resolve_test.exe" "%SHARD_DIR%\flat_mono_resolve_test.exe" >nul
 if errorlevel 1 ( echo [edvr] ERROR: cannot copy flat_mono_resolve_test.exe into %SHARD_DIR% & exit /b 1 )
 "%SHARD_DIR%\flat_mono_resolve_test.exe" --self-test --shard %1/%2 || exit /b 1
+exit /b 0
+
+REM call :assemble_if_changed <source .asm> <.obj>: ml64 writes the time into every .obj (/Brepro does not stop it), so an
+REM .obj reassembled from the same source never matches the compile cache's record of it, and the cached cl.exe link that
+REM takes it compiled the whole rig again on every build (native_frame_test: 51 s, 2026-11-13). The source is assembled only
+REM when the .obj is missing or the source differs from the copy kept beside it (<.obj>.src). The source includes nothing.
+REM As compile_cache.py keys on cl.exe, the assembler is part of the key: ml64's path, size and time go in <.obj>.tool, and
+REM another ml64 reassembles. EDVR_NO_COMPILE_CACHE=1 reassembles always, as it recompiles always. No parenthesised blocks:
+REM the assembler's path can hold "(x86)".
+:assemble_if_changed
+set "ASM_TOOL="
+for %%I in (ml64.exe) do set "ASM_TOOL=%%~$PATH:I"
+if defined ASM_TOOL for %%F in ("%ASM_TOOL%") do set "ASM_TOOL=%%~fF %%~zF %%~tF"
+if "%EDVR_NO_COMPILE_CACHE%"=="1" goto assemble_now
+if not defined ASM_TOOL goto assemble_now
+if not exist "%~2" goto assemble_now
+if not exist "%~2.src" goto assemble_now
+if not exist "%~2.tool" goto assemble_now
+fc /b "%~1" "%~2.src" >nul 2>&1
+if errorlevel 1 goto assemble_now
+set "ASM_TOOL_WAS="
+set /p ASM_TOOL_WAS=<"%~2.tool"
+if not "%ASM_TOOL_WAS%"=="%ASM_TOOL%" goto assemble_now
+exit /b 0
+:assemble_now
+if exist "%~2.src" del "%~2.src"
+if exist "%~2.tool" del "%~2.tool"
+ml64.exe /nologo /c /Fo"%~2" "%~1" >nul
+if errorlevel 1 exit /b 1
+copy /y "%~1" "%~2.src" >nul
+if not defined ASM_TOOL exit /b 0
+>"%~2.tool" echo %ASM_TOOL%
 exit /b 0
 
 :rig_c2_derive_test
@@ -2480,8 +2517,7 @@ exit /b 0
 :rig_object_classification
 echo [edvr] === object classification provenance regression ===
 if not exist "%OBJ%\classification" mkdir "%OBJ%\classification"
-ml64.exe /nologo /c /Fo"%OBJ%\classification\unwind_stubs.obj" ^
-    "tools\object_classification_test\unwind_stubs.asm"
+call :assemble_if_changed "tools\object_classification_test\unwind_stubs.asm" "%OBJ%\classification\unwind_stubs.obj"
 if errorlevel 1 ( echo [edvr] ERROR: unwind fixture build failed & exit /b 1 )
 %CC% /nologo /O2 /MT /std:c++17 /EHsc /W4 ^
     /DWIN32_LEAN_AND_MEAN /DNOMINMAX /D_CRT_SECURE_NO_WARNINGS /DEDVR_RECORD_WRITER_TEST ^

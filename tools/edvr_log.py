@@ -509,9 +509,23 @@ def describe_cmd(ref, root):
     return cmd
 
 
+_EXPECTED_VERSIONS = {}
+
+
 def expected_version(ref, root):
     """A git ref becomes `git describe`; anything else is taken literally,
-    so a version copied out of a release note works too."""
+    so a version copied out of a release note works too. The answer is
+    remembered per (ref, root) for the life of the process: a command line
+    asks once, and the self-test's 1,600 --health runs each asked git again,
+    49 s of a 64 s self-test and most of the build's slowest gate (measured
+    2026-11-13)."""
+    key = (ref, root)
+    if key not in _EXPECTED_VERSIONS:
+        _EXPECTED_VERSIONS[key] = _describe(ref, root)
+    return _EXPECTED_VERSIONS[key]
+
+
+def _describe(ref, root):
     import subprocess
     try:
         out = subprocess.run(describe_cmd(ref, root), capture_output=True,
