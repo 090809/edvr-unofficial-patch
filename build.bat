@@ -1782,15 +1782,32 @@ REM call :assemble_if_changed <source .asm> <.obj>: ml64 writes the time into ev
 REM .obj reassembled from the same source never matches the compile cache's record of it, and the cached cl.exe link that
 REM takes it compiled the whole rig again on every build (native_frame_test: 51 s, 2026-11-13). The source is assembled only
 REM when the .obj is missing or the source differs from the copy kept beside it (<.obj>.src). The source includes nothing.
+REM As compile_cache.py keys on cl.exe, the assembler is part of the key: ml64's path, size and time go in <.obj>.tool, and
+REM another ml64 reassembles. EDVR_NO_COMPILE_CACHE=1 reassembles always, as it recompiles always. No parenthesised blocks:
+REM the assembler's path can hold "(x86)".
 :assemble_if_changed
-if exist "%~2" if exist "%~2.src" (
-    fc /b "%~1" "%~2.src" >nul 2>&1
-    if not errorlevel 1 exit /b 0
-)
+set "ASM_TOOL="
+for %%I in (ml64.exe) do set "ASM_TOOL=%%~$PATH:I"
+if defined ASM_TOOL for %%F in ("%ASM_TOOL%") do set "ASM_TOOL=%%~fF %%~zF %%~tF"
+if "%EDVR_NO_COMPILE_CACHE%"=="1" goto assemble_now
+if not defined ASM_TOOL goto assemble_now
+if not exist "%~2" goto assemble_now
+if not exist "%~2.src" goto assemble_now
+if not exist "%~2.tool" goto assemble_now
+fc /b "%~1" "%~2.src" >nul 2>&1
+if errorlevel 1 goto assemble_now
+set "ASM_TOOL_WAS="
+set /p ASM_TOOL_WAS=<"%~2.tool"
+if not "%ASM_TOOL_WAS%"=="%ASM_TOOL%" goto assemble_now
+exit /b 0
+:assemble_now
 if exist "%~2.src" del "%~2.src"
+if exist "%~2.tool" del "%~2.tool"
 ml64.exe /nologo /c /Fo"%~2" "%~1" >nul
 if errorlevel 1 exit /b 1
 copy /y "%~1" "%~2.src" >nul
+if not defined ASM_TOOL exit /b 0
+>"%~2.tool" echo %ASM_TOOL%
 exit /b 0
 
 :rig_c2_derive_test

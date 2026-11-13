@@ -425,7 +425,9 @@ inline void precompilePreps(const std::vector<std::string>& sources) {
     {
         std::lock_guard<std::mutex> hold(g_prepLock);
         for (const auto& s : sources)
-            if (!g_prepBytes.count(s) && std::find(todo.begin(), todo.end(), &s) == todo.end()) todo.push_back(&s);
+            if (!g_prepBytes.count(s) &&
+                std::none_of(todo.begin(), todo.end(), [&](const std::string* t) { return *t == s; }))
+                todo.push_back(&s);
     }
     if (todo.empty()) return;
     const auto start = std::chrono::steady_clock::now();

@@ -139,7 +139,11 @@ static const double g_started = nowSeconds();
 // A 1 ms timer for the whole run. Each sampled draw waits on a query (awaitQuery: Sleep(1) once its 2 ms of yielding are spent) and Maps its readback, about 18,500
 // and 22,000 times a run, and at the default ~15.6 ms tick both waits round up to a tick: measured 2026-11-13, 183 s in polls and
 // 254 s in Map of a 520 s run, against 15.5 s and 2.3 s of a 55 s run with this. The checks are the same 74,590 either way.
-static const UINT g_timerResolution = (timeBeginPeriod(1), 1u);
+// Asked for at static initialisation and given back at exit, so the request is paired whichever way main returns.
+static const struct TimerResolution {
+    TimerResolution() { timeBeginPeriod(1); }
+    ~TimerResolution() { timeEndPeriod(1); }
+} g_timerResolution;
 
 // Compiles made ahead of use by precompile(), keyed by profile and source; compileHlsl takes each one out once. A miss (or a source
 // that failed ahead) compiles in place as before, so a failure still reports from the call that needs the shader.

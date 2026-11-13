@@ -2258,6 +2258,7 @@ def self_test():
     self_test_timeouts(check)
     self_test_gates(check)
     self_test_cpu(check)
+    self_test_tree_birth(check)
 
     if failures:
         for why in failures:
@@ -2337,17 +2338,29 @@ def self_test_cpu(check):
     check(code == 0 and hit is None, "the CPU toy ran")
     check(len(cpu) == 1 and cpu[0] is not None and cpu[0] >= 0.5,
           "the meter counts a grandchild that has already exited (read %r)" % (cpu,))
-    # A reused pid: this process's own parent, older than it, made to name it
-    # as its parent. The tree walk must refuse it (created before its "parent").
-    real_parents = globals()["process_parents"]
-    me, elder = os.getpid(), os.getppid()
+
+
+def self_test_tree_birth(check):
+    """The stall probe's tree walk against a reused pid, on a faked process
+    table so it needs no live process: 1004 is older than the rig's process
+    1001 yet names it as its parent (Windows reused the pid), and is refused.
+    A child created at the same tick as its parent, and one whose creation
+    time cannot be read, are still children."""
+    created = {1001: 200, 1002: 200, 1003: None, 1004: 100}
+    fakes = {"process_parents": lambda: {1001: 1004, 1002: 1001, 1003: 1001, 1004: 1001},
+             "process_created": lambda pid: created.get(pid),
+             "process_cpu_seconds": lambda pid: 1.0}
+    real = {name: globals()[name] for name in fakes}
     try:
-        globals()["process_parents"] = lambda: {me: elder, elder: me}
-        total, count = tree_cpu_seconds(me, {})
+        globals().update(fakes)
+        seen = {}
+        total, count = tree_cpu_seconds(1001, seen)
     finally:
-        globals()["process_parents"] = real_parents
-    check(process_created(elder) is not None and count == 1,
-          "a process created before the rig's process is not its child, whatever pid it names (counted %d)" % count)
+        globals().update(real)
+    check(1004 not in seen,
+          "a process created before the rig's process is not its child, whatever pid it names (read %r)" % sorted(seen))
+    check(sorted(seen) == [1001, 1002, 1003] and count == 3 and total == 3.0,
+          "a child born at its parent's tick, or with no readable birth, still counts (read %r)" % sorted(seen))
 
 
 def self_test_progress(check):
