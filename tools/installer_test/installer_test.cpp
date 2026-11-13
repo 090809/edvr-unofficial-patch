@@ -7287,6 +7287,173 @@ static void testSchemaReviewFixes(const std::wstring& scratch) {
     }
 }
 
+// Fixes from the second schema-2 review: a path this plan places is never retired, a delete re-checks its hash, a notice goes with its
+// runtime, a refused target keeps its record, and a record is held to the manifest's own target check.
+static void testReviewFollowUps(const std::wstring& scratch) {
+    printf("\nschema 2 review follow-ups\n");
+    const std::wstring dir = L"C:\\Games\\ED\\Products\\elite-dangerous-odyssey-64";
+    const std::wstring base = joinPath(scratch, L"review-followups");
+    auto provide = [](const PayloadInfo& p) {
+        return [&p](const std::string& item, const void** data, size_t* size) {
+            const PayloadFileEntry* e = p.find(item);
+            if (!e) return false;
+            *data = e->data;
+            *size = e->size;
+            return true;
+        };
+    };
+    auto sha = [](const std::string& bytes) { return sha256Bytes(bytes.data(), bytes.size()); };
+    auto deletes = [](const Plan& plan, const std::wstring& path) {
+        for (const Step& st : plan.steps)
+            if (st.action == Action::Delete && _wcsicmp(st.from.c_str(), path.c_str()) == 0) return true;
+        return false;
+    };
+
+    {   // An id renamed at an unchanged target: the record's old id is not placed any more, but its path is, so it is not retired.
+        const std::wstring game = joinPath(base, L"renamed");
+        layOutScratchGame(game);
+        const std::wstring lib = joinPath(game, L"Openvr\\win64\\helper.dll");
+        writeAll(lib, "OLD-HELPER-BYTES");
+        PayloadInfo p = testPayload(kNextIni);
+        taddExtra(p, "helper", TargetRoot::Openvr, "helper.dll", ExistingMode::Replace, kProfileVr, false, sha("bytes of helper"));
+        Survey s = scratchSurvey(game);
+        s.state.present = true; s.state.scope = "both"; s.state.profile = "vr";
+        FileRecord r;
+        r.id = "old_helper"; r.root = "openvr"; r.path = "helper.dll"; r.existing = "replace"; r.sha256 = sha256File(lib);
+        s.state.put(r);
+        const Plan plan = planInstall(s, testOptions(), p);
+        check(!plan.blocked, "a renamed id at the same target plans", unifiedProblems(plan));
+        check(hasStep(plan, Action::WritePayload, nullptr, L"helper.dll") && !deletes(plan, lib),
+              "the new file is written and the old id's copy at that path is not deleted");
+        check(plan.nextState.file("helper") && !plan.nextState.file("old_helper"), "and the record follows the id");
+        const ApplyResult result = applyPlan(plan, provide(p));
+        check(result.ok, "the plan applies", result.error);
+        expectEq(readAll(lib), "bytes of helper", "and the new file is still there afterwards");
+    }
+
+    {   // An id moves while another id takes its old path.
+        const std::wstring game = joinPath(base, L"swapped");
+        layOutScratchGame(game);
+        makeTree(joinPath(game, L"old"));
+        const std::wstring oldPath = joinPath(game, L"old\\x.dll");
+        writeAll(oldPath, "OLD-COPY-OF-MOVER");
+        PayloadInfo p = testPayload(kNextIni);
+        taddExtra(p, "mover", TargetRoot::Game, "new/x.dll", ExistingMode::Replace, 0, false, sha("bytes of mover"));
+        taddExtra(p, "taker", TargetRoot::Game, "old/x.dll", ExistingMode::Replace, 0, false, sha("bytes of taker"));
+        Survey s = scratchSurvey(game);
+        s.state.present = true; s.state.scope = "both"; s.state.profile = "vr";
+        FileRecord r;
+        r.id = "mover"; r.root = "game"; r.path = "old/x.dll"; r.existing = "replace"; r.sha256 = sha256File(oldPath);
+        s.state.put(r);
+        const Plan plan = planInstall(s, testOptions(), p);
+        check(!plan.blocked && !deletes(plan, oldPath), "a path another id takes is not retired with the moved id's old copy", unifiedProblems(plan));
+        const ApplyResult result = applyPlan(plan, provide(p));
+        check(result.ok, "the plan applies", result.error);
+        expectEq(readAll(oldPath), "bytes of taker", "the id that took the old path has its file there");
+        expectEq(readAll(joinPath(game, L"new\\x.dll")), "bytes of mover", "and the moved id has its file at the new one");
+    }
+
+    {   // The delete re-checks its hash: a step that wrote the file earlier in the same plan has changed what the delete was made for.
+        const std::wstring game = joinPath(base, L"delete-recheck");
+        layOutScratchGame(game);
+        const std::wstring path = joinPath(game, L"thing.dll");
+        writeAll(path, "OLD");
+        PayloadInfo p;
+        tfile(p, "settings_vr", "NEW-BYTES");
+        Plan plan;
+        plan.backupDir = joinPath(game, L"edvr_backup\\recheck");
+        Step write;
+        write.action = Action::WritePayload; write.item = "settings_vr"; write.to = path; write.why = "writes";
+        Step del;
+        del.action = Action::Delete; del.from = path; del.expectSha = sha("OLD"); del.why = "deletes the old bytes";
+        plan.steps = {write, del};
+        const ApplyResult result = applyPlan(plan, provide(p));
+        check(!result.ok, "a delete made for other bytes than the file now holds stops the plan");
+        check(!readAll(path).empty(), "and the file is not deleted");
+    }
+
+    {   // The XeSS notices travel with the runtime: neither is placed alone, and an earlier install's records stay.
+        PayloadInfo p = testPayload(kNextIni);
+        tset(p, "xess_license", "xl-new");
+        tset(p, "xess_third_party", "xt-new");
+        Survey s = baseSurvey(dir);
+        s.state.present = true; s.state.scope = "both"; s.state.profile = "vr";
+        trecord(s.state, "xess_license", "xl-old");
+        const Plan plan = planInstall(s, testOptions(), p);
+        check(!plan.blocked, "notices without the runtime plan", unifiedProblems(plan));
+        check(!hasStep(plan, Action::WritePayload, nullptr, L"INTEL-XESS-LICENSE.txt") &&
+              !hasStep(plan, Action::WritePayload, nullptr, L"INTEL-XESS-THIRD-PARTY.txt"),
+              "neither notice is placed when the payload carries no XeSS runtime");
+        check(plan.nextState.file("xess_license"), "and a record an earlier install made for one stays");
+        tset(p, "xess", "xs-new");
+        const Plan with = planInstall(baseSurvey(dir), testOptions(), p);
+        check(hasStep(with, Action::WritePayload, nullptr, L"INTEL-XESS-LICENSE.txt") &&
+              hasStep(with, Action::WritePayload, nullptr, L"INTEL-XESS-THIRD-PARTY.txt") &&
+              hasStep(with, Action::WritePayload, nullptr, L"libxess.dll"),
+              "with the runtime, all three are placed as before");
+    }
+
+    {   // A target the junction check refuses keeps the record of the file that is still on disk.
+        const std::wstring root = joinPath(base, L"refused");
+        removeTree(root);
+        const std::wstring game = joinPath(root, L"game");
+        const std::wstring elsewhere = joinPath(root, L"elsewhere");
+        layOutScratchGame(game);
+        makeTree(elsewhere);
+        writeAll(joinPath(elsewhere, L"x.dll"), "STILL-THERE");
+        const std::wstring link = joinPath(game, L"link");
+        const bool linked = makeJunction(link, elsewhere);
+        check(linked, "the rig made a junction to test with");
+        if (linked) {
+            PayloadInfo p = testPayload(kNextIni);
+            taddExtra(p, "through", TargetRoot::Game, "link/x.dll", ExistingMode::Replace, 0, false, sha("bytes of through"));
+            Survey s = scratchSurvey(game);
+            s.state.present = true; s.state.scope = "both"; s.state.profile = "vr";
+            FileRecord r;
+            r.id = "through"; r.root = "game"; r.path = "link/x.dll"; r.existing = "replace"; r.sha256 = sha("STILL-THERE");
+            s.state.put(r);
+            const Plan plan = planInstall(s, testOptions(), p);
+            check(problemMentions(plan, "leaves its folder") && !hasStep(plan, Action::WritePayload, nullptr, L"x.dll"),
+                  "the target through a junction is refused");
+            check(plan.nextState.file("through") && plan.nextState.file("through")->sha256 == sha("STILL-THERE"),
+                  "and the record of the file that stays on disk is kept");
+            RemoveDirectoryW(link.c_str());
+        }
+    }
+
+    {   // A record is held to the manifest's target check: reserved names and the pins of chain, runtime and settings.
+        InstallState st;
+        st.edvrVersion = "v9"; st.scope = "both";
+        auto record = [&](const char* id, const char* root, const char* path, ExistingMode mode) {
+            FileRecord r;
+            r.id = id; r.root = root; r.path = path; r.existing = existingName(mode); r.sha256 = "ab";
+            st.put(r);
+        };
+        record("graphics", "game", "d3d11.dll", ExistingMode::Chain);                 // legal
+        record("runtime", "openvr", "openvr_api.dll", ExistingMode::Runtime);        // legal
+        record("settings_flat", "game", "edvr-flat.ini", ExistingMode::Settings);    // legal
+        record("plain", "game", "sub/x.dll", ExistingMode::Replace);                  // legal
+        record("badchain", "game", "EliteDangerous64.exe", ExistingMode::Chain);
+        record("badruntime", "game", "openvr_api.dll", ExistingMode::Runtime);
+        record("badsettings", "game", "other.ini", ExistingMode::Settings);
+        record("badsettingsroot", "openvr", "edvr.ini", ExistingMode::Settings);
+        record("reserved", "game", "edvr_profile.ini", ExistingMode::Replace);
+        record("reservedchain", "game", "d3d11_edhm.dll", ExistingMode::Replace);
+        record("backupdir", "game", "edvr_backup/a.dll", ExistingMode::Owned);
+        const InstallState back = parseState(serializeState(st));
+        check(back.file("graphics") && back.file("runtime") && back.file("settings_flat") && back.file("plain"),
+              "records that satisfy the manifest's target check load");
+        check(!back.file("badchain") && !back.file("badruntime") && !back.file("badsettings") && !back.file("badsettingsroot") &&
+              !back.file("reserved") && !back.file("reservedchain") && !back.file("backupdir"),
+              "records that a manifest could not carry are refused on load");
+        check(back.refusedRecords.size() == 7, "and are counted as refused", std::to_string(back.refusedRecords.size()));
+        FileRecord hand;
+        hand.id = "graphics"; hand.root = "game"; hand.path = "EliteDangerous64.exe"; hand.existing = "chain"; hand.sha256 = "ab";
+        std::string why;
+        check(!recordTargetIsSafe(hand, &why) && !why.empty(), "a hand-edited chain record naming the game exe is unsafe", why);
+    }
+}
+
 // The command line's scope and the default one. --scope takes both, vr or flat and refuses anything else; --convert-profile is
 // accepted and changes nothing; with no --scope the run installs the folder's own scope, else both.
 static void testScopeArgs() {
@@ -7559,6 +7726,7 @@ int wmain(int argc, wchar_t** argv) {
     testState();
     testInstallRecords();
     testSchemaReviewFixes(scratch);
+    testReviewFollowUps(scratch);
     testScopeArgs();
 
     printf("\n%s\n", g_fails == 0 ? "installer_test: all good" : "installer_test: FAILURES");

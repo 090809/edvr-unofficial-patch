@@ -392,7 +392,22 @@ bool recordTargetIsSafe(const FileRecord& record, std::string* why) {
         if (why) *why = "unknown root";
         return false;
     }
-    return isTargetPath(record.path, why);
+    // The manifest's own target check, with the behaviour the record says the file was placed under: a hand-edited record is no looser
+    // than a manifest (it may not name a reserved file, nor a chain record anything but d3d11.dll).
+    bool known = false;
+    ExistingMode mode = ExistingMode::Replace;
+    for (const ExistingMode candidate : {ExistingMode::Replace, ExistingMode::Owned, ExistingMode::Chain, ExistingMode::Runtime,
+                                         ExistingMode::Settings}) {
+        if (record.existing == existingName(candidate)) { mode = candidate; known = true; }
+    }
+    if (!known) {
+        if (why) *why = "unknown behaviour";
+        return false;
+    }
+    ManifestTarget target;
+    target.root = record.root == "openvr" ? TargetRoot::Openvr : TargetRoot::Game;
+    target.path = record.path;
+    return targetAllowed(target, mode, why);
 }
 
 namespace {

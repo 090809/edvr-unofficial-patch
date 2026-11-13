@@ -370,6 +370,19 @@ def shape_cases():
         copy.deepcopy(m["files"][2]), id="settings_flat", when={"profile": ["flat"]},
         target={"root": "game", "path": "edvr-flat.ini"})))
 
+    # a settings file is the profile's own ini: [vr] is edvr.ini and [flat] is edvr-flat.ini, in the game root
+    mutate("constraint-settings-vr-other-name", lambda m: m["files"][2]["target"].update(path="other.ini"))
+    mutate("constraint-settings-vr-flat-name", lambda m: m["files"][2]["target"].update(path="edvr-flat.ini"))
+    mutate("constraint-settings-flat-vr-name", lambda m: m["files"][2].update(when={"profile": ["flat"]}))
+    mutate("constraint-settings-in-openvr-root", lambda m: m["files"][2]["target"].update(root="openvr"))
+    mutate("constraint-settings-name-case-ok", lambda m: m["files"][2]["target"].update(path="EDVR.INI"))
+
+    # integers are the launcher's parser's: 2^63-1 is read, 2^63 is "too large" there, so it is refused here too
+    mutate("int-size-int64-max-ok", lambda m: m["files"][0].update(size=(1 << 63) - 1))
+    mutate("int-issued-int64-max-ok", lambda m: m.update(issued=(1 << 63) - 1))
+    mutate("int-size-over-int64", lambda m: m["files"][0].update(size=1 << 63))
+    mutate("int-issued-over-int64", lambda m: m.update(issued=1 << 63))
+
     # chain and runtime work at today's names only
     mutate("constraint-chain-other-name", lambda m: m["files"][0]["target"].update(path="other.dll"))
     mutate("constraint-chain-in-openvr-root", lambda m: m["files"][0]["target"].update(root="openvr"))
@@ -578,7 +591,7 @@ def self_test():
         # Shape cases: both verdicts are present, each file is signed, and the
         # recorded verdict is the Python validator's.
         shapes = [line.split("\t") for line in (out / "shapes.txt").read_text().splitlines()]
-        assert len(shapes) == 271, len(shapes)
+        assert len(shapes) == 280, len(shapes)
         verdicts = {v for _, v in shapes}
         assert verdicts == {"accept", "refuse"}, verdicts
         by_name = dict(shapes)

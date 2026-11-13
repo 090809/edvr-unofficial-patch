@@ -198,29 +198,60 @@ std::string reservedTargetReason(const ManifestTarget& target) {
     return std::string();
 }
 
-// The cross-file rules: behaviour constraints and overlapping targets.
+// Everything a target must satisfy by itself for a file placed under `mode`, or "" when it does: the path rule, the reserved names, and
+// the names the chain, runtime and settings behaviours are pinned to (the planner's rules for them are written for one file each).
+// The sentence continues "file <id> ". The profile a settings file serves is a cross-file rule (checkFiles); here it only has to be a
+// profile's own ini. Shared with the install records (targetAllowed), so a hand-edited state.ini is held to what a manifest is.
+std::string targetProblem(const ManifestTarget& target, ExistingMode mode) {
+    std::string why;
+    if (!isTargetPath(target.path, &why)) return "target.path is refused: " + why;
+    const std::string reason = reservedTargetReason(target);
+    if (!reason.empty()) return "target " + reason;
+    const std::string path = foldAscii(target.path);
+    switch (mode) {
+        case ExistingMode::Chain:
+            if (target.root != TargetRoot::Game || path != "d3d11.dll") return "is a chain file and must target game d3d11.dll";
+            break;
+        case ExistingMode::Runtime:
+            if (target.root != TargetRoot::Openvr || path != "openvr_api.dll")
+                return "is a runtime file and must target openvr openvr_api.dll";
+            break;
+        case ExistingMode::Settings:
+            if (target.root != TargetRoot::Game || (path != "edvr.ini" && path != "edvr-flat.ini"))
+                return "is a settings file and must target game edvr.ini or edvr-flat.ini";
+            break;
+        default:
+            break;
+    }
+    return std::string();
+}
+
+// The cross-file rules: how many files a behaviour may have, the profile a settings file serves, and overlapping targets. The rules
+// about one file's own target are targetProblem's.
 bool checkFiles(const std::vector<ManifestFile>& files, std::string* error) {
     const ManifestFile* chain = nullptr;
     const ManifestFile* runtime = nullptr;
     const ManifestFile* settings[2] = {nullptr, nullptr};  // vr, flat
     for (const ManifestFile& f : files) {
+        const std::string problem = targetProblem(f.target, f.existing);
+        if (!problem.empty()) return failWith(error, "file " + f.id + " " + problem);
         switch (f.existing) {
             case ExistingMode::Chain:
                 if (chain) return failWith(error, "file " + f.id + " is a second chain file (after " + chain->id + ")");
-                if (f.target.root != TargetRoot::Game || foldAscii(f.target.path) != "d3d11.dll")
-                    return failWith(error, "file " + f.id + " is a chain file and must target game d3d11.dll");
                 chain = &f;
                 break;
             case ExistingMode::Runtime:
                 if (runtime) return failWith(error, "file " + f.id + " is a second runtime file (after " + runtime->id + ")");
-                if (f.target.root != TargetRoot::Openvr || foldAscii(f.target.path) != "openvr_api.dll")
-                    return failWith(error, "file " + f.id + " is a runtime file and must target openvr openvr_api.dll");
                 runtime = &f;
                 break;
             case ExistingMode::Settings: {
                 if (f.when.profiles != kProfileVr && f.when.profiles != kProfileFlat)
                     return failWith(error, "file " + f.id + " is a settings file and needs when.profile exactly [vr] or [flat]");
-                const ManifestFile*& slot = settings[f.when.profiles == kProfileVr ? 0 : 1];
+                const bool vr = f.when.profiles == kProfileVr;
+                if (foldAscii(f.target.path) != (vr ? "edvr.ini" : "edvr-flat.ini"))
+                    return failWith(error, "file " + f.id + " is a settings file and must target game " +
+                                           (vr ? "edvr.ini" : "edvr-flat.ini") + " for its profile");
+                const ManifestFile*& slot = settings[vr ? 0 : 1];
                 if (slot) return failWith(error, "file " + f.id + " is a second settings file for its profile (after " + slot->id + ")");
                 slot = &f;
                 break;
@@ -228,10 +259,6 @@ bool checkFiles(const std::vector<ManifestFile>& files, std::string* error) {
             default:
                 break;
         }
-    }
-    for (const ManifestFile& f : files) {
-        const std::string reason = reservedTargetReason(f.target);
-        if (!reason.empty()) return failWith(error, "file " + f.id + " target " + reason);
     }
     for (size_t i = 0; i < files.size(); ++i) {
         for (size_t j = i + 1; j < files.size(); ++j) {
@@ -271,6 +298,13 @@ bool isTargetPath(const std::string& path, std::string* why) {
         start = slash + 1;
     }
     return true;
+}
+
+bool targetAllowed(const ManifestTarget& target, ExistingMode mode, std::string* why) {
+    const std::string problem = targetProblem(target, mode);
+    if (problem.empty()) return true;
+    if (why) *why = problem;
+    return false;
 }
 
 bool whenHolds(const ManifestWhen& when, unsigned installedProfiles, bool nvidiaAdapter) {

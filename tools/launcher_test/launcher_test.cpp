@@ -375,7 +375,7 @@ void testSigning() {
 void testShapes() {
     section("shapes");
     const auto rows = lines(readAll(P(g_fixtures, L"shapes.txt")));
-    check(rows.size() == 271, "the shape fixture lists its cases");
+    check(rows.size() == 280, "the shape fixture lists its cases");
     std::map<std::string, std::string> verdictByName;
     int accepted = 0, refused = 0, mismatched = 0, tooNew = 0;
     for (const std::string& row : rows) {
@@ -404,7 +404,7 @@ void testShapes() {
         }
     }
     check(mismatched == 0, "the C++ and Python validators agree on every shape");
-    check(accepted == 49 && refused == 222, "the shapes include both accepted and refused manifests");
+    check(accepted == 52 && refused == 228, "the shapes include both accepted and refused manifests");
     check(tooNew == 4, "four shapes are of a newer schema");
     for (const char* name : {"schema-1", "schema-0", "schema-missing", "schema-true", "schema-float", "schema-text", "schema-null",
                              "min-launcher-present", "id-missing", "id-old-item-key", "id-upper", "id-too-long", "id-duplicate",
@@ -2193,20 +2193,24 @@ void testCore() {
                    " \"assets\": [{\"name\": \"core.zip\", \"sha256\": \"" + zeros + "\", \"size\": 1}],\n \"files\": [" + files + "]}\n";
         };
         auto fileEntry = [&](const std::string& id, const std::string& path, const std::string& rootName, const std::string& targetPath,
-                             const std::string& when, const std::string& existing) {
-            return "{\"id\": \"" + id + "\", \"asset\": \"core.zip\", \"path\": \"" + path + "\", \"sha256\": \"" + zeros +
+                             const std::string& when, const std::string& existing, const std::string& sha = std::string()) {
+            return "{\"id\": \"" + id + "\", \"asset\": \"core.zip\", \"path\": \"" + path + "\", \"sha256\": \"" + (sha.empty() ? zeros : sha) +
                    "\", \"size\": 1, \"target\": {\"root\": \"" + rootName + "\", \"path\": \"" + targetPath + "\"}" +
                    (when.empty() ? std::string() : ", \"when\": " + when) + ", \"existing\": \"" + existing + "\"}";
         };
-        const std::string table = fileEntry("graphics", "d3d11.dll", "game", "d3d11.dll", "{\"profile\": [\"vr\", \"flat\"]}", "chain") + "," +
-                                  fileEntry("settings_vr", "edvr.ini", "game", "edvr.ini", "{\"profile\": [\"vr\"]}", "settings") + "," +
-                                  fileEntry("runtime", "Openvr/openvr_api.dll", "openvr", "openvr_api.dll", "{\"profile\": [\"vr\"]}", "runtime") + "," +
-                                  fileEntry("dlss", "nvngx_dlss.dll", "game", "nvngx_dlss.dll", "{\"adapter\": \"nvidia\"}", "owned");
         const std::wstring dir = fresh("core-folder");
         copyOfSystemDll(P(dir, L"d3d11.dll"));
         writeAll(P(dir, L"edvr.ini"), "[fix]\nx=1\n");
         writeAll(P(dir, L"Openvr\\openvr_api.dll"), "runtime");
         writeAll(P(dir, L"unrelated.txt"), "ignored");
+        // The manifest carries each present file's real hash: listPayloadFolder hands it on and usePayloadFiles checks the folder against it.
+        const std::string graphicsSha = sha256File(P(dir, L"d3d11.dll"));
+        const std::string iniSha = sha("[fix]\nx=1\n");
+        const std::string runtimeSha = sha("runtime");
+        const std::string table = fileEntry("graphics", "d3d11.dll", "game", "d3d11.dll", "{\"profile\": [\"vr\", \"flat\"]}", "chain", graphicsSha) + "," +
+                                  fileEntry("settings_vr", "edvr.ini", "game", "edvr.ini", "{\"profile\": [\"vr\"]}", "settings", iniSha) + "," +
+                                  fileEntry("runtime", "Openvr/openvr_api.dll", "openvr", "openvr_api.dll", "{\"profile\": [\"vr\"]}", "runtime", runtimeSha) + "," +
+                                  fileEntry("dlss", "nvngx_dlss.dll", "game", "nvngx_dlss.dll", "{\"adapter\": \"nvidia\"}", "owned");
         writeAll(P(dir, L"ed-up-manifest.json"), manifestText("2", table));
         std::vector<PayloadFile> files;
         Manifest folder;
@@ -2217,11 +2221,11 @@ void testCore() {
         check(version == "v9.9.9", "the version is the manifest's build: " + version);
         bool graphics = false, ini = false, runtime = false;
         for (const PayloadFile& f : files) {
-            graphics |= f.id == "graphics" && f.sha256.empty();
-            ini |= f.id == "settings_vr";
-            runtime |= f.id == "runtime" && _wcsicmp(f.path.c_str(), P(dir, L"Openvr\\openvr_api.dll").c_str()) == 0;
+            graphics |= f.id == "graphics" && f.sha256 == graphicsSha;
+            ini |= f.id == "settings_vr" && f.sha256 == iniSha;
+            runtime |= f.id == "runtime" && f.sha256 == runtimeSha && _wcsicmp(f.path.c_str(), P(dir, L"Openvr\\openvr_api.dll").c_str()) == 0;
         }
-        check(graphics && ini && runtime, "the files are taken by their path, and no hash is claimed for the user's folder");
+        check(graphics && ini && runtime, "the files are taken by their path, each with the hash the manifest gives it");
 
         const LauncherRoots roots = launcherRoots(L"");
         const PayloadLoad load = loadLauncherPayload(roots, dir, g_testKeys);
@@ -2238,6 +2242,17 @@ void testCore() {
         const PayloadLoad none = loadLauncherPayload(roots, empty, g_testKeys);
         check(!none.ok && contains(none.note, "ed-up-manifest.json"), "a folder with no manifest is refused, and says what to point at: " + none.note);
         check(!payloadPresent(payloadInfo()), "and a refused load leaves the process with no payload");
+        // A folder whose file is not the one the manifest hashes is refused, and nothing is switched.
+        // (A fresh folder: the files of the first one stay mapped for the pointers payloadItem handed out.)
+        const std::wstring tamperedDir = fresh("core-folder-tampered");
+        copyOfSystemDll(P(tamperedDir, L"d3d11.dll"));
+        writeAll(P(tamperedDir, L"edvr.ini"), "[fix]\nx=2\n");
+        writeAll(P(tamperedDir, L"Openvr\\openvr_api.dll"), "runtime");
+        writeAll(P(tamperedDir, L"ed-up-manifest.json"), manifestText("2", table));
+        const PayloadLoad tampered = loadLauncherPayload(roots, tamperedDir, g_testKeys);
+        check(!tampered.ok && contains(tampered.note, "settings_vr") && contains(tampered.note, "does not match its hash"),
+              "a --payload folder whose file differs from the manifest's hash is refused: " + tampered.note);
+        check(!payloadPresent(payloadInfo()), "and a refused folder leaves the process with no payload");
         // A folder's manifest is held to the same schema: a newer one and a bad target are refused.
         const std::wstring newer = fresh("core-folder-newer");
         writeAll(P(newer, L"ed-up-manifest.json"), manifestText("3", table));

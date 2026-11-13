@@ -75,6 +75,7 @@ bool listPayloadFolder(const std::wstring& dir, Manifest* out, std::vector<Paylo
         PayloadFile f;
         f.id = file.id;
         f.path = path;
+        f.sha256 = file.sha256;  // usePayloadFiles hashes the file against the manifest's, so a folder that disagrees is refused
         found.push_back(std::move(f));
     }
     *files = std::move(found);

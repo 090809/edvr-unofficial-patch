@@ -181,7 +181,9 @@ def header_keys(header=None):
 # ---- the manifest ------------------------------------------------------------
 
 def _is_int(value):
-    return isinstance(value, int) and not isinstance(value, bool)
+    # The launcher's JSON parser (update_json.cpp) holds an integer in a signed 64-bit value and
+    # refuses one outside it, so a manifest carrying one cannot be read there: not signed here.
+    return isinstance(value, int) and not isinstance(value, bool) and -(1 << 63) <= value < (1 << 63)
 
 
 def _is_text(value):
@@ -354,6 +356,10 @@ def _cross_file_problems(files):
             if profile not in (["vr"], ["flat"]):
                 problems.append("file %s is a settings file and needs when.profile exactly [vr] or [flat]"
                                 % entry["id"])
+            elif (entry["target"]["root"] != "game" or entry["target"]["path"].lower() !=
+                  ("edvr.ini" if profile == ["vr"] else "edvr-flat.ini")):
+                problems.append("file %s is a settings file and must target game %s"
+                                % (entry["id"], "edvr.ini" if profile == ["vr"] else "edvr-flat.ini"))
             elif profile[0] in settings:
                 problems.append("file %s is a second settings file for its profile (after %s)"
                                 % (entry["id"], settings[profile[0]]))
@@ -863,6 +869,18 @@ def self_test():
     rejects("settings without when", lambda m: m["files"][2].pop("when"))
     rejects("settings both profiles", lambda m: m["files"][2].update(when={"profile": ["vr", "flat"]}))
     rejects("settings adapter only", lambda m: m["files"][2].update(when={"adapter": "nvidia"}))
+    rejects("vr settings file at another name", lambda m: m["files"][2]["target"].update(path="other.ini"))
+    rejects("vr settings file at the flat name", lambda m: m["files"][2]["target"].update(path="edvr-flat.ini"))
+    rejects("flat settings file at the vr name", lambda m: m["files"][2].update(when={"profile": ["flat"]}))
+    rejects("settings file in the openvr root", lambda m: m["files"][2]["target"].update(root="openvr"))
+    assert not mutated(lambda m: m["files"][2]["target"].update(path="EDVR.INI"))
+    # The integer range is the launcher's parser's: 2^63-1 passes, 2^63 does not.
+    for field in ("size", "issued"):
+        top = (1 << 63) - 1
+        target = (lambda m, f=field, v=top: m["files"][0].update(size=v) if f == "size" else m.update(issued=v))
+        assert not mutated(target), field
+        over = (lambda m, f=field, v=top + 1: m["files"][0].update(size=v) if f == "size" else m.update(issued=v))
+        rejects(field + " above 2^63-1", over)
     rejects("second settings file for a profile", lambda m: m["files"].append(dict(
         m["files"][2], id="other", target={"root": "game", "path": "other.ini"})))
     assert not mutated(lambda m: m["files"].append(dict(

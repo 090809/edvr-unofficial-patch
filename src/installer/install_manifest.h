@@ -98,6 +98,13 @@ ManifestParse parseManifest(const JsonValue& root, Manifest* out, std::string* e
 // On false `why` (may be null) says which.
 bool isTargetPath(const std::string& path, std::string* why);
 
+// Whether `target` may hold a file placed under `mode`, by itself: isTargetPath, the reserved names (the installer's own files and
+// folders, and the openvr folder under the game root), and the names `chain` (game d3d11.dll), `runtime` (openvr openvr_api.dll) and
+// `settings` (game edvr.ini or edvr-flat.ini) are pinned to. The manifest parser applies it to every file and the install records are
+// held to the same check on load and in the planner, so a hand-edited state.ini is no looser than a manifest. On false `why` (may be
+// null) is a sentence; mind that it starts at the verb ("is a chain file and ...") or "target ...", for the caller to name the file.
+bool targetAllowed(const ManifestTarget& target, ExistingMode mode, std::string* why);
+
 // Whether a `when` holds for an install covering `installedProfiles` (kProfile*
 // bits) on a machine where `nvidiaAdapter` says whether the survey found one.
 bool whenHolds(const ManifestWhen& when, unsigned installedProfiles, bool nvidiaAdapter);

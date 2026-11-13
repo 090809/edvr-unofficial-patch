@@ -354,6 +354,16 @@ bool targetStaysInside(const std::wstring& root, const std::wstring& path) {
     return true;
 }
 
+// Whether two paths are one file: the same normalised full path, compared the way Windows compares names.
+bool sameFullPath(const std::wstring& a, const std::wstring& b) {
+    auto full = [](const std::wstring& in) {
+        wchar_t buffer[32768];
+        const DWORD n = GetFullPathNameW(in.c_str(), static_cast<DWORD>(sizeof(buffer) / sizeof(buffer[0])), buffer, nullptr);
+        return (n == 0 || n >= sizeof(buffer) / sizeof(buffer[0])) ? in : std::wstring(buffer, n);
+    };
+    return _wcsicmp(full(a).c_str(), full(b).c_str()) == 0;
+}
+
 // targetPathOf, refused (false) when the result would leave its root.
 bool containedTargetPath(const Survey& s, const ManifestTarget& target, std::wstring* path) {
     *path = targetPathOf(s, target);
@@ -429,15 +439,24 @@ ExistingMode modeOfRecord(const FileRecord& r) {
 // How the report names the files it says most about: what it is, and what turns it on. The words only; a file with none is
 // placed and reported by its file name. `label` is the family a kept file is named by ("Keeping a changed OpenXR file").
 // This table and the startup config's loader name are the id-specific words that remain in the planner.
-struct FileBlurb { const char* id; const char* label; const char* what; const char* purpose; };
+// `needs` names the id of a file this one travels with: it is placed only when the payload carries that one (the XeSS notices go with
+// the runtime, never alone). This table is where id knowledge of that rule remains; the planner reads it, it does not name the ids.
+struct FileBlurb { const char* id; const char* label; const char* what; const char* purpose; const char* needs; };
 const FileBlurb kBlurbs[] = {
-    {"dlss", "DLSS", "NVIDIA's DLSS runtime", "for temporal_aa = dlaa"},
-    {"xess", "XeSS", "Intel's XeSS-SR runtime", "for temporal_aa = xess"},
-    {"xess_license", "XeSS", nullptr, nullptr},
-    {"xess_third_party", "XeSS", nullptr, nullptr},
-    {"openxr_loader", "OpenXR", nullptr, nullptr},
-    {"openxr_license", "OpenXR", nullptr, nullptr},
+    {"dlss", "DLSS", "NVIDIA's DLSS runtime", "for temporal_aa = dlaa", nullptr},
+    {"xess", "XeSS", "Intel's XeSS-SR runtime", "for temporal_aa = xess", nullptr},
+    {"xess_license", "XeSS", nullptr, nullptr, "xess"},
+    {"xess_third_party", "XeSS", nullptr, nullptr, "xess"},
+    {"openxr_loader", "OpenXR", nullptr, nullptr, nullptr},
+    {"openxr_license", "OpenXR", nullptr, nullptr, nullptr},
 };
+// The id a file travels with, or null.
+const char* travelsWith(const std::string& id) {
+    for (const FileBlurb& b : kBlurbs) {
+        if (id == b.id) return b.needs;
+    }
+    return nullptr;
+}
 const FileBlurb* blurbFor(const std::string& id) {
     for (const FileBlurb& b : kBlurbs) {
         if (id == b.id && b.what) return &b;
@@ -508,6 +527,23 @@ std::vector<Candidate> removalCandidates(const Survey& s, const PayloadInfo& p, 
                                          std::vector<std::string>* notes) {
     std::vector<Candidate> out;
     std::vector<DllInfo> probed;
+    // Where this install places files. A file that is one of those is never a removal candidate, whichever id the record names: an
+    // id renamed at an unchanged target, or an id that moves while another takes its old path, would otherwise be retired right after
+    // the new file was written. The placement's own backup keeps the old bytes. (Every file whose `when` holds counts, whether or not
+    // the adapter lets it be placed: leaving a copy where it is costs nothing.)
+    std::vector<std::wstring> placedPaths;
+    if (!uninstall) {
+        for (const PayloadFileEntry& e : p.files) {
+            std::wstring path;
+            if (whenHolds(e.file.when, profiles, true) && containedTargetPath(s, e.file.target, &path)) placedPaths.push_back(path);
+        }
+    }
+    auto placedHere = [&](const std::wstring& path) {
+        for (const std::wstring& placedPath : placedPaths) {
+            if (sameFullPath(placedPath, path)) return true;
+        }
+        return false;
+    };
     for (const FileRecord& r : s.state.files) {
         const ExistingMode mode = modeOfRecord(r);
         if (mode == ExistingMode::Chain || mode == ExistingMode::Runtime || mode == ExistingMode::Settings) continue;
@@ -537,6 +573,7 @@ std::vector<Candidate> removalCandidates(const Survey& s, const PayloadInfo& p, 
             notes->push_back("The install record names a path outside its folder for " + r.id + "; it was not touched.");
             continue;
         }
+        if (placedHere(c.path)) continue;
         c.info = targetInfoOf(s, c.path, &probed);
         if (c.info.kind == DllKind::Absent) continue;
         // Owned by the record's hash, a tool receipt, or the bytes this payload carries for the id (what the old loader and licence
@@ -552,7 +589,7 @@ std::vector<Candidate> removalCandidates(const Survey& s, const PayloadInfo& p, 
         Candidate c;
         c.id = e.file.id;
         c.mode = e.file.existing;
-        if (!containedTargetPath(s, e.file.target, &c.path)) continue;
+        if (!containedTargetPath(s, e.file.target, &c.path) || placedHere(c.path)) continue;
         c.info = targetInfoOf(s, c.path, &probed);
         if (c.info.kind == DllKind::Absent) continue;
         const bool provenance = toolListsPath(s, c.path) ||
@@ -948,6 +985,8 @@ Plan planInstall(const Survey& s, const Options& o, const PayloadInfo& p) {
         bool canPlace = true;   // the whole `when` holds; false when the profile holds and the adapter does not
     };
     std::vector<Placed> placed;
+    std::vector<std::string> keepRecordIds;  // payload files this plan leaves alone (a target the containment check refused, a notice
+                                             // whose runtime is not carried): not placed, and the record they have stays
     {
         std::vector<DllInfo> probed;
         const unsigned profiles = profilesOfScope(scope);
@@ -958,6 +997,7 @@ Plan planInstall(const Survey& s, const Options& o, const PayloadInfo& p) {
             if (!containedTargetPath(s, e.file.target, &f.dst)) {
                 plan.problems.push_back("The target of " + say(leafOf(f.dst)) + " (" + e.file.target.path +
                                         ") leaves its folder, through a junction or a link; it was not placed.");
+                keepRecordIds.push_back(e.file.id);
                 continue;
             }
             f.cur = targetInfoOf(s, f.dst, &probed);
@@ -1147,6 +1187,11 @@ Plan planInstall(const Survey& s, const Options& o, const PayloadInfo& p) {
     }
     auto placeOwned = [&](const Placed& f) {
         const std::string& id = f.entry->file.id;
+        // A notice is placed with its runtime only: a payload without the runtime (a build without the SDK) places neither, and what an
+        // earlier install placed stays recorded.
+        if (const char* with = travelsWith(id)) {
+            if (!p.find(with)) { keepRecordIds.push_back(id); return; }
+        }
         const std::string& sha = f.entry->sha;
         const std::wstring& dst = f.dst;
         const DllInfo& cur = f.cur;
@@ -1340,7 +1385,9 @@ Plan planInstall(const Survey& s, const Options& o, const PayloadInfo& p) {
         bool placedHere = false;
         for (const Placed& f : placed) placedHere |= f.entry->file.id == r.id;
         const bool keptVendor = r.existing == existingName(ExistingMode::Owned) && !p.find(r.id);
-        if (!placedHere && !keptVendor) next.drop(r.id);
+        // A target the containment check refused was not touched, and its file stays on disk: its record stays with it.
+        const bool refused = std::find(keepRecordIds.begin(), keepRecordIds.end(), r.id) != keepRecordIds.end();
+        if (!placedHere && !keptVendor && !refused) next.drop(r.id);
     }
 
     // The descriptor is the scope's canonical text, not the payload's: a scope change rewrites it.
