@@ -166,6 +166,14 @@ inline void mutationChecks(Rig& r) {
         mutationFailures = nullptr; if (first) *first = mutationFirst;
         return true;
     };
+    {   // this suite's sources, compiled ahead on every core
+        std::vector<std::string> sources{shipped};
+        for (const Mutant& m : mutants) {
+            bool once = false;
+            sources.push_back(fpgpu::replaceOnce(shipped, m.from, m.to, &once));
+        }
+        fpgpu::precompilePreps(sources);
+    }
     {   // The control: the shipped source, compiled here, passes.
         int failed = 0; std::string first;
         const bool ran = runMutated(shipped, &failed, &first);

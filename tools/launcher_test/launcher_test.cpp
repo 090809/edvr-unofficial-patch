@@ -2984,7 +2984,8 @@ void testSession() {
         Ui ui;
         LauncherSession session(envFor(&ui, &http, base, true, P(base, L"self.exe")));
         session.start();
-        check(ui.pump([&]() { return session.checkState() == CheckState::Skipped; }), "an unreachable GitHub ends the check as skipped");
+        // The payload loads on a worker of its own: wait for it too, or a check that finishes first leaves it Loading.
+        check(ui.pump([&]() { return session.checkState() == CheckState::Skipped && session.payloadState() != PayloadState::Loading; }), "an unreachable GitHub ends the check as skipped");
         check(contains(session.updateLine(), "could not be reached") && session.updateLine().back() == '.', "with one sentence: " + session.updateLine());
         session.beginUpdate();
         check(!session.updating() && http.count("ed-up-core") == 0, "Update does nothing when there is nothing to update");

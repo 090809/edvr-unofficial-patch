@@ -15,7 +15,11 @@
 #include <d3d11sdklayers.h>
 #include <wrl/client.h>
 #include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <map>
+#include <mutex>
+#include <thread>
 #include <cstdio>
 #include <cstdarg>
 #include <cstring>
@@ -71,15 +75,20 @@ void check(bool ok,const char* text){if(!ok){if(mutationFailures){if(!*mutationF
 // ---- sharding (--self-test --shard I/N) ----------------------------------------------------------------------------------------
 // The rig runs the suites as N processes at once, each from a directory of its own (build.bat's :rig_flat_mono_resolve_shard*), because one
 // process took 276 s (the same suites alone sum to about 95 s: the process slows as it goes). A UNIT is the smallest piece that runs whole in
-// one shard: the resolver section of main() with its tail (they share locals), each suite, and each case of the SDK foreground suite (the
-// shipped-prep scenario, the control, one per mutant). kUnits is the complete list, in main()'s order; `group` is the shard (1-based) that runs
-// the unit when N is 5, (group-1)%N+1 otherwise, so any N covers every unit exactly once. Plain --self-test (no --shard) runs every unit.
-// Checked 2026-10-14 by running every unit alone, then the shards: units share no state EXCEPT
+// one shard: the resolver section of main() with its tail (they share locals), each suite, each case of the SDK foreground suite (the
+// shipped-prep scenario, the control, one per mutant), and each slice of a mutation loop ("firstPerson:mutants1of4": the control, then every
+// 4th mutant; the suite's other checks stay in the suite's own unit). kUnits is the complete list, in main()'s order; `group` is the shard
+// (1-based) that runs the unit when N is 5, (group-1)%N+1 otherwise, so any N covers every unit exactly once. Plain --self-test (no --shard)
+// runs every unit. Checked 2026-11-13 by running every unit alone, then the shards: units share no state EXCEPT
 //   firstPersonPhaseGpuTests needs firstPersonGpuTests before it in the process: the resolver logs "first-person motion inputs bound" once per
-//   process, and the phase suite checks it adds no log line (group 1 holds both);
+//   process, and the phase unit checks it adds no log line (group 1 holds both). The phase mutation slices do not need it: they count log lines
+//   from after their own control run. Run alone, firstPersonPhaseGpuTests fails that check by design; `--only firstPersonGpuTests,firstPersonPhaseGpuTests`
+//   passes;
 // and the fixture directories, which are next to the exe (flat-pixel-fixture, flat-weapon-*-fixture), so concurrent shards need exes in
-// different directories. Alone-times, ms, WARP: firstPerson 19000, firstPersonPhase 13200, flatResolveInput 15700, steadyDepth 13900,
-// skin 9200, flatPixelCapture 4200, flatWeaponFootprint 2500, taaHistoryDepth 2000, mapEasu 1800, each SDK foreground case 300-800.
+// different directories (and the repository root as the working directory: some suites read src\ and tools\ files by relative path).
+// Single-threaded WARP CPU seconds in the pool, 2026-11-13: a mutation slice 50-75 (firstPerson 4 slices, firstPersonPhase 3, steadyDepth 3, skin 2,
+// each one control run plus its mutants; the scenario run costs 3-5 s), vehicleFrame 43, staleRecord 28, flatResolveInput 16, taaHistoryDepth 13,
+// firstPerson + firstPersonPhase units 12 together, steadyDepth unit 12, the 8 SDK foreground mutants 5-10 each, the rest 1-5.
 struct ShardUnit {const char* name;int group;};
 const ShardUnit kUnits[]={
     {"projectionScopeTests",1},{"projectionRuntimeTests",1},{"projectionSnapshotTests",1},
@@ -88,14 +97,17 @@ const ShardUnit kUnits[]={
     {"flatWeaponFootprintGpuTests",2},{"flatOverlayLayerGpuTests",2},{"flatLoopOutputGpuTests",2},
     {"flatResolveInputGpuTests",3},{"flatForegroundOwnershipGpuTests",2},
     {"hdrRouteGpuTests",2},
-    {"sdkForeground:shipped",3},{"sdkForeground:control",3},
-    {"sdkForeground:mutant1",4},{"sdkForeground:mutant2",4},{"sdkForeground:mutant3",4},{"sdkForeground:mutant4",5},
-    {"sdkForeground:mutant5",5},{"sdkForeground:mutant6",5},{"sdkForeground:mutant7",5},{"sdkForeground:mutant8",5},
-    {"mapEasuGpuTests",4},{"mapSmaaLookupLeakTests",3},{"uiLayerSmaaGpuTests",3},{"sdkForegroundSupersampleGpuTests",5},
+    {"sdkForeground:shipped",4},{"sdkForeground:control",4},
+    {"sdkForeground:mutant1",1},{"sdkForeground:mutant2",1},{"sdkForeground:mutant3",1},{"sdkForeground:mutant4",1},
+    {"sdkForeground:mutant5",3},{"sdkForeground:mutant6",4},{"sdkForeground:mutant7",4},{"sdkForeground:mutant8",5},
+    {"mapEasuGpuTests",5},{"mapSmaaLookupLeakTests",3},{"uiLayerSmaaGpuTests",3},{"sdkForegroundSupersampleGpuTests",5},
     {"upscalerSlotGpuTests",2},{"firstPersonGpuTests",1},{"firstPersonPhaseGpuTests",1},
-    {"refusalGpuTests",2},{"skinGpuTests",5},{"copyRefusalViewGpuTests",2},{"copyForegroundGpuTests",2},
-    {"steadyDepthGpuTests",4},{"staleRecordGpuTests",4},{"vehicleFrameGpuTests",5},{"taaHistoryDepthGpuTests",5},{"contextIsolationGpuTests",2},
-    {"originOpticalGpuTests",4},
+    {"firstPerson:mutants1of4",1},{"firstPerson:mutants2of4",2},{"firstPerson:mutants3of4",2},{"firstPerson:mutants4of4",1},
+    {"firstPersonPhase:mutants1of3",3},{"firstPersonPhase:mutants2of3",3},{"firstPersonPhase:mutants3of3",3},
+    {"refusalGpuTests",2},{"skinGpuTests",5},{"skin:mutants1of2",5},{"skin:mutants2of2",2},{"copyRefusalViewGpuTests",2},{"copyForegroundGpuTests",2},
+    {"steadyDepthGpuTests",4},{"steadyDepth:mutants1of3",4},{"steadyDepth:mutants2of3",4},{"steadyDepth:mutants3of3",5},
+    {"staleRecordGpuTests",4},{"vehicleFrameGpuTests",5},{"taaHistoryDepthGpuTests",5},{"contextIsolationGpuTests",2},
+    {"originOpticalGpuTests",5},
     {"flatDofBlurGpuTests",1},
     {"flatCelestialGpuTests",5},
 };
@@ -361,12 +373,13 @@ int main(int argc,char** argv) {
         // The VR world route's seams (section 82): the third upscaler slot, the first-person map and stencil in the prep, and the phase term
         // the map's vector gets when the world and the first-person camera are jittered (stage 2).
         if(shardRuns("upscalerSlotGpuTests"))timedSuite("upscalerSlotGpuTests",[&]{return upscalerSlotGpuTests(device.Get(),context.Get());});
-        if(shardRuns("firstPersonGpuTests"))timedSuite("firstPersonGpuTests",[&]{return firstPersonGpuTests(device.Get(),context.Get());});
-        if(shardRuns("firstPersonPhaseGpuTests"))timedSuite("firstPersonPhaseGpuTests",[&]{return firstPersonPhaseGpuTests(device.Get(),context.Get());});
+        // Gated unit by unit inside (the "firstPerson*" units: the scenario and contract, and the mutation slices).
+        timedSuite("firstPersonGpuTests",[&]{return firstPersonGpuTests(device.Get(),context.Get());});
+        timedSuite("firstPersonPhaseGpuTests",[&]{return firstPersonPhaseGpuTests(device.Get(),context.Get());});
         // The stage 2 experiment build's refusal census and view: the prep's class byte, the counting pass and its read-back, the steady-detail
         // rule's effect on the counts, and the HDR finish's paint.
         if(shardRuns("refusalGpuTests"))timedSuite("refusalGpuTests",[&]{return refusalGpuTests(device.Get(),context.Get());});
-        if(shardRuns("skinGpuTests"))timedSuite("skinGpuTests",[&]{return skinGpuTests(device.Get(),context.Get());});
+        timedSuite("skinGpuTests",[&]{return skinGpuTests(device.Get(),context.Get());});
         // The same view on the copy route (hdr off): the compute finish paints it for the SDK backends, EDVR's own TAA there asks for nothing.
         if(shardRuns("copyRefusalViewGpuTests"))timedSuite("copyRefusalViewGpuTests",[&]{return copyRefusalViewGpuTests(device.Get(),context.Get());});
         // The first-person contract on the copy route (the weapon support below the output): a qualified map reaches the DLSS and FSR stubs, the
@@ -374,7 +387,7 @@ int main(int argc,char** argv) {
         if(shardRuns("copyForegroundGpuTests"))timedSuite("copyForegroundGpuTests",[&]{return copyForegroundGpuTests(device.Get(),context.Get());});
         // The depth-validated steady detail (the same section, the key's second form): the prep's depth check, its tolerance and its previous depth,
         // through the DLSS and FSR stubs and EDVR's own TAA, and the same scenario against the prep with one rule flipped at a time.
-        if(shardRuns("steadyDepthGpuTests"))timedSuite("steadyDepthGpuTests",[&]{return steadyDepthGpuTests(device.Get(),context.Get());});
+        timedSuite("steadyDepthGpuTests",[&]{return steadyDepthGpuTests(device.Get(),context.Get());});
         if(shardRuns("vehicleFrameGpuTests"))timedSuite("vehicleFrameGpuTests",[&]{return vehicleFrameGpuTests(device.Get(),context.Get());});
         if(shardRuns("staleRecordGpuTests"))timedSuite("staleRecordGpuTests",[&]{return staleRecordGpuTests(device.Get(),context.Get());});
         if(shardRuns("originOpticalGpuTests"))timedSuite("originOpticalGpuTests",[&]{return originOpticalGpuTests(device.Get(),context.Get());});
